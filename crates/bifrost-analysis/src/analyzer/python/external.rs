@@ -23,6 +23,7 @@ use crate::analyzer::semantic_model::{
     SemanticModelActivationEvidence, Signature, TypeFact, TypeIdentity, TypeKind, TypeRef,
     Visibility, member_declaration_id, read_exact_artifact_while, type_declaration_id,
 };
+use crate::analyzer::topology::DependencyScope;
 use crate::analyzer::{Project, PythonAnalyzerConfig, PythonEnvironmentConfig};
 use tree_sitter::Node;
 
@@ -2477,6 +2478,8 @@ impl<'a> DiscoveryState<'a> {
                 },
             ],
             artifacts,
+            scope: DependencyScope::Unknown,
+            declared_by: None,
         }
     }
 

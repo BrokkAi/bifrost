@@ -376,9 +376,8 @@ impl<'a> RubySemanticIndex<'a> {
         let visible_files: Vec<ProjectFile> = visible_files.iter().cloned().collect();
         let mut seen = HashSet::default();
         let mut push_owner = |owner: &str, mode: RubyMethodLookupMode, out: &mut Vec<CodeUnit>| {
-            for unit in support.fqn_direct_children(owner) {
+            for unit in support.members_for_owner_name(owner, owner, member) {
                 if unit.is_function()
-                    && unit.identifier() == member
                     && visible_files.contains(unit.source())
                     && ruby_method_lookup_mode_matches(self.ruby, &unit, mode)
                     && seen.insert(unit.clone())

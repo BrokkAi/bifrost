@@ -17,33 +17,31 @@ mod python_module;
 #[cfg(feature = "release-tooling")]
 pub mod summary_foundry_fixtures;
 pub use brokk_bifrost_analysis::{
-    AnalyzerConfig, AnalyzerDelegate, CSharpAnalyzer, CancellationToken, CapabilityProvider,
-    CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeQuery, CodeQueryExecutionLimits,
-    CodeQueryExecutionMode, CodeQueryExplain, CodeQueryProfile, CodeQueryResponse, CodeUnit,
-    CodeUnitIndex, CodeUnitType, CppAnalyzer, DeclarationInfo, DeclarationKind,
-    DependencyPackActivationOutcome, DependencyPackEcosystem, DependencyPackEcosystemOutcome,
-    DependencyPackWorkspaceContext, DispatchHierarchyExpansion, EmptyAnalyzer, FileSetProject,
-    FilesystemProject, GoAnalyzer, IAnalyzer, ImportAnalysisProvider, ImportInfo,
-    ImportReachability, JavaAnalyzer, JavascriptAnalyzer, JvmAnalyzerConfig,
-    JvmDependencyDiscoveryConfig, JvmDependencyDiscoveryMode, JvmExternalArtifact,
-    JvmExternalDependencies, JvmMavenCoordinate, KotlinAnalyzer, Language, MultiAnalyzer,
-    MultiRootProject, NavigationOperation, OverlayProject, ParseError, ParseErrorKind, PhpAnalyzer,
-    PhpAnalyzerConfig, PhpDependencyApiEvidence, PhpDependencyPackAdapter, Project, ProjectFile,
-    PythonAnalyzer, PythonSemanticModelWorkspaceContext, Range, RenderedSummary, RubyAnalyzer,
-    RubyAnalyzerConfig, RubyDependencyApiEvidence, RubyDependencyPackAdapter, RubyGemApiArtifact,
-    RustAnalyzer, RustAnalyzerConfig, RustDependencyApiEvidence, RustDependencyPackAdapter,
+    AnalyzerConfig, AnalyzerDefinitionLookup, AnalyzerDelegate, CSharpAnalyzer, CancellationToken,
+    CapabilityProvider, CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitIndex,
+    CodeUnitType, CppAnalyzer, DeclarationInfo, DeclarationKind, DependencyPackActivationOutcome,
+    DependencyPackEcosystem, DependencyPackEcosystemOutcome, DependencyPackWorkspaceContext,
+    DispatchHierarchyExpansion, EmptyAnalyzer, FileSetProject, FilesystemProject, GoAnalyzer,
+    IAnalyzer, ImportAnalysisProvider, ImportInfo, ImportReachability, JavaAnalyzer,
+    JavascriptAnalyzer, JvmAnalyzerConfig, JvmDependencyDiscoveryConfig,
+    JvmDependencyDiscoveryMode, JvmExternalArtifact, JvmExternalDependencies, JvmMavenCoordinate,
+    KotlinAnalyzer, Language, MultiAnalyzer, MultiRootProject, NavigationOperation, OverlayProject,
+    ParseError, ParseErrorKind, PhpAnalyzer, PhpAnalyzerConfig, PhpDependencyApiEvidence,
+    PhpDependencyPackAdapter, Project, ProjectFile, PythonAnalyzer,
+    PythonSemanticModelWorkspaceContext, Range, RenderedSummary, RubyAnalyzer, RubyAnalyzerConfig,
+    RubyDependencyApiEvidence, RubyDependencyPackAdapter, RubyGemApiArtifact, RustAnalyzer,
+    RustAnalyzerConfig, RustDependencyApiEvidence, RustDependencyPackAdapter,
     RustPackageApiArtifact, RustSelectedTarget, ScalaAnalyzer, SourceContent, SummaryInput,
     TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TestProject,
     TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider, TypescriptAnalyzer,
-    WorkspaceAnalyzer, collect_workspace_files, execute_request, execute_request_with_cancellation,
-    execute_request_with_limits, resolve_php_semantic_pack_dependencies,
+    WorkspaceAnalyzer, collect_workspace_files, resolve_php_semantic_pack_dependencies,
     resolve_ruby_semantic_pack_dependencies, resolve_rust_semantic_pack_dependencies,
     summarize_inputs,
 };
 pub use brokk_bifrost_analysis::{
     analyzer, cache_db, cache_gc, cancellation, code_quality, compact_graph, diff_analysis,
     file_tools, git_file, gitblob, hash, model_context, navigation, path_normalization, path_utils,
-    process, profiling, relevance, schema_version, searchtools, searchtools_render, sexp, summary,
+    process, profiling, relevance, schema_version, searchtools, searchtools_render, summary,
     symbol_rename, text_utils, usages, util, workspace_document,
 };
 #[cfg(any(test, feature = "test-support"))]
@@ -51,6 +49,7 @@ pub use brokk_bifrost_analysis::{
     reset_rust_tree_parse_counters_for_test, rust_tree_parse_count_for_test,
     rust_tree_parse_request_count_for_test, rust_tree_parsed_bytes_for_test,
 };
+pub use brokk_bifrost_flow as flow;
 pub use brokk_bifrost_lsp::lsp;
 pub use brokk_bifrost_mcp::{
     mcp_cli, mcp_common, mcp_core, mcp_extended, mcp_nlp, mcp_registry, mcp_slopcop, mcp_text,
@@ -59,6 +58,11 @@ pub use brokk_bifrost_mcp::{
 #[cfg(feature = "nlp")]
 pub use brokk_bifrost_nlp as nlp;
 pub use brokk_bifrost_policy as policy;
+pub use brokk_bifrost_rql::{
+    self as rql, CodeQuery, CodeQueryExecutionLimits, CodeQueryExecutionMode, CodeQueryExplain,
+    CodeQueryProfile, CodeQueryResponse, execute_request, execute_request_with_cancellation,
+    execute_request_with_limits, sexp,
+};
 pub use brokk_bifrost_runtime::{CodeIntelligenceRuntime, code_intelligence, extension};
 pub use brokk_bifrost_semantic_packs as semantic_packs;
 

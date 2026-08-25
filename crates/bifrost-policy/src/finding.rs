@@ -10,7 +10,7 @@ use std::mem::size_of;
 use serde::{Serialize, Serializer};
 
 use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
-use brokk_bifrost_analysis::analyzer::structural::CodeQueryDiagnosticCode;
+use brokk_bifrost_rql::structural::CodeQueryDiagnosticCode;
 
 use super::baseline::PolicyFindingBaseline;
 use super::budget::PolicyBudget;

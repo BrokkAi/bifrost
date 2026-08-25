@@ -1,6 +1,6 @@
 use super::{
     ExtensionApiVersion, ExtensionWorkspaceDescription, NormalizedRelativePath, StableDigest,
-    WorkspaceGeneration,
+    WorkspaceContentIdentity, WorkspaceGeneration,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -13,7 +13,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const EXTENSION_RUN_MANIFEST_SCHEMA: &str = "1.0";
+pub const EXTENSION_RUN_MANIFEST_SCHEMA: &str = "2.0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -64,6 +64,13 @@ pub struct WorkspaceRunIdentity {
     pub commit: Box<str>,
     pub dirty_tree: Option<StableDigest>,
     pub generation: WorkspaceGeneration,
+    /// Portable identity of the analyzed source and configuration content.
+    ///
+    /// The derivation omits the workspace root and package metadata; literal
+    /// analyzer configuration remains an input. Dependency fingerprints remain
+    /// separate because they identify external dependency bytes rather than the
+    /// workspace's own portable content.
+    pub content_identity: WorkspaceContentIdentity,
     pub source_inventory_digest: StableDigest,
     pub roots: Box<[Box<str>]>,
     pub exclusions: Box<[Box<str>]>,
@@ -305,7 +312,9 @@ impl RunManifestBuilder {
         purpose: RunPurpose,
         cache: CacheStateDeclaration,
     ) -> Result<Self, ManifestError> {
-        if description.generation != workspace.generation || description.api != engine.extension_api
+        if description.generation != workspace.generation
+            || description.content_identity != workspace.content_identity
+            || description.api != engine.extension_api
         {
             return Err(ManifestError::new(
                 "workspace",

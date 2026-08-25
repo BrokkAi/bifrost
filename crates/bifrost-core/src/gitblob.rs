@@ -18,6 +18,8 @@ use git2::{
 };
 use growable_bloom_filter::GrowableBloom;
 
+use crate::analyzer::canonical_hash::{hash_domain_bytes, lower_hex_string};
+
 pub type Result<T> = std::result::Result<T, String>;
 
 /// Workspace-local directory holding Bifrost's tracked project configuration.
@@ -26,6 +28,7 @@ pub const PROJECT_DIR_NAME: &str = ".bifrost";
 /// Generated state beneath [`PROJECT_DIR_NAME`].
 pub const CACHE_SUBDIR_NAME: &str = "cache";
 pub const CACHE_DIR_ENV: &str = "BIFROST_CACHE_DIR";
+pub const CACHE_ROOT_ENV: &str = "BIFROST_CACHE_ROOT";
 
 /// Discover the repository containing `root`, if any.
 pub fn discover(root: &Path) -> Option<Repository> {
@@ -64,25 +67,92 @@ pub fn primary_repo_root(repo: &Repository) -> Option<PathBuf> {
 /// the same checkout stop seeing each other's work) and costs a full extra copy
 /// of the corpus. Scoping a session's *results* to its bound root is the job of
 /// reconciliation against that worktree's current oids, not of the file's
-/// location. `BIFROST_CACHE_DIR` deliberately overrides all of it, at the cost
-/// of that divergence; version-keyed naming applies inside the override
-/// directory too.
+/// location. `BIFROST_CACHE_ROOT` keeps that sharing contract while relocating
+/// each primary repository to a stable child of one machine-local root.
+/// `BIFROST_CACHE_DIR` deliberately overrides both locations with one exact
+/// directory, at the cost of per-root divergence and cross-repository writer
+/// contention; version-keyed naming applies inside either override too.
 ///
 /// The file name carries the schema version this build reads
 /// (`crate::cache_db::cache_db_file_name`), so checkouts at different versions
 /// share the directory without sharing a file (issue #1589).
 pub fn cache_db_path(workspace_root: &Path) -> PathBuf {
-    if let Some(cache_dir) = std::env::var_os(CACHE_DIR_ENV).filter(|value| !value.is_empty()) {
+    cache_db_path_with_overrides(
+        workspace_root,
+        std::env::var_os(CACHE_DIR_ENV).filter(|value| !value.is_empty()),
+        std::env::var_os(CACHE_ROOT_ENV).filter(|value| !value.is_empty()),
+    )
+}
+
+fn cache_db_path_with_overrides(
+    workspace_root: &Path,
+    cache_dir: Option<std::ffi::OsString>,
+    cache_root: Option<std::ffi::OsString>,
+) -> PathBuf {
+    if let Some(cache_dir) = cache_dir {
         return PathBuf::from(cache_dir).join(crate::cache_db::cache_db_file_name());
     }
     let primary_root = discover(workspace_root)
         .as_ref()
         .and_then(primary_repo_root)
         .unwrap_or_else(|| workspace_root.to_path_buf());
+    if let Some(cache_root) = cache_root {
+        let canonical_primary = primary_root.canonicalize().unwrap_or(primary_root);
+        return PathBuf::from(cache_root)
+            .join(cache_repository_key(&canonical_primary))
+            .join(crate::cache_db::cache_db_file_name());
+    }
     primary_root
         .join(PROJECT_DIR_NAME)
         .join(CACHE_SUBDIR_NAME)
         .join(crate::cache_db::cache_db_file_name())
+}
+
+fn cache_repository_key(primary_root: &Path) -> String {
+    let readable = primary_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| {
+            name.chars()
+                .map(|character| {
+                    if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                        character
+                    } else {
+                        '_'
+                    }
+                })
+                .collect::<String>()
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "workspace".to_string());
+    let digest = hash_domain_bytes(
+        b"bifrost-cache-primary-root-v1",
+        &platform_path_bytes(primary_root),
+    );
+    let digest = lower_hex_string(&digest);
+    format!("{readable}-{}", &digest[..16])
+}
+
+#[cfg(unix)]
+fn platform_path_bytes(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    path.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(windows)]
+fn platform_path_bytes(path: &Path) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    path.as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn platform_path_bytes(path: &Path) -> Vec<u8> {
+    path.to_string_lossy().as_bytes().to_vec()
 }
 
 /// Working-tree blob OID (hex) for each of `rel_paths`.
@@ -152,6 +222,14 @@ pub struct WorkingTreeIdentity {
     verified_clean_paths: Mutex<HashSet<String>>,
 }
 
+/// A working-tree OID paired with the filesystem observation used to resolve
+/// it. Callers can retain the metadata without taking a second stat pass and
+/// decide whether the observation is still current at their boundary.
+pub struct WorkingTreeResolution {
+    pub oid: Oid,
+    pub metadata: Metadata,
+}
+
 struct TrackedIdentity {
     oid: Oid,
     file_size: u32,
@@ -181,7 +259,7 @@ impl WorkingTreeIdentity {
         // names the canonical blob. Hash those bytes instead of serving the
         // canonical OID. A line-ending conversion changes the worktree size,
         // while other filters need the attribute guard below.
-        if canonical_blob_size(repo, tracked.oid) != Some(file_size)
+        if canonical_blob_size(repo, tracked.oid) != Some(file_size.len())
             || has_content_transform(repo, Path::new(rel))
         {
             return None;
@@ -208,10 +286,81 @@ impl WorkingTreeIdentity {
             .map(|(tracked, _)| tracked.oid)
     }
 
+    /// Resolve a batch of paths while retaining the metadata observed for
+    /// each returned OID. Clean tracked paths use one batched object-database
+    /// size lookup instead of opening the ODB once per path. A path is omitted
+    /// when its bytes were not stable for the duration of its resolution;
+    /// callers can then fall back to point resolution.
+    pub fn resolve_with_metadata(
+        &self,
+        repo: &Repository,
+        rel_paths: &[String],
+    ) -> Result<HashMap<String, WorkingTreeResolution>> {
+        let workdir = workdir(repo)?;
+        let clean_candidates: HashMap<String, (Oid, Metadata)> = rel_paths
+            .iter()
+            .filter_map(|rel| {
+                let abs_path = workdir.join(rel);
+                let (tracked, metadata) = self.stat_clean_entry(rel, &abs_path)?;
+                Some((rel.clone(), (tracked.oid, metadata)))
+            })
+            .collect();
+        let blob_sizes = canonical_blob_sizes(repo, clean_candidates.values().map(|(oid, _)| *oid));
+        let mut resolved = HashMap::with_capacity(rel_paths.len());
+        for rel in rel_paths {
+            let abs_path = workdir.join(rel);
+            let Some(metadata_before) = clean_candidates
+                .get(rel)
+                .map(|(_, metadata)| metadata.clone())
+                .or_else(|| std::fs::metadata(&abs_path).ok())
+            else {
+                continue;
+            };
+            if !metadata_before.is_file() {
+                continue;
+            }
+
+            let clean_oid = clean_candidates.get(rel).and_then(|(oid, _)| {
+                let verified = self
+                    .verified_clean_paths
+                    .lock()
+                    .expect("working-tree identity verification mutex poisoned")
+                    .contains(rel);
+                let same_size =
+                    blob_sizes.get(oid).copied().flatten() == Some(metadata_before.len());
+                let untransformed = !has_content_transform(repo, Path::new(rel));
+                (verified || (same_size && untransformed)).then_some(*oid)
+            });
+            let oid = if let Some(oid) = clean_oid {
+                self.verified_clean_paths
+                    .lock()
+                    .expect("working-tree identity verification mutex poisoned")
+                    .insert(rel.clone());
+                oid
+            } else {
+                hash_working_file(workdir, rel)?
+            };
+            let Some(metadata_after) = std::fs::metadata(&abs_path).ok() else {
+                continue;
+            };
+            if !metadata_same(&metadata_before, &metadata_after) {
+                continue;
+            }
+            resolved.insert(
+                rel.clone(),
+                WorkingTreeResolution {
+                    oid,
+                    metadata: metadata_after,
+                },
+            );
+        }
+        Ok(resolved)
+    }
+
     /// The tracked entry for `rel` and the current file size, when the scan saw
     /// the path clean and the file still carries the recorded stat. One
     /// `metadata` call serves both callers above.
-    fn stat_clean_entry(&self, rel: &str, abs_path: &Path) -> Option<(&TrackedIdentity, u64)> {
+    fn stat_clean_entry(&self, rel: &str, abs_path: &Path) -> Option<(&TrackedIdentity, Metadata)> {
         if self.dirty.contains(rel) {
             return None;
         }
@@ -233,7 +382,27 @@ impl WorkingTreeIdentity {
         if tracked.mtime_nanoseconds != 0 && modified.subsec_nanos() != tracked.mtime_nanoseconds {
             return None;
         }
-        Some((tracked, metadata.len()))
+        Some((tracked, metadata))
+    }
+}
+
+fn metadata_same(left: &Metadata, right: &Metadata) -> bool {
+    if left.len() != right.len() || left.modified().ok() != right.modified().ok() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        left.dev() == right.dev()
+            && left.ino() == right.ino()
+            && left.mode() == right.mode()
+            && left.uid() == right.uid()
+            && left.gid() == right.gid()
+    }
+    #[cfg(not(unix))]
+    {
+        true
     }
 }
 
@@ -945,6 +1114,72 @@ mod tests {
     }
 
     #[test]
+    fn cache_root_keeps_linked_worktrees_together_and_repositories_apart() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let first_root = temp.path().join("first").join("shared-name");
+        let second_root = temp.path().join("second").join("shared-name");
+        std::fs::create_dir_all(&first_root).unwrap();
+        std::fs::create_dir_all(&second_root).unwrap();
+        let first = init_repo(&first_root);
+        let _second = init_repo(&second_root);
+        std::fs::write(first_root.join("a.txt"), "first\n").unwrap();
+        commit_all(&first, "init");
+        let linked_root = temp.path().join("linked");
+        let _linked = first.worktree("linked", &linked_root, None).unwrap();
+        let cache_root = temp.path().join("local-cache");
+
+        let first_cache = cache_db_path_with_overrides(
+            &first_root,
+            None,
+            Some(cache_root.as_os_str().to_owned()),
+        );
+        let linked_cache = cache_db_path_with_overrides(
+            &linked_root,
+            None,
+            Some(cache_root.as_os_str().to_owned()),
+        );
+        let second_cache = cache_db_path_with_overrides(
+            &second_root,
+            None,
+            Some(cache_root.as_os_str().to_owned()),
+        );
+
+        assert_eq!(first_cache, linked_cache);
+        assert_ne!(first_cache, second_cache);
+        assert_eq!(
+            first_cache.parent().and_then(Path::parent),
+            Some(cache_root.as_path())
+        );
+        assert!(
+            first_cache
+                .parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("shared-name-")
+        );
+    }
+
+    #[test]
+    fn exact_cache_directory_override_wins_over_cache_root() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let exact = temp.path().join("exact");
+        let root = temp.path().join("root");
+
+        assert_eq!(
+            cache_db_path_with_overrides(
+                &workspace,
+                Some(exact.as_os_str().to_owned()),
+                Some(root.as_os_str().to_owned()),
+            ),
+            exact.join(crate::cache_db::cache_db_file_name())
+        );
+    }
+
+    #[test]
     fn promisor_remote_detection_distinguishes_local_paths_from_network_transports() {
         let temp = tempfile::TempDir::new().unwrap();
         let repo = init_repo(temp.path());
@@ -1145,6 +1380,52 @@ mod tests {
             Oid::hash_object(ObjectType::Blob, b"working\n")
                 .unwrap()
                 .to_string()
+        );
+    }
+
+    #[test]
+    fn batched_identity_pairs_current_metadata_with_clean_dirty_and_untracked_oids() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        std::fs::write(temp.path().join("clean.txt"), "clean\n").unwrap();
+        std::fs::write(temp.path().join("dirty.txt"), "committed\n").unwrap();
+        commit_all(&repo, "init");
+        std::fs::write(temp.path().join("dirty.txt"), "working\n").unwrap();
+        std::fs::write(temp.path().join("new.txt"), "fresh\n").unwrap();
+
+        let identity = working_tree_identity(&repo).unwrap();
+        reset_hash_calls();
+        let resolved = identity
+            .resolve_with_metadata(
+                &repo,
+                &[
+                    "clean.txt".to_string(),
+                    "dirty.txt".to_string(),
+                    "new.txt".to_string(),
+                ],
+            )
+            .unwrap();
+
+        for (path, bytes) in [
+            ("clean.txt", b"clean\n".as_slice()),
+            ("dirty.txt", b"working\n".as_slice()),
+            ("new.txt", b"fresh\n".as_slice()),
+        ] {
+            let resolution = &resolved[path];
+            assert_eq!(
+                resolution.oid,
+                Oid::hash_object(ObjectType::Blob, bytes).unwrap()
+            );
+            assert_eq!(resolution.metadata.len(), bytes.len() as u64);
+            assert!(metadata_same(
+                &resolution.metadata,
+                &std::fs::metadata(temp.path().join(path)).unwrap()
+            ));
+        }
+        assert_eq!(
+            hash_calls(),
+            2,
+            "only dirty and untracked files should read visible bytes"
         );
     }
 

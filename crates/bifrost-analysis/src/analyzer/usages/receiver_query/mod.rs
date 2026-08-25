@@ -50,24 +50,24 @@ use std::sync::Arc;
 use tree_sitter::Node;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum ReceiverQueryOperation {
+pub enum ReceiverQueryOperation {
     ReceiverTargets,
     PointsTo,
     MemberTargets,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ReceiverQueryInput {
+pub enum ReceiverQueryInput {
     Expression,
     ContainingSite,
 }
 
 impl ReceiverQueryOperation {
     /// The value domain the `analysis_kind` row fields publish (issue #2515).
-    pub(crate) const LABELS: &'static [&'static str] =
+    pub const LABELS: &'static [&'static str] =
         &["receiver_targets", "points_to", "member_targets"];
 
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::ReceiverTargets => "receiver_targets",
             Self::PointsTo => "points_to",
@@ -77,38 +77,38 @@ impl ReceiverQueryOperation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct ReceiverQuerySite {
-    pub(crate) file: ProjectFile,
-    pub(crate) language: Language,
-    pub(crate) range: Range,
-    pub(crate) text: String,
-    pub(crate) syntax_kind: String,
-    pub(crate) member_name: Option<String>,
+pub struct ReceiverQuerySite {
+    pub file: ProjectFile,
+    pub language: Language,
+    pub range: Range,
+    pub text: String,
+    pub syntax_kind: String,
+    pub member_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) enum ReceiverQueryAnalysis {
+pub enum ReceiverQueryAnalysis {
     Values(ReceiverAnalysisOutcome<ReceiverValue>),
     MemberTargets(ReceiverAnalysisOutcome<CodeUnit>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct ReceiverQueryReport {
-    pub(crate) operation: ReceiverQueryOperation,
-    pub(crate) site: ReceiverQuerySite,
-    pub(crate) analysis: ReceiverQueryAnalysis,
-    pub(crate) work: ReceiverAnalysisWork,
-    pub(crate) candidates_truncated: bool,
-    pub(crate) semantic_unsupported: Option<SemanticCapability>,
+pub struct ReceiverQueryReport {
+    pub operation: ReceiverQueryOperation,
+    pub site: ReceiverQuerySite,
+    pub analysis: ReceiverQueryAnalysis,
+    pub work: ReceiverAnalysisWork,
+    pub candidates_truncated: bool,
+    pub semantic_unsupported: Option<SemanticCapability>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ReceiverQueryError {
+pub enum ReceiverQueryError {
     Cancelled,
     SemanticProvider(SemanticProviderError),
 }
 
-pub(crate) struct ReceiverQueryService<'a> {
+pub struct ReceiverQueryService<'a> {
     analyzer: &'a dyn IAnalyzer,
     workspace: Option<&'a WorkspaceAnalyzer>,
     definitions: AnalyzerDefinitionLookup<'a>,
@@ -414,7 +414,7 @@ fn charge_limited_projection<T>(
 }
 
 impl<'a> ReceiverQueryService<'a> {
-    pub(crate) fn new(analyzer: &'a dyn IAnalyzer) -> Self {
+    pub fn new(analyzer: &'a dyn IAnalyzer) -> Self {
         Self {
             analyzer,
             workspace: None,
@@ -425,7 +425,7 @@ impl<'a> ReceiverQueryService<'a> {
         }
     }
 
-    pub(crate) fn from_workspace(workspace: &'a WorkspaceAnalyzer) -> Self {
+    pub fn from_workspace(workspace: &'a WorkspaceAnalyzer) -> Self {
         let analyzer = workspace.analyzer();
         Self {
             analyzer,
@@ -438,7 +438,7 @@ impl<'a> ReceiverQueryService<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn analyze_with_structural_facts(
+    pub fn analyze_with_structural_facts(
         &self,
         operation: ReceiverQueryOperation,
         file: &ProjectFile,
@@ -459,7 +459,7 @@ impl<'a> ReceiverQueryService<'a> {
         )
     }
 
-    pub(crate) fn analyze(
+    pub fn analyze(
         &self,
         operation: ReceiverQueryOperation,
         file: &ProjectFile,
@@ -1969,7 +1969,7 @@ fn prepared_structural_syntax_limited(
     cancellation: Option<&CancellationToken>,
 ) -> Option<StructuralSyntaxLimitedOutcome> {
     analyzer
-        .structural_search_providers()
+        .structural_fact_providers()
         .into_iter()
         .find(|provider| provider.structural_language() == language)
         .map(|provider| provider.structural_syntax_limited(file, max_source_bytes, cancellation))

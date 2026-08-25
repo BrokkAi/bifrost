@@ -920,7 +920,7 @@ jobs:
 
   publish-crate-rql:
     name: publish RQL crate
-    needs: [release-context, promote-qualification, publish-crate-core]
+    needs: [release-context, promote-qualification, publish-crate-flow, publish-crate-nlp]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
@@ -936,7 +936,7 @@ jobs:
 
   publish-crate-analysis:
     name: publish analysis crate
-    needs: [release-context, promote-qualification, publish-crate-core, publish-crate-go, publish-crate-cpp, publish-crate-js-ts, publish-crate-jvm, publish-crate-csharp, publish-crate-php, publish-crate-python, publish-crate-ruby, publish-crate-rust, publish-crate-rql]
+    needs: [release-context, promote-qualification, publish-crate-core, publish-crate-go, publish-crate-cpp, publish-crate-js-ts, publish-crate-jvm, publish-crate-csharp, publish-crate-php, publish-crate-python, publish-crate-ruby, publish-crate-rust]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
@@ -950,9 +950,25 @@ jobs:
       qualification_manifest_sha256: ${{ needs.promote-qualification.outputs.manifest_sha256 }}
     permissions: { contents: read, actions: read, id-token: write }
 
+  publish-crate-flow:
+    name: publish flow crate
+    needs: [release-context, promote-qualification, publish-crate-analysis]
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      tag: ${{ needs.release-context.outputs.tag }}
+      version: ${{ needs.release-context.outputs.version }}
+      commit: ${{ needs.release-context.outputs.commit }}
+      package: brokk-bifrost-flow
+      qualification_run_id: ${{ needs.promote-qualification.outputs.run_id }}
+      qualification_run_attempt: ${{ needs.promote-qualification.outputs.run_attempt }}
+      qualification_artifact_id: ${{ needs.promote-qualification.outputs.artifact_id }}
+      qualification_artifact_digest: ${{ needs.promote-qualification.outputs.artifact_digest }}
+      qualification_manifest_sha256: ${{ needs.promote-qualification.outputs.manifest_sha256 }}
+    permissions: { contents: read, actions: read, id-token: write }
+
   publish-crate-policy:
     name: publish policy crate
-    needs: [release-context, promote-qualification, publish-crate-analysis]
+    needs: [release-context, promote-qualification, publish-crate-rql, publish-crate-semantic-packs]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
@@ -1000,7 +1016,7 @@ jobs:
 
   publish-crate-semantic-packs:
     name: publish semantic packs crate
-    needs: [release-context, promote-qualification, publish-crate-analysis]
+    needs: [release-context, promote-qualification, publish-crate-flow, publish-crate-nlp]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
@@ -1016,7 +1032,7 @@ jobs:
 
   publish-crate-mcp:
     name: publish MCP crate
-    needs: [release-context, promote-qualification, publish-crate-runtime, publish-crate-nlp]
+    needs: [release-context, promote-qualification, publish-crate-runtime]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
@@ -1048,7 +1064,7 @@ jobs:
 
   publish-crate-facade:
     name: publish facade crate
-    needs: [release-context, promote-qualification, publish-crate-mcp, publish-crate-lsp, publish-crate-semantic-packs, publish-crate-nlp]
+    needs: [release-context, promote-qualification, publish-crate-mcp, publish-crate-lsp]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}

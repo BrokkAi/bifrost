@@ -509,6 +509,149 @@ fn flow_state_constrained_values_report_their_allowed_set() {
     assert_eq!(&json[diagnostic.range.clone()], "\"adjacent\"");
 }
 
+/// Hover help and validation ranges for the control-relation vocabulary
+/// (#2443), in both frontends. Every option name and every constrained value is
+/// checked at its own range, so an editor cannot underline the wrong token.
+#[test]
+fn control_relation_help_and_diagnostics_are_range_precise() {
+    let rql = "(control-relations :relation [dominates] \
+                :exit-partition [normal-and-exceptional] (procedure-of (function)))";
+    for token in ["control-relations", ":relation", ":exit-partition"] {
+        let offset = rql.find(token).unwrap();
+        let help = query_source_help_at(rql, offset)
+            .unwrap_or_else(|| panic!("no control-relation help for {token}"));
+        assert_eq!(&rql[help.range], token);
+        assert!(!help.description.is_empty());
+    }
+    assert!(validate_query_source(rql).is_empty(), "{rql}");
+
+    let json = r#"{"match":{"kind":"function"},"steps":[{"op":"procedure_of"},{"op":"control_relations","control_relation":["in_loop"],"exit_partition":["normal_and_exceptional"]}]}"#;
+    for token in ["control_relations", "control_relation", "exit_partition"] {
+        let offset = json.find(token).unwrap();
+        let help = query_source_help_at(json, offset)
+            .unwrap_or_else(|| panic!("no JSON control-relation help for {token}"));
+        assert!(!help.description.is_empty());
+    }
+    assert!(validate_query_source(json).is_empty(), "{json}");
+}
+
+/// Hover help and validation ranges for the guard step (#2443 slice 2), in
+/// both frontends. The step has no option axis, so one borrowed from a sibling
+/// step is reported on its own token rather than ignored.
+#[test]
+fn guard_help_and_diagnostics_are_range_precise() {
+    let rql = "(guards-of (procedure-of (function)))";
+    let offset = rql.find("guards-of").unwrap();
+    let help = query_source_help_at(rql, offset).expect("guard help");
+    assert_eq!(&rql[help.range], "guards-of");
+    assert!(
+        help.description.contains("guard_facts"),
+        "{:?}",
+        help.description
+    );
+    assert!(validate_query_source(rql).is_empty(), "{rql}");
+
+    let json =
+        r#"{"match":{"kind":"function"},"steps":[{"op":"procedure_of"},{"op":"guards_of"}]}"#;
+    let offset = json.find("guards_of").unwrap();
+    let help = query_source_help_at(json, offset).expect("JSON guard help");
+    assert!(!help.description.is_empty());
+    assert!(validate_query_source(json).is_empty(), "{json}");
+
+    let borrowed = "(guards-of :relation [dominates] (procedure-of (function)))";
+    let diagnostic = validate_query_source(borrowed)
+        .into_iter()
+        .find(|diagnostic| diagnostic.code == "wrong-value-shape")
+        .expect("a guard step takes no option axis");
+    assert!(diagnostic.message.contains("guards-of"), "{diagnostic:?}");
+}
+
+/// A constrained value outside the registry is reported on the value's own
+/// range, and the message names the allowed set -- including the reserved exit
+/// partitions, which are declared values even though no row carries them yet.
+#[test]
+fn control_relation_constrained_values_report_their_allowed_set() {
+    let rql = "(control-relations :relation [precedes] (procedure-of (function)))";
+    let diagnostic = validate_query_source(rql)
+        .into_iter()
+        .find(|diagnostic| diagnostic.message.contains("precedes"))
+        .expect("control-relation diagnostic");
+    assert_eq!(&rql[diagnostic.range.clone()], "precedes");
+    for allowed in [
+        "dominates",
+        "postdominates",
+        "control_depends_on",
+        "reachable",
+        "in_loop",
+    ] {
+        assert!(diagnostic.message.contains(allowed), "{diagnostic:?}");
+    }
+
+    let rql = "(control-relations :exit-partition [normal_and_cancellation] \
+                (procedure-of (function)))";
+    let diagnostic = validate_query_source(rql)
+        .into_iter()
+        .find(|diagnostic| diagnostic.message.contains("normal_and_cancellation"))
+        .expect("exit-partition diagnostic");
+    for allowed in ["normal_and_exceptional", "normal_only", "with_suspension"] {
+        assert!(diagnostic.message.contains(allowed), "{diagnostic:?}");
+    }
+
+    let rql = "(control-relations :certainty [exact] (procedure-of (function)))";
+    let diagnostic = validate_query_source(rql)
+        .into_iter()
+        .find(|diagnostic| diagnostic.code == "unknown-property")
+        .expect("unknown option diagnostic");
+    assert_eq!(&rql[diagnostic.range.clone()], ":certainty");
+}
+
+/// Hover help and validation ranges for the three project-topology steps
+/// (#2448), in both frontends.
+///
+/// Each step name hovers at its own range with the description the step
+/// registry declares, and a well-formed chain reports nothing. The steps carry
+/// no option axis at all, so a borrowed one is a shape error naming the step
+/// rather than a silently ignored key.
+#[test]
+fn topology_step_help_and_diagnostics_are_range_precise() {
+    let rql = "(topology-edges-of (target-of (file-of (class :name \"Order\"))))";
+    for token in ["topology-edges-of", "target-of", "file-of"] {
+        let offset = rql.find(token).unwrap();
+        let help = query_source_help_at(rql, offset)
+            .unwrap_or_else(|| panic!("no topology help for {token}"));
+        assert_eq!(&rql[help.range], token);
+        assert!(!help.description.is_empty());
+    }
+    assert!(validate_query_source(rql).is_empty(), "{rql}");
+
+    let source_set = "(source-set-of (file-of (class :name \"Order\")))";
+    let offset = source_set.find("source-set-of").unwrap();
+    let help = query_source_help_at(source_set, offset).expect("no help for source-set-of");
+    assert_eq!(&source_set[help.range], "source-set-of");
+    assert!(
+        help.description.contains("source set"),
+        "{:?}",
+        help.description
+    );
+    assert!(validate_query_source(source_set).is_empty(), "{source_set}");
+
+    let json = r#"{"match":{"kind":"class"},"steps":[{"op":"file_of"},{"op":"target_of"},{"op":"topology_edges_of"}]}"#;
+    for token in ["target_of", "topology_edges_of"] {
+        let offset = json.find(token).unwrap();
+        let help = query_source_help_at(json, offset)
+            .unwrap_or_else(|| panic!("no JSON topology help for {token}"));
+        assert!(!help.description.is_empty());
+    }
+    assert!(validate_query_source(json).is_empty(), "{json}");
+
+    let borrowed = "(target-of :scope [compile] (file-of (class)))";
+    let diagnostic = validate_query_source(borrowed)
+        .into_iter()
+        .find(|diagnostic| diagnostic.code == "wrong-value-shape")
+        .expect("a topology step takes no option axis");
+    assert!(diagnostic.message.contains("target-of"), "{diagnostic:?}");
+}
+
 /// Hover help and validation ranges for the bounded rewrite vocabulary
 /// (#1480), in both frontends.
 #[test]

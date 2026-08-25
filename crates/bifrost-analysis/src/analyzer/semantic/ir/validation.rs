@@ -153,6 +153,12 @@ pub(super) fn measure_artifact_work(
         work.control_edges = work
             .control_edges
             .saturating_add(procedure.control_edges.len());
+        // A guard row is bounded by the decision points that already spend the
+        // program-point dimension, so it is charged as a retained nested entry
+        // rather than as a budget dimension of its own.
+        work.nested_entries = work
+            .nested_entries
+            .saturating_add(procedure.guard_facts.len());
         // The frozen CFG retains two point-indexed offset arrays plus one
         // incoming procedure-local edge ID per canonical rich edge.
         let adjacency_entries = procedure
@@ -668,6 +674,7 @@ fn validate_procedure(
 
     validate_blocks(procedure)?;
     let control_edges = validate_control_edges(capabilities, procedure)?;
+    validate_guard_facts(capabilities, procedure, &control_edges)?;
     validate_events(
         capabilities,
         procedures,
@@ -708,6 +715,97 @@ fn validate_dense_rows(procedure: &ProcedureSemanticsParts) -> Result<(), Semant
     dense!(procedure.gaps, "gaps");
     dense!(procedure.blocks, "blocks");
     dense!(procedure.points, "points");
+    dense!(procedure.guard_facts, "guard_facts");
+    Ok(())
+}
+
+/// Guard rows say something about control, so every id they name has to be one
+/// this procedure owns (issue #2443).
+///
+/// Four rules, each closing a way a guard could be a lie rather than a fact:
+///
+/// * A declared arm must name an edge that actually leaves the guard's own
+///   point. An arm pointing anywhere else would let a consumer exclude control
+///   the guard never governed.
+/// * The two arms must be different edges, because one edge cannot be both
+///   outcomes of one decision.
+/// * A subject, and a constant-equality guard's constant, must be values this
+///   procedure defines; the constant must additionally be a constant value row,
+///   so the predicate cannot name a runtime value and call it a constant.
+/// * A procedure that publishes any guard row must declare the capability,
+///   which is what makes an empty table readable.
+fn validate_guard_facts(
+    capabilities: &SemanticCapabilities,
+    procedure: &ProcedureSemanticsParts,
+    control_edges: &ControlEdgeIndex,
+) -> Result<(), SemanticIrError> {
+    let id = procedure.id;
+    if procedure.guard_facts.is_empty() {
+        return Ok(());
+    }
+    require_capability(
+        id,
+        capabilities,
+        SemanticCapability::GuardFacts,
+        "guard-fact rows",
+    )?;
+    for guard in &procedure.guard_facts {
+        ensure_point(id, guard.point, procedure.points.len(), "guard point")?;
+        validate_metadata(id, guard.source, guard.evidence, procedure, "guard")?;
+        for (arm, label) in [(guard.true_arm, "true"), (guard.false_arm, "false")] {
+            let Some(arm) = arm else {
+                continue;
+            };
+            ensure_point(
+                id,
+                arm.target_point,
+                procedure.points.len(),
+                "guard arm target",
+            )?;
+            if !control_edges.contains(guard.point, arm.target_point, arm.kind) {
+                return Err(SemanticIrError::procedure(
+                    id,
+                    SemanticIrErrorKind::GuardContract,
+                    format!(
+                        "guard {} declares a {label} arm {} -> {} ({}) that is not an edge of its own point",
+                        guard.id,
+                        guard.point,
+                        arm.target_point,
+                        arm.kind.label()
+                    ),
+                ));
+            }
+        }
+        if let (Some(true_arm), Some(false_arm)) = (guard.true_arm, guard.false_arm)
+            && true_arm == false_arm
+        {
+            return Err(SemanticIrError::procedure(
+                id,
+                SemanticIrErrorKind::GuardContract,
+                format!("guard {} declares one edge as both outcomes", guard.id),
+            ));
+        }
+        if let Some(subject) = guard.subject {
+            ensure_value(id, subject, procedure.values.len(), "guard subject")?;
+        }
+        if let GuardPredicate::ConstantEquality { constant, .. } = guard.predicate {
+            ensure_value(id, constant, procedure.values.len(), "guard constant")?;
+            if !matches!(
+                procedure.values[constant.index()].kind,
+                SemanticValueKind::Constant
+            ) {
+                return Err(SemanticIrError::procedure(
+                    id,
+                    SemanticIrErrorKind::GuardContract,
+                    format!(
+                        "guard {} compares against value {constant}, which is a {} rather than a constant",
+                        guard.id,
+                        procedure.values[constant.index()].kind.label()
+                    ),
+                ));
+            }
+        }
+    }
     Ok(())
 }
 

@@ -1,4 +1,114 @@
-use tree_sitter::Node;
+use crate::graph::resolver::{
+    cpp_name_component_nodes, cpp_type_name_components, is_globally_qualified_cpp_name,
+    is_nested_type_node, qualified_owner_components,
+};
+use std::ops::Range;
+use tree_sitter::{Node, Parser};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MacroReplacementTypeReference {
+    pub components: Vec<String>,
+    pub component_ranges: Vec<Range<usize>>,
+    pub global: bool,
+}
+
+/// Recover type-bearing syntax hidden inside an object-like macro replacement.
+///
+/// Tree-sitter deliberately keeps the replacement of `#define NAME value` as
+/// one opaque `preproc_arg`. Reparse that exact byte slice as a C++ expression
+/// and return only references proven by the resulting tree: ordinary type
+/// nodes and the owner prefixes of qualified values such as `Owner::member`.
+/// Every returned range is mapped back to the original file.
+pub fn object_macro_replacement_type_references(
+    node: Node<'_>,
+    source: &str,
+) -> Vec<MacroReplacementTypeReference> {
+    if node.kind() != "preproc_arg"
+        || !node.parent().is_some_and(|parent| {
+            parent.kind() == "preproc_def"
+                && parent
+                    .child_by_field_name("value")
+                    .is_some_and(|value| value == node)
+        })
+    {
+        return Vec::new();
+    }
+    let Some(replacement) = source.get(node.start_byte()..node.end_byte()) else {
+        return Vec::new();
+    };
+    const PREFIX: &str = "void __bifrost_macro_reference() { ";
+    let synthetic = format!("{PREFIX}{replacement}; }}");
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&tree_sitter_cpp::LANGUAGE.into())
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(&synthetic, None) else {
+        return Vec::new();
+    };
+    if tree.root_node().has_error() {
+        return Vec::new();
+    }
+
+    let mut references = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(current) = stack.pop() {
+        let structured = if matches!(
+            current.kind(),
+            "type_identifier" | "scoped_type_identifier" | "template_type"
+        ) && !is_nested_type_node(current)
+        {
+            cpp_type_name_components(current, &synthetic)
+                .zip(cpp_name_component_nodes(current))
+                .map(|(components, nodes)| {
+                    (components, nodes, is_globally_qualified_cpp_name(current))
+                })
+        } else if current.kind() == "qualified_identifier"
+            && !current.parent().is_some_and(|parent| {
+                matches!(
+                    parent.kind(),
+                    "qualified_identifier" | "scoped_identifier" | "scoped_type_identifier"
+                )
+            })
+        {
+            qualified_owner_components(current, &synthetic)
+                .map(|owner| (owner.names, owner.nodes, owner.global))
+        } else {
+            None
+        };
+        if let Some((components, component_nodes, global)) = structured {
+            let component_ranges = component_nodes
+                .into_iter()
+                .map(|component| {
+                    let start = component.start_byte().checked_sub(PREFIX.len())?;
+                    let end = component.end_byte().checked_sub(PREFIX.len())?;
+                    (end <= replacement.len())
+                        .then_some(node.start_byte() + start..node.start_byte() + end)
+                })
+                .collect::<Option<Vec<_>>>();
+            if let Some(component_ranges) = component_ranges
+                && component_ranges.len() == components.len()
+            {
+                let reference = MacroReplacementTypeReference {
+                    components,
+                    component_ranges,
+                    global,
+                };
+                if !references.contains(&reference) {
+                    references.push(reference);
+                }
+            }
+        }
+        for index in (0..current.named_child_count()).rev() {
+            if let Some(child) = current.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    references
+}
 
 #[derive(Clone)]
 pub struct QualifiedCallableValue<'tree> {
@@ -100,4 +210,48 @@ fn append_qualified_components<'tree>(node: Node<'tree>, out: &mut Vec<Node<'tre
         }
     }
     Some(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn references(source: &str) -> Vec<MacroReplacementTypeReference> {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .expect("C++ grammar");
+        let tree = parser.parse(source, None).expect("macro fixture tree");
+        let value = tree
+            .root_node()
+            .named_child(0)
+            .and_then(|definition| definition.child_by_field_name("value"))
+            .expect("macro replacement");
+        object_macro_replacement_type_references(value, source)
+    }
+
+    #[test]
+    fn object_macro_replacement_reparse_preserves_type_ranges() {
+        let source = "#define SETTINGS (*api::SettingsImpl::GetInstance())\n";
+        let references = references(source);
+        let reference = references
+            .iter()
+            .find(|reference| reference.components == ["api", "SettingsImpl"])
+            .expect("qualified callable owner");
+        let rendered = reference
+            .component_ranges
+            .iter()
+            .map(|range| &source[range.clone()])
+            .collect::<Vec<_>>();
+        assert_eq!(rendered, ["api", "SettingsImpl"]);
+    }
+
+    #[test]
+    fn macro_reparse_ignores_function_like_and_non_code_text() {
+        let function_like = "#define SETTINGS(Type) (*Type::GetInstance())\n";
+        assert!(references(function_like).is_empty());
+
+        let text = "#define SETTINGS \"SettingsImpl::GetInstance()\"\n";
+        assert!(references(text).is_empty());
+    }
 }

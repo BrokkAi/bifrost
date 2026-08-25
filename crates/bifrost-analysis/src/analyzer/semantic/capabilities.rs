@@ -69,6 +69,7 @@ semantic_capabilities! {
     ConcurrentSpawn => "concurrent_spawn",
     NonLocalControl => "non_local_control",
     ResourceManagement => "resource_management",
+    GuardFacts => "guard_facts",
 }
 
 /// Whether an adapter completely, partially, or not at all supports a feature.

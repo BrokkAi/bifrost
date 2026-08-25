@@ -17,10 +17,14 @@
 //! path.
 
 pub mod analyzer;
+#[doc(hidden)]
+pub mod benchmark_provenance;
+pub mod bounded_output;
 pub mod cache_db;
 pub mod cache_gc;
 pub mod cancellation;
 pub mod compact_graph;
+pub mod complete_value_cache;
 pub mod git_file;
 pub mod gitblob;
 pub mod hash;

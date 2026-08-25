@@ -1,5 +1,5 @@
-use brokk_bifrost_analysis::analyzer::structural::edges::EdgeProvenance;
 use brokk_bifrost_analysis::analyzer::usages::UsageHitKind;
+use brokk_bifrost_rql::structural::edges::EdgeProvenance;
 
 use super::*;
 

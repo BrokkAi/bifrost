@@ -2119,7 +2119,7 @@ mod tests {
     /// analyzer registry entry, and every registry entry is spellable.
     #[test]
     fn assertion_atom_spellings_mirror_the_analyzer_occurrence_registries() {
-        use brokk_bifrost_analysis::analyzer::structural::occurrences::{
+        use brokk_bifrost_rql::structural::occurrences::{
             ALL_NAMESPACES, ALL_OCCURRENCE_CLASSES, ALL_OCCURRENCE_ROLES,
         };
 

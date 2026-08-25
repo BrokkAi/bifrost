@@ -507,14 +507,26 @@ impl CallBindings {
                     require_same_procedure(actual.procedure(), caller)?;
                     require_same_procedure(formal.procedure(), &callee)?;
                     // A call that spells a receiver operand binds exactly that
-                    // operand. A receiverless call may instead bind the
-                    // caller's own dispatch receiver: a bare call between
-                    // members of one declaring type dispatches on `this`.
+                    // operand. A receiverless call may instead bind one of two
+                    // structurally proven implicit actuals: the caller's own
+                    // dispatch receiver (a bare call between members of one
+                    // declaring type dispatches on `this`), or -- a
+                    // constructor call, `new Type(...)`, which spells no
+                    // receiver syntax at all -- the exact object this call's
+                    // own `result` allocated (#2574: the constructor's own
+                    // `this` can only ever be the object being constructed).
                     let receiver_actual_matches = match call_row.receiver {
                         Some(receiver) => receiver == actual.id(),
-                        None => caller.semantics().value(actual.id()).is_some_and(|row| {
-                            row.kind == SemanticValueKind::Receiver { dispatch: true }
-                        }),
+                        None => {
+                            caller.semantics().value(actual.id()).is_some_and(|row| {
+                                row.kind == SemanticValueKind::Receiver { dispatch: true }
+                            }) || (call_row.result == Some(actual.id())
+                                && caller
+                                    .semantics()
+                                    .allocations()
+                                    .iter()
+                                    .any(|allocation| allocation.result == actual.id()))
+                        }
                     };
                     if !receiver_actual_matches || formal.kind() != ProcedurePortKind::Receiver {
                         return Err(OracleContractError::InvalidCallBinding(

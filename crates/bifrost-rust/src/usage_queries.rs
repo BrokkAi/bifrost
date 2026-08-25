@@ -25,22 +25,23 @@
 //! `Oid`.
 
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use git2::Oid;
 
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
+use brokk_bifrost_core::hash::{HashMap, HashSet};
 
 use crate::graph_support::RustFactSource;
-use brokk_bifrost_core::hash::HashSet;
 
 use crate::declarations::rust_package_name;
 use crate::graph_support::rust_value_constructor_visibilities;
 use crate::imports::RustVisibility;
 use crate::lexical_scope::{RustCfgCondition, rust_cfg_condition};
 use crate::usage::{
-    Domain, ModuleKey, RustImportExtent, RustSymbolIdentity, RustSymbolNamespace,
+    Domain, ModuleKey, RustImportExtent, RustPathIdentity, RustSymbolIdentity, RustSymbolNamespace,
     direct_import_scope_for_module, rust_file_is_actual_crate_root,
 };
 use brokk_bifrost_core::analyzer::rust_facts::{
@@ -257,10 +258,14 @@ pub fn rust_declaration_facts(
     Some(facts)
 }
 
-/// A stateless view over the store, borrowing the analyzer for its store
+/// A query-scoped view over the store, borrowing the analyzer for its store
 /// handle, its live path mapping, and its bounded per-file fact cache.
 pub struct RustUsageQueries<'a> {
     analyzer: &'a dyn RustFactSource,
+    path_identities: RefCell<HashMap<ProjectFile, Arc<RustPathIdentity>>>,
+    path_identity_computations: Cell<u64>,
+    import_bindings: RefCell<HashMap<ProjectFile, Arc<Vec<RustImportBinding>>>>,
+    import_binding_computations: Cell<u64>,
 }
 
 /// The query surface every Rust usage answer reads through: `usage.rs` for
@@ -269,7 +274,44 @@ pub struct RustUsageQueries<'a> {
 /// cross-file.
 impl<'a> RustUsageQueries<'a> {
     pub fn new(analyzer: &'a dyn RustFactSource) -> Self {
-        Self { analyzer }
+        Self {
+            analyzer,
+            path_identities: RefCell::new(HashMap::default()),
+            path_identity_computations: Cell::new(0),
+            import_bindings: RefCell::new(HashMap::default()),
+            import_binding_computations: Cell::new(0),
+        }
+    }
+
+    /// The path-derived package and crate root for `file`, memoized for this
+    /// query. Both values walk Cargo manifest ancestors on a cold lookup, and
+    /// alias and import fixed points ask for them repeatedly while recomputing
+    /// the same file's routes.
+    pub fn path_identity_of(&self, file: &ProjectFile) -> Arc<RustPathIdentity> {
+        if let Some(cached) = self.path_identities.borrow().get(file).cloned() {
+            return cached;
+        }
+        let identity = Arc::new(RustPathIdentity::of(file));
+        self.path_identity_computations
+            .set(self.path_identity_computations.get() + 1);
+        self.path_identities
+            .borrow_mut()
+            .insert(file.clone(), Arc::clone(&identity));
+        identity
+    }
+
+    /// Number of live files whose path-derived package identity this query
+    /// has classified. Repeated fixed-point rounds should count each once.
+    pub fn path_identity_computations(&self) -> u64 {
+        self.path_identity_computations.get()
+    }
+
+    /// Compose a module key using the path identity already memoized for this
+    /// query. The canonical constructor remains available for cold callers;
+    /// usage walks should use this form on their fixed-point and edge paths.
+    pub fn module_key_of(&self, file: &ProjectFile, module: &str) -> ModuleKey {
+        let identity = self.path_identity_of(file);
+        ModuleKey::with_crate_root(&identity.crate_root_package, module)
     }
 
     /// Every persisted fact for `file`, memoized per `(generation, blob)`.
@@ -348,14 +390,18 @@ impl<'a> RustUsageQueries<'a> {
         let Some(facts) = self.facts_of(file) else {
             return Vec::new();
         };
-        let package = rust_package_name(file);
+        let identity = self.path_identity_of(file);
+        let package = &identity.package;
         facts
             .modules
             .iter()
             .filter(|module| module.is_inline)
             .map(|module| {
                 (
-                    ModuleKey::new(file, &compose_module(&package, &module.module_name)),
+                    ModuleKey::with_crate_root(
+                        &identity.crate_root_package,
+                        &compose_module(package, &module.module_name),
+                    ),
                     module.start_byte,
                     module.end_byte,
                 )
@@ -373,16 +419,37 @@ impl<'a> RustUsageQueries<'a> {
     }
 
     /// Every `use` binding of `file`, in source order.
-    pub fn import_bindings_of(&self, file: &ProjectFile) -> Vec<RustImportBinding> {
-        let Some(facts) = self.facts_of(file) else {
-            return Vec::new();
-        };
-        let package = rust_package_name(file);
-        facts
-            .import_targets
-            .iter()
-            .map(|target| binding_from_fact(file, &package, target))
-            .collect()
+    pub fn import_bindings_of(&self, file: &ProjectFile) -> Arc<Vec<RustImportBinding>> {
+        if let Some(cached) = self.import_bindings.borrow().get(file).cloned() {
+            return cached;
+        }
+        let bindings = Arc::new(
+            self.facts_of(file)
+                .map(|facts| {
+                    let identity = self.path_identity_of(file);
+                    let package = &identity.package;
+                    facts
+                        .import_targets
+                        .iter()
+                        .map(|target| {
+                            binding_from_fact(package, &identity.crate_root_package, target)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        );
+        self.import_binding_computations
+            .set(self.import_binding_computations.get() + 1);
+        self.import_bindings
+            .borrow_mut()
+            .insert(file.clone(), Arc::clone(&bindings));
+        bindings
+    }
+
+    /// Number of files whose persisted import rows have been decoded by this
+    /// query object. Repeated and cyclic reads of one file should count once.
+    pub fn import_binding_computations(&self) -> u64 {
+        self.import_binding_computations.get()
     }
 
     /// The names `file` re-exports through a non-private root `use`.
@@ -466,8 +533,8 @@ pub fn compose_module(package: &str, stored: &str) -> String {
 
 #[allow(dead_code)]
 fn binding_from_fact(
-    file: &ProjectFile,
     package: &str,
+    crate_root_package: &str,
     target: &RustImportTargetFact,
 ) -> RustImportBinding {
     let mut path: Vec<String> = target
@@ -499,7 +566,7 @@ fn binding_from_fact(
         is_extern_crate: target.is_extern_crate,
         visibility: target.visibility.clone(),
         cfg_condition: target.cfg_condition.clone(),
-        importer_module: ModuleKey::new(file, &owner_module),
+        importer_module: ModuleKey::with_crate_root(crate_root_package, &owner_module),
         owner_module,
         extent,
     }

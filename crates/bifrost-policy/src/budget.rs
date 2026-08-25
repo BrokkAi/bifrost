@@ -6,8 +6,9 @@
 
 use std::fmt;
 
-use brokk_bifrost_analysis::analyzer::structural::{
-    CodeQueryExecutionLimits, CodeQuerySemanticLimits, CodeQueryTypestateLimits,
+use brokk_bifrost_rql::structural::{
+    CodeQueryExecutionLimits, CodeQuerySemanticLimits, CodeQuerySemanticRowLimits,
+    CodeQueryTypestateLimits,
 };
 
 use super::relational::MAX_RETAINED_RELATIONAL_OBLIGATIONS;
@@ -47,7 +48,17 @@ const SCALED_SCAN_HEADROOM: u64 = 2;
 const MAX_SEMANTIC_MATERIALIZED_FILES: usize = 256;
 const MAX_SEMANTIC_SOURCE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SEMANTIC_ROWS_PER_DIMENSION: usize = 1_000_000;
-const MAX_SEMANTIC_RETAINED_BYTES: usize = 64 * 1024 * 1024;
+// 256 MiB, raised from 64 MiB with owner approval on issue #2523
+// (2026-08-23): after the per-dimension row caps landed, this floor was
+// the last binder on the gson relational effect walk, which retains just
+// over 64 MiB at full 98/98 subject coverage (206 MiB process peak RSS;
+// a 1 GiB probe retained no more than the 256 MiB run). The floor only
+// governs workspaces whose 25-bytes-per-source-byte scaled value falls
+// below it, roughly under 10 MiB of source. The 16x hard cap moves with
+// it (1 GiB -> 4 GiB) per the uniform audited ratio from #1936; the cap
+// is a host-configured rejection threshold and the clamp for workspaces
+// past ~160 MiB of source, never a silent default.
+const MAX_SEMANTIC_RETAINED_BYTES: usize = 256 * 1024 * 1024;
 const MAX_SEMANTIC_TRAVERSAL_STEPS: usize = 1_000_000;
 
 // The five semantic lanes are floors as well, for the same reason as the scan
@@ -84,9 +95,13 @@ const MAX_SEMANTIC_TRAVERSAL_STEPS_HARD_CAP: usize = 16 * MAX_SEMANTIC_TRAVERSAL
 // a census of every artifact's nested collections -- CFG adjacency arrays,
 // locator declaration segments, call arguments, evidence sources, block points,
 // dispatch candidates -- so it counts several rows per program point.  One
-// `max_rows_per_dimension` bounds every row dimension, so it must admit that
-// largest one.  The semantic provider's own defaults agree about the shape:
-// `NestedEntries` is 8,000,000 against `ProgramPoints` at 1,000,000.
+// `max_rows_per_dimension` is granted to every row dimension, so it must admit
+// that largest one.  The semantic provider's own defaults agree about the
+// shape: `NestedEntries` is 8,000,000 against `ProgramPoints` at 1,000,000.
+// `query_limits` publishes this lane per dimension so a query runs against the
+// audited number rather than the executor's memory-shaped estimate of it
+// (#2523); the grant itself stays one uniform quantity, which is what the
+// measurement above calibrates.
 //
 // The peak measured 9,187,328 rows, 0.79 rows per source byte.  Three rows per
 // two source bytes is 1.9x that, matching the ~1.8x headroom of the
@@ -104,9 +119,12 @@ const SCALED_SEMANTIC_ROW_SOURCE_BYTES: u64 = 2;
 // The retention lane peaked at 159,599,751 owned text bytes, 13.7 per source
 // byte.  Owned text is dominated by locator paths and declaration segment names,
 // which repeat per procedure, memory location, call target, and source mapping.
-// 25 per source byte is 1.82x the measurement, and 290,830,325 bytes on this
-// corpus, well inside the 1GiB hard cap.
-const SCALED_SEMANTIC_RETAINED_BYTES_PER_SOURCE_BYTE: u64 = 25;
+// 25 per source byte was 1.82x that measurement. The #2523 floor raise
+// (64 -> 256 MiB) moved the #1936 ratio model this density must dominate:
+// in the 2x-headroom regime the ratio slope is 2 * floor / 16 MiB = 32 per
+// source byte, so the density rises to match it, 2.33x the measurement and
+// still an only-raises change for every workspace.
+const SCALED_SEMANTIC_RETAINED_BYTES_PER_SOURCE_BYTE: u64 = 32;
 
 // The traversal lane is deliberately not recalibrated.  It peaked at 386,156
 // steps, which its own fixed default of 1,000,000 already admits with 2.6x
@@ -243,8 +261,34 @@ impl PolicyBudget {
         PolicyBudgetBuilder::default()
     }
 
-    pub const fn query_limits(&self) -> CodeQueryExecutionLimits {
-        self.query
+    /// The query limits one policy query runs under, with this budget's row
+    /// lane published per semantic dimension.
+    ///
+    /// The lane itself is one uniform quantity: `scaled_for_workspace`
+    /// derives a single row density for the audited workspace, and
+    /// `selector_compiler::semantic_work_limits` has always granted it to
+    /// every row dimension. Publishing it per dimension says which layer owns
+    /// these lanes. Without it the executor re-derives them from
+    /// `max_retained_bytes` instead, splitting half of that lane across the
+    /// row dimensions and pricing `nested_entries` at one 96-byte
+    /// `SemanticLocator` per entry -- while a nested entry is a CFG adjacency
+    /// offset, a call argument, an evidence source, or one bounded traversal
+    /// step. On google/gson that estimate capped the lane at 11,650 rows
+    /// against an audited 2,944,018, and reference policy B's second bind
+    /// stopped after 6 of its 98 marked procedures (#2523).
+    ///
+    /// The memory bound is unchanged, because it was never the estimate:
+    /// query-side materialization charges each artifact's measured retained
+    /// bytes against `max_retained_bytes`.
+    ///
+    /// A live per-lane table comes from `PolicySelectorSession`, which prices
+    /// each dimension from its own shared ledger's remainder; nothing authors
+    /// one into a budget.
+    pub fn query_limits(&self) -> CodeQueryExecutionLimits {
+        let rows = self.query.semantic.max_rows_per_dimension;
+        let mut limits = self.query;
+        limits.semantic.rows_per_dimension = Some(CodeQuerySemanticRowLimits::from_rows(|_| rows));
+        limits
     }
 
     /// Maximum matching sites one policy source or sink selector may bind.
@@ -1121,6 +1165,7 @@ mod tests {
                     max_rows_per_dimension: MAX_SEMANTIC_ROWS_PER_DIMENSION_HARD_CAP,
                     max_retained_bytes: MAX_SEMANTIC_RETAINED_BYTES_HARD_CAP,
                     max_traversal_steps: MAX_SEMANTIC_TRAVERSAL_STEPS_HARD_CAP,
+                    ..CodeQuerySemanticLimits::default()
                 },
                 ..CodeQueryExecutionLimits::default()
             })
@@ -1140,6 +1185,7 @@ mod tests {
                         max_rows_per_dimension: MAX_SEMANTIC_ROWS_PER_DIMENSION + 1,
                         max_retained_bytes: MAX_SEMANTIC_RETAINED_BYTES + 1,
                         max_traversal_steps: MAX_SEMANTIC_TRAVERSAL_STEPS + 1,
+                        ..CodeQuerySemanticLimits::default()
                     },
                     ..CodeQueryExecutionLimits::default()
                 })
@@ -1356,14 +1402,18 @@ mod tests {
         assert!(semantic.max_materialized_files > MAX_SEMANTIC_MATERIALIZED_FILES);
         assert_eq!(semantic.max_source_bytes, 80_000_000);
         assert!(semantic.max_source_bytes > MAX_SEMANTIC_SOURCE_BYTES);
-        // The row and retention lanes take their measured densities: 1.5 rows
-        // and 25 owned text bytes per source byte.  Both clamp here, because
-        // 40MB of source at those densities exceeds both hard caps.
+        // The row and retention lanes take their calibrated densities (the
+        // row lane clamps: 40MB of source at 1.5 rows per byte exceeds its
+        // hard cap; the retention lane's density is the ratio-model-dominating
+        // value derived at its constant).
         assert_eq!(
             semantic.max_rows_per_dimension,
             MAX_SEMANTIC_ROWS_PER_DIMENSION_HARD_CAP
         );
-        assert_eq!(semantic.max_retained_bytes, 40_000_000 * 25);
+        assert_eq!(
+            semantic.max_retained_bytes,
+            40_000_000 * SCALED_SEMANTIC_RETAINED_BYTES_PER_SOURCE_BYTE as usize
+        );
         assert!(semantic.max_retained_bytes < MAX_SEMANTIC_RETAINED_BYTES_HARD_CAP);
         // The traversal lane keeps the byte-lane ratio, 80_000_000 / 16MiB,
         // multiplied before dividing.  Flooring the ratio to whole default byte
@@ -1389,7 +1439,10 @@ mod tests {
             "the row lane must admit the measured peak: {}",
             corpus_semantic.max_rows_per_dimension
         );
-        assert_eq!(corpus_semantic.max_retained_bytes, 11_633_213 * 25);
+        assert_eq!(
+            corpus_semantic.max_retained_bytes,
+            11_633_213 * SCALED_SEMANTIC_RETAINED_BYTES_PER_SOURCE_BYTE as usize
+        );
         assert!(
             corpus_semantic.max_retained_bytes >= 159_599_751,
             "the retention lane must admit the measured peak: {}",
@@ -1537,6 +1590,7 @@ mod tests {
                     max_rows_per_dimension: 8 * MAX_SEMANTIC_ROWS_PER_DIMENSION,
                     max_retained_bytes: 8 * MAX_SEMANTIC_RETAINED_BYTES,
                     max_traversal_steps: 8 * MAX_SEMANTIC_TRAVERSAL_STEPS,
+                    ..CodeQuerySemanticLimits::default()
                 },
                 ..CodeQueryExecutionLimits::default()
             })

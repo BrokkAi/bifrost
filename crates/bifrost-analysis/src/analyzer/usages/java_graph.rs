@@ -13,15 +13,12 @@ mod shared;
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 
 use crate::analyzer::usages::common::language_for_target;
-use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
+use crate::analyzer::usages::inverted_edges::{EdgeNodeDomain, UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::java_graph::shared::{JavaEdgeResolver, JavaQueryResolver};
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::{UsageAnalyzer, UsageQueryResolver, UsageScanScope};
-use crate::analyzer::{
-    BoundedDefinitionLookup, CodeUnit, IAnalyzer, JavaAnalyzer, Language, ProjectFile,
-    resolve_analyzer,
-};
+use crate::analyzer::{CodeUnit, IAnalyzer, JavaAnalyzer, Language, ProjectFile, resolve_analyzer};
 use crate::hash::HashSet;
 use brokk_bifrost_jvm::java::graph::JavaGraphSource;
 use brokk_bifrost_jvm::java::graph::extractor::{self, ReturnTypeCaches, ScanState};
@@ -40,27 +37,115 @@ pub(in crate::analyzer::usages) use brokk_bifrost_jvm::java::graph::resolver::si
 /// Run `visit` with the [`JavaGraphSource`] built from the *dispatching*
 /// analyzer.
 ///
-/// A callback rather than a constructor because the definition-index accessor is
-/// itself a borrowed closure: `analyzer.global_usage_definition_index()` returns
-/// a handle that borrows the analyzer and merges one shard per delegate, and the
-/// Java side takes it lazily so a scan that never reaches a realm-wide lookup
-/// never pays for the merge.
+/// A callback rather than a constructor because the request-local relational
+/// frontier is valid only while its owned graph computation is being evaluated.
 pub(in crate::analyzer::usages) fn with_java_graph_source<R>(
     analyzer: &dyn IAnalyzer,
-    visit: impl FnOnce(JavaGraphSource<'_>) -> R,
+    mut visit: impl FnMut(JavaGraphSource<'_>) -> R,
 ) -> R {
-    let definitions = |consume: &mut dyn FnMut(&dyn BoundedDefinitionLookup)| {
-        consume(&analyzer.global_usage_definition_index());
-    };
     let import_statements = |file: &ProjectFile| analyzer.import_statements(file);
     let scope = AnalyzerQueryScope::new(analyzer);
-    visit(JavaGraphSource {
-        token: scope.token(),
-        index: analyzer,
-        hierarchy: analyzer.type_hierarchy_provider(),
-        definitions: &definitions,
-        import_statements: &import_statements,
-    })
+    let cancellation = crate::CancellationToken::new();
+    match crate::analyzer::relational_frontier::resolve_relational_frontier(
+        analyzer,
+        &cancellation,
+        |frontier| {
+            visit(JavaGraphSource {
+                token: scope.token(),
+                index: analyzer,
+                hierarchy: analyzer.type_hierarchy_provider(),
+                relational_definitions: frontier,
+                import_statements: &import_statements,
+            })
+        },
+    ) {
+        crate::analyzer::RelationalFrontierOutcome::Complete(result) => result,
+        crate::analyzer::RelationalFrontierOutcome::Cancelled => {
+            unreachable!("an uncancelled Java helper frontier cannot cancel")
+        }
+        crate::analyzer::RelationalFrontierOutcome::Failed(error) => {
+            panic!("Java relational helper frontier failed: {error:?}")
+        }
+    }
+}
+
+/// Scan one Java file inside a replayable frontier and publish only the final
+/// owned result. Each evaluation starts from the caller's same accumulated
+/// hit state and fresh return-type caches, so provisional empty answers cannot
+/// leak through either mutable output or memoized inference.
+pub(super) fn scan_java_file_replayable(
+    relational_session: &crate::analyzer::relational_frontier::RelationalFrontierSession<'_>,
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+    spec: &TargetSpec,
+    state: &mut ScanState<'_>,
+) -> crate::analyzer::RelationalFrontierOutcome<()> {
+    let initial_hits = state.hits.clone();
+    let initial_unproven_hits = state.unproven_hits.clone();
+    let initial_raw_match_count = *state.raw_match_count;
+    let initial_limit_exceeded = *state.limit_exceeded;
+    let max_usages = state.max_usages;
+    let outcome = relational_session.resolve_owned("java_semantic_scan", |frontier| {
+        let import_statements = |file: &ProjectFile| analyzer.import_statements(file);
+        let graph = JavaGraphSource {
+            token,
+            index: analyzer,
+            hierarchy: analyzer.type_hierarchy_provider(),
+            relational_definitions: frontier.as_ref(),
+            import_statements: &import_statements,
+        };
+        let mut hits = initial_hits.clone();
+        let mut unproven_hits = initial_unproven_hits.clone();
+        let mut raw_match_count = initial_raw_match_count;
+        let mut limit_exceeded = initial_limit_exceeded;
+        let method_return_cache = Mutex::new(crate::hash::HashMap::default());
+        let method_anonymous_return_cache = Mutex::new(crate::hash::HashMap::default());
+        let file_return_cache = Mutex::new(crate::hash::HashMap::default());
+        let return_caches = ReturnTypeCaches {
+            method_return: &method_return_cache,
+            method_anonymous_return: &method_anonymous_return_cache,
+            file_return: &file_return_cache,
+        };
+        let mut provisional = ScanState {
+            max_usages,
+            hits: &mut hits,
+            unproven_hits: &mut unproven_hits,
+            raw_match_count: &mut raw_match_count,
+            limit_exceeded: &mut limit_exceeded,
+        };
+        extractor::scan_file(
+            java,
+            token,
+            &graph,
+            file,
+            spec,
+            &return_caches,
+            &mut provisional,
+        );
+        (hits, unproven_hits, raw_match_count, limit_exceeded)
+    });
+    match outcome {
+        crate::analyzer::RelationalFrontierOutcome::Complete((
+            hits,
+            unproven_hits,
+            raw_match_count,
+            limit_exceeded,
+        )) => {
+            *state.hits = hits;
+            *state.unproven_hits = unproven_hits;
+            *state.raw_match_count = raw_match_count;
+            *state.limit_exceeded = limit_exceeded;
+            crate::analyzer::RelationalFrontierOutcome::Complete(())
+        }
+        crate::analyzer::RelationalFrontierOutcome::Cancelled => {
+            crate::analyzer::RelationalFrontierOutcome::Cancelled
+        }
+        crate::analyzer::RelationalFrontierOutcome::Failed(error) => {
+            crate::analyzer::RelationalFrontierOutcome::Failed(error)
+        }
+    }
 }
 
 pub(crate) fn build_java_usage_edges<F>(
@@ -73,6 +158,18 @@ where
 {
     let resolver = JavaEdgeResolver::try_new(analyzer)?;
     Some(resolver.build_edges(analyzer, nodes, keep_file))
+}
+
+pub(crate) fn build_rooted_java_usage_edges<F>(
+    analyzer: &dyn IAnalyzer,
+    callers: &HashSet<String>,
+    keep_file: F,
+) -> Option<UsageEdges>
+where
+    F: Fn(&ProjectFile) -> bool + Sync,
+{
+    let resolver = JavaEdgeResolver::try_new(analyzer)?;
+    Some(resolver.build_rooted_edges(analyzer, callers, keep_file))
 }
 
 pub(crate) fn build_java_usage_edge_weights<F>(
@@ -116,7 +213,12 @@ pub(crate) fn scan_jvm_files_for_foreign_type(
     let Some(java) = resolve_analyzer::<JavaAnalyzer>(analyzer) else {
         return;
     };
-    let Some(spec) = TargetSpec::from_target(java, token, target) else {
+    let cancellation = crate::CancellationToken::new();
+    let relational_session = crate::analyzer::relational_frontier::RelationalFrontierSession::new(
+        analyzer,
+        &cancellation,
+    );
+    let Some(spec) = TargetSpec::from_targets(java, std::slice::from_ref(target)) else {
         return;
     };
     let mut state = ScanState {
@@ -126,37 +228,32 @@ pub(crate) fn scan_jvm_files_for_foreign_type(
         raw_match_count,
         limit_exceeded,
     };
-    let method_return_cache = Mutex::new(crate::hash::HashMap::default());
-    let method_anonymous_return_cache = Mutex::new(crate::hash::HashMap::default());
-    let file_return_cache = Mutex::new(crate::hash::HashMap::default());
-    let return_caches = ReturnTypeCaches {
-        method_return: &method_return_cache,
-        method_anonymous_return: &method_anonymous_return_cache,
-        file_return: &file_return_cache,
-    };
     let mut java_files: Vec<ProjectFile> = candidate_files
         .iter()
         .filter(|file| crate::analyzer::usages::common::language_for_file(file) == Language::Java)
         .cloned()
         .collect();
     java_files.sort();
-    with_java_graph_source(analyzer, |graph| {
-        for file in java_files {
-            extractor::scan_file(
+    for file in &java_files {
+        if !matches!(
+            scan_java_file_replayable(
+                &relational_session,
+                analyzer,
                 java,
                 token,
-                &graph,
-                &file,
+                file,
                 &spec,
-                &return_caches,
                 &mut state,
-            );
-            if *state.limit_exceeded {
-                return;
-            }
+            ),
+            crate::analyzer::RelationalFrontierOutcome::Complete(())
+        ) {
+            return;
         }
-        scan_scala_files_for_java_target(analyzer, candidate_files, &spec, &mut state, None);
-    });
+        if *state.limit_exceeded {
+            return;
+        }
+    }
+    scan_scala_files_for_java_target(analyzer, candidate_files, &spec, &mut state, None);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -167,7 +264,7 @@ pub(crate) enum JavaDeadCodeBulkEligibility {
 
 pub(crate) fn dead_code_bulk_eligibility(
     analyzer: &dyn IAnalyzer,
-    token: QueryToken<'_>,
+    _token: QueryToken<'_>,
     target: &CodeUnit,
     overloaded_fqns: &HashSet<String>,
     static_imports_present: bool,
@@ -176,10 +273,10 @@ pub(crate) fn dead_code_bulk_eligibility(
     let Some(java) = resolve_analyzer::<JavaAnalyzer>(analyzer) else {
         return JavaDeadCodeBulkEligibility::NeedsPrecise;
     };
-    let Some(spec) = TargetSpec::from_target(java, token, target) else {
+    let Some(kind) = TargetSpec::kind_for_target(java, target) else {
         return JavaDeadCodeBulkEligibility::NeedsPrecise;
     };
-    match spec.kind {
+    match kind {
         TargetKind::Type if scala_files_present => JavaDeadCodeBulkEligibility::NeedsPrecise,
         TargetKind::Type => JavaDeadCodeBulkEligibility::BulkSafe,
         TargetKind::Method if scala_files_present => JavaDeadCodeBulkEligibility::NeedsPrecise,
@@ -321,6 +418,7 @@ fn scan_scala_files_for_foreign_target(
         }
     }
     let catalog = ScalaQueryTargetCatalog::build_foreign_jvm(spec, java, &receiver_owners);
+    let scala_types = scala.project_types();
     let relevant_names = catalog.relevant_names();
     let dispatch = crate::analyzer::usages::scala_graph::shared::ScalaDispatch(analyzer);
     let eligibility = ScalaFileEligibility::All;
@@ -369,6 +467,7 @@ fn scan_scala_files_for_foreign_target(
         brokk_bifrost_jvm::scala::graph::inverted::scan_scala_query_file(
             scala,
             scope.token(),
+            &scala_types,
             analyzer,
             &dispatch,
             file,
@@ -398,7 +497,7 @@ fn build_java_edges<Output, F>(
         ProjectFile,
         crate::analyzer::tree_sitter_analyzer::FileState,
     >,
-    nodes: &HashSet<String>,
+    domain: EdgeNodeDomain<'_>,
     keep_file: F,
 ) -> Output
 where
@@ -410,7 +509,7 @@ where
     use crate::analyzer::usages::inverted_edges::{
         ClassRangeIndex, build_edge_output, build_file_declarations_from_state_with_file_scope,
         build_file_declarations_with_file_scope, class_range_index_from_state,
-        parse_and_collect_with_declarations,
+        parse_and_collect_with_declarations_and_domain,
     };
 
     let language = tree_sitter_java::LANGUAGE.into();
@@ -424,7 +523,7 @@ where
         file_return: &file_return_cache,
     };
     with_java_graph_source(analyzer, |graph| {
-        build_edge_output(files, keep_file, |file| {
+        build_edge_output(files, &keep_file, |file| {
             let state = file_states.get(file);
             let include_file_scope = is_java_module_descriptor(file);
             let mut declarations = state
@@ -449,9 +548,9 @@ where
             let class_ranges = state
                 .map(class_range_index_from_state)
                 .unwrap_or_else(|| ClassRangeIndex::build(analyzer, file));
-            parse_and_collect_with_declarations(
+            parse_and_collect_with_declarations_and_domain(
                 file,
-                nodes,
+                domain,
                 ParseSpec::whole(&language),
                 declarations,
                 |input| scan_inverted_file(java, token, &graph, file, input, class_ranges, &caches),
@@ -462,4 +561,136 @@ where
 
 fn is_java_module_descriptor(file: &ProjectFile) -> bool {
     file.rel_path().file_name() == Some(OsStr::new("module-info.java"))
+}
+
+#[cfg(test)]
+mod relational_inverted_tests {
+    use super::*;
+    use crate::analyzer::TestProject;
+    use brokk_bifrost_core::analyzer::CodeUnitIndex;
+
+    #[test]
+    fn java_inverted_type_and_member_resolution_builds_no_global_definition_shard() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        ProjectFile::new(root.clone(), "Service.java")
+            .write("package api; public class Service { public void run() {} }\n")
+            .expect("write Java fixture");
+        ProjectFile::new(root.clone(), "Consumer.java")
+            .write(
+                "package app; import api.*;\n\
+                 class Consumer { void call(Service service) { service.run(); } }\n",
+            )
+            .expect("write Java consumer");
+        let analyzer = JavaAnalyzer::from_project(TestProject::new(root, Language::Java));
+        let nodes = analyzer
+            .get_all_declarations()
+            .into_iter()
+            .map(|unit| unit.fq_name())
+            .collect::<HashSet<_>>();
+        let edges = build_java_usage_edges(&analyzer, &nodes, |_| true)
+            .expect("Java edge resolver should be available");
+
+        assert!(
+            edges.edges.keys().any(|(caller, callee)| {
+                caller == "app.Consumer.call" && callee == "api.Service.run"
+            }),
+            "typed receiver call must resolve through relational type and member questions: {:?}",
+            edges.edges.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn java_forward_type_member_and_target_resolution_uses_relational_lookup() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        ProjectFile::new(root.clone(), "Service.java")
+            .write("package api; public class Service { public void run() {} }\n")
+            .expect("write Java fixture");
+        let consumer = ProjectFile::new(root.clone(), "Consumer.java");
+        consumer
+            .write(
+                "package app; import api.*;\n\
+                 class Consumer { void call(Service service) { service.run(); } }\n",
+            )
+            .expect("write Java consumer");
+        let analyzer = JavaAnalyzer::from_project(TestProject::new(root, Language::Java));
+        let target = analyzer
+            .get_all_declarations()
+            .into_iter()
+            .find(|unit| unit.fq_name() == "api.Service.run")
+            .expect("fixture declares Service.run");
+        let candidates = HashSet::from_iter([consumer]);
+        let scope = UsageScanScope::new(&candidates, true);
+
+        let outcome = JavaUsageGraphStrategy::new()
+            .find_graph_usages(&analyzer, std::slice::from_ref(&target), &scope, 100)
+            .into_fuzzy_result();
+
+        assert_eq!(outcome.all_hits_including_imports().len(), 1, "{outcome:?}");
+    }
+
+    #[test]
+    fn java_path_scoped_method_scan_reuses_answers_without_global_descendant_index() {
+        const CANDIDATE_COUNT: usize = 24;
+        const UNRELATED_COUNT: usize = 64;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        ProjectFile::new(root.clone(), "Service.java")
+            .write("package api; public class Service { public void run() {} }\n")
+            .expect("write Java target");
+        let mut candidates = HashSet::default();
+        for index in 0..CANDIDATE_COUNT {
+            let file = ProjectFile::new(root.clone(), format!("Consumer{index}.java"));
+            file.write(format!(
+                "package app; import api.Service;\n\
+                 class Consumer{index} {{\n\
+                     Service service = new Service();\n\
+                     void call() {{ service.run(); }}\n\
+                 }}\n"
+            ))
+            .expect("write Java consumer");
+            candidates.insert(file);
+        }
+        for index in 0..UNRELATED_COUNT {
+            let file = ProjectFile::new(root.clone(), format!("Unrelated{index}.java"));
+            file.write(format!(
+                "package unrelated;\n\
+                 class Other{index} {{}}\n\
+                 class Unrelated{index} {{ Other{index} value; }}\n"
+            ))
+            .expect("write unrelated Java candidate");
+            candidates.insert(file);
+        }
+        let analyzer = JavaAnalyzer::from_project(TestProject::new(root, Language::Java));
+        let target = analyzer
+            .get_all_declarations()
+            .into_iter()
+            .find(|unit| unit.fq_name() == "api.Service.run")
+            .expect("fixture declares Service.run");
+        let scope = UsageScanScope::new(&candidates, true);
+        analyzer.reset_hierarchy_query_counts_for_test();
+        let before = analyzer.relational_batch_reader_checkouts_for_test();
+
+        let outcome = JavaUsageGraphStrategy::new()
+            .find_graph_usages(&analyzer, std::slice::from_ref(&target), &scope, 1000)
+            .into_fuzzy_result();
+
+        let reader_checkouts = analyzer.relational_batch_reader_checkouts_for_test() - before;
+        assert_eq!(
+            analyzer.hierarchy_bulk_hydration_count_for_test(),
+            0,
+            "a path-scoped method scan must not build the workspace descendant index"
+        );
+        assert!(
+            outcome.all_hits_including_imports().len() >= CANDIDATE_COUNT,
+            "every candidate must retain its structured type reference: {outcome:?}"
+        );
+        assert!(
+            reader_checkouts < CANDIDATE_COUNT,
+            "one path-scoped query must skip ASTs without the target terminal and reuse converged answers for relevant files: {reader_checkouts} reader checkouts for {} candidates",
+            CANDIDATE_COUNT + UNRELATED_COUNT,
+        );
+    }
 }

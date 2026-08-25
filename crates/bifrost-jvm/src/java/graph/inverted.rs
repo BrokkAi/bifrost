@@ -21,16 +21,16 @@
 use super::JavaGraphSource;
 use super::resolver::{
     constructor_method_reference_receiver, is_ignored_type_context, is_module_type_reference,
-    is_non_type_module_reference, node_text, resolve_field_access_type,
-    resolve_nested_type_for_owner, resolve_type_segments,
+    is_non_type_module_reference, is_record_pattern_type_reference, java_callable_arity, node_text,
+    resolve_field_access_type, resolve_nested_type_for_owner, resolve_type_segments,
 };
 use super::return_type::{
     FileReturnCache, JavaReturnTypeContext, LexicalTypeResolution, METHOD_RECEIVER_CHAIN_LIMIT,
     METHOD_RECEIVER_CHAIN_LIMIT_NAME, MethodAnonymousReturnCache, MethodReturnCache,
-    java_lexical_type_from_node, java_type_name_from_node, merge_receiver_type_outcomes,
+    java_lexical_type_from_node, java_type_name_components, merge_receiver_type_outcomes,
     method_return_type_for_owner_fqn,
 };
-use crate::java::graph_support::{JavaSource, resolve_java_usage_type_name_in};
+use crate::java::graph_support::{JavaSource, resolve_java_usage_type_components_in};
 use crate::java::hierarchy::java_nearest_declaring_ancestors;
 use brokk_bifrost_core::analyzer::model::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
@@ -134,8 +134,8 @@ impl JavaScan<'_> {
             LexicalTypeResolution::Blocked => return None,
             LexicalTypeResolution::NotFound => {}
         }
-        let type_name = java_type_name_from_node(node, self.source)?;
-        self.resolve_realm_type_name(&type_name)
+        let components = java_type_name_components(node, self.source)?;
+        self.resolve_realm_type_name(&components)
     }
 
     /// Resolve a spelled type name through Java's own import and package tiers,
@@ -149,16 +149,14 @@ impl JavaScan<'_> {
     /// Java/Kotlin workspace report call relationships both ways (#1239
     /// milestone 4). Java's visibility rules are unchanged — only the universe
     /// of declarations those rules search.
-    fn resolve_realm_type_name(&self, type_name: &str) -> Option<CodeUnit> {
-        self.graph.with_definitions(|definitions| {
-            resolve_java_usage_type_name_in(
-                self.java,
-                self.graph.token,
-                definitions,
-                self.file,
-                type_name,
-            )
-        })
+    fn resolve_realm_type_name(&self, components: &[String]) -> Option<CodeUnit> {
+        resolve_java_usage_type_components_in(
+            self.java,
+            self.graph.token,
+            self.graph.relational_definitions,
+            self.file,
+            components,
+        )
     }
 
     fn resolve_nested_type(&self, owner: &CodeUnit, name: &str) -> Option<CodeUnit> {
@@ -196,6 +194,25 @@ impl JavaScan<'_> {
 impl JavaReturnTypeContext for JavaScan<'_> {
     fn java(&self) -> &dyn JavaSource {
         self.java
+    }
+
+    fn relational_definitions(
+        &self,
+    ) -> &dyn brokk_bifrost_core::analyzer::RelationalDefinitionFrontier {
+        self.graph.relational_definitions
+    }
+
+    fn call_answering_units(&self, owner: &str, name: &str, arity: usize) -> Vec<CodeUnit> {
+        let Some(owner) = self.graph.index.definitions(owner).next() else {
+            return Vec::new();
+        };
+        self.graph
+            .structural_members(owner.fq(), name)
+            .into_iter()
+            .filter(|unit| {
+                unit.is_function() && java_callable_arity(self.java, unit).accepts(arity)
+            })
+            .collect()
     }
 
     fn file(&self) -> &ProjectFile {
@@ -317,6 +334,16 @@ fn record_reference(
                 ctx.record(resolved.fq_name(), segment);
             }
         }
+        "identifier" if is_record_pattern_type_reference(node) => {
+            for (resolved, segment) in resolve_type_segments(
+                node,
+                ctx.source,
+                |candidate| ctx.resolve_type(token, candidate),
+                |owner, name| ctx.resolve_nested_type(owner, name),
+            ) {
+                ctx.record(resolved.fq_name(), segment);
+            }
+        }
         "method_invocation" => {
             let Some(name_node) = node.child_by_field_name("name") else {
                 return;
@@ -429,12 +456,11 @@ fn record_constructor_reference_for_type(
     };
     ctx.record(owner.fq_name().to_string(), type_node);
     let constructor_fqn = format!("{}.{}", owner.fq_name(), owner.identifier());
-    let declared = ctx.graph.with_definitions(|definitions| {
-        definitions
-            .fqn(&constructor_fqn)
-            .iter()
-            .any(|candidate| candidate.is_function() && !candidate.is_synthetic())
-    });
+    let declared = ctx
+        .graph
+        .structural_members(owner.fq(), owner.identifier())
+        .iter()
+        .any(|candidate| candidate.is_function() && !candidate.is_synthetic());
     if declared {
         ctx.record(constructor_fqn, reference_node);
     }
@@ -476,38 +502,33 @@ enum MethodCallee {
 /// ships `com.google.common.base.Supplier` under both `guava/` and
 /// `android/guava/`) is one callee, not an ambiguity.
 fn method_callee(owner_fq_name: &str, member: &str, ctx: &JavaScan<'_>) -> MethodCallee {
-    ctx.graph.with_definitions(|index| {
-        let declares = |scope: &str| {
-            index
-                .fqn(&format!("{scope}.{member}"))
-                .iter()
-                .any(CodeUnit::is_function)
-        };
-        if declares(owner_fq_name) {
-            return MethodCallee::Resolved(format!("{owner_fq_name}.{member}"));
-        }
-        let (Some(owner), Some(provider)) = (
-            ctx.graph.index.definitions(owner_fq_name).next(),
-            ctx.graph.hierarchy,
-        ) else {
-            return MethodCallee::Undeclared;
-        };
-        let Some(declaring) = java_nearest_declaring_ancestors(
-            ctx.graph.index,
-            provider,
-            &owner,
-            |ancestor: &CodeUnit| declares(&ancestor.fq_name()),
-        ) else {
-            return MethodCallee::Undeclared;
-        };
-        let mut owners: Vec<String> = declaring.iter().map(CodeUnit::fq_name).collect();
-        owners.sort();
-        owners.dedup();
-        match owners.len() {
-            1 => MethodCallee::Resolved(format!("{}.{member}", owners[0])),
-            _ => MethodCallee::Ambiguous,
-        }
-    })
+    let (Some(owner), Some(provider)) = (
+        ctx.graph.index.definitions(owner_fq_name).next(),
+        ctx.graph.hierarchy,
+    ) else {
+        return MethodCallee::Undeclared;
+    };
+    let declares = |scope: &CodeUnit| {
+        ctx.graph
+            .structural_members(scope.fq(), member)
+            .iter()
+            .any(CodeUnit::is_function)
+    };
+    if declares(&owner) {
+        return MethodCallee::Resolved(format!("{owner_fq_name}.{member}"));
+    }
+    let Some(declaring) =
+        java_nearest_declaring_ancestors(ctx.graph.index, provider, &owner, declares)
+    else {
+        return MethodCallee::Undeclared;
+    };
+    let mut owners: Vec<String> = declaring.iter().map(CodeUnit::fq_name).collect();
+    owners.sort();
+    owners.dedup();
+    match owners.len() {
+        1 => MethodCallee::Resolved(format!("{}.{member}", owners[0])),
+        _ => MethodCallee::Ambiguous,
+    }
 }
 
 /// Whether a method invocation's receiver is a same-owner receiver: an

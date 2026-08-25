@@ -42,10 +42,6 @@ use lsp_types::{
 
 use crate::NavigationOperation;
 use crate::analyzer::semantic::WorkspaceRelativePath;
-use crate::analyzer::structural::{
-    CodeQuery, CodeQueryExecutionLimits, CodeQueryResponse, CodeQueryResultItem,
-    CodeQueryResultValue,
-};
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerQueryScope, BIFROST_IGNORE_FILE_NAME, BuildProgressEvent,
     BuildProgressPhase, FilesystemProject, IndexWarmer, MultiRootProject, OverlayProject, Project,
@@ -81,6 +77,10 @@ use crate::policy::{
     PolicyEvaluationOptions, PolicyReportDocument, PolicySourceDiagnosticSeverity,
     PolicySourceIdentity, PolicySuppressionOptions, PolicySuppressionSource,
     rqlp_source_completion_at, rqlp_source_help_at, validate_rqlp_source,
+};
+use crate::rql::{
+    CodeQuery, CodeQueryExecutionLimits, CodeQueryResponse, CodeQueryResultItem,
+    CodeQueryResultValue,
 };
 use crate::text_utils::compute_line_starts;
 use crate::util::throttled_log::ThrottledLog;
@@ -1188,6 +1188,7 @@ fn handle_run_rql_query_request(
         }
     };
 
+    let flow_state = Arc::clone(&state.flow_state);
     start_cancellable_worker(
         connection,
         state,
@@ -1202,8 +1203,9 @@ fn handle_run_rql_query_request(
             success_message: "Query ready",
         },
         move |workspace, _project, _context, cancellation| {
-            let response = CodeIntelligenceRuntime::new(workspace, Some(cancellation))
-                .execute_query(&query, CodeQueryExecutionLimits::default());
+            let response =
+                CodeIntelligenceRuntime::new(workspace, flow_state.as_ref(), Some(cancellation))
+                    .execute_query(&query, CodeQueryExecutionLimits::default());
             // Avoid rendering and serializing a potentially large response
             // after execution has already observed cancellation. The common
             // request guard remains responsible for the race after this check.
@@ -1283,6 +1285,7 @@ fn handle_run_rql_policy_request(
     let policy_root_uri = path_to_uri_string(&workspace_root);
     let report_root_uri = path_to_uri_string(state.project().root());
 
+    let flow_state = Arc::clone(&state.flow_state);
     start_cancellable_worker(
         connection,
         state,
@@ -1298,17 +1301,18 @@ fn handle_run_rql_policy_request(
         },
         move |workspace, _project, context, cancellation| {
             context.report("Evaluating policy");
-            let outcome = CodeIntelligenceRuntime::new(workspace, Some(cancellation))
-                .evaluate_policy_source(&workspace_root, source_identity, &source, &options)
-                .map_err(|error| {
-                    if cancellation.is_cancelled() {
-                        CancellableWorkerError::Cancelled
-                    } else {
-                        CancellableWorkerError::Failed(format!(
-                            "Failed to evaluate RQL policy: {error}"
-                        ))
-                    }
-                })?;
+            let outcome =
+                CodeIntelligenceRuntime::new(workspace, flow_state.as_ref(), Some(cancellation))
+                    .evaluate_policy_source(&workspace_root, source_identity, &source, &options)
+                    .map_err(|error| {
+                        if cancellation.is_cancelled() {
+                            CancellableWorkerError::Cancelled
+                        } else {
+                            CancellableWorkerError::Failed(format!(
+                                "Failed to evaluate RQL policy: {error}"
+                            ))
+                        }
+                    })?;
             if cancellation.is_cancelled() {
                 return Err(CancellableWorkerError::Cancelled);
             }
@@ -1430,6 +1434,11 @@ fn run_rql_query_result(
                     CodeQueryResultValue::PathSegment { value } => &value.path,
                     CodeQueryResultValue::StateEvent { value } => &value.path,
                     CodeQueryResultValue::FlowRelation { value } => &value.path,
+                    CodeQueryResultValue::ControlRelation { value } => &value.path,
+                    CodeQueryResultValue::Guard { value } => &value.path,
+                    CodeQueryResultValue::SourceSet { value } => &value.build_file,
+                    CodeQueryResultValue::BuildTarget { value } => &value.build_file,
+                    CodeQueryResultValue::TopologyEdge { value } => &value.build_file,
                     CodeQueryResultValue::RewritePath { value } => &value.path,
                 };
                 RunRqlQueryResultItem {
@@ -2159,6 +2168,7 @@ pub(crate) struct ServerState {
     configuration_protocol: RuntimeConfigurationProtocol,
     python_pack: Option<LspPythonPackConfig>,
     workspace: WorkspaceAnalyzer,
+    flow_state: Arc<crate::flow::FlowWorkspaceState>,
     /// Background warmer for the expensive lazily built per-generation query
     /// indexes (#1582). Scheduled after the initial workspace is published,
     /// after a `didOpen` installs a new snapshot, and after a workspace
@@ -2967,6 +2977,7 @@ impl ServerState {
             configuration_protocol,
             python_pack,
             workspace,
+            flow_state: Arc::new(crate::flow::FlowWorkspaceState::new()),
             index_warmer: IndexWarmer::new(),
             dependency_packs: DependencyPackActivator::new(),
             dependency_pack_generation: 0,
@@ -4476,7 +4487,7 @@ mod tests {
 
     #[test]
     fn rql_query_transport_attaches_navigation_uris_to_typestate_witness_steps() {
-        use crate::analyzer::structural::{
+        use crate::rql::{
             CodeQueryRange, CodeQueryResult, CodeQuerySemanticCompleteness,
             CodeQuerySemanticEvidence, CodeQuerySemanticProof, CodeQuerySourceSite,
             CodeQueryTypestateSubject, CodeQueryTypestateWitness, CodeQueryTypestateWitnessStep,

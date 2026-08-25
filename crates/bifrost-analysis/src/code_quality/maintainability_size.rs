@@ -5,13 +5,13 @@
 //! to bifrost. Output is byte-for-byte equivalent to brokk-core MCP.
 
 use super::{
-    ReportLines, append_ambiguous_path_notes, cyclomatic_complexity_for, pick_positive,
-    resolve_project_files,
+    ReportLines, append_ambiguous_path_notes, cyclomatic_complexities_from_projection,
+    cyclomatic_complexity_for, pick_positive, resolve_project_files,
 };
 use crate::analyzer::common::language_for_target;
 use crate::analyzer::{
     CodeUnit, IAnalyzer, Language, MaintainabilitySizeSmell, MaintainabilitySizeSmellWeights,
-    ProjectFile, Range,
+    ProjectFile, Range, SummaryFileProjection,
 };
 use crate::path_utils::{AmbiguousPathInput, rel_path_string};
 use serde::{Deserialize, Serialize};
@@ -47,6 +47,21 @@ const MAX_DECLARATIONS_PER_FILE: usize = 50_000;
 /// declarations have been visited, returning the partial findings collected
 /// so far. Pathological generated files cannot cause unbounded work.
 pub fn find_long_method_and_god_object_smells(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    weights: MaintainabilitySizeSmellWeights,
+) -> Vec<MaintainabilitySizeSmell> {
+    if let Some(projection) = analyzer.summary_file_projection(file)
+        && let Some(source) = analyzer
+            .indexed_source(file)
+            .or_else(|| analyzer.project().read_source(file).ok())
+    {
+        return find_maintainability_size_smells_from_projection(&projection, &source, weights);
+    }
+    find_maintainability_size_smells_from_analyzer(analyzer, file, weights)
+}
+
+fn find_maintainability_size_smells_from_analyzer(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     weights: MaintainabilitySizeSmellWeights,
@@ -88,15 +103,91 @@ pub fn find_long_method_and_god_object_smells(
                 }
             }
             Frame::Exit(cu, top_level) => {
+                let range = widest_non_empty_range_of(analyzer, &cu);
+                let children = analyzer.direct_children(&cu);
                 let cu_metrics = score_maintainability_size_unit(
-                    analyzer,
                     &cu,
+                    range,
+                    &children,
+                    cyclomatic_complexity_for(analyzer, &cu),
+                    is_file_level_module(analyzer, &cu, top_level),
                     weights,
-                    top_level,
                     &metrics,
                     &mut findings,
                 );
                 metrics.insert(cu, cu_metrics);
+            }
+        }
+    }
+    findings
+}
+
+fn find_maintainability_size_smells_from_projection(
+    projection: &SummaryFileProjection,
+    source: &str,
+    weights: MaintainabilitySizeSmellWeights,
+) -> Vec<MaintainabilitySizeSmell> {
+    let complexities: HashMap<CodeUnit, u32> =
+        cyclomatic_complexities_from_projection(projection, source)
+            .into_iter()
+            .collect();
+    let child_units: HashSet<CodeUnit> = projection
+        .children
+        .values()
+        .flat_map(|children| children.iter().cloned())
+        .collect();
+    let mut findings = Vec::new();
+    let mut visited = HashSet::new();
+    let mut metrics = HashMap::new();
+
+    enum Frame {
+        Enter(CodeUnit, bool),
+        Exit(CodeUnit, bool),
+    }
+
+    let mut stack = Vec::with_capacity(projection.top_level_declarations.len() * 2);
+    for code_unit in projection.top_level_declarations.iter().rev() {
+        stack.push(Frame::Enter(code_unit.clone(), true));
+    }
+    while let Some(frame) = stack.pop() {
+        match frame {
+            Frame::Enter(code_unit, top_level) => {
+                if !visited.insert(code_unit.clone()) {
+                    continue;
+                }
+                if visited.len() > MAX_DECLARATIONS_PER_FILE {
+                    continue;
+                }
+                stack.push(Frame::Exit(code_unit.clone(), top_level));
+                if let Some(children) = projection.children.get(&code_unit) {
+                    for child in children.iter().rev() {
+                        stack.push(Frame::Enter(child.clone(), false));
+                    }
+                }
+            }
+            Frame::Exit(code_unit, top_level) => {
+                let range = widest_non_empty_projection_range(projection, &code_unit);
+                let children = projection
+                    .children
+                    .get(&code_unit)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                let language = language_for_target(&code_unit);
+                let file_level_module = top_level
+                    && code_unit.is_module()
+                    && !child_units.contains(&code_unit)
+                    && !matches!(language, Language::None | Language::Java);
+                let unit_metrics = score_maintainability_size_unit(
+                    &code_unit,
+                    range,
+                    children,
+                    complexities.get(&code_unit).copied().unwrap_or_default(),
+                    file_level_module,
+                    weights,
+                    &metrics,
+                    &mut findings,
+                );
+                metrics.insert(code_unit, unit_metrics);
             }
         }
     }
@@ -115,15 +206,17 @@ struct MaintainabilitySizeMetrics {
 /// Compute scoring + metrics for a single CodeUnit using already-computed
 /// child metrics from `child_metrics`. Returns the aggregate metrics that
 /// the caller stores so the parent's Exit frame can roll them up.
+#[allow(clippy::too_many_arguments)]
 fn score_maintainability_size_unit(
-    analyzer: &dyn IAnalyzer,
     cu: &CodeUnit,
+    range: Range,
+    children: &[CodeUnit],
+    own_cyclomatic_complexity: u32,
+    file_level_module: bool,
     weights: MaintainabilitySizeSmellWeights,
-    top_level: bool,
     child_metrics: &HashMap<CodeUnit, MaintainabilitySizeMetrics>,
     findings: &mut Vec<MaintainabilitySizeSmell>,
 ) -> MaintainabilitySizeMetrics {
-    let range = widest_non_empty_range_of(analyzer, cu);
     let synthetic = cu.is_synthetic();
     let own_span_lines = if synthetic { 0 } else { range.span_lines() };
     let mut max_function_span_lines = if !synthetic && cu.is_function() {
@@ -132,7 +225,7 @@ fn score_maintainability_size_unit(
         0
     };
     let mut max_cyclomatic_complexity = if !synthetic && cu.is_function() {
-        cyclomatic_complexity_for(analyzer, cu)
+        own_cyclomatic_complexity
     } else {
         0
     };
@@ -144,14 +237,13 @@ fn score_maintainability_size_unit(
     };
     let mut descendant_span_lines = own_span_lines;
 
-    let children = analyzer.direct_children(cu);
     let non_synthetic_children: Vec<CodeUnit> = children
         .iter()
         .filter(|child| !child.is_synthetic())
         .cloned()
         .collect();
 
-    for child in &children {
+    for child in children {
         if let Some(m) = child_metrics.get(child) {
             function_count = function_count.saturating_add(m.function_count);
             nested_type_count = nested_type_count.saturating_add(m.nested_type_count);
@@ -182,7 +274,7 @@ fn score_maintainability_size_unit(
                 ));
             }
         } else if cu.is_class() || cu.is_module() {
-            let module_leeway_multiplier = if is_file_level_module(analyzer, cu, top_level) {
+            let module_leeway_multiplier = if file_level_module {
                 weights.file_module_leeway_multiplier
             } else {
                 1
@@ -314,6 +406,26 @@ fn widest_non_empty_range_of(analyzer: &dyn IAnalyzer, cu: &CodeUnit) -> Range {
         .into_iter()
         .filter(|range| !range.is_empty())
         .max_by_key(|range| range.span_lines())
+        .unwrap_or(Range {
+            start_byte: 0,
+            end_byte: 0,
+            start_line: 0,
+            end_line: 0,
+        })
+}
+
+fn widest_non_empty_projection_range(
+    projection: &SummaryFileProjection,
+    code_unit: &CodeUnit,
+) -> Range {
+    projection
+        .ranges
+        .get(code_unit)
+        .into_iter()
+        .flatten()
+        .filter(|range| !range.is_empty())
+        .max_by_key(|range| range.span_lines())
+        .cloned()
         .unwrap_or(Range {
             start_byte: 0,
             end_byte: 0,

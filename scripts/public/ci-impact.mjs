@@ -28,6 +28,7 @@ const RQL_COMPONENTS = new Set([
   "policy_pack",
   "vscode",
 ]);
+const FLOW_COMPONENTS = new Set([...RQL_COMPONENTS, "rust"]);
 const MCP_COMPONENTS = new Set(["rql_runtime", "mcp_contract"]);
 const LSP_COMPONENTS = new Set(["rql_runtime", "lsp_contract"]);
 const RUNTIME_COMPONENTS = new Set(["rql_runtime", "mcp_contract", "lsp_contract"]);
@@ -52,6 +53,7 @@ function isRqlPath(path) {
       "crates/bifrost-analysis/src/analyzer/structural/",
       "crates/bifrost-core/src/analyzer/structural/",
       "crates/bifrost-policy/src/",
+      "crates/bifrost-rql/src/",
       "crates/bifrost-policy/policy-packs/",
     ]) ||
     path === "crates/bifrost-runtime/tests/code_intelligence_runtime.rs" ||
@@ -59,6 +61,10 @@ function isRqlPath(path) {
       path,
     )
   );
+}
+
+function isFlowPath(path) {
+  return startsWithAny(path, ["crates/bifrost-flow/src/"]);
 }
 
 function isRqlTestPath(path) {
@@ -127,8 +133,10 @@ function isRustPath(path) {
     "src/",
     "crates/bifrost-analysis/src/",
     "crates/bifrost-core/src/",
+    "crates/bifrost-flow/src/",
     "crates/bifrost-nlp/src/",
     "crates/bifrost-policy/src/",
+    "crates/bifrost-rql/src/",
     "crates/bifrost-semantic-packs/src/",
     "tests/",
     "examples/",
@@ -205,6 +213,9 @@ function classifyPath(path) {
       components: RQL_TEST_COMPONENTS,
       reason: "RQL or policy integration test surface",
     };
+  }
+  if (isFlowPath(path)) {
+    return { components: FLOW_COMPONENTS, reason: "flow engine and query execution surface" };
   }
   if (isRqlPath(path)) {
     return { components: RQL_COMPONENTS, reason: "RQL, structural-query, or policy surface" };

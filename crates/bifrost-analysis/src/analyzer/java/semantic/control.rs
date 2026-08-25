@@ -39,6 +39,7 @@ pub(super) fn lower_procedure<'tree, 'targets>(
         catch_binders: HashMap::default(),
         parameters: HashMap::default(),
         locals: HashMap::default(),
+        implicit_field_values: HashMap::default(),
         receiver: None,
         captured_receiver: None,
         procedure_targets,
@@ -48,7 +49,21 @@ pub(super) fn lower_procedure<'tree, 'targets>(
     context.emit_captured_receiver(&mut builder, entry, spec)?;
     context.emit_local_bindings(&mut builder, spec.body)?;
 
-    if spec.kind == ProcedureKind::Initializer {
+    // #2553: "source-order composition across initializer fragments" is the
+    // gap's own documented reason (JLS 12.4.2/12.5 compose every static-or-
+    // instance field initializer and initializer block in one class body
+    // into one ordered sequence). That reason cannot apply when this
+    // fragment is provably the only member of its scheduling group: there is
+    // nothing to compose it with, so its value is exactly what it computes.
+    // Emitting the gap unconditionally made it the single most common gap in
+    // the whole OWASP corpus census (#2545) -- dominated by the ordinary
+    // `private static final long serialVersionUID = 1L;` boilerplate, which
+    // has no sibling to interleave with. A genuine multi-fragment class (two
+    // field initializers, a field initializer plus an initializer block, and
+    // so on) still gets the gap on every one of its fragments.
+    if spec.kind == ProcedureKind::Initializer
+        && !is_sole_initializer_fragment(spec.callable, spec.properties.is_static)
+    {
         context.add_gap(
             &mut builder,
             entry,
@@ -267,6 +282,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         target,
                     },
                 )?;
+            } else {
+                // #2573: not a local or a parameter -- may still be an
+                // implicit `this.field` write (`LDAPManager`'s own
+                // constructor, `ctx = getDirContext();`). Symmetric with the
+                // read side (`emit_implicit_field_load`); a no-op when
+                // `left` does not unambiguously name a non-`static` instance
+                // field on the enclosing type.
+                self.emit_implicit_field_store(builder, left, terminal, value)?;
             }
             vec![right]
         } else if left.kind() == "field_access" && !self.field_access_is_type_qualifier(left) {
@@ -380,8 +403,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), JavaLoweringError> {
         match (node.kind(), binary_operator(node)) {
-            ("true", _) => self.edge(builder, entry, when_true),
-            ("false", _) => self.edge(builder, entry, when_false),
+            // A folded literal keeps exactly one arm. Recording the guard is
+            // the whole point of this slice: after the fold, nothing else in
+            // the artifact says the branch was constant (#2443).
+            ("true", _) => {
+                self.edge(builder, entry, when_true)?;
+                self.record_guard(builder, entry, node, Some(when_true), None)
+            }
+            ("false", _) => {
+                self.edge(builder, entry, when_false)?;
+                self.record_guard(builder, entry, node, None, Some(when_false))
+            }
             ("binary_expression", Some("&&")) => {
                 let left = required_field(node, "left")?;
                 let right = required_field(node, "right")?;
@@ -447,6 +479,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let decision = self.point(builder, node, Vec::new())?;
                 self.edge(builder, decision, when_true)?;
                 self.edge(builder, decision, when_false)?;
+                self.record_guard(builder, decision, node, Some(when_true), Some(when_false))?;
                 stack.push(Work::Expression {
                     node,
                     entry,
@@ -456,6 +489,167 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 Ok(())
             }
         }
+    }
+
+    /// Publish one normalized guard fact for a decision the lowerer just made.
+    ///
+    /// A predicate is published only when Java's own structured syntax
+    /// establishes it. Anything represented but not normalizable is recorded
+    /// `Opaque` rather than guessed, so an absent guard row means the lowerer
+    /// made no decision here at all -- which is what makes the
+    /// [`SemanticCapability::GuardFacts`] entry readable.
+    fn record_guard(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        condition: Node<'tree>,
+        when_true: Option<EdgeTarget>,
+        when_false: Option<EdgeTarget>,
+    ) -> Result<(), JavaLoweringError> {
+        let arm = |target: Option<EdgeTarget>| {
+            target.map(|target| GuardArm {
+                target_point: target.point,
+                kind: target.kind,
+            })
+        };
+        let (predicate, subject) = match self.normalize_condition(builder, condition)? {
+            Some(normalized) => normalized,
+            None => (
+                GuardPredicate::Opaque {
+                    digest: GuardConditionDigest::from_syntax_kind(condition.kind()),
+                },
+                // The condition's own value is the one thing an opaque guard
+                // can honestly name: the decision tested it, whatever it means.
+                Some(self.expression_value(
+                    builder,
+                    condition,
+                    expression_value_kind(condition),
+                )?),
+            ),
+        };
+        self.session.add_guard_fact(
+            builder,
+            point,
+            predicate,
+            subject,
+            arm(when_true),
+            arm(when_false),
+        )?;
+        Ok(())
+    }
+
+    /// Normalize one Java condition into a guard predicate, or answer `None`
+    /// when the syntax is represented but not normalizable.
+    ///
+    /// Every ingredient is a tree-sitter field: `operator`, `left`, `right`,
+    /// `operand`. Nothing here reads source text, and a shape this function
+    /// does not recognize becomes an explicit `Opaque` row rather than a
+    /// guessed one.
+    ///
+    /// `!` and parentheses are peeled iteratively before the match, because a
+    /// negated guard is the same guard with its outcome swapped rather than a
+    /// decision of its own.
+    fn normalize_condition(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        condition: Node<'tree>,
+    ) -> Result<Option<(GuardPredicate, Option<ValueId>)>, JavaLoweringError> {
+        let mut cursor = condition;
+        let mut negated = false;
+        loop {
+            match cursor.kind() {
+                "parenthesized_expression" => {
+                    let Some(inner) = first_named_child(cursor) else {
+                        return Ok(None);
+                    };
+                    cursor = inner;
+                }
+                "unary_expression"
+                    if cursor
+                        .child_by_field_name("operator")
+                        .is_some_and(|operator| operator.kind() == "!") =>
+                {
+                    let Some(operand) = cursor.child_by_field_name("operand") else {
+                        return Ok(None);
+                    };
+                    negated = !negated;
+                    cursor = operand;
+                }
+                _ => break,
+            }
+        }
+
+        match cursor.kind() {
+            "true" => {
+                return Ok(Some((
+                    GuardPredicate::ConstantBoolean { value: !negated },
+                    None,
+                )));
+            }
+            "false" => {
+                return Ok(Some((
+                    GuardPredicate::ConstantBoolean { value: negated },
+                    None,
+                )));
+            }
+            "binary_expression" => {}
+            _ => return Ok(None),
+        }
+
+        let Some(operator) = cursor.child_by_field_name("operator") else {
+            return Ok(None);
+        };
+        let equal_on_true = match operator.kind() {
+            "==" => !negated,
+            "!=" => negated,
+            _ => return Ok(None),
+        };
+        let (Some(left), Some(right)) = (
+            cursor.child_by_field_name("left"),
+            cursor.child_by_field_name("right"),
+        ) else {
+            return Ok(None);
+        };
+
+        // The null literal is itself a constant, so the null comparison has to
+        // be decided before the general constant comparison.
+        let null_subject = match (
+            left.kind() == "null_literal",
+            right.kind() == "null_literal",
+        ) {
+            (true, false) => Some(right),
+            (false, true) => Some(left),
+            (true, true) | (false, false) => None,
+        };
+        if let Some(subject) = null_subject {
+            let subject =
+                self.expression_value(builder, subject, expression_value_kind(subject))?;
+            return Ok(Some((
+                GuardPredicate::NullComparison {
+                    null_on_true: equal_on_true,
+                },
+                Some(subject),
+            )));
+        }
+
+        let left_constant = matches!(expression_value_kind(left), SemanticValueKind::Constant);
+        let right_constant = matches!(expression_value_kind(right), SemanticValueKind::Constant);
+        // Two constants compared with each other name no subject, so the
+        // comparison is not a guard over anything and stays opaque.
+        let (subject, constant) = match (left_constant, right_constant) {
+            (true, false) => (right, left),
+            (false, true) => (left, right),
+            (true, true) | (false, false) => return Ok(None),
+        };
+        let constant = self.expression_value(builder, constant, SemanticValueKind::Constant)?;
+        let subject = self.expression_value(builder, subject, expression_value_kind(subject))?;
+        Ok(Some((
+            GuardPredicate::ConstantEquality {
+                negated: !equal_on_true,
+                constant,
+            },
+            Some(subject),
+        )))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -828,6 +1022,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let result = self.expression_value(builder, node, expression_value_kind(node))?;
         if matches!(node.kind(), "identifier" | "this") {
             self.emit_lexical_input_flow(builder, node, entry, result)?;
+        }
+        if node.kind() == "identifier" {
+            // #2573: a bare identifier that is not a local or a parameter
+            // (the only case `emit_lexical_input_flow` above leaves as a
+            // no-op) may still name an implicit `this.field` access.
+            self.emit_implicit_field_load(builder, node, entry, result)?;
         }
         match node.kind() {
             "method_invocation" | "object_creation_expression" | "enum_constant" => {
@@ -1981,6 +2181,30 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 exceptional_continuation: exceptional,
             },
         )?;
+        // #2571: if this call's receiver names a lexical binding this
+        // procedure tracks (a local variable, a formal parameter, or
+        // `this`), carry whatever the call's own receiver value holds after
+        // the call back into that binding, so a later read of the same
+        // binding observes what a mutating call (for example
+        // `java.util.HashMap.put`, whose shipped summary chains a tainted
+        // argument onto its own `receiver -> receiver` transfer) did to it.
+        // See `emit_receiver_write_back`'s own doc comment for the full
+        // rationale, including why this is additive rather than a kill and
+        // why a reassignment of the binding between two calls still
+        // separates their carriers regardless.
+        if let (Some(receiver_node), Some(receiver_value)) = (receiver_node, receiver) {
+            self.emit_receiver_write_back(builder, receiver_node, normal, receiver_value)?;
+            // #2573: the field analogue of the write-back above, for a
+            // receiver that is an implicit `this.field` access rather than a
+            // lexical binding. See `emit_implicit_field_receiver_write_back`'s
+            // own doc comment for the full rationale.
+            self.emit_implicit_field_receiver_write_back(
+                builder,
+                receiver_node,
+                normal,
+                receiver_value,
+            )?;
+        }
         if node.kind() == "object_creation_expression" {
             self.session
                 .add_allocation(builder, normal, result, AllocationKind::Object)?;

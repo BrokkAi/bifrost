@@ -16,9 +16,11 @@ concurrency:
 jobs:
   scan:
     name: bifrost code-smells scan
-    runs-on: ubuntu-latest
+    runs-on: "runs-on=${{ github.run_id }}-${{ github.run_attempt }}-policy-sarif/runner=4cpu-linux-x64/ram=16/volume=100gb/extras=s3-cache"
     timeout-minutes: 30
     steps:
+      - uses: runs-on/action@46910bf61b41721b0579f237e186afb35477007a # v2.3.0
+
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
@@ -27,7 +29,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          toolchain: 1.96.0
+          toolchain: 1.97.1
 
       - name: Cache Bifrost build
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2

@@ -13,7 +13,7 @@
 use std::collections::HashSet;
 use std::fmt;
 
-use brokk_bifrost_analysis::analyzer::structural::CodeQueryRowScalarType;
+use brokk_bifrost_rql::structural::CodeQueryRowScalarType;
 
 use crate::definition::RowLiteral;
 
@@ -553,7 +553,7 @@ fn validate_relation(
 /// all. Only source and expansion relations are expandable further.
 fn relation_domain(
     relation: &IrRelation,
-) -> Option<brokk_bifrost_analysis::analyzer::structural::search::DetailedCodeQueryDomain> {
+) -> Option<brokk_bifrost_rql::structural::search::DetailedCodeQueryDomain> {
     match &relation.op {
         IrRelationOp::Source { domain, .. } | IrRelationOp::Expand { domain, .. } => Some(*domain),
         _ => None,

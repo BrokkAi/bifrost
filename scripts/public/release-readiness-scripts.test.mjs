@@ -489,7 +489,7 @@ test("an artifact whose name carries no commit is not reusable", () => {
   });
 });
 
-function completeBundle(dir, { crates = 19, wheels = 10, vsix = 1, tgz = 1, sidecars = 8, notices = true } = {}) {
+function completeBundle(dir, { crates = 20, wheels = 10, vsix = 1, tgz = 1, sidecars = 8, notices = true } = {}) {
   const bundle = path.join(dir, "qualification-bundle");
   fs.mkdirSync(bundle, { recursive: true });
   for (let index = 0; index < crates; index += 1) {

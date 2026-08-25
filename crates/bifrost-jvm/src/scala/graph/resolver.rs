@@ -1,4 +1,6 @@
-use super::inverted::{CachedCallableAlternatives, is_package_level_type, same_overload_family};
+use super::inverted::{
+    CachedCallableAlternatives, ProjectTypes, is_package_level_type, same_overload_family,
+};
 use crate::scala::graph::syntax::{ScalaCallableRole, parenthesized_arity};
 use crate::scala::graph_support::ScalaSource;
 use crate::scala::wildcard_imports::scala_import_path;
@@ -43,13 +45,13 @@ impl TargetSpec {
     pub fn from_target(
         scala: &dyn ScalaSource,
         token: QueryToken<'_>,
+        types: &ProjectTypes,
         target: &CodeUnit,
     ) -> Option<Self> {
         if target.is_class() || scala.is_type_alias(target) {
             let owner_name = scala_display_name(target);
             let is_type_alias = scala.is_type_alias(target);
             let is_object_type = !is_type_alias && target.short_name().ends_with('$');
-            let types = scala.project_types();
             let accepts_apply_role =
                 !is_type_alias && types.class_accepts_apply_role(scala, target);
             let accepts_term_field_role = types.has_term_field_declaration(target);
@@ -75,7 +77,7 @@ impl TargetSpec {
             });
         }
 
-        let owner = owner_of(scala, target);
+        let owner = owner_of(types, target);
         let owner_name = owner.as_ref().map(scala_display_name);
         let arity = target.signature().and_then(signature_arity).or_else(|| {
             scala
@@ -84,22 +86,19 @@ impl TargetSpec {
                 .find_map(|sig| signature_arity(&sig))
         });
         let callable_alternatives = if !target.is_field() && target.is_function() {
-            scala
-                .project_types()
-                .effective_callable_alternatives_for(scala, token, target)
+            types.effective_callable_alternatives_for(scala, token, target)
         } else {
             Arc::new(Vec::new())
         };
         let family_callable_alternatives = if !target.is_field() && target.is_function() {
             let mut alternatives = callable_alternatives.as_ref().clone();
-            for sibling in scala.definitions(&target.fq_name()) {
+            for sibling in types.definitions_by_fqn(&target.fq_name()) {
                 if sibling.is_function()
                     && sibling != *target
                     && same_overload_family(&sibling, target)
                 {
                     alternatives.extend(
-                        scala
-                            .project_types()
+                        types
                             .effective_callable_alternatives_for(scala, token, &sibling)
                             .iter()
                             .cloned(),
@@ -133,9 +132,7 @@ impl TargetSpec {
             .iter()
             .any(|alternative| alternative.extension_receiver_type.is_some());
         let accepts_field_implementation = kind == TargetKind::Method
-            && scala
-                .project_types()
-                .is_abstract_scala_method(scala, target)
+            && types.is_abstract_scala_method(scala, target)
             && callable_alternatives.iter().any(|alternative| {
                 alternative.role == ScalaCallableRole::Ordinary && alternative.shape.is_empty()
             });
@@ -144,10 +141,11 @@ impl TargetSpec {
         } else {
             target.identifier().to_string()
         };
-        let member_owners = inherited_member_owners(scala, &owner, kind, &member_name, arity);
+        let member_owners =
+            inherited_member_owners(scala, types, &owner, kind, &member_name, arity);
         let accepts_companion_apply_syntax = kind == TargetKind::Method
             && member_name == "apply"
-            && companion_apply_owner_is_unambiguous(scala, target, owner.as_ref());
+            && companion_apply_owner_is_unambiguous(scala, types, target, owner.as_ref());
         Some(Self {
             target: target.clone(),
             target_fq_name: scala_normalized_fq_name(&target.fq_name()),
@@ -173,6 +171,7 @@ impl TargetSpec {
 
 fn companion_apply_owner_is_unambiguous(
     scala: &dyn ScalaSource,
+    types: &ProjectTypes,
     target: &CodeUnit,
     owner: Option<&CodeUnit>,
 ) -> bool {
@@ -180,34 +179,33 @@ fn companion_apply_owner_is_unambiguous(
         return false;
     };
     if let Some(structural_owner) = scala.structural_parent_of(target) {
-        if scala
-            .project_types()
-            .type_accepts_object_roles(scala, &structural_owner)
-        {
+        if types.type_accepts_object_roles(scala, &structural_owner) {
             return true;
         }
-        return inherited_companion_apply_fallback_is_unambiguous(scala, target, &structural_owner);
+        return inherited_companion_apply_fallback_is_unambiguous(
+            scala,
+            types,
+            target,
+            &structural_owner,
+        );
     }
     let normalized_target = scala_normalized_fq_name(&target.fq_name());
-    !scala
+    !types
         .definitions_by_normalized_fqn(&normalized_target)
         .iter()
         .filter(|candidate| candidate.is_function() && !same_overload_family(candidate, target))
         .filter_map(|candidate| scala.structural_parent_of(candidate))
-        .any(|candidate_owner| {
-            scala
-                .project_types()
-                .type_accepts_object_roles(scala, &candidate_owner)
-        })
+        .any(|candidate_owner| types.type_accepts_object_roles(scala, &candidate_owner))
 }
 
 fn inherited_companion_apply_fallback_is_unambiguous(
     scala: &dyn ScalaSource,
+    types: &ProjectTypes,
     target: &CodeUnit,
     owner: &CodeUnit,
 ) -> bool {
     let normalized_target = scala_normalized_fq_name(&target.fq_name());
-    if scala
+    if types
         .definitions_by_normalized_fqn(&normalized_target)
         .iter()
         .any(|candidate| candidate.is_function() && !same_overload_family(candidate, target))
@@ -216,13 +214,11 @@ fn inherited_companion_apply_fallback_is_unambiguous(
     }
 
     let normalized_owner = scala_normalized_fq_name(&owner.fq_name());
-    let normalized_owners = scala.definitions_by_normalized_fqn(&normalized_owner);
+    let normalized_owners = types.definitions_by_normalized_fqn(&normalized_owner);
     let mut companions = normalized_owners.iter().filter(|candidate| {
         candidate.is_class()
             && *candidate != owner
-            && scala
-                .project_types()
-                .type_accepts_object_roles(scala, candidate)
+            && types.type_accepts_object_roles(scala, candidate)
     });
     let Some(companion) = companions.next() else {
         return false;
@@ -236,10 +232,11 @@ fn inherited_companion_apply_fallback_is_unambiguous(
     };
     !facts.supertype_lookup_paths.is_empty()
         && std::iter::once(companion.clone())
-            .chain(scala.get_ancestors(companion))
+            .chain(types.exact_ancestors(companion))
             .all(|candidate_owner| {
-                !scala
-                    .definitions(&format!("{}.apply", candidate_owner.fq_name()))
+                !types
+                    .exact_member_declarations(scala, &candidate_owner, "apply")
+                    .into_iter()
                     .any(|candidate| {
                         candidate.is_function()
                             && scala.structural_parent_of(&candidate).as_ref()
@@ -268,6 +265,7 @@ enum DirectMemberState {
 
 fn inherited_member_owners(
     scala: &dyn ScalaSource,
+    types: &ProjectTypes,
     owner: &Option<CodeUnit>,
     kind: TargetKind,
     member_name: &str,
@@ -293,11 +291,11 @@ fn inherited_member_owners(
         owner.clone(),
         InheritedMemberState::Related(HashSet::from_iter([owner.clone()])),
     )]);
-    for descendant in scala.get_descendants(owner) {
+    for descendant in types.exact_descendants(owner) {
         if !seen.insert(descendant.clone()) {
             continue;
         }
-        match direct_member_state(scala, &descendant, kind, member_name, arity) {
+        match direct_member_state(scala, types, &descendant, kind, member_name, arity) {
             DirectMemberState::RelatedOverride => {
                 related_declaration_owners.insert(descendant.clone());
                 inherited_state_by_owner.insert(
@@ -313,6 +311,7 @@ fn inherited_member_owners(
             DirectMemberState::None => {
                 let state = inherited_member_state_from_ancestors(
                     scala,
+                    types,
                     &descendant,
                     kind,
                     member_name,
@@ -334,8 +333,10 @@ fn inherited_member_owners(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn inherited_member_state_from_ancestors(
     scala: &dyn ScalaSource,
+    types: &ProjectTypes,
     descendant: &CodeUnit,
     kind: TargetKind,
     member_name: &str,
@@ -345,8 +346,8 @@ fn inherited_member_state_from_ancestors(
 ) -> InheritedMemberState {
     let mut related_matches = HashSet::default();
     let mut has_blocking_match = false;
-    for ancestor in scala.get_direct_ancestors(descendant) {
-        if owner_declares_matching_member(scala, &ancestor, kind, member_name, arity) {
+    for ancestor in types.exact_direct_ancestors(descendant) {
+        if owner_declares_matching_member(scala, types, &ancestor, kind, member_name, arity) {
             if related_declaration_owners.contains(&ancestor) {
                 related_matches.insert(ancestor);
             } else {
@@ -375,13 +376,15 @@ fn inherited_member_state_from_ancestors(
 
 fn direct_member_state(
     scala: &dyn ScalaSource,
+    types: &ProjectTypes,
     owner: &CodeUnit,
     kind: TargetKind,
     member_name: &str,
     arity: Option<usize>,
 ) -> DirectMemberState {
-    if scala
-        .definitions(&format!("{}.{}$", owner.fq_name(), member_name))
+    if types
+        .exact_member_declarations(scala, owner, &format!("{member_name}$"))
+        .into_iter()
         .any(|unit| {
             unit.is_class()
                 && unit.short_name().ends_with('$')
@@ -391,8 +394,9 @@ fn direct_member_state(
         return DirectMemberState::BlockingDeclaration;
     }
     if kind == TargetKind::Method
-        && scala
-            .definitions(&format!("{}.{}", owner.fq_name(), member_name))
+        && types
+            .exact_member_declarations(scala, owner, member_name)
+            .into_iter()
             .any(|unit| {
                 unit.is_function()
                     && scala.parent_of(&unit).as_ref() == Some(owner)
@@ -401,7 +405,7 @@ fn direct_member_state(
     {
         return DirectMemberState::RelatedOverride;
     }
-    if owner_declares_matching_member(scala, owner, kind, member_name, arity) {
+    if owner_declares_matching_member(scala, types, owner, kind, member_name, arity) {
         DirectMemberState::BlockingDeclaration
     } else {
         DirectMemberState::None
@@ -410,13 +414,15 @@ fn direct_member_state(
 
 fn owner_declares_matching_member(
     scala: &dyn ScalaSource,
+    types: &ProjectTypes,
     owner: &CodeUnit,
     kind: TargetKind,
     member_name: &str,
     arity: Option<usize>,
 ) -> bool {
-    scala
-        .definitions(&format!("{}.{}", owner.fq_name(), member_name))
+    types
+        .exact_member_declarations(scala, owner, member_name)
+        .into_iter()
         .any(|unit| {
             scala.parent_of(&unit).as_ref() == Some(owner)
                 && member_matches_target_kind(scala, &unit, kind, arity)
@@ -644,8 +650,8 @@ pub fn method_signature_arity(scala: &dyn ScalaSource, unit: &CodeUnit) -> Optio
     })
 }
 
-fn owner_of(scala: &dyn ScalaSource, target: &CodeUnit) -> Option<CodeUnit> {
-    if let Some(owner) = scala.structural_parent_of(target) {
+fn owner_of(types: &ProjectTypes, target: &CodeUnit) -> Option<CodeUnit> {
+    if let Some(owner) = types.projected_structural_parent(target) {
         return owner.is_class().then_some(owner);
     }
 
@@ -655,20 +661,15 @@ fn owner_of(scala: &dyn ScalaSource, target: &CodeUnit) -> Option<CodeUnit> {
     // package re-qualification (this branch's old body did exactly that
     // reconstruction by hand).
     if let Some(owner_fq) = default_parent_fq_name(target)
-        && let Some(owner) = scala.definitions(&owner_fq).find(|unit| unit.is_class())
+        && let Some(owner) = types
+            .definitions_by_fqn(&owner_fq)
+            .into_iter()
+            .find(|unit| unit.is_class())
     {
         return Some(owner);
     }
 
-    scala
-        .all_declarations()
-        .filter(|unit| unit.is_class())
-        .find(|candidate| {
-            scala
-                .direct_children(candidate)
-                .into_iter()
-                .any(|child| &child == target)
-        })
+    None
 }
 
 pub fn import_candidate_fq_names(path: &str, package_name: &str) -> HashSet<String> {

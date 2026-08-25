@@ -22,7 +22,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use brokk_bifrost_analysis::analyzer::structural::CodeQueryResultValue;
+use brokk_bifrost_rql::structural::CodeQueryResultValue;
 
 use crate::definition::{
     AssertCardinality, PolicyAssertId, RowBindingName, RowGroupName, RowLiteral,
@@ -707,46 +707,58 @@ fn evaluate_join(
         IrJoinKind::Anti => left.coverage.clone(),
     };
 
+    // Equality keys are typed values, so a composite key can be indexed
+    // directly. Buckets append right tuples in relation order; the map itself
+    // is never iterated, which keeps output order independent of hash seeding.
+    let mut right_index: HashMap<Vec<Option<RowScalar>>, Vec<&EvalTuple>> = HashMap::new();
+    for right_tuple in &right.tuples {
+        let key = keys
+            .iter()
+            .map(|(_, right_index)| right_tuple.values[*right_index].clone())
+            .collect();
+        right_index.entry(key).or_default().push(right_tuple);
+    }
+
     let mut joined = Vec::new();
     'left: for tuple in &left.tuples {
-        let mut matched = false;
-        for right_tuple in &right.tuples {
-            state.comparisons = state.comparisons.saturating_add(1);
-            if state.comparisons > state.limits.max_join_comparisons {
-                coverage = state.truncate(coverage);
-                break 'left;
-            }
-            if keys.iter().all(|(left_index, right_index)| {
-                tuple.values[*left_index] == right_tuple.values[*right_index]
-            }) {
-                matched = true;
-                match kind {
-                    IrJoinKind::Inner => {
-                        if joined.len() == state.limits.max_joined_rows {
-                            coverage = state.truncate(coverage);
-                            break 'left;
-                        }
-                        let mut values = tuple.values.clone();
-                        values.extend(right_tuple.values.iter().cloned());
-                        let mut rows = tuple.contributors.first().cloned().unwrap_or_default();
-                        rows.extend(
-                            right_tuple
-                                .contributors
-                                .first()
-                                .cloned()
-                                .unwrap_or_default(),
-                        );
-                        joined.push(EvalTuple {
-                            values,
-                            contributors: vec![rows],
-                            witness_sound: tuple.witness_sound && right_tuple.witness_sound,
-                        });
-                    }
-                    // Both filtering joins keep scanning: the comparison budget
-                    // is a plan-wide bound, so it must not depend on how early
-                    // a partner happened to be found.
-                    IrJoinKind::Semi | IrJoinKind::Anti => {}
+        // This is a plan-wide one-unit-per-left-key-probe budget. The lookup
+        // replaces the old per-pair comparison loop, while output remains
+        // independently bounded by max_joined_rows below.
+        state.comparisons = state.comparisons.saturating_add(1);
+        if state.comparisons > state.limits.max_join_comparisons {
+            coverage = state.truncate(coverage);
+            break;
+        }
+
+        let key = keys
+            .iter()
+            .map(|(left_index, _)| tuple.values[*left_index].clone())
+            .collect::<Vec<_>>();
+        let matches = right_index.get(&key);
+        let matched = matches.is_some();
+        if let Some(matches) = matches
+            && kind == IrJoinKind::Inner
+        {
+            for right_tuple in matches {
+                if joined.len() == state.limits.max_joined_rows {
+                    coverage = state.truncate(coverage);
+                    break 'left;
                 }
+                let mut values = tuple.values.clone();
+                values.extend(right_tuple.values.iter().cloned());
+                let mut rows = tuple.contributors.first().cloned().unwrap_or_default();
+                rows.extend(
+                    right_tuple
+                        .contributors
+                        .first()
+                        .cloned()
+                        .unwrap_or_default(),
+                );
+                joined.push(EvalTuple {
+                    values,
+                    contributors: vec![rows],
+                    witness_sound: tuple.witness_sound && right_tuple.witness_sound,
+                });
             }
         }
         let retain = match kind {

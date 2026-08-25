@@ -74,9 +74,11 @@ use crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input;
 use crate::analyzer::jvm::external::{JvmExternalDeclarationIndex, JvmExternalDeclarations};
 use crate::analyzer::jvm::retained_external_index_state;
 use crate::analyzer::languages::{
-    BoundedReceiverQuery, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
+    BoundedReceiverQuery, DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof,
+    DeadCodeRouting, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
     LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport,
-    StructuralReceiverResolver,
+    StructuralReceiverResolver, analyzable_file_count, candidate_fqns,
+    fqn_has_multiple_function_definitions,
 };
 use crate::analyzer::pool_memo::{KeyedPoolSafeMemo, PoolSafeMemo};
 use crate::analyzer::usages::GraphUsageAnalyzer;
@@ -85,7 +87,7 @@ use crate::analyzer::usages::get_definition::{
 };
 use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_kotlin_type_bounded};
 use crate::analyzer::usages::kotlin_graph::{
-    KotlinUsageGraphStrategy, build_kotlin_usage_edge_weights, build_kotlin_usage_edges,
+    KotlinUsageGraphStrategy, build_inbound_kotlin_usage_edges, build_kotlin_usage_edge_weights,
 };
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::weighted_cache::{
@@ -97,7 +99,7 @@ use crate::analyzer::{
     ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider, JvmAnalyzerConfig, Language, Project,
     ProjectFile, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
     TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider,
-    UsageFactsIndex, resolve_analyzer,
+    resolve_analyzer,
 };
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_jvm::kotlin::test_detection::detect_kotlin_test_assertion_smells;
@@ -462,11 +464,13 @@ impl KotlinSource for KotlinAnalyzer {
         self.inner.package_name_of(file)
     }
 
-    fn usage_definitions(
+    fn with_usage_definitions(
         &self,
-        token: QueryToken<'_>,
-    ) -> &dyn crate::analyzer::BoundedDefinitionLookup {
-        self.inner.global_usage_definition_index_ref(token)
+        _token: QueryToken<'_>,
+        read: &mut dyn FnMut(&dyn crate::analyzer::BoundedDefinitionLookup),
+    ) {
+        let lookup = crate::analyzer::AnalyzerDefinitionLookup::new(self, Language::Kotlin);
+        read(&lookup);
     }
 
     fn type_identifiers_of(&self, file: &ProjectFile) -> Option<HashSet<String>> {
@@ -537,7 +541,11 @@ impl CodeUnitIndex for KotlinAnalyzer {
         &self,
         file: &ProjectFile,
     ) -> Option<Arc<crate::analyzer::SummaryFileProjection>> {
-        self.inner.summary_file_projection(file)
+        let mut projection = (*self.inner.summary_file_projection(file)?).clone();
+        for children in projection.children.values_mut() {
+            children.retain(|child| !child.is_synthetic());
+        }
+        Some(Arc::new(projection))
     }
 
     fn analyzed_files(&self) -> Vec<ProjectFile> {
@@ -680,6 +688,8 @@ impl CodeUnitIndex for KotlinAnalyzer {
 }
 
 impl IAnalyzer for KotlinAnalyzer {
+    crate::analyzer::i_analyzer::forward_relational_definition_batch!();
+
     fn invalidate_cached_file_identities(&self) {
         self.inner.invalidate_cached_file_identities();
     }
@@ -721,25 +731,20 @@ impl IAnalyzer for KotlinAnalyzer {
         self.inner.workspace_file_index_cell()
     }
 
-    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
-        // Trait signature is fixed, so this boundary opens the scope the
-        // usage-graph funnel now demands proof of (issue #2423 milestone B).
-        let scope = crate::analyzer::AnalyzerQueryScope::new(self);
-        self.inner.global_usage_definition_index(scope.token())
-    }
-
-    fn usage_facts_index(&self) -> &UsageFactsIndex {
-        self.inner.usage_facts_index()
-    }
-
-    fn structural_search_providers(
+    fn structural_fact_providers(
         &self,
-    ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
-        self.inner.structural_search_providers()
+    ) -> Vec<&dyn crate::analyzer::structural::StructuralFactProvider> {
+        self.inner.structural_fact_providers()
     }
 
     fn snapshot_caches(&self) -> Option<&crate::analyzer::AnalyzerSnapshotCaches> {
         Some(self.inner.snapshot_caches())
+    }
+
+    fn workspace_content_identities(
+        &self,
+    ) -> Option<crate::analyzer::content_identity::WorkspaceContentIdentities> {
+        self.inner.workspace_content_identities()
     }
 
     fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
@@ -892,18 +897,6 @@ impl IAnalyzer for KotlinAnalyzer {
 
 #[cfg(any(test, feature = "test-support"))]
 impl crate::analyzer::AnalyzerTestHooks for KotlinAnalyzer {
-    fn reset_global_usage_definition_index_build_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_global_usage_definition_index_build_count_for_test();
-    }
-
-    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .global_usage_definition_index_build_count_for_test()
-    }
-
     fn reset_full_declaration_scan_count_for_test(&self) {
         self.inner
             .test_hooks()
@@ -940,6 +933,62 @@ impl TestDetectionProvider for KotlinAnalyzer {}
 static KOTLIN_USAGE_STRATEGY: KotlinUsageGraphStrategy = KotlinUsageGraphStrategy::new();
 
 pub(crate) struct KotlinSupport;
+
+static KOTLIN_DEAD_CODE_BULK: KotlinDeadCodeBulk = KotlinDeadCodeBulk;
+
+struct KotlinDeadCodeBulk;
+
+#[derive(Default)]
+struct KotlinDeadCodeMemo {
+    overloaded_fqns: HashMap<String, bool>,
+}
+
+impl DeadCodeBulkProof for KotlinDeadCodeBulk {
+    fn id(&self) -> EdgePassId {
+        EdgePassId::Kotlin
+    }
+
+    fn new_memo(&self) -> Box<dyn std::any::Any + Send> {
+        Box::new(KotlinDeadCodeMemo::default())
+    }
+
+    fn needs_precise_scan(&self, routing: DeadCodeRouting<'_>) -> bool {
+        let KotlinDeadCodeMemo { overloaded_fqns } =
+            routing.memo.downcast_mut().expect("Kotlin bulk memo");
+        // Kotlin properties are represented as fields in the analyzer index,
+        // while the inverted Kotlin resolver's complete target model is for
+        // classes and callable declarations. Keep fields on the existing
+        // precise path until the property accessor contract is explicit.
+        if !routing.candidate.is_function() && !routing.candidate.is_class() {
+            return true;
+        }
+        if !routing.candidate.is_function() {
+            return false;
+        }
+        let fqn = routing.candidate.fq_name();
+        *overloaded_fqns.entry(fqn.clone()).or_insert_with(|| {
+            fqn_has_multiple_function_definitions(routing.analyzer, Language::Kotlin, &fqn)
+        })
+    }
+
+    fn preflight(&self, analyzer: &dyn IAnalyzer) -> DeadCodeBulkPreflight {
+        DeadCodeBulkPreflight::Ready {
+            label: "Kotlin",
+            files: analyzable_file_count(analyzer, Language::Kotlin),
+        }
+    }
+
+    fn build(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        candidates: &[CodeUnit],
+    ) -> Option<DeadCodeBulkEdges> {
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let callees = candidate_fqns(candidates);
+        build_inbound_kotlin_usage_edges(analyzer, scope.token(), &callees)
+            .map(|edges| DeadCodeBulkEdges::Fqn(Arc::new(edges)))
+    }
+}
 
 impl LanguageSupport for KotlinSupport {
     fn language(&self) -> Language {
@@ -1023,7 +1072,7 @@ impl LanguageSupport for KotlinSupport {
     fn dead_code(&self) -> DeadCodeSupport {
         DeadCodeSupport {
             strategy: Some(&KOTLIN_USAGE_STRATEGY),
-            bulk: None,
+            bulk: Some(&KOTLIN_DEAD_CODE_BULK),
         }
     }
 
@@ -1057,8 +1106,13 @@ impl LanguageEdgePass for KotlinEdgePass {
     fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
         let scope = AnalyzerQueryScope::new(ctx.analyzer);
         let token = scope.token();
-        build_kotlin_usage_edges(ctx.analyzer, token, ctx.fqns, ctx.keep_file)
-            .map(LanguageEdgeSites)
+        crate::analyzer::usages::kotlin_graph::build_rooted_kotlin_usage_edges(
+            ctx.analyzer,
+            token,
+            ctx.fqns,
+            ctx.keep_file,
+        )
+        .map(LanguageEdgeSites)
     }
 
     fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {

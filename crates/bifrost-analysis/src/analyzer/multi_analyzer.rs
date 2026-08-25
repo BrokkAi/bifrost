@@ -4,9 +4,11 @@ use crate::analyzer::store::StoreError;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CSharpAnalyzer, CloneSmell,
     CloneSmellWeights, CodeUnit, CommentDensityStats, CppAnalyzer, DeclarationInfo,
-    DefinitionIndexHandle, ExceptionHandlingAnalysis, ExceptionSmellWeights, GoAnalyzer, IAnalyzer,
-    ImportAnalysisProvider, ImportInfo, ImportReachability, JavaAnalyzer, JavascriptAnalyzer,
-    KotlinAnalyzer, Language, PhpAnalyzer, Project, ProjectFile, PythonAnalyzer, Range,
+    DefinitionLanguageScope, ExceptionHandlingAnalysis, ExceptionSmellWeights, GoAnalyzer,
+    IAnalyzer, ImportAnalysisProvider, ImportInfo, ImportReachability, JavaAnalyzer,
+    JavascriptAnalyzer, KotlinAnalyzer, Language, PhpAnalyzer, Project, ProjectFile,
+    PythonAnalyzer, Range, RelationalBatchError, RelationalBatchOutcome,
+    RelationalDefinitionRequest, RelationalDefinitionResult, RelationalDefinitionValue,
     RubyAnalyzer, RustAnalyzer, ScalaAnalyzer, SearchSymbolCandidates, SearchSymbolPatternBatch,
     SignatureMetadata, SummaryFileProjection, TestAssertionAnalysis, TestAssertionSmell,
     TestAssertionWeights, TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider,
@@ -20,6 +22,8 @@ use brokk_bifrost_jvm::realm::JvmSourceRealm;
 use rayon::prelude::*;
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Resolve a concrete analyzer of type `T` out of a `&dyn IAnalyzer`, whether it is
@@ -293,6 +297,8 @@ pub(crate) struct WorkspaceBuildContext {
     project: Arc<dyn Project>,
     config: AnalyzerConfig,
     store_context: AnalyzerStoreContext,
+    #[cfg(test)]
+    startup_oid_batches: Option<Arc<AtomicUsize>>,
     requested_languages: Option<BTreeSet<Language>>,
 }
 
@@ -307,6 +313,8 @@ impl WorkspaceBuildContext {
             project,
             config,
             store_context,
+            #[cfg(test)]
+            startup_oid_batches: None,
             requested_languages: requested_languages.filter(|languages| !languages.is_empty()),
         }
     }
@@ -335,6 +343,22 @@ impl WorkspaceBuildContext {
     /// against, or `None` when the store lives only in memory.
     pub(crate) fn store_db_path(&self) -> Option<&std::path::Path> {
         self.store_context.store.db_path()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_startup_oid_batch_counter_for_test(
+        mut self,
+        counter: Option<Arc<AtomicUsize>>,
+    ) -> Self {
+        self.startup_oid_batches = counter;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn startup_oid_batch_count_for_test(&self) -> usize {
+        self.startup_oid_batches
+            .as_ref()
+            .map_or(0, |count| count.load(Ordering::Relaxed))
     }
 
     fn allows_language(&self, language: Language) -> bool {
@@ -426,7 +450,7 @@ impl MultiAnalyzer {
     pub fn new(delegates: BTreeMap<Language, AnalyzerDelegate>) -> Self {
         Self::new_with_derived_layer_budget(
             delegates,
-            crate::analyzer::structural::execution::derived::SnapshotDerivedLayerCache::DEFAULT_MAX_RETAINED_BYTES,
+            crate::analyzer::structural::derived_cache::SnapshotDerivedLayerCache::DEFAULT_MAX_RETAINED_BYTES,
         )
     }
 
@@ -461,6 +485,11 @@ impl MultiAnalyzer {
         }
     }
 
+    /// Adopt the previous generation's content-keyed workspace caches (#2449).
+    fn with_snapshot_caches(mut self, caches: crate::analyzer::AnalyzerSnapshotCaches) -> Self {
+        self.snapshot_caches = Arc::new(caches);
+        self
+    }
     pub fn with_java(java: JavaAnalyzer) -> Self {
         Self::new(BTreeMap::from([(
             Language::Java,
@@ -588,6 +617,41 @@ impl ImportAnalysisProvider for MultiAnalyzer {
             .filter_map(AnalyzerDelegate::import_analysis_provider)
             .flat_map(|provider| provider.referencing_files_of(file))
             .collect()
+    }
+
+    fn referencing_files_of_targets(
+        &self,
+        targets: &HashSet<ProjectFile>,
+        candidates: &[ProjectFile],
+        cancellation: &crate::CancellationToken,
+    ) -> HashSet<ProjectFile> {
+        let mut grouped: BTreeMap<Language, Vec<ProjectFile>> = BTreeMap::new();
+        for candidate in candidates {
+            grouped
+                .entry(self.dispatch_language(candidate))
+                .or_default()
+                .push(candidate.clone());
+        }
+
+        let mut referencing = HashSet::default();
+        for (language, group) in grouped {
+            if cancellation.is_cancelled() {
+                break;
+            }
+            let Some(provider) = self
+                .delegates
+                .get(&language)
+                .and_then(AnalyzerDelegate::import_analysis_provider)
+            else {
+                continue;
+            };
+            referencing.extend(provider.referencing_files_of_targets(
+                targets,
+                &group,
+                cancellation,
+            ));
+        }
+        referencing
     }
 
     fn import_info_of(&self, token: QueryToken<'_>, file: &ProjectFile) -> Vec<ImportInfo> {
@@ -1272,6 +1336,96 @@ impl IAnalyzer for MultiAnalyzer {
             .retain(|active| !Arc::ptr_eq(active, context));
     }
 
+    fn active_query_cancellation(&self) -> Option<crate::CancellationToken> {
+        self.query_contexts
+            .lock()
+            .expect("multi-analyzer query context mutex poisoned")
+            .iter()
+            .rev()
+            .find_map(|context| context.cancellation().cloned())
+    }
+
+    fn relational_definition_batch(
+        &self,
+        requests: &[RelationalDefinitionRequest],
+        cancellation: &crate::CancellationToken,
+    ) -> RelationalBatchOutcome {
+        if cancellation.is_cancelled() {
+            return RelationalBatchOutcome::Cancelled;
+        }
+
+        let mut values = requests
+            .iter()
+            .map(|request| RelationalDefinitionValue::empty_for(&request.query))
+            .collect::<Vec<_>>();
+        for (language, delegate) in &self.delegates {
+            let delegated = requests
+                .iter()
+                .enumerate()
+                .filter(|(_, request)| match request.language_scope {
+                    DefinitionLanguageScope::Workspace => true,
+                    DefinitionLanguageScope::Language(requested) => requested == *language,
+                })
+                .map(|(index, request)| {
+                    let mut request = request.clone();
+                    request.ordinal = index;
+                    request.language_scope = DefinitionLanguageScope::Language(*language);
+                    request
+                })
+                .collect::<Vec<_>>();
+            if delegated.is_empty() {
+                continue;
+            }
+
+            let results = match delegate
+                .analyzer()
+                .relational_definition_batch(&delegated, cancellation)
+            {
+                RelationalBatchOutcome::Complete(results) => results,
+                RelationalBatchOutcome::Cancelled => return RelationalBatchOutcome::Cancelled,
+                RelationalBatchOutcome::Failed(error) => {
+                    return RelationalBatchOutcome::Failed(RelationalBatchError::new(format!(
+                        "{language:?} relational definition projection failed: {}",
+                        error.message()
+                    )));
+                }
+            };
+            assert_eq!(
+                results.len(),
+                delegated.len(),
+                "a language projection returns one result per delegated request"
+            );
+            let mut seen = BTreeSet::new();
+            for result in results {
+                assert!(
+                    seen.insert(result.ordinal),
+                    "a language projection returned one request ordinal twice"
+                );
+                let value = values
+                    .get_mut(result.ordinal)
+                    .expect("a language projection returned an unknown request ordinal");
+                value.merge_from(result.value);
+            }
+        }
+        if cancellation.is_cancelled() {
+            return RelationalBatchOutcome::Cancelled;
+        }
+
+        RelationalBatchOutcome::Complete(
+            requests
+                .iter()
+                .zip(values)
+                .map(|(request, mut value)| {
+                    value.canonicalize();
+                    RelationalDefinitionResult {
+                        ordinal: request.ordinal,
+                        value,
+                    }
+                })
+                .collect(),
+        )
+    }
+
     fn begin_streaming_file_read(&self, file: &ProjectFile) {
         if let Some(delegate) = self.delegate_for_file(file) {
             delegate.analyzer().begin_streaming_file_read(file);
@@ -1397,7 +1551,12 @@ impl IAnalyzer for MultiAnalyzer {
                 delegates,
                 self.derived_layer_budget_bytes,
                 self.build_context.clone(),
-            );
+            )
+            // The derived layers and usage graphs are keyed by workspace
+            // content (#2449), so a delegate change cannot make one of them
+            // wrong. Carrying them across is what lets a Rust edit keep the JVM
+            // usage graph and a no-op update keep everything.
+            .with_snapshot_caches(self.snapshot_caches.carry_content_keyed_values_forward());
         }
         // No delegate saw a relevant change, so every one of them was cloned
         // and kept everything it had built.  Keeping the workspace-level
@@ -1441,6 +1600,7 @@ impl IAnalyzer for MultiAnalyzer {
             self.derived_layer_budget_bytes,
             self.build_context.clone(),
         )
+        .with_snapshot_caches(self.snapshot_caches.carry_content_keyed_values_forward())
     }
 
     /// A view over the delegates' own indexes, never a merged copy.
@@ -1451,20 +1611,6 @@ impl IAnalyzer for MultiAnalyzer {
     /// that retains the delegate.  A delegate whose store read fails degrades
     /// to its own recorded-error fallback shard, which keeps the failure
     /// visible and confined instead of emptying the whole workspace view.
-    fn global_usage_definition_index(&self) -> DefinitionIndexHandle<'_> {
-        DefinitionIndexHandle::Merged(
-            self.delegates
-                .values()
-                .flat_map(|delegate| {
-                    delegate
-                        .analyzer()
-                        .global_usage_definition_index()
-                        .into_shards()
-                })
-                .collect(),
-        )
-    }
-
     fn declaration_syntax_kind(&self, code_unit: &CodeUnit) -> Option<&'static str> {
         self.delegate_for_code_unit(code_unit)
             .and_then(|delegate| delegate.analyzer().declaration_syntax_kind(code_unit))
@@ -1845,12 +1991,12 @@ impl IAnalyzer for MultiAnalyzer {
             .then_some(self as &dyn TestDetectionProvider)
     }
 
-    fn structural_search_providers(
+    fn structural_fact_providers(
         &self,
-    ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
+    ) -> Vec<&dyn crate::analyzer::structural::StructuralFactProvider> {
         self.delegates
             .values()
-            .flat_map(|delegate| delegate.analyzer().structural_search_providers())
+            .flat_map(|delegate| delegate.analyzer().structural_fact_providers())
             .collect()
     }
 
@@ -1858,19 +2004,25 @@ impl IAnalyzer for MultiAnalyzer {
         Some(&self.snapshot_caches)
     }
 
-    fn snapshot_source_generations(&self) -> Box<[u64]> {
-        self.delegates
-            .values()
-            .map(|delegate| delegate.analyzer().project().analysis_generation())
-            .collect()
-    }
-
-    fn snapshot_generations_match(&self, expected: &[u64]) -> bool {
-        expected.len() == self.delegates.len()
-            && expected.iter().copied().eq(self
-                .delegates
-                .values()
-                .map(|delegate| delegate.analyzer().project().analysis_generation()))
+    /// One entry per delegate, or nothing at all.
+    ///
+    /// A delegate that cannot answer must not simply be left out: a scope
+    /// digest over a subset of the languages this analyzer serves would compare
+    /// equal to the same subset in a workspace that also holds the missing one,
+    /// which is exactly the undersized reuse #2449 forbids. The whole answer
+    /// widens instead.
+    fn workspace_content_identities(
+        &self,
+    ) -> Option<crate::analyzer::content_identity::WorkspaceContentIdentities> {
+        let mut entries = Vec::with_capacity(self.delegates.len());
+        for (language, delegate) in &self.delegates {
+            let identity = delegate
+                .analyzer()
+                .workspace_content_identities()
+                .and_then(|identities| identities.language(*language))?;
+            entries.push((*language, identity.digest()));
+        }
+        Some(crate::analyzer::content_identity::WorkspaceContentIdentities::new(entries))
     }
 
     fn contains_tests(&self, file: &ProjectFile) -> bool {
@@ -1934,27 +2086,6 @@ impl IAnalyzer for MultiAnalyzer {
 
 #[cfg(any(test, feature = "test-support"))]
 impl crate::analyzer::AnalyzerTestHooks for MultiAnalyzer {
-    fn reset_global_usage_definition_index_build_count_for_test(&self) {
-        for delegate in self.delegates.values() {
-            delegate
-                .analyzer()
-                .test_hooks()
-                .reset_global_usage_definition_index_build_count_for_test();
-        }
-    }
-
-    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
-        self.delegates
-            .values()
-            .map(|delegate| {
-                delegate
-                    .analyzer()
-                    .test_hooks()
-                    .global_usage_definition_index_build_count_for_test()
-            })
-            .sum::<usize>()
-    }
-
     fn reset_definition_candidates_query_count_for_test(&self) {
         for delegate in self.delegates.values() {
             delegate
@@ -2122,6 +2253,7 @@ impl crate::analyzer::AnalyzerTestHooks for MultiAnalyzer {
 mod tests {
     use super::*;
     use crate::analyzer::FileSetProject;
+    use brokk_bifrost_core::analyzer::{RelationalDefinitionQuery, RelationalName};
 
     fn project_file(rel_path: &str) -> ProjectFile {
         let root = if cfg!(windows) {
@@ -2147,7 +2279,7 @@ mod tests {
         let analyzer = MultiAnalyzer::default();
         assert_eq!(
             analyzer.derived_layer_budget_bytes,
-            crate::analyzer::structural::execution::derived::SnapshotDerivedLayerCache::DEFAULT_MAX_RETAINED_BYTES
+            crate::analyzer::structural::derived_cache::SnapshotDerivedLayerCache::DEFAULT_MAX_RETAINED_BYTES
         );
         assert_eq!(
             analyzer
@@ -2240,80 +2372,64 @@ mod tests {
     }
 
     #[test]
-    fn definition_query_builds_each_delegate_index_once_and_scans_nothing() {
+    fn relational_workspace_batch_merges_language_projections() {
         let (_temp, analyzer) = two_language_analyzer();
-        analyzer
-            .test_hooks()
-            .reset_global_usage_definition_index_build_count_for_test();
-        analyzer
-            .test_hooks()
-            .reset_full_declaration_scan_count_for_test();
+        let root = analyzer.project().root().to_path_buf();
+        let java_file = ProjectFile::new(root.clone(), "src/App.java");
+        let rust_file = ProjectFile::new(root, "src/lib.rs");
+        let java = analyzer
+            .declarations(&java_file)
+            .into_iter()
+            .find(CodeUnit::is_class)
+            .expect("Java class declaration");
+        let rust = analyzer
+            .declarations(&rust_file)
+            .into_iter()
+            .find(CodeUnit::is_class)
+            .expect("Rust struct declaration");
+        let requests = [
+            RelationalDefinitionRequest {
+                ordinal: 9,
+                language_scope: DefinitionLanguageScope::Workspace,
+                name: RelationalName::stable(java.fq().clone()),
+                query: RelationalDefinitionQuery::ExactName,
+            },
+            RelationalDefinitionRequest {
+                ordinal: 4,
+                language_scope: DefinitionLanguageScope::Workspace,
+                name: RelationalName::stable(rust.fq().clone()),
+                query: RelationalDefinitionQuery::ExactName,
+            },
+        ];
 
-        // Two queries, so a view that rebuilt per call would show it.
+        let RelationalBatchOutcome::Complete(results) =
+            analyzer.relational_definition_batch(&requests, &crate::CancellationToken::new())
+        else {
+            panic!("mixed relational batch should complete");
+        };
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].ordinal, 9);
+        assert_eq!(results[1].ordinal, 4);
         assert_eq!(
-            analyzer
-                .global_usage_definition_index()
-                .fqn("app.App")
-                .len(),
-            1
+            results[0].value,
+            RelationalDefinitionValue::Definitions(vec![java])
         );
         assert_eq!(
-            analyzer.global_usage_definition_index().fqn("Widget").len(),
-            1
-        );
-
-        for (language, delegate) in analyzer.delegates() {
-            assert_eq!(
-                delegate
-                    .analyzer()
-                    .test_hooks()
-                    .global_usage_definition_index_build_count_for_test(),
-                1,
-                "delegate {language:?} built its definition index more than once"
-            );
-        }
-        // The merged view answers out of the delegates' own indexes; it must
-        // never fall back to a full declaration scan per delegate.
-        assert_eq!(
-            analyzer.test_hooks().full_declaration_scan_count_for_test(),
-            0
+            results[1].value,
+            RelationalDefinitionValue::Definitions(vec![rust])
         );
     }
 
     #[test]
-    fn update_with_only_irrelevant_files_retains_indexes_and_snapshot_caches() {
+    fn update_with_only_irrelevant_files_retains_snapshot_caches() {
         let (_temp, analyzer) = two_language_analyzer();
         analyzer
             .test_hooks()
-            .reset_global_usage_definition_index_build_count_for_test();
-        analyzer
-            .test_hooks()
             .reset_full_declaration_scan_count_for_test();
-        assert_eq!(
-            analyzer
-                .global_usage_definition_index()
-                .fqn("app.App")
-                .len(),
-            1
-        );
 
         let readme = ProjectFile::new(analyzer.project().root().to_path_buf(), "README.md");
         let updated = analyzer.update(&BTreeSet::from([readme]));
 
-        assert_eq!(
-            updated.global_usage_definition_index().fqn("app.App").len(),
-            1
-        );
-        for (language, delegate) in updated.delegates() {
-            assert_eq!(
-                delegate
-                    .analyzer()
-                    .test_hooks()
-                    .global_usage_definition_index_build_count_for_test(),
-                1,
-                "delegate {language:?} rebuilt its definition index after an irrelevant change"
-            );
-        }
         assert_eq!(
             updated.test_hooks().full_declaration_scan_count_for_test(),
             0
@@ -2325,19 +2441,272 @@ mod tests {
     }
 
     #[test]
-    fn update_touching_an_analyzed_file_allocates_fresh_snapshot_caches() {
+    fn update_touching_an_analyzed_file_carries_the_content_keyed_caches_forward() {
         let (_temp, analyzer) = two_language_analyzer();
         let source = ProjectFile::new(analyzer.project().root().to_path_buf(), "src/App.java");
         let updated = analyzer.update(&BTreeSet::from([source]));
 
+        // The container is new because the semantic-model publication inside it
+        // is snapshot-scoped, but the two content-keyed caches ride the update
+        // (#2449): a value keyed by content an edit did not touch stays exact.
         assert!(!Arc::ptr_eq(
             &analyzer.snapshot_caches,
             &updated.snapshot_caches
         ));
+        assert!(std::ptr::eq(
+            analyzer.snapshot_caches.derived_layers(),
+            updated.snapshot_caches.derived_layers()
+        ));
+        assert!(std::ptr::eq(
+            analyzer.snapshot_caches.usage_graphs(),
+            updated.snapshot_caches.usage_graphs()
+        ));
+    }
+
+    fn ecosystem_identity(
+        analyzer: &MultiAnalyzer,
+        ecosystem: crate::analyzer::usages::workspace_graph::UsageEcosystem,
+    ) -> crate::analyzer::content_identity::WorkspaceContentIdentity {
+        analyzer
+            .workspace_content_identities()
+            .expect("a two-language analyzer states its content identities")
+            .scope(|language| {
+                crate::analyzer::usages::workspace_graph::UsageEcosystem::of(language) == ecosystem
+            })
+            .unwrap_or_else(|| panic!("no analyzed content for {ecosystem:?}"))
+    }
+
+    fn usage_graph_key(
+        analyzer: &MultiAnalyzer,
+        ecosystem: crate::analyzer::usages::workspace_graph::UsageEcosystem,
+    ) -> crate::analyzer::usages::workspace_graph_cache::WorkspaceUsageGraphCacheKey {
+        crate::analyzer::usages::workspace_graph_cache::WorkspaceUsageGraphCacheKey::new(
+            crate::analyzer::usages::workspace_graph_cache::WorkspaceUsageGraphKind::Exact,
+            [ecosystem],
+            ecosystem_identity(analyzer, ecosystem),
+        )
+    }
+
+    fn acquire_usage_graph(
+        analyzer: &MultiAnalyzer,
+        ecosystem: crate::analyzer::usages::workspace_graph::UsageEcosystem,
+    ) -> crate::analyzer::usages::workspace_graph_cache::WorkspaceUsageGraphCacheLifecycle {
+        use crate::analyzer::usages::workspace_graph::WorkspaceUsageRankingGraph;
+        use crate::analyzer::usages::workspace_graph_cache::{
+            WorkspaceUsageGraphCacheAcquisition, WorkspaceUsageGraphCacheBuildOutcome,
+        };
+        let acquisition = analyzer.snapshot_caches.usage_graphs().acquire(
+            usage_graph_key(analyzer, ecosystem),
+            &crate::cancellation::CancellationToken::default(),
+            || {
+                WorkspaceUsageGraphCacheBuildOutcome::Complete(WorkspaceUsageRankingGraph {
+                    nodes: Vec::new(),
+                    edges: Vec::new(),
+                    node_indices_by_file: crate::hash::HashMap::default(),
+                    resolved_ecosystems: vec![ecosystem],
+                })
+            },
+            || true,
+        );
+        match acquisition {
+            WorkspaceUsageGraphCacheAcquisition::Ready { lifecycle, .. } => lifecycle,
+            WorkspaceUsageGraphCacheAcquisition::Cancelled => panic!("unexpected cancellation"),
+            WorkspaceUsageGraphCacheAcquisition::Stale => panic!("unexpected stale result"),
+        }
+    }
+
+    /// Milestone J (#2449) case (a): a usage graph is scoped to its ecosystems,
+    /// so an edit to a language outside them must leave it reusable. Before the
+    /// caches were content-keyed, the whole cache was minted fresh on every
+    /// update and this graph was rebuilt for a file it does not contain.
+    #[test]
+    fn an_edit_to_one_language_keeps_another_ecosystems_usage_graph() {
+        use crate::analyzer::usages::workspace_graph::UsageEcosystem;
+        use crate::analyzer::usages::workspace_graph_cache::WorkspaceUsageGraphCacheLifecycle;
+
+        let (_temp, analyzer) = two_language_analyzer();
+        assert_eq!(
+            WorkspaceUsageGraphCacheLifecycle::Built,
+            acquire_usage_graph(&analyzer, UsageEcosystem::Rust)
+        );
+        assert_eq!(
+            WorkspaceUsageGraphCacheLifecycle::Built,
+            acquire_usage_graph(&analyzer, UsageEcosystem::Jvm)
+        );
+
+        let java = ProjectFile::new(analyzer.project().root().to_path_buf(), "src/App.java");
+        std::fs::write(
+            java.abs_path(),
+            "package app;\npublic class App { void added() {} }\n",
+        )
+        .unwrap();
+        let updated = analyzer.update(&BTreeSet::from([java]));
+
+        assert_eq!(
+            ecosystem_identity(&analyzer, UsageEcosystem::Rust),
+            ecosystem_identity(&updated, UsageEcosystem::Rust),
+            "a Java edit must not move the Rust content identity"
+        );
+        assert_ne!(
+            ecosystem_identity(&analyzer, UsageEcosystem::Jvm),
+            ecosystem_identity(&updated, UsageEcosystem::Jvm),
+            "a Java edit must move the JVM content identity"
+        );
+        assert_eq!(
+            WorkspaceUsageGraphCacheLifecycle::Hit,
+            acquire_usage_graph(&updated, UsageEcosystem::Rust),
+            "the Rust usage graph must survive an edit to a Java file"
+        );
+        assert_eq!(
+            WorkspaceUsageGraphCacheLifecycle::Built,
+            acquire_usage_graph(&updated, UsageEcosystem::Jvm),
+            "the JVM usage graph must be rebuilt for the edited Java content"
+        );
+    }
+
+    /// Milestone J (#2449) case (b): an update that rewrites a file with the
+    /// same bytes changes no content identity, so every content-keyed cache
+    /// answers from what it already holds.
+    #[test]
+    fn a_no_op_update_reuses_every_content_keyed_workspace_cache() {
+        use crate::analyzer::structural::derived_cache::{
+            DerivedLayerAcquisition, DerivedLayerBuildMetrics, DerivedLayerBuildOutcome,
+            DerivedLayerRequest,
+        };
+        use crate::analyzer::structural::index::StructuralIndexAcquisition;
+        use crate::analyzer::usages::workspace_graph::UsageEcosystem;
+        use crate::analyzer::usages::workspace_graph_cache::WorkspaceUsageGraphCacheLifecycle;
+        use crate::cancellation::CancellationToken;
+
+        let (_temp, analyzer) = two_language_analyzer();
+        let request = DerivedLayerRequest::complete_direct_import_topology();
+        let cancellation = CancellationToken::default();
+
+        let acquire_layer = |analyzer: &MultiAnalyzer| {
+            let content = analyzer
+                .workspace_content_identity()
+                .expect("a two-language analyzer states a whole-workspace identity");
+            let acquisition = analyzer.snapshot_caches.derived_layers().acquire(
+                request,
+                content,
+                &cancellation,
+                || DerivedLayerBuildOutcome::Unavailable {
+                    reason: "the test does not need a real topology".to_string(),
+                    over_budget: false,
+                    rejection_scope: None,
+                    metrics: DerivedLayerBuildMetrics::default(),
+                },
+                || true,
+            );
+            matches!(acquisition, DerivedLayerAcquisition::Unavailable { .. })
+        };
+        let structural_lifecycle = |analyzer: &MultiAnalyzer| {
+            let providers = analyzer.structural_fact_providers();
+            let provider = providers
+                .iter()
+                .find(|provider| provider.structural_language() == Language::Java)
+                .expect("the Java delegate is a structural provider");
+            let cache = provider
+                .snapshot_structural_index_cache()
+                .expect("a built-in provider owns a snapshot index cache");
+            match cache.inner().acquire(*provider, &cancellation) {
+                StructuralIndexAcquisition::Ready { lifecycle, .. } => lifecycle,
+                other => panic!(
+                    "the structural index must be acquirable: {}",
+                    match other {
+                        StructuralIndexAcquisition::Unavailable { reason, .. } =>
+                            reason.to_string(),
+                        _ => "cancelled".to_string(),
+                    }
+                ),
+            }
+        };
+
+        assert!(acquire_layer(&analyzer));
+        assert_eq!(
+            WorkspaceUsageGraphCacheLifecycle::Built,
+            acquire_usage_graph(&analyzer, UsageEcosystem::Jvm)
+        );
+        assert_eq!(
+            crate::analyzer::structural::index::StructuralIndexLifecycle::Built,
+            structural_lifecycle(&analyzer)
+        );
+
+        // Rewrite the same bytes: the file's blob identity is unchanged, so no
+        // content identity moves even though the analyzer reconciled the file.
+        let java = ProjectFile::new(analyzer.project().root().to_path_buf(), "src/App.java");
+        let source = std::fs::read_to_string(java.abs_path()).unwrap();
+        std::fs::write(java.abs_path(), source).unwrap();
+        let updated = analyzer.update(&BTreeSet::from([java]));
+
+        assert_eq!(
+            analyzer.workspace_content_identity(),
+            updated.workspace_content_identity(),
+            "a no-op update must not move the workspace content identity"
+        );
+        assert!(acquire_layer(&updated));
+        assert_eq!(
+            WorkspaceUsageGraphCacheLifecycle::Hit,
+            acquire_usage_graph(&updated, UsageEcosystem::Jvm)
+        );
+        assert_eq!(
+            crate::analyzer::structural::index::StructuralIndexLifecycle::Hit,
+            structural_lifecycle(&updated)
+        );
+        let (retained, _) = updated.snapshot_caches.usage_graphs().verdicts().totals();
+        assert!(
+            retained >= 1,
+            "the reuse must be recorded as a retention verdict"
+        );
+    }
+
+    /// Milestone J (#2449) case (c): a real content change rotates exactly the
+    /// identity of the language whose content moved, and the cache records the
+    /// typed rebuild verdict rather than silently missing.
+    #[test]
+    fn a_real_content_change_rotates_the_affected_identity() {
+        use crate::analyzer::invalidation::ArtifactVerdict;
+
+        let (_temp, analyzer) = two_language_analyzer();
+        let before = analyzer
+            .workspace_content_identities()
+            .expect("content identities");
+        assert_eq!(2, before.entries().len());
+
+        let rust = ProjectFile::new(analyzer.project().root().to_path_buf(), "src/lib.rs");
+        std::fs::write(rust.abs_path(), "pub struct Widget;\npub struct Gauge;\n").unwrap();
+        let updated = analyzer.update(&BTreeSet::from([rust]));
+        let after = updated
+            .workspace_content_identities()
+            .expect("content identities");
+
+        assert_ne!(
+            before.language(Language::Rust),
+            after.language(Language::Rust)
+        );
+        assert_eq!(
+            before.language(Language::Java),
+            after.language(Language::Java)
+        );
+        assert_ne!(before.whole_workspace(), after.whole_workspace());
+
+        use crate::analyzer::usages::workspace_graph::UsageEcosystem;
+        acquire_usage_graph(&analyzer, UsageEcosystem::Rust);
+        acquire_usage_graph(&updated, UsageEcosystem::Rust);
+        let verdicts = updated.snapshot_caches.usage_graphs().verdicts().recent();
+        assert!(
+            verdicts.iter().any(|verdict| matches!(
+                verdict,
+                ArtifactVerdict::Invalidated(
+                    crate::analyzer::invalidation::InvalidationReason::NoRetainedArtifact { .. }
+                )
+            )),
+            "the rebuild after a content change must be recorded: {verdicts:?}"
+        );
     }
 
     #[test]
-    fn overlay_snapshot_recomputes_the_merged_view_from_retained_delegates() {
+    fn overlay_snapshot_allocates_fresh_snapshot_caches() {
         let (_temp, analyzer) = two_language_analyzer();
         let project: Arc<dyn Project> = Arc::new(FileSetProject::new(
             analyzer.project().root().to_path_buf(),
@@ -2349,12 +2718,5 @@ mod tests {
             &analyzer.snapshot_caches,
             &snapshot.snapshot_caches
         ));
-        assert_eq!(
-            snapshot
-                .global_usage_definition_index()
-                .fqn("app.App")
-                .len(),
-            1
-        );
     }
 }

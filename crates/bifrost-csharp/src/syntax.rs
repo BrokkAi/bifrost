@@ -7,6 +7,7 @@
 //! `brokk-bifrost-analysis` re-exports the names its framework call sites and
 //! the rest of the C# seam already used.
 
+use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::model::{CallableArity, DispatchExtensibility};
 use brokk_bifrost_core::analyzer::tree_walk::ParentIndex;
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex};
@@ -207,6 +208,36 @@ pub fn csharp_normalize_full_name(fq_name: &str) -> String {
         .collect::<Vec<_>>()
         .join(".");
     normalize_csharp_constructor_name(normalized)
+}
+
+/// Canonicalize a declaration identity without reparsing its rendered name.
+///
+/// Generic arity and constructor spelling live inside individual semantic
+/// segments. `$`/`+` nested-owner separators are already represented by the
+/// segment kind, so changing `Nested`/`Companion` to `Type` gives the same dot
+/// join as [`csharp_normalize_full_name`] without splitting a string.
+pub fn csharp_normalize_fq_name(fq_name: &FqName) -> FqName {
+    let interner = segment_interner();
+    let mut normalized = FqName::new();
+    for (index, &segment_id) in fq_name.segments().iter().enumerate() {
+        let (text, kind) = interner.resolve(segment_id);
+        let normalized_kind = match kind {
+            SegmentKind::Nested | SegmentKind::Companion => SegmentKind::Type,
+            other => other,
+        };
+        let normalized_text = if index + 1 == fq_name.len() && text == "#ctor" {
+            normalized
+                .last()
+                .map(|owner| interner.resolve(owner).0)
+                .unwrap_or(text)
+        } else {
+            strip_csharp_generic_arity(text)
+        };
+        if !normalized_text.is_empty() {
+            normalized.push(interner.intern(normalized_text, normalized_kind));
+        }
+    }
+    normalized
 }
 
 fn normalize_csharp_constructor_name(normalized: String) -> String {
@@ -1228,7 +1259,9 @@ fn count_top_level_comma_separated(text: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::csharp_type_node_identity;
+    use super::{csharp_normalize_fq_name, csharp_normalize_full_name, csharp_type_node_identity};
+    use brokk_bifrost_core::analyzer::Language;
+    use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
     use tree_sitter::Parser;
 
     fn generic_identity(source: &str, spelling: &str) -> String {
@@ -1263,5 +1296,18 @@ mod tests {
             generic_identity("class C { Map<string, int> field; }", "Map<string, int>"),
             "Map`2"
         );
+    }
+
+    #[test]
+    fn structured_lookup_canonicalization_matches_the_legacy_spelling() {
+        let interner = segment_interner();
+        let mut name = FqName::new();
+        name.push(interner.intern("Demo", SegmentKind::Package));
+        name.push(interner.intern("Box`1", SegmentKind::Type));
+        name.push(interner.intern("#ctor", SegmentKind::Member));
+        let exact = name.display_native(Language::CSharp, interner);
+        let structured = csharp_normalize_fq_name(&name).display_native(Language::CSharp, interner);
+        assert_eq!(structured, csharp_normalize_full_name(&exact));
+        assert_eq!(structured, "Demo.Box.Box");
     }
 }

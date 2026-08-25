@@ -3,11 +3,10 @@ use crate::analyzer::store::StoreError;
 use crate::analyzer::usages::{DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES, FuzzyResult, UsageFinder};
 use crate::analyzer::{
     CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitType, CommentDensityStats,
-    DeclarationInfo, DefinitionIndexHandle, ExceptionHandlingAnalysis, ExceptionSmellWeights,
-    GlobalUsageDefinitionIndex, ImportAnalysisProvider, ParseError, Project, ProjectFile,
-    SearchSymbolCandidate, SemanticDiagnosticReport, TestAssertionAnalysis, TestAssertionSmell,
-    TestAssertionWeights, TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider,
-    UsageFactsIndex, metrics_from_declarations,
+    DeclarationInfo, ExceptionHandlingAnalysis, ExceptionSmellWeights, ImportAnalysisProvider,
+    ParseError, Project, ProjectFile, SearchSymbolCandidate, SemanticDiagnosticReport,
+    TestAssertionAnalysis, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
+    TypeAliasProvider, TypeHierarchyProvider, metrics_from_declarations,
 };
 use crate::cancellation::CancellationToken;
 use crate::gitblob;
@@ -29,6 +28,28 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// must not present an incomplete batch as an authoritative search result.
 #[doc(hidden)]
 pub type SearchSymbolCandidates = QueryBatch<SearchSymbolCandidate>;
+
+/// Forward [`IAnalyzer::relational_definition_batch`] from a public language
+/// analyzer wrapper to its generic `TreeSitterAnalyzer`. Keeping the forwarding
+/// body singular prevents one language from silently retaining a different
+/// point/batch contract during the migration.
+macro_rules! forward_relational_definition_batch {
+    () => {
+        fn relational_definition_batch(
+            &self,
+            requests: &[crate::analyzer::RelationalDefinitionRequest],
+            cancellation: &crate::CancellationToken,
+        ) -> crate::analyzer::RelationalBatchOutcome {
+            crate::analyzer::RelationalDefinitionLookup::batch(&self.inner, requests, cancellation)
+        }
+
+        fn active_query_cancellation(&self) -> Option<crate::CancellationToken> {
+            self.inner.active_query_cancellation()
+        }
+    };
+}
+
+pub(crate) use forward_relational_definition_batch;
 
 #[derive(Debug, Clone)]
 enum CompiledSymbolPatterns {
@@ -491,6 +512,52 @@ pub struct AnalyzerQueryContext {
     tier_accesses: [AtomicUsize; InformationTier::COUNT],
 }
 
+/// Tier crossings paid while constructing one workspace analyzer.
+///
+/// Construction happens before an [`AnalyzerQueryScope`] can exist, so the
+/// request-scoped counters cannot describe the work done by workspace open.
+/// This small observer gives that build a separate accounting boundary without
+/// changing the meaning of per-operation tier reports.
+#[derive(Debug)]
+pub struct AnalyzerBuildTierAccess {
+    active: std::sync::atomic::AtomicBool,
+    tier_accesses: [AtomicUsize; InformationTier::COUNT],
+}
+
+impl AnalyzerBuildTierAccess {
+    pub(crate) fn new_active() -> Self {
+        Self {
+            active: std::sync::atomic::AtomicBool::new(true),
+            tier_accesses: Default::default(),
+        }
+    }
+
+    pub(crate) fn finish(&self) {
+        self.active
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn record_tier_access(&self, tier: InformationTier) {
+        if !self.active.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        self.tier_accesses[tier.index()].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn tier_access_count(&self, tier: InformationTier) -> usize {
+        self.tier_accesses[tier.index()].load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Default for AnalyzerBuildTierAccess {
+    fn default() -> Self {
+        Self {
+            active: std::sync::atomic::AtomicBool::new(false),
+            tier_accesses: Default::default(),
+        }
+    }
+}
+
 /// One rung of the information-cost ladder (issue #2414).
 ///
 /// Bifrost answers a query by consuming progressively more expensive derived
@@ -532,30 +599,51 @@ impl InformationTier {
 #[doc(hidden)]
 #[derive(Default)]
 pub struct AnalyzerSnapshotCaches {
-    derived_layers: crate::analyzer::structural::execution::derived::SnapshotDerivedLayerCache,
-    usage_graphs: crate::analyzer::usages::workspace_graph_cache::SnapshotWorkspaceUsageGraphCache,
+    derived_layers: Arc<crate::analyzer::structural::derived_cache::SnapshotDerivedLayerCache>,
+    usage_graphs:
+        Arc<crate::analyzer::usages::workspace_graph_cache::SnapshotWorkspaceUsageGraphCache>,
     semantic_models: crate::analyzer::semantic_model::SemanticModelRuntimeCache,
 }
 
 impl AnalyzerSnapshotCaches {
     pub(crate) fn new(derived_layer_budget_bytes: u64) -> Self {
         Self {
-            derived_layers:
-                crate::analyzer::structural::execution::derived::SnapshotDerivedLayerCache::new(
+            derived_layers: Arc::new(
+                crate::analyzer::structural::derived_cache::SnapshotDerivedLayerCache::new(
                     derived_layer_budget_bytes,
                 ),
-            usage_graphs: crate::analyzer::usages::workspace_graph_cache::SnapshotWorkspaceUsageGraphCache::new(
-                derived_layer_budget_bytes,
             ),
+            usage_graphs: Arc::new(crate::analyzer::usages::workspace_graph_cache::SnapshotWorkspaceUsageGraphCache::new(
+                derived_layer_budget_bytes,
+            )),
             semantic_models: crate::analyzer::semantic_model::SemanticModelRuntimeCache::new(
                 derived_layer_budget_bytes,
             ),
         }
     }
 
-    pub(crate) fn derived_layers(
+    /// The caches an analyzer update inherits from the generation before it
+    /// (#2449).
+    ///
+    /// The derived layers and usage graphs are keyed by workspace content, so
+    /// an update cannot make an entry wrong: an entry whose content moved is
+    /// simply never asked for again and is retired by the cache's own byte
+    /// budget. The semantic-model publication is not content-keyed -- it
+    /// records what a host activated against one snapshot -- so it is minted
+    /// fresh, exactly as it was before this change.
+    pub(crate) fn carry_content_keyed_values_forward(&self) -> Self {
+        Self {
+            derived_layers: Arc::clone(&self.derived_layers),
+            usage_graphs: Arc::clone(&self.usage_graphs),
+            semantic_models: crate::analyzer::semantic_model::SemanticModelRuntimeCache::new(
+                self.derived_layers.max_retained_bytes(),
+            ),
+        }
+    }
+
+    pub fn derived_layers(
         &self,
-    ) -> &crate::analyzer::structural::execution::derived::SnapshotDerivedLayerCache {
+    ) -> &crate::analyzer::structural::derived_cache::SnapshotDerivedLayerCache {
         &self.derived_layers
     }
 
@@ -756,6 +844,18 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
     /// Ends a top-level query boundary and releases request-scoped memoized state.
     fn end_query(&self, _context: &Arc<AnalyzerQueryContext>) {}
 
+    /// The cancellation token carried by the innermost active query boundary.
+    ///
+    /// Compatibility APIs such as `CodeUnitIndex::definitions` cannot accept a
+    /// token without breaking their public contract. Their relational adapters
+    /// consult this hook so moving a lookup behind SQL does not make it
+    /// uncancellable. Implementations without request-scoped state return
+    /// `None` and retain their ordinary unbounded behavior.
+    #[doc(hidden)]
+    fn active_query_cancellation(&self) -> Option<CancellationToken> {
+        None
+    }
+
     /// Starts a disposable, file-local analyzer read used by broad sequential
     /// consumers such as semantic materialization.
     #[doc(hidden)]
@@ -841,14 +941,33 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
     where
         Self: Sized;
 
-    fn global_usage_definition_index(&self) -> DefinitionIndexHandle<'_> {
-        static EMPTY: OnceLock<GlobalUsageDefinitionIndex> = OnceLock::new();
-        DefinitionIndexHandle::Single(EMPTY.get_or_init(GlobalUsageDefinitionIndex::default))
+    /// Execute one typed relational definition batch through this analyzer's
+    /// store-backed language projection. Composite analyzers override this to
+    /// partition a mixed-language request without exposing store connections
+    /// to language crates.
+    fn relational_definition_batch(
+        &self,
+        _requests: &[crate::analyzer::RelationalDefinitionRequest],
+        _cancellation: &CancellationToken,
+    ) -> crate::analyzer::RelationalBatchOutcome {
+        crate::analyzer::RelationalBatchOutcome::Failed(crate::analyzer::RelationalBatchError::new(
+            "this analyzer does not provide relational definition lookup",
+        ))
     }
 
-    fn usage_facts_index(&self) -> &UsageFactsIndex {
-        static EMPTY: OnceLock<UsageFactsIndex> = OnceLock::new();
-        EMPTY.get_or_init(UsageFactsIndex::default)
+    /// Execute a relational batch from a compatibility API that has no token
+    /// parameter, inheriting the innermost request token when one exists.
+    #[doc(hidden)]
+    fn relational_definition_batch_for_active_query(
+        &self,
+        requests: &[crate::analyzer::RelationalDefinitionRequest],
+    ) -> crate::analyzer::RelationalBatchOutcome {
+        let local_cancellation = CancellationToken::new();
+        let active_cancellation = self.active_query_cancellation();
+        self.relational_definition_batch(
+            requests,
+            active_cancellation.as_ref().unwrap_or(&local_cancellation),
+        )
     }
 
     /// Return the declaration node's tree-sitter kind when structured syntax
@@ -1010,9 +1129,9 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
     /// per language whose adapter has a structural spec. Languages without a
     /// spec are absent; `query_code` reports them as capability diagnostics
     /// instead of silently returning nothing.
-    fn structural_search_providers(
+    fn structural_fact_providers(
         &self,
-    ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
+    ) -> Vec<&dyn crate::analyzer::structural::StructuralFactProvider> {
         Vec::new()
     }
 
@@ -1060,21 +1179,45 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
         None
     }
 
-    /// Monotonic source generations covered by the snapshot-owned derived
-    /// layer cache. A composite analyzer overrides this with one ordered entry
-    /// per delegate so a change outside its primary project cannot reuse stale
-    /// workspace-wide relations.
+    /// The content identity of every language scope this analyzer serves
+    /// (#2449).
+    ///
+    /// This is what the snapshot-scoped caches key on. It replaced the
+    /// process-local source-generation vector, which reported "something in
+    /// this process changed" and therefore threw away every workspace relation
+    /// on every edit. An identity moves only when the analyzed content, the
+    /// language epoch, or the analyzer configuration moves, and it names no
+    /// absolute path, so it also compares equal across two checkouts of the
+    /// same content.
+    ///
+    /// An analyzer that cannot answer returns `None`. That is not a licence to
+    /// reuse: a caller with no identity must rebuild and record
+    /// [`crate::analyzer::invalidation::InvalidationReason::ContentIdentityEvidenceMissing`].
     #[doc(hidden)]
-    fn snapshot_source_generations(&self) -> Box<[u64]> {
-        Box::new([self.project().analysis_generation()])
+    fn workspace_content_identities(
+        &self,
+    ) -> Option<crate::analyzer::content_identity::WorkspaceContentIdentities> {
+        None
     }
 
-    /// Allocation-free freshness check for a previously captured generation
-    /// vector. Composite analyzers override this to compare every delegate in
-    /// the same deterministic order as [`Self::snapshot_source_generations`].
+    /// The whole-workspace content identity, for a cache whose value spans
+    /// every language this analyzer serves.
     #[doc(hidden)]
-    fn snapshot_generations_match(&self, expected: &[u64]) -> bool {
-        expected == [self.project().analysis_generation()]
+    fn workspace_content_identity(
+        &self,
+    ) -> Option<crate::analyzer::content_identity::WorkspaceContentIdentity> {
+        self.workspace_content_identities()
+            .and_then(|identities| identities.whole_workspace())
+    }
+
+    /// Whether a previously captured whole-workspace identity is still the
+    /// current one. A missing identity is never a match.
+    #[doc(hidden)]
+    fn workspace_content_matches(
+        &self,
+        expected: crate::analyzer::content_identity::WorkspaceContentIdentity,
+    ) -> bool {
+        self.workspace_content_identity() == Some(expected)
     }
 
     fn autocomplete_definitions(&self, query: &str) -> Vec<CodeUnit> {
@@ -1346,14 +1489,6 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
 /// inherits [`NoOpAnalyzerTestHooks`] and behaves exactly as before.
 #[cfg(any(test, feature = "test-support"))]
 pub trait AnalyzerTestHooks {
-    #[doc(hidden)]
-    fn reset_global_usage_definition_index_build_count_for_test(&self) {}
-
-    #[doc(hidden)]
-    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
-        0
-    }
-
     #[doc(hidden)]
     fn reset_definition_candidates_query_count_for_test(&self) {}
 

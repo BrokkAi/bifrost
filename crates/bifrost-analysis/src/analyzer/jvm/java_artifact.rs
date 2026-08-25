@@ -1755,6 +1755,19 @@ pub(super) struct JavaClassSurfaceMember {
     /// full pack-production path, so dropping it here would make the same jar
     /// answer the question on one path and not on the other.
     pub(super) returns: Option<TypeRef>,
+    /// Whether the class file's member table marks this member `static`
+    /// (`FieldFlags::ACC_STATIC`/`MethodFlags::ACC_STATIC`), read verbatim
+    /// from `JavaApiMember::is_static` (#2538).
+    pub(super) is_static: bool,
+    /// The member kind the producer already classified this member as,
+    /// including whether a field is both `static` and `final`
+    /// (`MemberKind::Constant`, set by `class_field_member` exactly when the
+    /// class file's `FieldFlags::ACC_STATIC` and `FieldFlags::ACC_FINAL` are
+    /// both present). Kept verbatim from `JavaApiMember::member_kind` (#2538):
+    /// dropping it here, the way this surface previously did, made a
+    /// `static final` external field indistinguishable from an ordinary
+    /// mutable one to every caller of [`JavaClassSurface`].
+    pub(super) member_kind: MemberKind,
 }
 
 pub(super) enum JavaClassSurfaceOutcome {
@@ -1803,6 +1816,8 @@ pub(super) fn class_surface(
                     .map(|member| JavaClassSurfaceMember {
                         name: member.name,
                         visibility: member.visibility,
+                        is_static: member.is_static,
+                        member_kind: member.member_kind,
                         returns: member.signature.and_then(|signature| signature.returns),
                     })
                     .collect(),
@@ -2533,6 +2548,8 @@ mod tests {
         import java.util.List;\n\
         public class Surface<T> extends Base implements Contract {\n\
           public T value;\n\
+          public static int mutableStatic;\n\
+          public static final int CONST_VALUE = 7;\n\
           public Surface() {}\n\
           protected List<T> copy(T input) { return null; }\n\
           public <U> U convert(U value) { return value; }\n\
@@ -2681,6 +2698,78 @@ mod tests {
             Some(named_type("fixture.api.Dollar$Type".to_owned())),
             "a surface member must carry the return type its class file writes: {:?}",
             self_member.returns
+        );
+    }
+
+    /// #2538: a `static final` field's class-file access flags
+    /// (`ACC_STATIC`/`ACC_FINAL`) must survive `class_surface`'s narrowing
+    /// step so a later caller (`JvmExternalMember::is_compile_time_constant`)
+    /// can prove a read of it carries no attacker-influenced value flow. A
+    /// plain instance field and a mutable (non-`final`) static field must
+    /// both report the shapes that keep them *ineligible* for that proof, so
+    /// the discharge this member carries fails closed rather than
+    /// over-claiming.
+    #[test]
+    fn the_bounded_class_surface_carries_static_and_final_access_flags() {
+        let fixture = JavaFixture::new();
+        let limits = ArtifactProducerLimits::default();
+        let mut diagnostics = BoundedProducerDiagnostics::new(&limits);
+        let mut remaining_records = limits.max_records;
+        let mut record_limit_hit = false;
+        let entry = "fixture/api/Surface.class";
+        let bytes = fs::read(fixture.classes.join("fixture/api/Surface.class")).unwrap();
+        let JavaClassSurfaceOutcome::Declared(surface) = class_surface(
+            "fixture.jar",
+            entry,
+            &bytes,
+            limits.max_signature_depth,
+            &mut remaining_records,
+            &mut record_limit_hit,
+            &mut diagnostics,
+        ) else {
+            panic!("the fixture class must declare a surface");
+        };
+        let member = |name: &str| {
+            surface
+                .members
+                .iter()
+                .find(|member| member.name == name)
+                .unwrap_or_else(|| panic!("the surface must carry the declared member {name}"))
+        };
+
+        let constant = member("CONST_VALUE");
+        assert!(
+            constant.is_static,
+            "a `public static final` field must carry is_static: true"
+        );
+        assert_eq!(
+            constant.member_kind,
+            MemberKind::Constant,
+            "a field with both ACC_STATIC and ACC_FINAL must classify as MemberKind::Constant, \
+             got {:?}",
+            constant.member_kind
+        );
+
+        let mutable_static = member("mutableStatic");
+        assert!(
+            mutable_static.is_static,
+            "a `public static` (non-final) field must still carry is_static: true"
+        );
+        assert_ne!(
+            mutable_static.member_kind,
+            MemberKind::Constant,
+            "a `static` field without ACC_FINAL must not classify as MemberKind::Constant"
+        );
+
+        let instance = member("value");
+        assert!(
+            !instance.is_static,
+            "a plain instance field must not carry is_static: true"
+        );
+        assert_ne!(
+            instance.member_kind,
+            MemberKind::Constant,
+            "a non-static instance field must not classify as MemberKind::Constant"
         );
     }
 

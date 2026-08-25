@@ -6,7 +6,35 @@
 //! `CppAnalyzer` over a temp workspace, so it cannot cross the crate line.
 
 use super::*;
-use crate::analyzer::CodeUnitType;
+use crate::analyzer::{
+    CodeUnitType, DefinitionLanguageScope, RelationalBatchOutcome, RelationalDefinitionQuery,
+    RelationalDefinitionRequest, RelationalDefinitionValue,
+};
+use std::collections::BTreeSet;
+
+#[test]
+fn reconciliation_does_not_reenter_for_inline_constructor_without_metadata() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical temp dir");
+    ProjectFile::new(root.clone(), "temp_dir.cpp")
+        .write(
+            r#"class TempDir {
+public:
+    TempDir() {}
+};
+"#,
+        )
+        .expect("write constructor fixture");
+    let analyzer = CppAnalyzer::from_project(crate::TestProject::new(root, Language::Cpp));
+
+    let definitions = analyzer.get_definitions("TempDir");
+    assert!(
+        definitions
+            .iter()
+            .any(|unit| unit.is_class() && unit.fq_name() == "TempDir"),
+        "the class lookup must complete without constructor reconciliation re-entry: {definitions:#?}"
+    );
+}
 
 #[test]
 fn class_template_metadata_does_not_leak_into_ordinary_nested_classes() {
@@ -240,7 +268,122 @@ int DecoyOuter::DecoyInner::method() const { return 3; }
     assert_eq!(
         analyzer.visible_type_units_build_count_for_test(),
         1,
-        "only the matching candidate's file may pay the class-table build"
+        "the owner-bounded query may build only the matching candidate's class table"
+    );
+
+    let parsed = |name: &str| {
+        brokk_bifrost_core::analyzer::RelationalName::stable(
+            brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path_fq(
+                Language::Cpp,
+                name,
+                crate::analyzer::fq_name::segment_interner(),
+            ),
+        )
+    };
+    let member_name = "log4cxx.Outer$Inner.method";
+    let owner_name = "log4cxx.Outer$Inner";
+    let requests = [
+        (parsed(member_name), RelationalDefinitionQuery::ExactName),
+        (
+            parsed(member_name),
+            RelationalDefinitionQuery::NormalizedName,
+        ),
+        (
+            parsed(owner_name),
+            RelationalDefinitionQuery::StructuralChildren,
+        ),
+        (
+            parsed(owner_name),
+            RelationalDefinitionQuery::StructuralMembers {
+                identifier: "method".to_string(),
+            },
+        ),
+        (
+            parsed(owner_name),
+            RelationalDefinitionQuery::VisibleMembers {
+                identifier: "method".to_string(),
+            },
+        ),
+        (
+            parsed("method"),
+            RelationalDefinitionQuery::Identifier { file: None },
+        ),
+        (
+            parsed(member_name),
+            RelationalDefinitionQuery::CallableFacts,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(ordinal, (name, query))| RelationalDefinitionRequest {
+        ordinal,
+        language_scope: DefinitionLanguageScope::Language(Language::Cpp),
+        name,
+        query,
+    })
+    .collect::<Vec<_>>();
+    let RelationalBatchOutcome::Complete(results) =
+        analyzer.relational_definition_batch(&requests, &crate::CancellationToken::new())
+    else {
+        panic!("the cross-shape relational reconciliation batch must complete");
+    };
+    for result in results {
+        let declarations = match result.value {
+            RelationalDefinitionValue::Definitions(units) => units,
+            RelationalDefinitionValue::CallableFacts(facts) => {
+                facts.into_iter().map(|fact| fact.declaration).collect()
+            }
+            RelationalDefinitionValue::PackageRelation(_) => {
+                panic!("the reconciliation batch contains no package queries")
+            }
+        };
+        assert!(
+            declarations.iter().any(|unit| {
+                unit.fq_name() == member_name
+                    && unit.source().rel_path() == std::path::Path::new("impl.cpp")
+            }),
+            "query ordinal {} must include the reconciled out-of-line definition: {declarations:?}",
+            result.ordinal
+        );
+    }
+}
+
+#[test]
+fn retained_analyzer_reads_callable_facts_from_its_content_snapshot() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical temp dir");
+    let file = ProjectFile::new(root.clone(), "retained.cpp");
+    file.write("int Original(int value) { return value; }\n")
+        .unwrap();
+    let analyzer = CppAnalyzer::from_project(crate::TestProject::new(root, Language::Cpp));
+    let original = analyzer
+        .get_definitions("Original")
+        .into_iter()
+        .next()
+        .expect("original definition");
+
+    file.write("int Successor(int value) { return value + 1; }\n")
+        .unwrap();
+    let successor = analyzer.update(&BTreeSet::from([file]));
+    assert!(successor.get_definitions("Original").is_empty());
+
+    let request = RelationalDefinitionRequest {
+        ordinal: 0,
+        language_scope: DefinitionLanguageScope::Language(Language::Cpp),
+        name: brokk_bifrost_core::analyzer::RelationalName::stable(original.fq().clone()),
+        query: RelationalDefinitionQuery::CallableFacts,
+    };
+    let RelationalBatchOutcome::Complete(mut results) =
+        analyzer.relational_definition_batch(&[request], &crate::CancellationToken::new())
+    else {
+        panic!("retained callable request must complete");
+    };
+    let RelationalDefinitionValue::CallableFacts(facts) = results.remove(0).value else {
+        panic!("callable request returned the wrong value shape");
+    };
+    assert!(
+        facts.iter().any(|fact| fact.declaration == original),
+        "retained callable facts: {facts:?}"
     );
 }
 

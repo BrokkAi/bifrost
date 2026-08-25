@@ -252,6 +252,7 @@ pub(super) fn declaration_kind_name(kind: DeclarationKind) -> &'static str {
     match kind {
         DeclarationKind::Parameter => "parameter",
         DeclarationKind::ReceiverParameter => "receiver_parameter",
+        DeclarationKind::ImportAlias => "type",
         DeclarationKind::LambdaParameter => "lambda_parameter",
         DeclarationKind::LocalVariable
         | DeclarationKind::CatchParameter
@@ -374,6 +375,17 @@ impl DefinitionCandidateRenderCache {
         analyzer: &dyn IAnalyzer,
         unit: &CodeUnit,
     ) -> Option<(Range, Option<(usize, usize)>)> {
+        if unit.is_module() {
+            return Some((
+                Range {
+                    start_byte: 0,
+                    end_byte: 0,
+                    start_line: 1,
+                    end_line: 1,
+                },
+                Some((1, 1)),
+            ));
+        }
         let context = self
             .contexts
             .entry(unit.source().clone())
@@ -833,6 +845,17 @@ fn resolve_selectable_definition_groups_bounded(
         CodeUnitResolution::Ambiguous(matches) => matches,
         CodeUnitResolution::NotFound => {
             let Some(anchor) = &anchor else {
+                // No anchor can mean the splitter *refused* one: it only accepts
+                // an anchor that names exactly one file, so `path.c#VEC` with two
+                // `path.c` in the tree degrades to the plain name `path.c#VEC`
+                // and misses. Reporting "no symbol matched" hides the real
+                // problem, so name the candidate files instead.
+                if let Some(note) = ambiguous_selector_anchor_note(analyzer, input) {
+                    return Ok(SelectableDefinitionGroups::NotFound(not_found_input(
+                        input,
+                        Some(note),
+                    )));
+                }
                 return Ok(SelectableDefinitionGroups::NotFound(
                     symbol_not_found_input(input),
                 ));
@@ -879,6 +902,37 @@ fn resolve_selectable_definition_groups_bounded(
     })
 }
 
+/// The `path is ambiguous` note for a `path#symbol` input whose anchor matches
+/// several files by basename, or `None` when no split point names an ambiguous
+/// path.
+///
+/// `split_definition_selector_with_resolver` requires an anchor that resolves to
+/// exactly one file, so an ambiguous basename is not an anchor at all and the
+/// whole input degrades to a bare name that resolves to nothing. Re-probe the
+/// same split points, longest anchor first (the #1216 order), and answer with
+/// the wording `PathQualifiedSelector::AmbiguousPath` already uses for
+/// `path::symbol`, so both selector spellings teach the same recovery.
+fn ambiguous_selector_anchor_note(analyzer: &dyn IAnalyzer, input: &str) -> Option<String> {
+    if !input.contains('#') {
+        return None;
+    }
+    let resolver = WorkspaceFileResolver::for_analyzer(analyzer);
+    for (index, _) in input.match_indices('#').rev() {
+        let (anchor, name) = input.split_at(index);
+        let name = &name[1..];
+        if anchor.is_empty() || name.is_empty() || !looks_like_path_selector_anchor(anchor) {
+            continue;
+        }
+        if let ResolvedFileInput::Ambiguous(item) = resolver.resolve_literal(anchor) {
+            return Some(format!(
+                "path is ambiguous; retry with one of: {}",
+                item.matches.join(", ")
+            ));
+        }
+    }
+    None
+}
+
 pub(super) fn ambiguous_symbol_selector_note(matches: &[String]) -> Option<String> {
     matches.first().map(|example| {
         format!("Ambiguous; re-call with one selector from `matches` (e.g. {example}).")
@@ -918,6 +972,10 @@ pub(super) fn capped_ambiguous_symbol(target: &str, mut matches: Vec<String>) ->
 /// `…VerifyGeneratedCode#01.verified.cs`) truncated at its first `#` produced a
 /// plausible-looking anchor that names nothing and the real file was never
 /// tried (#1198).
+///
+/// The returned anchor is the *resolved* workspace-relative path whenever the
+/// anchor names a real file, not the string the caller typed. See
+/// [`split_definition_selector_with_workspace_files`] for why.
 pub(super) fn split_workspace_definition_selector<'a>(
     analyzer: &dyn IAnalyzer,
     input: &'a str,
@@ -930,13 +988,36 @@ pub(super) fn split_workspace_definition_selector<'a>(
 
 /// [`split_workspace_definition_selector`] for callers that already hold a
 /// [`WorkspaceFileResolver`] (its basename index is built once per instance).
+///
+/// The anchor is normalized to the resolved workspace-relative path. Every
+/// consumer narrows candidates with `rel_path_string(unit.source()) == anchor`
+/// (`anchor_scoped_codeunit_resolution` here, plus `sources.rs` and
+/// `definitions.rs`), so a raw anchor that is not already a full relative path
+/// filters everything away. `resolve_literal` accepts a unique *basename*, so
+/// `path.c#VEC` for `src/util/path.c` split cleanly and then matched no unit at
+/// all, reporting "`VEC` resolved, but no definition is in `path.c`".
+/// [`split_path_qualified_definition_selector`] has always normalized this way;
+/// the `#` splitter was the odd one out.
+///
+/// An anchor that names no file keeps the raw spelling: a slash-bearing anchor
+/// is accepted on shape alone precisely so a typo (`src/wrong.js#Widget`) still
+/// reaches the anchor-recovery diagnostics that quote it back.
 pub(super) fn split_definition_selector_with_workspace_files<'a>(
     resolver: &WorkspaceFileResolver<'_>,
     input: &'a str,
 ) -> DefinitionSelector<'a> {
-    split_definition_selector_with_resolver(input, |anchor| {
+    match split_definition_selector_with_resolver(input, |anchor| {
         matches!(resolver.resolve_literal(anchor), ResolvedFileInput::File(_))
-    })
+    }) {
+        DefinitionSelector::FileAnchored { anchor, lookup } => DefinitionSelector::FileAnchored {
+            anchor: match resolver.resolve_literal(&anchor) {
+                ResolvedFileInput::File(file) => rel_path_string(&file),
+                _ => anchor,
+            },
+            lookup,
+        },
+        selector @ DefinitionSelector::Name(_) => selector,
+    }
 }
 
 /// File-aware split: `#`-bearing paths (marked's fixture

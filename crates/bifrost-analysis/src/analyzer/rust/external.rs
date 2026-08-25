@@ -505,6 +505,8 @@ mod tests {
                 ExternalArtifactKind::RustdocJson,
                 path,
             )],
+            scope: crate::analyzer::topology::DependencyScope::Unknown,
+            declared_by: None,
         }
     }
 

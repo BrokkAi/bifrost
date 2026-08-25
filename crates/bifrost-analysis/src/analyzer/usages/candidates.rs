@@ -1,4 +1,5 @@
 use crate::analyzer::common::source_identifier_for_target;
+use crate::analyzer::languages::language_support;
 use crate::analyzer::usages::common::{
     analyzed_files_for_language, language_for_file, language_for_target,
 };
@@ -75,6 +76,7 @@ fn find_import_graph_candidates(
         && target.is_function()
         && let Some(parent) = analyzer.parent_of(target)
         && parent.is_class()
+        && !is_constructor_target(target, analyzer)
     {
         // The index build behind this call is the one that used to run past
         // the request's whole budget without ever looking at it (#1748). A
@@ -152,8 +154,20 @@ fn find_import_graph_candidates(
     // resolves every Rust file's imports first and then repeats the same walk.
     // The standalone provider has no prepared phase, so it retains this path.
     let rust_prepared_query_owns_importers = target_language == Language::Rust && scope.is_some();
+    // Some languages own a structured transitive reverse-import relation that is both
+    // more complete and cheaper than the generic workspace-wide importer walk. Dispatch
+    // through the language registry so this framework stays independent of its providers.
+    let language_importers_own_candidates = language_support(target_language)
+        .and_then(|support| {
+            support.transitive_referencing_files(analyzer, &source_files, cancellation)
+        })
+        .is_some_and(|importers| {
+            candidates.extend(importers);
+            true
+        });
     if target_language != Language::Python
         && !rust_prepared_query_owns_importers
+        && !language_importers_own_candidates
         && let Some(import_provider) = analyzer.import_analysis_provider()
     {
         let importer_files = usage_ecosystem_files(analyzer.analyzed_files(), target_language);
@@ -190,6 +204,13 @@ fn find_import_graph_candidates(
     add_cross_language_jvm_candidates(target, analyzer, &mut candidates, cancellation);
 
     candidates
+}
+
+fn is_constructor_target(target: &CodeUnit, analyzer: &dyn IAnalyzer) -> bool {
+    analyzer
+        .signature_metadata(target)
+        .iter()
+        .any(|metadata| metadata.callable_is_constructor())
 }
 
 /// Files that can name declarations in `target_language` through the usage
@@ -771,13 +792,50 @@ pub(crate) fn find_default_candidates_within(
     scope: &DescendantIndexScope<'_>,
 ) -> HashSet<ProjectFile> {
     let cancellation = scope.cancellation();
-    apply_fallback_policy(
+    let candidates = apply_fallback_policy(
         target,
         analyzer,
         || find_import_graph_candidates(target, analyzer, Some(scope)),
         || find_text_candidates(target, analyzer, Some(cancellation)),
         || cancellation.is_cancelled(),
-    )
+    );
+    if !cpp_free_function_requires_written_identifier(target, analyzer)
+        || cancellation.is_cancelled()
+    {
+        return candidates;
+    }
+
+    // A C++ free function can be called, have its address taken, or be
+    // redeclared only where its source identifier is written. The reverse
+    // include closure remains necessary to establish visibility, but shared
+    // headers can otherwise admit hundreds of translation units that cannot
+    // possibly contain a use. Use the spelling only to narrow file admission;
+    // the C++ AST resolver still proves every occurrence reported as a usage.
+    let written_identifier_candidates = find_text_candidates(target, analyzer, Some(cancellation));
+    if written_identifier_candidates.is_empty() {
+        // Preserve the graph result on read failures and for unusual targets
+        // whose source identifier cannot be recovered.
+        return candidates;
+    }
+    candidates
+        .intersection(&written_identifier_candidates)
+        .cloned()
+        .collect()
+}
+
+fn cpp_free_function_requires_written_identifier(
+    target: &CodeUnit,
+    analyzer: &dyn IAnalyzer,
+) -> bool {
+    if language_for_target(target) != Language::Cpp || !target.is_function() {
+        return false;
+    }
+    let identifier = source_identifier_for_target(target);
+    !identifier.trim().is_empty()
+        && !identifier.starts_with("operator")
+        && analyzer
+            .parent_of(target)
+            .is_none_or(|owner| !owner.is_class())
 }
 
 fn is_cancelled(cancellation: Option<&CancellationToken>) -> bool {
@@ -787,8 +845,11 @@ fn is_cancelled(cancellation: Option<&CancellationToken>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::CodeUnitIndex;
+    use crate::analyzer::KotlinAnalyzer;
     use crate::analyzer::workspace::EmptyAnalyzer;
     use crate::analyzer::{CodeUnitType, ImportInfo, Language};
+    use crate::test_support::AnalyzerFixture;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// The importer walks take a `QueryToken`, and these tests drive them with
@@ -911,6 +972,50 @@ mod tests {
                 "unexpected Scala operator {identifier:?}"
             );
         }
+    }
+
+    /// Constructors do not participate in polymorphic dispatch. Before this
+    /// gate, asking for one constructor's usages built Kotlin's complete
+    /// descendant index and resolved every unrelated class hierarchy in the
+    /// workspace (#1748).
+    #[test]
+    fn kotlin_constructor_candidates_skip_workspace_descendant_resolution() {
+        let unrelated_hierarchy = (0..64)
+            .map(|index| format!("open class Base{index}\nclass Child{index} : Base{index}()\n"))
+            .collect::<String>();
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Kotlin,
+            &[
+                (
+                    "DuplicateColumnException.kt",
+                    "package api\nclass DuplicateColumnException(message: String) : Exception(message)\n",
+                ),
+                ("Unrelated.kt", &unrelated_hierarchy),
+            ],
+        );
+        let analyzer = KotlinAnalyzer::new(Arc::new(fixture.test_project().clone()));
+        let constructor = analyzer
+            .get_all_declarations()
+            .into_iter()
+            .find(|unit| unit.fq_name() == "api.DuplicateColumnException.DuplicateColumnException")
+            .expect("fixture declares the DuplicateColumnException constructor");
+        assert!(is_constructor_target(&constructor, &analyzer));
+
+        let cancellation = CancellationToken::default();
+        let scope = DescendantIndexScope::whole_workspace(&cancellation);
+        analyzer
+            .test_hooks()
+            .reset_definition_candidates_query_count_for_test();
+        let candidates = find_default_candidates_within(&constructor, &analyzer, &scope);
+        let definition_queries = analyzer
+            .test_hooks()
+            .definition_candidates_query_count_for_test();
+
+        assert!(candidates.contains(constructor.source()));
+        assert!(
+            definition_queries < 8,
+            "constructor discovery must not resolve the unrelated workspace hierarchy; got {definition_queries} definition queries"
+        );
     }
 
     #[test]

@@ -1,11 +1,11 @@
 mod common;
 
-use brokk_bifrost_analysis::analyzer::structural::{
-    RuneIrLanguage, RuneIrLimits, RuneIrSelection, SCHEMA_VERSION, render_source_rune_ir,
-};
 use brokk_bifrost_analysis::{BIFROST_IGNORE_FILE_NAME, Language};
 use brokk_bifrost_policy::{
     PolicyFormatOptions, format_rqlp_source, format_rqlp_source_with_options,
+};
+use brokk_bifrost_rql::{
+    RuneIrLanguage, RuneIrLimits, RuneIrSelection, SCHEMA_VERSION, render_source_rune_ir,
 };
 use common::lsp_client::{LspServer, uri_for};
 use serde_json::{Value, json};

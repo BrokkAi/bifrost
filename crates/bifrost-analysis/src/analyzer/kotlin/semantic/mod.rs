@@ -228,11 +228,15 @@ fn kotlin_capabilities() -> SemanticCapabilities {
     //   is an ordinary stdlib higher-order call, already represented as a call
     //   site plus a lambda procedure, so claiming partial resource management
     //   would describe a construct the language does not have.
+    // * `GuardFacts` — this adapter normalizes no branch conditions, so an
+    //   empty `guard_facts` table means "this language publishes no guard
+    //   facts" rather than "this procedure has no decision" (#2443).
     for capability in [
         SemanticCapability::AsyncSuspendResume,
         SemanticCapability::GeneratorSuspension,
         SemanticCapability::ConcurrentSpawn,
         SemanticCapability::ResourceManagement,
+        SemanticCapability::GuardFacts,
     ] {
         builder = builder.unsupported(capability);
     }

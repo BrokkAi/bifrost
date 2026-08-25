@@ -1,22 +1,20 @@
-#[cfg(test)]
-pub(crate) mod benchmark_provenance;
-pub(crate) mod bounded_output;
+mod analyzer_definition_lookup;
 mod clone_detection;
 pub mod cognitive_complexity;
 #[cfg(test)]
 mod cognitive_complexity_tests;
 mod comment_density;
 pub mod common;
-mod complete_value_cache;
+pub mod content_identity;
+pub mod correspondence;
 mod cpp;
 mod csharp;
-pub mod dataflow;
 pub mod declaration_range;
 pub(crate) mod exception_handling;
-mod global_usage_definition_index;
 mod go;
 mod i_analyzer;
 mod index_warmer;
+pub mod invalidation;
 mod java;
 mod javascript;
 mod js_ts;
@@ -29,6 +27,7 @@ pub mod packs_document;
 mod php;
 mod python;
 pub mod reference_candidates;
+pub(crate) mod relational_frontier;
 mod ruby;
 mod rust;
 mod scala;
@@ -38,18 +37,16 @@ mod source_ingestion;
 pub mod store;
 pub mod structural;
 pub(crate) mod symbol_lookup;
-pub mod taint;
+pub mod topology;
 pub use brokk_bifrost_core::analyzer::test_assertions;
 pub(crate) mod tier_demand;
 pub mod tree_sitter_analyzer;
 pub(crate) mod tree_walk;
 mod typescript;
-pub mod typestate;
-mod usage_facts;
 pub mod usages;
-pub mod value_flow;
 pub(crate) use brokk_bifrost_core::analyzer::weighted_cache;
-mod work_budget;
+pub(crate) use brokk_bifrost_core::analyzer::work_budget;
+pub(crate) use brokk_bifrost_core::complete_value_cache;
 mod workspace;
 
 // The model layer moved to `brokk-bifrost-core` (the analyzer data model, the
@@ -67,7 +64,12 @@ use brokk_bifrost_core::analyzer::{
 pub(crate) use brokk_bifrost_core::analyzer::{dense_id, fq_name, type_relations};
 pub use code_unit_index::CodeUnitIndex;
 pub(crate) use code_unit_index::default_parent_fq_name;
-pub(crate) use definition_lookup::{BoundedDefinitionLookup, sort_units};
+pub(crate) use definition_lookup::{
+    BoundedDefinitionLookup, DefinitionLanguageScope, RelationalBatchError, RelationalBatchOutcome,
+    RelationalCallableFact, RelationalDefinitionFrontier, RelationalDefinitionLookup,
+    RelationalDefinitionQuery, RelationalDefinitionQuestion, RelationalDefinitionRequest,
+    RelationalDefinitionResult, RelationalDefinitionValue, RelationalFrontierOutcome, sort_units,
+};
 
 pub(crate) use brokk_bifrost_cpp::imports::{
     include_paths as cpp_include_paths, resolve_include_targets, resolve_include_targets_with_index,
@@ -112,6 +114,8 @@ pub use csharp::external::{
 // block's consumers with it. What remains is what the parked definition route
 // (`usages/get_definition/csharp.rs`, `usages/get_type/csharp.rs`) and the
 // framework hub still read.
+pub use analyzer_definition_lookup::AnalyzerDefinitionLookup;
+pub(crate) use analyzer_definition_lookup::{ForwardQueryProvider, impl_forward_query_provider};
 pub(crate) use csharp::{
     csharp_attribute_name_node, csharp_attribute_type_names, csharp_callable_arity,
     csharp_conditional_member_access, csharp_member_name, csharp_method_generic_arity,
@@ -119,10 +123,6 @@ pub(crate) use csharp::{
 };
 pub use csharp::{csharp_source_name_segment, strip_csharp_generic_arity};
 pub use fq_name::FqName;
-pub(crate) use global_usage_definition_index::{
-    AnalyzerDefinitionLookup, ForwardQueryProvider, impl_forward_query_provider,
-};
-pub use global_usage_definition_index::{DefinitionIndexHandle, GlobalUsageDefinitionIndex};
 // Go language knowledge lives in `brokk-bifrost-go`; these keep their
 // historical `crate::analyzer::` paths for the analysis-side consumers
 // (symbol_lookup, searchtools, the definition routes).
@@ -135,8 +135,8 @@ pub use go::{
 };
 pub use i_analyzer::AnalyzerStreamingFileScope;
 pub use i_analyzer::{
-    AnalyzerQueryContext, AnalyzerSnapshotCaches, IAnalyzer, QueryBatch, SearchSymbolCandidates,
-    SearchSymbolPatternBatch, WorkspaceFileIndex, WorkspaceFileIndexCell,
+    AnalyzerBuildTierAccess, AnalyzerQueryContext, AnalyzerSnapshotCaches, IAnalyzer, QueryBatch,
+    SearchSymbolCandidates, SearchSymbolPatternBatch, WorkspaceFileIndex, WorkspaceFileIndexCell,
 };
 pub use i_analyzer::{AnalyzerQueryScope, InformationTier, QueryScope, QueryToken};
 #[cfg(any(test, feature = "test-support"))]
@@ -221,13 +221,12 @@ pub use source_ingestion::{
 };
 pub(crate) use tree_sitter_analyzer::{
     AnalyzerStoreContext, BuildAbort, BulkFileStateSource, ephemeral_store_context,
-    persistent_store_context,
+    persistent_store_context, persistent_store_context_without_automatic_gc,
 };
 pub use tree_sitter_analyzer::{
     BuildProgress, BuildProgressEvent, BuildProgressPhase, LanguageAdapter, TreeSitterAnalyzer,
 };
 pub use typescript::TypescriptAnalyzer;
-pub(crate) use usage_facts::UsageFactsIndex;
 pub use workspace::{
     DependencyPackActivationOutcome, DependencyPackEcosystem, DependencyPackEcosystemOutcome,
     DependencyPackWorkspaceContext, EmptyAnalyzer, PythonSemanticModelActivationOutcome,
@@ -261,9 +260,7 @@ pub fn parser_language_for(language: Language) -> Option<tree_sitter::Language> 
 /// [`LanguageDialect`] itself is core-owned so language crates can name it;
 /// the grammar registry it would need for this is analysis machinery, so the
 /// resolution stays here as a free function.
-pub(crate) fn parser_language_for_dialect(
-    dialect: LanguageDialect,
-) -> Option<tree_sitter::Language> {
+pub fn parser_language_for_dialect(dialect: LanguageDialect) -> Option<tree_sitter::Language> {
     parser_language_for_flavor(dialect.language(), ParserFlavor::for_dialect(dialect))
 }
 
@@ -289,8 +286,6 @@ pub(crate) fn parser_flavor_for_path(language: Language, path: &std::path::Path)
 
 /// Resolve the normalized structural adapter registered for a language
 /// without constructing a workspace analyzer.
-pub(crate) fn structural_spec_for(
-    language: Language,
-) -> Option<&'static dyn structural::StructuralSpec> {
+pub fn structural_spec_for(language: Language) -> Option<&'static dyn structural::StructuralSpec> {
     languages::language_support(language).map(languages::LanguageSupport::structural_spec)
 }

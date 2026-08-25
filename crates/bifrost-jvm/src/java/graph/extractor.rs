@@ -5,14 +5,16 @@ use super::resolver::{
     bare_field_context_matches_target, bare_method_context_matches_target,
     constructor_method_reference_receiver, has_proven_static_import, infer_type_from_value,
     is_declaration_name, is_ignored_type_context, is_module_type_reference,
-    java_method_signatures_match, nested_type_for_owner, node_text, receiver_matches_target,
-    receiver_type_matches_target, resolve_field_access_type, resolve_field_access_type_segments,
-    resolve_non_nested_type_from_node, resolve_type_from_node, resolve_type_segments,
-    same_owner_context, seed_class_binding,
+    is_record_pattern_type_reference, java_method_signatures_match, nested_type_for_owner,
+    node_text, receiver_matches_target, receiver_type_matches_target, resolve_field_access_type,
+    resolve_field_access_type_segments, resolve_non_nested_type_from_node, resolve_type_from_node,
+    resolve_type_segments, same_owner_context, seed_class_binding,
 };
-use super::return_type::{FileReturnCache, MethodAnonymousReturnCache, MethodReturnCache};
+use super::return_type::{
+    FileReturnCache, MethodAnonymousReturnCache, MethodReturnCache, java_type_name_components,
+};
 use crate::java::graph_support::{
-    JavaSource, java_switch_selector_expression, resolve_java_usage_type_name_in,
+    JavaSource, java_switch_selector_expression, resolve_java_usage_type_components_in,
 };
 use crate::java::structural::expression_name_node;
 use brokk_bifrost_core::analyzer::model::{CodeUnit, ProjectFile};
@@ -90,16 +92,14 @@ impl ScanCtx<'_> {
     /// the reference. Only the universe of declarations widens here — Java's
     /// visibility rules are unchanged, so a class in another package still needs
     /// an import (#1239 milestone 4).
-    pub fn resolve_realm_type_name(&self, type_name: &str) -> Option<CodeUnit> {
-        self.graph.with_definitions(|definitions| {
-            resolve_java_usage_type_name_in(
-                self.java,
-                self.graph.token,
-                definitions,
-                self.file,
-                type_name,
-            )
-        })
+    pub fn resolve_realm_type_components(&self, components: &[String]) -> Option<CodeUnit> {
+        resolve_java_usage_type_components_in(
+            self.java,
+            self.graph.token,
+            self.graph.relational_definitions,
+            self.file,
+            components,
+        )
     }
 }
 
@@ -132,9 +132,12 @@ pub fn scan_file(
     let Some(tree) = parser.parse(source.as_str(), None) else {
         return;
     };
+    if !tree_contains_target_terminal(tree.root_node(), &source, &spec.member_name) {
+        return;
+    }
     let line_starts = compute_line_starts(&source);
     let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
-    seed_class_binding(java, token, file, spec, &mut bindings);
+    seed_class_binding(java, token, graph, file, spec, &mut bindings);
     let mut ctx = ScanCtx {
         java,
         graph,
@@ -159,6 +162,36 @@ pub fn scan_file(
         class_scope_depths: Vec::new(),
     };
     scan_node(tree.root_node(), token, &mut ctx);
+}
+
+/// Whether this parsed file contains the target's terminal symbol at all.
+///
+/// A path-scoped query receives ranked files, not occurrence candidates. Most
+/// of those files cannot mention the requested declaration. Building local
+/// type inference for them asks relational definition questions about every
+/// unrelated declaration in the file before the semantic hit checks reject
+/// them. The Java grammar represents every type, method, field, constructor,
+/// and import terminal that the scanner can match as an `identifier` or
+/// `type_identifier`, so this AST pass is an exact necessary condition. The
+/// semantic scan still proves identity for every file that passes it.
+fn tree_contains_target_terminal(root: Node<'_>, source: &str, target: &str) -> bool {
+    let mut found = false;
+    walk_tree_iterative(
+        root,
+        &mut found,
+        |node, found| {
+            if matches!(node.kind(), "identifier" | "type_identifier")
+                && node_text(node, source) == target
+            {
+                *found = true;
+                TreeWalkAction::Stop
+            } else {
+                TreeWalkAction::Descend
+            }
+        },
+        |_| {},
+    );
+    found
 }
 
 fn scan_node(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
@@ -406,6 +439,9 @@ fn maybe_record_type_hit(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCt
     }) {
         return;
     }
+    if !tree_contains_target_terminal(type_node, ctx.source, &ctx.spec.member_name) {
+        return;
+    }
     if is_ignored_type_context(type_node) {
         return;
     }
@@ -422,12 +458,15 @@ fn maybe_record_type_hit(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCt
 }
 
 fn record_selector_type_segments(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
+    if !tree_contains_target_terminal(node, ctx.source, &ctx.spec.member_name) {
+        return;
+    }
     let segments = match node.kind() {
         "field_access" => resolve_field_access_type_segments(
             node,
             ctx.source,
             |base| Ok(resolve_selector_root_type(base, token, ctx)),
-            |qualified| ctx.resolve_realm_type_name(qualified),
+            |qualified| ctx.resolve_realm_type_components(qualified),
             |owner, name| nested_type_for_owner(owner, name, ctx),
         ),
         "identifier"
@@ -456,7 +495,8 @@ fn resolve_selector_root_type(
 ) -> Option<CodeUnit> {
     let name = node_text(node, ctx.source);
     let direct = || {
-        ctx.resolve_realm_type_name(name)
+        java_type_name_components(node, ctx.source)
+            .and_then(|components| ctx.resolve_realm_type_components(&components))
             .or_else(|| resolve_non_nested_type_from_node(node, token, ctx))
     };
     match ctx.bindings.resolve_symbol(name) {
@@ -597,11 +637,9 @@ fn maybe_record_constructor_method_reference(
     if owner != ctx.spec.owner {
         return;
     }
-    let constructor_fqn = format!("{}.{}", owner.fq_name(), owner.identifier());
     let candidates = ctx
-        .java
-        .usage_definitions(token)
-        .fqn(&constructor_fqn)
+        .graph
+        .structural_members(owner.fq(), owner.identifier())
         .into_iter()
         .filter(|candidate| candidate.is_function() && !candidate.is_synthetic())
         .collect::<Vec<_>>();
@@ -804,7 +842,7 @@ fn method_reference_owner_fq_names(
                     Ok(resolve_type_from_node(base, token, ctx))
                 }
             },
-            |qualified| ctx.resolve_realm_type_name(qualified),
+            |qualified| ctx.resolve_realm_type_components(qualified),
             |owner, name| nested_type_for_owner(owner, name, ctx),
         )
         .map(|owner| vec![owner.fq_name()])
@@ -817,31 +855,27 @@ fn method_reference_owner_fq_names(
 
 fn method_reference_candidates_for_owner(
     owner_fq_name: &str,
-    token: QueryToken<'_>,
+    _token: QueryToken<'_>,
     ctx: &ScanCtx<'_>,
 ) -> Vec<CodeUnit> {
-    let mut candidates = ctx
-        .java
-        .usage_definitions(token)
-        .fqn(&format!("{owner_fq_name}.{}", ctx.spec.member_name))
-        .iter()
-        .filter(|unit| unit.is_function())
-        .cloned()
-        .collect::<Vec<_>>();
     let Some(owner) = ctx.graph.index.definitions(owner_fq_name).next() else {
-        return candidates;
+        return Vec::new();
     };
+    let mut candidates = ctx
+        .graph
+        .structural_members(owner.fq(), &ctx.spec.member_name)
+        .into_iter()
+        .filter(CodeUnit::is_function)
+        .collect::<Vec<_>>();
     let Some(provider) = ctx.graph.hierarchy else {
         return candidates;
     };
     for ancestor in provider.get_ancestors(&owner) {
         candidates.extend(
-            ctx.java
-                .usage_definitions(token)
-                .fqn(&format!("{}.{}", ancestor.fq_name(), ctx.spec.member_name))
-                .iter()
-                .filter(|unit| unit.is_function())
-                .cloned(),
+            ctx.graph
+                .structural_members(ancestor.fq(), &ctx.spec.member_name)
+                .into_iter()
+                .filter(CodeUnit::is_function),
         );
     }
     candidates.sort();
@@ -869,16 +903,23 @@ fn maybe_record_method_declaration_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if owner.fq_name() == ctx.spec.owner.fq_name() {
         return;
     }
-    if !ctx
-        .spec
-        .declaration_owner_fq_names
-        .contains(&owner.fq_name())
+    if !enclosing.is_function()
+        || !java_method_signatures_match(ctx.java, &ctx.spec.target, enclosing)
     {
         return;
     }
-    if enclosing.is_function()
-        && java_method_signatures_match(ctx.java, &ctx.spec.target, enclosing)
-    {
+    let Some(hierarchy) = ctx.graph.hierarchy else {
+        return;
+    };
+    let candidate_overrides_target = hierarchy
+        .get_ancestors(owner)
+        .iter()
+        .any(|ancestor| ancestor == &ctx.spec.owner);
+    let target_overrides_candidate = hierarchy
+        .get_ancestors(&ctx.spec.owner)
+        .iter()
+        .any(|ancestor| ancestor == owner);
+    if candidate_overrides_target || target_overrides_candidate {
         hits::push_override_declaration_hit(node, ctx);
     }
 }
@@ -959,6 +1000,7 @@ fn maybe_record_field_hit(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanC
 fn type_reference_node(node: Node<'_>) -> Option<Node<'_>> {
     match node.kind() {
         "type_identifier" | "scoped_type_identifier" | "generic_type" => Some(node),
+        "identifier" | "scoped_identifier" if is_record_pattern_type_reference(node) => Some(node),
         "identifier" | "scoped_identifier" if is_module_type_reference(node) => Some(node),
         "annotation" | "marker_annotation" => node.child_by_field_name("name"),
         _ => None,

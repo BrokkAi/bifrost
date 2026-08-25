@@ -11,7 +11,7 @@ Receiver-bearing structural sites can expose Bifrost's bounded, demand-driven re
 
 Every analyzed input produces a `receiver_analysis` row. Read its `outcome` before using its candidates: `precise`, `ambiguous`, `unknown`, `unsupported`, and `exceeded_budget` are distinct states. This is not whole-program points-to, general alias analysis, path-sensitive control flow, taint, or data-flow analysis.
 
-> Last verified end to end: 2026-08-06 (`query_code` schema version 1).
+> Last verified end to end: 2026-08-21 (`query_code` schema version 1).
 
 ## Fixture
 
@@ -204,7 +204,7 @@ The nested report above is the compatibility projection. Policy evaluation and r
 
 <!-- code-query-case:receiver-outcome-row:expected -->
 ```json
-{"results":[{"analysis_kind":"points_to","candidate_count":1,"candidates_truncated":false,"coverage":"exhaustive","id":"747fe544c97ced0ee644792ffa6320d73c729fcc91886a218c6ca9e205d0971e","language":"typescript","outcome":"precise","path":"receiver.ts","provenance":[{"seed":{"end_line":19,"kind":"call","path":"receiver.ts","result_type":"structural_match","start_line":19},"steps":[{"op":"points_to","result":{"analysis_kind":"points_to","capture":"receiver","outcome":"precise","path":"receiver.ts","range":{"end_column":9,"end_line":19,"start_column":3,"start_line":19},"result_type":"receiver_analysis"}},{"op":"receiver_outcome","result":{"coverage":"exhaustive","id":"747fe544c97ced0ee644792ffa6320d73c729fcc91886a218c6ca9e205d0971e","outcome":"precise","path":"receiver.ts","range":{"end_column":9,"end_line":19,"start_column":3,"start_line":19},"result_type":"receiver_outcome","site_id":"747fe544c97ced0ee644792ffa6320d73c729fcc91886a218c6ca9e205d0971e"}}]}],"range":{"end_column":9,"end_line":19,"start_column":3,"start_line":19},"result_type":"receiver_outcome","scope_nodes":1848,"setup_nodes":94,"site_ast_id":"644d2e02537cb72d9210252f7c3248decccdd2c518598e843cf8dc1ec6b69da6","site_id":"747fe544c97ced0ee644792ffa6320d73c729fcc91886a218c6ca9e205d0971e","summary_expansions":15}],"truncated":false}
+{"results":[{"analysis_kind":"points_to","candidate_count":1,"candidates_truncated":false,"coverage":"exhaustive","id":"747fe544c97ced0ee644792ffa6320d73c729fcc91886a218c6ca9e205d0971e","language":"typescript","outcome":"precise","path":"receiver.ts","provenance":[{"seed":{"end_line":19,"kind":"call","path":"receiver.ts","result_type":"structural_match","start_line":19},"steps":[{"op":"points_to","result":{"analysis_kind":"points_to","capture":"receiver","outcome":"precise","path":"receiver.ts","range":{"end_column":9,"end_line":19,"start_column":3,"start_line":19},"result_type":"receiver_analysis"}},{"op":"receiver_outcome","result":{"coverage":"exhaustive","id":"747fe544c97ced0ee644792ffa6320d73c729fcc91886a218c6ca9e205d0971e","outcome":"precise","path":"receiver.ts","range":{"end_column":9,"end_line":19,"start_column":3,"start_line":19},"result_type":"receiver_outcome","site_id":"747fe544c97ced0ee644792ffa6320d73c729fcc91886a218c6ca9e205d0971e"}}]}],"range":{"end_column":9,"end_line":19,"start_column":3,"start_line":19},"result_type":"receiver_outcome","scope_nodes":1862,"setup_nodes":94,"site_ast_id":"644d2e02537cb72d9210252f7c3248decccdd2c518598e843cf8dc1ec6b69da6","site_id":"747fe544c97ced0ee644792ffa6320d73c729fcc91886a218c6ca9e205d0971e","summary_expansions":15}],"truncated":false}
 ```
 
 A factory receiver's evidence is a parent-linked chain: the `factory_return` row is hop zero, and the value it returned links back through `parent_evidence_id`.

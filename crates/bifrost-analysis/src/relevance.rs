@@ -322,7 +322,7 @@ pub(crate) fn most_relevant_project_files_cascade(
     if history.status == HistoryRankingStatus::Cancelled {
         return MostRelevantProjectFilesOutcome::Cancelled;
     }
-    let neighbours = import_neighbourhood(analyzer, &seed_files);
+    let neighbours = import_neighbourhood(analyzer, &universe, &seed_files, cancellation);
     if cancellation.is_cancelled() {
         return MostRelevantProjectFilesOutcome::Cancelled;
     }
@@ -370,11 +370,13 @@ fn cascade_universe(analyzer: &dyn IAnalyzer) -> Vec<ProjectFile> {
 ///
 /// Deliberately not the ranked import graph `related_files_by_imports` builds:
 /// that one expands two levels and resolves every reverse importer, which costs
-/// minutes in large Java workspaces. The cascade only asks whether a file is
-/// adjacent to a seed, and adjacency is one lookup per seed.
+/// minutes in large Java workspaces. The cascade resolves forward edges only
+/// for its seeds and asks the provider for all reverse seed edges in one batch.
 fn import_neighbourhood(
     analyzer: &dyn IAnalyzer,
+    universe: &[ProjectFile],
     seeds: &HashSet<ProjectFile>,
+    cancellation: &CancellationToken,
 ) -> HashSet<ProjectFile> {
     let _scope = profiling::scope("relevance::cascade_import_neighbourhood");
     let mut neighbours = HashSet::default();
@@ -382,14 +384,17 @@ fn import_neighbourhood(
         return neighbours;
     };
     for seed in seeds {
+        if cancellation.is_cancelled() {
+            return HashSet::default();
+        }
         neighbours.extend(
             provider
                 .imported_code_units_of(seed)
                 .iter()
                 .map(|code_unit| code_unit.source().clone()),
         );
-        neighbours.extend(provider.referencing_files_of(seed));
     }
+    neighbours.extend(provider.referencing_files_of_targets(seeds, universe, cancellation));
     neighbours
 }
 
@@ -691,12 +696,34 @@ fn build_usage_ranking_graph_with_kind_and_cancellation(
         .map(Arc::new);
     };
 
+    // The graph spans exactly the ecosystems its seeds belong to, so it is
+    // keyed by the content identity of the languages in those ecosystems
+    // (#2449). An edit to a language outside them cannot retire it.
+    let ecosystem_content = |analyzer: &dyn IAnalyzer| {
+        analyzer
+            .workspace_content_identities()
+            .and_then(|identities| {
+                identities
+                    .scope(|language| selected_ecosystems.contains(&UsageEcosystem::of(language)))
+            })
+    };
+    let Some(workspace_content) = ecosystem_content(analyzer) else {
+        cache.record_missing_content_identity(graph_kind, selected_ecosystems.iter().copied());
+        return build_usage_ranking_graph_uncached(
+            analyzer,
+            token,
+            seed_weights,
+            &selected_ecosystems,
+            graph_kind,
+            cancellation,
+        )
+        .map(Arc::new);
+    };
     for _ in 0..2 {
-        let source_generations = analyzer.snapshot_source_generations();
         let key = WorkspaceUsageGraphCacheKey::new(
             graph_kind,
             selected_ecosystems.iter().copied(),
-            source_generations.clone(),
+            workspace_content,
         );
         let acquisition = cache.acquire(
             key,
@@ -714,7 +741,7 @@ fn build_usage_ranking_graph_with_kind_and_cancellation(
                 }
                 Cancellable::Cancelled => WorkspaceUsageGraphCacheBuildOutcome::Cancelled,
             },
-            || analyzer.snapshot_generations_match(&source_generations),
+            || ecosystem_content(analyzer) == Some(workspace_content),
         );
         match acquisition {
             WorkspaceUsageGraphCacheAcquisition::Ready {
@@ -723,8 +750,9 @@ fn build_usage_ranking_graph_with_kind_and_cancellation(
                 wait,
             } => {
                 if profiling::enabled() {
+                    let (retained, invalidated) = cache.verdicts().totals();
                     profiling::note(format!(
-                        "usage-graph cache={lifecycle:?} waits={} wait_ms={:.1}",
+                        "usage-graph cache={lifecycle:?} waits={} wait_ms={:.1} retained={retained} rebuilt={invalidated}",
                         wait.waits,
                         wait.wait_ns as f64 / 1_000_000.0
                     ));

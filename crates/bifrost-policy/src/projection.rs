@@ -825,7 +825,10 @@ fn validate_taint_projection(
             field: "taint_common_sink",
         });
     }
-    let mut strong_sink_identity = None;
+    // One envelope is one sink site, so its pairs must agree on both halves of
+    // the anchor's site identity: the declaration identity and the ordinal that
+    // separates the sink calls written inside that declaration (#2544).
+    let mut strong_sink_site = None;
     for pair in &projection.pairs {
         if let Some(strong) = pair.anchor.strong_fields() {
             if strong.sink_identity().path().as_str() != pair.report.primary.path() {
@@ -833,13 +836,14 @@ fn validate_taint_projection(
                     field: "taint_sink_anchor_path",
                 });
             }
-            match strong_sink_identity {
-                Some(expected) if expected != strong.sink_identity() => {
+            let site = (strong.sink_identity(), strong.sink_site_ordinal());
+            match strong_sink_site {
+                Some(expected) if expected != site => {
                     return Err(ProjectionAuthorityError::FindingEnvelopeMismatch {
                         field: "taint_common_sink_identity",
                     });
                 }
-                None => strong_sink_identity = Some(strong.sink_identity()),
+                None => strong_sink_site = Some(site),
                 Some(_) => {}
             }
         }
@@ -2111,6 +2115,7 @@ mod tests {
         .unwrap();
         let anchor = TaintFindingAnchor::strong(
             sink_identity,
+            0,
             source_fact.source_endpoint_analysis_projection_hash,
             facts.sink_endpoint_analysis_projection_hash,
             scenario_hash,

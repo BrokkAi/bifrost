@@ -1,7 +1,8 @@
 use super::{PhpAnalyzerFacts, php_graph_source};
 use crate::analyzer::usages::common::{analyzed_files_for_language, language_for_file};
 use crate::analyzer::usages::inverted_edges::{
-    UsageEdgeBuildOutput, UsageEdgeWeights, UsageEdges, build_edge_output, parse_and_collect,
+    EdgeNodeDomain, UsageEdgeBuildOutput, UsageEdgeWeights, UsageEdges, build_edge_output,
+    parse_and_collect_with_domain,
 };
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
@@ -54,7 +55,7 @@ impl<'a> UsageQueryResolver<'a> for PhpQueryResolver<'a> {
             files.insert(target.source().clone());
         }
 
-        let facts = PhpAnalyzerFacts(analyzer);
+        let facts = PhpAnalyzerFacts::new(analyzer);
         let source = php_graph_source(analyzer, &facts);
         let hierarchy = matches!(
             spec.kind,
@@ -118,7 +119,19 @@ impl<'a> PhpEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        self.build_php_edges(analyzer, nodes, keep_file)
+        self.build_php_edges(analyzer, EdgeNodeDomain::Closed(nodes), keep_file)
+    }
+
+    pub(crate) fn build_rooted_edges<F>(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        callers: &HashSet<String>,
+        keep_file: F,
+    ) -> UsageEdges
+    where
+        F: Fn(&ProjectFile) -> bool + Sync,
+    {
+        self.build_php_edges(analyzer, EdgeNodeDomain::Rooted(callers), keep_file)
     }
 
     pub(crate) fn build_edge_weights<F>(
@@ -130,7 +143,7 @@ impl<'a> PhpEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        self.build_php_edges(analyzer, nodes, keep_file)
+        self.build_php_edges(analyzer, EdgeNodeDomain::Closed(nodes), keep_file)
     }
 
     /// The inverted pass's fan-out: the shared driver's parallel walk plus
@@ -140,21 +153,21 @@ impl<'a> PhpEdgeResolver<'a> {
     fn build_php_edges<Output, F>(
         &self,
         analyzer: &dyn IAnalyzer,
-        nodes: &HashSet<String>,
+        domain: EdgeNodeDomain<'_>,
         keep_file: F,
     ) -> Output
     where
         Output: UsageEdgeBuildOutput<String>,
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        let facts = PhpAnalyzerFacts(analyzer);
+        let facts = PhpAnalyzerFacts::new(analyzer);
         let source = php_graph_source(analyzer, &facts);
         let language = tree_sitter_php::LANGUAGE_PHP.into();
         build_edge_output(&self.files, keep_file, |file| {
-            parse_and_collect(
+            parse_and_collect_with_domain(
                 analyzer,
                 file,
-                nodes,
+                domain,
                 ParseSpec::whole(&language),
                 |input| scan_php_file(source, self.php, file, input),
             )

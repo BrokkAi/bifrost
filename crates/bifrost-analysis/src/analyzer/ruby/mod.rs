@@ -15,7 +15,6 @@ mod source_artifact;
 pub(crate) mod structural;
 mod tests;
 
-use crate::analyzer::QueryScope;
 use crate::analyzer::clone_detection::detect_language_structural_clone_smells;
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::languages::{
@@ -32,7 +31,8 @@ use crate::analyzer::usages::get_definition::{
 };
 use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_ruby_type_bounded};
 use crate::analyzer::usages::ruby_graph::{
-    RubyUsageGraphStrategy, build_ruby_usage_edge_weights, build_ruby_usage_edges,
+    RubyUsageGraphStrategy, build_rooted_ruby_usage_edges, build_ruby_usage_edge_weights,
+    build_ruby_usage_edges,
 };
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::weighted_cache::{
@@ -424,6 +424,8 @@ impl CodeUnitIndex for RubyAnalyzer {
 }
 
 impl IAnalyzer for RubyAnalyzer {
+    crate::analyzer::i_analyzer::forward_relational_definition_batch!();
+
     #[cfg(any(test, feature = "test-support"))]
     fn test_hooks(&self) -> &dyn crate::analyzer::AnalyzerTestHooks {
         self
@@ -465,21 +467,20 @@ impl IAnalyzer for RubyAnalyzer {
         self.inner.workspace_file_index_cell()
     }
 
-    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
-        // Trait signature is fixed, so this boundary opens the scope the
-        // usage-graph funnel now demands proof of (issue #2423 milestone B).
-        let scope = crate::analyzer::AnalyzerQueryScope::new(self);
-        self.inner.global_usage_definition_index(scope.token())
-    }
-
-    fn structural_search_providers(
+    fn structural_fact_providers(
         &self,
-    ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
-        self.inner.structural_search_providers()
+    ) -> Vec<&dyn crate::analyzer::structural::StructuralFactProvider> {
+        self.inner.structural_fact_providers()
     }
 
     fn snapshot_caches(&self) -> Option<&crate::analyzer::AnalyzerSnapshotCaches> {
         Some(self.inner.snapshot_caches())
+    }
+
+    fn workspace_content_identities(
+        &self,
+    ) -> Option<crate::analyzer::content_identity::WorkspaceContentIdentities> {
+        self.inner.workspace_content_identities()
     }
 
     fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
@@ -622,18 +623,6 @@ impl IAnalyzer for RubyAnalyzer {
 
 #[cfg(any(test, feature = "test-support"))]
 impl crate::analyzer::AnalyzerTestHooks for RubyAnalyzer {
-    fn reset_global_usage_definition_index_build_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_global_usage_definition_index_build_count_for_test();
-    }
-
-    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .global_usage_definition_index_build_count_for_test()
-    }
-
     fn reset_full_declaration_scan_count_for_test(&self) {
         self.inner
             .test_hooks()
@@ -751,7 +740,7 @@ impl LanguageEdgePass for RubyEdgePass {
     }
 
     fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
-        build_ruby_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file).map(LanguageEdgeSites)
+        build_rooted_ruby_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file).map(LanguageEdgeSites)
     }
 
     fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {

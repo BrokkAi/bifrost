@@ -13810,6 +13810,88 @@ ABSL_NAMESPACE_END
         }
     }
 
+    /// Issue #2361: the callable metadata helpers must ask the per-tree parent
+    /// index for every ancestor edge. Asking tree-sitter directly makes each
+    /// edge re-descend from the root, turning declaration extraction on a
+    /// deeply nested generated header from quadratic output work into a cubic
+    /// tree walk. Exact query counts pin the route without a machine-dependent
+    /// wall-clock ceiling.
+    #[test]
+    fn deeply_nested_callable_ancestor_questions_use_the_parent_index() {
+        const DEPTH: usize = 64;
+        let mut source = String::new();
+        for level in 0..DEPTH {
+            writeln!(source, "namespace n{level} {{").unwrap();
+        }
+        source.push_str("int deepest(int value);\n");
+        for _ in 0..DEPTH {
+            source.push_str("}\n");
+        }
+
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(&source, None).unwrap();
+        let root = tree.root_node();
+        let ancestry = ParentIndex::new(root);
+        let mut function_declarator = None;
+        walk_named_tree_preorder(root, true, |node| {
+            if node.kind() == "function_declarator" {
+                function_declarator = Some(node);
+                WalkControl::Break
+            } else {
+                WalkControl::Continue
+            }
+        });
+        let function_declarator = function_declarator.expect("deepest function declarator");
+        let ancestor_count =
+            std::iter::successors(function_declarator.parent(), |node| node.parent()).count();
+
+        ancestry.reset_parent_query_count_for_test();
+        let lexical_scope = cpp_callable_lexical_scope(function_declarator, &source, &ancestry);
+        assert_eq!(DEPTH, lexical_scope.len());
+        assert_eq!(
+            ancestor_count + 1,
+            ancestry.parent_query_count_for_test(),
+            "lexical-scope ancestry bypassed the parent index"
+        );
+
+        ancestry.reset_parent_query_count_for_test();
+        assert_eq!(
+            DispatchExtensibility::Closed,
+            cpp_callable_dispatch_extensibility(function_declarator, &ancestry)
+        );
+        assert_eq!(
+            ancestor_count,
+            ancestry.parent_query_count_for_test(),
+            "dispatch ancestry bypassed the parent index"
+        );
+
+        ancestry.reset_parent_query_count_for_test();
+        assert_eq!(
+            CallableLinkage::External,
+            cpp_callable_linkage(function_declarator, &source, &ancestry)
+        );
+        assert_eq!(
+            ancestor_count + 1,
+            ancestry.parent_query_count_for_test(),
+            "linkage ancestry bypassed the parent index"
+        );
+
+        ancestry.reset_parent_query_count_for_test();
+        assert!(!cpp_callable_is_structural_constructor(
+            function_declarator,
+            &source,
+            &ancestry
+        ));
+        assert_eq!(
+            ancestor_count + 1,
+            ancestry.parent_query_count_for_test(),
+            "constructor ancestry bypassed the parent index"
+        );
+    }
+
     /// Forward declarations followed by definitions are compacted as one
     /// batch, without rescanning the shared namespace/top-level lists for each
     /// tag. Definitions are intentionally visited in reverse order so the

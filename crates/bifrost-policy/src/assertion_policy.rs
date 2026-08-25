@@ -58,13 +58,13 @@ mod tests {
     use std::fmt;
     use std::str::FromStr;
 
-    use brokk_bifrost_analysis::analyzer::structural::search::{
+    use brokk_bifrost_analysis::schema_version::{SchemaVersionOrigin, SchemaVersionResolution};
+    use brokk_bifrost_rql::structural::search::{
         CodeQueryOccurrence, CodeQueryOccurrenceTarget, CodeQueryResultItem,
     };
-    use brokk_bifrost_analysis::analyzer::structural::{
+    use brokk_bifrost_rql::structural::{
         CodeQuery, CodeQueryRange, CodeQueryResultValue, CodeQueryRowScalarType,
     };
-    use brokk_bifrost_analysis::schema_version::{SchemaVersionOrigin, SchemaVersionResolution};
     use serde_json::json;
 
     use super::*;
@@ -491,7 +491,7 @@ mod tests {
     fn call_argument(site: &str, index: usize, name: &str) -> CodeQueryResultItem {
         item(CodeQueryResultValue::CallArgument {
             value: Box::new(
-                brokk_bifrost_analysis::analyzer::structural::search::CodeQueryCallShapeArgument {
+                brokk_bifrost_rql::structural::search::CodeQueryCallShapeArgument {
                     id: format!("{site}-arg-{index}"),
                     group_id: format!("{site}-group"),
                     site_id: site.to_string(),
@@ -508,7 +508,7 @@ mod tests {
     fn signature_parameter(signature: &str, index: usize, label: &str) -> CodeQueryResultItem {
         item(CodeQueryResultValue::SignatureParameter {
             value: Box::new(
-                brokk_bifrost_analysis::analyzer::structural::search::CodeQuerySignatureParameter {
+                brokk_bifrost_rql::structural::search::CodeQuerySignatureParameter {
                     id: format!("{signature}-param-{index}"),
                     signature_id: signature.to_string(),
                     path: "app.py".to_string(),

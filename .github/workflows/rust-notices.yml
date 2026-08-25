@@ -28,7 +28,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          toolchain: 1.96.0
+          toolchain: 1.97.1
 
       - name: Install pinned cargo-about
         run: cargo install --locked cargo-about --version 0.9.1 --features cli

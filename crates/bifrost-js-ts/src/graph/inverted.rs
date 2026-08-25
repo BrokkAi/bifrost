@@ -23,7 +23,7 @@ use super::resolver::{
     JsTsUsageIndex, browser_global_property_shape, unbound_browser_global_property,
 };
 use crate::parse::flow_dialect_blocks_extraction;
-use crate::providers::JsTsSource;
+use crate::providers::{JsTsSource, with_usage_definitions};
 use crate::syntax::{
     JsTsLexicalBindingIndex, compute_import_binder, is_declaration_identifier,
     is_lexically_nested_type_declaration, is_object_in_member_expression,
@@ -63,7 +63,6 @@ pub fn scan_file(
     declarations_index: &dyn CodeUnitIndex,
     language: Language,
     file: &ProjectFile,
-    nodes: &HashSet<String>,
     input: &FileEdgeScanInput<'_>,
 ) -> PerFileEdges {
     let source = input.source;
@@ -105,30 +104,31 @@ pub fn scan_file(
         source,
     );
 
-    let mut ctx = TsScan {
-        source,
-        receiver_provider: JsTsReceiverFactProvider::new(
-            host,
-            host.usage_definitions(token),
-            language,
-            file,
+    with_usage_definitions(host, token, |definitions| {
+        let mut ctx = TsScan {
             source,
-            input.root(),
-            binder.clone(),
-        ),
-        named_imports,
-        namespace_locals,
-        same_file,
-        browser_globals,
-        lexical_bindings,
-        type_shadow_scopes: vec![HashSet::default()],
-        nodes,
-        input,
-        edges: PerFileEdges::default(),
-    };
-    let mut locals = LocalInferenceEngine::new(LocalInferenceConfig::default());
-    scan_node(input.root(), &mut ctx, &mut locals);
-    ctx.edges
+            receiver_provider: JsTsReceiverFactProvider::new(
+                host,
+                definitions,
+                language,
+                file,
+                source,
+                input.root(),
+                binder.clone(),
+            ),
+            named_imports,
+            namespace_locals,
+            same_file,
+            browser_globals,
+            lexical_bindings,
+            type_shadow_scopes: vec![HashSet::default()],
+            input,
+            edges: PerFileEdges::default(),
+        };
+        let mut locals = LocalInferenceEngine::new(LocalInferenceConfig::default());
+        scan_node(input.root(), &mut ctx, &mut locals);
+        ctx.edges
+    })
 }
 
 /// The workspace-wide state a scoped scan resolves through, built once before
@@ -205,30 +205,32 @@ pub fn scan_scoped_file(
     if flow_dialect_blocks_extraction(file, input.root(), input.source) {
         return PerFileEdges::default();
     }
-    let mut ctx = ScopedTsScan {
-        source: input.source,
-        receiver_provider: JsTsReceiverFactProvider::new(
-            host,
-            host.usage_definitions(token),
-            language,
-            file,
-            input.source,
-            input.root(),
-            compute_import_binder(input.source, input.tree),
-        ),
-        index,
-        declarations: &prep.declarations,
-        imports: file_prep.imports,
-        same_file: file_prep.same_file,
-        browser_globals: file_prep.browser_globals,
-        lexical_bindings: file_prep.lexical_bindings,
-        type_shadow_scopes: vec![HashSet::default()],
-        input,
-        edges: PerFileEdges::default(),
-    };
-    let mut locals = LocalInferenceEngine::new(LocalInferenceConfig::default());
-    scan_scoped_node(input.root(), &mut ctx, &mut locals);
-    ctx.edges
+    with_usage_definitions(host, token, |definitions| {
+        let mut ctx = ScopedTsScan {
+            source: input.source,
+            receiver_provider: JsTsReceiverFactProvider::new(
+                host,
+                definitions,
+                language,
+                file,
+                input.source,
+                input.root(),
+                compute_import_binder(input.source, input.tree),
+            ),
+            index,
+            declarations: &prep.declarations,
+            imports: file_prep.imports,
+            same_file: file_prep.same_file,
+            browser_globals: file_prep.browser_globals,
+            lexical_bindings: file_prep.lexical_bindings,
+            type_shadow_scopes: vec![HashSet::default()],
+            input,
+            edges: PerFileEdges::default(),
+        };
+        let mut locals = LocalInferenceEngine::new(LocalInferenceConfig::default());
+        scan_scoped_node(input.root(), &mut ctx, &mut locals);
+        ctx.edges
+    })
 }
 
 #[derive(Clone, Default)]
@@ -351,7 +353,6 @@ struct TsScan<'a> {
     browser_globals: HashMap<String, String>,
     lexical_bindings: Option<JsTsLexicalBindingIndex>,
     type_shadow_scopes: Vec<HashSet<String>>,
-    nodes: &'a HashSet<String>,
     input: &'a FileEdgeScanInput<'a>,
     edges: PerFileEdges,
 }
@@ -359,12 +360,12 @@ struct TsScan<'a> {
 impl TsScan<'_> {
     fn member_declaration_keys(&self, owner: &str, member: &str) -> Vec<String> {
         let static_key = format!("{owner}.{member}$static");
-        if self.nodes.contains(&static_key) {
+        if self.input.is_node(&static_key) {
             return vec![static_key];
         }
 
         let plain_key = format!("{owner}.{member}");
-        if self.nodes.contains(&plain_key) {
+        if self.input.is_node(&plain_key) {
             return vec![plain_key];
         }
 

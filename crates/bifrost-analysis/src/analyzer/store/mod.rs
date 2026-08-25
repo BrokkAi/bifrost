@@ -2,6 +2,9 @@ pub mod epoch;
 pub mod gc;
 pub mod liveness;
 pub mod query;
+mod relational_query;
+mod writer;
+pub(crate) use relational_query::RelationalStoreOutcome;
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -28,6 +31,7 @@ use brokk_bifrost_core::cache_db::{
     OPTIONAL_FACT_KIND_SCALA_TRAIT,
 };
 
+use brokk_bifrost_core::analyzer::RelationalName;
 use brokk_bifrost_core::analyzer::rust_facts::{
     RustCfgCondition, RustExportFact, RustIdentifierOccurrence, RustImportTargetFact,
     RustIncludeEdgeFact, RustIncludeHostBindingFact, RustMacroGateFact, RustModuleFact,
@@ -38,7 +42,7 @@ use brokk_bifrost_core::analyzer::rust_facts::{
 };
 
 use crate::CancellationToken;
-use crate::analyzer::fq_name::{FqName, segment_interner};
+use crate::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
 use crate::analyzer::model::MAX_SIGNATURE_METADATA_COLUMN_BYTES;
 use crate::analyzer::structural::DeclaredVisibility;
 use crate::analyzer::structural::materialization::{
@@ -55,6 +59,7 @@ use crate::gitblob;
 use crate::hash::{HashMap, HashSet, set_with_capacity};
 use crate::text_utils::compute_line_starts;
 pub(crate) use brokk_bifrost_core::analyzer::query_batch::LimitedQueryRows;
+use writer::StoreWriter;
 
 const PREPARED_WRITE_IMMEDIATE_RETRIES: usize = 2;
 const STALE_GENERATION_RECLAIM_ROWS: usize = 10_000;
@@ -94,7 +99,7 @@ impl StoreError {
         }
     }
 
-    pub(crate) fn is_stale_generation(&self) -> bool {
+    pub fn is_stale_generation(&self) -> bool {
         self.stale_generation
     }
 
@@ -218,12 +223,17 @@ AND EXISTS (
 const EXACT_PATH_SYMBOL_FQN_SQL: &str =
     "SELECT lang, rel_path, blob_oid, kind, package_name, short_name,
            exact_fqn, normalized_fqn
-    FROM path_symbol_units INDEXED BY idx_path_symbol_units_lang_generation_exact_fqn
+    FROM workspace_path_symbol_exact_names
     WHERE lang = ?1 AND exact_fqn = ?2
-      AND generation = COALESCE(
-        (SELECT generation FROM analysis_epochs WHERE lang = ?1), 0
-      )
     ORDER BY rel_path, exact_fqn";
+const NORMALIZED_PATH_SYMBOL_FQN_SQL: &str =
+    "SELECT lang, rel_path, blob_oid, kind, package_name, short_name,
+           exact_fqn, normalized_fqn
+    FROM workspace_path_symbol_normalized_names
+    WHERE lang = ?1 AND normalized_fqn = ?2
+    ORDER BY rel_path, exact_fqn";
+const WORKSPACE_SNAPSHOT_FINGERPRINT_SQL: &str =
+    "SELECT fingerprint FROM workspace_snapshots WHERE lang = ?1 AND generation = ?2";
 
 /// The full verification predicate: membership, plus a re-count of every fact
 /// table against the counts `blob_meta` recorded.
@@ -303,6 +313,39 @@ AND meta.type_identifier_count = (
   SELECT COUNT(*) FROM type_identifiers AS identifiers
   WHERE identifiers.blob_oid = meta.blob_oid AND identifiers.lang = meta.lang
 )
+AND NOT EXISTS (
+  SELECT 1 FROM code_units AS units
+  WHERE units.blob_oid = meta.blob_oid AND units.lang = meta.lang
+    AND (
+      (units.fq_segment_count = 0) <> (units.exact_fqn_tail IS NULL)
+      OR units.fq_segment_count <> (
+        SELECT COUNT(*) FROM code_unit_fq_segments AS segments
+        WHERE segments.blob_oid = units.blob_oid
+          AND segments.lang = units.lang
+          AND segments.unit_key = units.unit_key
+      )
+      OR units.fq_segment_bytes <> COALESCE((
+        SELECT SUM(length(CAST(segments.seg_kind AS BLOB))
+                   + length(CAST(segments.segment AS BLOB)))
+        FROM code_unit_fq_segments AS segments
+        WHERE segments.blob_oid = units.blob_oid
+          AND segments.lang = units.lang
+          AND segments.unit_key = units.unit_key
+      ), 0)
+      OR (units.fq_segment_count > 0 AND 0 <> (
+        SELECT MIN(segments.seg_ordinal) FROM code_unit_fq_segments AS segments
+        WHERE segments.blob_oid = units.blob_oid
+          AND segments.lang = units.lang
+          AND segments.unit_key = units.unit_key
+      ))
+      OR (units.fq_segment_count > 0 AND units.fq_segment_count - 1 <> (
+        SELECT MAX(segments.seg_ordinal) FROM code_unit_fq_segments AS segments
+        WHERE segments.blob_oid = units.blob_oid
+          AND segments.lang = units.lang
+          AND segments.unit_key = units.unit_key
+      ))
+    )
+)
 ",
     );
     condition
@@ -372,7 +415,7 @@ pub struct AnalyzerStore {
     // declaration order, so the writer `conn` and every pooled reader must be
     // closed before `_ephemeral` runs and deletes the backing temp file (open
     // handles block deletion on Windows).
-    conn: Mutex<Connection>,
+    conn: StoreWriter,
     readers: ReaderPool,
     active_readers: ReaderPool,
     streaming_readers: ReaderPool,
@@ -380,15 +423,23 @@ pub struct AnalyzerStore {
     lifetime: Arc<()>,
     _ephemeral: Option<EphemeralDb>,
     #[cfg(test)]
-    parsed_blob_transaction_starts: AtomicUsize,
+    parsed_blob_transaction_starts: Arc<AtomicUsize>,
     #[cfg(test)]
     parsed_blob_point_contains_queries: AtomicUsize,
     #[cfg(test)]
-    replacement_cost_lookup_queries: AtomicUsize,
+    replacement_cost_lookup_queries: Arc<AtomicUsize>,
     #[cfg(test)]
-    replacement_cost_fallback_queries: AtomicUsize,
+    replacement_cost_fallback_queries: Arc<AtomicUsize>,
     #[cfg(test)]
-    prepared_generation_lookup_queries: AtomicUsize,
+    prepared_generation_lookup_queries: Arc<AtomicUsize>,
+    #[cfg(test)]
+    relational_batch_reader_checkouts: AtomicUsize,
+    #[cfg(test)]
+    relational_batch_generation_validations: AtomicUsize,
+    #[cfg(test)]
+    relational_batch_distinct_requests: AtomicUsize,
+    #[cfg(test)]
+    relational_live_unit_count_queries: AtomicUsize,
 }
 
 /// A hand-rolled checkout pool of read-only SQLite connections for one store.
@@ -652,8 +703,21 @@ pub struct CandidateFlags {
     pub synthetic: bool,
 }
 
+/// Persisted identity metadata that is cheap to select with a candidate row.
+/// It deliberately contains no child segments; crossing from this header to a
+/// complete identity requires an explicit relational batch read.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CandidateRow {
+pub struct FqIdentityHeader {
+    anchor: Option<PackageAnchor>,
+    package_tail_segments: usize,
+    expected_segment_count: usize,
+    expected_segment_bytes: usize,
+    exact_tail: String,
+    normalized_tail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateRow<I = FqIdentityHeader> {
     pub blob_oid: Oid,
     pub lang: String,
     pub unit_key: i64,
@@ -662,12 +726,20 @@ pub struct CandidateRow {
     pub content_qualifier: String,
     pub signature: Option<String>,
     pub flags: CandidateFlags,
-    /// The persisted structured identity envelope. It contains either the full
-    /// `FqName` and package boundary or a content-stable tail whose path-derived
-    /// prefix is supplied by the language adapter during hydration. Every
-    /// candidate projection selects this column at index 12.
-    pub fq_segments: Option<Vec<u8>>,
+    /// Header for the authoritative relational identity. The default type is
+    /// intentionally not hydrated.
+    pub fq: Option<I>,
 }
+
+pub type HydratedCandidateRow = CandidateRow<RelationalUnitFq>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MountedCandidateRow<I = FqIdentityHeader> {
+    pub(crate) candidate: CandidateRow<I>,
+    pub(crate) rel_path: String,
+}
+
+pub(crate) type HydratedMountedCandidateRow = MountedCandidateRow<RelationalUnitFq>;
 
 #[derive(Debug, Default)]
 struct LimitedQueryByteBudget {
@@ -692,10 +764,12 @@ impl LimitedQueryByteBudget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CandidatePrimaryRangeRow {
-    pub(crate) candidate: CandidateRow,
+pub(crate) struct CandidatePrimaryRangeRow<I = FqIdentityHeader> {
+    pub(crate) candidate: CandidateRow<I>,
     pub(crate) primary_range: Option<Range>,
 }
+
+pub(crate) type HydratedCandidatePrimaryRangeRow = CandidatePrimaryRangeRow<RelationalUnitFq>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct HierarchyStorageKey {
@@ -712,9 +786,40 @@ pub(crate) struct PersistedHierarchyFacts {
 /// Persisted metadata needed to preserve definition ordering without
 /// reconstructing the candidate's complete file state.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DefinitionOrderCandidateRow {
-    pub(crate) candidate: CandidateRow,
+pub(crate) struct DefinitionOrderCandidateRow<I = FqIdentityHeader> {
+    pub(crate) candidate: CandidateRow<I>,
     pub(crate) first_start_byte: Option<usize>,
+    /// The workspace-derived half of this candidate's live mounted identity.
+    /// It comes from `live_definition_exact_names`, so filtering it never
+    /// re-walks a language's package discovery rules or the filesystem.
+    pub(crate) mounted_prefix: String,
+}
+
+pub(crate) type HydratedDefinitionOrderCandidateRow = DefinitionOrderCandidateRow<RelationalUnitFq>;
+
+#[derive(Debug, Clone)]
+pub(crate) struct RenderedDefinitionRequest {
+    pub(crate) exact_name: String,
+    pub(crate) normalized_name: String,
+    /// False when the language's persisted spelling vocabulary proves this
+    /// request cannot name a stored unit. It may still reach path symbols or
+    /// dirty state outside this store query.
+    pub(crate) seekable: bool,
+}
+
+pub(crate) enum RenderedDefinitionCandidateOutcome {
+    Complete(Vec<Vec<HydratedDefinitionOrderCandidateRow>>),
+    Cancelled,
+    WorkspaceChanged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RenderedNameComponent {
+    prefix: String,
+    tail: String,
+    normalized: bool,
+    normalized_exact_fallback: bool,
+    anchored: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -726,6 +831,39 @@ pub(crate) struct PathSymbolRow {
     pub(crate) short_name: String,
     pub(crate) exact_fqn: String,
     pub(crate) normalized_fqn: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkspaceFileRow {
+    pub(crate) rel_path: String,
+    pub(crate) blob_oid: Oid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct WorkspacePackageFileRow {
+    pub(crate) package_name: String,
+    pub(crate) rel_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct WorkspacePackageEdgeRow {
+    pub(crate) parent_package_name: String,
+    pub(crate) child_package_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct WorkspaceAnchorRow {
+    pub(crate) rel_path: String,
+    pub(crate) anchor: PackageAnchor,
+    pub(crate) package_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct WorkspaceContentPackageFact {
+    pub(crate) blob_oid: Oid,
+    pub(crate) anchor: Option<PackageAnchor>,
+    pub(crate) content_qualifier: String,
+    pub(crate) package_tail: FqName,
 }
 
 type PathSymbolRowsResult = Result<Vec<(String, PathSymbolRow)>>;
@@ -770,54 +908,57 @@ fn path_symbol_rows_by_fqn_in_tx(
     normalized_fqn: &str,
 ) -> Result<Vec<(String, PathSymbolRow)>> {
     let mut out = Vec::new();
-    let sql = format!(
-        "SELECT lang, rel_path, blob_oid, kind, package_name, short_name,
-                exact_fqn, normalized_fqn
-         FROM path_symbol_units AS units
-         WHERE lang = ?1 AND (exact_fqn = ?2 OR normalized_fqn = ?3)
-           AND units.generation = COALESCE(
-             (SELECT generation FROM analysis_epochs WHERE lang = units.lang), 0
-           )
-           AND (
-             lang NOT IN ('javascript', 'typescript:ts', 'typescript:tsx')
-             OR EXISTS(
-               SELECT 1 FROM import_statements AS imports
-               JOIN blob_meta AS meta
-                 ON meta.blob_oid = imports.blob_oid AND meta.lang = imports.lang
-               WHERE imports.blob_oid = units.blob_oid AND imports.lang = units.lang
-                 AND {PARSED_BLOB_COMPLETE_CONDITION}
-             )
-           )
-         ORDER BY rel_path, exact_fqn"
-    );
     for lang in langs {
-        if lang == "python" && exact_fqn == normalized_fqn {
-            let mut stmt = tx.prepare_cached(EXACT_PATH_SYMBOL_FQN_SQL)?;
-            let mapped = stmt.query_map(params![lang, exact_fqn], |row| {
-                Ok((row.get(0)?, decode_path_symbol_row(row, 1)?))
-            })?;
-            out.extend(mapped.collect::<std::result::Result<Vec<_>, _>>()?);
-        } else {
-            let mut stmt = tx.prepare_cached(&sql)?;
-            let mapped = stmt.query_map(params![lang, exact_fqn, normalized_fqn], |row| {
-                Ok((row.get(0)?, decode_path_symbol_row(row, 1)?))
+        let mut exact = tx.prepare_cached(EXACT_PATH_SYMBOL_FQN_SQL)?;
+        let mapped = exact.query_map(params![lang, exact_fqn], |row| {
+            Ok((row.get::<_, String>(0)?, decode_path_symbol_row(row, 1)?))
+        })?;
+        out.extend(mapped.collect::<std::result::Result<Vec<_>, _>>()?);
+        if normalized_fqn != exact_fqn {
+            let mut normalized = tx.prepare_cached(NORMALIZED_PATH_SYMBOL_FQN_SQL)?;
+            let mapped = normalized.query_map(params![lang, normalized_fqn], |row| {
+                Ok((row.get::<_, String>(0)?, decode_path_symbol_row(row, 1)?))
             })?;
             out.extend(mapped.collect::<std::result::Result<Vec<_>, _>>()?);
         }
     }
+    out.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.rel_path.cmp(&right.1.rel_path))
+            .then_with(|| left.1.exact_fqn.cmp(&right.1.exact_fqn))
+            .then_with(|| left.1.kind.cmp(&right.1.kind))
+    });
+    out.dedup();
     Ok(out)
 }
 
-fn path_symbol_fingerprint(rows: &[PathSymbolRow]) -> String {
-    let mut ordered = rows.iter().collect::<Vec<_>>();
-    ordered.sort_by(|left, right| {
+fn workspace_snapshot_fingerprint(
+    files: &[WorkspaceFileRow],
+    path_symbols: &[PathSymbolRow],
+    packages: &[String],
+    package_files: &[WorkspacePackageFileRow],
+    package_edges: &[WorkspacePackageEdgeRow],
+    anchors: &[WorkspaceAnchorRow],
+) -> String {
+    let mut ordered_files = files.iter().collect::<Vec<_>>();
+    ordered_files.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
+    let mut digest = Sha256::new();
+    digest.update(b"bifrost.workspace-snapshot.v1\0");
+    for file in ordered_files {
+        for value in [file.rel_path.as_bytes(), file.blob_oid.as_bytes()] {
+            digest.update(value.len().to_le_bytes());
+            digest.update(value);
+        }
+    }
+    let mut ordered_symbols = path_symbols.iter().collect::<Vec<_>>();
+    ordered_symbols.sort_by(|left, right| {
         left.rel_path
             .cmp(&right.rel_path)
             .then_with(|| left.exact_fqn.cmp(&right.exact_fqn))
             .then_with(|| left.kind.cmp(&right.kind))
     });
-    let mut digest = Sha256::new();
-    for row in ordered {
+    for row in ordered_symbols {
         for value in [
             row.rel_path.as_bytes(),
             row.blob_oid.as_bytes(),
@@ -831,7 +972,98 @@ fn path_symbol_fingerprint(rows: &[PathSymbolRow]) -> String {
         }
         digest.update([code_unit_kind_to_i64(row.kind) as u8]);
     }
+    let mut ordered_packages = packages.iter().collect::<Vec<_>>();
+    ordered_packages.sort();
+    for package in ordered_packages {
+        digest.update(package.len().to_le_bytes());
+        digest.update(package.as_bytes());
+    }
+    let mut ordered_package_files = package_files.iter().collect::<Vec<_>>();
+    ordered_package_files.sort();
+    for row in ordered_package_files {
+        for value in [row.package_name.as_bytes(), row.rel_path.as_bytes()] {
+            digest.update(value.len().to_le_bytes());
+            digest.update(value);
+        }
+    }
+    let mut ordered_package_edges = package_edges.iter().collect::<Vec<_>>();
+    ordered_package_edges.sort();
+    for row in ordered_package_edges {
+        for value in [
+            row.parent_package_name.as_bytes(),
+            row.child_package_name.as_bytes(),
+        ] {
+            digest.update(value.len().to_le_bytes());
+            digest.update(value);
+        }
+    }
+    let mut ordered_anchors = anchors.iter().collect::<Vec<_>>();
+    ordered_anchors.sort();
+    for row in ordered_anchors {
+        for value in [row.rel_path.as_bytes(), row.package_name.as_bytes()] {
+            digest.update(value.len().to_le_bytes());
+            digest.update(value);
+        }
+        match row.anchor {
+            PackageAnchor::OwnModule { pop } => digest.update([1, pop]),
+            PackageAnchor::CrateRoot => digest.update([2, 0]),
+        }
+    }
     format!("{:x}", digest.finalize())
+}
+
+fn refresh_incremental_workspace_fingerprint(
+    tx: &Transaction<'_>,
+    lang: &str,
+    generation: GenerationId,
+) -> Result<()> {
+    let mut digest = Sha256::new();
+    digest.update(b"bifrost.workspace-file-set.v1\0");
+    let mut statement = tx.prepare_cached(
+        "SELECT rel_path, blob_oid FROM workspace_files
+         WHERE lang = ?1 AND generation = ?2
+         ORDER BY rel_path",
+    )?;
+    let rows = statement.query_map(params![lang, generation.0], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (rel_path, blob_oid) = row?;
+        for value in [rel_path.as_bytes(), blob_oid.as_bytes()] {
+            digest.update(value.len().to_le_bytes());
+            digest.update(value);
+        }
+    }
+    drop(statement);
+    let fingerprint = format!("{:x}", digest.finalize());
+    let updated = tx.execute(
+        "UPDATE workspace_snapshots SET fingerprint = ?3
+         WHERE lang = ?1 AND generation = ?2",
+        params![lang, generation.0, fingerprint],
+    )?;
+    assert_eq!(
+        updated, 1,
+        "incremental workspace replacement requires an initialized snapshot"
+    );
+    Ok(())
+}
+
+fn workspace_snapshot_fingerprints_conn(
+    conn: &Connection,
+    langs: &[String],
+    generations: &HashMap<String, GenerationId>,
+) -> Result<HashMap<String, String>> {
+    let mut statement = conn.prepare_cached(WORKSPACE_SNAPSHOT_FINGERPRINT_SQL)?;
+    let mut fingerprints = HashMap::default();
+    for lang in langs {
+        let fingerprint = statement
+            .query_row(params![lang, generations[lang].0], |row| row.get(0))
+            .optional()?;
+        if let Some(fingerprint) = fingerprint {
+            fingerprints.insert(lang.clone(), fingerprint);
+        }
+    }
+    Ok(fingerprints)
 }
 
 fn insert_path_symbol_row(
@@ -853,9 +1085,87 @@ fn insert_path_symbol_row(
     ])
 }
 
+fn insert_workspace_relation_rows(
+    tx: &Transaction<'_>,
+    lang: &str,
+    generation: GenerationId,
+    packages: &[String],
+    package_files: &[WorkspacePackageFileRow],
+    package_edges: &[WorkspacePackageEdgeRow],
+    anchors: &[WorkspaceAnchorRow],
+) -> Result<()> {
+    {
+        let mut insert = tx.prepare_cached(
+            "INSERT OR IGNORE INTO workspace_packages(lang, generation, package_name)
+             VALUES(?1, ?2, ?3)",
+        )?;
+        for package in packages {
+            insert.execute(params![lang, generation.0, package])?;
+        }
+    }
+    {
+        let mut insert = tx.prepare_cached(
+            "INSERT OR REPLACE INTO workspace_package_files(
+               lang, generation, package_name, file_id
+             )
+             SELECT ?1, ?2, ?3, files.file_id
+             FROM workspace_files AS files
+             WHERE files.lang = ?1 AND files.generation = ?2
+               AND files.rel_path = ?4",
+        )?;
+        for row in package_files {
+            let inserted =
+                insert.execute(params![lang, generation.0, row.package_name, row.rel_path])?;
+            assert_eq!(inserted, 1, "package membership names one workspace file");
+        }
+    }
+    {
+        let mut insert = tx.prepare_cached(
+            "INSERT OR IGNORE INTO workspace_package_edges(
+               lang, generation, parent_package_name, child_package_name
+             ) VALUES(?1, ?2, ?3, ?4)",
+        )?;
+        for row in package_edges {
+            insert.execute(params![
+                lang,
+                generation.0,
+                row.parent_package_name,
+                row.child_package_name
+            ])?;
+        }
+    }
+    {
+        let mut insert = tx.prepare_cached(
+            "INSERT OR REPLACE INTO workspace_file_anchors(
+               lang, generation, file_id, anchor_kind, anchor_pop, package_name
+             )
+             SELECT ?1, ?2, files.file_id, ?4, ?5, ?6
+             FROM workspace_files AS files
+             WHERE files.lang = ?1 AND files.generation = ?2
+               AND files.rel_path = ?3",
+        )?;
+        for row in anchors {
+            let (kind, pop) = match row.anchor {
+                PackageAnchor::OwnModule { pop } => ("own_module", i64::from(pop)),
+                PackageAnchor::CrateRoot => ("crate_root", 0),
+            };
+            let inserted = insert.execute(params![
+                lang,
+                generation.0,
+                row.rel_path,
+                kind,
+                pop,
+                row.package_name
+            ])?;
+            assert_eq!(inserted, 1, "workspace anchor names one workspace file");
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SearchCandidateRow {
-    pub candidate: CandidateRow,
+pub struct SearchCandidateRow<I = FqIdentityHeader> {
+    pub candidate: CandidateRow<I>,
     pub primary_range: Option<Range>,
     /// Per-declaration test-region taint (issue #1102): true when this specific
     /// unit is inside a structurally-evidenced test region, replacing the old
@@ -863,6 +1173,8 @@ pub struct SearchCandidateRow {
     /// with inline tests are not hidden.
     pub in_test_region: bool,
 }
+
+pub type HydratedSearchCandidateRow = SearchCandidateRow<RelationalUnitFq>;
 
 /// The minimum persisted projection a `search_symbols` pattern batch needs to
 /// decide whether a declaration matches: its short name plus the qualifier its
@@ -921,86 +1233,278 @@ pub(crate) struct SearchCandidateKey {
 /// Persisted facts required to derive callable arity and return types without
 /// reconstructing a complete file state.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UsageFactRow {
-    pub candidate: CandidateRow,
+pub struct UsageFactRow<I = FqIdentityHeader> {
+    pub candidate: CandidateRow<I>,
     pub signature: Option<String>,
     pub signature_metadata: Option<SignatureMetadata>,
 }
 
+pub type HydratedUsageFactRow = UsageFactRow<RelationalUnitFq>;
+
 impl AnalyzerStore {
-    pub(crate) fn sync_path_symbol_units(
+    pub(crate) fn workspace_content_package_facts(
         &self,
         lang: &str,
         generation: GenerationId,
-        rows: &[PathSymbolRow],
-    ) -> Result<()> {
-        let fingerprint = path_symbol_fingerprint(rows);
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
+        blob_oids: &[Oid],
+    ) -> Result<Vec<WorkspaceContentPackageFact>> {
+        let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_current_generation(&tx, lang, generation)?;
-        let existing_fingerprint = tx
-            .query_row(
-                "SELECT fingerprint FROM path_symbol_snapshots
-                 WHERE lang = ?1 AND generation = ?2",
-                params![lang, generation.0],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        if existing_fingerprint.as_deref() == Some(fingerprint.as_str()) {
-            tx.commit()?;
-            return Ok(());
+        let mut statement = tx.prepare(
+            "WITH package_units AS (
+               SELECT units.blob_oid, units.lang, units.fq_anchor_kind,
+                      units.fq_anchor_pop, units.content_qualifier,
+                      units.package_fqn_tail, units.fq_package_tail_segments,
+                      MIN(units.unit_key) AS unit_key
+               FROM live_declarations AS units
+               WHERE units.lang = ?1
+                 AND units.blob_oid = ?2
+                 AND units.package_fqn_tail IS NOT NULL
+                 AND units.fq_package_tail_segments IS NOT NULL
+               GROUP BY units.blob_oid, units.lang, units.fq_anchor_kind,
+                        units.fq_anchor_pop, units.content_qualifier,
+                        units.package_fqn_tail, units.fq_package_tail_segments
+             )
+             SELECT packages.blob_oid, packages.fq_anchor_kind,
+                    packages.fq_anchor_pop, packages.content_qualifier,
+                    packages.package_fqn_tail,
+                    packages.fq_package_tail_segments,
+                    segments.seg_ordinal, segments.seg_kind, segments.segment
+             FROM package_units AS packages
+             LEFT JOIN code_unit_fq_segments AS segments
+               ON segments.blob_oid = packages.blob_oid
+              AND segments.lang = packages.lang
+              AND segments.unit_key = packages.unit_key
+              AND segments.seg_ordinal < packages.fq_package_tail_segments
+             ORDER BY packages.blob_oid, packages.fq_anchor_kind,
+                      packages.fq_anchor_pop, packages.content_qualifier,
+                      packages.package_fqn_tail, segments.seg_ordinal",
+        )?;
+        #[derive(PartialEq)]
+        struct GroupKey {
+            blob_oid: Oid,
+            anchor_kind: Option<String>,
+            anchor_pop: Option<i64>,
+            content_qualifier: String,
+            package_tail: String,
+            package_segment_count: usize,
         }
-        let existing = {
-            let mut stmt = tx.prepare(
-                "SELECT rel_path, blob_oid, kind, package_name, short_name,
-                        exact_fqn, normalized_fqn
-                 FROM path_symbol_units WHERE lang = ?1 AND generation = ?2",
-            )?;
-            let mapped = stmt.query_map(params![lang, generation.0], |row| {
-                decode_path_symbol_row(row, 0)
+        type RawRow = (
+            String,
+            Option<String>,
+            Option<i64>,
+            String,
+            String,
+            usize,
+            Option<usize>,
+            Option<String>,
+            Option<String>,
+        );
+        let mut requested_blobs = blob_oids.to_vec();
+        requested_blobs.sort_unstable();
+        requested_blobs.dedup();
+        let mut rows = Vec::new();
+        for blob_oid in requested_blobs {
+            let oid = blob_oid.to_string();
+            let mapped = statement.query_map(params![lang, oid], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
             })?;
-            mapped
-                .map(|row| row.map(|row| (row.rel_path.clone(), row)))
-                .collect::<std::result::Result<HashMap<_, _>, _>>()?
-        };
-        let wanted: HashMap<_, _> = rows
-            .iter()
-            .cloned()
-            .map(|row| (row.rel_path.clone(), row))
-            .collect();
+            rows.extend(mapped.collect::<std::result::Result<Vec<RawRow>, _>>()?);
+        }
+        drop(statement);
+        tx.commit()?;
 
-        let mut delete =
-            tx.prepare("DELETE FROM path_symbol_units WHERE lang = ?1 AND rel_path = ?2")?;
-        for (rel_path, row) in &existing {
-            if wanted.get(rel_path) != Some(row) {
-                delete.execute(params![lang, rel_path])?;
+        let interner = segment_interner();
+        let mut facts = Vec::new();
+        let mut current: Option<(GroupKey, FqName)> = None;
+        let finish = |facts: &mut Vec<WorkspaceContentPackageFact>,
+                      key: GroupKey,
+                      package_tail: FqName|
+         -> Result<()> {
+            if package_tail.len() != key.package_segment_count {
+                return Err(StoreError::new(format!(
+                    "relational package tail segment count disagrees for {}/{}: expected {}, found {}",
+                    key.blob_oid,
+                    lang,
+                    key.package_segment_count,
+                    package_tail.len()
+                )));
+            }
+            let anchor = match (key.anchor_kind.as_deref(), key.anchor_pop) {
+                (None, None) => None,
+                (Some("own_module"), Some(pop)) => Some(PackageAnchor::OwnModule {
+                    pop: u8::try_from(pop).map_err(|_| {
+                        StoreError::new(format!("invalid own-module anchor pop {pop}"))
+                    })?,
+                }),
+                (Some("crate_root"), Some(0)) => Some(PackageAnchor::CrateRoot),
+                pair => {
+                    return Err(StoreError::new(format!(
+                        "invalid relational package anchor pair {pair:?}"
+                    )));
+                }
+            };
+            facts.push(WorkspaceContentPackageFact {
+                blob_oid: key.blob_oid,
+                anchor,
+                content_qualifier: key.content_qualifier,
+                package_tail,
+            });
+            Ok(())
+        };
+        for (
+            oid_text,
+            anchor_kind,
+            anchor_pop,
+            content_qualifier,
+            package_tail,
+            package_segment_count,
+            ordinal,
+            kind,
+            segment,
+        ) in rows
+        {
+            let key = GroupKey {
+                blob_oid: Oid::from_str(&oid_text)?,
+                anchor_kind,
+                anchor_pop,
+                content_qualifier,
+                package_tail,
+                package_segment_count,
+            };
+            if current.as_ref().is_some_and(|(current, _)| *current != key) {
+                let (finished_key, finished_tail) = current.take().unwrap();
+                finish(&mut facts, finished_key, finished_tail)?;
+            }
+            let (_, fq) = current.get_or_insert_with(|| (key, FqName::new()));
+            match (ordinal, kind, segment) {
+                (Some(ordinal), Some(kind), Some(segment)) => {
+                    if ordinal != fq.len() {
+                        return Err(StoreError::new(format!(
+                            "relational package segments are not contiguous: expected {}, found {ordinal}",
+                            fq.len()
+                        )));
+                    }
+                    fq.push(interner.intern(&segment, segment_kind_from_sql(&kind)?));
+                }
+                (None, None, None) if package_segment_count == 0 => {}
+                row => {
+                    return Err(StoreError::new(format!(
+                        "incomplete relational package segment row {row:?}"
+                    )));
+                }
             }
         }
-        drop(delete);
+        if let Some((key, package_tail)) = current {
+            finish(&mut facts, key, package_tail)?;
+        }
+        Ok(facts)
+    }
 
-        let mut insert = tx.prepare(
-            "INSERT OR REPLACE INTO path_symbol_units(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn sync_workspace_snapshot(
+        &self,
+        lang: &str,
+        generation: GenerationId,
+        files: &[WorkspaceFileRow],
+        path_symbols: &[PathSymbolRow],
+        packages: &[String],
+        package_files: &[WorkspacePackageFileRow],
+        package_edges: &[WorkspacePackageEdgeRow],
+        anchors: &[WorkspaceAnchorRow],
+    ) -> Result<()> {
+        let fingerprint = workspace_snapshot_fingerprint(
+            files,
+            path_symbols,
+            packages,
+            package_files,
+            package_edges,
+            anchors,
+        );
+        let lang = lang.to_string();
+        let files = files.to_vec();
+        let path_symbols = path_symbols.to_vec();
+        let packages = packages.to_vec();
+        let package_files = package_files.to_vec();
+        let package_edges = package_edges.to_vec();
+        let anchors = anchors.to_vec();
+        self.conn.execute(move |conn| {
+            let lang = lang.as_str();
+            let files = files.as_slice();
+            let path_symbols = path_symbols.as_slice();
+            let packages = packages.as_slice();
+            let package_files = package_files.as_slice();
+            let package_edges = package_edges.as_slice();
+            let anchors = anchors.as_slice();
+            let tx = conn.transaction()?;
+            require_current_generation(&tx, lang, generation)?;
+            let existing_fingerprint = tx
+                .query_row(
+                    "SELECT fingerprint FROM workspace_snapshots
+                 WHERE lang = ?1 AND generation = ?2",
+                    params![lang, generation.0],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if existing_fingerprint.as_deref() == Some(fingerprint.as_str()) {
+                tx.commit()?;
+                return Ok(());
+            }
+            tx.execute("DELETE FROM path_symbol_units WHERE lang = ?1", [lang])?;
+            tx.execute("DELETE FROM workspace_snapshots WHERE lang = ?1", [lang])?;
+            tx.execute(
+                "INSERT INTO workspace_snapshots(lang, generation, fingerprint)
+             VALUES(?1, ?2, ?3)",
+                params![lang, generation.0, fingerprint],
+            )?;
+            {
+                let mut insert = tx.prepare(
+                    "INSERT INTO workspace_files(lang, generation, rel_path, blob_oid)
+                 VALUES(?1, ?2, ?3, ?4)",
+                )?;
+                for file in files {
+                    insert.execute(params![
+                        lang,
+                        generation.0,
+                        file.rel_path,
+                        file.blob_oid.to_string()
+                    ])?;
+                }
+            }
+            let mut insert = tx.prepare(
+                "INSERT INTO path_symbol_units(
                lang, rel_path, blob_oid, kind, package_name, short_name,
                exact_fqn, normalized_fqn, generation
              ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        )?;
-        for (rel_path, row) in &wanted {
-            if existing.get(rel_path) == Some(row) {
-                continue;
+            )?;
+            for row in path_symbols {
+                insert_path_symbol_row(&mut insert, lang, generation, row)?;
             }
-            insert_path_symbol_row(&mut insert, lang, generation, row)?;
-        }
-        drop(insert);
-        tx.execute(
-            "INSERT INTO path_symbol_snapshots(lang, fingerprint, generation) VALUES(?1, ?2, ?3)
-             ON CONFLICT(lang) DO UPDATE SET
-               fingerprint = excluded.fingerprint,
-               generation = excluded.generation",
-            params![lang, fingerprint, generation.0],
-        )?;
-        tx.commit()?;
-        let _ = reclaim_stale_generations_conn(&mut conn, STALE_GENERATION_RECLAIM_ROWS);
-        Ok(())
+            drop(insert);
+            insert_workspace_relation_rows(
+                &tx,
+                lang,
+                generation,
+                packages,
+                package_files,
+                package_edges,
+                anchors,
+            )?;
+            tx.commit()?;
+            let _ = reclaim_stale_generations_conn(conn, STALE_GENERATION_RECLAIM_ROWS);
+            Ok(())
+        })
     }
 
     pub(crate) fn path_symbol_rows_by_fqn_for_langs(
@@ -1044,43 +1548,115 @@ impl AnalyzerStore {
         Ok(results)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn replace_path_symbol_unit(
         &self,
         storage_langs: &[String],
         generations: &HashMap<String, GenerationId>,
         rel_path: &str,
-        replacement: Option<(&str, &PathSymbolRow)>,
+        file_replacement: Option<(&str, Oid)>,
+        path_symbol_replacement: Option<(&str, &PathSymbolRow)>,
+        packages: &[String],
+        package_files: &[WorkspacePackageFileRow],
+        package_edges: &[WorkspacePackageEdgeRow],
+        anchors: &[WorkspaceAnchorRow],
     ) -> Result<()> {
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
-        let tx = conn.transaction()?;
-        for lang in storage_langs {
-            let generation = generations.get(lang).copied().ok_or_else(|| {
-                StoreError::new(format!("missing captured generation for {lang}"))
-            })?;
-            require_current_generation(&tx, lang, generation)?;
-            tx.execute(
-                "DELETE FROM path_symbol_units
+        let storage_langs = storage_langs.to_vec();
+        let generations = generations.clone();
+        let rel_path = rel_path.to_string();
+        let file_replacement = file_replacement.map(|(lang, oid)| (lang.to_string(), oid));
+        let path_symbol_replacement =
+            path_symbol_replacement.map(|(lang, row)| (lang.to_string(), row.clone()));
+        let packages = packages.to_vec();
+        let package_files = package_files.to_vec();
+        let package_edges = package_edges.to_vec();
+        let anchors = anchors.to_vec();
+        self.conn.execute(move |conn| {
+            let storage_langs = storage_langs.as_slice();
+            let generations = &generations;
+            let rel_path = rel_path.as_str();
+            let file_replacement = file_replacement
+                .as_ref()
+                .map(|(lang, oid)| (lang.as_str(), *oid));
+            let path_symbol_replacement = path_symbol_replacement
+                .as_ref()
+                .map(|(lang, row)| (lang.as_str(), row));
+            let packages = packages.as_slice();
+            let package_files = package_files.as_slice();
+            let package_edges = package_edges.as_slice();
+            let anchors = anchors.as_slice();
+            let tx = conn.transaction()?;
+            for lang in storage_langs {
+                let generation = generations.get(lang).copied().ok_or_else(|| {
+                    StoreError::new(format!("missing captured generation for {lang}"))
+                })?;
+                require_current_generation(&tx, lang, generation)?;
+                tx.execute(
+                    "DELETE FROM path_symbol_units
                  WHERE lang = ?1 AND rel_path = ?2 AND generation = ?3",
-                params![lang, rel_path, generation.0],
-            )?;
-            tx.execute(
-                "DELETE FROM path_symbol_snapshots WHERE lang = ?1 AND generation = ?2",
-                params![lang, generation.0],
-            )?;
-        }
-        if let Some((lang, row)) = replacement {
-            let generation = generations[lang];
-            let mut insert = tx.prepare(
-                "INSERT INTO path_symbol_units(
+                    params![lang, rel_path, generation.0],
+                )?;
+                tx.execute(
+                    "DELETE FROM workspace_files
+                 WHERE lang = ?1 AND generation = ?2 AND rel_path = ?3",
+                    params![lang, generation.0, rel_path],
+                )?;
+            }
+            if let Some((lang, blob_oid)) = file_replacement {
+                let generation = generations[lang];
+                tx.execute(
+                    "INSERT INTO workspace_files(lang, generation, rel_path, blob_oid)
+                 VALUES(?1, ?2, ?3, ?4)",
+                    params![lang, generation.0, rel_path, blob_oid.to_string()],
+                )?;
+            }
+            if let Some((lang, row)) = path_symbol_replacement {
+                let generation = generations[lang];
+                let mut insert = tx.prepare(
+                    "INSERT INTO path_symbol_units(
                    lang, rel_path, blob_oid, kind, package_name, short_name,
                    exact_fqn, normalized_fqn, generation
                  ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            )?;
-            insert_path_symbol_row(&mut insert, lang, generation, row)?;
-        }
-        tx.commit()?;
-        let _ = reclaim_stale_generations_conn(&mut conn, STALE_GENERATION_RECLAIM_ROWS);
-        Ok(())
+                )?;
+                insert_path_symbol_row(&mut insert, lang, generation, row)?;
+            }
+            if let Some((lang, _)) = file_replacement {
+                let generation = generations[lang];
+                insert_workspace_relation_rows(
+                    &tx,
+                    lang,
+                    generation,
+                    packages,
+                    package_files,
+                    package_edges,
+                    anchors,
+                )?;
+            }
+            for lang in storage_langs {
+                let generation = generations[lang];
+                tx.execute(
+                    "WITH RECURSIVE retained(package_name) AS (
+                   SELECT package_name
+                   FROM workspace_package_files
+                   WHERE lang = ?1 AND generation = ?2
+                   UNION
+                   SELECT edges.parent_package_name
+                   FROM workspace_package_edges AS edges
+                   JOIN retained
+                     ON retained.package_name = edges.child_package_name
+                   WHERE edges.lang = ?1 AND edges.generation = ?2
+                 )
+                 DELETE FROM workspace_packages
+                 WHERE lang = ?1 AND generation = ?2
+                   AND package_name NOT IN (SELECT package_name FROM retained)",
+                    params![lang, generation.0],
+                )?;
+                refresh_incremental_workspace_fingerprint(&tx, lang, generation)?;
+            }
+            tx.commit()?;
+            let _ = reclaim_stale_generations_conn(conn, STALE_GENERATION_RECLAIM_ROWS);
+            Ok(())
+        })
     }
 
     pub fn open_for_workspace(workspace_root: &Path) -> Result<Self> {
@@ -1098,7 +1674,7 @@ impl AnalyzerStore {
         ephemeral: Option<EphemeralDb>,
     ) -> Self {
         Self {
-            conn: Mutex::new(conn),
+            conn: StoreWriter::local(conn),
             readers: ReaderPool::new(reader_source.clone()),
             active_readers: ReaderPool::new(reader_source.clone()),
             streaming_readers: ReaderPool::new(reader_source),
@@ -1106,27 +1682,55 @@ impl AnalyzerStore {
             lifetime: Arc::new(()),
             _ephemeral: ephemeral,
             #[cfg(test)]
-            parsed_blob_transaction_starts: AtomicUsize::new(0),
+            parsed_blob_transaction_starts: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             parsed_blob_point_contains_queries: AtomicUsize::new(0),
             #[cfg(test)]
-            replacement_cost_lookup_queries: AtomicUsize::new(0),
+            replacement_cost_lookup_queries: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
-            replacement_cost_fallback_queries: AtomicUsize::new(0),
+            replacement_cost_fallback_queries: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
-            prepared_generation_lookup_queries: AtomicUsize::new(0),
+            prepared_generation_lookup_queries: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            relational_batch_reader_checkouts: AtomicUsize::new(0),
+            #[cfg(test)]
+            relational_batch_generation_validations: AtomicUsize::new(0),
+            #[cfg(test)]
+            relational_batch_distinct_requests: AtomicUsize::new(0),
+            #[cfg(test)]
+            relational_live_unit_count_queries: AtomicUsize::new(0),
         }
     }
 
     pub fn open_persistent(db_path: &Path) -> Result<Self> {
-        let conn = crate::cache_db::open_unified_connection(db_path).map_err(StoreError::new)?;
-        let reader_source = reader_source_path(&conn);
-        Ok(Self::from_parts(
+        let (conn, reader_source) = StoreWriter::persistent(db_path)?;
+        Ok(Self {
             conn,
-            reader_source,
-            Some(db_path.to_path_buf()),
-            None,
-        ))
+            readers: ReaderPool::new(Some(reader_source.clone())),
+            active_readers: ReaderPool::new(Some(reader_source.clone())),
+            streaming_readers: ReaderPool::new(Some(reader_source)),
+            db_path: Some(db_path.to_path_buf()),
+            lifetime: Arc::new(()),
+            _ephemeral: None,
+            #[cfg(test)]
+            parsed_blob_transaction_starts: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            parsed_blob_point_contains_queries: AtomicUsize::new(0),
+            #[cfg(test)]
+            replacement_cost_lookup_queries: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            replacement_cost_fallback_queries: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            prepared_generation_lookup_queries: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            relational_batch_reader_checkouts: AtomicUsize::new(0),
+            #[cfg(test)]
+            relational_batch_generation_validations: AtomicUsize::new(0),
+            #[cfg(test)]
+            relational_batch_distinct_requests: AtomicUsize::new(0),
+            #[cfg(test)]
+            relational_live_unit_count_queries: AtomicUsize::new(0),
+        })
     }
 
     /// Ephemeral (non-git) workspace store.
@@ -1208,36 +1812,38 @@ impl AnalyzerStore {
     ) -> Result<SemanticPackActiveSet> {
         let active_set = SemanticPackActiveSet::from_members(members)?;
         let now = crate::cache_db::now_unix_seconds();
-        let mut connection = self.conn.lock().expect("analyzer store mutex poisoned");
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute("DELETE FROM semantic_pack_active_members", [])?;
-        {
-            let mut insert = transaction.prepare(
-                "INSERT INTO semantic_pack_active_members(
+        self.conn.execute(move |connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute("DELETE FROM semantic_pack_active_members", [])?;
+            {
+                let mut insert = transaction.prepare(
+                    "INSERT INTO semantic_pack_active_members(
                    ordinal, manifest_digest, source_kind, source_id, workspace_produced
                  ) VALUES(?1, ?2, ?3, ?4, ?5)",
-            )?;
-            for (ordinal, member) in active_set.members.iter().enumerate() {
-                insert.execute(params![
-                    ordinal,
-                    &member.manifest_digest,
-                    member.source_kind.as_str(),
-                    &member.source_id,
-                    member.workspace_produced
-                ])?;
+                )?;
+                for (ordinal, member) in active_set.members.iter().enumerate() {
+                    insert.execute(params![
+                        ordinal,
+                        &member.manifest_digest,
+                        member.source_kind.as_str(),
+                        &member.source_id,
+                        member.workspace_produced
+                    ])?;
+                }
             }
-        }
-        transaction.execute(
-            "INSERT INTO semantic_pack_active_state(
+            transaction.execute(
+                "INSERT INTO semantic_pack_active_state(
                singleton, active_set_digest, updated_at
              ) VALUES(1, ?1, ?2)
              ON CONFLICT(singleton) DO UPDATE SET
                active_set_digest = excluded.active_set_digest,
                updated_at = excluded.updated_at",
-            params![&active_set.active_set_digest, now],
-        )?;
-        transaction.commit()?;
-        Ok(active_set)
+                params![&active_set.active_set_digest, now],
+            )?;
+            transaction.commit()?;
+            Ok(active_set)
+        })
     }
 
     fn open_ephemeral_temp_file() -> Result<Self> {
@@ -1358,37 +1964,34 @@ impl AnalyzerStore {
         self.db_path.is_none()
     }
 
-    pub(crate) fn has_published_analyzer_rows(&self) -> Result<bool> {
-        let connection = self.read_conn()?;
-        Ok(connection
-            .query_row("SELECT 1 FROM analysis_epochs LIMIT 1", [], |_| Ok(()))
-            .optional()?
-            .is_some())
-    }
-
     pub fn register_blobs(&self, oids: &[Oid], lang: &str, generation: GenerationId) -> Result<()> {
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
-        let tx = conn.transaction()?;
-        require_current_generation(&tx, lang, generation)?;
-        {
-            let mut remove_stale = tx.prepare(
-                "DELETE FROM blobs
+        let oids = oids.to_vec();
+        let lang = lang.to_string();
+        self.conn.execute(move |conn| {
+            let lang = lang.as_str();
+            let oids = oids.as_slice();
+            let tx = conn.transaction()?;
+            require_current_generation(&tx, lang, generation)?;
+            {
+                let mut remove_stale = tx.prepare(
+                    "DELETE FROM blobs
                  WHERE blob_oid = ?1 AND lang = ?2 AND generation <> ?3",
-            )?;
-            let mut insert = tx.prepare(
-                "INSERT OR IGNORE INTO blobs(blob_oid, lang, generation) VALUES(?1, ?2, ?3)",
-            )?;
-            let mut seen = HashSet::default();
-            for oid in oids {
-                if seen.insert(*oid) {
-                    remove_stale.execute(params![oid.to_string(), lang, generation.0])?;
-                    insert.execute(params![oid.to_string(), lang, generation.0])?;
+                )?;
+                let mut insert = tx.prepare(
+                    "INSERT OR IGNORE INTO blobs(blob_oid, lang, generation) VALUES(?1, ?2, ?3)",
+                )?;
+                let mut seen = HashSet::default();
+                for oid in oids {
+                    if seen.insert(*oid) {
+                        remove_stale.execute(params![oid.to_string(), lang, generation.0])?;
+                        insert.execute(params![oid.to_string(), lang, generation.0])?;
+                    }
                 }
             }
-        }
-        tx.commit()?;
-        let _ = reclaim_stale_generations_conn(&mut conn, STALE_GENERATION_RECLAIM_ROWS);
-        Ok(())
+            tx.commit()?;
+            let _ = reclaim_stale_generations_conn(conn, STALE_GENERATION_RECLAIM_ROWS);
+            Ok(())
+        })
     }
 
     pub fn ensure_language_epoch(
@@ -1413,8 +2016,14 @@ impl AnalyzerStore {
         &self,
         entries: &[(String, String)],
     ) -> Result<HashMap<String, GenerationId>> {
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
-        ensure_language_epochs_tx(&mut conn, entries)
+        let conn = self.read_conn()?;
+        if let Some(generations) = matching_language_epochs_conn(&conn, entries)? {
+            return Ok(generations);
+        }
+        drop(conn);
+        let entries = entries.to_vec();
+        self.conn
+            .execute(move |conn| ensure_language_epochs_tx(conn, &entries))
     }
 
     /// Sum persisted analyzer payload bytes for complete blobs in the active
@@ -1678,76 +2287,81 @@ impl AnalyzerStore {
                 "invalid structural facts snapshot version {snapshot_version}"
             )));
         }
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
-        // This transaction reads the existing snapshot/cost before replacing
-        // them. Acquire the writer slot up front so a concurrent cache writer
-        // cannot commit between the read and a deferred write upgrade, which
-        // would surface as SQLITE_BUSY_SNAPSHOT and leave a one-file hole.
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_current_generation(&tx, lang, generation)?;
-        let complete_sql = format!(
-            "SELECT 1 FROM blob_meta AS meta
+        let lang = lang.to_string();
+        let payload = payload.to_vec();
+        self.conn.execute(move |conn| {
+            let lang = lang.as_str();
+            let payload = payload.as_slice();
+            // This transaction reads the existing snapshot/cost before replacing
+            // them. Acquire the writer slot up front so a concurrent cache writer
+            // cannot commit between the read and a deferred write upgrade, which
+            // would surface as SQLITE_BUSY_SNAPSHOT and leave a one-file hole.
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            require_current_generation(&tx, lang, generation)?;
+            let complete_sql = format!(
+                "SELECT 1 FROM blob_meta AS meta
              WHERE meta.blob_oid = ?1 AND meta.lang = ?2
                AND {PARSED_BLOB_COMPLETE_CONDITION}"
-        );
-        let oid = oid.to_string();
-        let complete = tx
-            .query_row(&complete_sql, params![oid, lang], |_| Ok(()))
-            .optional()?
-            .is_some();
-        if !complete {
-            tx.commit()?;
-            return Ok(false);
-        }
+            );
+            let oid = oid.to_string();
+            let complete = tx
+                .query_row(&complete_sql, params![oid, lang], |_| Ok(()))
+                .optional()?
+                .is_some();
+            if !complete {
+                tx.commit()?;
+                return Ok(false);
+            }
 
-        let previous_snapshot_bytes = tx.query_row(
-            "SELECT COALESCE(SUM(length(payload)), 0)
+            let previous_snapshot_bytes = tx.query_row(
+                "SELECT COALESCE(SUM(length(payload)), 0)
              FROM structural_facts_snapshots
              WHERE blob_oid = ?1 AND lang = ?2",
-            params![oid, lang],
-            |row| row.get::<_, usize>(0),
-        )?;
-        let previous_payload_cost = tx
-            .query_row(
-                "SELECT payload_bytes FROM blob_payload_costs
-                 WHERE blob_oid = ?1 AND lang = ?2",
                 params![oid, lang],
                 |row| row.get::<_, usize>(0),
-            )
-            .optional()?;
-        tx.execute(
-            "DELETE FROM structural_facts_snapshots
-             WHERE blob_oid = ?1 AND lang = ?2",
-            params![oid, lang],
-        )?;
-        tx.execute(
-            "INSERT INTO structural_facts_snapshots(
-               blob_oid, lang, snapshot_version, payload
-             ) VALUES(?1, ?2, ?3, ?4)",
-            params![oid, lang, snapshot_version, payload],
-        )?;
-
-        if previous_payload_cost.is_some_and(|cost| cost >= previous_snapshot_bytes) {
-            tx.execute(
-                "UPDATE blob_payload_costs
-                 SET payload_bytes = payload_bytes - ?3 + ?4
-                 WHERE blob_oid = ?1 AND lang = ?2",
-                params![
-                    oid,
-                    lang,
-                    usize_to_i64(previous_snapshot_bytes)?,
-                    usize_to_i64(payload.len())?,
-                ],
             )?;
-        } else {
+            let previous_payload_cost = tx
+                .query_row(
+                    "SELECT payload_bytes FROM blob_payload_costs
+                 WHERE blob_oid = ?1 AND lang = ?2",
+                    params![oid, lang],
+                    |row| row.get::<_, usize>(0),
+                )
+                .optional()?;
             tx.execute(
-                "DELETE FROM blob_payload_costs WHERE blob_oid = ?1 AND lang = ?2",
+                "DELETE FROM structural_facts_snapshots
+             WHERE blob_oid = ?1 AND lang = ?2",
                 params![oid, lang],
             )?;
-            update_blob_payload_cost_tx(&tx, &oid, lang)?;
-        }
-        tx.commit()?;
-        Ok(true)
+            tx.execute(
+                "INSERT INTO structural_facts_snapshots(
+               blob_oid, lang, snapshot_version, payload
+             ) VALUES(?1, ?2, ?3, ?4)",
+                params![oid, lang, snapshot_version, payload],
+            )?;
+
+            if previous_payload_cost.is_some_and(|cost| cost >= previous_snapshot_bytes) {
+                tx.execute(
+                    "UPDATE blob_payload_costs
+                 SET payload_bytes = payload_bytes - ?3 + ?4
+                 WHERE blob_oid = ?1 AND lang = ?2",
+                    params![
+                        oid,
+                        lang,
+                        usize_to_i64(previous_snapshot_bytes)?,
+                        usize_to_i64(payload.len())?,
+                    ],
+                )?;
+            } else {
+                tx.execute(
+                    "DELETE FROM blob_payload_costs WHERE blob_oid = ?1 AND lang = ?2",
+                    params![oid, lang],
+                )?;
+                update_blob_payload_cost_tx(&tx, &oid, lang)?;
+            }
+            tx.commit()?;
+            Ok(true)
+        })
     }
 
     #[cfg(test)]
@@ -1764,14 +2378,14 @@ impl AnalyzerStore {
 
     #[cfg(test)]
     pub(crate) fn mark_parsed_blob_incomplete_for_test(&self, oid: Oid, lang: &str) {
-        self.conn
-            .lock()
-            .expect("analyzer store mutex poisoned")
-            .execute(
+        let lang = lang.to_string();
+        self.conn.execute(move |conn| {
+            conn.execute(
                 "UPDATE blob_meta SET is_complete = 0 WHERE blob_oid = ?1 AND lang = ?2",
                 params![oid.to_string(), lang],
             )
-            .expect("mark parsed blob incomplete");
+            .expect("mark parsed blob incomplete")
+        });
     }
 
     #[cfg(test)]
@@ -1794,19 +2408,15 @@ impl AnalyzerStore {
         adapter: &A,
         state: &FileState,
     ) -> Result<()> {
-        #[cfg(test)]
-        self.parsed_blob_transaction_starts
-            .fetch_add(1, Ordering::SeqCst);
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
-        // Reserve the writer slot before reading the generation. A deferred
-        // transaction can otherwise fail while upgrading its read snapshot
-        // under concurrent pooled-reader churn, particularly on Windows.
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_current_generation(&tx, lang, generation)?;
-        write_parsed_blob_tx(&tx, oid, lang, generation, adapter, state)?;
-        tx.commit()?;
-        let _ = reclaim_stale_generations_conn(&mut conn, STALE_GENERATION_RECLAIM_ROWS);
-        Ok(())
+        let prepared =
+            prepare_parsed_blob(oid, lang, generation, adapter, Arc::new(state.clone()))?;
+        let (mut outcomes, _) =
+            self.persist_prepared_blobs(vec![prepared], PersistBatchLimits::PRODUCTION);
+        let outcome = outcomes.pop().expect("one prepared blob has one outcome");
+        match outcome.error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     #[cfg(test)]
@@ -1835,250 +2445,31 @@ impl AnalyzerStore {
         prepared: Vec<PreparedParsedBlob>,
         limits: PersistBatchLimits,
     ) -> (Vec<PersistBlobOutcome>, PersistBatchStats) {
-        let limits = limits.normalized();
-        let mut outcomes = Vec::with_capacity(prepared.len());
-        let mut stats = PersistBatchStats::default();
-        let mut batch = Vec::new();
-        let mut batch_rows = 0usize;
-        let mut batch_bytes = 0usize;
-        let mut seen = HashSet::default();
-
-        for blob in prepared {
-            if !seen.insert((blob.oid(), blob.lang().to_string())) {
-                outcomes.push(PersistBlobOutcome {
-                    prepared: blob,
-                    error: Some(StoreError::new(
-                        "duplicate prepared blob key in one persistence call",
-                    )),
-                });
-                stats.failed_blobs = stats.failed_blobs.saturating_add(1);
-                continue;
-            }
-            let exceeds = !batch.is_empty()
-                && (batch.len() >= limits.max_blobs
-                    || batch_rows.saturating_add(blob.mutation_logical_rows()) > limits.max_rows
-                    || batch_bytes.saturating_add(blob.mutation_payload_bytes())
-                        > limits.max_payload_bytes);
-            if exceeds {
-                let (batch_outcomes, batch_stats) = self.persist_prepared_chunk(batch, limits);
-                outcomes.extend(batch_outcomes);
-                stats.merge(batch_stats);
-                batch = Vec::new();
-                batch_rows = 0;
-                batch_bytes = 0;
-            }
-            batch_rows = batch_rows.saturating_add(blob.mutation_logical_rows());
-            batch_bytes = batch_bytes.saturating_add(blob.mutation_payload_bytes());
-            batch.push(blob);
-        }
-        if !batch.is_empty() {
-            let (batch_outcomes, batch_stats) = self.persist_prepared_chunk(batch, limits);
-            outcomes.extend(batch_outcomes);
-            stats.merge(batch_stats);
-        }
-        (outcomes, stats)
+        let counters = self.prepared_write_counters();
+        self.conn.execute(move |conn| {
+            PreparedPersistenceWriter::new(conn, counters).persist_prepared_blobs(prepared, limits)
+        })
     }
 
-    fn persist_prepared_chunk(
-        &self,
-        mut prepared: Vec<PreparedParsedBlob>,
-        limits: PersistBatchLimits,
-    ) -> (Vec<PersistBlobOutcome>, PersistBatchStats) {
-        let batch_blobs = prepared.len();
-        let batch_rows = saturating_sum(
-            prepared
-                .iter()
-                .map(PreparedParsedBlob::mutation_logical_rows),
-        );
-        let batch_bytes = saturating_sum(
-            prepared
-                .iter()
-                .map(PreparedParsedBlob::mutation_payload_bytes),
-        );
-        let result = self.try_persist_prepared_chunk(&prepared, limits);
-
-        match result {
-            Ok(actual_cost) => {
-                let stats = PersistBatchStats {
-                    transactions: 1,
-                    committed_blobs: batch_blobs,
-                    logical_rows: actual_cost.logical_rows,
-                    payload_bytes: actual_cost.payload_bytes,
-                    peak_batch_blobs: batch_blobs,
-                    peak_batch_rows: actual_cost.logical_rows,
-                    peak_batch_payload_bytes: actual_cost.payload_bytes,
-                    ..PersistBatchStats::default()
-                };
-                let outcomes = prepared
-                    .into_iter()
-                    .map(|prepared| PersistBlobOutcome {
-                        prepared,
-                        error: None,
-                    })
-                    .collect();
-                (outcomes, stats)
-            }
-            Err(error) if error.is_stale_generation() => {
-                let outcomes = prepared
-                    .into_iter()
-                    .map(|prepared| PersistBlobOutcome {
-                        prepared,
-                        error: Some(error.clone()),
-                    })
-                    .collect();
-                (
-                    outcomes,
-                    PersistBatchStats {
-                        failed_transaction_attempts: 1,
-                        failed_blobs: batch_blobs,
-                        peak_batch_blobs: batch_blobs,
-                        peak_batch_rows: batch_rows,
-                        peak_batch_payload_bytes: batch_bytes,
-                        ..PersistBatchStats::default()
-                    },
-                )
-            }
-            Err(mut error) if prepared.len() == 1 => {
-                let mut failed_attempts = 1;
-                for retry in 1..=PREPARED_WRITE_IMMEDIATE_RETRIES {
-                    std::thread::sleep(Duration::from_millis(10 * retry as u64));
-                    match self.try_persist_prepared_chunk(&prepared, limits) {
-                        Ok(actual_cost) => {
-                            return (
-                                vec![PersistBlobOutcome {
-                                    prepared: prepared.pop().expect("single retried prepared blob"),
-                                    error: None,
-                                }],
-                                PersistBatchStats {
-                                    transactions: 1,
-                                    failed_transaction_attempts: failed_attempts,
-                                    committed_blobs: 1,
-                                    logical_rows: actual_cost.logical_rows,
-                                    payload_bytes: actual_cost.payload_bytes,
-                                    peak_batch_blobs: batch_blobs,
-                                    peak_batch_rows: actual_cost.logical_rows,
-                                    peak_batch_payload_bytes: actual_cost.payload_bytes,
-                                    ..PersistBatchStats::default()
-                                },
-                            );
-                        }
-                        Err(retry_error) => {
-                            failed_attempts = failed_attempts.saturating_add(1);
-                            if retry_error.is_stale_generation() {
-                                error = retry_error;
-                                break;
-                            }
-                            error = retry_error;
-                        }
-                    }
-                }
-                (
-                    vec![PersistBlobOutcome {
-                        prepared: prepared.pop().expect("single failed prepared blob"),
-                        error: Some(error),
-                    }],
-                    PersistBatchStats {
-                        failed_transaction_attempts: failed_attempts,
-                        failed_blobs: 1,
-                        peak_batch_blobs: batch_blobs,
-                        peak_batch_rows: batch_rows,
-                        peak_batch_payload_bytes: batch_bytes,
-                        ..PersistBatchStats::default()
-                    },
-                )
-            }
-            Err(_) => {
-                let right = prepared.split_off(prepared.len() / 2);
-                let (mut left_outcomes, mut stats) = self.persist_prepared_chunk(prepared, limits);
-                let (right_outcomes, right_stats) = self.persist_prepared_chunk(right, limits);
-                left_outcomes.extend(right_outcomes);
-                stats.failed_transaction_attempts =
-                    stats.failed_transaction_attempts.saturating_add(1);
-                stats.peak_batch_blobs = stats.peak_batch_blobs.max(batch_blobs);
-                stats.peak_batch_rows = stats.peak_batch_rows.max(batch_rows);
-                stats.peak_batch_payload_bytes = stats.peak_batch_payload_bytes.max(batch_bytes);
-                stats.merge(right_stats);
-                (left_outcomes, stats)
-            }
-        }
+    pub(crate) fn repair_prepared_blob(&self, prepared: PreparedParsedBlob) -> Result<()> {
+        self.conn
+            .repair_prepared_blob(prepared, self.prepared_write_counters())
     }
 
-    fn try_persist_prepared_chunk(
-        &self,
-        prepared: &[PreparedParsedBlob],
-        limits: PersistBatchLimits,
-    ) -> Result<PersistedMutationCost> {
-        #[cfg(test)]
-        self.parsed_blob_transaction_starts
-            .fetch_add(1, Ordering::SeqCst);
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
-        let tx = conn.transaction()?;
-        let mut generations = HashMap::default();
-        for blob in prepared {
-            if let Some(existing) = generations.insert(blob.lang(), blob.generation)
-                && existing != blob.generation
-            {
-                return Err(StoreError::stale_generation(format!(
-                    "conflicting prepared generations for language {}",
-                    blob.lang()
-                )));
-            }
-        }
-        for (lang, generation) in generations {
+    fn prepared_write_counters(&self) -> PreparedWriteCounters {
+        PreparedWriteCounters {
             #[cfg(test)]
-            self.prepared_generation_lookup_queries
-                .fetch_add(1, Ordering::SeqCst);
-            require_current_generation(&tx, lang, generation)?;
+            transaction_starts: Arc::clone(&self.parsed_blob_transaction_starts),
+            #[cfg(test)]
+            generation_lookups: Arc::clone(&self.prepared_generation_lookup_queries),
+            #[cfg(test)]
+            replacement_lookups: Arc::clone(&self.replacement_cost_lookup_queries),
+            #[cfg(test)]
+            replacement_fallbacks: Arc::clone(&self.replacement_cost_fallback_queries),
         }
-        let stored_costs = self.stored_blob_cascade_costs(&tx, prepared)?;
-        let mut fallback_cost_statement =
-            tx.prepare_cached(persisted_blob_mutation_cost_fallback_sql())?;
-        let mut cost = PersistedMutationCost::default();
-        for (blob, stored) in prepared.iter().zip(stored_costs) {
-            let replaced = match stored {
-                StoredCascadeCost::Missing => PersistedMutationCost::default(),
-                StoredCascadeCost::Known(cost) => cost,
-                StoredCascadeCost::Legacy => {
-                    #[cfg(test)]
-                    self.replacement_cost_fallback_queries
-                        .fetch_add(1, Ordering::SeqCst);
-                    persisted_blob_mutation_cost_fallback_statement(
-                        &mut fallback_cost_statement,
-                        blob.oid_text.as_str(),
-                        blob.lang(),
-                    )?
-                }
-            };
-            cost.logical_rows = cost
-                .logical_rows
-                .saturating_add(blob.logical_rows())
-                .saturating_add(replaced.logical_rows);
-            cost.payload_bytes = cost
-                .payload_bytes
-                .saturating_add(blob.payload_bytes())
-                .saturating_add(replaced.payload_bytes);
-        }
-        drop(fallback_cost_statement);
-        if prepared.len() > 1
-            && (prepared.len() > limits.max_blobs
-                || cost.logical_rows > limits.max_rows
-                || cost.payload_bytes > limits.max_payload_bytes)
-        {
-            return Err(StoreError::new(format!(
-                "prepared replacement mutation batch exceeds limits: blobs={}, rows={}, bytes={}",
-                prepared.len(),
-                cost.logical_rows,
-                cost.payload_bytes
-            )));
-        }
-        for blob in prepared {
-            write_prepared_blob_unchecked_tx(&tx, blob)?;
-        }
-        tx.commit()?;
-        let _ = reclaim_stale_generations_conn(&mut conn, STALE_GENERATION_RECLAIM_ROWS);
-        Ok(cost)
     }
 
+    #[cfg(test)]
     fn stored_blob_cascade_costs(
         &self,
         conn: &Connection,
@@ -2168,12 +2559,13 @@ impl AnalyzerStore {
         generation: GenerationId,
         adapter: &A,
         file: &ProjectFile,
+        source: &str,
     ) -> Result<Option<SummaryFileProjection>> {
         let _scope = crate::profiling::scope("AnalyzerStore::summary_file_projection");
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_current_generation(&tx, lang, generation)?;
-        let result = summary_file_projection_conn(&tx, oid, lang, adapter, file)?;
+        let result = summary_file_projection_conn(&tx, oid, lang, adapter, file, source)?;
         tx.commit()?;
         Ok(result)
     }
@@ -2213,6 +2605,26 @@ impl AnalyzerStore {
         let tx = conn.transaction()?;
         require_current_generation(&tx, lang, generation)?;
         let result = enclosing_declarations_for_range_conn(&tx, oid, lang, adapter, file, range)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// Read all persisted declaration ranges for one file. This compact
+    /// projection is used by batched owner lookups and does not hydrate the
+    /// file's source or unrelated analyzer facts.
+    pub(crate) fn enclosing_declarations_for_file<A: LanguageAdapter>(
+        &self,
+        oid: Oid,
+        lang: &str,
+        generation: GenerationId,
+        adapter: &A,
+        file: &ProjectFile,
+    ) -> Result<Option<Vec<(CodeUnit, Range)>>> {
+        let _scope = crate::profiling::scope("AnalyzerStore::enclosing_declarations_for_file");
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        require_current_generation(&tx, lang, generation)?;
+        let result = enclosing_declarations_for_file_conn(&tx, oid, lang, adapter, file)?;
         tx.commit()?;
         Ok(result)
     }
@@ -2285,7 +2697,7 @@ impl AnalyzerStore {
         generation: GenerationId,
         unit: &CodeUnit,
         limit: usize,
-    ) -> Result<LimitedQueryRows<CandidateRow>> {
+    ) -> Result<LimitedQueryRows<HydratedCandidateRow>> {
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_current_generation(&tx, lang, generation)?;
@@ -2468,6 +2880,109 @@ impl AnalyzerStore {
                         imports: imports_by_oid.get(&oid).cloned().unwrap_or_default(),
                     },
                 );
+            }
+        }
+        tx.commit()?;
+        Ok(out)
+    }
+
+    /// Return current candidate blobs that may reference one of a small set of
+    /// declaration names through a non-static import or a lexical type use.
+    ///
+    /// This is deliberately a prefilter. Import paths are sought by any
+    /// matching structured segment, then Java's resolver verifies the complete
+    /// path and precedence after hydrating the small surviving set. False
+    /// positives are harmless; a false negative would change relevance.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reverse_reference_candidate_oids(
+        &self,
+        lang: &str,
+        generation: GenerationId,
+        candidate_oids: &[Oid],
+        explicit_import_segments: &HashSet<String>,
+        wildcard_import_segments: &HashSet<String>,
+        type_identifiers: &HashSet<String>,
+        cancellation: &CancellationToken,
+    ) -> Result<HashSet<Oid>> {
+        if candidate_oids.is_empty()
+            || (explicit_import_segments.is_empty()
+                && wildcard_import_segments.is_empty()
+                && type_identifiers.is_empty())
+        {
+            return Ok(HashSet::default());
+        }
+
+        let mut conn = self.active_read_conn()?;
+        let tx = conn.transaction()?;
+        require_current_generation(&tx, lang, generation)?;
+        let active_blobs = candidate_oids
+            .iter()
+            .copied()
+            .map(ActiveSearchBlob::unfiltered)
+            .collect::<Vec<_>>();
+        sync_active_blob_oids(&tx, &active_blobs)?;
+        sync_reverse_reference_lookup_keys(
+            &tx,
+            explicit_import_segments,
+            wildcard_import_segments,
+            type_identifiers,
+        )?;
+
+        let mut matches = HashSet::default();
+        if !explicit_import_segments.is_empty() || !wildcard_import_segments.is_empty() {
+            let mut statement = tx.prepare_cached(REVERSE_IMPORT_CANDIDATE_BLOBS_SQL)?;
+            let mut rows = statement.query([lang])?;
+            while let Some(row) = rows.next()? {
+                if cancellation.is_cancelled() {
+                    return Ok(HashSet::default());
+                }
+                let oid = row.get::<_, String>(0)?;
+                matches.insert(Oid::from_str(&oid)?);
+            }
+        }
+        if !type_identifiers.is_empty() {
+            let mut statement = tx.prepare_cached(REVERSE_TYPE_CANDIDATE_BLOBS_SQL)?;
+            let mut rows = statement.query([lang])?;
+            while let Some(row) = rows.next()? {
+                if cancellation.is_cancelled() {
+                    return Ok(HashSet::default());
+                }
+                let oid = row.get::<_, String>(0)?;
+                matches.insert(Oid::from_str(&oid)?);
+            }
+        }
+        tx.commit()?;
+        Ok(matches)
+    }
+
+    pub(crate) fn hydrate_type_identifiers_by_key(
+        &self,
+        entries: &[(ProjectFile, Oid, String)],
+        generations: &HashMap<String, GenerationId>,
+    ) -> Result<HashMap<ProjectFile, HashSet<String>>> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        require_generation_map(
+            &tx,
+            generations,
+            entries.iter().map(|(_, _, lang)| lang.as_str()),
+        )?;
+        let mut by_lang: HashMap<String, Vec<(ProjectFile, Oid)>> = HashMap::default();
+        for (file, oid, lang) in entries {
+            by_lang
+                .entry(lang.clone())
+                .or_default()
+                .push((file.clone(), *oid));
+        }
+        let mut out = HashMap::default();
+        for (lang, lang_entries) in by_lang {
+            let oids = unique_oid_strings(&lang_entries);
+            let meta_by_oid = read_blob_meta_bulk(&tx, &lang, &oids)?;
+            for (file, oid) in lang_entries {
+                let Some(meta) = meta_by_oid.get(&oid.to_string()) else {
+                    continue;
+                };
+                out.insert(file, meta.type_identifiers.clone());
             }
         }
         tx.commit()?;
@@ -2690,10 +3205,13 @@ impl AnalyzerStore {
         &self,
         lang: &str,
         short_name: &str,
-    ) -> Result<Vec<CandidateRow>> {
-        let conn = self.read_conn()?;
+    ) -> Result<Vec<HydratedCandidateRow>> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
         let sql = declaration_candidate_sql("units.lang = ?1 AND units.short_name = ?2");
-        candidate_rows_for_languages(&conn, std::iter::once(lang), &sql, &[&short_name])
+        let rows = candidate_rows_for_languages(&tx, std::iter::once(lang), &sql, &[&short_name])?;
+        tx.commit()?;
+        Ok(rows)
     }
 
     pub fn declaration_candidate_rows_by_short_name_for_langs(
@@ -2701,7 +3219,7 @@ impl AnalyzerStore {
         langs: &[String],
         generations: &HashMap<String, GenerationId>,
         short_name: &str,
-    ) -> Result<Vec<CandidateRow>> {
+    ) -> Result<Vec<HydratedCandidateRow>> {
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
@@ -2719,6 +3237,7 @@ impl AnalyzerStore {
     /// `complete` is false when the caller's deadline expired mid-seek. The
     /// rows returned with it are a prefix, not an answer: a caller must not
     /// present them as this name's candidate set, and must not memoize them.
+    #[cfg(test)]
     pub(crate) fn declaration_order_candidate_rows_by_short_name_for_langs(
         &self,
         langs: &[String],
@@ -2730,13 +3249,14 @@ impl AnalyzerStore {
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
         let sql = definition_order_candidate_sql(
-            "units.lang = ?1 AND units.short_name = ?2",
+            "live_definition_exact_names",
+            "names.lang = ?1 AND names.short_name = ?2 AND names.source_kind <> 'path'",
             "units.in_declarations = 1",
         );
         let rows = definition_order_candidate_rows_for_languages(
             &tx,
             langs.iter().map(String::as_str),
-            &sql,
+            &[sql.as_str()],
             &[&short_name],
             cancellation,
         )?;
@@ -2744,96 +3264,227 @@ impl AnalyzerStore {
         Ok(rows)
     }
 
-    /// The many-name form of
-    /// [`Self::declaration_order_candidate_rows_by_short_name_for_langs`], for
-    /// callers that can enumerate every name they will ask about before they
-    /// ask about any of them (#1748).
-    ///
-    /// One chunked `IN` seek per `SHORT_NAMES_PER_QUERY` names against the
-    /// same `(lang, short_name)` index, inside one transaction and one
-    /// generation check, instead of a pooled reader checkout plus transaction
-    /// plus generation check per name. Rows carry their `short_name`, so the
-    /// caller regroups them without a second read.
-    ///
-    /// The `IN` list is the same idiom as
-    /// `declaration_candidate_rows_by_identifiers_for_langs` (#1688); the
-    /// chunk bound matches the 400-key bulk readers in this file.
-    pub(crate) fn declaration_order_candidate_rows_by_short_names_for_langs(
+    /// Cross the candidate identity boundary for the rows that survived
+    /// header-only name and liveness filtering. Generation validation is
+    /// repeated in this transaction so a delayed read cannot combine headers
+    /// from one publication with segments from another.
+    #[cfg(test)]
+    pub(crate) fn hydrate_definition_order_candidate_rows(
         &self,
-        langs: &[String],
+        rows: Vec<DefinitionOrderCandidateRow>,
         generations: &HashMap<String, GenerationId>,
-        short_names: &[String],
         cancellation: Option<&CancellationToken>,
-    ) -> Result<LimitedQueryRows<DefinitionOrderCandidateRow>> {
-        const SHORT_NAMES_PER_QUERY: usize = 400;
-        if short_names.is_empty() {
-            return Ok(LimitedQueryRows::complete(Vec::new(), 0));
-        }
+    ) -> Result<LimitedQueryRows<HydratedDefinitionOrderCandidateRow>> {
+        let inspected = rows.len();
+        let mut langs = rows
+            .iter()
+            .map(|row| row.candidate.lang.as_str())
+            .collect::<Vec<_>>();
+        langs.sort_unstable();
+        langs.dedup();
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
-        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
-        let mut rows = Vec::new();
-        let mut complete = true;
-        for chunk in short_names.chunks(SHORT_NAMES_PER_QUERY) {
-            // `?1` is the language, so the names start at `?2`.
-            let placeholders = (0..chunk.len())
-                .map(|index| format!("?{}", index + 2))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let sql = definition_order_candidate_sql(
-                &format!("units.lang = ?1 AND units.short_name IN ({placeholders})"),
-                "units.in_declarations = 1",
-            );
-            let values: Vec<&dyn ToSql> = chunk.iter().map(|name| name as &dyn ToSql).collect();
-            let chunk_rows = definition_order_candidate_rows_for_languages(
-                &tx,
-                langs.iter().map(String::as_str),
-                &sql,
-                &values,
-                cancellation,
-            )?;
-            complete &= chunk_rows.complete;
-            rows.extend(chunk_rows.rows);
-            if !complete {
-                break;
-            }
-        }
+        require_generation_map(&tx, generations, langs)?;
+        let hydrated = hydrate_candidate_rows(&tx, rows, cancellation)?;
         tx.commit()?;
-        let inspected = rows.len();
-        Ok(if complete {
-            LimitedQueryRows::complete(rows, inspected)
-        } else {
-            LimitedQueryRows::incomplete(rows, inspected)
+        Ok(match hydrated {
+            Some(rows) => LimitedQueryRows::complete(rows, inspected),
+            None => LimitedQueryRows::incomplete(Vec::new(), inspected),
         })
     }
 
-    /// Returns name-bounded declaration-lookup candidates together with the
-    /// persisted range fact needed for definition ordering. `complete` carries
-    /// the same meaning as in
-    /// [`Self::declaration_order_candidate_rows_by_short_name_for_langs`].
-    pub(crate) fn definition_lookup_order_candidate_rows_by_short_name_for_langs(
+    /// Invert rendered definition requests into bounded `(prefix, tail)`
+    /// alternatives, seek their authoritative component relations, then
+    /// hydrate only the physical identities that matched. Point lookup is the
+    /// arity-one form of this batch contract.
+    pub(crate) fn rendered_definition_order_candidate_rows_for_langs(
         &self,
         langs: &[String],
         generations: &HashMap<String, GenerationId>,
-        short_name: &str,
+        workspace_fingerprints: &HashMap<String, String>,
+        requests: &[RenderedDefinitionRequest],
+        include_definition_lookup_units: bool,
         cancellation: Option<&CancellationToken>,
-    ) -> Result<LimitedQueryRows<DefinitionOrderCandidateRow>> {
+    ) -> Result<RenderedDefinitionCandidateOutcome> {
+        if requests.is_empty() {
+            return Ok(RenderedDefinitionCandidateOutcome::Complete(Vec::new()));
+        }
+        let components = requests
+            .iter()
+            .enumerate()
+            .flat_map(|(request_index, request)| {
+                rendered_definition_components(request_index, request)
+            })
+            .collect::<Vec<_>>();
+        let membership = if include_definition_lookup_units {
+            "(units.in_declarations = 1 OR units.in_definition_lookup = 1)"
+        } else {
+            "units.in_declarations = 1"
+        };
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
-        let sql = definition_order_candidate_sql(
-            "units.lang = ?1 AND units.short_name = ?2",
-            "(units.in_declarations = 1 OR units.in_definition_lookup = 1)",
-        );
-        let rows = definition_order_candidate_rows_for_languages(
-            &tx,
-            langs.iter().map(String::as_str),
-            &sql,
-            &[&short_name],
-            cancellation,
-        )?;
+        if workspace_snapshot_fingerprints_conn(&tx, langs, generations)? != *workspace_fingerprints
+        {
+            tx.commit()?;
+            return Ok(RenderedDefinitionCandidateOutcome::WorkspaceChanged);
+        }
+        let mut rows = Vec::new();
+
+        // Arity one is semantically the same operation as the batch below,
+        // but scalar parameters avoid constructing and scanning a JSON virtual
+        // request table for the latency-sensitive point path.
+        if requests.len() == 1 {
+            for lang in langs {
+                let generation = generations
+                    .get(lang)
+                    .expect("validated generation map contains every requested language")
+                    .0;
+                for tail_match in [
+                    RenderedTailMatch::Exact,
+                    RenderedTailMatch::NormalizedStored,
+                    RenderedTailMatch::NormalizedExact,
+                ] {
+                    let normalized = tail_match != RenderedTailMatch::Exact;
+                    for anchored in [false, true] {
+                        let matching_components = components.iter().filter(|(_, component)| {
+                            component.normalized == normalized
+                                && component.anchored == anchored
+                                && !component.tail.is_empty()
+                                && (tail_match != RenderedTailMatch::NormalizedExact
+                                    || component.normalized_exact_fallback)
+                        });
+                        let mut matching_components = matching_components.peekable();
+                        if matching_components.peek().is_none() {
+                            continue;
+                        }
+                        let sql = point_component_definition_candidate_sql(
+                            anchored, tail_match, membership,
+                        );
+                        let mut statement = tx.prepare_cached(sql)?;
+                        for (_, component) in matching_components {
+                            let complete = if anchored {
+                                collect_rendered_definition_candidate_rows(
+                                    &mut statement,
+                                    params![lang, generation, component.prefix, component.tail],
+                                    &mut rows,
+                                    cancellation,
+                                )?
+                            } else {
+                                collect_rendered_definition_candidate_rows(
+                                    &mut statement,
+                                    params![lang, generation, component.tail],
+                                    &mut rows,
+                                    cancellation,
+                                )?
+                            };
+                            if !complete {
+                                return Ok(RenderedDefinitionCandidateOutcome::Cancelled);
+                            }
+                        }
+                    }
+                }
+                let mut statement =
+                    tx.prepare_cached(point_anchor_only_definition_candidate_sql(membership))?;
+                for (_, component) in components.iter().filter(|(_, component)| {
+                    component.anchored && !component.normalized && component.tail.is_empty()
+                }) {
+                    if !collect_rendered_definition_candidate_rows(
+                        &mut statement,
+                        params![lang, generation, component.prefix],
+                        &mut rows,
+                        cancellation,
+                    )? {
+                        return Ok(RenderedDefinitionCandidateOutcome::Cancelled);
+                    }
+                }
+            }
+        } else {
+            let request_rows = components
+                .iter()
+                .map(|(request_index, component)| {
+                    (
+                        *request_index,
+                        component.prefix.as_str(),
+                        component.tail.as_str(),
+                        i64::from(component.normalized),
+                        i64::from(component.anchored),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let request_json = serde_json::to_string(&request_rows).map_err(|error| {
+                StoreError::new(format!(
+                    "serializing definition request components: {error}"
+                ))
+            })?;
+            for lang in langs {
+                let generation = generations
+                    .get(lang)
+                    .expect("validated generation map contains every requested language")
+                    .0;
+                for anchored in [false, true] {
+                    for tail_match in [
+                        RenderedTailMatch::Exact,
+                        RenderedTailMatch::NormalizedStored,
+                        RenderedTailMatch::NormalizedExact,
+                    ] {
+                        let sql = batch_component_definition_candidate_sql(
+                            anchored, tail_match, membership,
+                        );
+                        let mut statement = tx.prepare_cached(&sql)?;
+                        if !collect_rendered_definition_candidate_rows(
+                            &mut statement,
+                            params![request_json, lang, generation],
+                            &mut rows,
+                            cancellation,
+                        )? {
+                            return Ok(RenderedDefinitionCandidateOutcome::Cancelled);
+                        }
+                    }
+                }
+                let sql = batch_anchor_only_definition_candidate_sql(membership);
+                let mut statement = tx.prepare_cached(&sql)?;
+                if !collect_rendered_definition_candidate_rows(
+                    &mut statement,
+                    params![request_json, lang, generation],
+                    &mut rows,
+                    cancellation,
+                )? {
+                    return Ok(RenderedDefinitionCandidateOutcome::Cancelled);
+                }
+            }
+        }
+
+        // Exact and normalized component alternatives can reach the same
+        // physical identity. Preserve genuinely different mount prefixes but
+        // hydrate each request/identity/prefix tuple only once.
+        let mut seen = HashSet::default();
+        rows.retain(|(candidate, (request_index, _, mounted_prefix))| {
+            seen.insert((
+                *request_index,
+                candidate.blob_oid,
+                candidate.lang.clone(),
+                candidate.unit_key,
+                mounted_prefix.clone(),
+            ))
+        });
+        let Some(rows) = hydrate_candidate_rows(&tx, rows, cancellation)? else {
+            tx.commit()?;
+            return Ok(RenderedDefinitionCandidateOutcome::Cancelled);
+        };
+        let mut grouped = std::iter::repeat_with(Vec::new)
+            .take(requests.len())
+            .collect::<Vec<_>>();
+        for (candidate, (request_index, first_start_byte, mounted_prefix)) in rows {
+            assert!(request_index < grouped.len());
+            grouped[request_index].push(DefinitionOrderCandidateRow {
+                candidate,
+                first_start_byte,
+                mounted_prefix,
+            });
+        }
         tx.commit()?;
-        Ok(rows)
+        Ok(RenderedDefinitionCandidateOutcome::Complete(grouped))
     }
 
     /// Backs `CodeUnitIndex::lookup_candidates_by_identifier`, the sole bare-name
@@ -2853,7 +3504,7 @@ impl AnalyzerStore {
         langs: &[String],
         generations: &HashMap<String, GenerationId>,
         identifier: &str,
-    ) -> Result<Vec<CandidateRow>> {
+    ) -> Result<Vec<HydratedCandidateRow>> {
         self.declaration_candidate_rows_by_identifiers_for_langs(langs, generations, &[identifier])
     }
 
@@ -2868,7 +3519,7 @@ impl AnalyzerStore {
         langs: &[String],
         generations: &HashMap<String, GenerationId>,
         identifiers: &[&str],
-    ) -> Result<Vec<CandidateRow>> {
+    ) -> Result<Vec<HydratedCandidateRow>> {
         assert!(
             !identifiers.is_empty(),
             "a suffix query path always spells at least its terminal segment"
@@ -2900,6 +3551,45 @@ impl AnalyzerStore {
         Ok(rows)
     }
 
+    pub(crate) fn retained_definition_candidate_rows_by_identifiers_for_langs(
+        &self,
+        langs: &[String],
+        generations: &HashMap<String, GenerationId>,
+        identifiers: &[&str],
+        include_definition_lookup_units: bool,
+    ) -> Result<Vec<HydratedCandidateRow>> {
+        assert!(!identifiers.is_empty());
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
+        let placeholders = (0..identifiers.len())
+            .map(|index| format!("?{}", index + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let membership = if include_definition_lookup_units {
+            "(units.in_declarations = 1 OR units.in_definition_lookup = 1)"
+        } else {
+            "units.in_declarations = 1"
+        };
+        let sql = candidate_rows_sql_with_membership(
+            "units",
+            "FROM code_units AS units
+             JOIN blob_meta AS meta
+               ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang",
+            &format!("units.lang = ?1 AND units.identifier IN ({placeholders})"),
+            membership,
+            "units.blob_oid, units.unit_key",
+        );
+        let values = identifiers
+            .iter()
+            .map(|identifier| identifier as &dyn ToSql)
+            .collect::<Vec<_>>();
+        let rows =
+            candidate_rows_for_languages(&tx, langs.iter().map(String::as_str), &sql, &values)?;
+        tx.commit()?;
+        Ok(rows)
+    }
+
     /// Candidate rows whose `identifier` starts with `prefix`.
     ///
     /// A half-open range over the same `(lang, identifier)` index the exact
@@ -2920,7 +3610,7 @@ impl AnalyzerStore {
         langs: &[String],
         generations: &HashMap<String, GenerationId>,
         prefix: &str,
-    ) -> Result<Vec<CandidateRow>> {
+    ) -> Result<Vec<HydratedCandidateRow>> {
         let upper = byte_successor(prefix)
             .expect("an identifier prefix is a non-empty string with a byte successor");
         let mut conn = self.read_conn()?;
@@ -2942,7 +3632,7 @@ impl AnalyzerStore {
         generations: &HashMap<String, GenerationId>,
         identifier: &str,
         limit: usize,
-    ) -> Result<LimitedQueryRows<CandidateRow>> {
+    ) -> Result<LimitedQueryRows<HydratedCandidateRow>> {
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
@@ -2953,7 +3643,7 @@ impl AnalyzerStore {
                ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang",
             "units.lang = ?1 AND units.identifier = ?2",
             "(units.in_declarations = 1 OR units.in_definition_lookup = 1)",
-            "units.blob_oid, units.unit_key",
+            &["units.blob_oid", "units.unit_key"],
         );
         let sql = format!("{sql} LIMIT ?3");
         let rows = candidate_rows_for_languages_limited(
@@ -2967,13 +3657,64 @@ impl AnalyzerStore {
         Ok(rows)
     }
 
+    /// Candidate rows for one live blob and identifier. The blob predicate is
+    /// deliberately added to the existing `(lang, identifier)` index seek.
+    /// SQLite carries the `WITHOUT ROWID` primary-key columns, including
+    /// `blob_oid`, in that secondary index, so this file-scoped lookup needs no
+    /// new schema index.
+    pub(crate) fn declaration_candidate_rows_by_identifier_for_blob(
+        &self,
+        lang: &str,
+        generations: &HashMap<String, GenerationId>,
+        blob_oid: Oid,
+        identifier: &str,
+    ) -> Result<Vec<HydratedCandidateRow>> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        require_current_generation(&tx, lang, generations[lang])?;
+        let rows = candidate_rows_for_languages(
+            &tx,
+            std::iter::once(lang),
+            &identifier_candidate_for_blob_sql(),
+            &[&identifier, &blob_oid.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(rows)
+    }
+
+    pub(crate) fn declaration_candidate_rows_by_identifier_for_blob_limited(
+        &self,
+        lang: &str,
+        generations: &HashMap<String, GenerationId>,
+        blob_oid: Oid,
+        identifier: &str,
+        limit: usize,
+    ) -> Result<LimitedQueryRows<HydratedCandidateRow>> {
+        if limit == 0 {
+            return Ok(LimitedQueryRows::incomplete(Vec::new(), 0));
+        }
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        require_current_generation(&tx, lang, generations[lang])?;
+        let sql = format!("{} LIMIT ?4", limited_identifier_candidate_for_blob_sql());
+        let rows = candidate_rows_for_languages_limited(
+            &tx,
+            std::iter::once(lang),
+            &sql,
+            &[&identifier, &blob_oid.to_string()],
+            limit,
+        )?;
+        tx.commit()?;
+        Ok(rows)
+    }
+
     pub(crate) fn declaration_candidate_rows_by_lookup_key_for_langs(
         &self,
         langs: &[String],
         generations: &HashMap<String, GenerationId>,
         column: PersistedLookupKey,
         value: &str,
-    ) -> Result<Vec<CandidateRow>> {
+    ) -> Result<Vec<HydratedCandidateRow>> {
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
@@ -2995,7 +3736,7 @@ impl AnalyzerStore {
         column: PersistedLookupKey,
         value: &str,
         limit: usize,
-    ) -> Result<LimitedQueryRows<CandidateRow>> {
+    ) -> Result<LimitedQueryRows<HydratedCandidateRow>> {
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
@@ -3024,7 +3765,7 @@ impl AnalyzerStore {
         owner: &str,
         normalized: bool,
         identifier: &str,
-    ) -> Result<Vec<CandidateRow>> {
+    ) -> Result<Vec<HydratedCandidateRow>> {
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
@@ -3067,7 +3808,7 @@ impl AnalyzerStore {
         normalized: bool,
         identifier: &str,
         limit: usize,
-    ) -> Result<LimitedQueryRows<CandidateRow>> {
+    ) -> Result<LimitedQueryRows<HydratedCandidateRow>> {
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
@@ -3092,7 +3833,7 @@ impl AnalyzerStore {
                  AND owner.in_declarations = 1 AND child.identifier = ?3"
             ),
             "child.in_declarations = 1",
-            "child.blob_oid, child.unit_key",
+            &["child.blob_oid", "child.unit_key"],
         );
         let sql = format!("{sql} LIMIT ?4");
         let rows = candidate_rows_for_languages_limited(
@@ -3111,7 +3852,7 @@ impl AnalyzerStore {
         langs: &[String],
         generations: &HashMap<String, GenerationId>,
         package: &str,
-    ) -> Result<Vec<CandidateRow>> {
+    ) -> Result<Vec<HydratedCandidateRow>> {
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
@@ -3136,7 +3877,7 @@ impl AnalyzerStore {
         package: &str,
         after: Option<(&str, Oid, i64)>,
         limit: usize,
-    ) -> Result<Vec<CandidateRow>> {
+    ) -> Result<Vec<HydratedCandidateRow>> {
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_current_generation(&tx, lang, generation)?;
@@ -3183,14 +3924,22 @@ impl AnalyzerStore {
         };
         let rows = collect_candidate_rows(mapped)?;
         drop(statement);
+        let rows = hydrate_candidate_rows(&tx, rows, None)?
+            .expect("uncancelled package-page hydration completes");
         tx.commit()?;
         Ok(rows)
     }
 
-    pub fn declaration_candidate_rows_by_lang(&self, lang: &str) -> Result<Vec<CandidateRow>> {
-        let conn = self.read_conn()?;
+    pub fn declaration_candidate_rows_by_lang(
+        &self,
+        lang: &str,
+    ) -> Result<Vec<HydratedCandidateRow>> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
         let sql = declaration_candidate_sql("units.lang = ?1");
-        candidate_rows_for_languages(&conn, std::iter::once(lang), &sql, &[])
+        let rows = candidate_rows_for_languages(&tx, std::iter::once(lang), &sql, &[])?;
+        tx.commit()?;
+        Ok(rows)
     }
 
     /// Candidate rows for a literal ASCII substring over a persistently stable
@@ -3201,15 +3950,18 @@ impl AnalyzerStore {
         &self,
         lang: &str,
         substring: &str,
-    ) -> Result<Vec<CandidateRow>> {
-        let conn = self.read_conn()?;
+    ) -> Result<Vec<HydratedCandidateRow>> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
         let sql = declaration_candidate_sql(
             "units.lang = ?1 AND (
                instr(lower(units.short_name), lower(?2)) > 0
                OR instr(lower(units.content_qualifier), lower(?2)) > 0
              )",
         );
-        candidate_rows_for_languages(&conn, std::iter::once(lang), &sql, &[&substring])
+        let rows = candidate_rows_for_languages(&tx, std::iter::once(lang), &sql, &[&substring])?;
+        tx.commit()?;
+        Ok(rows)
     }
 
     pub fn declaration_candidate_rows_by_literal_substring_for_langs(
@@ -3217,7 +3969,7 @@ impl AnalyzerStore {
         langs: &[String],
         generations: &HashMap<String, GenerationId>,
         substring: &str,
-    ) -> Result<Vec<CandidateRow>> {
+    ) -> Result<Vec<HydratedCandidateRow>> {
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
@@ -3239,9 +3991,15 @@ impl AnalyzerStore {
 
     /// Search candidates carry the metadata that `search_symbols` otherwise
     /// obtains by repeatedly hydrating complete file states.
-    pub fn search_candidate_rows_by_lang(&self, lang: &str) -> Result<Vec<SearchCandidateRow>> {
-        let conn = self.read_conn()?;
-        search_candidate_rows_by_lang_conn(&conn, lang)
+    pub fn search_candidate_rows_by_lang(
+        &self,
+        lang: &str,
+    ) -> Result<Vec<HydratedSearchCandidateRow>> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        let rows = search_candidate_rows_by_lang_conn(&tx, lang)?;
+        tx.commit()?;
+        Ok(rows)
     }
 
     /// Enumerate the declaration projection needed to *decide* whether a
@@ -3317,7 +4075,7 @@ impl AnalyzerStore {
         generations: &HashMap<String, GenerationId>,
         keys: &[SearchCandidateKey],
         cancellation: Option<&CancellationToken>,
-    ) -> Result<LimitedQueryRows<SearchCandidateRow>> {
+    ) -> Result<LimitedQueryRows<HydratedSearchCandidateRow>> {
         if keys.is_empty() {
             return Ok(LimitedQueryRows::complete(Vec::new(), 0));
         }
@@ -3357,24 +4115,31 @@ impl AnalyzerStore {
             }
         }
         drop(stmt);
-        tx.commit()?;
-        if complete && !cancellation.is_some_and(CancellationToken::is_cancelled) {
-            Ok(LimitedQueryRows::complete(out, inspected))
-        } else {
-            Ok(LimitedQueryRows::incomplete(out, inspected))
+        if !complete || cancellation.is_some_and(CancellationToken::is_cancelled) {
+            tx.commit()?;
+            return Ok(LimitedQueryRows::incomplete(Vec::new(), inspected));
         }
+        let Some(out) = hydrate_candidate_rows(&tx, out, cancellation)? else {
+            tx.commit()?;
+            return Ok(LimitedQueryRows::incomplete(Vec::new(), inspected));
+        };
+        tx.commit()?;
+        Ok(LimitedQueryRows::complete(out, inspected))
     }
 
-    pub fn usage_fact_rows_by_lang(&self, lang: &str) -> Result<Vec<UsageFactRow>> {
-        let conn = self.read_conn()?;
-        usage_fact_rows_by_lang_conn(&conn, lang)
+    pub fn usage_fact_rows_by_lang(&self, lang: &str) -> Result<Vec<HydratedUsageFactRow>> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        let rows = usage_fact_rows_by_lang_conn(&tx, lang)?;
+        tx.commit()?;
+        Ok(rows)
     }
 
     pub fn usage_fact_rows_for_langs(
         &self,
         langs: &[String],
         generations: &HashMap<String, GenerationId>,
-    ) -> Result<Vec<UsageFactRow>> {
+    ) -> Result<Vec<HydratedUsageFactRow>> {
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
@@ -3386,34 +4151,11 @@ impl AnalyzerStore {
         Ok(out)
     }
 
-    pub(crate) fn declaration_and_usage_fact_rows_for_langs(
-        &self,
-        langs: &[String],
-        generations: &HashMap<String, GenerationId>,
-    ) -> Result<(Vec<CandidateRow>, Vec<UsageFactRow>)> {
-        let mut conn = self.read_conn()?;
-        let tx = conn.transaction()?;
-        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
-        let declaration_sql = declaration_candidate_sql("units.lang = ?1");
-        let declarations = candidate_rows_for_languages(
-            &tx,
-            langs.iter().map(String::as_str),
-            &declaration_sql,
-            &[],
-        )?;
-        let mut usage_facts = Vec::new();
-        for lang in langs {
-            usage_facts.extend(usage_fact_rows_by_lang_conn(&tx, lang)?);
-        }
-        tx.commit()?;
-        Ok((declarations, usage_facts))
-    }
-
     pub fn declaration_candidate_rows_for_langs(
         &self,
         langs: &[String],
         generations: &HashMap<String, GenerationId>,
-    ) -> Result<Vec<CandidateRow>> {
+    ) -> Result<Vec<HydratedCandidateRow>> {
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
@@ -3423,11 +4165,93 @@ impl AnalyzerStore {
         Ok(rows)
     }
 
+    pub(crate) fn definition_candidate_rows_for_langs(
+        &self,
+        langs: &[String],
+        generations: &HashMap<String, GenerationId>,
+    ) -> Result<Vec<HydratedCandidateRow>> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
+        let sql = candidate_rows_sql_with_membership(
+            "units",
+            "FROM code_units AS units
+             JOIN blob_meta AS meta
+               ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang",
+            "units.lang = ?1",
+            "(units.in_declarations = 1 OR units.in_definition_lookup = 1)",
+            "units.blob_oid, units.unit_key",
+        );
+        let rows = candidate_rows_for_languages(&tx, langs.iter().map(String::as_str), &sql, &[])?;
+        tx.commit()?;
+        Ok(rows)
+    }
+
+    pub(crate) fn workspace_snapshot_fingerprints_for_langs(
+        &self,
+        langs: &[String],
+        generations: &HashMap<String, GenerationId>,
+    ) -> Result<HashMap<String, String>> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
+        let fingerprints = workspace_snapshot_fingerprints_conn(&tx, langs, generations)?;
+        tx.commit()?;
+        Ok(fingerprints)
+    }
+
+    /// Enumerate declarations through the schema's mounted-name interface.
+    ///
+    /// Unlike the legacy content-row scan, this query returns the workspace
+    /// path that mounted each blob reading. A header can therefore be mounted
+    /// under both `cpp` and `cpp:c` without asking Rust to reconstruct that
+    /// workspace relation from the blob-to-path index.
+    pub(crate) fn mounted_declaration_rows_for_langs(
+        &self,
+        langs: &[String],
+        generations: &HashMap<String, GenerationId>,
+    ) -> Result<Vec<HydratedMountedCandidateRow>> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
+        let sql = candidate_rows_sql_with_membership_and_projection(
+            "units",
+            "FROM live_definition_exact_names AS names
+             JOIN code_units AS units
+               ON units.blob_oid = names.blob_oid
+              AND units.lang = names.lang
+              AND units.unit_key = names.unit_key
+             JOIN blob_meta AS meta
+               ON meta.blob_oid = units.blob_oid
+              AND meta.lang = units.lang",
+            "names.lang = ?1 AND names.source_kind <> 'path'",
+            "units.in_declarations = 1",
+            "names.rel_path, units.blob_oid, units.unit_key",
+            ", names.rel_path",
+        );
+        let mut statement = tx.prepare_cached(&sql)?;
+        let mut out = Vec::new();
+        for lang in langs {
+            let rows = statement.query_map([lang], |row| {
+                Ok(MountedCandidateRow {
+                    candidate: candidate_row_from_row(row)?,
+                    rel_path: row.get(19)?,
+                })
+            })?;
+            out.extend(rows.collect::<std::result::Result<Vec<_>, _>>()?);
+        }
+        drop(statement);
+        let out = hydrate_candidate_rows(&tx, out, None)?
+            .expect("uncancelled mounted-candidate hydration completes");
+        tx.commit()?;
+        Ok(out)
+    }
+
     pub fn declaration_candidate_rows_with_primary_ranges_for_langs(
         &self,
         langs: &[String],
         generations: &HashMap<String, GenerationId>,
-    ) -> Result<Vec<(CandidateRow, Option<Range>)>> {
+    ) -> Result<Vec<(HydratedCandidateRow, Option<Range>)>> {
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
@@ -3454,7 +4278,7 @@ impl AnalyzerStore {
         langs: &[String],
         generations: &HashMap<String, GenerationId>,
         kind: CodeUnitType,
-    ) -> Result<Vec<CandidatePrimaryRangeRow>> {
+    ) -> Result<Vec<HydratedCandidatePrimaryRangeRow>> {
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
@@ -3462,7 +4286,10 @@ impl AnalyzerStore {
             "SELECT units.blob_oid, units.lang, units.unit_key, units.kind, units.short_name,
                     units.content_qualifier, units.signature, units.synthetic,
                     units.is_type_alias, units.top_level_ordinal, units.in_declarations,
-                    units.in_definition_lookup, units.fq_segments,
+                    units.in_definition_lookup, units.fq_anchor_kind, units.fq_anchor_pop,
+                    units.fq_package_tail_segments, units.fq_segment_count,
+                    units.exact_fqn_tail, units.fq_segment_bytes,
+                    units.normalized_fqn_tail,
                     primary_range.start_byte, primary_range.end_byte,
                     primary_range.start_line, primary_range.end_line
              FROM code_units AS units
@@ -3487,6 +4314,8 @@ impl AnalyzerStore {
             )?)?);
         }
         drop(statement);
+        let out = hydrate_candidate_rows(&tx, out, None)?
+            .expect("uncancelled ranged-candidate hydration completes");
         tx.commit()?;
         Ok(out)
     }
@@ -3552,7 +4381,7 @@ impl AnalyzerStore {
         &self,
         lang: &str,
         oids: &[Oid],
-    ) -> Result<Vec<CandidateRow>> {
+    ) -> Result<Vec<HydratedCandidateRow>> {
         let _scope = crate::profiling::scope("AnalyzerStore::definition_lookup_rows_by_oids");
         if crate::profiling::enabled() {
             crate::profiling::note(format!("language={lang} oid_count={}", oids.len()));
@@ -3574,7 +4403,7 @@ impl AnalyzerStore {
         &self,
         entries: &[(Oid, String)],
         generations: &HashMap<String, GenerationId>,
-    ) -> Result<Vec<CandidateRow>> {
+    ) -> Result<Vec<HydratedCandidateRow>> {
         let _scope = crate::profiling::scope("AnalyzerStore::definition_lookup_rows_by_keys");
         if crate::profiling::enabled() {
             crate::profiling::note(format!("key_count={}", entries.len()));
@@ -3605,7 +4434,7 @@ impl AnalyzerStore {
         &self,
         lang: &str,
         _pattern: &str,
-    ) -> Result<Vec<CandidateRow>> {
+    ) -> Result<Vec<HydratedCandidateRow>> {
         // Full match semantics are over recomposed, adapter-normalized FQNs,
         // so SQL intentionally supplies a declaration-row candidate set and
         // the query layer applies the existing Rust regex semantics after
@@ -3618,7 +4447,7 @@ impl AnalyzerStore {
         langs: &[String],
         generations: &HashMap<String, GenerationId>,
         _pattern: &str,
-    ) -> Result<Vec<CandidateRow>> {
+    ) -> Result<Vec<HydratedCandidateRow>> {
         self.declaration_candidate_rows_for_langs(langs, generations)
     }
 
@@ -3696,53 +4525,55 @@ impl AnalyzerStore {
     }
 
     pub fn gc_with_bloom(&self, reachable: &GrowableBloom) -> Result<usize> {
-        self.gc_with(|oid| reachable.contains(oid))
+        let reachable = reachable.clone();
+        self.gc_with(move |oid| reachable.contains(oid))
     }
 
-    pub fn gc_with(&self, keep: impl Fn(&str) -> bool) -> Result<usize> {
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
-        let tx = conn.transaction()?;
-        let dead: Vec<(String, String)> = {
-            let mut stmt = tx.prepare(
-                "SELECT blobs.blob_oid, blobs.lang
+    pub fn gc_with(&self, keep: impl Fn(&str) -> bool + Send + 'static) -> Result<usize> {
+        self.conn.execute(move |conn| {
+            let tx = conn.transaction()?;
+            let dead: Vec<(String, String)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT blobs.blob_oid, blobs.lang
                  FROM blobs
                  LEFT JOIN analysis_epochs AS epochs ON epochs.lang = blobs.lang
                  WHERE blobs.generation = COALESCE(epochs.generation, 0)",
-            )?;
-            let rows = stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?;
-            let mut dead = Vec::new();
-            for row in rows {
-                let (oid, lang) = row?;
-                if !keep(&oid) {
-                    dead.push((oid, lang));
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+                let mut dead = Vec::new();
+                for row in rows {
+                    let (oid, lang) = row?;
+                    if !keep(&oid) {
+                        dead.push((oid, lang));
+                    }
                 }
-            }
-            dead
-        };
-        {
-            let mut del = tx.prepare(
-                "DELETE FROM blobs
+                dead
+            };
+            {
+                let mut del = tx.prepare(
+                    "DELETE FROM blobs
                  WHERE blob_oid = ?1 AND lang = ?2
                    AND generation = COALESCE(
                      (SELECT generation FROM analysis_epochs WHERE lang = ?2), 0
                    )",
-            )?;
-            for (oid, lang) in &dead {
-                del.execute(params![oid, lang])?;
+                )?;
+                for (oid, lang) in &dead {
+                    del.execute(params![oid, lang])?;
+                }
             }
-        }
-        tx.commit()?;
-        let _ = reclaim_stale_generations_conn(&mut conn, STALE_GENERATION_RECLAIM_ROWS);
-        conn.pragma_update(None, "incremental_vacuum", 0)?;
-        Ok(dead.len())
+            tx.commit()?;
+            let _ = reclaim_stale_generations_conn(conn, STALE_GENERATION_RECLAIM_ROWS);
+            conn.pragma_update(None, "incremental_vacuum", 0)?;
+            Ok(dead.len())
+        })
     }
 
     #[cfg(test)]
     pub(crate) fn reclaim_stale_generations(&self, max_logical_rows: usize) -> Result<usize> {
-        let mut conn = self.conn.lock().expect("analyzer store mutex poisoned");
-        reclaim_stale_generations_conn(&mut conn, max_logical_rows)
+        self.conn
+            .execute(move |conn| reclaim_stale_generations_conn(conn, max_logical_rows))
     }
 
     pub fn seconds_since_gc(&self) -> Result<Option<i64>> {
@@ -3900,23 +4731,25 @@ impl AnalyzerStore {
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn delete_rust_facts_for_test(&self, lang: &str) {
-        let conn = self.conn.lock().expect("analyzer store mutex poisoned");
-        for table in [
-            "rust_exports",
-            "rust_import_targets",
-            "rust_modules",
-            "rust_identifier_occurrences",
-            "rust_module_scopes",
-            "rust_module_routes",
-            "rust_module_route_gates",
-            "rust_item_macros",
-        ] {
-            conn.execute(
-                &format!("DELETE FROM {table} WHERE lang = ?1"),
-                params![lang],
-            )
-            .expect("delete rust fact rows");
-        }
+        let lang = lang.to_string();
+        self.conn.execute(move |conn| {
+            for table in [
+                "rust_exports",
+                "rust_import_targets",
+                "rust_modules",
+                "rust_identifier_occurrences",
+                "rust_module_scopes",
+                "rust_module_routes",
+                "rust_module_route_gates",
+                "rust_item_macros",
+            ] {
+                conn.execute(
+                    &format!("DELETE FROM {table} WHERE lang = ?1"),
+                    params![lang],
+                )
+                .expect("delete rust fact rows");
+            }
+        });
     }
 
     /// Test hook: make the Rust fact witness table unreadable, so
@@ -3931,11 +4764,10 @@ impl AnalyzerStore {
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn drop_rust_modules_table_for_test(&self) {
-        self.conn
-            .lock()
-            .expect("analyzer store mutex poisoned")
-            .execute("DROP TABLE rust_modules", [])
-            .expect("drop rust_modules");
+        self.conn.execute(move |conn| {
+            conn.execute("DROP TABLE rust_modules", [])
+                .expect("drop rust_modules")
+        });
     }
 
     /// Which of `oids` already carry Rust fact rows.
@@ -4138,6 +4970,30 @@ fn identifier_prefix_candidate_sql() -> String {
     )
 }
 
+fn identifier_candidate_for_blob_sql() -> String {
+    candidate_rows_sql_with_membership(
+        "units",
+        "FROM code_units AS units
+         JOIN blob_meta AS meta
+           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang",
+        "units.lang = ?1 AND units.identifier = ?2 AND units.blob_oid = ?3",
+        "(units.in_declarations = 1 OR units.in_definition_lookup = 1)",
+        "units.blob_oid, units.unit_key",
+    )
+}
+
+fn limited_identifier_candidate_for_blob_sql() -> String {
+    limited_candidate_rows_sql_with_membership(
+        "units",
+        "FROM code_units AS units
+         JOIN blob_meta AS meta
+           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang",
+        "units.lang = ?1 AND units.identifier = ?2 AND units.blob_oid = ?3",
+        "(units.in_declarations = 1 OR units.in_definition_lookup = 1)",
+        &["units.blob_oid", "units.unit_key"],
+    )
+}
+
 /// The least string greater than every string starting with `prefix`, under
 /// SQLite's BINARY collation, so that `col >= prefix AND col < successor` is
 /// an index range over exactly the prefix matches.
@@ -4163,7 +5019,7 @@ fn limited_declaration_candidate_sql(predicate: &str) -> String {
            ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang",
         predicate,
         "units.in_declarations = 1",
-        "units.blob_oid, units.unit_key",
+        &["units.blob_oid", "units.unit_key"],
     )
 }
 
@@ -4211,7 +5067,7 @@ fn limited_candidate_rows_sql_with_membership(
     from_clause: &str,
     predicate: &str,
     membership: &str,
-    order_by: &str,
+    order_by: &[&str],
 ) -> String {
     let row_bytes = format!(
         "length(CAST({candidate_alias}.blob_oid AS BLOB))
@@ -4219,34 +5075,62 @@ fn limited_candidate_rows_sql_with_membership(
          + length(CAST({candidate_alias}.short_name AS BLOB))
          + length(CAST({candidate_alias}.content_qualifier AS BLOB))
          + COALESCE(length(CAST({candidate_alias}.signature AS BLOB)), 0)
-         + COALESCE(length(CAST({candidate_alias}.fq_segments AS BLOB)), 0)"
+         + {candidate_alias}.fq_segment_bytes"
     );
     let admitted = |column: &str| {
         format!(
-            "CASE WHEN ({row_bytes}) <= {MAX_LIMITED_QUERY_ROW_BYTES}
-                  THEN {candidate_alias}.{column}
+            "CASE WHEN bounded.row_bytes <= {MAX_LIMITED_QUERY_ROW_BYTES}
+                  THEN bounded.{column}
                   ELSE NULL
              END"
         )
     };
+    assert!(!order_by.is_empty());
+    let order_projection = order_by
+        .iter()
+        .enumerate()
+        .map(|(ordinal, expression)| format!(", {expression} AS result_order_{ordinal}"))
+        .collect::<String>();
+    let bounded_order = (0..order_by.len())
+        .map(|ordinal| format!("bounded.result_order_{ordinal}"))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
-        "SELECT {}, {}, {candidate_alias}.unit_key,
-                {candidate_alias}.kind, {},
+        "WITH bounded AS MATERIALIZED (
+           SELECT {candidate_alias}.blob_oid, {candidate_alias}.lang,
+                  {candidate_alias}.unit_key, {candidate_alias}.kind,
+                  {candidate_alias}.short_name, {candidate_alias}.content_qualifier,
+                  {candidate_alias}.signature, {candidate_alias}.synthetic,
+                  {candidate_alias}.is_type_alias, {candidate_alias}.top_level_ordinal,
+                  {candidate_alias}.in_declarations,
+                  {candidate_alias}.in_definition_lookup,
+                  {candidate_alias}.fq_anchor_kind, {candidate_alias}.fq_anchor_pop,
+                  {candidate_alias}.fq_package_tail_segments,
+                  {candidate_alias}.fq_segment_count, {candidate_alias}.exact_fqn_tail,
+                  {candidate_alias}.fq_segment_bytes, {candidate_alias}.normalized_fqn_tail
+                  {order_projection},
+                  ({row_bytes}) AS row_bytes
+           {from_clause}
+           WHERE {predicate} AND {membership}
+             AND {PARSED_BLOB_COMPLETE_CONDITION}
+         )
+         SELECT {}, {}, bounded.unit_key,
+                bounded.kind, {},
                 {}, {},
-                {candidate_alias}.synthetic, {candidate_alias}.is_type_alias,
-                {candidate_alias}.top_level_ordinal, {candidate_alias}.in_declarations,
-                {candidate_alias}.in_definition_lookup, {},
-                ({row_bytes})
-         {from_clause}
-         WHERE {predicate} AND {membership}
-           AND {PARSED_BLOB_COMPLETE_CONDITION}
-         ORDER BY {order_by}",
+                bounded.synthetic, bounded.is_type_alias,
+                bounded.top_level_ordinal, bounded.in_declarations,
+                bounded.in_definition_lookup, bounded.fq_anchor_kind,
+                bounded.fq_anchor_pop, bounded.fq_package_tail_segments,
+                bounded.fq_segment_count, bounded.exact_fqn_tail,
+                bounded.fq_segment_bytes, bounded.normalized_fqn_tail,
+                bounded.row_bytes
+         FROM bounded
+         ORDER BY {bounded_order}",
         admitted("blob_oid"),
         admitted("lang"),
         admitted("short_name"),
         admitted("content_qualifier"),
         admitted("signature"),
-        admitted("fq_segments"),
     )
 }
 
@@ -4258,36 +5142,557 @@ fn candidate_rows_sql_with_membership_and_projection(
     order_by: &str,
     extra_projection: &str,
 ) -> String {
+    candidate_rows_sql_with_membership_projection_and_completeness(
+        candidate_alias,
+        from_clause,
+        predicate,
+        membership,
+        PARSED_BLOB_COMPLETE_CONDITION,
+        order_by,
+        extra_projection,
+    )
+}
+
+fn candidate_rows_sql_with_membership_projection_and_completeness(
+    candidate_alias: &str,
+    from_clause: &str,
+    predicate: &str,
+    membership: &str,
+    completeness: &str,
+    order_by: &str,
+    extra_projection: &str,
+) -> String {
+    let order_by = if order_by.is_empty() {
+        String::new()
+    } else {
+        format!("ORDER BY {order_by}")
+    };
     format!(
         "SELECT {candidate_alias}.blob_oid, {candidate_alias}.lang, {candidate_alias}.unit_key,
                 {candidate_alias}.kind, {candidate_alias}.short_name,
                 {candidate_alias}.content_qualifier, {candidate_alias}.signature,
                 {candidate_alias}.synthetic, {candidate_alias}.is_type_alias,
                 {candidate_alias}.top_level_ordinal, {candidate_alias}.in_declarations,
-                {candidate_alias}.in_definition_lookup, {candidate_alias}.fq_segments{extra_projection}
+                {candidate_alias}.in_definition_lookup,
+                {candidate_alias}.fq_anchor_kind, {candidate_alias}.fq_anchor_pop,
+                {candidate_alias}.fq_package_tail_segments,
+                {candidate_alias}.fq_segment_count, {candidate_alias}.exact_fqn_tail,
+                {candidate_alias}.fq_segment_bytes,
+                {candidate_alias}.normalized_fqn_tail{extra_projection}
          {from_clause}
          WHERE {predicate} AND {membership}
-           AND {PARSED_BLOB_COMPLETE_CONDITION}
-         ORDER BY {order_by}"
+           AND {completeness}
+         {order_by}"
     )
 }
 
-fn definition_order_candidate_sql(predicate: &str, membership: &str) -> String {
+#[cfg(test)]
+fn definition_order_candidate_sql(view: &str, predicate: &str, membership: &str) -> String {
     candidate_rows_sql_with_membership_and_projection(
         "units",
-        "FROM code_units AS units
+        &format!(
+            "FROM {view} AS names
+         JOIN code_units AS units
+           ON units.blob_oid = names.blob_oid
+          AND units.lang = names.lang
+          AND units.unit_key = names.unit_key
          JOIN blob_meta AS meta
-           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang",
+           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang"
+        ),
         predicate,
         membership,
-        "units.blob_oid, units.unit_key",
+        "units.blob_oid, units.unit_key, names.prefix",
         ",
                 (SELECT MIN(ranges.start_byte)
                  FROM unit_ranges AS ranges
                  WHERE ranges.blob_oid = units.blob_oid
                    AND ranges.lang = units.lang
-                   AND ranges.unit_key = units.unit_key) AS first_start_byte",
+                   AND ranges.unit_key = units.unit_key) AS first_start_byte,
+                names.prefix",
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenderedTailMatch {
+    Exact,
+    NormalizedStored,
+    NormalizedExact,
+}
+
+impl RenderedTailMatch {
+    fn index(self) -> usize {
+        match self {
+            Self::Exact => 0,
+            Self::NormalizedStored => 1,
+            Self::NormalizedExact => 2,
+        }
+    }
+}
+
+fn rendered_name_components(name: &str, normalized: bool) -> Vec<RenderedNameComponent> {
+    let mut components = Vec::new();
+    let mut push = |prefix: &str, tail: &str, anchored: bool| {
+        if tail.is_empty() {
+            return;
+        }
+        components.push(RenderedNameComponent {
+            prefix: prefix.to_string(),
+            tail: tail.to_string(),
+            normalized,
+            normalized_exact_fallback: false,
+            anchored,
+        });
+    };
+    // A content-derived stable identity and a file mounted at the empty
+    // workspace package can render the same complete request. They are
+    // separate indexed relations, so retain both exact alternatives.
+    push("", name, false);
+    push("", name, true);
+    for (index, character) in name.char_indices() {
+        let separator_len = match character {
+            '.' | '/' | '$' => 1,
+            ':' if name[index..].starts_with("::") => 2,
+            _ => continue,
+        };
+        let tail_start = index + separator_len;
+        if index > 0 && tail_start < name.len() {
+            push(&name[..index], &name[tail_start..], true);
+        }
+    }
+    // A mounted module or package declaration can be represented entirely by
+    // its workspace anchor, with no content-derived FQ-name tail. This remains
+    // a bounded anchored seek; final hydrated identity comparison decides
+    // whether the empty-tail row actually renders as the request.
+    components.push(RenderedNameComponent {
+        prefix: name.to_string(),
+        tail: String::new(),
+        normalized,
+        normalized_exact_fallback: false,
+        anchored: true,
+    });
+    components
+}
+
+fn rendered_definition_components(
+    request_index: usize,
+    request: &RenderedDefinitionRequest,
+) -> Vec<(usize, RenderedNameComponent)> {
+    if !request.seekable {
+        return Vec::new();
+    }
+    let mut components = rendered_name_components(&request.exact_name, false)
+        .into_iter()
+        .map(|component| (request_index, component))
+        .collect::<Vec<_>>();
+    // A request that is already in normalized spelling must still probe the
+    // normalized-tail relation: the stored declaration can have a distinct
+    // exact spelling even though normalizing the request itself is a no-op.
+    components.extend(
+        rendered_name_components(&request.normalized_name, true)
+            .into_iter()
+            .map(|mut component| {
+                component.normalized_exact_fallback = request.normalized_name != request.exact_name;
+                (request_index, component)
+            }),
+    );
+    components
+}
+
+fn component_tail_predicate(
+    tail_match: RenderedTailMatch,
+    request_tail: &str,
+    stable: bool,
+) -> String {
+    let exact_tail = if stable {
+        // Match the stable component index's expression exactly. Keeping this
+        // equality out of the ordinary column's planner vocabulary prevents
+        // the index from stealing parent-tail plans in shared relational
+        // views; exact_fqn_tail is non-NULL in every component arm.
+        "COALESCE(units.exact_fqn_tail, '')"
+    } else {
+        "units.exact_fqn_tail"
+    };
+    match tail_match {
+        RenderedTailMatch::Exact => format!("{exact_tail} = {request_tail}"),
+        RenderedTailMatch::NormalizedStored => {
+            format!("units.normalized_fqn_tail = {request_tail}")
+        }
+        RenderedTailMatch::NormalizedExact => format!(
+            "units.normalized_fqn_tail IS NULL
+             AND {exact_tail} = {request_tail}"
+        ),
+    }
+}
+
+fn component_definition_candidate_projection(
+    from_clause: &str,
+    predicate: &str,
+    membership: &str,
+    mounted_prefix: &str,
+    request_index: &str,
+) -> String {
+    candidate_rows_sql_with_membership_projection_and_completeness(
+        "units",
+        from_clause,
+        predicate,
+        membership,
+        "meta.is_complete = 1",
+        "",
+        &format!(
+            ",
+             (SELECT MIN(ranges.start_byte)
+              FROM unit_ranges AS ranges
+              WHERE ranges.blob_oid = units.blob_oid
+                AND ranges.lang = units.lang
+                AND ranges.unit_key = units.unit_key) AS first_start_byte,
+             {mounted_prefix} AS mounted_prefix,
+             {request_index} AS request_index"
+        ),
+    )
+}
+
+fn build_point_component_definition_candidate_sql(
+    anchored: bool,
+    tail_match: RenderedTailMatch,
+    membership: &str,
+) -> String {
+    let tail_parameter = if anchored { "?4" } else { "?3" };
+    let tail_predicate = component_tail_predicate(tail_match, tail_parameter, !anchored);
+    if anchored {
+        let unit_source = match tail_match {
+            RenderedTailMatch::Exact | RenderedTailMatch::NormalizedExact => {
+                "code_units AS units INDEXED BY idx_code_units_anchored_blob_exact_tail"
+            }
+            RenderedTailMatch::NormalizedStored => "code_units AS units",
+        };
+        component_definition_candidate_projection(
+            &format!(
+                "FROM workspace_file_anchors AS anchors
+             JOIN workspace_files AS files
+               ON files.lang = anchors.lang
+              AND files.generation = anchors.generation
+              AND files.file_id = anchors.file_id
+             JOIN {unit_source}
+               ON units.blob_oid = files.blob_oid
+              AND units.lang = files.lang
+              AND units.fq_anchor_kind = anchors.anchor_kind
+              AND units.fq_anchor_pop = anchors.anchor_pop
+             JOIN blobs AS active_blob
+               ON active_blob.blob_oid = units.blob_oid
+              AND active_blob.lang = units.lang
+              AND active_blob.generation = ?2
+             JOIN blob_meta AS meta
+               ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang"
+            ),
+            &format!(
+                "anchors.lang = ?1
+                 AND anchors.generation = ?2
+                 AND anchors.package_name = ?3
+                 AND units.fq_anchor_kind IS NOT NULL
+                 AND {tail_predicate}"
+            ),
+            membership,
+            "anchors.package_name",
+            "0",
+        )
+    } else {
+        let unit_source = match tail_match {
+            RenderedTailMatch::Exact | RenderedTailMatch::NormalizedExact => {
+                "code_units AS units INDEXED BY idx_code_units_stable_exact_tail"
+            }
+            RenderedTailMatch::NormalizedStored => {
+                "code_units AS units INDEXED BY idx_code_units_stable_normalized_tail"
+            }
+        };
+        component_definition_candidate_projection(
+            &format!(
+                "FROM {unit_source}
+             JOIN blobs AS active_blob
+               ON active_blob.blob_oid = units.blob_oid
+              AND active_blob.lang = units.lang
+              AND active_blob.generation = ?2
+             JOIN blob_meta AS meta
+               ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang"
+            ),
+            &format!(
+                "units.lang = ?1
+                 AND units.fq_anchor_kind IS NULL
+                 AND units.exact_fqn_tail IS NOT NULL
+                 AND {tail_predicate}
+                 AND EXISTS (
+                   SELECT 1
+                   FROM workspace_files AS files
+                   WHERE files.lang = units.lang
+                     AND files.generation = ?2
+                     AND files.blob_oid = units.blob_oid
+                 )"
+            ),
+            membership,
+            "''",
+            "0",
+        )
+    }
+}
+
+fn point_component_definition_candidate_sql(
+    anchored: bool,
+    tail_match: RenderedTailMatch,
+    membership: &str,
+) -> &'static str {
+    static SQL: LazyLock<[[[String; 3]; 2]; 2]> = LazyLock::new(|| {
+        std::array::from_fn(|membership_index| {
+            let membership = if membership_index == 0 {
+                "units.in_declarations = 1"
+            } else {
+                "(units.in_declarations = 1 OR units.in_definition_lookup = 1)"
+            };
+            std::array::from_fn(|anchored_index| {
+                std::array::from_fn(|tail_index| {
+                    let tail_match = match tail_index {
+                        0 => RenderedTailMatch::Exact,
+                        1 => RenderedTailMatch::NormalizedStored,
+                        2 => RenderedTailMatch::NormalizedExact,
+                        _ => unreachable!(),
+                    };
+                    build_point_component_definition_candidate_sql(
+                        anchored_index == 1,
+                        tail_match,
+                        membership,
+                    )
+                })
+            })
+        })
+    });
+    let membership_index = match membership {
+        "units.in_declarations = 1" => 0,
+        "(units.in_declarations = 1 OR units.in_definition_lookup = 1)" => 1,
+        _ => unreachable!("component lookup has one of two membership contracts"),
+    };
+    &SQL[membership_index][usize::from(anchored)][tail_match.index()]
+}
+
+fn point_anchor_only_definition_candidate_sql(membership: &str) -> &'static str {
+    static SQL: LazyLock<[String; 2]> = LazyLock::new(|| {
+        std::array::from_fn(|membership_index| {
+            let membership = if membership_index == 0 {
+                "units.in_declarations = 1"
+            } else {
+                "(units.in_declarations = 1 OR units.in_definition_lookup = 1)"
+            };
+            component_definition_candidate_projection(
+                "FROM workspace_file_anchors AS anchors
+                 JOIN workspace_files AS files
+                   ON files.lang = anchors.lang
+                  AND files.generation = anchors.generation
+                  AND files.file_id = anchors.file_id
+                 JOIN code_units AS units
+                   ON units.blob_oid = files.blob_oid
+                  AND units.lang = files.lang
+                  AND units.fq_anchor_kind = anchors.anchor_kind
+                  AND units.fq_anchor_pop = anchors.anchor_pop
+                 JOIN blobs AS active_blob
+                   ON active_blob.blob_oid = units.blob_oid
+                  AND active_blob.lang = units.lang
+                  AND active_blob.generation = ?2
+                 JOIN blob_meta AS meta
+                   ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang",
+                "anchors.lang = ?1
+                 AND anchors.generation = ?2
+                 AND anchors.package_name = ?3
+                 AND units.fq_anchor_kind IS NOT NULL
+                 AND units.exact_fqn_tail IS NULL",
+                membership,
+                "anchors.package_name",
+                "0",
+            )
+        })
+    });
+    let membership_index = match membership {
+        "units.in_declarations = 1" => 0,
+        "(units.in_declarations = 1 OR units.in_definition_lookup = 1)" => 1,
+        _ => unreachable!("anchor-only lookup has one of two membership contracts"),
+    };
+    &SQL[membership_index]
+}
+
+fn batch_component_definition_candidate_sql(
+    anchored: bool,
+    tail_match: RenderedTailMatch,
+    membership: &str,
+) -> String {
+    let normalized = match tail_match {
+        RenderedTailMatch::Exact => 0,
+        RenderedTailMatch::NormalizedStored | RenderedTailMatch::NormalizedExact => 1,
+    };
+    let tail_predicate = component_tail_predicate(tail_match, "requests.tail", !anchored);
+    let select = if anchored {
+        let unit_source = match tail_match {
+            RenderedTailMatch::Exact | RenderedTailMatch::NormalizedExact => {
+                "code_units AS units INDEXED BY idx_code_units_anchored_blob_exact_tail"
+            }
+            RenderedTailMatch::NormalizedStored => "code_units AS units",
+        };
+        component_definition_candidate_projection(
+            &format!(
+                "FROM requests
+             JOIN workspace_file_anchors AS anchors
+               ON anchors.lang = ?2
+              AND anchors.generation = ?3
+              AND anchors.package_name = requests.prefix
+             JOIN workspace_files AS files
+               ON files.lang = anchors.lang
+              AND files.generation = anchors.generation
+              AND files.file_id = anchors.file_id
+             JOIN {unit_source}
+               ON units.blob_oid = files.blob_oid
+              AND units.lang = files.lang
+              AND units.fq_anchor_kind = anchors.anchor_kind
+              AND units.fq_anchor_pop = anchors.anchor_pop
+             JOIN blobs AS active_blob
+               ON active_blob.blob_oid = units.blob_oid
+              AND active_blob.lang = units.lang
+              AND active_blob.generation = ?3
+             JOIN blob_meta AS meta
+               ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang"
+            ),
+            &format!(
+                "requests.anchored = 1
+                 AND requests.tail <> ''
+                 AND requests.normalized = {normalized}
+                 AND units.fq_anchor_kind IS NOT NULL
+                 AND {tail_predicate}"
+            ),
+            membership,
+            "anchors.package_name",
+            "requests.request_index",
+        )
+    } else {
+        let unit_source = match tail_match {
+            RenderedTailMatch::Exact | RenderedTailMatch::NormalizedExact => {
+                "code_units AS units INDEXED BY idx_code_units_stable_exact_tail"
+            }
+            RenderedTailMatch::NormalizedStored => {
+                "code_units AS units INDEXED BY idx_code_units_stable_normalized_tail"
+            }
+        };
+        component_definition_candidate_projection(
+            &format!(
+                "FROM requests
+             JOIN {unit_source}
+               ON units.lang = ?2
+             JOIN blobs AS active_blob
+               ON active_blob.blob_oid = units.blob_oid
+              AND active_blob.lang = units.lang
+              AND active_blob.generation = ?3
+             JOIN blob_meta AS meta
+               ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang"
+            ),
+            &format!(
+                "requests.anchored = 0
+                 AND requests.normalized = {normalized}
+                 AND units.fq_anchor_kind IS NULL
+                 AND units.exact_fqn_tail IS NOT NULL
+                 AND {tail_predicate}
+                 AND EXISTS (
+                   SELECT 1
+                   FROM workspace_files AS files
+                   WHERE files.lang = units.lang
+                     AND files.generation = ?3
+                     AND files.blob_oid = units.blob_oid
+                 )"
+            ),
+            membership,
+            "''",
+            "requests.request_index",
+        )
+    };
+    format!(
+        "WITH requests(request_index, prefix, tail, normalized, anchored) AS MATERIALIZED (
+           SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'),
+                  json_extract(value, '$[2]'), json_extract(value, '$[3]'),
+                  json_extract(value, '$[4]')
+           FROM json_each(?1)
+         )
+         {select}"
+    )
+}
+
+fn batch_anchor_only_definition_candidate_sql(membership: &str) -> String {
+    let select = component_definition_candidate_projection(
+        "FROM requests
+         JOIN workspace_file_anchors AS anchors
+           ON anchors.lang = ?2
+          AND anchors.generation = ?3
+          AND anchors.package_name = requests.prefix
+         JOIN workspace_files AS files
+           ON files.lang = anchors.lang
+          AND files.generation = anchors.generation
+          AND files.file_id = anchors.file_id
+         JOIN code_units AS units
+           ON units.blob_oid = files.blob_oid
+          AND units.lang = files.lang
+          AND units.fq_anchor_kind = anchors.anchor_kind
+          AND units.fq_anchor_pop = anchors.anchor_pop
+         JOIN blobs AS active_blob
+           ON active_blob.blob_oid = units.blob_oid
+          AND active_blob.lang = units.lang
+          AND active_blob.generation = ?3
+         JOIN blob_meta AS meta
+           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang",
+        "requests.anchored = 1
+         AND requests.normalized = 0
+         AND requests.tail = ''
+         AND units.fq_anchor_kind IS NOT NULL
+         AND units.exact_fqn_tail IS NULL",
+        membership,
+        "anchors.package_name",
+        "requests.request_index",
+    );
+    format!(
+        "WITH requests(request_index, prefix, tail, normalized, anchored) AS MATERIALIZED (
+           SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'),
+                  json_extract(value, '$[2]'), json_extract(value, '$[3]'),
+                  json_extract(value, '$[4]')
+           FROM json_each(?1)
+         )
+         {select}"
+    )
+}
+
+type RenderedDefinitionCandidateHeader = (CandidateRow, (usize, Option<usize>, String));
+
+fn collect_rendered_definition_candidate_rows<P: rusqlite::Params>(
+    statement: &mut rusqlite::Statement<'_>,
+    parameters: P,
+    rows: &mut Vec<RenderedDefinitionCandidateHeader>,
+    cancellation: Option<&CancellationToken>,
+) -> Result<bool> {
+    let mapped = statement.query_map(parameters, |row| {
+        let first_start_byte = row
+            .get::<_, Option<i64>>(19)?
+            .map(i64_to_usize)
+            .transpose()
+            .map_err(rusqlite_error_from_store)?;
+        Ok((
+            candidate_row_from_row(row)?,
+            (
+                row.get::<_, usize>(21)?,
+                first_start_byte,
+                row.get::<_, String>(20)?,
+            ),
+        ))
+    })?;
+    for row in mapped {
+        rows.push(row?);
+        if rows
+            .len()
+            .is_multiple_of(CANDIDATE_ROWS_PER_CANCELLATION_POLL)
+            && cancellation.is_some_and(CancellationToken::is_cancelled)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn candidate_rows_for_languages<'a>(
@@ -4295,7 +5700,7 @@ fn candidate_rows_for_languages<'a>(
     langs: impl IntoIterator<Item = &'a str>,
     sql: &str,
     values: &[&dyn ToSql],
-) -> Result<Vec<CandidateRow>> {
+) -> Result<Vec<HydratedCandidateRow>> {
     let mut statement = conn.prepare_cached(sql)?;
     let mut rows = Vec::new();
     for lang in langs {
@@ -4304,7 +5709,8 @@ fn candidate_rows_for_languages<'a>(
             statement.query_map(params_from_iter(params), candidate_row_from_row)?,
         )?);
     }
-    Ok(rows)
+    Ok(hydrate_candidate_rows(conn, rows, None)?
+        .expect("uncancelled candidate hydration completes"))
 }
 
 fn candidate_rows_for_languages_limited<'a>(
@@ -4313,7 +5719,7 @@ fn candidate_rows_for_languages_limited<'a>(
     sql: &str,
     values: &[&dyn ToSql],
     limit: usize,
-) -> Result<LimitedQueryRows<CandidateRow>> {
+) -> Result<LimitedQueryRows<HydratedCandidateRow>> {
     if limit == 0 {
         return Ok(LimitedQueryRows::incomplete(Vec::new(), 0));
     }
@@ -4322,10 +5728,12 @@ fn candidate_rows_for_languages_limited<'a>(
     let mut rows = Vec::new();
     let mut inspected = 0usize;
     let mut bytes = LimitedQueryByteBudget::default();
-    for lang in langs {
+    let mut complete = true;
+    'languages: for lang in langs {
         let remaining = limit.saturating_sub(inspected);
         if remaining == 0 {
-            return Ok(LimitedQueryRows::incomplete(rows, inspected));
+            complete = false;
+            break;
         }
         let sql_limit = i64::try_from(remaining).unwrap_or(i64::MAX);
         let params = std::iter::once(&lang as &dyn ToSql)
@@ -4334,19 +5742,27 @@ fn candidate_rows_for_languages_limited<'a>(
         let mut query = statement.query(params_from_iter(params))?;
         while let Some(row) = query.next()? {
             inspected = inspected.saturating_add(1);
-            // `fq_segments` occupies index 12; the row-byte budget column follows.
-            let row_bytes = row.get::<_, i64>(13)?;
+            // The relational FQ header occupies 12..=18; row bytes follow.
+            let row_bytes = row.get::<_, i64>(19)?;
             if !bytes.admit_sqlite_bytes(row_bytes)? {
-                return Ok(LimitedQueryRows::incomplete(rows, inspected));
+                complete = false;
+                break 'languages;
             }
             rows.push(candidate_row_from_row(row)?);
         }
         drop(query);
         if inspected == limit {
-            return Ok(LimitedQueryRows::incomplete(rows, inspected));
+            complete = false;
+            break;
         }
     }
-    Ok(LimitedQueryRows::complete(rows, inspected))
+    let rows = hydrate_candidate_rows(conn, rows, None)?
+        .expect("uncancelled candidate hydration completes");
+    if complete {
+        Ok(LimitedQueryRows::complete(rows, inspected))
+    } else {
+        Ok(LimitedQueryRows::incomplete(rows, inspected))
+    }
 }
 
 /// Rows walked between two deadline checks inside one candidate-row seek.
@@ -4363,33 +5779,38 @@ fn candidate_rows_for_languages_limited<'a>(
 /// path.
 const CANDIDATE_ROWS_PER_CANCELLATION_POLL: usize = 512;
 
+#[cfg(test)]
 fn definition_order_candidate_rows_for_languages<'a>(
     conn: &Connection,
     langs: impl IntoIterator<Item = &'a str>,
-    sql: &str,
+    sqls: &[&str],
     values: &[&dyn ToSql],
     cancellation: Option<&CancellationToken>,
 ) -> Result<LimitedQueryRows<DefinitionOrderCandidateRow>> {
-    let mut statement = conn.prepare_cached(sql)?;
     let mut rows = Vec::new();
     for lang in langs {
-        let params = std::iter::once(&lang as &dyn ToSql).chain(values.iter().copied());
-        let mapped = statement.query_map(
-            params_from_iter(params),
-            definition_order_candidate_row_from_row,
-        )?;
-        for row in mapped {
-            rows.push(row?);
-            if rows.len() % CANDIDATE_ROWS_PER_CANCELLATION_POLL == 0
-                && cancellation.is_some_and(CancellationToken::is_cancelled)
-            {
-                let inspected = rows.len();
-                return Ok(LimitedQueryRows::incomplete(rows, inspected));
+        for &sql in sqls {
+            let mut statement = conn.prepare_cached(sql)?;
+            let params = std::iter::once(&lang as &dyn ToSql).chain(values.iter().copied());
+            let mapped = statement.query_map(
+                params_from_iter(params),
+                definition_order_candidate_row_from_row,
+            )?;
+            for row in mapped {
+                rows.push(row?);
+                if rows
+                    .len()
+                    .is_multiple_of(CANDIDATE_ROWS_PER_CANCELLATION_POLL)
+                    && cancellation.is_some_and(CancellationToken::is_cancelled)
+                {
+                    let inspected = rows.len();
+                    return Ok(LimitedQueryRows::incomplete(Vec::new(), inspected));
+                }
             }
         }
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             let inspected = rows.len();
-            return Ok(LimitedQueryRows::incomplete(rows, inspected));
+            return Ok(LimitedQueryRows::incomplete(Vec::new(), inspected));
         }
     }
     let inspected = rows.len();
@@ -4430,10 +5851,21 @@ struct PreparedUnitRow {
     in_declarations: i64,
     in_definition_lookup: i64,
     in_test_region: i64,
-    /// Serialized `FqName` segments (see `FqName::encode_segments`), or `None`
-    /// when the unit's `fq` is empty (synthetic file-scope units, etc.). Written
-    /// to `code_units.fq_segments` and re-interned on load.
-    fq_segments: Option<Vec<u8>>,
+    fq_segment_count: i64,
+    fq_segment_bytes: i64,
+    fq_anchor_kind: Option<&'static str>,
+    fq_anchor_pop: Option<i64>,
+    fq_package_tail_segments: Option<i64>,
+    exact_fqn_tail: Option<String>,
+    normalized_fqn_tail: Option<String>,
+    exact_parent_fqn_tail: Option<String>,
+    normalized_parent_fqn_tail: Option<String>,
+    package_fqn_tail: Option<String>,
+    /// `(ordinal, kind, text)` rows for `code_unit_fq_segments`.
+    relational_fq_segments: Vec<(i64, &'static str, String)>,
+    /// `(ordinal, exact tail, normalized tail)` rows for semantic visibility
+    /// that differs from the structured FqName parent.
+    visibility_containers: Vec<(i64, String, Option<String>)>,
 }
 
 /// The four `rust_*` fact tables' rows for one blob, converted from
@@ -5566,6 +6998,296 @@ struct PersistedMutationCost {
     payload_bytes: usize,
 }
 
+#[derive(Clone, Default)]
+struct PreparedWriteCounters {
+    #[cfg(test)]
+    transaction_starts: Arc<AtomicUsize>,
+    #[cfg(test)]
+    generation_lookups: Arc<AtomicUsize>,
+    #[cfg(test)]
+    replacement_lookups: Arc<AtomicUsize>,
+    #[cfg(test)]
+    replacement_fallbacks: Arc<AtomicUsize>,
+}
+
+/// Runs the existing adaptive prepared-blob writer on the connection owned by
+/// a `StoreWriter` backend. Keeping this connection-taking implementation
+/// separate from `AnalyzerStore` prevents a persistent actor job from
+/// recursively submitting another actor job.
+struct PreparedPersistenceWriter<'a> {
+    conn: &'a mut Connection,
+    #[cfg(test)]
+    counters: PreparedWriteCounters,
+}
+
+impl<'a> PreparedPersistenceWriter<'a> {
+    fn new(conn: &'a mut Connection, counters: PreparedWriteCounters) -> Self {
+        #[cfg(not(test))]
+        let _ = counters;
+        Self {
+            conn,
+            #[cfg(test)]
+            counters,
+        }
+    }
+
+    fn persist_prepared_blobs(
+        &mut self,
+        prepared: Vec<PreparedParsedBlob>,
+        limits: PersistBatchLimits,
+    ) -> (Vec<PersistBlobOutcome>, PersistBatchStats) {
+        let limits = limits.normalized();
+        let mut outcomes = Vec::with_capacity(prepared.len());
+        let mut stats = PersistBatchStats::default();
+        let mut batch = Vec::new();
+        let mut batch_rows = 0usize;
+        let mut batch_bytes = 0usize;
+        let mut seen = HashSet::default();
+
+        for blob in prepared {
+            if !seen.insert((blob.oid(), blob.lang().to_string())) {
+                outcomes.push(PersistBlobOutcome {
+                    prepared: blob,
+                    error: Some(StoreError::new(
+                        "duplicate prepared blob key in one persistence call",
+                    )),
+                });
+                stats.failed_blobs = stats.failed_blobs.saturating_add(1);
+                continue;
+            }
+            let exceeds = !batch.is_empty()
+                && (batch.len() >= limits.max_blobs
+                    || batch_rows.saturating_add(blob.mutation_logical_rows()) > limits.max_rows
+                    || batch_bytes.saturating_add(blob.mutation_payload_bytes())
+                        > limits.max_payload_bytes);
+            if exceeds {
+                let (batch_outcomes, batch_stats) = self.persist_prepared_chunk(batch, limits);
+                outcomes.extend(batch_outcomes);
+                stats.merge(batch_stats);
+                batch = Vec::new();
+                batch_rows = 0;
+                batch_bytes = 0;
+            }
+            batch_rows = batch_rows.saturating_add(blob.mutation_logical_rows());
+            batch_bytes = batch_bytes.saturating_add(blob.mutation_payload_bytes());
+            batch.push(blob);
+        }
+        if !batch.is_empty() {
+            let (batch_outcomes, batch_stats) = self.persist_prepared_chunk(batch, limits);
+            outcomes.extend(batch_outcomes);
+            stats.merge(batch_stats);
+        }
+        (outcomes, stats)
+    }
+
+    fn persist_prepared_chunk(
+        &mut self,
+        mut prepared: Vec<PreparedParsedBlob>,
+        limits: PersistBatchLimits,
+    ) -> (Vec<PersistBlobOutcome>, PersistBatchStats) {
+        let batch_blobs = prepared.len();
+        let batch_rows = saturating_sum(
+            prepared
+                .iter()
+                .map(PreparedParsedBlob::mutation_logical_rows),
+        );
+        let batch_bytes = saturating_sum(
+            prepared
+                .iter()
+                .map(PreparedParsedBlob::mutation_payload_bytes),
+        );
+        let result = self.try_persist_prepared_chunk(&prepared, limits);
+
+        match result {
+            Ok(actual_cost) => {
+                let stats = PersistBatchStats {
+                    transactions: 1,
+                    committed_blobs: batch_blobs,
+                    logical_rows: actual_cost.logical_rows,
+                    payload_bytes: actual_cost.payload_bytes,
+                    peak_batch_blobs: batch_blobs,
+                    peak_batch_rows: actual_cost.logical_rows,
+                    peak_batch_payload_bytes: actual_cost.payload_bytes,
+                    ..PersistBatchStats::default()
+                };
+                let outcomes = prepared
+                    .into_iter()
+                    .map(|prepared| PersistBlobOutcome {
+                        prepared,
+                        error: None,
+                    })
+                    .collect();
+                (outcomes, stats)
+            }
+            Err(error) if error.is_stale_generation() => {
+                let outcomes = prepared
+                    .into_iter()
+                    .map(|prepared| PersistBlobOutcome {
+                        prepared,
+                        error: Some(error.clone()),
+                    })
+                    .collect();
+                (
+                    outcomes,
+                    PersistBatchStats {
+                        failed_transaction_attempts: 1,
+                        failed_blobs: batch_blobs,
+                        peak_batch_blobs: batch_blobs,
+                        peak_batch_rows: batch_rows,
+                        peak_batch_payload_bytes: batch_bytes,
+                        ..PersistBatchStats::default()
+                    },
+                )
+            }
+            Err(mut error) if prepared.len() == 1 => {
+                let mut failed_attempts = 1;
+                for retry in 1..=PREPARED_WRITE_IMMEDIATE_RETRIES {
+                    std::thread::sleep(Duration::from_millis(10 * retry as u64));
+                    match self.try_persist_prepared_chunk(&prepared, limits) {
+                        Ok(actual_cost) => {
+                            return (
+                                vec![PersistBlobOutcome {
+                                    prepared: prepared.pop().expect("single retried prepared blob"),
+                                    error: None,
+                                }],
+                                PersistBatchStats {
+                                    transactions: 1,
+                                    failed_transaction_attempts: failed_attempts,
+                                    committed_blobs: 1,
+                                    logical_rows: actual_cost.logical_rows,
+                                    payload_bytes: actual_cost.payload_bytes,
+                                    peak_batch_blobs: batch_blobs,
+                                    peak_batch_rows: actual_cost.logical_rows,
+                                    peak_batch_payload_bytes: actual_cost.payload_bytes,
+                                    ..PersistBatchStats::default()
+                                },
+                            );
+                        }
+                        Err(retry_error) => {
+                            failed_attempts = failed_attempts.saturating_add(1);
+                            if retry_error.is_stale_generation() {
+                                error = retry_error;
+                                break;
+                            }
+                            error = retry_error;
+                        }
+                    }
+                }
+                (
+                    vec![PersistBlobOutcome {
+                        prepared: prepared.pop().expect("single failed prepared blob"),
+                        error: Some(error),
+                    }],
+                    PersistBatchStats {
+                        failed_transaction_attempts: failed_attempts,
+                        failed_blobs: 1,
+                        peak_batch_blobs: batch_blobs,
+                        peak_batch_rows: batch_rows,
+                        peak_batch_payload_bytes: batch_bytes,
+                        ..PersistBatchStats::default()
+                    },
+                )
+            }
+            Err(_) => {
+                let right = prepared.split_off(prepared.len() / 2);
+                let (mut left_outcomes, mut stats) = self.persist_prepared_chunk(prepared, limits);
+                let (right_outcomes, right_stats) = self.persist_prepared_chunk(right, limits);
+                left_outcomes.extend(right_outcomes);
+                stats.failed_transaction_attempts =
+                    stats.failed_transaction_attempts.saturating_add(1);
+                stats.peak_batch_blobs = stats.peak_batch_blobs.max(batch_blobs);
+                stats.peak_batch_rows = stats.peak_batch_rows.max(batch_rows);
+                stats.peak_batch_payload_bytes = stats.peak_batch_payload_bytes.max(batch_bytes);
+                stats.merge(right_stats);
+                (left_outcomes, stats)
+            }
+        }
+    }
+
+    fn try_persist_prepared_chunk(
+        &mut self,
+        prepared: &[PreparedParsedBlob],
+        limits: PersistBatchLimits,
+    ) -> Result<PersistedMutationCost> {
+        #[cfg(test)]
+        self.counters
+            .transaction_starts
+            .fetch_add(1, Ordering::SeqCst);
+        let tx = self.conn.transaction()?;
+        let mut generations = HashMap::default();
+        for blob in prepared {
+            if let Some(existing) = generations.insert(blob.lang(), blob.generation)
+                && existing != blob.generation
+            {
+                return Err(StoreError::stale_generation(format!(
+                    "conflicting prepared generations for language {}",
+                    blob.lang()
+                )));
+            }
+        }
+        for (lang, generation) in generations {
+            #[cfg(test)]
+            self.counters
+                .generation_lookups
+                .fetch_add(1, Ordering::SeqCst);
+            require_current_generation(&tx, lang, generation)?;
+        }
+        let stored_costs = stored_blob_cascade_costs_conn(&tx, prepared, || {
+            #[cfg(test)]
+            self.counters
+                .replacement_lookups
+                .fetch_add(1, Ordering::SeqCst);
+        })?;
+        let mut fallback_cost_statement =
+            tx.prepare_cached(persisted_blob_mutation_cost_fallback_sql())?;
+        let mut cost = PersistedMutationCost::default();
+        for (blob, stored) in prepared.iter().zip(stored_costs) {
+            let replaced = match stored {
+                StoredCascadeCost::Missing => PersistedMutationCost::default(),
+                StoredCascadeCost::Known(cost) => cost,
+                StoredCascadeCost::Legacy => {
+                    #[cfg(test)]
+                    self.counters
+                        .replacement_fallbacks
+                        .fetch_add(1, Ordering::SeqCst);
+                    persisted_blob_mutation_cost_fallback_statement(
+                        &mut fallback_cost_statement,
+                        blob.oid_text.as_str(),
+                        blob.lang(),
+                    )?
+                }
+            };
+            cost.logical_rows = cost
+                .logical_rows
+                .saturating_add(blob.logical_rows())
+                .saturating_add(replaced.logical_rows);
+            cost.payload_bytes = cost
+                .payload_bytes
+                .saturating_add(blob.payload_bytes())
+                .saturating_add(replaced.payload_bytes);
+        }
+        drop(fallback_cost_statement);
+        if prepared.len() > 1
+            && (prepared.len() > limits.max_blobs
+                || cost.logical_rows > limits.max_rows
+                || cost.payload_bytes > limits.max_payload_bytes)
+        {
+            return Err(StoreError::new(format!(
+                "prepared replacement mutation batch exceeds limits: blobs={}, rows={}, bytes={}",
+                prepared.len(),
+                cost.logical_rows,
+                cost.payload_bytes
+            )));
+        }
+        for blob in prepared {
+            write_prepared_blob_unchecked_tx(&tx, blob)?;
+        }
+        tx.commit()?;
+        let _ = reclaim_stale_generations_conn(self.conn, STALE_GENERATION_RECLAIM_ROWS);
+        Ok(cost)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct PersistedSideTableCounts {
     range_count: usize,
@@ -5926,11 +7648,14 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
     for stored in stored_units {
         let content_qualifier =
             adapter.storage_content_qualifier(&stored.unit, &state.content_qualifier);
+        let prepared_fq = prepare_unit_fq(adapter, &stored.unit, &content_qualifier)?;
         let exact_fqn = persist_lookup_keys.then(|| stored.unit.fq_name());
         let normalized_fqn = exact_fqn
             .as_deref()
             .map(|fqn| adapter.normalize_full_name(fqn));
-        let simple_type_name = (persist_lookup_keys && stored.unit.is_class())
+        let simple_type_name = stored
+            .unit
+            .is_class()
             .then(|| adapter.simple_type_name(&stored.unit));
         units.push(PreparedUnitRow {
             key: stored.key,
@@ -5948,7 +7673,36 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
             in_declarations: bool_to_i64(stored.in_declarations),
             in_definition_lookup: bool_to_i64(stored.in_definition_lookup),
             in_test_region: bool_to_i64(stored.in_test_region),
-            fq_segments: encode_unit_fq_segments(adapter, &stored.unit, &content_qualifier),
+            fq_segment_count: prepared_fq
+                .as_ref()
+                .map_or(Ok(0), |fq| usize_to_i64(fq.segments.len()))?,
+            fq_segment_bytes: prepared_fq.as_ref().map_or(Ok(0), |fq| {
+                usize_to_i64(
+                    fq.segments
+                        .iter()
+                        .map(|(_, kind, segment)| kind.len() + segment.len())
+                        .sum(),
+                )
+            })?,
+            fq_anchor_kind: prepared_fq.as_ref().and_then(|fq| fq.anchor_kind),
+            fq_anchor_pop: prepared_fq.as_ref().and_then(|fq| fq.anchor_pop),
+            fq_package_tail_segments: prepared_fq.as_ref().map(|fq| fq.package_tail_segments),
+            exact_fqn_tail: prepared_fq.as_ref().map(|fq| fq.exact_tail.clone()),
+            normalized_fqn_tail: prepared_fq
+                .as_ref()
+                .and_then(|fq| fq.normalized_tail.clone()),
+            exact_parent_fqn_tail: prepared_fq.as_ref().map(|fq| fq.exact_parent_tail.clone()),
+            normalized_parent_fqn_tail: prepared_fq
+                .as_ref()
+                .and_then(|fq| fq.normalized_parent_tail.clone()),
+            package_fqn_tail: prepared_fq.as_ref().map(|fq| fq.package_tail.clone()),
+            relational_fq_segments: prepared_fq
+                .as_ref()
+                .map(|fq| fq.segments.clone())
+                .unwrap_or_default(),
+            visibility_containers: prepared_fq
+                .map(|fq| fq.visibility_containers)
+                .unwrap_or_default(),
         });
     }
 
@@ -6074,6 +7828,8 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
         3,
         optional_counts.nonzero_len(),
         units.len(),
+        saturating_sum(units.iter().map(|row| row.relational_fq_segments.len())),
+        saturating_sum(units.iter().map(|row| row.visibility_containers.len())),
         ranges.len(),
         signatures.len(),
         signature_metadata.len(),
@@ -6097,6 +7853,28 @@ fn prepare_parsed_blob<A: LanguageAdapter>(
             row.normalized_fqn.as_ref().map_or(0, String::len),
             row.simple_type_name.as_ref().map_or(0, String::len),
             row.signature.as_ref().map_or(0, String::len),
+            row.fq_anchor_kind.map_or(0, str::len),
+            row.exact_fqn_tail.as_ref().map_or(0, String::len),
+            row.normalized_fqn_tail.as_ref().map_or(0, String::len),
+            row.exact_parent_fqn_tail.as_ref().map_or(0, String::len),
+            row.normalized_parent_fqn_tail
+                .as_ref()
+                .map_or(0, String::len),
+            row.package_fqn_tail.as_ref().map_or(0, String::len),
+            saturating_sum(
+                row.relational_fq_segments
+                    .iter()
+                    .map(|(_, kind, segment)| kind.len().saturating_add(segment.len())),
+            ),
+            saturating_sum(
+                row.visibility_containers
+                    .iter()
+                    .map(|(_, exact, normalized)| {
+                        exact
+                            .len()
+                            .saturating_add(normalized.as_ref().map_or(0, String::len))
+                    }),
+            ),
         ])
     }));
     let string_bytes = saturating_sum([
@@ -6209,8 +7987,14 @@ fn write_prepared_blob_rows_tx(
                blob_oid, lang, unit_key, kind, short_name, identifier, content_qualifier,
                exact_fqn, normalized_fqn, simple_type_name, signature, synthetic,
                is_type_alias, top_level_ordinal, in_declarations, in_definition_lookup,
-               in_test_region, fq_segments
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+               in_test_region, fq_segment_count, fq_segment_bytes,
+               fq_anchor_kind, fq_anchor_pop,
+               fq_package_tail_segments, exact_fqn_tail, normalized_fqn_tail,
+               exact_parent_fqn_tail, normalized_parent_fqn_tail, package_fqn_tail
+             ) VALUES(
+               ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+               ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27
+             )",
         )?;
         for row in &blob.units {
             stmt.execute(params![
@@ -6231,8 +8015,42 @@ fn write_prepared_blob_rows_tx(
                 row.in_declarations,
                 row.in_definition_lookup,
                 row.in_test_region,
-                row.fq_segments,
+                row.fq_segment_count,
+                row.fq_segment_bytes,
+                row.fq_anchor_kind,
+                row.fq_anchor_pop,
+                row.fq_package_tail_segments,
+                row.exact_fqn_tail,
+                row.normalized_fqn_tail,
+                row.exact_parent_fqn_tail,
+                row.normalized_parent_fqn_tail,
+                row.package_fqn_tail,
             ])?;
+        }
+    }
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO unit_visibility_containers(
+               blob_oid, lang, unit_key, container_ordinal,
+               exact_container_tail, normalized_container_tail
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        for row in &blob.units {
+            for (ordinal, exact, normalized) in &row.visibility_containers {
+                stmt.execute(params![oid, lang, row.key, ordinal, exact, normalized])?;
+            }
+        }
+    }
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO code_unit_fq_segments(
+               blob_oid, lang, unit_key, seg_ordinal, seg_kind, segment
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        for row in &blob.units {
+            for (ordinal, kind, segment) in &row.relational_fq_segments {
+                stmt.execute(params![oid, lang, row.key, ordinal, kind, segment])?;
+            }
         }
     }
     macro_rules! insert_rows {
@@ -6373,158 +8191,6 @@ fn write_prepared_blob_rows_tx(
     Ok(())
 }
 
-fn write_parsed_blob_tx<A: LanguageAdapter>(
-    tx: &Transaction<'_>,
-    oid: Oid,
-    lang: &str,
-    generation: GenerationId,
-    adapter: &A,
-    state: &FileState,
-) -> Result<()> {
-    write_parsed_blob_rows_tx(tx, oid, lang, generation, adapter, state)?;
-    // A second reading of the same blob (issue #1970: the C projection of a
-    // C++ header) lands under its own storage language key in the same
-    // transaction, at that key's own current generation. `additional_
-    // projections` is always empty on a projection state, so this is one level
-    // deep by construction.
-    for (projection_lang, projection_state) in &state.additional_projections {
-        let projection_generation = current_generation_conn(tx, projection_lang)?;
-        write_parsed_blob_rows_tx(
-            tx,
-            oid,
-            projection_lang,
-            projection_generation,
-            adapter,
-            projection_state,
-        )?;
-    }
-    Ok(())
-}
-
-fn write_parsed_blob_rows_tx<A: LanguageAdapter>(
-    tx: &Transaction<'_>,
-    oid: Oid,
-    lang: &str,
-    generation: GenerationId,
-    adapter: &A,
-    state: &FileState,
-) -> Result<()> {
-    require_complete_file_state(state)?;
-    let oid = oid.to_string();
-    tx.execute(
-        "DELETE FROM blobs WHERE blob_oid = ?1 AND lang = ?2",
-        params![oid, lang],
-    )?;
-    tx.execute(
-        "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, ?2, ?3)",
-        params![oid, lang, generation.0],
-    )?;
-
-    let units = collect_stored_units(adapter, state);
-    let unit_keys: HashMap<CodeUnit, i64> = units
-        .iter()
-        .map(|unit| (unit.unit.clone(), unit.key))
-        .collect();
-
-    {
-        let mut stmt = tx.prepare(
-            "INSERT OR IGNORE INTO code_units(
-               blob_oid, lang, unit_key, kind, short_name, identifier, content_qualifier,
-               exact_fqn, normalized_fqn, simple_type_name,
-               signature, synthetic, is_type_alias, top_level_ordinal,
-               in_declarations, in_definition_lookup, in_test_region, fq_segments
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
-        )?;
-        for stored in &units {
-            let content_qualifier =
-                adapter.storage_content_qualifier(&stored.unit, &state.content_qualifier);
-            let fq_segments = encode_unit_fq_segments(adapter, &stored.unit, &content_qualifier);
-            let persist_lookup_keys = adapter.persist_content_stable_lookup_keys();
-            let exact_fqn = persist_lookup_keys.then(|| stored.unit.fq_name());
-            let normalized_fqn = exact_fqn
-                .as_deref()
-                .map(|fqn| adapter.normalize_full_name(fqn));
-            let simple_type_name = (persist_lookup_keys && stored.unit.is_class())
-                .then(|| adapter.simple_type_name(&stored.unit));
-            stmt.execute(params![
-                oid,
-                lang,
-                stored.key,
-                code_unit_kind_to_i64(stored.unit.kind()),
-                stored.unit.short_name(),
-                stored.unit.identifier(),
-                content_qualifier,
-                exact_fqn,
-                normalized_fqn,
-                simple_type_name,
-                stored.unit.signature(),
-                bool_to_i64(stored.unit.is_synthetic()),
-                bool_to_i64(stored.is_type_alias),
-                stored.top_level_ordinal.map(usize_to_i64).transpose()?,
-                bool_to_i64(stored.in_declarations),
-                bool_to_i64(stored.in_definition_lookup),
-                bool_to_i64(stored.in_test_region),
-                fq_segments,
-            ])?;
-        }
-    }
-
-    let range_count = insert_unit_ranges(tx, &oid, lang, &unit_keys, &state.ranges)?;
-    let signature_count = insert_unit_signatures(tx, &oid, lang, &unit_keys, &state.signatures)?;
-    let signature_metadata_count =
-        insert_unit_signature_metadata(tx, &oid, lang, &unit_keys, &state.signature_metadata)?;
-    let cpp_template_metadata_count =
-        insert_cpp_template_metadata(tx, &oid, lang, &unit_keys, &state.cpp_template_metadata)?;
-    let supertype_count = insert_unit_supertypes(
-        tx,
-        &oid,
-        lang,
-        &unit_keys,
-        &state.raw_supertypes,
-        &state.supertype_lookup_paths,
-    )?;
-    let child_count = insert_unit_children(tx, &oid, lang, &unit_keys, &state.children)?;
-    let ruby_dispatch_count = insert_ruby_method_dispatch_modes(
-        tx,
-        &oid,
-        lang,
-        &unit_keys,
-        &state.ruby_method_dispatch_modes,
-    )?;
-    let scala_trait_count = insert_scala_traits(tx, &oid, lang, &unit_keys, &state.scala_traits)?;
-    let import_rows = ImportRows::from_imports(&state.imports)?;
-    insert_import_rows(tx, &oid, lang, &import_rows)?;
-    insert_rust_fact_rows(
-        tx,
-        &oid,
-        lang,
-        &RustFactRows::from_facts(&state.rust_usage_facts)?,
-    )?;
-    let scala_export_count =
-        insert_scala_exports(tx, &oid, lang, &unit_keys, &state.scala_exports)?;
-    let materialization_record_count =
-        insert_materialization_records(tx, &oid, lang, &unit_keys, &state.materialization_records)?;
-    let side_counts = PersistedSideTableCounts {
-        range_count,
-        signature_count,
-        signature_metadata_count,
-        supertype_count,
-        child_count,
-        import_statement_count: import_rows.statements.len(),
-        type_identifier_count: state.type_identifiers.len(),
-        optional: optional_fact_counts(
-            cpp_template_metadata_count,
-            ruby_dispatch_count,
-            scala_trait_count,
-            scala_export_count,
-            materialization_record_count,
-        ),
-    };
-    insert_blob_meta(tx, &oid, lang, adapter, state, units.len(), side_counts)?;
-    update_blob_payload_cost_tx(tx, &oid, lang)?;
-    Ok(())
-}
-
 fn require_complete_file_state(state: &FileState) -> Result<()> {
     if !state.parse_complete {
         return Err(StoreError::new(
@@ -6610,321 +8276,6 @@ fn stored_unit_order_key(
     )
 }
 
-fn insert_unit_ranges(
-    tx: &Transaction<'_>,
-    oid: &str,
-    lang: &str,
-    unit_keys: &HashMap<CodeUnit, i64>,
-    ranges: &HashMap<CodeUnit, Vec<Range>>,
-) -> Result<usize> {
-    let mut stmt = tx.prepare(
-        "INSERT OR IGNORE INTO unit_ranges(
-           blob_oid, lang, unit_key, ordinal, start_byte, end_byte, start_line, end_line
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-    )?;
-    let mut count = 0;
-    for (unit, entries) in ranges {
-        let Some(unit_key) = unit_keys.get(unit) else {
-            continue;
-        };
-        for (ordinal, range) in entries.iter().enumerate() {
-            stmt.execute(params![
-                oid,
-                lang,
-                unit_key,
-                usize_to_i64(ordinal)?,
-                usize_to_i64(range.start_byte)?,
-                usize_to_i64(range.end_byte)?,
-                usize_to_i64(range.start_line)?,
-                usize_to_i64(range.end_line)?,
-            ])?;
-            count += 1;
-        }
-    }
-    Ok(count)
-}
-
-fn insert_unit_signatures(
-    tx: &Transaction<'_>,
-    oid: &str,
-    lang: &str,
-    unit_keys: &HashMap<CodeUnit, i64>,
-    signatures: &HashMap<CodeUnit, Vec<String>>,
-) -> Result<usize> {
-    let mut stmt = tx.prepare(
-        "INSERT OR IGNORE INTO unit_signatures(
-           blob_oid, lang, unit_key, ordinal, text
-         ) VALUES(?1, ?2, ?3, ?4, ?5)",
-    )?;
-    let mut count = 0;
-    for (unit, entries) in signatures {
-        let Some(unit_key) = unit_keys.get(unit) else {
-            continue;
-        };
-        for (ordinal, signature) in entries.iter().enumerate() {
-            stmt.execute(params![
-                oid,
-                lang,
-                unit_key,
-                usize_to_i64(ordinal)?,
-                signature
-            ])?;
-            count += 1;
-        }
-    }
-    Ok(count)
-}
-
-fn insert_unit_signature_metadata(
-    tx: &Transaction<'_>,
-    oid: &str,
-    lang: &str,
-    unit_keys: &HashMap<CodeUnit, i64>,
-    metadata: &HashMap<CodeUnit, Vec<SignatureMetadata>>,
-) -> Result<usize> {
-    let mut stmt = tx.prepare(signature_metadata_insert_sql())?;
-    let mut count = 0;
-    for (unit, entries) in metadata {
-        let Some(&unit_key) = unit_keys.get(unit) else {
-            continue;
-        };
-        for (ordinal, entry) in entries.iter().enumerate() {
-            SignatureMetadataColumns::encode(entry)?.insert(
-                &mut stmt,
-                oid,
-                lang,
-                unit_key,
-                usize_to_i64(ordinal)?,
-            )?;
-            count += 1;
-        }
-    }
-    Ok(count)
-}
-
-fn insert_cpp_template_metadata(
-    tx: &Transaction<'_>,
-    oid: &str,
-    lang: &str,
-    unit_keys: &HashMap<CodeUnit, i64>,
-    metadata: &HashMap<CodeUnit, CppTemplateMetadata>,
-) -> Result<usize> {
-    let mut stmt = tx.prepare(
-        "INSERT OR IGNORE INTO unit_cpp_template_metadata(
-           blob_oid, lang, unit_key, metadata
-         ) VALUES(?1, ?2, ?3, ?4)",
-    )?;
-    let mut count = 0;
-    for (unit, entry) in metadata {
-        let Some(unit_key) = unit_keys.get(unit) else {
-            continue;
-        };
-        stmt.execute(params![oid, lang, unit_key, serialize_blob(entry)?])?;
-        count += 1;
-    }
-    Ok(count)
-}
-
-fn insert_unit_supertypes(
-    tx: &Transaction<'_>,
-    oid: &str,
-    lang: &str,
-    unit_keys: &HashMap<CodeUnit, i64>,
-    supertypes: &HashMap<CodeUnit, Vec<String>>,
-    lookup_paths: &HashMap<CodeUnit, Vec<String>>,
-) -> Result<usize> {
-    let mut stmt = tx.prepare(
-        "INSERT OR IGNORE INTO unit_supertypes(
-           blob_oid, lang, unit_key, ordinal, raw, lookup_path
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
-    )?;
-    let mut count = 0;
-    for (unit, entries) in supertypes {
-        let Some(unit_key) = unit_keys.get(unit) else {
-            continue;
-        };
-        for (ordinal, raw) in entries.iter().enumerate() {
-            let lookup_path = lookup_paths
-                .get(unit)
-                .and_then(|paths| paths.get(ordinal))
-                .map(String::as_str)
-                .unwrap_or("");
-            stmt.execute(params![
-                oid,
-                lang,
-                unit_key,
-                usize_to_i64(ordinal)?,
-                raw,
-                lookup_path
-            ])?;
-            count += 1;
-        }
-    }
-    Ok(count)
-}
-
-fn insert_unit_children(
-    tx: &Transaction<'_>,
-    oid: &str,
-    lang: &str,
-    unit_keys: &HashMap<CodeUnit, i64>,
-    children: &HashMap<CodeUnit, Vec<CodeUnit>>,
-) -> Result<usize> {
-    let mut stmt = tx.prepare(
-        "INSERT OR IGNORE INTO unit_children(
-           blob_oid, lang, parent_key, child_key, ordinal
-         ) VALUES(?1, ?2, ?3, ?4, ?5)",
-    )?;
-    let mut count = 0;
-    for (parent, entries) in children {
-        let Some(parent_key) = unit_keys.get(parent) else {
-            continue;
-        };
-        for (ordinal, child) in entries.iter().enumerate() {
-            let Some(child_key) = unit_keys.get(child) else {
-                continue;
-            };
-            stmt.execute(params![
-                oid,
-                lang,
-                parent_key,
-                child_key,
-                usize_to_i64(ordinal)?,
-            ])?;
-            count += 1;
-        }
-    }
-    Ok(count)
-}
-
-fn insert_ruby_method_dispatch_modes(
-    tx: &Transaction<'_>,
-    oid: &str,
-    lang: &str,
-    unit_keys: &HashMap<CodeUnit, i64>,
-    dispatch_modes: &HashMap<CodeUnit, RubyMethodDispatchMode>,
-) -> Result<usize> {
-    let mut stmt = tx.prepare(
-        "INSERT OR IGNORE INTO ruby_method_dispatch_modes(
-           blob_oid, lang, unit_key, mode
-         ) VALUES(?1, ?2, ?3, ?4)",
-    )?;
-    let mut count = 0;
-    for (unit, mode) in dispatch_modes {
-        let Some(unit_key) = unit_keys.get(unit) else {
-            continue;
-        };
-        stmt.execute(params![
-            oid,
-            lang,
-            unit_key,
-            ruby_dispatch_mode_to_i64(*mode)
-        ])?;
-        count += 1;
-    }
-    Ok(count)
-}
-
-fn insert_scala_traits(
-    tx: &Transaction<'_>,
-    oid: &str,
-    lang: &str,
-    unit_keys: &HashMap<CodeUnit, i64>,
-    traits: &HashSet<CodeUnit>,
-) -> Result<usize> {
-    let mut stmt = tx.prepare(
-        "INSERT OR IGNORE INTO scala_traits(
-           blob_oid, lang, unit_key
-         ) VALUES(?1, ?2, ?3)",
-    )?;
-    let mut count = 0;
-    for unit in traits {
-        let Some(unit_key) = unit_keys.get(unit) else {
-            continue;
-        };
-        stmt.execute(params![oid, lang, unit_key])?;
-        count += 1;
-    }
-    Ok(count)
-}
-
-fn insert_scala_exports(
-    tx: &Transaction<'_>,
-    oid: &str,
-    lang: &str,
-    unit_keys: &HashMap<CodeUnit, i64>,
-    exports: &HashMap<CodeUnit, Vec<crate::analyzer::ScalaExportInfo>>,
-) -> Result<usize> {
-    let mut stmt = tx.prepare(
-        "INSERT OR IGNORE INTO scala_exports(
-           blob_oid, lang, owner_key, ordinal, info
-         ) VALUES(?1, ?2, ?3, ?4, ?5)",
-    )?;
-    let mut count = 0;
-    for (owner, entries) in exports {
-        let Some(owner_key) = unit_keys.get(owner) else {
-            continue;
-        };
-        for (ordinal, info) in entries.iter().enumerate() {
-            stmt.execute(params![
-                oid,
-                lang,
-                owner_key,
-                usize_to_i64(ordinal)?,
-                serialize_blob(info)?,
-            ])?;
-            count += 1;
-        }
-    }
-    Ok(count)
-}
-
-fn insert_blob_meta<A: LanguageAdapter>(
-    tx: &Transaction<'_>,
-    oid: &str,
-    lang: &str,
-    adapter: &A,
-    state: &FileState,
-    stored_unit_count: usize,
-    side_counts: PersistedSideTableCounts,
-) -> Result<()> {
-    tx.execute(
-        "INSERT OR IGNORE INTO blob_meta(
-           blob_oid, lang, contains_tests, content_package, stored_unit_count,
-           range_count, signature_count, signature_metadata_count, supertype_count,
-           child_count, import_statement_count, type_identifier_count, is_complete
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-        params![
-            oid,
-            lang,
-            bool_to_i64(adapter.storage_contains_tests(state)),
-            adapter.storage_file_content_qualifier(&state.content_qualifier),
-            usize_to_i64(stored_unit_count)?,
-            usize_to_i64(side_counts.range_count)?,
-            usize_to_i64(side_counts.signature_count)?,
-            usize_to_i64(side_counts.signature_metadata_count)?,
-            usize_to_i64(side_counts.supertype_count)?,
-            usize_to_i64(side_counts.child_count)?,
-            usize_to_i64(side_counts.import_statement_count)?,
-            usize_to_i64(side_counts.type_identifier_count)?,
-            1,
-        ],
-    )?;
-    insert_optional_fact_manifest(tx, oid, lang, side_counts.optional)?;
-    let mut type_identifiers: Vec<_> = state.type_identifiers.iter().collect();
-    type_identifiers.sort();
-    let mut stmt = tx.prepare(
-        "INSERT OR IGNORE INTO type_identifiers(
-           blob_oid, lang, type_identifier
-         ) VALUES(?1, ?2, ?3)",
-    )?;
-    for identifier in type_identifiers {
-        stmt.execute(params![oid, lang, identifier])?;
-    }
-    Ok(())
-}
-
-#[derive(Debug)]
 struct UnitRow {
     key: i64,
     unit: CodeUnit,
@@ -6937,6 +8288,7 @@ struct UnitRow {
 
 #[derive(Debug, Clone)]
 struct RawUnitRow {
+    blob_oid: Oid,
     key: i64,
     kind: CodeUnitType,
     content_qualifier: String,
@@ -6947,9 +8299,115 @@ struct RawUnitRow {
     in_declarations: bool,
     in_definition_lookup: bool,
     in_test_region: bool,
-    /// Serialized `FqName` segments (see `FqName::decode_segments`); `None` for
-    /// rows written before the segments column existed.
-    fq_segments: Option<Vec<u8>>,
+    fq: Option<RelationalUnitFq>,
+}
+
+const RAW_UNIT_COLUMNS: &str = "blob_oid, unit_key, kind, content_qualifier, signature, synthetic,
+     is_type_alias, top_level_ordinal, in_declarations, in_definition_lookup,
+     in_test_region, fq_anchor_kind, fq_anchor_pop, fq_package_tail_segments,
+     fq_segment_count, exact_fqn_tail, fq_segment_bytes, normalized_fqn_tail";
+
+fn raw_unit_columns_sql(alias: &str) -> String {
+    format!(
+        "{alias}.blob_oid, {alias}.unit_key, {alias}.kind,
+         {alias}.content_qualifier, {alias}.signature, {alias}.synthetic,
+         {alias}.is_type_alias, {alias}.top_level_ordinal,
+         {alias}.in_declarations, {alias}.in_definition_lookup,
+         {alias}.in_test_region, {alias}.fq_anchor_kind, {alias}.fq_anchor_pop,
+         {alias}.fq_package_tail_segments, {alias}.fq_segment_count,
+         {alias}.exact_fqn_tail, {alias}.fq_segment_bytes,
+         {alias}.normalized_fqn_tail"
+    )
+}
+
+fn raw_unit_row_from_row(row: &rusqlite::Row<'_>, base: usize) -> rusqlite::Result<RawUnitRow> {
+    let oid_text = row.get::<_, String>(base)?;
+    let blob_oid = Oid::from_str(&oid_text).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(base, rusqlite::types::Type::Text, Box::new(err))
+    })?;
+    let kind_raw = row.get::<_, i64>(base + 2)?;
+    let kind = code_unit_kind_from_i64(kind_raw).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(
+            base + 2,
+            rusqlite::types::Type::Integer,
+            Box::new(err),
+        )
+    })?;
+    Ok(RawUnitRow {
+        blob_oid,
+        key: row.get(base + 1)?,
+        kind,
+        content_qualifier: row.get(base + 3)?,
+        signature: row.get(base + 4)?,
+        synthetic: row.get::<_, i64>(base + 5)? != 0,
+        is_type_alias: row.get::<_, i64>(base + 6)? != 0,
+        top_level_ordinal: row
+            .get::<_, Option<i64>>(base + 7)?
+            .map(i64_to_usize)
+            .transpose()
+            .map_err(rusqlite_error_from_store)?,
+        in_declarations: row.get::<_, i64>(base + 8)? != 0,
+        in_definition_lookup: row.get::<_, i64>(base + 9)? != 0,
+        in_test_region: row.get::<_, i64>(base + 10)? != 0,
+        fq: fq_identity_header_from_row(row, base + 11)?.map(RelationalUnitFq::from_header),
+    })
+}
+
+fn attach_raw_unit_fq_segments(
+    conn: &Connection,
+    lang: &str,
+    oids: &[String],
+    rows: &mut [RawUnitRow],
+) -> Result<()> {
+    let mut loaded: HashMap<(Oid, i64), Vec<(SegmentKind, String)>> = HashMap::default();
+    for chunk in oids.chunks(900) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let placeholders = chunk_placeholders(chunk);
+        let sql = raw_unit_fq_segments_sql(&placeholders);
+        let parameters = chunk_params(lang, chunk);
+        let mut statement = conn.prepare_cached(&sql)?;
+        let mut query = statement.query(params_from_iter(parameters.iter()))?;
+        while let Some(row) = query.next()? {
+            let oid_text = row.get::<_, String>(0)?;
+            let oid = Oid::from_str(&oid_text).map_err(|err| {
+                StoreError::new(format!(
+                    "invalid FqName segment blob oid {oid_text:?}: {err}"
+                ))
+            })?;
+            let unit_key = row.get::<_, i64>(1)?;
+            let ordinal = i64_to_usize(row.get::<_, i64>(2)?)?;
+            let kind_text = row.get::<_, String>(3)?;
+            let segment = row.get::<_, String>(4)?;
+            let segments = loaded.entry((oid, unit_key)).or_default();
+            if ordinal != segments.len() {
+                return Err(StoreError::new(format!(
+                    "analyzer store FqName segments are not dense: expected ordinal {}, got {ordinal}",
+                    segments.len()
+                )));
+            }
+            segments.push((segment_kind_from_sql(&kind_text)?, segment));
+        }
+    }
+    for row in rows {
+        let key = (row.blob_oid, lang.to_string(), row.key);
+        let segments = loaded
+            .get(&(row.blob_oid, row.key))
+            .cloned()
+            .unwrap_or_default();
+        attach_complete_relational_fq(&mut row.fq, segments, &key)?;
+    }
+    Ok(())
+}
+
+fn raw_unit_fq_segments_sql(placeholders: &str) -> String {
+    format!(
+        "SELECT blob_oid, unit_key, seg_ordinal, seg_kind, segment
+         FROM code_unit_fq_segments
+         WHERE lang = ? AND blob_oid IN ({placeholders})
+         ORDER BY blob_oid, unit_key, seg_ordinal"
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -6968,6 +8426,7 @@ struct SummaryProjectionMeta {
     range_count: usize,
     signature_count: usize,
     child_count: usize,
+    import_statement_count: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -7119,6 +8578,7 @@ fn summary_file_projection_conn<A: LanguageAdapter>(
     lang: &str,
     adapter: &A,
     file: &ProjectFile,
+    source: &str,
 ) -> Result<Option<SummaryFileProjection>> {
     let oid = oid.to_string();
     let Some(meta) = read_summary_projection_meta(conn, &oid, lang)? else {
@@ -7153,12 +8613,19 @@ fn summary_file_projection_conn<A: LanguageAdapter>(
         return Ok(None);
     }
 
-    Ok(Some(SummaryFileProjection {
+    let mut projection = SummaryFileProjection {
         top_level_declarations: top_level.into_iter().map(|(_, unit)| unit).collect(),
         signatures,
         ranges,
         children,
-    }))
+    };
+    adapter.synthesize_summary_projection(
+        file,
+        source,
+        meta.import_statement_count > 0,
+        &mut projection,
+    );
+    Ok(Some(projection))
 }
 
 fn type_aliases_for_file_conn<A: LanguageAdapter>(
@@ -7171,9 +8638,9 @@ fn type_aliases_for_file_conn<A: LanguageAdapter>(
     if read_summary_projection_meta(conn, &oid.to_string(), lang)?.is_none() {
         return Ok(None);
     }
+    let unit_columns = raw_unit_columns_sql("units");
     let sql = format!(
-        "SELECT units.kind, units.content_qualifier, units.signature, units.synthetic,
-                units.fq_segments
+        "SELECT {unit_columns}
          FROM code_units AS units
          JOIN blob_meta AS meta
            ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
@@ -7183,23 +8650,21 @@ fn type_aliases_for_file_conn<A: LanguageAdapter>(
     );
     let oid = oid.to_string();
     let mut statement = conn.prepare_cached(&sql)?;
-    let mut rows = statement.query(params![oid, lang])?;
-    let mut aliases = Vec::new();
-    while let Some(row) = rows.next()? {
-        let kind = code_unit_kind_from_i64(row.get(0)?)?;
-        let content_qualifier = row.get::<_, String>(1)?;
-        let signature = row.get::<_, Option<String>>(2)?;
-        let synthetic = row.get::<_, i64>(3)? != 0;
-        let fq_segments = row.get::<_, Option<Vec<u8>>>(4)?;
+    let mapped = statement.query_map(params![oid, lang], |row| raw_unit_row_from_row(row, 0))?;
+    let mut rows = mapped.collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(statement);
+    attach_raw_unit_fq_segments(conn, lang, std::slice::from_ref(&oid), &mut rows)?;
+    let mut aliases = Vec::with_capacity(rows.len());
+    for row in rows {
         let (fq_name, package_segment_count) =
-            hydrate_unit_fq(adapter, fq_segments.as_deref(), &content_qualifier, file)?;
+            hydrate_unit_fq(adapter, row.fq.as_ref(), &row.content_qualifier, file)?;
         aliases.push(CodeUnit::from_fq(
             file.clone(),
-            kind,
+            row.kind,
             fq_name,
             package_segment_count,
-            signature,
-            synthetic,
+            row.signature,
+            row.synthetic,
         ));
     }
     Ok(Some(aliases))
@@ -7216,9 +8681,9 @@ fn enclosing_declarations_for_range_conn<A: LanguageAdapter>(
     if read_summary_projection_meta(conn, &oid.to_string(), lang)?.is_none() {
         return Ok(None);
     }
+    let unit_columns = raw_unit_columns_sql("units");
     let sql = format!(
-        "SELECT units.unit_key, units.kind, units.content_qualifier, units.signature, units.synthetic,
-                units.fq_segments,
+        "SELECT {unit_columns},
                 ranges.start_byte, ranges.end_byte, ranges.start_line, ranges.end_line
          FROM code_units AS units
          JOIN blob_meta AS meta
@@ -7239,40 +8704,131 @@ fn enclosing_declarations_for_range_conn<A: LanguageAdapter>(
         .map_err(|_| StoreError::new("range end byte exceeds SQLite integer range"))?;
     let mut statement = conn.prepare_cached(&sql)?;
     let mut rows = statement.query(params![oid, lang, start_byte, end_byte])?;
-    let mut declarations = Vec::new();
+    let mut raw_declarations = Vec::new();
     let mut previous_unit_key = None;
     while let Some(row) = rows.next()? {
-        let unit_key = row.get::<_, i64>(0)?;
+        let raw = raw_unit_row_from_row(row, 0)?;
+        let unit_key = raw.key;
         if previous_unit_key == Some(unit_key) {
             continue;
         }
         previous_unit_key = Some(unit_key);
-        let kind = code_unit_kind_from_i64(row.get(1)?)?;
-        let content_qualifier = row.get::<_, String>(2)?;
-        let signature = row.get::<_, Option<String>>(3)?;
-        let synthetic = row.get::<_, i64>(4)? != 0;
-        let fq_segments = row.get::<_, Option<Vec<u8>>>(5)?;
         let range = Range {
-            start_byte: i64_to_usize(row.get(6)?)?,
-            end_byte: i64_to_usize(row.get(7)?)?,
-            start_line: i64_to_usize(row.get(8)?)?,
-            end_line: i64_to_usize(row.get(9)?)?,
+            start_byte: i64_to_usize(row.get(18)?)?,
+            end_byte: i64_to_usize(row.get(19)?)?,
+            start_line: i64_to_usize(row.get(20)?)?,
+            end_line: i64_to_usize(row.get(21)?)?,
         };
+        raw_declarations.push((raw, range));
+    }
+    drop(rows);
+    drop(statement);
+    let mut raw_units = raw_declarations
+        .iter()
+        .map(|(raw, _)| raw.clone())
+        .collect::<Vec<_>>();
+    attach_raw_unit_fq_segments(conn, lang, std::slice::from_ref(&oid), &mut raw_units)?;
+    let mut declarations = Vec::with_capacity(raw_units.len());
+    for (raw, (_, range)) in raw_units.into_iter().zip(raw_declarations) {
         let (fq_name, package_segment_count) =
-            hydrate_unit_fq(adapter, fq_segments.as_deref(), &content_qualifier, file)?;
+            hydrate_unit_fq(adapter, raw.fq.as_ref(), &raw.content_qualifier, file)?;
         declarations.push((
             CodeUnit::from_fq(
                 file.clone(),
-                kind,
+                raw.kind,
                 fq_name,
                 package_segment_count,
-                signature,
-                synthetic,
+                raw.signature,
+                raw.synthetic,
             ),
             range,
         ));
     }
     Ok(Some(declarations))
+}
+
+fn enclosing_declarations_for_file_conn<A: LanguageAdapter>(
+    conn: &Connection,
+    oid: Oid,
+    lang: &str,
+    adapter: &A,
+    file: &ProjectFile,
+) -> Result<Option<Vec<(CodeUnit, Range)>>> {
+    if read_summary_projection_meta(conn, &oid.to_string(), lang)?.is_none() {
+        return Ok(None);
+    }
+    let sql = enclosing_declarations_for_file_sql();
+    let oid = oid.to_string();
+    let mut statement = conn.prepare_cached(&sql)?;
+    let mut rows = statement.query(params![oid, lang])?;
+    let mut raw_declarations = Vec::new();
+    while let Some(row) = rows.next()? {
+        let raw = raw_unit_row_from_row(row, 0)?;
+        let range = Range {
+            start_byte: i64_to_usize(row.get(18)?)?,
+            end_byte: i64_to_usize(row.get(19)?)?,
+            start_line: i64_to_usize(row.get(20)?)?,
+            end_line: i64_to_usize(row.get(21)?)?,
+        };
+        raw_declarations.push((raw, range));
+    }
+    drop(rows);
+    drop(statement);
+    let mut raw_units_by_key = HashMap::default();
+    for (raw, _) in &raw_declarations {
+        raw_units_by_key
+            .entry(raw.key)
+            .or_insert_with(|| raw.clone());
+    }
+    let mut unique_raw_units = raw_units_by_key.into_values().collect::<Vec<_>>();
+    attach_raw_unit_fq_segments(
+        conn,
+        lang,
+        std::slice::from_ref(&oid),
+        &mut unique_raw_units,
+    )?;
+    let raw_units_by_key = unique_raw_units
+        .into_iter()
+        .map(|raw| (raw.key, raw))
+        .collect::<HashMap<_, _>>();
+    let mut declarations = Vec::with_capacity(raw_declarations.len());
+    for (raw, range) in raw_declarations {
+        let raw = raw_units_by_key
+            .get(&raw.key)
+            .expect("every declaration range has a unit row");
+        let (fq_name, package_segment_count) =
+            hydrate_unit_fq(adapter, raw.fq.as_ref(), &raw.content_qualifier, file)?;
+        declarations.push((
+            CodeUnit::from_fq(
+                file.clone(),
+                raw.kind,
+                fq_name,
+                package_segment_count,
+                raw.signature.clone(),
+                raw.synthetic,
+            ),
+            range,
+        ));
+    }
+    Ok(Some(declarations))
+}
+
+fn enclosing_declarations_for_file_sql() -> String {
+    let unit_columns = raw_unit_columns_sql("units");
+    format!(
+        "SELECT {unit_columns},
+                ranges.start_byte, ranges.end_byte, ranges.start_line, ranges.end_line
+         FROM code_units AS units
+         CROSS JOIN blob_meta AS meta
+         CROSS JOIN unit_ranges AS ranges
+         WHERE units.blob_oid = meta.blob_oid AND units.lang = meta.lang
+           AND ranges.blob_oid = units.blob_oid
+           AND ranges.lang = units.lang
+           AND ranges.unit_key = units.unit_key
+           AND units.blob_oid = ?1 AND units.lang = ?2 AND units.in_declarations = 1
+           AND {PARSED_BLOB_COMPLETE_CONDITION}
+         ORDER BY units.unit_key, ranges.ordinal"
+    )
 }
 
 fn hydrate_file_states_conn<A: LanguageAdapter>(
@@ -7318,12 +8874,8 @@ fn hydrate_file_states_conn<A: LanguageAdapter>(
         }
         let mut by_key = HashMap::default();
         for raw in raw_units {
-            let (fq, package_segment_count) = hydrate_unit_fq(
-                adapter,
-                raw.fq_segments.as_deref(),
-                &raw.content_qualifier,
-                file,
-            )?;
+            let (fq, package_segment_count) =
+                hydrate_unit_fq(adapter, raw.fq.as_ref(), &raw.content_qualifier, file)?;
             let unit = CodeUnit::from_fq(
                 file.clone(),
                 raw.kind,
@@ -7512,23 +9064,31 @@ fn read_summary_projection_meta(
     lang: &str,
 ) -> Result<Option<SummaryProjectionMeta>> {
     let sql = format!(
-        "SELECT stored_unit_count, range_count, signature_count, child_count
+        "SELECT stored_unit_count, range_count, signature_count, child_count,
+                import_statement_count
          FROM blob_meta AS meta
          WHERE meta.blob_oid = ?1 AND meta.lang = ?2
            AND {PARSED_BLOB_COMPLETE_CONDITION}"
     );
-    let row: Option<(i64, i64, i64, i64)> = conn
+    let row: Option<(i64, i64, i64, i64, i64)> = conn
         .query_row(&sql, params![oid, lang], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
         })
         .optional()?;
     row.map(
-        |(stored_unit_count, range_count, signature_count, child_count)| {
+        |(stored_unit_count, range_count, signature_count, child_count, import_statement_count)| {
             Ok(SummaryProjectionMeta {
                 stored_unit_count: i64_to_usize(stored_unit_count)?,
                 range_count: i64_to_usize(range_count)?,
                 signature_count: i64_to_usize(signature_count)?,
                 child_count: i64_to_usize(child_count)?,
+                import_statement_count: i64_to_usize(import_statement_count)?,
             })
         },
     )
@@ -7757,9 +9317,7 @@ fn read_unit_rows_bulk(
         }
         let placeholders = chunk_placeholders(chunk);
         let sql = format!(
-            "SELECT blob_oid, unit_key, kind, content_qualifier, signature, synthetic,
-                    is_type_alias, top_level_ordinal, in_declarations, in_definition_lookup,
-                    in_test_region, fq_segments
+            "SELECT {RAW_UNIT_COLUMNS}
              FROM code_units
              WHERE lang = ? AND blob_oid IN ({placeholders})
              ORDER BY blob_oid, unit_key"
@@ -7767,37 +9325,21 @@ fn read_unit_rows_bulk(
         let params = chunk_params(lang, chunk);
         let mut stmt = conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
-            let kind_raw = row.get::<_, i64>(2)?;
-            let kind = code_unit_kind_from_i64(kind_raw).map_err(|err| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    2,
-                    rusqlite::types::Type::Integer,
-                    Box::new(err),
-                )
-            })?;
-            Ok((
-                row.get::<_, String>(0)?,
-                RawUnitRow {
-                    key: row.get(1)?,
-                    kind,
-                    content_qualifier: row.get(3)?,
-                    signature: row.get(4)?,
-                    synthetic: row.get::<_, i64>(5)? != 0,
-                    is_type_alias: row.get::<_, i64>(6)? != 0,
-                    top_level_ordinal: row
-                        .get::<_, Option<i64>>(7)?
-                        .and_then(|value| usize::try_from(value).ok()),
-                    in_declarations: row.get::<_, i64>(8)? != 0,
-                    in_definition_lookup: row.get::<_, i64>(9)? != 0,
-                    in_test_region: row.get::<_, i64>(10)? != 0,
-                    fq_segments: row.get::<_, Option<Vec<u8>>>(11)?,
-                },
-            ))
+            let raw = raw_unit_row_from_row(row, 0)?;
+            Ok((raw.blob_oid.to_string(), raw))
         })?;
         for row in rows {
             let (oid, raw) = row?;
             out.entry(oid).or_default().push(raw);
         }
+    }
+    let mut all_rows = out
+        .values_mut()
+        .flat_map(|rows| rows.drain(..))
+        .collect::<Vec<_>>();
+    attach_raw_unit_fq_segments(conn, lang, oids, &mut all_rows)?;
+    for row in all_rows {
+        out.entry(row.blob_oid.to_string()).or_default().push(row);
     }
     Ok(out)
 }
@@ -8442,59 +9984,445 @@ fn count_vec_entries<T>(map: &HashMap<CodeUnit, Vec<T>>) -> usize {
 }
 
 fn candidate_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CandidateRow> {
-    let oid_text = row.get::<_, String>(0)?;
+    candidate_row_from_row_at(row, 0)
+}
+
+fn fq_identity_header_from_row(
+    row: &rusqlite::Row<'_>,
+    base: usize,
+) -> rusqlite::Result<Option<FqIdentityHeader>> {
+    let anchor_kind = row.get::<_, Option<String>>(base)?;
+    let anchor_pop = row.get::<_, Option<i64>>(base + 1)?;
+    let package_tail_segments = row.get::<_, Option<i64>>(base + 2)?;
+    let expected_segment_count = row.get::<_, i64>(base + 3)?;
+    let exact_tail = row.get::<_, Option<String>>(base + 4)?;
+    let expected_segment_bytes = row.get::<_, i64>(base + 5)?;
+    let normalized_tail = row.get::<_, Option<String>>(base + 6)?;
+    let invalid = |message: String| rusqlite_error_from_store(StoreError::new(message));
+
+    if exact_tail.is_none() {
+        if expected_segment_count != 0
+            || anchor_kind.is_some()
+            || anchor_pop.is_some()
+            || package_tail_segments.is_some()
+            || expected_segment_bytes != 0
+            || normalized_tail.is_some()
+        {
+            return Err(invalid(
+                "analyzer store empty FqName row has relational identity metadata".to_string(),
+            ));
+        }
+        return Ok(None);
+    }
+    if expected_segment_count <= 0 {
+        return Err(invalid(format!(
+            "analyzer store non-empty FqName declares invalid segment count {expected_segment_count}"
+        )));
+    }
+    let package_tail_segments = package_tail_segments
+        .ok_or_else(|| invalid("analyzer store FqName is missing its package boundary".to_string()))
+        .and_then(|value| i64_to_usize(value).map_err(rusqlite_error_from_store))?;
+    let expected_segment_count =
+        i64_to_usize(expected_segment_count).map_err(rusqlite_error_from_store)?;
+    let expected_segment_bytes =
+        i64_to_usize(expected_segment_bytes).map_err(rusqlite_error_from_store)?;
+    let anchor = match (anchor_kind.as_deref(), anchor_pop) {
+        (None, None) => None,
+        (Some("own_module"), Some(pop @ 0..=255)) => Some(PackageAnchor::OwnModule {
+            pop: u8::try_from(pop).expect("validated anchor pop fits u8"),
+        }),
+        (Some("crate_root"), Some(0)) => Some(PackageAnchor::CrateRoot),
+        (kind, pop) => {
+            return Err(invalid(format!(
+                "analyzer store FqName has invalid anchor pair ({kind:?}, {pop:?})"
+            )));
+        }
+    };
+    Ok(Some(FqIdentityHeader {
+        anchor,
+        package_tail_segments,
+        expected_segment_count,
+        expected_segment_bytes,
+        exact_tail: exact_tail.expect("non-empty identity has an exact tail"),
+        normalized_tail,
+    }))
+}
+
+pub(super) trait CandidateRowContainer: Sized {
+    type Hydrated;
+
+    fn candidate(&self) -> &CandidateRow;
+    fn with_hydrated_fq(self, fq: Option<RelationalUnitFq>) -> Self::Hydrated;
+}
+
+fn attach_complete_relational_fq(
+    fq: &mut Option<RelationalUnitFq>,
+    segments: Vec<(SegmentKind, String)>,
+    key: &(Oid, String, i64),
+) -> Result<()> {
+    match fq.as_mut() {
+        None => {
+            if !segments.is_empty() {
+                return Err(StoreError::new(format!(
+                    "analyzer store empty FqName has persisted segment rows for {key:?}"
+                )));
+            }
+        }
+        Some(fq) => {
+            if segments.len() != fq.expected_segment_count {
+                return Err(StoreError::new(format!(
+                    "analyzer store FqName expected {} segments but loaded {} for {key:?}",
+                    fq.expected_segment_count,
+                    segments.len()
+                )));
+            }
+            if fq.package_tail_segments >= segments.len() {
+                return Err(StoreError::new(format!(
+                    "analyzer store FqName package boundary {} leaves no declaration tail for {key:?}",
+                    fq.package_tail_segments
+                )));
+            }
+            let loaded_bytes = segments
+                .iter()
+                .map(|(kind, segment)| segment_kind_sql(*kind).len() + segment.len())
+                .sum::<usize>();
+            if loaded_bytes != fq.expected_segment_bytes {
+                return Err(StoreError::new(format!(
+                    "analyzer store FqName expected {} segment bytes but loaded {loaded_bytes} for {key:?}",
+                    fq.expected_segment_bytes
+                )));
+            }
+            fq.segments = segments;
+        }
+    }
+    Ok(())
+}
+
+fn candidate_with_hydrated_fq(
+    row: CandidateRow,
+    fq: Option<RelationalUnitFq>,
+) -> HydratedCandidateRow {
+    CandidateRow {
+        blob_oid: row.blob_oid,
+        lang: row.lang,
+        unit_key: row.unit_key,
+        kind: row.kind,
+        short_name: row.short_name,
+        content_qualifier: row.content_qualifier,
+        signature: row.signature,
+        flags: row.flags,
+        fq,
+    }
+}
+
+impl CandidateRowContainer for CandidateRow {
+    type Hydrated = HydratedCandidateRow;
+
+    fn candidate(&self) -> &CandidateRow {
+        self
+    }
+
+    fn with_hydrated_fq(self, fq: Option<RelationalUnitFq>) -> Self::Hydrated {
+        candidate_with_hydrated_fq(self, fq)
+    }
+}
+
+impl CandidateRowContainer for MountedCandidateRow {
+    type Hydrated = HydratedMountedCandidateRow;
+
+    fn candidate(&self) -> &CandidateRow {
+        &self.candidate
+    }
+
+    fn with_hydrated_fq(self, fq: Option<RelationalUnitFq>) -> Self::Hydrated {
+        MountedCandidateRow {
+            candidate: candidate_with_hydrated_fq(self.candidate, fq),
+            rel_path: self.rel_path,
+        }
+    }
+}
+
+impl CandidateRowContainer for DefinitionOrderCandidateRow {
+    type Hydrated = HydratedDefinitionOrderCandidateRow;
+
+    fn candidate(&self) -> &CandidateRow {
+        &self.candidate
+    }
+
+    fn with_hydrated_fq(self, fq: Option<RelationalUnitFq>) -> Self::Hydrated {
+        DefinitionOrderCandidateRow {
+            candidate: candidate_with_hydrated_fq(self.candidate, fq),
+            first_start_byte: self.first_start_byte,
+            mounted_prefix: self.mounted_prefix,
+        }
+    }
+}
+
+impl CandidateRowContainer for CandidatePrimaryRangeRow {
+    type Hydrated = HydratedCandidatePrimaryRangeRow;
+
+    fn candidate(&self) -> &CandidateRow {
+        &self.candidate
+    }
+
+    fn with_hydrated_fq(self, fq: Option<RelationalUnitFq>) -> Self::Hydrated {
+        CandidatePrimaryRangeRow {
+            candidate: candidate_with_hydrated_fq(self.candidate, fq),
+            primary_range: self.primary_range,
+        }
+    }
+}
+
+impl CandidateRowContainer for SearchCandidateRow {
+    type Hydrated = HydratedSearchCandidateRow;
+
+    fn candidate(&self) -> &CandidateRow {
+        &self.candidate
+    }
+
+    fn with_hydrated_fq(self, fq: Option<RelationalUnitFq>) -> Self::Hydrated {
+        SearchCandidateRow {
+            candidate: candidate_with_hydrated_fq(self.candidate, fq),
+            primary_range: self.primary_range,
+            in_test_region: self.in_test_region,
+        }
+    }
+}
+
+impl CandidateRowContainer for UsageFactRow {
+    type Hydrated = HydratedUsageFactRow;
+
+    fn candidate(&self) -> &CandidateRow {
+        &self.candidate
+    }
+
+    fn with_hydrated_fq(self, fq: Option<RelationalUnitFq>) -> Self::Hydrated {
+        UsageFactRow {
+            candidate: candidate_with_hydrated_fq(self.candidate, fq),
+            signature: self.signature,
+            signature_metadata: self.signature_metadata,
+        }
+    }
+}
+
+impl<T> CandidateRowContainer for (CandidateRow, T) {
+    type Hydrated = (HydratedCandidateRow, T);
+
+    fn candidate(&self) -> &CandidateRow {
+        &self.0
+    }
+
+    fn with_hydrated_fq(self, fq: Option<RelationalUnitFq>) -> Self::Hydrated {
+        (candidate_with_hydrated_fq(self.0, fq), self.1)
+    }
+}
+
+fn padded_candidate_key_arity(len: usize) -> usize {
+    const LADDER: [usize; 5] = [1, 16, 64, 256, 400];
+    LADDER
+        .iter()
+        .copied()
+        .find(|&arity| arity >= len)
+        .unwrap_or(LADDER[LADDER.len() - 1])
+}
+
+fn candidate_fq_segments_sql(padded_arity: usize) -> String {
+    let values = std::iter::repeat_n("(?, ?, ?, ?)", padded_arity)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "WITH requested(request_ordinal, blob_oid, lang, unit_key) AS (VALUES {values})
+         SELECT requested.request_ordinal, segments.seg_ordinal,
+                segments.seg_kind, segments.segment
+         FROM requested
+         JOIN code_unit_fq_segments AS segments
+           ON segments.blob_oid = requested.blob_oid
+          AND segments.lang = requested.lang
+          AND segments.unit_key = requested.unit_key"
+    )
+}
+
+/// Load complete ordered relational identities for a candidate batch.
+///
+/// The function does not mutate candidates until every requested segment has
+/// been read and validated, so cancellation or corruption cannot expose a
+/// partly hydrated identity. A point request is this same path with arity one.
+pub(super) fn hydrate_candidate_rows<T: CandidateRowContainer>(
+    conn: &Connection,
+    rows: Vec<T>,
+    cancellation: Option<&CancellationToken>,
+) -> Result<Option<Vec<T::Hydrated>>> {
+    let mut unique_keys = Vec::with_capacity(rows.len());
+    let mut key_indices = HashMap::default();
+    let mut remaining_uses = Vec::new();
+    for row in &rows {
+        let candidate = row.candidate();
+        let key = (
+            candidate.blob_oid,
+            candidate.lang.clone(),
+            candidate.unit_key,
+        );
+        if let Some(index) = key_indices.get(&key).copied() {
+            remaining_uses[index] += 1;
+        } else {
+            let index = unique_keys.len();
+            key_indices.insert(key.clone(), index);
+            unique_keys.push(key);
+            remaining_uses.push(1usize);
+        }
+    }
+
+    let mut loaded: Vec<Vec<(usize, SegmentKind, String)>> =
+        (0..unique_keys.len()).map(|_| Vec::new()).collect();
+    let mut inspected_segments = 0usize;
+    for (chunk_index, chunk) in unique_keys.chunks(400).enumerate() {
+        let chunk_start = chunk_index * 400;
+        let padded = padded_candidate_key_arity(chunk.len());
+        let sql = candidate_fq_segments_sql(padded);
+        let mut parameters = Vec::with_capacity(padded * 4);
+        for (offset, (oid, lang, unit_key)) in chunk.iter().enumerate() {
+            parameters.push(rusqlite::types::Value::Integer(
+                i64::try_from(offset).expect("candidate chunk ordinal fits i64"),
+            ));
+            parameters.push(rusqlite::types::Value::Text(oid.to_string()));
+            parameters.push(rusqlite::types::Value::Text(lang.clone()));
+            parameters.push(rusqlite::types::Value::Integer(*unit_key));
+        }
+        parameters.resize(padded * 4, rusqlite::types::Value::Null);
+        let mut statement = conn.prepare_cached(&sql)?;
+        let mut query = statement.query(params_from_iter(parameters.iter()))?;
+        while let Some(row) = query.next()? {
+            inspected_segments = inspected_segments.saturating_add(1);
+            if inspected_segments.is_multiple_of(CANDIDATE_ROWS_PER_CANCELLATION_POLL)
+                && cancellation.is_some_and(CancellationToken::is_cancelled)
+            {
+                return Ok(None);
+            }
+            let request_ordinal = i64_to_usize(row.get::<_, i64>(0)?)?;
+            let loaded_index = chunk_start + request_ordinal;
+            let segments = loaded.get_mut(loaded_index).ok_or_else(|| {
+                StoreError::new(format!(
+                    "analyzer store returned invalid FqName request ordinal {request_ordinal} for chunk of {}",
+                    chunk.len()
+                ))
+            })?;
+            let ordinal = i64_to_usize(row.get::<_, i64>(1)?)?;
+            let kind_text = row.get::<_, String>(2)?;
+            let segment = row.get::<_, String>(3)?;
+            segments.push((ordinal, segment_kind_from_sql(&kind_text)?, segment));
+        }
+    }
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return Ok(None);
+    }
+
+    let mut loaded: Vec<Vec<(SegmentKind, String)>> = loaded
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut segments)| {
+            segments.sort_unstable_by_key(|(ordinal, _, _)| *ordinal);
+            for (expected, (ordinal, _, _)) in segments.iter().enumerate() {
+                if *ordinal != expected {
+                    return Err(StoreError::new(format!(
+                        "analyzer store FqName segments are not dense: expected ordinal {expected}, got {ordinal} for {:?}",
+                        unique_keys[index]
+                    )));
+                }
+            }
+            Ok(segments
+                .into_iter()
+                .map(|(_, kind, segment)| (kind, segment))
+                .collect())
+        })
+        .collect::<Result<_>>()?;
+
+    let mut hydrated = Vec::with_capacity(rows.len());
+    for row in rows {
+        let candidate = row.candidate();
+        let key = (
+            candidate.blob_oid,
+            candidate.lang.clone(),
+            candidate.unit_key,
+        );
+        let index = *key_indices
+            .get(&key)
+            .expect("every candidate key was indexed before segment loading");
+        remaining_uses[index] -= 1;
+        let segments = if remaining_uses[index] == 0 {
+            std::mem::take(&mut loaded[index])
+        } else {
+            loaded[index].clone()
+        };
+        let mut fq = candidate.fq.clone().map(RelationalUnitFq::from_header);
+        attach_complete_relational_fq(&mut fq, segments, &key)?;
+        hydrated.push(row.with_hydrated_fq(fq));
+    }
+    Ok(Some(hydrated))
+}
+
+fn candidate_row_from_row_at(
+    row: &rusqlite::Row<'_>,
+    base: usize,
+) -> rusqlite::Result<CandidateRow> {
+    let oid_text = row.get::<_, String>(base)?;
     let blob_oid = Oid::from_str(&oid_text).map_err(|err| {
-        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
+        rusqlite::Error::FromSqlConversionFailure(base, rusqlite::types::Type::Text, Box::new(err))
     })?;
-    let kind_raw = row.get::<_, i64>(3)?;
+    let kind_raw = row.get::<_, i64>(base + 3)?;
     let kind = code_unit_kind_from_i64(kind_raw).map_err(|err| {
-        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Integer, Box::new(err))
+        rusqlite::Error::FromSqlConversionFailure(
+            base + 3,
+            rusqlite::types::Type::Integer,
+            Box::new(err),
+        )
     })?;
     Ok(CandidateRow {
         blob_oid,
-        lang: row.get(1)?,
-        unit_key: row.get(2)?,
+        lang: row.get(base + 1)?,
+        unit_key: row.get(base + 2)?,
         kind,
-        short_name: row.get(4)?,
-        content_qualifier: row.get(5)?,
-        signature: row.get(6)?,
+        short_name: row.get(base + 4)?,
+        content_qualifier: row.get(base + 5)?,
+        signature: row.get(base + 6)?,
         flags: CandidateFlags {
-            synthetic: row.get::<_, i64>(7)? != 0,
-            is_type_alias: row.get::<_, i64>(8)? != 0,
-            is_top_level: row.get::<_, Option<i64>>(9)?.is_some(),
-            in_declarations: row.get::<_, i64>(10)? != 0,
-            in_definition_lookup: row.get::<_, i64>(11)? != 0,
+            synthetic: row.get::<_, i64>(base + 7)? != 0,
+            is_type_alias: row.get::<_, i64>(base + 8)? != 0,
+            is_top_level: row.get::<_, Option<i64>>(base + 9)?.is_some(),
+            in_declarations: row.get::<_, i64>(base + 10)? != 0,
+            in_definition_lookup: row.get::<_, i64>(base + 11)? != 0,
         },
-        // Every candidate projection selects `fq_segments` at index 12, directly
-        // after `in_definition_lookup`; any extra per-query columns follow at 13+.
-        fq_segments: row.get::<_, Option<Vec<u8>>>(12)?,
+        // Every candidate projection selects the seven-column relational FQ
+        // header at 12..=18; any per-query columns follow at 19+.
+        fq: fq_identity_header_from_row(row, base + 12)?,
     })
 }
 
+#[cfg(test)]
 fn definition_order_candidate_row_from_row(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<DefinitionOrderCandidateRow> {
-    // `fq_segments` occupies index 12; the definition-order extra column follows.
+    // The relational FQ header occupies 12..=18.
     let first_start_byte = row
-        .get::<_, Option<i64>>(13)?
+        .get::<_, Option<i64>>(19)?
         .map(i64_to_usize)
         .transpose()
         .map_err(rusqlite_error_from_store)?;
     Ok(DefinitionOrderCandidateRow {
         candidate: candidate_row_from_row(row)?,
         first_start_byte,
+        mounted_prefix: row.get(20)?,
     })
 }
 
 fn candidate_primary_range_row_from_row(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<CandidatePrimaryRangeRow> {
-    // `fq_segments` occupies index 12; the primary-range columns follow at 13-16.
+    // The relational FQ header occupies 12..=18; the range follows at 19..=22.
     let primary_range = match (
-        row.get::<_, Option<i64>>(13)?,
-        row.get::<_, Option<i64>>(14)?,
-        row.get::<_, Option<i64>>(15)?,
-        row.get::<_, Option<i64>>(16)?,
+        row.get::<_, Option<i64>>(19)?,
+        row.get::<_, Option<i64>>(20)?,
+        row.get::<_, Option<i64>>(21)?,
+        row.get::<_, Option<i64>>(22)?,
     ) {
         (Some(start_byte), Some(end_byte), Some(start_line), Some(end_line)) => Some(Range {
             start_byte: i64_to_usize(start_byte).map_err(rusqlite_error_from_store)?,
@@ -8524,31 +10452,31 @@ where
 }
 
 fn usage_fact_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageFactRow> {
-    // `fq_segments` occupies index 12, the unit's first signature text 13, and
-    // the outer-joined signature-metadata columns 14 onward. `label` is NOT
+    // The relational FQ header occupies 12..=18, the unit's first signature
+    // text is 19, and signature-metadata columns start at 20. `label` is NOT
     // NULL in the table, so a NULL there is the join missing, not a row with
     // no label.
     let metadata = row
-        .get::<_, Option<String>>(14)?
+        .get::<_, Option<String>>(20)?
         .is_some()
-        .then(|| signature_metadata_from_row(row, 14))
+        .then(|| signature_metadata_from_row(row, 20))
         .transpose()?;
     Ok(UsageFactRow {
         candidate: candidate_row_from_row(row)?,
-        signature: row.get(13)?,
+        signature: row.get(19)?,
         signature_metadata: metadata,
     })
 }
 
 fn search_candidate_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SearchCandidateRow> {
     let candidate = candidate_row_from_row(row)?;
-    // `fq_segments` occupies index 12; `in_test_region` moves to 13 and the
-    // primary-range columns to 14-17.
+    // The relational FQ header occupies 12..=18; `in_test_region` is 19 and
+    // the primary-range columns are 20..=23.
     let primary_range = match (
-        row.get::<_, Option<i64>>(14)?,
-        row.get::<_, Option<i64>>(15)?,
-        row.get::<_, Option<i64>>(16)?,
-        row.get::<_, Option<i64>>(17)?,
+        row.get::<_, Option<i64>>(20)?,
+        row.get::<_, Option<i64>>(21)?,
+        row.get::<_, Option<i64>>(22)?,
+        row.get::<_, Option<i64>>(23)?,
     ) {
         (Some(start_byte), Some(end_byte), Some(start_line), Some(end_line)) => Some(Range {
             start_byte: i64_to_usize(start_byte).map_err(rusqlite_error_from_store)?,
@@ -8561,7 +10489,7 @@ fn search_candidate_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Se
     Ok(SearchCandidateRow {
         candidate,
         primary_range,
-        in_test_region: row.get::<_, i64>(13)? != 0,
+        in_test_region: row.get::<_, i64>(19)? != 0,
     })
 }
 
@@ -8594,7 +10522,10 @@ fn search_candidate_sql(predicate: &str) -> String {
         "SELECT units.blob_oid, units.lang, units.unit_key, units.kind, units.short_name,
                 units.content_qualifier, units.signature, units.synthetic,
                 units.is_type_alias, units.top_level_ordinal, units.in_declarations,
-                units.in_definition_lookup, units.fq_segments, units.in_test_region,
+                units.in_definition_lookup, units.fq_anchor_kind, units.fq_anchor_pop,
+                units.fq_package_tail_segments, units.fq_segment_count,
+                units.exact_fqn_tail, units.fq_segment_bytes,
+                units.normalized_fqn_tail, units.in_test_region,
                 primary_range.start_byte, primary_range.end_byte,
                 primary_range.start_line, primary_range.end_line
          FROM code_units AS units
@@ -8613,7 +10544,7 @@ fn search_candidate_sql(predicate: &str) -> String {
 fn search_candidate_rows_by_lang_conn(
     conn: &Connection,
     lang: &str,
-) -> Result<Vec<SearchCandidateRow>> {
+) -> Result<Vec<HydratedSearchCandidateRow>> {
     let sql = format!(
         "{} ORDER BY units.blob_oid, units.unit_key",
         search_candidate_sql("units.lang = ?1")
@@ -8624,7 +10555,8 @@ fn search_candidate_rows_by_lang_conn(
     while let Some(row) = query.next()? {
         rows.push(search_candidate_row_from_row(row)?);
     }
-    Ok(rows)
+    Ok(hydrate_candidate_rows(conn, rows, None)?
+        .expect("uncancelled search-candidate hydration completes"))
 }
 
 /// The `LIKE` operand that holds when a column contains `literal`, with the
@@ -8806,13 +10738,70 @@ fn sync_active_blob_oids(conn: &Connection, active_blobs: &[ActiveSearchBlob]) -
     Ok(())
 }
 
-fn usage_fact_rows_by_lang_conn(conn: &Connection, lang: &str) -> Result<Vec<UsageFactRow>> {
+const REVERSE_IMPORT_CANDIDATE_BLOBS_SQL: &str = "SELECT segments.blob_oid
+     FROM temp.reverse_import_lookup_keys AS requested
+     CROSS JOIN import_path_segments AS segments
+       INDEXED BY idx_import_path_segments_by_segment
+       ON segments.lang = ?1 AND segments.segment = requested.value
+     JOIN temp.active_blob_oids AS active ON active.blob_oid = segments.blob_oid
+     JOIN import_statements AS imports
+       ON imports.blob_oid = segments.blob_oid
+      AND imports.lang = segments.lang
+      AND imports.ordinal = segments.ordinal
+     WHERE requested.kind IN (0, 1)
+       AND imports.is_wildcard = requested.kind
+       AND imports.path_kind IS NOT 'static_member'";
+
+const REVERSE_TYPE_CANDIDATE_BLOBS_SQL: &str = "SELECT identifiers.blob_oid
+     FROM temp.reverse_import_lookup_keys AS requested
+     CROSS JOIN type_identifiers AS identifiers
+       INDEXED BY idx_type_identifiers_by_identifier
+       ON identifiers.lang = ?1 AND identifiers.type_identifier = requested.value
+     JOIN temp.active_blob_oids AS active ON active.blob_oid = identifiers.blob_oid
+     WHERE requested.kind = 2";
+
+fn sync_reverse_reference_lookup_keys(
+    conn: &Connection,
+    explicit_import_segments: &HashSet<String>,
+    wildcard_import_segments: &HashSet<String>,
+    type_identifiers: &HashSet<String>,
+) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS reverse_import_lookup_keys(
+           kind INTEGER NOT NULL CHECK(kind BETWEEN 0 AND 2),
+           value TEXT NOT NULL,
+           PRIMARY KEY(kind, value)
+         ) WITHOUT ROWID, STRICT;
+         DELETE FROM temp.reverse_import_lookup_keys;",
+    )?;
+    let mut statement = conn.prepare_cached(
+        "INSERT OR IGNORE INTO temp.reverse_import_lookup_keys(kind, value) VALUES(?1, ?2)",
+    )?;
+    for (kind, values) in [
+        (0_i64, explicit_import_segments),
+        (1_i64, wildcard_import_segments),
+        (2_i64, type_identifiers),
+    ] {
+        for value in values {
+            statement.execute(params![kind, value])?;
+        }
+    }
+    Ok(())
+}
+
+fn usage_fact_rows_by_lang_conn(
+    conn: &Connection,
+    lang: &str,
+) -> Result<Vec<HydratedUsageFactRow>> {
     let metadata_columns = signature_metadata_value_columns_sql("metadata");
     let sql = format!(
         "SELECT units.blob_oid, units.lang, units.unit_key, units.kind, units.short_name,
                 units.content_qualifier, units.signature, units.synthetic,
                 units.is_type_alias, units.top_level_ordinal, units.in_declarations,
-                units.in_definition_lookup, units.fq_segments, signature.text,
+                units.in_definition_lookup, units.fq_anchor_kind, units.fq_anchor_pop,
+                units.fq_package_tail_segments, units.fq_segment_count,
+                units.exact_fqn_tail, units.fq_segment_bytes,
+                units.normalized_fqn_tail, signature.text,
                 {metadata_columns}
          FROM code_units AS units
          JOIN blob_meta AS meta
@@ -8832,7 +10821,10 @@ fn usage_fact_rows_by_lang_conn(conn: &Connection, lang: &str) -> Result<Vec<Usa
          ORDER BY units.blob_oid, units.unit_key"
     );
     let mut stmt = conn.prepare_cached(&sql)?;
-    collect_usage_fact_rows(stmt.query_map([lang], usage_fact_row_from_row)?)
+    let rows = collect_usage_fact_rows(stmt.query_map([lang], usage_fact_row_from_row)?)?;
+    drop(stmt);
+    Ok(hydrate_candidate_rows(conn, rows, None)?
+        .expect("uncancelled usage-fact hydration completes"))
 }
 
 fn primary_ranges_by_unit_for_lang_conn(
@@ -8894,7 +10886,7 @@ fn definition_lookup_candidate_rows_by_oids_conn(
     conn: &Connection,
     lang: &str,
     oids: &[Oid],
-) -> Result<Vec<CandidateRow>> {
+) -> Result<Vec<HydratedCandidateRow>> {
     let mut out = Vec::new();
     for chunk in oids.chunks(900) {
         if chunk.is_empty() {
@@ -8907,7 +10899,10 @@ fn definition_lookup_candidate_rows_by_oids_conn(
             "SELECT units.blob_oid, units.lang, units.unit_key, units.kind, units.short_name,
                     units.content_qualifier, units.signature, units.synthetic,
                     units.is_type_alias, units.top_level_ordinal, units.in_declarations,
-                    units.in_definition_lookup, units.fq_segments
+                    units.in_definition_lookup, units.fq_anchor_kind, units.fq_anchor_pop,
+                    units.fq_package_tail_segments, units.fq_segment_count,
+                    units.exact_fqn_tail, units.fq_segment_bytes,
+                    units.normalized_fqn_tail
              FROM code_units AS units
              JOIN blob_meta AS meta
                ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
@@ -8926,7 +10921,8 @@ fn definition_lookup_candidate_rows_by_oids_conn(
             candidate_row_from_row,
         )?)?);
     }
-    Ok(out)
+    Ok(hydrate_candidate_rows(conn, out, None)?
+        .expect("uncancelled definition-candidate hydration completes"))
 }
 
 fn blobs_with_structured_imports_conn(
@@ -8978,77 +10974,38 @@ fn read_unit_rows<A: LanguageAdapter>(
     adapter: &A,
     file: &ProjectFile,
 ) -> Result<Vec<UnitRow>> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT unit_key, kind, content_qualifier, signature, synthetic,
-                is_type_alias, top_level_ordinal, in_declarations, in_definition_lookup,
-                in_test_region, fq_segments
+    let sql = format!(
+        "SELECT {RAW_UNIT_COLUMNS}
          FROM code_units
          WHERE blob_oid = ?1 AND lang = ?2
-         ORDER BY unit_key",
-    )?;
-    let rows = stmt.query_map(params![oid, lang], |row| {
-        let key = row.get::<_, i64>(0)?;
-        let kind_raw = row.get::<_, i64>(1)?;
-        let content_qualifier = row.get::<_, String>(2)?;
-        let signature = row.get::<_, Option<String>>(3)?;
-        let synthetic = row.get::<_, i64>(4)? != 0;
-        let is_type_alias = row.get::<_, i64>(5)? != 0;
-        let top_level_ordinal = row
-            .get::<_, Option<i64>>(6)?
-            .and_then(|value| usize::try_from(value).ok());
-        let in_declarations = row.get::<_, i64>(7)? != 0;
-        let in_definition_lookup = row.get::<_, i64>(8)? != 0;
-        let in_test_region = row.get::<_, i64>(9)? != 0;
-        let fq_segments = row.get::<_, Option<Vec<u8>>>(10)?;
-        Ok((
-            key,
-            kind_raw,
-            content_qualifier,
-            signature,
-            synthetic,
-            is_type_alias,
-            top_level_ordinal,
-            in_declarations,
-            in_definition_lookup,
-            in_test_region,
-            fq_segments,
-        ))
-    })?;
+         ORDER BY unit_key"
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let mapped = stmt.query_map(params![oid, lang], |row| raw_unit_row_from_row(row, 0))?;
+    let mut rows = mapped.collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+    attach_raw_unit_fq_segments(conn, lang, &[oid.to_string()], &mut rows)?;
 
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(rows.len());
     for row in rows {
-        let (
-            key,
-            kind_raw,
-            content_qualifier,
-            signature,
-            synthetic,
-            is_type_alias,
-            top_level_ordinal,
-            in_declarations,
-            in_definition_lookup,
-            in_test_region,
-            fq_segments,
-        ) = row?;
-        let kind = code_unit_kind_from_i64(kind_raw)?;
         let (fq, package_segment_count) =
-            hydrate_unit_fq(adapter, fq_segments.as_deref(), &content_qualifier, file)?;
+            hydrate_unit_fq(adapter, row.fq.as_ref(), &row.content_qualifier, file)?;
         let unit = CodeUnit::from_fq(
             file.clone(),
-            kind,
+            row.kind,
             fq,
             package_segment_count,
-            signature,
-            synthetic,
+            row.signature,
+            row.synthetic,
         );
         out.push(UnitRow {
-            key,
+            key: row.key,
             unit,
-            is_type_alias,
-            top_level_ordinal,
-            in_declarations,
-            in_definition_lookup,
-            in_test_region,
+            is_type_alias: row.is_type_alias,
+            top_level_ordinal: row.top_level_ordinal,
+            in_declarations: row.in_declarations,
+            in_definition_lookup: row.in_definition_lookup,
+            in_test_region: row.in_test_region,
         });
     }
     Ok(out)
@@ -9072,40 +11029,6 @@ fn read_import_infos(conn: &Connection, oid: &str, lang: &str) -> Result<Vec<Imp
     by_oid.insert(oid.to_string(), imports);
     attach_import_path_children(conn, lang, &[oid.to_string()], &mut by_oid)?;
     Ok(by_oid.remove(oid).unwrap_or_default())
-}
-
-fn insert_materialization_records(
-    tx: &Transaction<'_>,
-    oid: &str,
-    lang: &str,
-    unit_keys: &HashMap<CodeUnit, i64>,
-    records: &[MaterializationRecord],
-) -> Result<usize> {
-    let mut stmt = tx.prepare(
-        "INSERT OR IGNORE INTO materialization_records(
-           blob_oid, lang, ordinal, unit_key, payload
-         ) VALUES(?1, ?2, ?3, ?4, ?5)",
-    )?;
-    let mut count = 0;
-    for (ordinal, record) in records.iter().enumerate() {
-        let (unit, payload) = record.split();
-        let unit_key = match unit {
-            Some(unit) => match unit_keys.get(unit) {
-                Some(&key) => Some(key),
-                None => continue,
-            },
-            None => None,
-        };
-        stmt.execute(params![
-            oid,
-            lang,
-            usize_to_i64(ordinal)?,
-            unit_key,
-            serialize_blob(&payload)?,
-        ])?;
-        count += 1;
-    }
-    Ok(count)
 }
 
 fn read_materialization_records(
@@ -9221,10 +11144,50 @@ fn direct_children_for_unit_limited_conn(
     lang: &str,
     unit: &CodeUnit,
     limit: usize,
-) -> Result<LimitedQueryRows<CandidateRow>> {
+) -> Result<LimitedQueryRows<HydratedCandidateRow>> {
     if limit == 0 {
         return Ok(LimitedQueryRows::incomplete(Vec::new(), 0));
     }
+    let sql = direct_children_limited_candidate_sql();
+    let oid = oid.to_string();
+    let kind = code_unit_kind_to_i64(unit.kind());
+    let synthetic = bool_to_i64(unit.is_synthetic());
+    let sql_limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let mut statement = conn.prepare_cached(&sql)?;
+    let mut query = statement.query(params![
+        oid,
+        lang,
+        unit.fq_name(),
+        kind,
+        unit.short_name(),
+        unit.signature(),
+        synthetic,
+        sql_limit,
+    ])?;
+    let mut rows = Vec::new();
+    let mut inspected = 0usize;
+    let mut bytes = LimitedQueryByteBudget::default();
+    let mut complete = true;
+    while let Some(row) = query.next()? {
+        inspected = inspected.saturating_add(1);
+        // The relational FQ header occupies 12..=18; row bytes follow.
+        if !bytes.admit_sqlite_bytes(row.get::<_, i64>(19)?)? {
+            complete = false;
+            break;
+        }
+        rows.push(candidate_row_from_row(row)?);
+    }
+    drop(query);
+    let rows = hydrate_candidate_rows(conn, rows, None)?
+        .expect("uncancelled direct-child hydration completes");
+    if !complete || inspected == limit {
+        Ok(LimitedQueryRows::incomplete(rows, inspected))
+    } else {
+        Ok(LimitedQueryRows::complete(rows, inspected))
+    }
+}
+
+fn direct_children_limited_candidate_sql() -> String {
     let sql = limited_candidate_rows_sql_with_membership(
         "child",
         "FROM code_units AS owner
@@ -9247,41 +11210,9 @@ fn direct_children_for_unit_limited_conn(
          AND owner.signature IS ?6
          AND owner.synthetic = ?7",
         "owner.in_declarations = 1 AND child.in_declarations = 1",
-        "edge.ordinal, child.unit_key",
+        &["edge.ordinal", "child.unit_key"],
     );
-    let sql = format!("{sql} LIMIT ?8");
-    let oid = oid.to_string();
-    let kind = code_unit_kind_to_i64(unit.kind());
-    let synthetic = bool_to_i64(unit.is_synthetic());
-    let sql_limit = i64::try_from(limit).unwrap_or(i64::MAX);
-    let mut statement = conn.prepare_cached(&sql)?;
-    let mut query = statement.query(params![
-        oid,
-        lang,
-        unit.fq_name(),
-        kind,
-        unit.short_name(),
-        unit.signature(),
-        synthetic,
-        sql_limit,
-    ])?;
-    let mut rows = Vec::new();
-    let mut inspected = 0usize;
-    let mut bytes = LimitedQueryByteBudget::default();
-    while let Some(row) = query.next()? {
-        inspected = inspected.saturating_add(1);
-        // `fq_segments` occupies index 12; the row-byte budget column follows.
-        if !bytes.admit_sqlite_bytes(row.get::<_, i64>(13)?)? {
-            return Ok(LimitedQueryRows::incomplete(rows, inspected));
-        }
-        rows.push(candidate_row_from_row(row)?);
-    }
-    drop(query);
-    if inspected == limit {
-        Ok(LimitedQueryRows::incomplete(rows, inspected))
-    } else {
-        Ok(LimitedQueryRows::complete(rows, inspected))
-    }
+    format!("{sql} LIMIT ?8")
 }
 
 /// The bounded per-unit signature-metadata read. Named so a plan pin can
@@ -9831,32 +11762,12 @@ fn ensure_language_epochs_tx(
     conn: &mut Connection,
     entries: &[(String, String)],
 ) -> Result<HashMap<String, GenerationId>> {
-    let mut generations = HashMap::default();
-    let mut all_match = true;
-    for (lang, analysis_epoch) in entries {
-        let stored: Option<(String, i64)> = conn
-            .query_row(
-                "SELECT epoch, generation FROM analysis_epochs WHERE lang = ?1",
-                [lang],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        match stored {
-            Some((stored_epoch, generation)) if stored_epoch == *analysis_epoch => {
-                generations.insert(lang.clone(), GenerationId(generation));
-            }
-            _ => {
-                all_match = false;
-                break;
-            }
-        }
-    }
-    if all_match {
+    if let Some(generations) = matching_language_epochs_conn(conn, entries)? {
         return Ok(generations);
     }
 
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    generations.clear();
+    let mut generations = HashMap::default();
     for (lang, analysis_epoch) in entries {
         let stored_epoch: Option<String> = tx
             .query_row(
@@ -9889,6 +11800,30 @@ fn ensure_language_epochs_tx(
     }
     tx.commit()?;
     Ok(generations)
+}
+
+fn matching_language_epochs_conn(
+    conn: &Connection,
+    entries: &[(String, String)],
+) -> Result<Option<HashMap<String, GenerationId>>> {
+    let mut generations = HashMap::default();
+    for (lang, analysis_epoch) in entries {
+        let stored: Option<(String, i64)> = conn
+            .query_row(
+                "SELECT epoch, generation FROM analysis_epochs WHERE lang = ?1",
+                [lang],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((stored_epoch, generation)) = stored else {
+            return Ok(None);
+        };
+        if stored_epoch != *analysis_epoch {
+            return Ok(None);
+        }
+        generations.insert(lang.clone(), GenerationId(generation));
+    }
+    Ok(Some(generations))
 }
 
 fn require_current_generation(
@@ -10049,6 +11984,12 @@ fn stored_blob_cascade_costs_sql(key_count: usize) -> String {
                + meta.signature_metadata_count
                + meta.supertype_count + meta.child_count
                + meta.import_statement_count + meta.type_identifier_count
+               + (SELECT COUNT(*) FROM code_unit_fq_segments AS fq_segments
+                  WHERE fq_segments.blob_oid = meta.blob_oid
+                    AND fq_segments.lang = meta.lang)
+               + (SELECT COUNT(*) FROM unit_visibility_containers AS visibility
+                  WHERE visibility.blob_oid = meta.blob_oid
+                    AND visibility.lang = meta.lang)
                + (SELECT COUNT(*) FROM import_path_segments AS segments
                   WHERE segments.blob_oid = meta.blob_oid AND segments.lang = meta.lang)
                + (SELECT COUNT(*) FROM import_lexical_scopes AS scopes
@@ -10101,6 +12042,12 @@ fn persisted_blob_mutation_cost_fallback_sql() -> &'static str {
            + meta.signature_metadata_count
            + meta.supertype_count + meta.child_count
            + meta.import_statement_count + meta.type_identifier_count
+           + (SELECT COUNT(*) FROM code_unit_fq_segments AS fq_segments
+              WHERE fq_segments.blob_oid = meta.blob_oid
+                AND fq_segments.lang = meta.lang)
+           + (SELECT COUNT(*) FROM unit_visibility_containers AS visibility
+              WHERE visibility.blob_oid = meta.blob_oid
+                AND visibility.lang = meta.lang)
            + (SELECT COUNT(*) FROM import_path_segments AS segments
               WHERE segments.blob_oid = meta.blob_oid AND segments.lang = meta.lang)
            + (SELECT COUNT(*) FROM import_lexical_scopes AS scopes
@@ -10121,7 +12068,20 @@ fn persisted_blob_mutation_cost_fallback_sql() -> &'static str {
                + COALESCE(length(CAST(normalized_fqn AS BLOB)), 0)
                + COALESCE(length(CAST(simple_type_name AS BLOB)), 0)
                + COALESCE(length(CAST(signature AS BLOB)), 0)
+               + COALESCE(length(CAST(fq_anchor_kind AS BLOB)), 0)
+               + COALESCE(length(CAST(exact_fqn_tail AS BLOB)), 0)
+               + COALESCE(length(CAST(normalized_fqn_tail AS BLOB)), 0)
+               + COALESCE(length(CAST(exact_parent_fqn_tail AS BLOB)), 0)
+               + COALESCE(length(CAST(normalized_parent_fqn_tail AS BLOB)), 0)
+               + COALESCE(length(CAST(package_fqn_tail AS BLOB)), 0)
              ) FROM code_units WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
+           + COALESCE((SELECT SUM(length(CAST(seg_kind AS BLOB))
+               + length(CAST(segment AS BLOB))) FROM code_unit_fq_segments
+               WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
+           + COALESCE((SELECT SUM(length(CAST(exact_container_tail AS BLOB))
+               + COALESCE(length(CAST(normalized_container_tail AS BLOB)), 0))
+               FROM unit_visibility_containers
+               WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
            + COALESCE((SELECT SUM(length(CAST(text AS BLOB))) FROM unit_signatures
                WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
            + COALESCE((SELECT SUM({signature_metadata_bytes}) FROM unit_signature_metadata
@@ -10427,13 +12387,13 @@ fn reclaim_stale_generations_conn(conn: &mut Connection, max_logical_rows: usize
     }
     if remaining > 0 {
         reclaimed = reclaimed.saturating_add(tx.execute(
-            "DELETE FROM path_symbol_snapshots
-             WHERE lang IN (
-               SELECT snapshots.lang
-               FROM path_symbol_snapshots AS snapshots
+            "DELETE FROM workspace_snapshots
+             WHERE (lang, generation) IN (
+               SELECT snapshots.lang, snapshots.generation
+               FROM workspace_snapshots AS snapshots
                LEFT JOIN analysis_epochs AS epochs ON epochs.lang = snapshots.lang
                WHERE snapshots.generation <> COALESCE(epochs.generation, 0)
-               ORDER BY snapshots.lang
+               ORDER BY snapshots.lang, snapshots.generation
                LIMIT ?1
              )",
             [usize_to_i64(remaining)?],
@@ -10448,46 +12408,62 @@ fn serialize_blob<T: serde::Serialize>(value: &T) -> Result<Vec<u8>> {
         .map_err(|err| StoreError::new(format!("analyzer store serialization error: {err}")))
 }
 
-const FQ_SEGMENTS_MAGIC: &[u8; 4] = b"FQ2\0";
-const FQ_SEGMENTS_FULL: u8 = 0;
-const FQ_SEGMENTS_OWN_MODULE: u8 = 1;
-const FQ_SEGMENTS_CRATE_ROOT: u8 = 2;
-const FQ_SEGMENTS_HEADER_LEN: usize = 9;
-
-/// Pack the mode-dependent u32 header field for an anchored row.
-///
-/// Mode `FULL` reads that field as an absolute package segment count. The
-/// anchored modes read it as `{u16 boundary_in_tail, u8 pop, u8 reserved}`,
-/// little endian. Rows written before anchors existed always stored a literal
-/// `0`, which decodes as `boundary_in_tail = 0, pop = 0` — exactly the
-/// semantics they were written with, so they hydrate unchanged and their
-/// languages need no epoch bump.
-fn pack_anchored_header(boundary_in_tail: u16, pop: u8) -> u32 {
-    u32::from(boundary_in_tail) | (u32::from(pop) << 16)
+struct PersistedUnitFq {
+    anchor: Option<PackageAnchor>,
+    package_tail_segments: usize,
+    tail: FqName,
 }
 
-fn unpack_anchored_header(field: u32) -> (u16, u8) {
-    ((field & 0xffff) as u16, ((field >> 16) & 0xff) as u8)
+#[derive(Debug)]
+struct PreparedUnitFq {
+    anchor_kind: Option<&'static str>,
+    anchor_pop: Option<i64>,
+    package_tail_segments: i64,
+    exact_tail: String,
+    normalized_tail: Option<String>,
+    exact_parent_tail: String,
+    normalized_parent_tail: Option<String>,
+    package_tail: String,
+    segments: Vec<(i64, &'static str, String)>,
+    visibility_containers: Vec<(i64, String, Option<String>)>,
 }
 
-/// Persist one structured declaration identity as an anchor plus a
-/// content-stable tail.
-///
-/// A unit whose package is intrinsic to the blob (no effective anchor) is
-/// stored in full. Otherwise only the tail past the anchor's resolved prefix is
-/// stored, so one content-addressed blob can be mounted at several paths and
-/// still hydrate with per-mount package names; the adapter recreates the prefix
-/// from the live `ProjectFile` without parsing a rendered name.
-fn encode_unit_fq_segments<A: LanguageAdapter>(
+fn segment_kind_sql(kind: SegmentKind) -> &'static str {
+    match kind {
+        SegmentKind::Path => "path",
+        SegmentKind::Package => "package",
+        SegmentKind::Type => "type",
+        SegmentKind::Companion => "companion",
+        SegmentKind::Nested => "nested",
+        SegmentKind::Member => "member",
+        SegmentKind::Unknown => "unknown",
+    }
+}
+
+fn segment_kind_from_sql(value: &str) -> Result<SegmentKind> {
+    match value {
+        "path" => Ok(SegmentKind::Path),
+        "package" => Ok(SegmentKind::Package),
+        "type" => Ok(SegmentKind::Type),
+        "companion" => Ok(SegmentKind::Companion),
+        "nested" => Ok(SegmentKind::Nested),
+        "member" => Ok(SegmentKind::Member),
+        "unknown" => Ok(SegmentKind::Unknown),
+        _ => Err(StoreError::new(format!(
+            "analyzer store row has unknown relational FqName segment kind {value:?}"
+        ))),
+    }
+}
+
+fn persisted_unit_fq<A: LanguageAdapter>(
     adapter: &A,
     unit: &CodeUnit,
     content_qualifier: &str,
-) -> Option<Vec<u8>> {
+) -> Option<PersistedUnitFq> {
     let fq = unit.fq();
     if fq.is_empty() {
         return None;
     }
-    let interner = segment_interner();
     let explicit_anchor = unit.package_anchor();
     let anchored = explicit_anchor
         .or_else(|| adapter.default_package_anchor())
@@ -10495,13 +12471,6 @@ fn encode_unit_fq_segments<A: LanguageAdapter>(
             let prefix =
                 adapter.resolve_package_anchor(anchor, content_qualifier, unit.source())?;
             let package = unit.package_fq();
-            // An extractor-supplied anchor names where a package *starts*, so
-            // the tail may carry content-written package segments. The adapter
-            // default only claims that a unit sits in its own package, so it
-            // applies only when the resolved prefix IS that package — otherwise
-            // a genuinely foreign package (`impl Trait for serde::Value`) would
-            // be re-anchored to the mount path whenever the file's own package
-            // happens to be empty and therefore a trivial prefix of it.
             let placed = if explicit_anchor.is_some() {
                 package.starts_with(&prefix)
             } else {
@@ -10510,89 +12479,190 @@ fn encode_unit_fq_segments<A: LanguageAdapter>(
             if !placed {
                 return None;
             }
-            let boundary_in_tail = u16::try_from(package.len() - prefix.len()).ok()?;
-            let (mode, pop) = match anchor {
-                PackageAnchor::OwnModule { pop } => (FQ_SEGMENTS_OWN_MODULE, pop),
-                PackageAnchor::CrateRoot => (FQ_SEGMENTS_CRATE_ROOT, 0),
-            };
-            Some((
-                mode,
-                pack_anchored_header(boundary_in_tail, pop),
-                fq.suffix_from(prefix.len()),
-            ))
+            Some(PersistedUnitFq {
+                anchor: Some(anchor),
+                package_tail_segments: package.len() - prefix.len(),
+                tail: fq.suffix_from(prefix.len()),
+            })
         });
-    let (mode, header_field, persisted_fq) = match anchored {
-        Some(anchored) => anchored,
+    match anchored {
+        Some(anchored) => Some(anchored),
         None => {
-            // Falling back to a full name is a safety valve, not a plan: an
-            // extractor that recorded an anchor asserted the unit can be placed
-            // from its live path, so failing to place it is an extractor bug.
-            // An adapter DEFAULT anchor legitimately fails to apply — a unit
-            // whose package is foreign to its own file keeps its complete name
-            // — so that path stays silent.
             debug_assert!(
                 explicit_anchor.is_none(),
                 "an explicitly anchored CodeUnit must resolve to a prefix of its package \
                  (anchor={explicit_anchor:?}, content_qualifier={content_qualifier:?}, \
                  unit={unit:?})"
             );
-            let package_segment_count = u32::try_from(unit.package_segment_count())
-                .expect("CodeUnit package segment count must fit in u32");
-            (FQ_SEGMENTS_FULL, package_segment_count, fq.clone())
+            Some(PersistedUnitFq {
+                anchor: None,
+                package_tail_segments: unit.package_segment_count(),
+                tail: fq.clone(),
+            })
         }
-    };
-    let encoded_segments = persisted_fq.encode_segments(interner);
-    let mut encoded = Vec::with_capacity(FQ_SEGMENTS_HEADER_LEN + encoded_segments.len());
-    encoded.extend_from_slice(FQ_SEGMENTS_MAGIC);
-    encoded.push(mode);
-    encoded.extend_from_slice(&header_field.to_le_bytes());
-    encoded.extend_from_slice(&encoded_segments);
-    Some(encoded)
+    }
 }
 
-/// Hydrate the structured identity and its package boundary. This format has no
-/// legacy-string fallback: stale cache rows are invalidated by the store epoch.
+/// Address `unit` through the same mounted prefix/content tail split used by
+/// persistence.
+///
+/// A hydrated unit carries its complete workspace identity, while relational
+/// rows for path-derived languages store only the content-stable suffix. Query
+/// construction must reproduce that boundary instead of treating the complete
+/// identity as a stable tail.
+pub(crate) fn relational_name_for_unit<A: LanguageAdapter>(
+    adapter: &A,
+    unit: &CodeUnit,
+    content_qualifier: &str,
+) -> RelationalName {
+    let Some(persisted) = persisted_unit_fq(adapter, unit, content_qualifier) else {
+        return RelationalName::stable(unit.fq().clone());
+    };
+    let prefix_len = unit
+        .fq()
+        .len()
+        .checked_sub(persisted.tail.len())
+        .expect("a persisted unit tail is a suffix of its hydrated identity");
+    RelationalName::new(unit.fq().prefix(prefix_len), persisted.tail)
+}
+
+fn prepare_unit_fq<A: LanguageAdapter>(
+    adapter: &A,
+    unit: &CodeUnit,
+    content_qualifier: &str,
+) -> Result<Option<PreparedUnitFq>> {
+    let Some(persisted) = persisted_unit_fq(adapter, unit, content_qualifier) else {
+        return Ok(None);
+    };
+    let interner = segment_interner();
+    let exact_tail = persisted.tail.display_native(adapter.language(), interner);
+    let normalized_fq = adapter.normalize_fq_name(&persisted.tail);
+    let normalized_text = normalized_fq.display_native(adapter.language(), interner);
+    let normalized_tail = (normalized_text != exact_tail).then_some(normalized_text);
+    let exact_parent_tail = persisted
+        .tail
+        .parent()
+        .expect("a persisted unit identity has at least one segment")
+        .display_native(adapter.language(), interner);
+    let normalized_parent_text = normalized_fq
+        .parent()
+        .expect("a normalized unit identity has at least one segment")
+        .display_native(adapter.language(), interner);
+    let normalized_parent_tail =
+        (normalized_parent_text != exact_parent_tail).then_some(normalized_parent_text);
+    let package_tail = persisted
+        .tail
+        .prefix(persisted.package_tail_segments)
+        .display_native(adapter.language(), interner);
+    let omitted_prefix_segments = unit.fq().len() - persisted.tail.len();
+    let omitted_prefix = unit.fq().prefix(omitted_prefix_segments);
+    let mut visibility_names = adapter.visibility_containers(unit);
+    visibility_names.sort_by_cached_key(|name| name.display_native(adapter.language(), interner));
+    visibility_names.dedup();
+    let mut visibility_containers = Vec::with_capacity(visibility_names.len());
+    for (ordinal, container) in visibility_names.into_iter().enumerate() {
+        assert!(
+            container.starts_with(&omitted_prefix),
+            "a visibility container must share its unit's persisted workspace prefix"
+        );
+        let container_tail = container.suffix_from(omitted_prefix_segments);
+        let exact = container_tail.display_native(adapter.language(), interner);
+        let normalized = adapter.normalize_fq_name(&container_tail);
+        let normalized_text = normalized.display_native(adapter.language(), interner);
+        visibility_containers.push((
+            usize_to_i64(ordinal)?,
+            exact.clone(),
+            (normalized_text != exact).then_some(normalized_text),
+        ));
+    }
+    let mut segments = Vec::with_capacity(persisted.tail.len());
+    for (ordinal, &segment_id) in persisted.tail.segments().iter().enumerate() {
+        let (text, kind) = interner.resolve(segment_id);
+        segments.push((
+            usize_to_i64(ordinal)?,
+            segment_kind_sql(kind),
+            text.to_string(),
+        ));
+    }
+    let (anchor_kind, anchor_pop) = match persisted.anchor {
+        None => (None, None),
+        Some(PackageAnchor::OwnModule { pop }) => (Some("own_module"), Some(i64::from(pop))),
+        Some(PackageAnchor::CrateRoot) => (Some("crate_root"), Some(0)),
+    };
+    Ok(Some(PreparedUnitFq {
+        anchor_kind,
+        anchor_pop,
+        package_tail_segments: usize_to_i64(persisted.package_tail_segments)?,
+        exact_tail,
+        normalized_tail,
+        exact_parent_tail,
+        normalized_parent_tail,
+        package_tail,
+        segments,
+        visibility_containers,
+    }))
+}
+
+/// One complete relational identity loaded from `code_unit_fq_segments`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationalUnitFq {
+    anchor: Option<PackageAnchor>,
+    package_tail_segments: usize,
+    expected_segment_count: usize,
+    expected_segment_bytes: usize,
+    segments: Vec<(SegmentKind, String)>,
+}
+
+impl RelationalUnitFq {
+    fn from_header(header: FqIdentityHeader) -> Self {
+        let FqIdentityHeader {
+            anchor,
+            package_tail_segments,
+            expected_segment_count,
+            expected_segment_bytes,
+            exact_tail: _,
+            normalized_tail: _,
+        } = header;
+        Self {
+            anchor,
+            package_tail_segments,
+            expected_segment_count,
+            expected_segment_bytes,
+            segments: Vec::with_capacity(expected_segment_count),
+        }
+    }
+}
+
+/// Hydrate the structured identity and its package boundary from authoritative
+/// relational segments. There is no binary or rendered-name fallback.
 pub(crate) fn hydrate_unit_fq<A: LanguageAdapter>(
     adapter: &A,
-    persisted: Option<&[u8]>,
+    persisted: Option<&RelationalUnitFq>,
     content_qualifier: &str,
     file: &ProjectFile,
 ) -> Result<(FqName, usize)> {
     let interner = segment_interner();
-    let bytes = persisted
+    let persisted = persisted
         .ok_or_else(|| StoreError::new("analyzer store row is missing its structured FqName"))?;
-    if bytes.len() < FQ_SEGMENTS_HEADER_LEN || &bytes[..4] != FQ_SEGMENTS_MAGIC {
-        return Err(StoreError::new(
-            "analyzer store row has an unsupported structured FqName encoding",
-        ));
+    if persisted.segments.len() != persisted.expected_segment_count {
+        return Err(StoreError::new(format!(
+            "analyzer store FqName expected {} segments but loaded {}",
+            persisted.expected_segment_count,
+            persisted.segments.len()
+        )));
     }
-    let mode = bytes[4];
-    let header_field = u32::from_le_bytes(bytes[5..9].try_into().unwrap());
-    let stored_fq = FqName::decode_segments(&bytes[FQ_SEGMENTS_HEADER_LEN..], interner)
-        .map_err(|err| StoreError::new(format!("analyzer store fq segment decode error: {err}")))?;
-    let anchor = match mode {
-        FQ_SEGMENTS_FULL => {
-            let stored_package_segment_count = header_field as usize;
-            if stored_package_segment_count >= stored_fq.len() {
-                return Err(StoreError::new(
-                    "analyzer store FqName package boundary leaves no declaration tail",
-                ));
-            }
-            return Ok((stored_fq, stored_package_segment_count));
+    let mut stored_fq = FqName::new();
+    for (kind, segment) in &persisted.segments {
+        stored_fq.push(interner.intern(segment, *kind));
+    }
+    let Some(anchor) = persisted.anchor else {
+        if persisted.package_tail_segments >= stored_fq.len() {
+            return Err(StoreError::new(
+                "analyzer store FqName package boundary leaves no declaration tail",
+            ));
         }
-        // The reserved header byte is ignored: a writer that starts using it
-        // must take a new mode so old readers cannot silently misread it.
-        FQ_SEGMENTS_OWN_MODULE => PackageAnchor::OwnModule {
-            pop: unpack_anchored_header(header_field).1,
-        },
-        FQ_SEGMENTS_CRATE_ROOT => PackageAnchor::CrateRoot,
-        _ => {
-            return Err(StoreError::new(format!(
-                "analyzer store FqName has unknown mode {mode}"
-            )));
-        }
+        return Ok((stored_fq, persisted.package_tail_segments));
     };
-    let boundary_in_tail = usize::from(unpack_anchored_header(header_field).0);
     let mut prefix = adapter
         .resolve_package_anchor(anchor, content_qualifier, file)
         .ok_or_else(|| {
@@ -10600,7 +12670,7 @@ pub(crate) fn hydrate_unit_fq<A: LanguageAdapter>(
                 "analyzer adapter did not provide the persisted anchored package prefix",
             )
         })?;
-    let package_segment_count = prefix.len() + boundary_in_tail;
+    let package_segment_count = prefix.len() + persisted.package_tail_segments;
     prefix.extend_from(&stored_fq);
     if package_segment_count >= prefix.len() {
         return Err(StoreError::new(
@@ -11164,8 +13234,11 @@ fn ruby_dispatch_mode_from_i64(value: i64) -> Result<RubyMethodDispatchMode> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
     use crate::analyzer::cpp::CppAdapter;
+    use crate::analyzer::csharp::CSharpAdapter;
     use crate::analyzer::go::GoAdapter;
     use crate::analyzer::java::JavaAdapter;
     use crate::analyzer::model::{StructuredTypeIdentityBuilder, StructuredTypeName};
@@ -11203,10 +13276,30 @@ mod tests {
         let content_qualifier = adapter.storage_content_qualifier(&unit, "");
 
         assert!(content_qualifier.is_empty());
-        let encoded = encode_unit_fq_segments(&adapter, &unit, &content_qualifier).unwrap();
-        assert_eq!(encoded[4], FQ_SEGMENTS_FULL);
+        let persisted = persisted_unit_fq(&adapter, &unit, &content_qualifier).unwrap();
+        assert_eq!(persisted.anchor, None);
+        let interner = segment_interner();
+        let segments = persisted
+            .tail
+            .segments()
+            .iter()
+            .map(|&id| {
+                let (text, kind) = interner.resolve(id);
+                (kind, text.to_string())
+            })
+            .collect::<Vec<_>>();
+        let relational = RelationalUnitFq {
+            anchor: persisted.anchor,
+            package_tail_segments: persisted.package_tail_segments,
+            expected_segment_count: persisted.tail.len(),
+            expected_segment_bytes: segments
+                .iter()
+                .map(|(kind, segment)| segment_kind_sql(*kind).len() + segment.len())
+                .sum(),
+            segments,
+        };
         let (hydrated_fq, hydrated_package_segment_count) =
-            hydrate_unit_fq(&adapter, Some(&encoded), &content_qualifier, &file).unwrap();
+            hydrate_unit_fq(&adapter, Some(&relational), &content_qualifier, &file).unwrap();
         assert_eq!(hydrated_fq, unit.fq().clone());
         assert_eq!(hydrated_package_segment_count, 0);
     }
@@ -11416,7 +13509,7 @@ mod tests {
             .write_parsed_blob_at_generation(oid, "java", generation, &JavaAdapter, &state)
             .unwrap();
 
-        let conn = store.conn.lock().expect("store mutex");
+        let conn = store.read_conn().unwrap();
         let (rows, initialized, labels): (i64, i64, String) = conn
             .query_row(
                 "SELECT COUNT(*), COALESCE(SUM(field_has_initializer), 0),
@@ -11647,6 +13740,41 @@ mod tests {
         assert!(
             joined_plan.iter().all(|detail| !detail.contains("SCAN")),
             "the joined reader must not scan any table: {joined_plan:#?}"
+        );
+    }
+
+    #[test]
+    fn enclosing_declaration_file_projection_uses_ordered_primary_keys() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let conn = store.conn.lock().expect("store mutex");
+        let mut statement = conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                enclosing_declarations_for_file_sql()
+            ))
+            .expect("prepare plan");
+        let plan = statement
+            .query_map(params![TEST_OID, "rust"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+
+        for table in ["units", "meta", "ranges"] {
+            assert!(
+                plan.iter()
+                    .any(|detail| detail.contains(&format!("SEARCH {table} USING PRIMARY KEY"))),
+                "enclosing declaration projection must seek {table}: {plan:#?}"
+            );
+            assert!(
+                plan.iter()
+                    .all(|detail| !detail.contains(&format!("SCAN {table}"))),
+                "enclosing declaration projection must not scan {table}: {plan:#?}"
+            );
+        }
+        assert!(
+            plan.iter()
+                .all(|detail| !detail.contains("USE TEMP B-TREE")),
+            "the primary-key order must satisfy the projection ORDER BY: {plan:#?}"
         );
     }
 
@@ -13058,18 +15186,34 @@ mod tests {
         };
 
         store
-            .sync_path_symbol_units(
+            .sync_workspace_snapshot(
                 "python",
                 GenerationId::BOOTSTRAP,
+                &[WorkspaceFileRow {
+                    rel_path: row.rel_path.clone(),
+                    blob_oid: row.blob_oid,
+                }],
                 std::slice::from_ref(&row),
+                &[],
+                &[],
+                &[],
+                &[],
             )
             .unwrap();
         let changes_after_cold_sync = store.conn.lock().expect("store mutex").total_changes();
         store
-            .sync_path_symbol_units(
+            .sync_workspace_snapshot(
                 "python",
                 GenerationId::BOOTSTRAP,
+                &[WorkspaceFileRow {
+                    rel_path: row.rel_path.clone(),
+                    blob_oid: row.blob_oid,
+                }],
                 std::slice::from_ref(&row),
+                &[],
+                &[],
+                &[],
+                &[],
             )
             .unwrap();
         let changes_after_warm_sync = store.conn.lock().expect("store mutex").total_changes();
@@ -13162,25 +15306,61 @@ mod tests {
     }
 
     #[test]
-    fn python_exact_path_symbol_lookup_uses_fqn_index() {
+    fn path_symbol_name_lookups_use_their_fqn_indexes() {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
-        let mut stmt = conn
-            .prepare(&format!("EXPLAIN QUERY PLAN {EXACT_PATH_SYMBOL_FQN_SQL}"))
+        for (sql, expected_index) in [
+            (
+                EXACT_PATH_SYMBOL_FQN_SQL,
+                "idx_path_symbol_units_lang_generation_exact_fqn",
+            ),
+            (
+                NORMALIZED_PATH_SYMBOL_FQN_SQL,
+                "idx_path_symbol_units_lang_generation_normalized_fqn",
+            ),
+        ] {
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let plan = stmt
+                .query_map(params!["python", "pkg.service"], |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(
+                plan.iter().any(|detail| detail.contains(expected_index)),
+                "expected path-name lookup to use {expected_index}, got {plan:?}"
+            );
+            assert!(
+                plan.iter().all(|detail| !detail.contains("SCAN symbols")),
+                "path-name lookup must not scan path_symbol_units: {plan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_snapshot_identity_is_a_primary_key_point_query() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let conn = store.conn.lock().expect("store mutex");
+        let mut statement = conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {WORKSPACE_SNAPSHOT_FINGERPRINT_SQL}"
+            ))
             .unwrap();
-        let plan = stmt
-            .query_map(params!["python", "pkg.service"], |row| {
-                row.get::<_, String>(3)
-            })
+        let plan = statement
+            .query_map(params!["python", 0], |row| row.get::<_, String>(3))
             .unwrap()
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap();
-
         assert!(
-            plan.iter().any(|detail| {
-                detail.contains("idx_path_symbol_units_lang_generation_exact_fqn")
-            }),
-            "expected exact Python lookup to use the FQN index, got {plan:?}"
+            plan.iter()
+                .any(|detail| { detail.contains("SEARCH workspace_snapshots USING PRIMARY KEY") }),
+            "workspace identity must seek the snapshot primary key: {plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .all(|detail| !detail.contains("SCAN workspace_snapshots")),
+            "workspace identity must not scan snapshots: {plan:?}"
         );
     }
 
@@ -13203,7 +15383,14 @@ mod tests {
             .unwrap();
 
         let projection = store
-            .summary_file_projection(oid, "java", GenerationId::BOOTSTRAP, &adapter, &file)
+            .summary_file_projection(
+                oid,
+                "java",
+                GenerationId::BOOTSTRAP,
+                &adapter,
+                &file,
+                &source,
+            )
             .unwrap()
             .expect("complete summary projection");
         let hydrated = store
@@ -13236,7 +15423,14 @@ mod tests {
         }
         assert!(
             store
-                .summary_file_projection(oid, "java", GenerationId::BOOTSTRAP, &adapter, &file,)
+                .summary_file_projection(
+                    oid,
+                    "java",
+                    GenerationId::BOOTSTRAP,
+                    &adapter,
+                    &file,
+                    &source,
+                )
                 .unwrap()
                 .is_none()
         );
@@ -13334,6 +15528,21 @@ mod tests {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(oid, "java", &adapter, &state)
+            .unwrap();
+        store
+            .sync_workspace_snapshot(
+                "java",
+                GenerationId::BOOTSTRAP,
+                &[WorkspaceFileRow {
+                    rel_path: crate::path_utils::rel_path_string(&file),
+                    blob_oid: oid,
+                }],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
             .unwrap();
 
         let unit_key = {
@@ -13440,13 +15649,86 @@ mod tests {
         let adapter = JavaAdapter;
         let state = parse_state(&adapter, &file);
         let store = AnalyzerStore::open_ephemeral().unwrap();
+        let mut workspace_files = Vec::with_capacity(blobs);
         for index in 0..blobs {
             let oid = oid_for(format!("sample blob {index}").as_bytes());
             store
                 .write_parsed_blob(oid, "java", &adapter, &state)
                 .unwrap();
+            workspace_files.push(WorkspaceFileRow {
+                rel_path: format!("src/demo/Sample_{index}.java"),
+                blob_oid: oid,
+            });
         }
+        store
+            .sync_workspace_snapshot(
+                "java",
+                GenerationId::BOOTSTRAP,
+                &workspace_files,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
         (temp, store)
+    }
+
+    /// Release-only same-process baseline for the FQ2-to-relational hydration
+    /// change. Setup is deliberately outside the timed interval. Run this test
+    /// at arities 1, 64, 512, and 10,000 by setting
+    /// `BIFROST_FQ_BENCH_BLOBS`; keep the v27 executable so the same samples
+    /// can be alternated with v28 after the migration.
+    #[test]
+    #[ignore = "release-only FQ identity storage benchmark"]
+    fn benchmark_fq_segment_hydration() {
+        let blobs = std::env::var("BIFROST_FQ_BENCH_BLOBS")
+            .ok()
+            .map(|value| value.parse::<usize>().expect("positive benchmark arity"))
+            .unwrap_or(512);
+        assert!(blobs > 0, "benchmark arity must be positive");
+        let iterations = std::env::var("BIFROST_FQ_BENCH_ITERATIONS")
+            .ok()
+            .map(|value| value.parse::<usize>().expect("positive iteration count"))
+            .unwrap_or_else(|| if blobs >= 10_000 { 5 } else { 20 });
+        assert!(iterations > 0, "benchmark iterations must be positive");
+
+        let (_temp, store) = store_with_repeated_short_name(blobs);
+        let generations = HashMap::from_iter([("java".to_string(), GenerationId::BOOTSTRAP)]);
+        let languages = ["java".to_string()];
+        let read = || {
+            store
+                .declaration_candidate_rows_by_short_name_for_langs(
+                    &languages,
+                    &generations,
+                    "Sample",
+                )
+                .expect("read benchmark candidates")
+        };
+        let warm = read();
+        assert_eq!(warm.len(), blobs);
+        let segment_rows = store
+            .conn
+            .lock()
+            .expect("analyzer store mutex poisoned")
+            .query_row("SELECT COUNT(*) FROM code_unit_fq_segments", [], |row| {
+                row.get::<_, usize>(0)
+            })
+            .expect("count benchmark segment rows");
+
+        let started = Instant::now();
+        let mut returned_rows = 0usize;
+        for _ in 0..iterations {
+            let rows = std::hint::black_box(read());
+            returned_rows = returned_rows.saturating_add(rows.len());
+            std::hint::black_box(rows);
+        }
+        let elapsed = started.elapsed();
+        eprintln!(
+            "{{\"benchmark\":\"fq_segment_hydration\",\"arity\":{blobs},\"iterations\":{iterations},\"returned_rows\":{returned_rows},\"segment_rows\":{segment_rows},\"wall_ns\":{}}}",
+            elapsed.as_nanos()
+        );
     }
 
     /// A candidate-row seek must observe its caller's deadline *inside* the
@@ -13498,9 +15780,13 @@ mod tests {
             "a seek that stopped at its deadline must not report a complete row set"
         );
         assert_eq!(
-            CANDIDATE_ROWS_PER_CANCELLATION_POLL,
+            0,
             stopped.rows.len(),
-            "the seek must stop at its first poll, not run the statement out"
+            "an incomplete identity batch must not escape"
+        );
+        assert_eq!(
+            CANDIDATE_ROWS_PER_CANCELLATION_POLL, stopped.inspected,
+            "the parent seek must stop at its first poll, not run the statement out"
         );
     }
 
@@ -13514,7 +15800,11 @@ mod tests {
     #[test]
     fn a_completing_candidate_row_seek_polls_once_per_row_block() {
         const BLOBS: usize = 1_200;
-        const GENEROUS_CHECK_BUDGET: usize = 8;
+        // Three parent checks, one check after the segment load, and one
+        // check per 512 relational segment rows. The fixture has three
+        // segments per candidate, so twelve leaves ample headroom while
+        // remaining far below a per-row polling strategy.
+        const GENEROUS_CHECK_BUDGET: usize = 12;
         let (_temp, store) = store_with_repeated_short_name(BLOBS);
         let generations = HashMap::from_iter([("java".to_string(), GenerationId::BOOTSTRAP)]);
         let cancellation = CancellationToken::cancel_after_checks_for_test(GENEROUS_CHECK_BUDGET);
@@ -13533,6 +15823,170 @@ mod tests {
             "a seek that polls per row would spend its whole check budget and report incomplete"
         );
         assert_eq!(BLOBS, rows.rows.len());
+    }
+
+    #[test]
+    fn relational_fq_corruption_fails_closed_without_a_fallback() {
+        let read_error_after = |mutation: &str| {
+            let (_temp, store) = store_with_repeated_short_name(1);
+            {
+                let conn = store.conn.lock().expect("store mutex");
+                conn.execute_batch(mutation).unwrap();
+            }
+            let generations = HashMap::from_iter([("java".to_string(), GenerationId::BOOTSTRAP)]);
+            store
+                .declaration_candidate_rows_by_short_name_for_langs(
+                    &["java".to_string()],
+                    &generations,
+                    "Sample",
+                )
+                .unwrap_err()
+                .to_string()
+        };
+
+        assert!(
+            read_error_after("DELETE FROM code_unit_fq_segments WHERE seg_ordinal = 1")
+                .contains("segments but loaded")
+        );
+        assert!(
+            read_error_after(
+                "UPDATE code_unit_fq_segments SET seg_ordinal = 4 WHERE seg_ordinal = 0"
+            )
+            .contains("segments are not dense")
+        );
+        assert!(
+            read_error_after(
+                "PRAGMA ignore_check_constraints = ON;
+                 UPDATE code_unit_fq_segments SET seg_kind = 'invalid' WHERE seg_ordinal = 0;
+                 PRAGMA ignore_check_constraints = OFF;"
+            )
+            .contains("unknown relational FqName segment kind")
+        );
+        assert!(
+            read_error_after("UPDATE code_units SET fq_segment_count = fq_segment_count + 1")
+                .contains("segments but loaded")
+        );
+        assert!(
+            read_error_after("UPDATE code_units SET fq_segment_bytes = fq_segment_bytes + 1")
+                .contains("segment bytes but loaded")
+        );
+        assert!(
+            read_error_after(
+                "PRAGMA ignore_check_constraints = ON;
+                 UPDATE code_units SET fq_anchor_kind = 'crate_root', fq_anchor_pop = 2;
+                 PRAGMA ignore_check_constraints = OFF;"
+            )
+            .contains("invalid anchor pair")
+        );
+        assert!(
+            read_error_after("UPDATE code_units SET fq_package_tail_segments = fq_segment_count")
+                .contains("leaves no declaration tail")
+        );
+
+        let (_temp, store) = store_with_repeated_short_name(1);
+        let conn = store.conn.lock().expect("store mutex");
+        assert!(
+            conn.execute_batch(
+                "INSERT INTO code_unit_fq_segments(
+                     blob_oid, lang, unit_key, seg_ordinal, seg_kind, segment)
+                 SELECT blob_oid, lang, unit_key, seg_ordinal, seg_kind, segment
+                 FROM code_unit_fq_segments WHERE seg_ordinal = 0"
+            )
+            .is_err(),
+            "the relational primary key must reject duplicate ordinals"
+        );
+    }
+
+    #[test]
+    fn definition_headers_hydrate_only_the_identity_that_survives_name_narrowing() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let adapter = JavaAdapter;
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let mut oids = Vec::new();
+        let mut workspace_files = Vec::new();
+        for package in ["wanted", "loser"] {
+            let file = write_file(
+                temp.path(),
+                &format!("{package}/Sample.java"),
+                &format!("package {package}; class Sample {{}}\n"),
+            );
+            let source = file.read_to_string().unwrap();
+            let oid = oid_for(source.as_bytes());
+            let state = parse_state(&adapter, &file);
+            store
+                .write_parsed_blob(oid, "java", &adapter, &state)
+                .unwrap();
+            oids.push((package, oid));
+            workspace_files.push(WorkspaceFileRow {
+                rel_path: crate::path_utils::rel_path_string(&file),
+                blob_oid: oid,
+            });
+        }
+        store
+            .sync_workspace_snapshot(
+                "java",
+                GenerationId::BOOTSTRAP,
+                &workspace_files,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        let generations = HashMap::from_iter([("java".to_string(), GenerationId::BOOTSTRAP)]);
+        let rows = store
+            .declaration_order_candidate_rows_by_short_name_for_langs(
+                &["java".to_string()],
+                &generations,
+                "Sample",
+                None,
+            )
+            .unwrap();
+        assert!(rows.complete);
+        assert_eq!(rows.rows.len(), 2);
+        let wanted = rows
+            .rows
+            .into_iter()
+            .filter(|row| {
+                row.candidate
+                    .fq
+                    .as_ref()
+                    .is_some_and(|header| header.exact_tail == "wanted.Sample")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(wanted.len(), 1);
+
+        let loser_oid = oids
+            .iter()
+            .find_map(|(package, oid)| (*package == "loser").then_some(*oid))
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM code_unit_fq_segments
+                 WHERE blob_oid = ?1 AND lang = 'java'",
+                [loser_oid.to_string()],
+            )
+            .unwrap();
+
+        let hydrated = store
+            .hydrate_definition_order_candidate_rows(wanted, &generations, None)
+            .unwrap();
+        assert!(hydrated.complete);
+        assert_eq!(hydrated.rows.len(), 1);
+        assert_eq!(
+            hydrated.rows[0]
+                .candidate
+                .fq
+                .as_ref()
+                .unwrap()
+                .segments
+                .len(),
+            2
+        );
     }
 
     #[test]
@@ -14529,6 +16983,100 @@ mod tests {
         );
     }
 
+    /// #2597: the JavaScript walk now records callable modifier metadata.
+    /// A blob written under the prior epoch says "nobody read the modifiers",
+    /// which every consumer reads as "undecided" rather than as an error, so
+    /// the salt is the only thing that retires those rows.
+    #[test]
+    fn js_callable_modifier_metadata_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "widget.js",
+            "export class Widget {\n    static build(spec) { return new Widget(spec); }\n    render(target) { return target; }\n}\n",
+        );
+        let state = Arc::new(parse_state(
+            &crate::analyzer::javascript::JavascriptAdapter,
+            &file,
+        ));
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let prior_epoch = epoch::javascript_epoch_before_callable_modifier_metadata();
+        let prior_generation = store
+            .ensure_language_epoch_value("javascript", &prior_epoch)
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "javascript",
+                prior_generation,
+                &crate::analyzer::javascript::JavascriptAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "javascript").unwrap());
+
+        let current_generation = store
+            .ensure_language_epoch(
+                Language::JavaScript,
+                &tree_sitter_javascript::LANGUAGE.into(),
+            )
+            .unwrap();
+
+        assert_ne!(current_generation, prior_generation);
+        assert!(!store.contains_parsed_blob(oid, "javascript").unwrap());
+        assert_eq!(
+            store
+                .missing_parsed_blob_keys(&[(oid, "javascript".to_string())])
+                .unwrap(),
+            vec![(oid, "javascript".to_string())]
+        );
+    }
+
+    /// The TypeScript half of the same #2597 bump.
+    #[test]
+    fn ts_callable_modifier_metadata_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "widget.ts",
+            "export class Widget {\n    static build(spec: string): Widget { return new Widget(); }\n    render(target: string): string { return target; }\n}\n",
+        );
+        let state = Arc::new(parse_state(&TypescriptAdapter, &file));
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let prior_epoch = epoch::typescript_epoch_before_callable_modifier_metadata();
+        let prior_generation = store
+            .ensure_language_epoch_value("typescript", &prior_epoch)
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "typescript",
+                prior_generation,
+                &TypescriptAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "typescript").unwrap());
+
+        let current_generation = store
+            .ensure_language_epoch(
+                Language::TypeScript,
+                &tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            )
+            .unwrap();
+
+        assert_ne!(current_generation, prior_generation);
+        assert!(!store.contains_parsed_blob(oid, "typescript").unwrap());
+        assert_eq!(
+            store
+                .missing_parsed_blob_keys(&[(oid, "typescript".to_string())])
+                .unwrap(),
+            vec![(oid, "typescript".to_string())]
+        );
+    }
+
     #[test]
     fn ts_inline_return_type_members_epoch_invalidates_prior_parsed_blobs() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -14914,11 +17462,35 @@ mod tests {
             normalized_fqn: "Model".to_string(),
         };
         store
-            .sync_path_symbol_units("java", b, std::slice::from_ref(&row))
+            .sync_workspace_snapshot(
+                "java",
+                b,
+                &[WorkspaceFileRow {
+                    rel_path: row.rel_path.clone(),
+                    blob_oid: row.blob_oid,
+                }],
+                std::slice::from_ref(&row),
+                &[],
+                &[],
+                &[],
+                &[],
+            )
             .unwrap();
         assert!(
             store
-                .sync_path_symbol_units("java", a, std::slice::from_ref(&row))
+                .sync_workspace_snapshot(
+                    "java",
+                    a,
+                    &[WorkspaceFileRow {
+                        rel_path: row.rel_path.clone(),
+                        blob_oid: row.blob_oid,
+                    }],
+                    std::slice::from_ref(&row),
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                )
                 .unwrap_err()
                 .is_stale_generation()
         );
@@ -14955,7 +17527,19 @@ mod tests {
             normalized_fqn: "Model".to_string(),
         };
         store
-            .sync_path_symbol_units("java", a, std::slice::from_ref(&row))
+            .sync_workspace_snapshot(
+                "java",
+                a,
+                &[WorkspaceFileRow {
+                    rel_path: row.rel_path.clone(),
+                    blob_oid: row.blob_oid,
+                }],
+                std::slice::from_ref(&row),
+                &[],
+                &[],
+                &[],
+                &[],
+            )
             .unwrap();
         let langs = vec!["java".to_string()];
         let a_map = HashMap::from_iter([("java".to_string(), a)]);
@@ -15050,22 +17634,34 @@ mod tests {
         let reader = AnalyzerStore::open_persistent(&db).unwrap();
         let generation = writer.ensure_language_epoch_value("java", "same").unwrap();
 
-        reader
-            .conn
-            .lock()
-            .unwrap()
-            .busy_timeout(Duration::from_millis(100))
-            .unwrap();
-        let mut writer_conn = writer.conn.lock().unwrap();
-        let writer_tx = writer_conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let blocker = std::thread::spawn(move || {
+            writer.conn.execute(move |conn| {
+                let writer_tx = conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .unwrap();
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                writer_tx.rollback().unwrap();
+            });
+        });
+        entered_rx.recv().unwrap();
 
-        assert_eq!(
-            reader.ensure_language_epoch_value("java", "same").unwrap(),
-            generation
-        );
-        writer_tx.rollback().unwrap();
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let matching = std::thread::spawn(move || {
+            result_tx
+                .send(reader.ensure_language_epoch_value("java", "same"))
+                .unwrap();
+        });
+        let observed = result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a matching epoch must use the read pool instead of the blocked writer")
+            .unwrap();
+        release_tx.send(()).unwrap();
+        blocker.join().unwrap();
+        matching.join().unwrap();
+        assert_eq!(observed, generation);
     }
 
     #[test]
@@ -15084,7 +17680,7 @@ mod tests {
             .write_parsed_blob_at_generation(oid, "java", a, &JavaAdapter, &state_a)
             .unwrap();
 
-        let mut reader_conn = reader.conn.lock().expect("reader mutex");
+        let mut reader_conn = reader.read_conn().unwrap();
         let read_tx = reader_conn.transaction().unwrap();
         require_current_generation(&read_tx, "java", a).unwrap();
         let old_meta = read_blob_meta(
@@ -15638,6 +18234,305 @@ mod tests {
         );
     }
 
+    #[test]
+    fn relational_fq_loaders_use_only_ordered_primary_key_probes() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let conn = store.conn.lock().expect("store mutex");
+        let explain = |sql: String, parameters: Vec<rusqlite::types::Value>| {
+            let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            statement
+                .query_map(params_from_iter(parameters.iter()), |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+
+        let candidate_plan = explain(
+            candidate_fq_segments_sql(16),
+            vec![rusqlite::types::Value::Null; 16 * 4],
+        );
+        assert!(
+            candidate_plan
+                .iter()
+                .any(|detail| detail.contains("SEARCH segments USING PRIMARY KEY")),
+            "candidate batches must seek the segment primary key: {candidate_plan:#?}"
+        );
+        assert!(
+            candidate_plan.iter().all(|detail| {
+                !detail.contains("SCAN segments") && !detail.contains("USE TEMP B-TREE")
+            }),
+            "candidate batches must not scan or sort persisted rows: {candidate_plan:#?}"
+        );
+
+        let range_plan = explain(
+            raw_unit_fq_segments_sql("?, ?"),
+            vec![
+                rusqlite::types::Value::Text("java".to_string()),
+                rusqlite::types::Value::Text("oid-a".to_string()),
+                rusqlite::types::Value::Text("oid-b".to_string()),
+            ],
+        );
+        assert!(
+            range_plan
+                .iter()
+                .any(|detail| detail.contains("SEARCH code_unit_fq_segments USING PRIMARY KEY")),
+            "file batches must seek the segment primary key: {range_plan:#?}"
+        );
+        assert!(
+            range_plan.iter().all(|detail| {
+                !detail.contains("SCAN code_unit_fq_segments")
+                    && !detail.contains("USE TEMP B-TREE")
+            }),
+            "file batches must not scan or sort persisted rows: {range_plan:#?}"
+        );
+    }
+
+    #[test]
+    fn limited_candidate_cost_uses_parent_segment_bytes_without_child_probe() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let conn = store.conn.lock().expect("store mutex");
+        let sql = format!(
+            "EXPLAIN QUERY PLAN {} LIMIT ?4",
+            limited_identifier_candidate_for_blob_sql()
+        );
+        let plan = conn
+            .prepare(&sql)
+            .unwrap()
+            .query_map(
+                params![
+                    "java",
+                    "Widget",
+                    "0123456789012345678901234567890123456789",
+                    16_i64
+                ],
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(
+            plan.iter()
+                .all(|detail| !detail.contains("code_unit_fq_segments")),
+            "header admission must use the parent byte count without touching segment rows: {plan:#?}"
+        );
+        assert!(
+            plan.iter().all(|detail| {
+                !detail.contains("SCAN segments")
+                    && !detail.contains("SCAN units")
+                    && !detail.contains("SCAN meta")
+            }),
+            "the limited read must not scan a persisted parent or child table: {plan:#?}"
+        );
+
+        let component_sql = point_component_definition_candidate_sql(
+            true,
+            RenderedTailMatch::Exact,
+            "units.in_declarations = 1",
+        );
+        let header_plan = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {component_sql}"))
+            .unwrap()
+            .query_map(params!["java", 0_i64, "pkg", "Widget"], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            header_plan
+                .iter()
+                .all(|detail| !detail.contains("code_unit_fq_segments")),
+            "component candidate headers must not hydrate child segments: {header_plan:#?}"
+        );
+        assert!(
+            header_plan.iter().any(|detail| {
+                detail.contains("idx_workspace_file_anchors_by_package")
+                    && detail.contains("package_name=?")
+            }),
+            "mounted lookup must seek the request prefix: {header_plan:#?}"
+        );
+        assert!(
+            header_plan.iter().any(|detail| {
+                detail.contains("idx_code_units_anchored_blob_exact_tail")
+                    && detail.contains("exact_fqn_tail=?")
+            }),
+            "mounted lookup must seek the request tail inside the selected blob: {header_plan:#?}"
+        );
+        assert!(
+            header_plan.iter().all(|detail| {
+                !detail.contains("SCAN units") && !detail.contains("SCAN anchors")
+            }),
+            "component lookup must not enumerate a short-name candidate set: {header_plan:#?}"
+        );
+        assert!(
+            header_plan
+                .iter()
+                .all(|detail| !detail.contains("USE TEMP B-TREE")),
+            "point lookup has no SQL ordering contract and must not sort: {header_plan:#?}"
+        );
+
+        let stable_sql = point_component_definition_candidate_sql(
+            false,
+            RenderedTailMatch::Exact,
+            "units.in_declarations = 1",
+        );
+        let stable_plan = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {stable_sql}"))
+            .unwrap()
+            .query_map(params!["java", 0_i64, "pkg.Widget"], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            stable_plan
+                .iter()
+                .any(|detail| detail.contains("idx_code_units_stable_exact_tail")),
+            "stable component lookup must seek the complete request tail: {stable_plan:#?}"
+        );
+        assert!(
+            stable_plan
+                .iter()
+                .all(|detail| !detail.contains("SCAN units")),
+            "stable component lookup must not enumerate language units: {stable_plan:#?}"
+        );
+    }
+
+    #[test]
+    fn limited_candidate_order_terms_survive_materialization() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let conn = store.conn.lock().expect("store mutex");
+        let sql = direct_children_limited_candidate_sql();
+        assert!(
+            sql.contains("edge.ordinal AS result_order_0")
+                && sql.contains("child.unit_key AS result_order_1")
+                && sql.contains("ORDER BY bounded.result_order_0, bounded.result_order_1"),
+            "join-owned ordering terms must be projected through the bounded relation: {sql}"
+        );
+        let plan = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map(
+                params![
+                    "0123456789012345678901234567890123456789",
+                    "scala",
+                    "app.Child",
+                    0_i64,
+                    "Child",
+                    Option::<String>::None,
+                    0_i64,
+                    1_i64,
+                ],
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("SEARCH edge USING PRIMARY KEY")),
+            "the bounded direct-child query must retain its ordered edge relation: {plan:#?}"
+        );
+    }
+
+    #[test]
+    fn rendered_name_components_invert_every_supported_boundary() {
+        assert_eq!(
+            rendered_name_components("pkg::thing.Value$Nested", false),
+            vec![
+                RenderedNameComponent {
+                    prefix: String::new(),
+                    tail: "pkg::thing.Value$Nested".to_string(),
+                    normalized: false,
+                    normalized_exact_fallback: false,
+                    anchored: false,
+                },
+                RenderedNameComponent {
+                    prefix: String::new(),
+                    tail: "pkg::thing.Value$Nested".to_string(),
+                    normalized: false,
+                    normalized_exact_fallback: false,
+                    anchored: true,
+                },
+                RenderedNameComponent {
+                    prefix: "pkg".to_string(),
+                    tail: "thing.Value$Nested".to_string(),
+                    normalized: false,
+                    normalized_exact_fallback: false,
+                    anchored: true,
+                },
+                RenderedNameComponent {
+                    prefix: "pkg::thing".to_string(),
+                    tail: "Value$Nested".to_string(),
+                    normalized: false,
+                    normalized_exact_fallback: false,
+                    anchored: true,
+                },
+                RenderedNameComponent {
+                    prefix: "pkg::thing.Value".to_string(),
+                    tail: "Nested".to_string(),
+                    normalized: false,
+                    normalized_exact_fallback: false,
+                    anchored: true,
+                },
+                RenderedNameComponent {
+                    prefix: "pkg::thing.Value$Nested".to_string(),
+                    tail: String::new(),
+                    normalized: false,
+                    normalized_exact_fallback: false,
+                    anchored: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn normalized_definition_components_probe_stored_normalized_tails() {
+        let already_normalized = rendered_definition_components(
+            0,
+            &RenderedDefinitionRequest {
+                exact_name: "app.api.v1".to_string(),
+                normalized_name: "app.api.v1".to_string(),
+                seekable: true,
+            },
+        );
+        assert!(already_normalized.iter().any(|(_, component)| {
+            component.normalized
+                && component.prefix == "app.api"
+                && component.tail == "v1"
+                && !component.normalized_exact_fallback
+        }));
+
+        let changed_by_normalization = rendered_definition_components(
+            0,
+            &RenderedDefinitionRequest {
+                exact_name: "app.Api.V1".to_string(),
+                normalized_name: "app.api.v1".to_string(),
+                seekable: true,
+            },
+        );
+        assert!(changed_by_normalization.iter().any(|(_, component)| {
+            component.normalized
+                && component.prefix == "app.api"
+                && component.tail == "v1"
+                && component.normalized_exact_fallback
+        }));
+    }
+
+    #[test]
+    fn anchor_only_lookup_uses_the_null_tail_relation() {
+        let sql = point_anchor_only_definition_candidate_sql("units.in_declarations = 1");
+        assert!(sql.contains("units.exact_fqn_tail IS NULL"), "{sql}");
+        assert!(
+            !sql.contains("idx_code_units_anchored_blob_exact_tail"),
+            "the partial exact-tail index excludes anchor-only identities: {sql}"
+        );
+    }
+
     // The C# arity-free lookup (#1063) reaches ``Widget`1`` through an
     // identifier *prefix*, which is only affordable as an index range. If the
     // planner ever reads `code_units` end to end for it, symbol lookup is back
@@ -15669,12 +18564,137 @@ mod tests {
     }
 
     #[test]
+    fn file_identifier_lookup_seeks_identifier_index_before_blob_key_filter() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let conn = store.conn.lock().expect("store mutex");
+        let sql = format!(
+            "EXPLAIN QUERY PLAN {} LIMIT ?4",
+            limited_identifier_candidate_for_blob_sql()
+        );
+        let mut statement = conn.prepare(&sql).unwrap();
+        let plan = statement
+            .query_map(
+                params![
+                    "rust",
+                    "Widget",
+                    "0123456789012345678901234567890123456789",
+                    16_i64
+                ],
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(
+            plan.iter().any(|detail| detail
+                .contains("SEARCH units USING INDEX idx_code_units_lang_identifier_lookup")),
+            "file-scoped lookup must seek the identifier index: {plan:#?}"
+        );
+        assert!(
+            plan.iter().all(|detail| !detail.contains("SCAN units")),
+            "file-scoped lookup must never scan code_units: {plan:#?}"
+        );
+    }
+
+    #[test]
     fn byte_successor_bounds_a_prefix_range() {
         assert_eq!(Some("Widgeta".to_string()), byte_successor("Widget`"));
         assert_eq!(Some("create%".to_string()), byte_successor("create$"));
         assert_eq!(None, byte_successor(""));
         // A multi-byte tail has no single-byte successor that stays UTF-8.
         assert_eq!(None, byte_successor("Wid\u{00e9}"));
+    }
+
+    #[test]
+    fn simultaneous_identical_repairs_share_one_persistent_transaction() {
+        const PRODUCERS: usize = 50;
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(temp.path(), "Model.java", "class Model {}\n");
+        let state = Arc::new(parse_state(&JavaAdapter, &file));
+        let db = temp.path().join("shared-cache.db");
+        let stores = (0..PRODUCERS)
+            .map(|_| Arc::new(AnalyzerStore::open_persistent(&db).unwrap()))
+            .collect::<Vec<_>>();
+        let writer_identity = stores[0].conn.identity();
+        assert!(
+            stores
+                .iter()
+                .all(|store| store.conn.identity() == writer_identity),
+            "every session for the cache must share one writer actor"
+        );
+        let generation = stores[0]
+            .ensure_language_epoch_value("java", "shared-repair-v1")
+            .unwrap();
+        let oid = oid_for(b"shared repair source");
+        let prepared = (0..PRODUCERS)
+            .map(|_| {
+                AnalyzerStore::prepare_parsed_blob(
+                    oid,
+                    "java",
+                    generation,
+                    &JavaAdapter,
+                    Arc::clone(&state),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let initial_submissions = stores[0].conn.repair_submissions();
+        let initial_transactions = stores[0].conn.repair_transactions();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let blocker_store = Arc::clone(&stores[0]);
+        let blocker = std::thread::spawn(move || {
+            blocker_store.conn.execute(move |_| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+        });
+        entered_rx.recv().unwrap();
+
+        let barrier = Arc::new(std::sync::Barrier::new(PRODUCERS + 1));
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let mut producers = Vec::new();
+        for (store, prepared) in stores.iter().cloned().zip(prepared) {
+            let barrier = Arc::clone(&barrier);
+            let result_tx = result_tx.clone();
+            producers.push(std::thread::spawn(move || {
+                barrier.wait();
+                result_tx
+                    .send(store.repair_prepared_blob(prepared))
+                    .unwrap();
+            }));
+        }
+        drop(result_tx);
+        barrier.wait();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while stores[0].conn.repair_submissions() < initial_submissions + PRODUCERS {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "all repair producers must enqueue behind the blocked writer"
+            );
+            std::thread::yield_now();
+        }
+        release_tx.send(()).unwrap();
+
+        for _ in 0..PRODUCERS {
+            result_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("repair producer must receive its writer result")
+                .unwrap();
+        }
+        blocker.join().unwrap();
+        for producer in producers {
+            producer.join().unwrap();
+        }
+        stores[0].conn.execute(|_| {});
+        assert_eq!(
+            stores[0].conn.repair_transactions() - initial_transactions,
+            1,
+            "identical queued repairs must persist one representative"
+        );
+        assert!(stores[0].contains_parsed_blob(oid, "java").unwrap());
     }
 
     #[test]
@@ -16006,7 +19026,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_writer_matches_legacy_adapter_projections() {
+    fn direct_adapter_write_matches_explicit_prepared_write() {
         let temp = tempfile::TempDir::new().unwrap();
         let root = temp.path();
         let ruby_file = write_file(
@@ -16030,10 +19050,10 @@ mod tests {
             "template <typename T, typename U = T*> class Demo {};\ntemplate <typename T> class Demo<T, T*> {};\n",
         );
 
-        assert_legacy_prepared_parity(&RubyAdapter, "ruby", &ruby_file);
-        assert_legacy_prepared_parity(&ScalaAdapter, "scala", &scala_file);
-        assert_legacy_prepared_parity(&TypescriptAdapter, "typescript", &ts_file);
-        assert_legacy_prepared_parity(&CppAdapter, "cpp", &cpp_file);
+        assert_direct_prepared_parity(&RubyAdapter, "ruby", &ruby_file);
+        assert_direct_prepared_parity(&ScalaAdapter, "scala", &scala_file);
+        assert_direct_prepared_parity(&TypescriptAdapter, "typescript", &ts_file);
+        assert_direct_prepared_parity(&CppAdapter, "cpp", &cpp_file);
     }
 
     #[test]
@@ -16087,28 +19107,23 @@ mod tests {
         );
     }
 
-    /// The persisted row for the unit whose rendered name is `fq_name`, plus
-    /// the mode byte, the anchored header's `(boundary_in_tail, pop)`, and the
-    /// content-stable tail the row actually stores.
-    fn encoded_unit_row<A: LanguageAdapter>(
+    /// The relational anchor, package boundary, and content-stable tail for
+    /// the unit whose rendered name is `fq_name`.
+    fn persisted_unit_row<A: LanguageAdapter>(
         adapter: &A,
         state: &FileState,
         fq_name: &str,
-    ) -> (u8, u16, u8, String) {
+    ) -> (Option<PackageAnchor>, usize, String) {
         let unit = state
             .declarations
             .iter()
             .find(|unit| unit.fq_name() == fq_name)
             .unwrap_or_else(|| panic!("fixture must declare {fq_name}: {:?}", state.declarations));
         let content_qualifier = adapter.storage_content_qualifier(unit, &state.content_qualifier);
-        let encoded = encode_unit_fq_segments(adapter, unit, &content_qualifier).unwrap();
-        let (boundary_in_tail, pop) =
-            unpack_anchored_header(u32::from_le_bytes(encoded[5..9].try_into().unwrap()));
+        let persisted = persisted_unit_fq(adapter, unit, &content_qualifier).unwrap();
         let interner = segment_interner();
-        let tail = FqName::decode_segments(&encoded[FQ_SEGMENTS_HEADER_LEN..], interner)
-            .unwrap()
-            .display(interner);
-        (encoded[4], boundary_in_tail, pop, tail)
+        let tail = persisted.tail.display(interner);
+        (persisted.anchor, persisted.package_tail_segments, tail)
     }
 
     /// A crate-root-qualified impl owner (`use crate::JsError; impl T for
@@ -16131,15 +19146,51 @@ mod tests {
         let adapter = RustAdapter;
         let state = parse_state(&adapter, &file_a);
 
-        let (mode, boundary_in_tail, pop, tail) =
-            encoded_unit_row(&adapter, &state, "JsError.describe");
-        assert_eq!(mode, FQ_SEGMENTS_CRATE_ROOT);
-        assert_eq!((boundary_in_tail, pop), (0, 0));
+        let (anchor, boundary_in_tail, tail) =
+            persisted_unit_row(&adapter, &state, "JsError.describe");
+        assert_eq!(anchor, Some(PackageAnchor::CrateRoot));
+        assert_eq!(boundary_in_tail, 0);
         assert_eq!(tail, "JsError.describe");
 
         let store = AnalyzerStore::open_ephemeral().unwrap();
         store
             .write_parsed_blob(oid, "rust", &adapter, &state)
+            .unwrap();
+        let workspace_files = [&file_a, &file_b]
+            .into_iter()
+            .map(|file| WorkspaceFileRow {
+                rel_path: crate::path_utils::rel_path_string(file),
+                blob_oid: oid,
+            })
+            .collect::<Vec<_>>();
+        let anchors = [&file_a, &file_b]
+            .into_iter()
+            .map(|file| WorkspaceAnchorRow {
+                rel_path: crate::path_utils::rel_path_string(file),
+                anchor: PackageAnchor::CrateRoot,
+                package_name: adapter
+                    .resolve_package_anchor(PackageAnchor::CrateRoot, "", file)
+                    .unwrap()
+                    .display_native(Language::Rust, segment_interner()),
+            })
+            .collect::<Vec<_>>();
+        let mut packages = anchors
+            .iter()
+            .map(|anchor| anchor.package_name.clone())
+            .collect::<Vec<_>>();
+        packages.sort();
+        packages.dedup();
+        store
+            .sync_workspace_snapshot(
+                "rust",
+                GenerationId::BOOTSTRAP,
+                &workspace_files,
+                &[],
+                &packages,
+                &[],
+                &[],
+                &anchors,
+            )
             .unwrap();
         let hydrated_a = store
             .hydrate_file_state(oid, "rust", &adapter, &file_a)
@@ -16164,6 +19215,115 @@ mod tests {
             "{:?}",
             hydrated_b.declarations
         );
+        let mounted_names = {
+            let conn = store.conn.lock().expect("store mutex");
+            let mut statement = conn
+                .prepare(
+                    "SELECT prefix, tail, rel_path
+                     FROM live_definition_exact_names
+                     WHERE lang = 'rust' AND tail = 'JsError.describe'
+                     ORDER BY rel_path",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            mounted_names,
+            [
+                (
+                    "crates.webidl.src".to_string(),
+                    "JsError.describe".to_string(),
+                    "crates/webidl/src/describe.rs".to_string(),
+                ),
+                (
+                    String::new(),
+                    "JsError.describe".to_string(),
+                    "src/describe.rs".to_string(),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn csharp_nested_type_persists_structural_and_namespace_visibility() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let content = "namespace Demo { class Outer { public class Nested<T> {} } }\n";
+        let file = write_file(temp.path(), "Nested.cs", content);
+        let oid = oid_for(content.as_bytes());
+        let adapter = CSharpAdapter;
+        let state = parse_state(&adapter, &file);
+        let nested = state
+            .declarations
+            .iter()
+            .find(|unit| unit.is_class() && unit.identifier().starts_with("Nested"))
+            .expect("fixture declares a nested type");
+        assert_eq!(nested.package_name(), "Demo");
+
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        store
+            .write_parsed_blob(oid, "csharp", &adapter, &state)
+            .unwrap();
+        let workspace_file = WorkspaceFileRow {
+            rel_path: crate::path_utils::rel_path_string(&file),
+            blob_oid: oid,
+        };
+        store
+            .sync_workspace_snapshot(
+                "csharp",
+                GenerationId::BOOTSTRAP,
+                &[workspace_file],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+
+        let conn = store.conn.lock().expect("store mutex");
+        let containers = conn
+            .prepare(
+                "SELECT exact_parent_tail
+                 FROM live_visible_members
+                 WHERE lang = 'csharp' AND identifier LIKE 'Nested%'
+                 ORDER BY exact_parent_tail",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(containers, ["Demo", "Demo.Outer"]);
+
+        let (simple_name, normalized_tail, segment_count): (String, String, i64) = conn
+            .query_row(
+                "SELECT units.simple_type_name, units.normalized_fqn_tail,
+                        COUNT(segments.seg_ordinal)
+                 FROM code_units AS units
+                 JOIN code_unit_fq_segments AS segments
+                   ON segments.blob_oid = units.blob_oid
+                  AND segments.lang = units.lang
+                  AND segments.unit_key = units.unit_key
+                 WHERE units.blob_oid = ?1 AND units.lang = 'csharp'
+                   AND units.identifier LIKE 'Nested%'
+                 GROUP BY units.blob_oid, units.lang, units.unit_key",
+                [oid.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(simple_name, "Nested");
+        assert_eq!(normalized_tail, "Demo.Outer.Nested");
+        assert_eq!(segment_count, nested.fq().len() as i64);
     }
 
     /// The same impl-bearing blob mounted at two directory depths must hydrate
@@ -16180,10 +19340,10 @@ mod tests {
         let adapter = RustAdapter;
         let state = parse_state(&adapter, &file_a);
 
-        let (mode, boundary_in_tail, pop, tail) =
-            encoded_unit_row(&adapter, &state, "alpha.src.service.Client.connect");
-        assert_eq!(mode, FQ_SEGMENTS_OWN_MODULE);
-        assert_eq!((boundary_in_tail, pop), (0, 0));
+        let (anchor, boundary_in_tail, tail) =
+            persisted_unit_row(&adapter, &state, "alpha.src.service.Client.connect");
+        assert_eq!(anchor, Some(PackageAnchor::OwnModule { pop: 0 }));
+        assert_eq!(boundary_in_tail, 0);
         assert_eq!(tail, "Client.connect");
 
         let store = AnalyzerStore::open_ephemeral().unwrap();
@@ -16230,9 +19390,9 @@ mod tests {
         let adapter = RustAdapter;
         let state = parse_state(&adapter, &file);
 
-        let (mode, boundary_in_tail, pop, tail) = encoded_unit_row(&adapter, &state, "a.b.T.f");
-        assert_eq!(mode, FQ_SEGMENTS_OWN_MODULE);
-        assert_eq!((boundary_in_tail, pop), (0, 0));
+        let (anchor, boundary_in_tail, tail) = persisted_unit_row(&adapter, &state, "a.b.T.f");
+        assert_eq!(anchor, Some(PackageAnchor::OwnModule { pop: 0 }));
+        assert_eq!(boundary_in_tail, 0);
         assert_eq!(tail, "T.f");
     }
 
@@ -16256,9 +19416,9 @@ mod tests {
         // The file-level binding is not in scope inside `mod m` (the module
         // body gets its own binder), so this owner resolves as a bare local
         // name under the inline module and keeps `m` in the content tail.
-        let (mode, boundary_in_tail, pop, tail) = encoded_unit_row(&adapter, &state, "a.b.m.T.f");
-        assert_eq!(mode, FQ_SEGMENTS_OWN_MODULE);
-        assert_eq!((boundary_in_tail, pop), (0, 0));
+        let (anchor, boundary_in_tail, tail) = persisted_unit_row(&adapter, &state, "a.b.m.T.f");
+        assert_eq!(anchor, Some(PackageAnchor::OwnModule { pop: 0 }));
+        assert_eq!(boundary_in_tail, 0);
         assert_eq!(tail, "m.T.f");
 
         let store = AnalyzerStore::open_ephemeral().unwrap();
@@ -16297,10 +19457,10 @@ mod tests {
         let adapter = RustAdapter;
         let state = parse_state(&adapter, &file_a);
 
-        let (mode, boundary_in_tail, pop, tail) =
-            encoded_unit_row(&adapter, &state, "crates.webidl.src.foo.Bar.f");
-        assert_eq!(mode, FQ_SEGMENTS_CRATE_ROOT);
-        assert_eq!((boundary_in_tail, pop), (1, 0));
+        let (anchor, boundary_in_tail, tail) =
+            persisted_unit_row(&adapter, &state, "crates.webidl.src.foo.Bar.f");
+        assert_eq!(anchor, Some(PackageAnchor::CrateRoot));
+        assert_eq!(boundary_in_tail, 1);
         assert_eq!(tail, "foo.Bar.f");
 
         let store = AnalyzerStore::open_ephemeral().unwrap();
@@ -16334,9 +19494,9 @@ mod tests {
         let adapter = RustAdapter;
         let state = parse_state(&adapter, &file_a);
 
-        let (mode, boundary_in_tail, pop, tail) = encoded_unit_row(&adapter, &state, "a.T.f");
-        assert_eq!(mode, FQ_SEGMENTS_OWN_MODULE);
-        assert_eq!((boundary_in_tail, pop), (0, 1));
+        let (anchor, boundary_in_tail, tail) = persisted_unit_row(&adapter, &state, "a.T.f");
+        assert_eq!(anchor, Some(PackageAnchor::OwnModule { pop: 1 }));
+        assert_eq!(boundary_in_tail, 0);
         assert_eq!(tail, "T.f");
 
         let store = AnalyzerStore::open_ephemeral().unwrap();
@@ -16372,8 +19532,8 @@ mod tests {
         let adapter = RustAdapter;
         let state = parse_state(&adapter, &file);
 
-        let (mode, _, _, tail) = encoded_unit_row(&adapter, &state, "serde.Value.f");
-        assert_eq!(mode, FQ_SEGMENTS_FULL);
+        let (anchor, _, tail) = persisted_unit_row(&adapter, &state, "serde.Value.f");
+        assert_eq!(anchor, None);
         assert_eq!(tail, "serde.Value.f");
 
         let store = AnalyzerStore::open_ephemeral().unwrap();
@@ -16647,7 +19807,7 @@ mod tests {
         assert!(hydrated.parse_errors.is_none());
     }
 
-    fn assert_legacy_prepared_parity<A: LanguageAdapter>(
+    fn assert_direct_prepared_parity<A: LanguageAdapter>(
         adapter: &A,
         lang: &str,
         file: &ProjectFile,
@@ -16655,8 +19815,8 @@ mod tests {
         let source = file.read_to_string().unwrap();
         let oid = oid_for(source.as_bytes());
         let parsed = Arc::new(parse_state(adapter, file));
-        let legacy = AnalyzerStore::open_ephemeral().unwrap();
-        legacy
+        let direct = AnalyzerStore::open_ephemeral().unwrap();
+        direct
             .write_parsed_blob(oid, lang, adapter, parsed.as_ref())
             .unwrap();
         let prepared_store = AnalyzerStore::open_ephemeral().unwrap();
@@ -16674,7 +19834,7 @@ mod tests {
         assert_eq!(stats.committed_blobs, 1);
         assert!(outcomes.iter().all(|outcome| outcome.error.is_none()));
 
-        let legacy_state = legacy
+        let direct_state = direct
             .hydrate_file_state(oid, lang, adapter, file)
             .unwrap()
             .unwrap();
@@ -16682,9 +19842,9 @@ mod tests {
             .hydrate_file_state(oid, lang, adapter, file)
             .unwrap()
             .unwrap();
-        assert_file_state_equivalent(parsed.as_ref(), &legacy_state);
+        assert_file_state_equivalent(parsed.as_ref(), &direct_state);
         assert_file_state_equivalent(parsed.as_ref(), &prepared_state);
-        assert_file_state_equivalent(&legacy_state, &prepared_state);
+        assert_file_state_equivalent(&direct_state, &prepared_state);
         let bulk_states = prepared_store
             .hydrate_file_states(
                 &[(file.clone(), oid)],
@@ -16701,7 +19861,7 @@ mod tests {
             parsed.scala_exports
         );
         assert_eq!(
-            legacy.content_row_count(oid, lang).unwrap(),
+            direct.content_row_count(oid, lang).unwrap(),
             prepared_store.content_row_count(oid, lang).unwrap()
         );
     }
@@ -17491,6 +20651,60 @@ mod tests {
                 "{table}: {plan:#?}"
             );
         }
+    }
+
+    #[test]
+    fn reverse_reference_candidates_use_name_first_indexes() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let conn = store.conn.lock().expect("store mutex");
+        sync_active_blob_oids(&conn, &[]).unwrap();
+        sync_reverse_reference_lookup_keys(
+            &conn,
+            &["Target".to_string()].into_iter().collect(),
+            &["pkg".to_string()].into_iter().collect(),
+            &["Target".to_string()].into_iter().collect(),
+        )
+        .unwrap();
+        let explain = |sql: &str| {
+            let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            statement
+                .query_map(["java"], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+
+        let imports = explain(REVERSE_IMPORT_CANDIDATE_BLOBS_SQL);
+        assert!(
+            imports.iter().any(|detail| {
+                detail.contains(
+                    "SEARCH segments USING COVERING INDEX idx_import_path_segments_by_segment",
+                )
+            }),
+            "reverse import lookup must seek the requested segment: {imports:#?}"
+        );
+        assert!(
+            imports
+                .iter()
+                .all(|detail| !detail.contains("SCAN segments")),
+            "reverse import lookup must not scan import_path_segments: {imports:#?}"
+        );
+
+        let identifiers = explain(REVERSE_TYPE_CANDIDATE_BLOBS_SQL);
+        assert!(
+            identifiers.iter().any(|detail| {
+                detail.contains(
+                    "SEARCH identifiers USING COVERING INDEX idx_type_identifiers_by_identifier",
+                )
+            }),
+            "reverse type lookup must seek the requested identifier: {identifiers:#?}"
+        );
+        assert!(
+            identifiers
+                .iter()
+                .all(|detail| !detail.contains("SCAN identifiers")),
+            "reverse type lookup must not scan type_identifiers: {identifiers:#?}"
+        );
     }
 
     fn insert_test_blob_and_unit(conn: &Connection) {

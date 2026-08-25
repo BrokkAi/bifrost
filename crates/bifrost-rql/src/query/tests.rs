@@ -1,5 +1,8 @@
 use super::*;
 use brokk_bifrost_core::analyzer::Language;
+use brokk_bifrost_core::analyzer::structural::control_relation::{
+    ControlExitPartition, ControlRelationKind,
+};
 use brokk_bifrost_core::analyzer::structural::flow_state::{
     FlowCertainty, FlowRelation as FlowRelationLabel, FlowSubjectKind, StateEventClass,
 };
@@ -660,6 +663,258 @@ fn flow_state_filters_reject_values_outside_their_vocabulary() {
         ]
     }));
     assert_eq!(error.path, "steps[1].relation");
+}
+
+/// The control-relation vocabulary (#2443) parses from both frontends, lowers
+/// to the same typed step, and types its pipeline end to end.
+#[test]
+fn control_relation_steps_parse_and_lower_from_both_frontends() {
+    let query = parse_ok(json!({
+        "schema_version": 1,
+        "match": { "kind": "function", "name": "handler" },
+        "steps": [
+            { "op": "procedure_of" },
+            {
+                "op": "control_relations",
+                "control_relation": ["dominates", "control_depends_on"],
+                "exit_partition": ["normal_and_exceptional"]
+            }
+        ]
+    }));
+    assert_eq!(
+        query.plan.steps,
+        vec![
+            QueryStep::ProcedureOf,
+            QueryStep::ControlRelations(ControlRelationFilter {
+                relations: vec![
+                    ControlRelationKind::Dominates,
+                    ControlRelationKind::ControlDependsOn
+                ],
+                exit_partitions: vec![ControlExitPartition::NormalAndExceptional],
+            }),
+        ]
+    );
+    assert_eq!(
+        query.validate_steps().unwrap(),
+        QueryValueKind::ControlRelation
+    );
+
+    // The hyphenated RQL spellings canonicalize to the same wire labels.
+    let rql = CodeQuery::from_sexp(
+        "(control-relations :relation [dominates control-depends-on] \
+           :exit-partition [normal-and-exceptional] \
+           (procedure-of (function :name \"handler\")))",
+    )
+    .expect("control-relation RQL should lower");
+    assert_eq!(rql.schema_version, SCHEMA_VERSION);
+    assert_eq!(rql.plan.steps, query.plan.steps);
+    assert_eq!(rql.to_canonical_json(), query.to_canonical_json());
+}
+
+/// A reserved exit partition is authorable: it is a value no row carries today,
+/// not a value the parser refuses. Rejecting it would make a partitioned
+/// derivation a breaking change instead of an added value (#2443).
+#[test]
+fn a_reserved_exit_partition_parses_and_a_misspelled_one_does_not() {
+    let reserved = CodeQuery::from_sexp(
+        "(control-relations :exit-partition [normal-only] (procedure-of (function)))",
+    )
+    .expect("a reserved partition is a declared value");
+    assert_eq!(
+        reserved.plan.steps,
+        vec![
+            QueryStep::ProcedureOf,
+            QueryStep::ControlRelations(ControlRelationFilter {
+                relations: Vec::new(),
+                exit_partitions: vec![ControlExitPartition::NormalOnly],
+            }),
+        ]
+    );
+
+    let error = error_of(json!({
+        "schema_version": 1,
+        "match": { "kind": "function" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "control_relations", "exit_partition": ["normal_and_cancellation"] }
+        ]
+    }));
+    assert_eq!(error.path, "steps[1].exit_partition[0]");
+}
+
+/// The typed algebra refuses the step over anything but a procedure, and a
+/// value outside the relation vocabulary is rejected on its own path.
+#[test]
+fn control_relations_reject_wrong_inputs_and_unknown_values() {
+    let error = error_of(json!({
+        "schema_version": 1,
+        "match": { "kind": "function" },
+        "steps": [{ "op": "control_relations" }]
+    }));
+    assert!(error.message.contains("procedure"), "{error:?}");
+
+    let error = error_of(json!({
+        "schema_version": 1,
+        "match": { "kind": "function" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "control_relations", "control_relation": ["dominates", "precedes"] }
+        ]
+    }));
+    assert_eq!(error.path, "steps[1].control_relation[1]");
+
+    let error = error_of(json!({
+        "schema_version": 1,
+        "match": { "kind": "function" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "control_relations", "certainty": ["exact"] }
+        ]
+    }));
+    assert_eq!(error.path, "steps[1].certainty");
+}
+
+/// The `guards_of` step (#2443 slice 2) parses from both frontends, lowers to
+/// the same typed step, and types its pipeline end to end.
+///
+/// The step takes no option axis: a guard row carries its predicate as a
+/// column, so an author narrows with `:where` rather than with a filter the
+/// registry would have to keep in step with the IR enum.
+#[test]
+fn guard_steps_parse_and_lower_from_both_frontends() {
+    let query = parse_ok(json!({
+        "schema_version": 1,
+        "match": { "kind": "function", "name": "handler" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "guards_of" }
+        ]
+    }));
+    assert_eq!(
+        query.plan.steps,
+        vec![QueryStep::ProcedureOf, QueryStep::GuardsOf]
+    );
+    assert_eq!(query.validate_steps().unwrap(), QueryValueKind::Guard);
+
+    let rql = CodeQuery::from_sexp("(guards-of (procedure-of (function :name \"handler\")))")
+        .expect("guard RQL should lower");
+    assert_eq!(rql.schema_version, SCHEMA_VERSION);
+    assert_eq!(rql.plan.steps, query.plan.steps);
+    assert_eq!(rql.to_canonical_json(), query.to_canonical_json());
+}
+
+/// The typed algebra refuses `guards_of` over anything but a procedure, and the
+/// step carries no option axis, so one borrowed from a sibling step is rejected
+/// on its own path rather than silently ignored.
+#[test]
+fn guard_steps_reject_wrong_inputs_and_borrowed_options() {
+    let error = error_of(json!({
+        "schema_version": 1,
+        "match": { "kind": "function" },
+        "steps": [{ "op": "guards_of" }]
+    }));
+    assert!(error.message.contains("procedure"), "{error:?}");
+
+    let error = error_of(json!({
+        "schema_version": 1,
+        "match": { "kind": "function" },
+        "steps": [
+            { "op": "procedure_of" },
+            { "op": "guards_of", "control_relation": ["dominates"] }
+        ]
+    }));
+    assert_eq!(error.path, "steps[1].control_relation");
+}
+
+/// The three project-topology steps (#2448) parse from both frontends, lower
+/// to the same typed steps, and type their pipeline end to end.
+///
+/// The chain is the one an architecture rule writes: a file's declared target,
+/// and that target's declared dependencies.
+#[test]
+fn topology_steps_parse_and_lower_from_both_frontends() {
+    let query = parse_ok(json!({
+        "schema_version": 1,
+        "match": { "kind": "class", "name": "Order" },
+        "steps": [
+            { "op": "file_of" },
+            { "op": "target_of" },
+            { "op": "topology_edges_of" }
+        ]
+    }));
+    assert_eq!(
+        query.plan.steps,
+        vec![
+            QueryStep::FileOf,
+            QueryStep::TargetOf,
+            QueryStep::TopologyEdgesOf,
+        ]
+    );
+    assert_eq!(
+        query.validate_steps().unwrap(),
+        QueryValueKind::TopologyEdge
+    );
+
+    let rql =
+        CodeQuery::from_sexp("(topology-edges-of (target-of (file-of (class :name \"Order\"))))")
+            .expect("topology RQL should lower");
+    assert_eq!(rql.schema_version, SCHEMA_VERSION);
+    assert_eq!(rql.plan.steps, query.plan.steps);
+    assert_eq!(rql.to_canonical_json(), query.to_canonical_json());
+
+    let source_set = CodeQuery::from_sexp("(source-set-of (file-of (class :name \"Order\")))")
+        .expect("source-set-of RQL should lower");
+    assert_eq!(
+        source_set.plan.steps,
+        vec![QueryStep::FileOf, QueryStep::SourceSetOf]
+    );
+    assert_eq!(
+        source_set.validate_steps().unwrap(),
+        QueryValueKind::SourceSet
+    );
+}
+
+/// The typed algebra refuses each topology step over anything but its declared
+/// input, so a rule cannot ask a source file for its dependencies or a source
+/// set for its edges.
+#[test]
+fn topology_steps_reject_wrong_inputs() {
+    let error = error_of(json!({
+        "schema_version": 1,
+        "match": { "kind": "class" },
+        "steps": [{ "op": "target_of" }]
+    }));
+    assert!(error.message.contains("file"), "{error:?}");
+
+    let error = error_of(json!({
+        "schema_version": 1,
+        "match": { "kind": "class" },
+        "steps": [{ "op": "file_of" }, { "op": "topology_edges_of" }]
+    }));
+    assert!(error.message.contains("build_target"), "{error:?}");
+
+    let error = error_of(json!({
+        "schema_version": 1,
+        "match": { "kind": "class" },
+        "steps": [
+            { "op": "file_of" },
+            { "op": "source_set_of" },
+            { "op": "topology_edges_of" }
+        ]
+    }));
+    assert!(error.message.contains("build_target"), "{error:?}");
+
+    // The steps carry no option axis at all, so one borrowed from a sibling
+    // step is rejected on its own path rather than silently ignored.
+    let error = error_of(json!({
+        "schema_version": 1,
+        "match": { "kind": "class" },
+        "steps": [
+            { "op": "file_of" },
+            { "op": "target_of", "certainty": ["exact"] }
+        ]
+    }));
+    assert_eq!(error.path, "steps[1].certainty");
 }
 
 /// The bounded rewrite-path vocabulary (#1480) parses from both frontends,

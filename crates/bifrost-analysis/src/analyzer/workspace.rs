@@ -5,36 +5,39 @@ use crate::analyzer::languages::language_support;
 use crate::analyzer::multi_analyzer::{WorkspaceBuildContext, build_language_delegate};
 use crate::analyzer::semantic_model::{
     DependencyDiscoveryEvidence, DependencyDiscoveryOutcome, DependencyPackAdapter,
-    DependencyPackLimits, DependencyPackPreparationOutcome, SemanticModelActivationPersistence,
-    SemanticModelActivationRequest, SemanticModelRuntimeOutcome, SemanticPackCatalog,
+    DependencyPackLimits, DependencyPackPreparationOutcome, DependencyResolver,
+    DependencyResolverBounds, SemanticModelActivationPersistence, SemanticModelActivationRequest,
+    SemanticModelRuntimeOutcome, SemanticPackCatalog, SubprocessPolicy,
     acquire_active_semantic_models_with_evidence, prepare_dependency_semantic_packs,
 };
 use crate::analyzer::store::StoreError;
+use crate::analyzer::tree_sitter_analyzer::WorkspaceBuildSnapshot;
 use crate::analyzer::{
-    AnalyzerConfig, AnalyzerDelegate, BuildProgress, CSharpDependencyPackAdapter,
-    GoDependencyPackAdapter, IAnalyzer, JsTsDependencyPackAdapter, JvmDependencyPackAdapter,
-    Language, MultiAnalyzer, Project, PythonDependencyPackAdapter, RubyDependencyPackAdapter,
-    RustDependencyPackAdapter, resolve_csharp_semantic_pack_dependencies,
-    resolve_go_semantic_pack_dependencies, resolve_js_ts_semantic_pack_dependencies,
-    resolve_jvm_semantic_pack_dependencies, resolve_python_semantic_pack_dependencies,
-    resolve_ruby_semantic_pack_dependencies, resolve_rust_semantic_pack_dependencies,
+    AnalyzerBuildTierAccess, AnalyzerConfig, AnalyzerDelegate, BuildProgress,
+    CSharpDependencyPackAdapter, GoDependencyPackAdapter, IAnalyzer, JsTsDependencyPackAdapter,
+    JvmDependencyDiscoveryMode, JvmDependencyPackAdapter, Language, MultiAnalyzer, Project,
+    PythonDependencyPackAdapter, RubyDependencyPackAdapter, RustDependencyPackAdapter,
+    resolve_csharp_semantic_pack_dependencies, resolve_go_semantic_pack_dependencies,
+    resolve_js_ts_semantic_pack_dependencies, resolve_jvm_semantic_pack_dependencies,
+    resolve_python_semantic_pack_dependencies, resolve_ruby_semantic_pack_dependencies,
+    resolve_rust_semantic_pack_dependencies,
 };
 use crate::profiling;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-struct InitialBuildLock {
+struct WorkspaceBuildLock {
     _file: File,
-    marker_path: PathBuf,
 }
 
-impl InitialBuildLock {
+impl WorkspaceBuildLock {
     fn acquire(db_path: &Path) -> Result<Self, StoreError> {
+        // Keep the established sidecar name so processes running older Bifrost
+        // builds coordinate on the same OS lock during an upgrade.
         let lock_path = analyzer_sidecar_path(db_path, ".initial-build.lock");
         let file = OpenOptions::new()
             .create(true)
@@ -44,41 +47,17 @@ impl InitialBuildLock {
             .open(&lock_path)
             .map_err(|error| {
                 StoreError::new(format!(
-                    "failed to open initial analyzer build lock {}: {error}",
+                    "failed to open workspace analyzer build lock {}: {error}",
                     lock_path.display()
                 ))
             })?;
         file.lock().map_err(|error| {
             StoreError::new(format!(
-                "failed to acquire initial analyzer build lock {}: {error}",
+                "failed to acquire workspace analyzer build lock {}: {error}",
                 lock_path.display()
             ))
         })?;
-        Ok(Self {
-            _file: file,
-            marker_path: analyzer_sidecar_path(db_path, ".initial-build.complete"),
-        })
-    }
-
-    fn publish_complete(self) -> Result<(), StoreError> {
-        let parent = self.marker_path.parent().ok_or_else(|| {
-            StoreError::new(format!(
-                "initial analyzer build marker has no parent: {}",
-                self.marker_path.display()
-            ))
-        })?;
-        let _ = std::fs::remove_file(&self.marker_path);
-        let mut marker = tempfile::NamedTempFile::new_in(parent)?;
-        marker.write_all(b"complete\n")?;
-        marker.as_file().sync_all()?;
-        marker.persist(&self.marker_path).map_err(|error| {
-            StoreError::new(format!(
-                "failed to publish initial analyzer build marker {}: {}",
-                self.marker_path.display(),
-                error.error
-            ))
-        })?;
-        Ok(())
+        Ok(Self { _file: file })
     }
 }
 
@@ -86,26 +65,6 @@ fn analyzer_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
     let mut path = OsString::from(db_path.as_os_str());
     path.push(suffix);
     PathBuf::from(path)
-}
-
-fn initial_build_complete(
-    store_context: &crate::analyzer::AnalyzerStoreContext,
-    db_path: &Path,
-    marker_path: &Path,
-) -> Result<bool, StoreError> {
-    if !marker_path.is_file() {
-        return Ok(false);
-    }
-    store_context
-        .store
-        .has_published_analyzer_rows()
-        .map_err(|error| {
-            error.context(format!(
-                "checking the persisted analyzer store at {}; this cache is derived state, so remove {} and retry to rebuild it",
-                db_path.display(),
-                db_path.display(),
-            ))
-        })
 }
 
 #[derive(Clone)]
@@ -384,35 +343,350 @@ impl DependencyPackEcosystem {
     /// activation; missing one would leave stale proof in place, so this table
     /// errs toward invalidating.
     ///
-    /// Reading these files is the whole of discovery: no resolver runs a
-    /// package manager and none opens a network connection.
+    /// Most of discovery is reading these files. Two ecosystems can do more
+    /// than read: JVM discovery in `JvmDependencyDiscoveryMode::OfflineBuildTools`
+    /// runs Maven and Gradle, and Go discovery runs `go list`. Each resolver
+    /// states which through [`DependencyResolver::bounds`], because this
+    /// sentence used to claim no resolver ran a package manager and was wrong
+    /// for exactly those two (#2442).
     pub fn dependency_inputs(self) -> &'static [&'static str] {
+        self.resolver().dependency_inputs()
+    }
+
+    /// The resolver that discovers this ecosystem's dependencies, paired with
+    /// the adapter that turns them into packs.
+    ///
+    /// This registry replaced a hard-coded match in
+    /// [`WorkspaceAnalyzer::activate_dependency_packs`] that restated the
+    /// resolver-to-adapter pairing inline, which is how the activation loop
+    /// came to hold per-ecosystem limit adjustments as well.
+    pub(crate) fn resolver(self) -> &'static dyn DependencyResolver {
         match self {
-            // `is_jvm_dependency_input` is the reader-side predicate for the
-            // same inputs; these are its base names.
-            Self::Jvm => &[
-                "pom.xml",
-                "settings.xml",
-                "build.gradle",
-                "build.gradle.kts",
-                "settings.gradle",
-                "settings.gradle.kts",
-                "gradle.properties",
-                "gradle.lockfile",
-                "libs.versions.toml",
-                "gradle-wrapper.properties",
-            ],
-            Self::DotNet => &["project.assets.json"],
-            Self::Npm => &["package.json", "package-lock.json", "npm-shrinkwrap.json"],
-            // Python discovery reads distribution metadata under the roots the
-            // host configures; there is no project-level manifest it consults.
-            Self::Python => &["METADATA", "RECORD", "top_level.txt"],
-            Self::Go => &["go.mod", "go.sum", "go.work", "go.work.sum", "modules.txt"],
-            Self::Cargo => &["Cargo.toml", "Cargo.lock"],
-            Self::Ruby => &["Gemfile", "Gemfile.lock", "gems.locked"],
-            Self::Composer => &["composer.json", "composer.lock", "installed.json"],
-            Self::Cpp => &["compile_commands.json"],
+            Self::Jvm => &JvmDependencyResolver,
+            Self::DotNet => &DotNetDependencyResolver,
+            Self::Npm => &NpmDependencyResolver,
+            Self::Python => &PythonDependencyResolver,
+            Self::Go => &GoDependencyResolver,
+            Self::Cargo => &CargoDependencyResolver,
+            Self::Ruby => &RubyDependencyResolver,
+            Self::Composer => &ComposerDependencyResolver,
+            Self::Cpp => &CppDependencyResolver,
         }
+    }
+}
+
+/// The bounds a resolver that only reads files declares: no process, no clock
+/// of its own, and a walk bounded by the project's file listing and
+/// `DependencyPackLimits`.
+const READS_FILES_ONLY: DependencyResolverBounds = DependencyResolverBounds {
+    max_files_walked: None,
+    max_metadata_bytes: None,
+    subprocess: SubprocessPolicy::Forbidden,
+    wall_clock: None,
+};
+
+struct JvmDependencyResolver;
+
+impl DependencyResolver for JvmDependencyResolver {
+    fn adapter(&self) -> &'static dyn DependencyPackAdapter {
+        &JvmDependencyPackAdapter
+    }
+
+    fn dependency_inputs(&self) -> &'static [&'static str] {
+        // `is_jvm_dependency_input` is the reader-side predicate for the same
+        // inputs; these are its base names.
+        &[
+            "pom.xml",
+            "settings.xml",
+            "build.gradle",
+            "build.gradle.kts",
+            "settings.gradle",
+            "settings.gradle.kts",
+            "gradle.properties",
+            "gradle.lockfile",
+            "libs.versions.toml",
+            "gradle-wrapper.properties",
+        ]
+    }
+
+    fn bounds(&self, config: &AnalyzerConfig) -> DependencyResolverBounds {
+        let discovery = &config.jvm.dependency_discovery;
+        let runs_tools = discovery.mode == JvmDependencyDiscoveryMode::OfflineBuildTools;
+        DependencyResolverBounds {
+            max_files_walked: None,
+            max_metadata_bytes: Some(crate::analyzer::jvm::MAX_BUILD_METADATA_BYTES as u64),
+            subprocess: if runs_tools {
+                SubprocessPolicy::OfflineBuildTools
+            } else {
+                SubprocessPolicy::Forbidden
+            },
+            wall_clock: runs_tools.then_some(discovery.timeout),
+        }
+    }
+
+    fn resolve(
+        &self,
+        config: &AnalyzerConfig,
+        project: &dyn Project,
+        limits: &DependencyPackLimits,
+        cancellation: Option<&crate::CancellationToken>,
+    ) -> DependencyDiscoveryOutcome {
+        resolve_jvm_semantic_pack_dependencies(&config.jvm, project, limits, cancellation)
+    }
+}
+
+struct DotNetDependencyResolver;
+
+impl DependencyResolver for DotNetDependencyResolver {
+    fn adapter(&self) -> &'static dyn DependencyPackAdapter {
+        &CSharpDependencyPackAdapter
+    }
+
+    fn dependency_inputs(&self) -> &'static [&'static str] {
+        &["project.assets.json"]
+    }
+
+    fn bounds(&self, _config: &AnalyzerConfig) -> DependencyResolverBounds {
+        READS_FILES_ONLY
+    }
+
+    fn resolve(
+        &self,
+        config: &AnalyzerConfig,
+        project: &dyn Project,
+        limits: &DependencyPackLimits,
+        cancellation: Option<&crate::CancellationToken>,
+    ) -> DependencyDiscoveryOutcome {
+        resolve_csharp_semantic_pack_dependencies(&config.csharp, project, limits, cancellation)
+    }
+}
+
+struct NpmDependencyResolver;
+
+impl DependencyResolver for NpmDependencyResolver {
+    fn adapter(&self) -> &'static dyn DependencyPackAdapter {
+        &JsTsDependencyPackAdapter
+    }
+
+    fn dependency_inputs(&self) -> &'static [&'static str] {
+        &["package.json", "package-lock.json", "npm-shrinkwrap.json"]
+    }
+
+    fn bounds(&self, _config: &AnalyzerConfig) -> DependencyResolverBounds {
+        READS_FILES_ONLY
+    }
+
+    fn resolve(
+        &self,
+        config: &AnalyzerConfig,
+        project: &dyn Project,
+        limits: &DependencyPackLimits,
+        cancellation: Option<&crate::CancellationToken>,
+    ) -> DependencyDiscoveryOutcome {
+        resolve_js_ts_semantic_pack_dependencies(
+            &config.js_ts.dependency_discovery,
+            project,
+            limits,
+            cancellation,
+        )
+    }
+}
+
+struct PythonDependencyResolver;
+
+impl DependencyResolver for PythonDependencyResolver {
+    fn adapter(&self) -> &'static dyn DependencyPackAdapter {
+        &PythonDependencyPackAdapter
+    }
+
+    fn dependency_inputs(&self) -> &'static [&'static str] {
+        // Python discovery reads distribution metadata under the roots the
+        // host configures; there is no project-level manifest it consults.
+        &["METADATA", "RECORD", "top_level.txt"]
+    }
+
+    fn bounds(&self, config: &AnalyzerConfig) -> DependencyResolverBounds {
+        DependencyResolverBounds {
+            max_files_walked: config
+                .python
+                .environment
+                .as_ref()
+                .map(|environment| environment.limits.max_files_per_distribution),
+            ..READS_FILES_ONLY
+        }
+    }
+
+    fn adjust_limits(&self, config: &AnalyzerConfig, limits: &mut DependencyPackLimits) {
+        if let Some(environment) = &config.python.environment {
+            limits.max_artifacts_per_dependency = limits
+                .max_artifacts_per_dependency
+                .max(environment.limits.max_files_per_distribution);
+        }
+    }
+
+    fn resolve(
+        &self,
+        config: &AnalyzerConfig,
+        project: &dyn Project,
+        limits: &DependencyPackLimits,
+        cancellation: Option<&crate::CancellationToken>,
+    ) -> DependencyDiscoveryOutcome {
+        resolve_python_semantic_pack_dependencies(&config.python, project, limits, cancellation)
+    }
+}
+
+struct GoDependencyResolver;
+
+impl DependencyResolver for GoDependencyResolver {
+    fn adapter(&self) -> &'static dyn DependencyPackAdapter {
+        &GoDependencyPackAdapter
+    }
+
+    fn dependency_inputs(&self) -> &'static [&'static str] {
+        &["go.mod", "go.sum", "go.work", "go.work.sum", "modules.txt"]
+    }
+
+    fn bounds(&self, config: &AnalyzerConfig) -> DependencyResolverBounds {
+        let discovery = &config.go.dependency_discovery;
+        DependencyResolverBounds {
+            subprocess: if discovery.enabled {
+                // `go list` under the bounded-process runner, with a cleared
+                // environment and the module cache the configuration names.
+                SubprocessPolicy::OfflineBuildTools
+            } else {
+                SubprocessPolicy::Forbidden
+            },
+            wall_clock: discovery.enabled.then_some(discovery.timeout),
+            ..READS_FILES_ONLY
+        }
+    }
+
+    fn resolve(
+        &self,
+        config: &AnalyzerConfig,
+        project: &dyn Project,
+        limits: &DependencyPackLimits,
+        cancellation: Option<&crate::CancellationToken>,
+    ) -> DependencyDiscoveryOutcome {
+        resolve_go_semantic_pack_dependencies(&config.go, project, limits, cancellation)
+    }
+}
+
+struct CargoDependencyResolver;
+
+impl DependencyResolver for CargoDependencyResolver {
+    fn adapter(&self) -> &'static dyn DependencyPackAdapter {
+        &RustDependencyPackAdapter
+    }
+
+    fn dependency_inputs(&self) -> &'static [&'static str] {
+        &["Cargo.toml", "Cargo.lock"]
+    }
+
+    fn bounds(&self, _config: &AnalyzerConfig) -> DependencyResolverBounds {
+        READS_FILES_ONLY
+    }
+
+    fn resolve(
+        &self,
+        config: &AnalyzerConfig,
+        project: &dyn Project,
+        limits: &DependencyPackLimits,
+        cancellation: Option<&crate::CancellationToken>,
+    ) -> DependencyDiscoveryOutcome {
+        resolve_rust_semantic_pack_dependencies(&config.rust, project, limits, cancellation)
+    }
+}
+
+struct RubyDependencyResolver;
+
+impl DependencyResolver for RubyDependencyResolver {
+    fn adapter(&self) -> &'static dyn DependencyPackAdapter {
+        &RubyDependencyPackAdapter
+    }
+
+    fn dependency_inputs(&self) -> &'static [&'static str] {
+        &["Gemfile", "Gemfile.lock", "gems.locked"]
+    }
+
+    fn bounds(&self, _config: &AnalyzerConfig) -> DependencyResolverBounds {
+        READS_FILES_ONLY
+    }
+
+    fn resolve(
+        &self,
+        config: &AnalyzerConfig,
+        project: &dyn Project,
+        limits: &DependencyPackLimits,
+        cancellation: Option<&crate::CancellationToken>,
+    ) -> DependencyDiscoveryOutcome {
+        resolve_ruby_semantic_pack_dependencies(&config.ruby, project, limits, cancellation)
+    }
+}
+
+struct ComposerDependencyResolver;
+
+impl DependencyResolver for ComposerDependencyResolver {
+    fn adapter(&self) -> &'static dyn DependencyPackAdapter {
+        &crate::analyzer::php::PhpDependencyPackAdapter
+    }
+
+    fn dependency_inputs(&self) -> &'static [&'static str] {
+        &["composer.json", "composer.lock", "installed.json"]
+    }
+
+    fn bounds(&self, _config: &AnalyzerConfig) -> DependencyResolverBounds {
+        READS_FILES_ONLY
+    }
+
+    fn adjust_limits(&self, _config: &AnalyzerConfig, limits: &mut DependencyPackLimits) {
+        // Composer emits one artifact per autoload rule so a PSR-4 prefix stays
+        // bound to the files it admits. Discovery caps the rule count itself,
+        // so the artifact budget only has to admit that cap.
+        limits.max_artifacts_per_dependency = limits
+            .max_artifacts_per_dependency
+            .max(crate::analyzer::php::PHP_MAX_AUTOLOAD_RULES_PER_PACKAGE);
+    }
+
+    fn resolve(
+        &self,
+        config: &AnalyzerConfig,
+        project: &dyn Project,
+        limits: &DependencyPackLimits,
+        cancellation: Option<&crate::CancellationToken>,
+    ) -> DependencyDiscoveryOutcome {
+        crate::analyzer::php::resolve_php_semantic_pack_dependencies(
+            &config.php,
+            project,
+            limits,
+            cancellation,
+        )
+    }
+}
+
+struct CppDependencyResolver;
+
+impl DependencyResolver for CppDependencyResolver {
+    fn adapter(&self) -> &'static dyn DependencyPackAdapter {
+        &CppDependencyPackAdapter
+    }
+
+    fn dependency_inputs(&self) -> &'static [&'static str] {
+        &["compile_commands.json"]
+    }
+
+    fn bounds(&self, _config: &AnalyzerConfig) -> DependencyResolverBounds {
+        READS_FILES_ONLY
+    }
+
+    fn resolve(
+        &self,
+        _config: &AnalyzerConfig,
+        project: &dyn Project,
+        limits: &DependencyPackLimits,
+        cancellation: Option<&crate::CancellationToken>,
+    ) -> DependencyDiscoveryOutcome {
+        resolve_cpp_semantic_pack_dependencies(project, limits, cancellation)
     }
 }
 
@@ -471,6 +745,18 @@ impl WorkspaceAnalyzer {
     /// Discover, prepare, and publish exact local dependency packs as one
     /// analyzer-generation transaction. Diagnostic requests only read the
     /// published result and never call this host-owned method.
+    ///
+    /// Failure is per ecosystem (#2442). An ecosystem whose discovery is
+    /// incomplete, or whose preparation is, contributes no evidence and leaves
+    /// the whole outcome incomplete, but its siblings still activate: a
+    /// workspace with an unreadable `Cargo.lock` used to lose its npm packs
+    /// too, which is the same false-green shape as reporting a clean run from
+    /// evidence that was never read. Only cancellation stops the transaction,
+    /// because a cancelled token says the caller is gone rather than that one
+    /// ecosystem is unreadable.
+    ///
+    /// Publication still requires something to publish: when every requested
+    /// ecosystem failed, nothing is acquired and no host is asked to refresh.
     pub fn activate_dependency_packs(
         &self,
         config: &AnalyzerConfig,
@@ -480,137 +766,58 @@ impl WorkspaceAnalyzer {
         let mut outcomes = Vec::with_capacity(ecosystems.len());
         let mut activation = context.activation.clone();
         let mut publication_evidence = Vec::with_capacity(ecosystems.len());
+        let mut cancelled = false;
 
         for ecosystem in ecosystems.iter().copied() {
+            let resolver = ecosystem.resolver();
             let mut limits = context.limits;
-            if ecosystem == DependencyPackEcosystem::Python
-                && let Some(environment) = &config.python.environment
-            {
-                limits.max_artifacts_per_dependency = limits
-                    .max_artifacts_per_dependency
-                    .max(environment.limits.max_files_per_distribution);
-            }
-            // Composer emits one artifact per autoload rule so a PSR-4 prefix
-            // stays bound to the files it admits. Discovery caps the rule count
-            // itself, so the artifact budget only has to admit that cap.
-            if ecosystem == DependencyPackEcosystem::Composer {
-                limits.max_artifacts_per_dependency = limits
-                    .max_artifacts_per_dependency
-                    .max(crate::analyzer::php::PHP_MAX_AUTOLOAD_RULES_PER_PACKAGE);
-            }
-            let (discovery, adapter): (DependencyDiscoveryOutcome, &dyn DependencyPackAdapter) =
-                match ecosystem {
-                    DependencyPackEcosystem::Jvm => (
-                        resolve_jvm_semantic_pack_dependencies(
-                            &config.jvm,
-                            self.analyzer().project(),
-                            &limits,
-                            Some(context.cancellation),
-                        ),
-                        &JvmDependencyPackAdapter,
-                    ),
-                    DependencyPackEcosystem::DotNet => (
-                        resolve_csharp_semantic_pack_dependencies(
-                            &config.csharp,
-                            self.analyzer().project(),
-                            &limits,
-                            Some(context.cancellation),
-                        ),
-                        &CSharpDependencyPackAdapter,
-                    ),
-                    DependencyPackEcosystem::Npm => (
-                        resolve_js_ts_semantic_pack_dependencies(
-                            &config.js_ts.dependency_discovery,
-                            self.analyzer().project(),
-                            &limits,
-                            Some(context.cancellation),
-                        ),
-                        &JsTsDependencyPackAdapter,
-                    ),
-                    DependencyPackEcosystem::Python => (
-                        resolve_python_semantic_pack_dependencies(
-                            &config.python,
-                            self.analyzer().project(),
-                            &limits,
-                            Some(context.cancellation),
-                        ),
-                        &PythonDependencyPackAdapter,
-                    ),
-                    DependencyPackEcosystem::Go => (
-                        resolve_go_semantic_pack_dependencies(
-                            &config.go,
-                            self.analyzer().project(),
-                            &limits,
-                            Some(context.cancellation),
-                        ),
-                        &GoDependencyPackAdapter,
-                    ),
-                    DependencyPackEcosystem::Cargo => (
-                        resolve_rust_semantic_pack_dependencies(
-                            &config.rust,
-                            self.analyzer().project(),
-                            &limits,
-                            Some(context.cancellation),
-                        ),
-                        &RustDependencyPackAdapter,
-                    ),
-                    DependencyPackEcosystem::Ruby => (
-                        resolve_ruby_semantic_pack_dependencies(
-                            &config.ruby,
-                            self.analyzer().project(),
-                            &limits,
-                            Some(context.cancellation),
-                        ),
-                        &RubyDependencyPackAdapter,
-                    ),
-                    DependencyPackEcosystem::Composer => (
-                        crate::analyzer::php::resolve_php_semantic_pack_dependencies(
-                            &config.php,
-                            self.analyzer().project(),
-                            &limits,
-                            Some(context.cancellation),
-                        ),
-                        &crate::analyzer::php::PhpDependencyPackAdapter,
-                    ),
-                    DependencyPackEcosystem::Cpp => (
-                        resolve_cpp_semantic_pack_dependencies(
-                            self.analyzer().project(),
-                            &limits,
-                            Some(context.cancellation),
-                        ),
-                        &CppDependencyPackAdapter,
-                    ),
-                };
-            if discovery.cancelled || !discovery.complete {
+            resolver.adjust_limits(config, &mut limits);
+            let discovery = resolver.resolve(
+                config,
+                self.analyzer().project(),
+                &limits,
+                Some(context.cancellation),
+            );
+            if discovery.cancelled {
+                cancelled = true;
                 outcomes.push(DependencyPackEcosystemOutcome {
                     ecosystem,
                     discovery,
                     preparation: None,
                 });
-                return DependencyPackActivationOutcome {
-                    ecosystems: outcomes,
-                    runtime: None,
-                    diagnostic_refresh_required: false,
-                };
+                break;
+            }
+            if !discovery.complete {
+                outcomes.push(DependencyPackEcosystemOutcome {
+                    ecosystem,
+                    discovery,
+                    preparation: None,
+                });
+                continue;
             }
             let preparation = prepare_dependency_semantic_packs(
                 context.catalog,
-                adapter,
+                resolver.adapter(),
                 &discovery.dependencies,
                 &limits,
                 Some(context.cancellation),
             );
+            if preparation.cancelled {
+                cancelled = true;
+                outcomes.push(DependencyPackEcosystemOutcome {
+                    ecosystem,
+                    discovery,
+                    preparation: Some(preparation),
+                });
+                break;
+            }
             if !preparation.complete {
                 outcomes.push(DependencyPackEcosystemOutcome {
                     ecosystem,
                     discovery,
                     preparation: Some(preparation),
                 });
-                return DependencyPackActivationOutcome {
-                    ecosystems: outcomes,
-                    runtime: None,
-                    diagnostic_refresh_required: false,
-                };
+                continue;
             }
             activation
                 .evidence
@@ -624,6 +831,14 @@ impl WorkspaceAnalyzer {
                 discovery,
                 preparation: Some(preparation),
             });
+        }
+
+        if cancelled || (!ecosystems.is_empty() && publication_evidence.is_empty()) {
+            return DependencyPackActivationOutcome {
+                ecosystems: outcomes,
+                runtime: None,
+                diagnostic_refresh_required: false,
+            };
         }
 
         activation.evidence.sort();
@@ -743,11 +958,49 @@ impl WorkspaceAnalyzer {
         Self::build_filtered(project, config, None, store_context, None)
     }
 
+    /// Build an analyzer and retain the tier crossings paid while constructing
+    /// it. The observer is finished before the result is returned, so later
+    /// incremental work cannot contaminate the open report.
+    #[doc(hidden)]
+    pub fn build_ephemeral_with_tier_access(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+    ) -> Result<(Self, Arc<AnalyzerBuildTierAccess>), StoreError> {
+        let observer = Arc::new(AnalyzerBuildTierAccess::new_active());
+        let mut store_context = crate::analyzer::ephemeral_store_context(project.as_ref())?;
+        store_context.build_tier_access = Arc::clone(&observer);
+        let workspace = Self::build_filtered(project, config, None, store_context, None)?;
+        observer.finish();
+        Ok((workspace, observer))
+    }
+
     pub fn build_persisted(
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
     ) -> Result<Self, StoreError> {
-        Self::build_persisted_inner(project, config, None)
+        Self::build_persisted_inner(project, config, None, true, None)
+    }
+
+    /// Build a persisted analyzer whose cache is collected only when the host
+    /// explicitly requests it.
+    pub fn build_persisted_without_automatic_gc(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+    ) -> Result<Self, StoreError> {
+        Self::build_persisted_inner(project, config, None, false, None)
+    }
+
+    /// Persisted counterpart of [`Self::build_ephemeral_with_tier_access`].
+    #[doc(hidden)]
+    pub fn build_persisted_with_tier_access(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+    ) -> Result<(Self, Arc<AnalyzerBuildTierAccess>), StoreError> {
+        let observer = Arc::new(AnalyzerBuildTierAccess::new_active());
+        let workspace =
+            Self::build_persisted_inner(project, config, None, true, Some(Arc::clone(&observer)))?;
+        observer.finish();
+        Ok((workspace, observer))
     }
 
     /// Progress-reporting variant of `build_persisted`.
@@ -759,30 +1012,25 @@ impl WorkspaceAnalyzer {
     where
         F: Fn(crate::analyzer::BuildProgressEvent) + Send + Sync + 'static,
     {
-        Self::build_persisted_inner(project, config, Some(Arc::new(progress)))
+        Self::build_persisted_inner(project, config, Some(Arc::new(progress)), true, None)
     }
 
     fn build_persisted_inner(
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
         progress: Option<BuildProgress>,
+        automatic_gc: bool,
+        tier_access: Option<Arc<AnalyzerBuildTierAccess>>,
     ) -> Result<Self, StoreError> {
-        let store_context = crate::analyzer::persistent_store_context(project.as_ref())?;
-        let Some(db_path) = store_context.store.db_path().map(Path::to_path_buf) else {
-            return Self::build_filtered(project, config, None, store_context, progress);
+        let mut store_context = if automatic_gc {
+            crate::analyzer::persistent_store_context(project.as_ref())?
+        } else {
+            crate::analyzer::persistent_store_context_without_automatic_gc(project.as_ref())?
         };
-        let marker_path = analyzer_sidecar_path(&db_path, ".initial-build.complete");
-        if initial_build_complete(&store_context, &db_path, &marker_path)? {
-            return Self::build_filtered(project, config, None, store_context, progress);
+        if let Some(tier_access) = tier_access {
+            store_context.build_tier_access = tier_access;
         }
-        let lock = InitialBuildLock::acquire(&db_path)?;
-        if initial_build_complete(&store_context, &db_path, &marker_path)? {
-            drop(lock);
-            return Self::build_filtered(project, config, None, store_context, progress);
-        }
-        let workspace = Self::build_filtered(project, config, None, store_context, progress)?;
-        lock.publish_complete()?;
-        Ok(workspace)
+        Self::build_filtered(project, config, None, store_context, progress)
     }
 
     fn build_filtered(
@@ -793,10 +1041,19 @@ impl WorkspaceAnalyzer {
         progress: Option<BuildProgress>,
     ) -> Result<Self, StoreError> {
         let _scope = profiling::scope("WorkspaceAnalyzer::build");
+        // Persisted workspaces share parsed blobs, so serialize the complete
+        // reconciliation, not just the first population. Otherwise concurrent
+        // worktrees all snapshot the same missing set and each creates a full
+        // analyzer pool before any of them can publish reusable results.
+        let build_lock = store_context
+            .store
+            .db_path()
+            .map(WorkspaceBuildLock::acquire)
+            .transpose()?;
         // A fresh abort per fan-out. The caller's context may outlive this
         // build and go on to serve lazy per-language delegate builds, and those
         // must not inherit a flag this build set.
-        let store_context = crate::analyzer::AnalyzerStoreContext {
+        let mut store_context = crate::analyzer::AnalyzerStoreContext {
             build_abort: Arc::new(crate::analyzer::BuildAbort::default()),
             ..store_context
         };
@@ -809,6 +1066,20 @@ impl WorkspaceAnalyzer {
                 .collect(),
             _ => project_languages.into_iter().collect(),
         };
+        #[cfg(test)]
+        let startup_oid_batches = store_context
+            .liveness
+            .as_ref()
+            .map(|liveness| liveness.startup_oid_batch_counter());
+        // Capture one immutable listing and one startup identity projection
+        // before the language fan-out. The snapshot is consumed by delegate
+        // construction and cleared before the retained build context is made,
+        // so watcher-driven updates never serve stale startup state.
+        store_context.workspace_snapshot = WorkspaceBuildSnapshot::capture(
+            project.as_ref(),
+            store_context.liveness.as_deref(),
+            &selected_languages,
+        );
         // One build thread per language: a single language with one pathological
         // file (a vendored million-line generated parser.c, say) otherwise
         // serializes ahead of every other language's build and dominates cold
@@ -881,27 +1152,48 @@ impl WorkspaceAnalyzer {
             delegates.insert(language, delegate?);
         }
 
-        let build_context = Arc::new(WorkspaceBuildContext::new(
+        store_context.workspace_snapshot = None;
+
+        let build_context = WorkspaceBuildContext::new(
             Arc::clone(&project),
             config,
             store_context,
             requested_languages.cloned(),
-        ));
+        );
+        #[cfg(test)]
+        let build_context =
+            build_context.with_startup_oid_batch_counter_for_test(startup_oid_batches);
+        let build_context = Arc::new(build_context);
 
-        Ok(if delegates.is_empty() {
+        let workspace = if delegates.is_empty() {
             Self::Empty(EmptyAnalyzer::new_for_workspace(build_context))
         } else {
             Self::Multi(Box::new(MultiAnalyzer::new_for_workspace(
                 delegates,
                 build_context,
             )))
-        })
+        };
+        drop(build_lock);
+        Ok(workspace)
     }
 
     pub fn analyzer(&self) -> &dyn IAnalyzer {
         match self {
             Self::Empty(analyzer) => analyzer,
             Self::Multi(analyzer) => analyzer.as_ref(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn startup_oid_batch_count_for_test(&self) -> usize {
+        match self {
+            Self::Empty(analyzer) => analyzer
+                .build_context
+                .as_deref()
+                .map_or(0, WorkspaceBuildContext::startup_oid_batch_count_for_test),
+            Self::Multi(analyzer) => analyzer
+                .build_context()
+                .map_or(0, WorkspaceBuildContext::startup_oid_batch_count_for_test),
         }
     }
 
@@ -1019,7 +1311,7 @@ impl WorkspaceAnalyzer {
 
     /// Check one retained semantic identity and report the exact source bytes
     /// read so callers can enforce an aggregate validation budget.
-    pub(crate) fn semantic_artifact_key_is_current_with_source_bytes(
+    pub fn semantic_artifact_key_is_current_with_source_bytes(
         &self,
         key: &crate::analyzer::semantic::SemanticArtifactKey,
         max_source_bytes: usize,
@@ -1194,9 +1486,199 @@ impl WorkspaceAnalyzer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::{OverlayProject, ProjectFile, TestProject};
+    use crate::analyzer::store::liveness::Liveness;
+    use crate::analyzer::{
+        FilesystemProject, MultiRootProject, OverlayProject, Project, ProjectFile, TestProject,
+    };
     use crate::gitblob::test_repo::{commit_all, init_repo};
     use rusqlite::Connection;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn git_multilanguage_build_reuses_constructor_listing_and_one_oid_batch() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("Sample.java"), "class Sample {}\n").unwrap();
+        std::fs::write(root.join("sample.py"), "class SamplePy:\n    pass\n").unwrap();
+        let repository = init_repo(&root);
+        commit_all(&repository, "multi-language workspace");
+
+        let project = Arc::new(FilesystemProject::new(&root).unwrap());
+        let workspace = WorkspaceAnalyzer::build_ephemeral(
+            Arc::clone(&project) as Arc<dyn Project>,
+            AnalyzerConfig::default(),
+        )
+        .expect("ephemeral multi-language workspace");
+
+        assert_eq!(
+            project.workspace_file_listing_count(),
+            1,
+            "the constructor listing should seed the one build snapshot"
+        );
+        assert_eq!(workspace.startup_oid_batch_count_for_test(), 1);
+        assert!(
+            workspace
+                .analyzer()
+                .declarations(&ProjectFile::new(&root, "Sample.java"))
+                .iter()
+                .any(|unit| unit.identifier() == "Sample")
+        );
+        assert!(
+            workspace
+                .analyzer()
+                .declarations(&ProjectFile::new(&root, "sample.py"))
+                .iter()
+                .any(|unit| unit.identifier() == "SamplePy")
+        );
+
+        let late = ProjectFile::new(&root, "late.go");
+        std::fs::write(late.abs_path(), "package late\n").unwrap();
+        assert!(project.all_files_shared().unwrap().contains(&late));
+        assert_eq!(
+            project.workspace_file_listing_count(),
+            2,
+            "manual sessions must return to a fresh walk after the build seed"
+        );
+    }
+
+    #[test]
+    fn non_git_multilanguage_build_reuses_one_listing_without_live_oids() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("Sample.java"), "class Sample {}\n").unwrap();
+        std::fs::write(root.join("sample.py"), "class SamplePy:\n    pass\n").unwrap();
+        let project = Arc::new(TestProject::from_root_with_inferred_languages(&root).unwrap());
+        let workspace = WorkspaceAnalyzer::build_ephemeral(
+            Arc::clone(&project) as Arc<dyn Project>,
+            AnalyzerConfig::default(),
+        )
+        .expect("ephemeral non-Git workspace");
+
+        assert_eq!(project.workspace_file_listing_count(), 1);
+        assert_eq!(workspace.startup_oid_batch_count_for_test(), 0);
+        assert!(workspace.analyzer().languages().contains(&Language::Java));
+        assert!(workspace.analyzer().languages().contains(&Language::Python));
+    }
+
+    #[test]
+    fn multi_root_build_consumes_each_constructor_seed_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let java_root = root.join("java");
+        let python_root = root.join("python");
+        std::fs::create_dir_all(&java_root).unwrap();
+        std::fs::create_dir_all(&python_root).unwrap();
+        std::fs::write(java_root.join("Sample.java"), "class Sample {}\n").unwrap();
+        std::fs::write(python_root.join("sample.py"), "class SamplePy:\n    pass\n").unwrap();
+
+        let project = Arc::new(MultiRootProject::new([java_root, python_root]).unwrap());
+        let workspace = WorkspaceAnalyzer::build_ephemeral(
+            Arc::clone(&project) as Arc<dyn Project>,
+            AnalyzerConfig::default(),
+        )
+        .expect("ephemeral multi-root workspace");
+
+        assert_eq!(project.workspace_file_listing_count(), 2);
+        assert!(workspace.analyzer().languages().contains(&Language::Java));
+        assert!(workspace.analyzer().languages().contains(&Language::Python));
+
+        let late = root.join("java").join("late.go");
+        std::fs::write(&late, "package late\n").unwrap();
+        let late_file = ProjectFile::new(&root, "java/late.go");
+        assert!(project.all_files_shared().unwrap().contains(&late_file));
+        assert_eq!(project.workspace_file_listing_count(), 4);
+    }
+
+    #[test]
+    fn build_snapshot_hashes_overlay_source_once_as_an_overlay_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let file = ProjectFile::new(&root, "Sample.java");
+        std::fs::write(file.abs_path(), "class Disk {}\n").unwrap();
+        let repository = init_repo(&root);
+        commit_all(&repository, "overlay source");
+
+        let base: Arc<dyn Project> = Arc::new(FilesystemProject::new(&root).unwrap());
+        let overlay = Arc::new(OverlayProject::new(base));
+        let overlay_source = "class Overlay {}\n";
+        assert!(overlay.set(file.abs_path(), overlay_source.to_owned()));
+        let repository = crate::gitblob::discover(&root).unwrap();
+        let liveness = Liveness::new(repository).unwrap();
+        let snapshot =
+            WorkspaceBuildSnapshot::capture(overlay.as_ref(), Some(&liveness), &[Language::Java])
+                .expect("Git-backed overlay snapshot");
+        let entry = snapshot
+            .live_entry(overlay.as_ref(), &file)
+            .expect("overlay live entry");
+        assert_eq!(
+            liveness.startup_oid_batch_counter().load(Ordering::Relaxed),
+            0
+        );
+        let expected =
+            git2::Oid::hash_object(git2::ObjectType::Blob, overlay_source.as_bytes()).unwrap();
+        assert_eq!(entry.oid(), expected);
+        assert!(entry.is_overlay());
+
+        let updated_overlay_source = "class OverlayTwo {}\n";
+        assert!(overlay.set(file.abs_path(), updated_overlay_source.to_owned()));
+        assert!(snapshot.live_entry(overlay.as_ref(), &file).is_none());
+        let refreshed =
+            WorkspaceBuildSnapshot::capture(overlay.as_ref(), Some(&liveness), &[Language::Java])
+                .expect("refreshed overlay snapshot");
+        let refreshed_entry = refreshed
+            .live_entry(overlay.as_ref(), &file)
+            .expect("refreshed overlay live entry");
+        let refreshed_expected =
+            git2::Oid::hash_object(git2::ObjectType::Blob, updated_overlay_source.as_bytes())
+                .unwrap();
+        assert_eq!(refreshed_entry.oid(), refreshed_expected);
+
+        let workspace = WorkspaceAnalyzer::build_ephemeral(
+            Arc::clone(&overlay) as Arc<dyn Project>,
+            AnalyzerConfig::default(),
+        )
+        .expect("ephemeral overlay workspace");
+        assert!(
+            workspace
+                .analyzer()
+                .declarations(&file)
+                .iter()
+                .any(|unit| unit.identifier() == "OverlayTwo")
+        );
+    }
+
+    #[test]
+    fn build_snapshot_rejects_changed_disk_identity_and_recomputes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let file = ProjectFile::new(&root, "Sample.java");
+        std::fs::write(file.abs_path(), "class Disk {}").unwrap();
+        let repository = init_repo(&root);
+        commit_all(&repository, "disk source");
+
+        let project = FilesystemProject::new(&root).unwrap();
+        let repository = crate::gitblob::discover(&root).unwrap();
+        let liveness = Liveness::new(repository).unwrap();
+        let snapshot =
+            WorkspaceBuildSnapshot::capture(&project, Some(&liveness), &[Language::Java])
+                .expect("Git-backed disk snapshot");
+        let old_oid = snapshot
+            .live_entry(&project, &file)
+            .expect("disk live entry")
+            .oid();
+
+        std::fs::write(file.abs_path(), "class DiskUpdated {}").unwrap();
+        assert!(snapshot.live_entry(&project, &file).is_none());
+
+        let refreshed =
+            WorkspaceBuildSnapshot::capture(&project, Some(&liveness), &[Language::Java])
+                .expect("refreshed disk snapshot");
+        let new_oid = refreshed
+            .live_entry(&project, &file)
+            .expect("refreshed disk live entry")
+            .oid();
+        assert_ne!(old_oid, new_oid);
+    }
 
     #[test]
     fn semantic_generation_check_rejects_a_stale_configuration_identity() {
@@ -1371,7 +1853,7 @@ mod tests {
         let disk_workspace =
             WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default())
                 .expect("persisted analyzer should build");
-        let disk_provider = disk_workspace.analyzer().structural_search_providers()[0];
+        let disk_provider = disk_workspace.analyzer().structural_fact_providers()[0];
         let disk_facts = disk_provider.structural_facts(&file).unwrap();
         let disk_fact_count = disk_facts.nodes().len();
         assert_eq!(disk_facts.source(), disk_source);
@@ -1380,7 +1862,7 @@ mod tests {
         assert!(overlay.set(file.abs_path(), overlay_source.to_owned()));
         let overlay_workspace =
             disk_workspace.clone_with_project(Arc::clone(&overlay) as Arc<dyn Project>);
-        let overlay_provider = overlay_workspace.analyzer().structural_search_providers()[0];
+        let overlay_provider = overlay_workspace.analyzer().structural_fact_providers()[0];
         let extractions_before = overlay_provider.structural_extraction_count();
         let overlay_facts = overlay_provider.structural_facts(&file).unwrap();
         assert_eq!(overlay_facts.source(), overlay_source);
@@ -1395,7 +1877,7 @@ mod tests {
 
         let disk_reopened = WorkspaceAnalyzer::build_persisted(project, AnalyzerConfig::default())
             .expect("persisted analyzer should reopen");
-        let disk_provider = disk_reopened.analyzer().structural_search_providers()[0];
+        let disk_provider = disk_reopened.analyzer().structural_fact_providers()[0];
         let hydrated_before = disk_provider.structural_hydration_count();
         let disk_facts = disk_provider.structural_facts(&file).unwrap();
         assert_eq!(disk_facts.source(), disk_source);

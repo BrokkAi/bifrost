@@ -1739,10 +1739,15 @@ pub fn acquire_active_semantic_models_with_evidence(
         "{request_key}:{}:{}",
         catalog_identity.mutation_generation, catalog_identity.sqlite_data_version
     );
-    let generations = analyzer.snapshot_source_generations();
+    // The activation guard asks whether the analyzer snapshot moved underneath
+    // this resolution. Comparing the whole optional identity keeps an analyzer
+    // that states none (an empty workspace) on its previous behavior instead of
+    // reporting a permanent mismatch.
+    let snapshot_content = analyzer.workspace_content_identity();
+    let content_is_current = || analyzer.workspace_content_identity() == snapshot_content;
     let Some(caches) = analyzer.snapshot_caches() else {
         let outcome = resolve_active_semantic_models(catalog, request, cancellation);
-        if !analyzer.snapshot_generations_match(&generations) {
+        if !content_is_current() {
             return stale_generation_outcome(request.limits);
         }
         if let SemanticModelResolutionOutcome::Ready(active) = &outcome
@@ -1755,7 +1760,7 @@ pub fn acquire_active_semantic_models_with_evidence(
     let (acquisition, _) = caches.semantic_models().values.acquire(&key, cancellation);
     match acquisition {
         CompleteValueAcquisition::Cached { value } => {
-            if !analyzer.snapshot_generations_match(&generations) {
+            if !content_is_current() {
                 return stale_generation_outcome(request.limits);
             }
             if let Err(error) = publish_active_models(catalog, persistence, &value) {
@@ -1780,7 +1785,7 @@ pub fn acquire_active_semantic_models_with_evidence(
             let SemanticModelResolutionOutcome::Ready(active) = outcome else {
                 return runtime_outcome(outcome, SemanticModelRuntimeLifecycle::Built);
             };
-            if !analyzer.snapshot_generations_match(&generations) {
+            if !content_is_current() {
                 return stale_generation_outcome(request.limits);
             }
             let active = Arc::new(active);

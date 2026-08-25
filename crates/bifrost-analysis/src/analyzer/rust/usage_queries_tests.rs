@@ -18,6 +18,7 @@ mod tests {
     use brokk_bifrost_rust::usage::{ModuleKey, RustImportExtent, RustSymbolNamespace};
     use brokk_bifrost_rust::usage_queries::RustUsageQueries;
     use brokk_bifrost_rust::usage_queries::compose_module;
+    use std::sync::Arc;
     /// Two files with modules, imports, a re-export, and a name that occurs in
     /// one file's code and another file's comment only.
     fn analyzer_with_fixture() -> (tempfile::TempDir, RustAnalyzer, ProjectFile, ProjectFile) {
@@ -186,6 +187,41 @@ mod tests {
             "a module-scope `use` has module reach: {:?}",
             worker_bindings[0].extent
         );
+    }
+
+    #[test]
+    fn repeated_import_binding_reads_decode_one_file_once() {
+        let (_temp, analyzer, lib, _worker) = analyzer_with_fixture();
+        let queries = RustUsageQueries::new(&analyzer);
+
+        let first = queries.import_bindings_of(&lib);
+        let second = queries.import_bindings_of(&lib);
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(queries.import_binding_computations(), 1);
+    }
+
+    #[test]
+    fn prederived_module_keys_match_the_canonical_constructor() {
+        let (_temp, analyzer, lib, worker) = analyzer_with_fixture();
+        let leaf = analyzed_file(&analyzer, "leaf.rs");
+        let queries = RustUsageQueries::new(&analyzer);
+
+        for file in [&lib, &worker, &leaf] {
+            let identity = queries.path_identity_of(file);
+            for module in [
+                identity.package.as_str(),
+                identity.crate_root_package.as_str(),
+                "unrelated.relative.module",
+                "",
+            ] {
+                assert_eq!(
+                    queries.module_key_of(file, module),
+                    ModuleKey::new(file, module),
+                    "prederived key differs for {file:?} and {module:?}"
+                );
+            }
+        }
     }
 
     /// The inverted lookups are the candidate half of the design. They must

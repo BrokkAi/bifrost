@@ -72,7 +72,7 @@ The action exposes these outputs for later steps:
 
 ## Analyzer cache
 
-The action caches `.bifrost/cache` at the checkout root. The database keys rows by Git blob object ID, so a cache saved on one branch stays valid for every file that other branches did not change. A pull-request run restores the most recent cache and re-analyzes only the files it changed. The cache saves when the job completes successfully, so a gate that fails does not write one. Keep the workflow enabled and green on the default branch so pull requests always find a warm cache to restore.
+The action caches `.bifrost/cache` at the checkout root. Cache entries are separated by runner OS, runner architecture, and the selected Bifrost version, which avoids cross-architecture and cross-version restores. The database keys rows by Git blob object ID, so a cache saved on one branch stays valid for every file that other branches did not change. A pull-request run restores the most recent cache and re-analyzes only the files it changed. The cache saves when the job completes successfully, so a gate that fails does not write one. Keep the workflow enabled and green on the default branch so pull requests always find a warm cache to restore.
 
 ## New findings on pull requests
 

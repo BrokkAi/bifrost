@@ -5,7 +5,7 @@
 # Two callers need exactly this set: scripts/public/check-workspace-packages.sh, which
 # proves the archives are well formed, and scripts/public/package-release-crates.sh,
 # which builds the archives a readiness run qualifies. Until this file existed
-# both carried their own copy of the list and of the eighteen Cargo patch
+# both carried their own copy of the list and of the nineteen Cargo patch
 # arguments, so adding a crate to one and not the other would qualify a release
 # that silently omits it.
 #
@@ -23,11 +23,12 @@ RELEASE_CRATES=(
   brokk-bifrost-python
   brokk-bifrost-ruby
   brokk-bifrost-rust
-  brokk-bifrost-rql
   brokk-bifrost-analysis
+  brokk-bifrost-flow
   brokk-bifrost-nlp
-  brokk-bifrost-policy
+  brokk-bifrost-rql
   brokk-bifrost-semantic-packs
+  brokk-bifrost-policy
   brokk-bifrost-runtime
   brokk-bifrost-mcp
   brokk-bifrost-lsp

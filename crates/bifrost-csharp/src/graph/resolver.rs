@@ -1127,43 +1127,37 @@ fn member_declared_type_fq_name_inner(
     usage: bool,
     session: Option<&ResolutionSession>,
 ) -> Option<String> {
-    let member_fqn = format!("{}.{}", owner.fq_name(), member_name);
-    let candidates = if usage {
-        resolution_query_rows(session, || {
-            graph_support::usage_member_candidates_for_owner(
-                csharp,
-                token,
-                owner.fq_name().as_str(),
-                member_name,
-            )
-        })
-    } else {
-        resolution_query_limited_rows(
-            session,
-            |limit| {
-                csharp.member_candidates_for_owner_limited(
-                    owner.fq_name().as_str(),
-                    member_name,
-                    limit,
-                    &mut || session.is_none_or(ResolutionSession::observe_cancellation),
-                )
-            },
-            || {
-                csharp
-                    .member_candidates_for_owner(owner.fq_name().as_str(), member_name)
-                    .into_iter()
-                    .collect()
-            },
-        )
-    };
+    // A member named by an unqualified identifier can be declared by the owner
+    // itself or inherited from an ancestor, so take the same nearest-member walk
+    // the call and shadowing paths use. Asking only the owner's own members left
+    // an inherited field's declared type unknown, and the caller then mistook the
+    // field name for a visible type of the same name.
+    let graph = CSharpGraphSource::from_source(csharp);
+    let candidates = nearest_member_candidates_for_owner_inner(
+        &graph,
+        csharp,
+        token,
+        owner,
+        member_name,
+        None,
+        None,
+        usage,
+        session,
+    );
     let mut resolved_types = Vec::new();
     for unit in candidates {
         if !resolution_scope_step(session) {
             return None;
         }
-        if !unit.is_field() || unit.fq_name() != member_fqn {
+        if !unit.is_field() {
             continue;
         }
+        // The declared type text is written in the declaring type's scope, so a
+        // type nested in that ancestor must be resolved against it, not against
+        // the type the member was reached through.
+        let declaring = resolution_query(session, || graph.index.parent_of(&unit))
+            .flatten()
+            .unwrap_or_else(|| owner.clone());
         let metadata = resolution_query_limited_rows(
             session,
             |limit| csharp.signature_metadata_limited(&unit, limit),
@@ -1176,7 +1170,7 @@ fn member_declared_type_fq_name_inner(
                     csharp,
                     token,
                     unit.source(),
-                    owner,
+                    &declaring,
                     identity,
                     session,
                 )
@@ -1192,7 +1186,7 @@ fn member_declared_type_fq_name_inner(
                     csharp,
                     token,
                     unit.source(),
-                    owner,
+                    &declaring,
                     &declared_type,
                     usage,
                 )

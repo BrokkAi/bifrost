@@ -1,6 +1,6 @@
-use super::{build_java_edges, with_java_graph_source};
-use crate::analyzer::tree_sitter_analyzer::FileState;
+use super::{build_java_edges, scan_java_file_replayable};
 use crate::analyzer::usages::common::language_for_file;
+use crate::analyzer::usages::inverted_edges::EdgeNodeDomain;
 use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
@@ -9,15 +9,9 @@ use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::analyzer::{
     BulkFileStateSource, CodeUnit, IAnalyzer, JavaAnalyzer, Language, ProjectFile, resolve_analyzer,
 };
-use crate::hash::HashMap;
 use crate::hash::HashSet;
-use brokk_bifrost_jvm::java::graph::extractor::{ReturnTypeCaches, ScanState, scan_file};
-use brokk_bifrost_jvm::java::graph::resolver::TargetSpec;
-use brokk_bifrost_jvm::java::graph::return_type::{
-    FileReturnCache, MethodAnonymousReturnCache, MethodReturnCache,
-};
+use brokk_bifrost_jvm::java::graph::extractor::ScanState;
 use std::collections::BTreeSet;
-use std::sync::Mutex;
 
 pub(crate) struct JavaQueryResolver<'a> {
     java: &'a JavaAnalyzer,
@@ -42,8 +36,17 @@ impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
         let Some(target) = overloads.first() else {
             return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
         };
+        let uncancelled = crate::CancellationToken::new();
+        let cancellation = scan_scope.cancellation().unwrap_or(&uncancelled);
+        let relational_session =
+            crate::analyzer::relational_frontier::RelationalFrontierSession::new(
+                analyzer,
+                cancellation,
+            );
         let target_spec_scope = crate::profiling::scope("java_graph::target_spec");
-        let Some(spec) = TargetSpec::from_targets(self.java, token, overloads) else {
+        let Some(spec) = brokk_bifrost_jvm::java::graph::resolver::TargetSpec::from_targets(
+            self.java, overloads,
+        ) else {
             return GraphUsageOutcome::fallback_safe(
                 target.fq_name(),
                 GraphFailureReason::UnsupportedTargetShape("target shape is unsupported"),
@@ -67,15 +70,6 @@ impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
         let mut unproven_hits: BTreeSet<UsageHit> = BTreeSet::new();
         let mut raw_match_count = 0usize;
         let mut limit_exceeded = false;
-        let method_return_cache: MethodReturnCache = Mutex::new(HashMap::default());
-        let method_anonymous_return_cache: MethodAnonymousReturnCache =
-            Mutex::new(HashMap::default());
-        let file_return_cache: FileReturnCache = Mutex::new(HashMap::default());
-        let return_caches = ReturnTypeCaches {
-            method_return: &method_return_cache,
-            method_anonymous_return: &method_anonymous_return_cache,
-            file_return: &file_return_cache,
-        };
         let mut state = ScanState {
             max_usages,
             hits: &mut hits,
@@ -83,23 +77,34 @@ impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
             raw_match_count: &mut raw_match_count,
             limit_exceeded: &mut limit_exceeded,
         };
-        with_java_graph_source(analyzer, |graph| {
-            for file in files {
-                let _scan_scope = crate::profiling::scope("java_graph::scan_file");
-                scan_file(
-                    self.java,
-                    token,
-                    &graph,
-                    &file,
-                    &spec,
-                    &return_caches,
-                    &mut state,
-                );
-                if *state.limit_exceeded {
-                    break;
+        for file in &files {
+            let _scan_scope = crate::profiling::scope("java_graph::scan_file");
+            match scan_java_file_replayable(
+                &relational_session,
+                analyzer,
+                self.java,
+                token,
+                file,
+                &spec,
+                &mut state,
+            ) {
+                crate::analyzer::RelationalFrontierOutcome::Complete(()) => {}
+                crate::analyzer::RelationalFrontierOutcome::Cancelled => break,
+                crate::analyzer::RelationalFrontierOutcome::Failed(error) => {
+                    crate::profiling::note_with(|| {
+                        format!("Java file frontier failed: {}", error.message())
+                    });
+                    return GraphUsageOutcome::fallback_safe(
+                        target.fq_name(),
+                        GraphFailureReason::UnsupportedTargetShape("a Java file frontier failed"),
+                        "JavaUsageGraphStrategy",
+                    );
                 }
             }
-        });
+            if *state.limit_exceeded {
+                break;
+            }
+        }
         let _scala_scope = crate::profiling::scope("java_graph::scan_scala_files");
         super::scan_scala_files_for_java_target(analyzer, candidate_files, &spec, &mut state, None);
         drop(_scala_scope);
@@ -140,7 +145,6 @@ impl<'a> UsageQueryResolver<'a> for JavaQueryResolver<'a> {
 pub(crate) struct JavaEdgeResolver<'a> {
     java: &'a JavaAnalyzer,
     files: Vec<ProjectFile>,
-    file_states: HashMap<ProjectFile, FileState>,
 }
 
 /// The whole-workspace `caller -> callee` scan behind this language's
@@ -156,12 +160,7 @@ impl<'a> JavaEdgeResolver<'a> {
             .ok()?
             .into_iter()
             .collect();
-        let file_states = java.bulk_file_states(files.clone(), BulkFileStateSource::Omit);
-        Some(Self {
-            java,
-            files,
-            file_states,
-        })
+        Some(Self { java, files })
     }
 
     pub(crate) fn build_edges<F>(
@@ -173,12 +172,49 @@ impl<'a> JavaEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
+        let selected_files: Vec<_> = self
+            .files
+            .iter()
+            .filter(|file| keep_file(file))
+            .cloned()
+            .collect();
+        let file_states = self
+            .java
+            .bulk_file_states(selected_files, BulkFileStateSource::Omit);
         build_java_edges(
             analyzer,
             self.java,
             &self.files,
-            &self.file_states,
-            nodes,
+            &file_states,
+            EdgeNodeDomain::Closed(nodes),
+            keep_file,
+        )
+    }
+
+    pub(crate) fn build_rooted_edges<F>(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        callers: &HashSet<String>,
+        keep_file: F,
+    ) -> UsageEdges
+    where
+        F: Fn(&ProjectFile) -> bool + Sync,
+    {
+        let selected_files: Vec<_> = self
+            .files
+            .iter()
+            .filter(|file| keep_file(file))
+            .cloned()
+            .collect();
+        let file_states = self
+            .java
+            .bulk_file_states(selected_files, BulkFileStateSource::Omit);
+        build_java_edges(
+            analyzer,
+            self.java,
+            &self.files,
+            &file_states,
+            EdgeNodeDomain::Rooted(callers),
             keep_file,
         )
     }
@@ -192,12 +228,21 @@ impl<'a> JavaEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
+        let selected_files: Vec<_> = self
+            .files
+            .iter()
+            .filter(|file| keep_file(file))
+            .cloned()
+            .collect();
+        let file_states = self
+            .java
+            .bulk_file_states(selected_files, BulkFileStateSource::Omit);
         build_java_edges(
             analyzer,
             self.java,
             &self.files,
-            &self.file_states,
-            nodes,
+            &file_states,
+            EdgeNodeDomain::Closed(nodes),
             keep_file,
         )
     }

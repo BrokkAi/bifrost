@@ -27,6 +27,7 @@
 use crate::compile_context::CppCompileContext;
 use crate::graph::CppWorkspaceSource;
 use crate::graph::resolver::SourceUsingIndex;
+use crate::identity::CppCallableUnitRole;
 use crate::imports::IncludeTargetIndex;
 use brokk_bifrost_core::analyzer::capabilities::{TypeAliasProvider, TypeHierarchyProvider};
 use brokk_bifrost_core::analyzer::model::{CppFieldLinkage, CppTemplateMetadata};
@@ -39,6 +40,10 @@ use std::sync::Arc;
 pub trait CppSource:
     CodeUnitIndex + TypeAliasProvider + TypeHierarchyProvider + CppWorkspaceSource
 {
+    /// The callable role recorded for a physical stored declaration, without
+    /// consulting reconciliation fallbacks that may themselves be building.
+    fn stored_callable_unit_role(&self, callable: &CodeUnit) -> CppCallableUnitRole;
+
     /// The workspace-wide `#include` resolution table, built once per analyzer
     /// generation from [`IncludeTargetIndex::build`].
     fn include_target_index(&self) -> &IncludeTargetIndex;

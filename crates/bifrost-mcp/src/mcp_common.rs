@@ -250,6 +250,24 @@ pub(crate) fn attach_run_policy_correlation(
     }
 }
 
+pub(crate) fn attach_run_policy_correlation_result(
+    mut output: rmcp::model::CallToolResult,
+    request_correlation_id: Option<&str>,
+) -> rmcp::model::CallToolResult {
+    let Some(request_correlation_id) = request_correlation_id else {
+        return output;
+    };
+    if let Some(structured) = output.structured_content.as_mut()
+        && let Some(object) = structured.as_object_mut()
+    {
+        object.insert(
+            "request_correlation_id".to_string(),
+            Value::String(request_correlation_id.to_string()),
+        );
+    }
+    output
+}
+
 pub(crate) const UNBOUND_WORKSPACE_MESSAGE: &str = "Bifrost is not bound to a workspace. The MCP client must provide an approved filesystem root via roots/list or Codex sandbox-state metadata, or configure Bifrost with --root or BIFROST_WORKSPACE_ROOT.";
 
 pub(crate) fn fit_get_summaries_output_to_budget(
@@ -331,6 +349,7 @@ fn degrade_get_summaries_value(
                     code: SearchToolsServiceErrorCode::Internal,
                     message: "list_symbols returned non-structured output during MCP budgeting"
                         .to_string(),
+                    retryable_stale_generation: false,
                 });
             };
             structured =
@@ -359,6 +378,7 @@ fn degrade_get_summaries_value(
                     code: SearchToolsServiceErrorCode::Internal,
                     message: "list_symbols returned non-structured output during MCP budgeting"
                         .to_string(),
+                    retryable_stale_generation: false,
                 });
             };
             structured =

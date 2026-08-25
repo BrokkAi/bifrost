@@ -28,13 +28,10 @@ use std::borrow::Cow;
 use std::sync::OnceLock;
 use tree_sitter::Language as TsLanguage;
 
-// v11 is the last salt this struct will ever cost. Signature metadata now
-// lives in the typed columns that migration 0023 created, so a new signature
-// fact is an `ALTER TABLE ... ADD COLUMN ... DEFAULT ...` in a new migration
-// and never a field on a serialized struct. Add the column; do not bump this
-// salt. A migration re-keys the store file by schema version and invalidates
-// nothing, while a salt bump throws away every analyzer row for every language
-// in every cache on every machine.
+// Signature metadata now lives in the typed columns that migration 0023
+// created, so adding a signature fact does not justify an epoch bump: add a
+// column with a compatible default. Bump this salt only when existing content
+// rows cannot be transformed by SQL, as in v12 below.
 //
 // v11: merge of two v10 bumps made independently on both sides of a branch.
 // One added `SignatureMetadata::field_has_initializer`; the other added the
@@ -50,7 +47,10 @@ use tree_sitter::Language as TsLanguage;
 // and Scala and TypeScript now emit one row per binding rather than one per
 // declaration. `binder_span` (#1600) rides along as a column on that row
 // rather than as a bincode field, because the blob it used to live in is gone.
-const STORE_EPOCH_SALT: &str = "analyzer-blob-store-v11-signature-metadata-merge";
+// v12: schema 26 makes `code_unit_fq_segments` the authoritative structured
+// identity and adds indexed content-tail projections. SQL cannot backfill the
+// FQ2 blob into rows, so old generations must be republished once.
+const STORE_EPOCH_SALT: &str = "analyzer-blob-store-v12-relational-fq-names";
 
 /// Returns the analysis epoch for a language as a hex string.
 ///
@@ -567,12 +567,25 @@ mod query_content_tests {
 // runnable.
 // Salt bumped again (#1862): plain top-level fields in scripts now use the
 // shared program-scope identity. Warm rows used a file-qualified identity.
+// Salt bumped again (#2597): the JavaScript and TypeScript declaration walks
+// now record callable modifier metadata -- static, constructor, and the fact
+// that the adapter read the modifier nodes at all. Both dialect salts carry the
+// bump: `.js` files can be parsed through the TS grammar, and both walks
+// changed. Rows persisted before it deserialize as "nobody read the modifiers",
+// so `receiver_contract_of` reports no contract and every JS/TS procedure
+// summary stays inert on a warm workspace with no error raised anywhere.
 lang_epoch!(
     JavaScript,
     "javascript",
     "treesitter/javascript/",
-    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07;js-ts-query-assets-in-brokk-bifrost-js-ts-2026-08;structured-class-field-properties-2026-08;ts-overload-declaration-only-metadata-2026-08;program-scope-plain-value-identities-2026-08"
+    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07;js-ts-query-assets-in-brokk-bifrost-js-ts-2026-08;structured-class-field-properties-2026-08;ts-overload-declaration-only-metadata-2026-08;program-scope-plain-value-identities-2026-08;js-ts-callable-modifier-metadata-2026-08"
 );
+
+#[cfg(test)]
+pub(super) fn javascript_epoch_before_callable_modifier_metadata() -> String {
+    let prior = salt_before_bump(JavaScript::SALT, "js-ts-callable-modifier-metadata-2026-08");
+    compute_epoch::<JavaScript>(&tree_sitter_javascript::LANGUAGE.into(), prior)
+}
 // TS salt bumped again (#1167): `is_simple_ts_initializer` now includes
 // `regex` (a regex-initialized binding renders its initializer inline in the
 // skeleton instead of dropping it, matching JS), and a module-scope
@@ -593,16 +606,24 @@ lang_epoch!(
 // the function, so the persisted unit set for such a file gains rows that warm
 // rows do not have. Only TypeScript's salt moves: the walk that changed reads
 // a type annotation, which `.js` and `.jsx` files cannot carry.
+// Salt bumped again (#2597): callable modifier metadata, described at the
+// JavaScript salt above. Both dialects changed, so both salts move.
 lang_epoch!(
     TypeScript,
     "typescript",
     "treesitter/typescript/",
-    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07;js-ts-query-assets-in-brokk-bifrost-js-ts-2026-08;ts-overload-declaration-only-metadata-2026-08;program-scope-plain-value-identities-2026-08;ts-inline-return-type-members-2026-08"
+    "synthetic-file-scope-code-units-2026-07;anonymous-default-export-units-2026-07;fq-interned-segments-2026-07;js-ts-drift-parity-2026-07;js-ts-query-assets-in-brokk-bifrost-js-ts-2026-08;ts-overload-declaration-only-metadata-2026-08;program-scope-plain-value-identities-2026-08;ts-inline-return-type-members-2026-08;js-ts-callable-modifier-metadata-2026-08"
 );
 
 #[cfg(test)]
 pub(super) fn typescript_epoch_before_inline_return_type_members() -> String {
     let prior = salt_before_bump(TypeScript::SALT, "ts-inline-return-type-members-2026-08");
+    compute_epoch::<TypeScript>(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(), prior)
+}
+
+#[cfg(test)]
+pub(super) fn typescript_epoch_before_callable_modifier_metadata() -> String {
+    let prior = salt_before_bump(TypeScript::SALT, "js-ts-callable-modifier-metadata-2026-08");
     compute_epoch::<TypeScript>(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(), prior)
 }
 // Salt bumped (#1548 stage 3 fleet): the Python `.scm` query assets moved from
@@ -687,11 +708,14 @@ pub(super) fn rust_epoch_before_anchored_fq_encoding() -> String {
 // this crate's `resources/treesitter/php/` into `brokk-bifrost-php`, so the
 // salted content now comes from a different crate's `include_str!`. The bytes are
 // unchanged, which is exactly why the salt has to carry the relocation.
+// Salt bumped again: callable and property signature metadata now carries the
+// parser-derived, namespace- and alias-resolved nominal return identity. Warm
+// rows contain only display text and cannot serve the relational second phase.
 lang_epoch!(
     Php,
     "php",
     "treesitter/php/",
-    "synthetic-file-scope-code-units-2026-07;ast-test-detection-2026-07;fq-interned-segments-2026-07;conditional-free-function-declarations-2026-07;php-query-assets-in-brokk-bifrost-php-2026-08"
+    "synthetic-file-scope-code-units-2026-07;ast-test-detection-2026-07;fq-interned-segments-2026-07;conditional-free-function-declarations-2026-07;php-query-assets-in-brokk-bifrost-php-2026-08;structured-declared-return-identities-2026-08"
 );
 
 /// The PHP epoch as it stood before the #1420 conditional-free-function bump.
@@ -782,17 +806,26 @@ lang_epoch!(
 // own name without re-parsing the declaring file. A companion indexed before
 // this change carries no metadata at all, and a warm workspace would read every
 // companion as an ordinary nested object — losing every `Base.of()` edge.
+// `kotlin-structured-signature-types-2026-08`: the same parser-derived return,
+// property and extension-receiver names are now persisted as structured type
+// identities. Graph resolution consumes those component vectors and must not
+// read an older row as if the structured identity were genuinely absent.
 // Salt bumped (#1548 stage 3 fleet): Kotlin's `highlights.scm` and grammar
 // binding moved from this crate into `brokk-bifrost-jvm`. Unlike Java's and
 // Scala's, this bump is not forced by the mechanism -- `treesitter/kotlin/`
 // selects no entry in the salted asset set, because Kotlin is
 // declaration-walk-only and neither of its `.scm` files has ever been in
 // `EMBEDDED_QUERIES`. It is here for consistency with its two realm peers.
+// `kotlin-constructor-callable-metadata-2026-08`: primary and secondary
+// constructors now publish `SignatureMetadata::callable_is_constructor`.
+// Candidate discovery consumes that fact to avoid the impossible polymorphic
+// descendant expansion for constructor usage scans, so warm rows with the
+// compatible false default must be re-extracted.
 lang_epoch!(
     Kotlin,
     "kotlin",
     "treesitter/kotlin/",
-    "brokk-tree-sitter-kotlin-0.4.0-2026-08;kotlin-core-indexing-2026-07;kotlin-class-parameter-default-arity-2026-07;kotlin-backtick-identifier-names-2026-07;kotlin-jvm-realm-imports-supertypes-2026-07;kotlin-signature-returns-receivers-2026-07;kotlin-companion-object-marker-2026-07;jvm-query-assets-in-brokk-bifrost-jvm-2026-08"
+    "brokk-tree-sitter-kotlin-0.4.0-2026-08;kotlin-core-indexing-2026-07;kotlin-class-parameter-default-arity-2026-07;kotlin-backtick-identifier-names-2026-07;kotlin-jvm-realm-imports-supertypes-2026-07;kotlin-signature-returns-receivers-2026-07;kotlin-companion-object-marker-2026-07;kotlin-structured-signature-types-2026-08;jvm-query-assets-in-brokk-bifrost-jvm-2026-08;kotlin-constructor-callable-metadata-2026-08"
 );
 
 #[cfg(test)]

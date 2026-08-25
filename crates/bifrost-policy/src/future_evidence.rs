@@ -16,9 +16,7 @@ use serde::{Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
 use brokk_bifrost_analysis::analyzer::canonical_hash::{CanonicalHasher, write_lower_hex};
-pub use brokk_bifrost_analysis::analyzer::typestate::{
-    TypestateBindingPlanHash, TypestateProtocolHash,
-};
+pub use brokk_bifrost_flow::typestate::{TypestateBindingPlanHash, TypestateProtocolHash};
 
 use super::budget::PolicyBudget;
 use super::classification::{MAX_REPORT_PROSE_BYTES, TextValidationError, validate_required_text};
@@ -404,6 +402,7 @@ impl RetainedSize for TaintPolicyProjectionFacts {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaintStrongAnchor {
     sink_identity: StableSemanticIdentity,
+    sink_site_ordinal: u32,
     source_endpoint_analysis_projection_hash: EndpointAnalysisProjectionHash,
     sink_endpoint_analysis_projection_hash: EndpointAnalysisProjectionHash,
     source_scenario_set_hash: SourceScenarioSetHash,
@@ -412,6 +411,20 @@ pub struct TaintStrongAnchor {
 impl TaintStrongAnchor {
     pub const fn sink_identity(&self) -> &StableSemanticIdentity {
         &self.sink_identity
+    }
+
+    /// Which sink site inside `sink_identity` this finding reports.
+    ///
+    /// `sink_identity` names the declaration the sink call sits in, not the
+    /// call, because a semantic key may not carry a positional handle. One
+    /// procedure can hold several sink calls, so without this ordinal each of
+    /// them minted the same finding identity and the projection authority
+    /// rejected the run as a duplicate-identity violation (#2544). It is the
+    /// site's position among the sites sharing that declaration, in source
+    /// order, which is the same construction `MatchStrongAnchor` uses for
+    /// several results inside one owner.
+    pub const fn sink_site_ordinal(&self) -> u32 {
+        self.sink_site_ordinal
     }
 
     pub const fn source_endpoint_analysis_projection_hash(&self) -> EndpointAnalysisProjectionHash {
@@ -447,6 +460,7 @@ pub enum TaintFindingAnchor {
 impl TaintFindingAnchor {
     pub fn strong(
         sink_identity: StableSemanticIdentity,
+        sink_site_ordinal: u32,
         source_endpoint_analysis_projection_hash: EndpointAnalysisProjectionHash,
         sink_endpoint_analysis_projection_hash: EndpointAnalysisProjectionHash,
         source_scenario_set_hash: SourceScenarioSetHash,
@@ -465,6 +479,7 @@ impl TaintFindingAnchor {
         }
         Ok(Self::Strong(TaintStrongAnchor {
             sink_identity,
+            sink_site_ordinal,
             source_endpoint_analysis_projection_hash,
             sink_endpoint_analysis_projection_hash,
             source_scenario_set_hash,
@@ -504,9 +519,10 @@ impl Serialize for TaintFindingAnchor {
     {
         match self {
             Self::Strong(anchor) => {
-                let mut state = serializer.serialize_struct("TaintFindingAnchor", 5)?;
+                let mut state = serializer.serialize_struct("TaintFindingAnchor", 6)?;
                 state.serialize_field("type", "strong")?;
                 state.serialize_field("sink_identity", &anchor.sink_identity)?;
+                state.serialize_field("sink_site_ordinal", &anchor.sink_site_ordinal)?;
                 state.serialize_field(
                     "source_endpoint_analysis_projection_hash",
                     &anchor.source_endpoint_analysis_projection_hash,
@@ -1960,6 +1976,7 @@ pub(crate) fn taint_policy_finding_digest(
         TaintFindingAnchor::Strong(anchor) => {
             update_finding_value(&mut hasher, b"strong");
             update_finding_stable_identity(&mut hasher, &anchor.sink_identity);
+            update_finding_value(&mut hasher, &anchor.sink_site_ordinal.to_be_bytes());
             update_finding_value(
                 &mut hasher,
                 anchor.source_endpoint_analysis_projection_hash.as_bytes(),
@@ -1986,6 +2003,7 @@ pub(crate) fn taint_vulnerability_digest(anchor: &TaintFindingAnchor) -> [u8; 32
         TaintFindingAnchor::Strong(anchor) => {
             update_finding_value(&mut hasher, b"strong");
             update_finding_stable_identity(&mut hasher, &anchor.sink_identity);
+            update_finding_value(&mut hasher, &anchor.sink_site_ordinal.to_be_bytes());
             update_finding_value(
                 &mut hasher,
                 anchor.source_endpoint_analysis_projection_hash.as_bytes(),
@@ -2612,6 +2630,7 @@ mod tests {
         let fact = &projection.source_facts[0];
         let anchor = TaintFindingAnchor::strong(
             stable_identity(StableIdentityDerivation::CanonicalAstIdentity, "sink-call"),
+            0,
             fact.source_endpoint_analysis_projection_hash,
             projection.sink_endpoint_analysis_projection_hash,
             fact.scenario_set_hash,
@@ -2880,6 +2899,7 @@ mod tests {
                 StableIdentityDerivation::CanonicalAstIdentity,
                 "crate::sink/call",
             ),
+            0,
             EndpointAnalysisProjectionHash::from_bytes([1; 32]),
             EndpointAnalysisProjectionHash::from_bytes([2; 32]),
             taint_scenarios,
@@ -2892,6 +2912,7 @@ mod tests {
                     StableIdentityDerivation::CanonicalAstIdentity,
                     "crate::sink/empty",
                 ),
+                0,
                 EndpointAnalysisProjectionHash::from_bytes([1; 32]),
                 EndpointAnalysisProjectionHash::from_bytes([2; 32]),
                 SourceScenarioSetHash::try_from_scenarios(Vec::new()).unwrap(),
@@ -2902,6 +2923,7 @@ mod tests {
         assert_eq!(
             TaintFindingAnchor::strong(
                 stable_identity(StableIdentityDerivation::CatalogEntry, "catalog-sink"),
+                0,
                 EndpointAnalysisProjectionHash::from_bytes([1; 32]),
                 EndpointAnalysisProjectionHash::from_bytes([2; 32]),
                 taint_scenarios,
@@ -2952,6 +2974,7 @@ mod tests {
             SourceScenarioSetHash::try_from_scenarios(vec![source_scenario("path")]).unwrap();
         let taint_anchor = TaintFindingAnchor::strong(
             stable_identity(StableIdentityDerivation::CanonicalAstIdentity, "sink-call"),
+            0,
             EndpointAnalysisProjectionHash::from_bytes([1; 32]),
             EndpointAnalysisProjectionHash::from_bytes([2; 32]),
             source_scenarios,
@@ -2961,6 +2984,26 @@ mod tests {
         assert_eq!(
             taint_id,
             PolicyFindingId::from_taint_anchor(&policy_id, &taint_anchor)
+        );
+
+        // Two sink calls in one declaration share every other anchor field, so
+        // the site ordinal is the only thing that can separate their identities
+        // (#2544).
+        let second_site = TaintFindingAnchor::strong(
+            stable_identity(StableIdentityDerivation::CanonicalAstIdentity, "sink-call"),
+            1,
+            EndpointAnalysisProjectionHash::from_bytes([1; 32]),
+            EndpointAnalysisProjectionHash::from_bytes([2; 32]),
+            source_scenarios,
+        )
+        .unwrap();
+        assert_ne!(
+            taint_id,
+            PolicyFindingId::from_taint_anchor(&policy_id, &second_site)
+        );
+        assert_ne!(
+            taint_vulnerability_digest(&taint_anchor),
+            taint_vulnerability_digest(&second_site)
         );
 
         let projection = typestate_projection();
@@ -3165,6 +3208,7 @@ mod tests {
         let fact = &projection.source_facts[0];
         let anchor = TaintFindingAnchor::strong(
             stable_identity(StableIdentityDerivation::CanonicalAstIdentity, "sink-call"),
+            0,
             fact.source_endpoint_analysis_projection_hash,
             projection.sink_endpoint_analysis_projection_hash,
             fact.scenario_set_hash,

@@ -12,6 +12,7 @@ use crate::analyzer::semantic_model::{
     ResolvedDependency, ResolvedDependencyArtifact, SemanticModelActivationEvidence,
     read_exact_artifact_while,
 };
+use crate::analyzer::topology::DependencyScope;
 use crate::analyzer::{Project, RubyAnalyzerConfig, RubyDependencyApiEvidence, RubyGemApiArtifact};
 use crate::hash::HashSet;
 
@@ -300,6 +301,8 @@ fn resolve_evidence(
                 canonical_archive,
                 archive.sha256().to_owned(),
             )],
+            scope: DependencyScope::Unknown,
+            declared_by: None,
         });
     }
     Ok(resolved)

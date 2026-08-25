@@ -16,6 +16,8 @@ pub(in crate::analyzer::usages) use brokk_bifrost_php::graph::resolver::{
 };
 pub(in crate::analyzer::usages) use brokk_bifrost_php::graph::syntax;
 
+use crate::analyzer::fq_name::{SegmentKind, segment_interner};
+use crate::analyzer::store::StoreError;
 use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::model::FuzzyResult;
@@ -23,33 +25,199 @@ use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::php_graph::shared::{PhpEdgeResolver, PhpQueryResolver};
 use crate::analyzer::usages::traits::GraphUsageAnalyzer;
 use crate::analyzer::usages::traits::{UsageAnalyzer, UsageQueryResolver, UsageScanScope};
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, PhpAnalyzer, ProjectFile, resolve_analyzer};
+use crate::analyzer::{
+    AnalyzerDefinitionLookup, CodeUnit, DefinitionLanguageScope, FqName, IAnalyzer, Language,
+    PhpAnalyzer, ProjectFile, RelationalBatchOutcome, RelationalCallableFact,
+    RelationalDefinitionQuery, RelationalDefinitionQuestion, RelationalDefinitionValue,
+    StructuredTypeName, resolve_analyzer,
+};
+use crate::cancellation::CancellationToken;
+use crate::hash::HashMap;
 use crate::hash::HashSet;
+use brokk_bifrost_core::analyzer::RelationalName;
 use brokk_bifrost_php::graph::resolver::{TargetKind, TargetSpec};
 use brokk_bifrost_php::graph::{PhpCallableFacts, PhpGraphSource};
+use std::sync::Mutex;
 
-/// `UsageFactsIndex` is analysis-owned and its entries are `pub(crate)` here, so
-/// the crate line is drawn at the two answers PHP reads out of it rather than at
-/// the index.
-pub(in crate::analyzer::usages) struct PhpAnalyzerFacts<'a>(
-    pub(in crate::analyzer::usages) &'a dyn IAnalyzer,
-);
+/// Request-local PHP callable facts. Signature rows and return-type definition
+/// candidates are fetched only for declarations the scan reaches; the bounded
+/// lookup memoizes repeated names for the life of this facts source.
+pub(in crate::analyzer::usages) struct PhpAnalyzerFacts<'a> {
+    analyzer: &'a dyn IAnalyzer,
+    definitions: AnalyzerDefinitionLookup<'a>,
+    declaration_returns: Mutex<HashMap<CodeUnit, Option<String>>>,
+    callable_returns: Mutex<HashMap<String, Option<String>>>,
+}
+
+impl<'a> PhpAnalyzerFacts<'a> {
+    pub(in crate::analyzer::usages) fn new(analyzer: &'a dyn IAnalyzer) -> Self {
+        Self {
+            analyzer,
+            definitions: AnalyzerDefinitionLookup::new(analyzer, Language::None),
+            declaration_returns: Mutex::new(HashMap::default()),
+            callable_returns: Mutex::new(HashMap::default()),
+        }
+    }
+
+    fn callable_facts(&self, declarations: &[CodeUnit]) -> Option<Vec<RelationalCallableFact>> {
+        let mut names = declarations
+            .iter()
+            .map(|declaration| declaration.fq().clone())
+            .collect::<Vec<_>>();
+        let mut seen = HashSet::default();
+        names.retain(|name| seen.insert(name.clone()));
+        let questions = names
+            .into_iter()
+            .map(|name| RelationalDefinitionQuestion {
+                language_scope: DefinitionLanguageScope::Language(Language::Php),
+                name: RelationalName::stable(name),
+                query: RelationalDefinitionQuery::CallableFacts,
+            })
+            .collect::<Vec<_>>();
+        let values = self.query(&questions)?;
+        Some(
+            values
+                .into_iter()
+                .flat_map(|value| match value {
+                    RelationalDefinitionValue::CallableFacts(facts) => facts,
+                    _ => unreachable!("PHP callable-facts query returned the wrong shape"),
+                })
+                .collect(),
+        )
+    }
+
+    fn resolved_return_type(&self, facts: &[RelationalCallableFact]) -> Option<String> {
+        let mut names = facts
+            .iter()
+            .map(|fact| {
+                fact.metadata
+                    .as_ref()?
+                    .return_type_identity()?
+                    .nominal_name()
+                    .and_then(php_resolved_type_fq_name)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let mut seen = HashSet::default();
+        names.retain(|name| seen.insert(name.clone()));
+        if names.is_empty() {
+            return None;
+        }
+        let questions = names
+            .into_iter()
+            .map(|name| RelationalDefinitionQuestion {
+                language_scope: DefinitionLanguageScope::Language(Language::Php),
+                name: RelationalName::stable(name),
+                query: RelationalDefinitionQuery::ExactName,
+            })
+            .collect::<Vec<_>>();
+        let values = self.query(&questions)?;
+        let mut resolved = Vec::new();
+        for value in values {
+            let RelationalDefinitionValue::Definitions(units) = value else {
+                unreachable!("PHP return-type query returned the wrong shape")
+            };
+            if units.is_empty() {
+                return None;
+            }
+            resolved.extend(units.into_iter().map(|unit| unit.fq_name()));
+        }
+        resolved.sort();
+        resolved.dedup();
+        (resolved.len() == 1).then(|| resolved.remove(0))
+    }
+
+    fn query(
+        &self,
+        questions: &[RelationalDefinitionQuestion],
+    ) -> Option<Vec<RelationalDefinitionValue>> {
+        if questions.is_empty() {
+            return Some(Vec::new());
+        }
+        let requests = questions
+            .iter()
+            .enumerate()
+            .map(|(ordinal, question)| question.request(ordinal))
+            .collect::<Vec<_>>();
+        match self
+            .analyzer
+            .relational_definition_batch(&requests, &CancellationToken::new())
+        {
+            RelationalBatchOutcome::Complete(results) => {
+                assert_eq!(results.len(), requests.len());
+                Some(results.into_iter().map(|result| result.value).collect())
+            }
+            RelationalBatchOutcome::Cancelled => None,
+            RelationalBatchOutcome::Failed(error) => {
+                self.analyzer
+                    .record_query_failure(StoreError::new(error.message()));
+                None
+            }
+        }
+    }
+}
 
 impl PhpCallableFacts for PhpAnalyzerFacts<'_> {
     fn declaration_return_type_fqn(&self, unit: &CodeUnit) -> Option<String> {
-        self.0
-            .usage_facts_index()
-            .fact_for_declaration(unit)
-            .and_then(|facts| facts.return_type_fqn.as_deref())
-            .map(str::to_string)
+        if let Some(cached) = self
+            .declaration_returns
+            .lock()
+            .expect("PHP declaration return cache poisoned")
+            .get(unit)
+        {
+            return cached.clone();
+        }
+        let facts = self
+            .callable_facts(std::slice::from_ref(unit))?
+            .into_iter()
+            .filter(|fact| fact.declaration == *unit)
+            .collect::<Vec<_>>();
+        let resolved = self.resolved_return_type(&facts);
+        self.declaration_returns
+            .lock()
+            .expect("PHP declaration return cache poisoned")
+            .insert(unit.clone(), resolved.clone());
+        resolved
     }
 
     fn callable_return_type_fqn(&self, callable_fqn: &str) -> Option<String> {
-        self.0
-            .usage_facts_index()
-            .callable_return_type(callable_fqn)
-            .map(str::to_string)
+        if let Some(cached) = self
+            .callable_returns
+            .lock()
+            .expect("PHP callable return cache poisoned")
+            .get(callable_fqn)
+        {
+            return cached.clone();
+        }
+        let mut declarations = self
+            .definitions
+            .fqn(callable_fqn)
+            .into_iter()
+            .filter(CodeUnit::is_function)
+            .collect::<Vec<_>>();
+        declarations.sort();
+        declarations.dedup();
+        let facts = self.callable_facts(&declarations)?;
+        let resolved = self.resolved_return_type(&facts);
+        self.callable_returns
+            .lock()
+            .expect("PHP callable return cache poisoned")
+            .insert(callable_fqn.to_string(), resolved.clone());
+        resolved
     }
+}
+
+fn php_resolved_type_fq_name(name: &StructuredTypeName) -> Option<FqName> {
+    if !name.is_absolute() || !name.lexical_scope().is_empty() {
+        return None;
+    }
+    let (type_name, packages) = name.path().split_last()?;
+    let interner = segment_interner();
+    let mut fq = FqName::new();
+    for package in packages {
+        fq.push(interner.intern(package, SegmentKind::Package));
+    }
+    fq.push(interner.intern(type_name, SegmentKind::Type));
+    Some(fq)
 }
 
 /// The [`PhpGraphSource`] built from the *dispatching* analyzer.
@@ -77,6 +245,18 @@ where
 {
     let resolver = PhpEdgeResolver::try_new(analyzer)?;
     Some(resolver.build_edges(analyzer, nodes, keep_file))
+}
+
+pub(crate) fn build_rooted_php_usage_edges<F>(
+    analyzer: &dyn IAnalyzer,
+    callers: &HashSet<String>,
+    keep_file: F,
+) -> Option<UsageEdges>
+where
+    F: Fn(&ProjectFile) -> bool + Sync,
+{
+    let resolver = PhpEdgeResolver::try_new(analyzer)?;
+    Some(resolver.build_rooted_edges(analyzer, callers, keep_file))
 }
 
 pub(crate) fn build_php_usage_edge_weights<F>(

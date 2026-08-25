@@ -10,10 +10,10 @@
 //! The catalog is data, not prose: it is deterministic, versioned, and carries
 //! no evaluation state.
 
-use brokk_bifrost_analysis::analyzer::structural::search::{
+use brokk_bifrost_rql::structural::search::{
     ALL_DETAILED_CODE_QUERY_DOMAINS, DetailedCodeQueryDomain,
 };
-use brokk_bifrost_analysis::analyzer::structural::{CodeQueryEnumDomain, CodeQueryRowScalarType};
+use brokk_bifrost_rql::structural::{CodeQueryEnumDomain, CodeQueryRowScalarType};
 use serde::Serialize;
 
 use super::ir::{ALL_ROW_EXPANSION_STEPS, expansion_result_domain};

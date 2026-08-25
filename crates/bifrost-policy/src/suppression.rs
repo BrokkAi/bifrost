@@ -840,6 +840,35 @@ pub struct PolicySuppressionLoadOutcome {
     pub failures: Vec<PolicySuppressionSourceFailure>,
 }
 
+/// The analyzer-free result of loading every configured suppression source.
+///
+/// Hosts can perform this bounded configuration check before acquiring an
+/// analyzer snapshot, then move the same result into policy evaluation. The
+/// load outcome is intentionally owned rather than shared: one request has one
+/// parsed suppression document and cannot observe a second read of the files.
+#[derive(Debug)]
+pub struct PolicySuppressionPreflight {
+    outcome: PolicySuppressionLoadOutcome,
+}
+
+impl PolicySuppressionPreflight {
+    pub(crate) fn new(outcome: PolicySuppressionLoadOutcome) -> Self {
+        Self { outcome }
+    }
+
+    pub(crate) fn into_outcome(self) -> PolicySuppressionLoadOutcome {
+        self.outcome
+    }
+
+    pub(crate) fn outcome(&self) -> &PolicySuppressionLoadOutcome {
+        &self.outcome
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.outcome.failures.is_empty()
+    }
+}
+
 /// Load every configured source and merge them into one record set.
 ///
 /// A source that is absent contributes nothing and is not an error: the local

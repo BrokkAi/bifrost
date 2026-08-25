@@ -126,16 +126,43 @@ impl CppCReading {
     }
 }
 
-/// Every C-reading-only identity in the workspace, keyed for lookup by the
-/// two names resolution asks about.
-#[derive(Default)]
-pub(crate) struct CppCReadingIndex {
-    pub(crate) all: Vec<CodeUnit>,
-    pub(crate) by_identifier: HashMap<String, Vec<CodeUnit>>,
-    pub(crate) by_fq_name: HashMap<String, Vec<CodeUnit>>,
-}
-
 impl CppAnalyzer {
+    /// Publish each header's distinct C reading through the ordinary
+    /// `workspace_files` relation under `cpp:c`.
+    ///
+    /// The attribution is workspace-dependent, while the parsed row-set is
+    /// content-addressed. This is therefore snapshot work, not extraction
+    /// work: every analyzer generation replaces the complete sparse set after
+    /// include attribution is known. All relational name views then inherit
+    /// the same liveness and generation predicates without a C++-specific SQL
+    /// branch or a Rust-side workspace index.
+    pub(crate) fn sync_published_c_reading_workspace(&self) {
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        let analyzed_files = self.inner.analyzed_files();
+        let has_c_translation_unit = analyzed_files.iter().any(is_c_source_file);
+        let files = analyzed_files
+            .into_iter()
+            .filter(|file| {
+                is_c_source_file(file)
+                    || (has_c_translation_unit
+                        && !imports::is_cpp_translation_unit(file)
+                        && matches!(
+                            self.header_language_attribution(token, file),
+                            HeaderLanguageAttribution::C | HeaderLanguageAttribution::Mixed
+                        ))
+            })
+            .collect::<Vec<_>>();
+        if let Err(error) = self
+            .inner
+            .sync_content_reading_workspace_files(CPP_C_STORAGE_LANGUAGE_KEY, &files)
+        {
+            self.inner.record_store_error(
+                error.context("publishing C header readings in the workspace snapshot"),
+            );
+        }
+    }
+
     /// The C reading of `file`'s blob, or `None` when the two readings agree
     /// (no `cpp:c` rows were stored) or `file` is not a header this analyzer
     /// serves.
@@ -249,60 +276,6 @@ impl CppAnalyzer {
             .get(code_unit)
             .cloned()
             .unwrap_or_default()
-    }
-
-    /// The identities the C reading of `file` adds to the workspace index.
-    pub(crate) fn c_reading_index_additions(
-        &self,
-        token: QueryToken<'_>,
-        file: &ProjectFile,
-    ) -> Vec<CodeUnit> {
-        self.published_c_reading(token, file)
-            .map(|reading| reading.c_only.clone())
-            .unwrap_or_default()
-    }
-
-    /// Every C-reading identity the workspace index carries, keyed for the
-    /// two questions resolution asks by name.
-    ///
-    /// One whole-workspace pass, memoized for the analyzer generation exactly
-    /// like the include target index beside it. It is cheap on a C++ workspace
-    /// -- no header is attributed C or Mixed, so no blob is probed at all --
-    /// and bounded by the headers a C translation unit reaches otherwise.
-    pub(crate) fn c_reading_index(&self, token: QueryToken<'_>) -> Arc<CppCReadingIndex> {
-        self.c_reading_index.get_or_build(
-            || self.build_c_reading_index(token),
-            || self.build_c_reading_index(token),
-        )
-    }
-
-    fn build_c_reading_index(&self, token: QueryToken<'_>) -> CppCReadingIndex {
-        let mut index = CppCReadingIndex::default();
-        for file in self.inner.analyzed_files() {
-            for unit in self.c_reading_index_additions(token, &file) {
-                index
-                    .by_identifier
-                    .entry(unit.identifier().to_string())
-                    .or_default()
-                    .push(unit.clone());
-                index
-                    .by_fq_name
-                    .entry(unit.fq_name())
-                    .or_default()
-                    .push(unit.clone());
-                index.all.push(unit);
-            }
-        }
-        index
-    }
-
-    /// Every C-reading identity the workspace index carries, over all files
-    /// this analyzer serves.
-    pub(crate) fn c_reading_index_additions_for_workspace(
-        &self,
-        token: QueryToken<'_>,
-    ) -> Vec<CodeUnit> {
-        self.c_reading_index(token).all.clone()
     }
 
     /// Declaration ranges for a unit the C reading mints and the `cpp` row-set

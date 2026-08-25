@@ -17,12 +17,10 @@ use std::ops::Range;
 use brokk_bifrost_analysis::analyzer::semantic::{
     WorkspaceRelativePath, WorkspaceRelativePathError,
 };
-use brokk_bifrost_analysis::analyzer::structural::search::{
+use brokk_bifrost_rql::structural::search::{
     execute_code_query_detailed_eager_index, execute_code_query_detailed_eager_index_workspace,
 };
-use brokk_bifrost_analysis::analyzer::structural::{
-    CodeQuery, CodeQueryCompletion, CodeQueryResultDetail,
-};
+use brokk_bifrost_rql::structural::{CodeQuery, CodeQueryCompletion, CodeQueryResultDetail};
 use brokk_bifrost_rql::{CodeQueryPlanSource, SetOperator};
 
 use crate::budget::PolicyBudget;

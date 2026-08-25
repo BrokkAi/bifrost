@@ -13,11 +13,14 @@ pub(crate) mod jdk_artifact;
 pub(crate) mod kotlin_artifact;
 pub(crate) mod realm_builder;
 pub(crate) mod scala_artifact;
+pub(crate) mod topology;
 
 use brokk_bifrost_jvm::proof::{
     JvmActiveSemanticModel, JvmModelDisposition, JvmRetainedExternalIndex,
 };
 use external::JvmExternalDeclarationIndex;
+
+pub(crate) use dependency_discovery::MAX_BUILD_METADATA_BYTES;
 
 /// Classify a peeked `OnceLock<JvmExternalDeclarationIndex>` cell for the
 /// proof-gated diagnostic ladder (#1619).

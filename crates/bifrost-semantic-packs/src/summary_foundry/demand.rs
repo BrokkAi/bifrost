@@ -29,11 +29,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use brokk_bifrost_analysis::analyzer::dataflow::SummaryBoundaryKind;
 use brokk_bifrost_analysis::analyzer::semantic::{
     DeclarationSegmentKind, DispatchBoundaryKind, SemanticLocator,
 };
-use brokk_bifrost_analysis::analyzer::taint::TaintFindingReport;
+use brokk_bifrost_flow::dataflow::SummaryBoundaryKind;
+use brokk_bifrost_flow::taint::TaintFindingReport;
 use serde::{Deserialize, Serialize};
 
 /// The schema tag for a written demand-sweep report. Bump it only when a reader

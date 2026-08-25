@@ -12,6 +12,8 @@
 
 use crate::analyzer::model::{Language, ParseError, ParseErrorKind, Range};
 use crate::cancellation::CancellationToken;
+#[cfg(any(test, feature = "test-support"))]
+use std::cell::Cell;
 use tree_sitter::Node;
 
 /// The byte and 1-based line span a node covers. Language-blind: every adapter
@@ -487,6 +489,8 @@ fn push_named_children<'tree>(node: Node<'tree>, stack: &mut Vec<TreeWalkFrame<'
 /// walk.
 pub struct ParentIndex<'tree> {
     parents: crate::hash::HashMap<usize, Node<'tree>>,
+    #[cfg(any(test, feature = "test-support"))]
+    parent_queries: Cell<usize>,
 }
 
 impl<'tree> ParentIndex<'tree> {
@@ -506,7 +510,11 @@ impl<'tree> ParentIndex<'tree> {
                 parents.insert(child.id(), node);
             }
         }
-        Self { parents }
+        Self {
+            parents,
+            #[cfg(any(test, feature = "test-support"))]
+            parent_queries: Cell::new(0),
+        }
     }
 
     /// An index that records nothing, so every question is answered by
@@ -520,6 +528,8 @@ impl<'tree> ParentIndex<'tree> {
     pub fn unindexed() -> Self {
         Self {
             parents: crate::hash::HashMap::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            parent_queries: Cell::new(0),
         }
     }
 
@@ -530,10 +540,25 @@ impl<'tree> ParentIndex<'tree> {
     /// back to [`Node::parent`], which answers the same question and pays the
     /// walk this index exists to avoid.
     pub fn parent(&self, node: Node<'tree>) -> Option<Node<'tree>> {
+        #[cfg(any(test, feature = "test-support"))]
+        self.parent_queries
+            .set(self.parent_queries.get().saturating_add(1));
         match self.parents.get(&node.id()) {
             Some(parent) => Some(*parent),
             None => node.parent(),
         }
+    }
+
+    /// Reset the number of parent questions answered by this index.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn reset_parent_query_count_for_test(&self) {
+        self.parent_queries.set(0);
+    }
+
+    /// Return the number of parent questions answered since construction or reset.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn parent_query_count_for_test(&self) -> usize {
+        self.parent_queries.get()
     }
 }
 

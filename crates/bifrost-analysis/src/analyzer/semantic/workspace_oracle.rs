@@ -6,12 +6,15 @@ mod heap;
 mod source;
 mod value_flow;
 
+pub use dispatch::procedures_for_definition_with_limits;
 pub(super) use dispatch::semantic_locator_work;
 #[cfg(test)]
 pub(super) use dispatch::{
     CallableDefinitionIdentity, retain_dispatch_candidate, scoped_procedure_dispatch_gap,
 };
-pub(crate) use dispatch::{exact_source_for_procedure, procedures_for_definition_with_limits};
+pub(crate) use dispatch::{
+    exact_source_for_procedure, external_constant_field_read_discharges_gap,
+};
 // Policy lowering resolves authored source ranges to procedures through these
 // two, so they are public where the rest of dispatch stays crate-internal.
 pub use dispatch::{ProcedureRangeLookupStatus, procedures_for_source_ranges};
@@ -19,7 +22,7 @@ pub use source::{SourceDispatchObservation, SourceDispatchResult, SourcePointsTo
 // The value-flow plan re-applies these relevance rules when it decides
 // whether a snapshot's residual openness was refined by its own complete
 // call resolutions (#1952).
-pub(crate) use value_flow::{
+pub use value_flow::{
     abort_paths_run_user_code, allocation_call_is_dischargeable, call_target_refinement_call,
     constructor_call_gap_is_discharged, gap_impacts_value_flow, implicit_abort_gap_is_discharged,
     value_flow_capabilities_are_open,

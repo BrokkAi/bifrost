@@ -31,6 +31,7 @@ pub(in crate::analyzer::usages) use resolver::{
 };
 pub(in crate::analyzer::usages) use syntax::{node_text as scala_node_text, scala_import_path};
 
+#[cfg(test)]
 pub(crate) fn build_scala_usage_edges<F>(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
@@ -44,6 +45,34 @@ where
     Some(resolver.build_edges(analyzer, token, nodes, keep_file))
 }
 
+pub(crate) fn build_rooted_scala_usage_edges<F>(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    callers: &HashSet<String>,
+    keep_file: F,
+) -> Option<UsageEdges>
+where
+    F: Fn(&ProjectFile) -> bool + Sync,
+{
+    let resolver = ScalaEdgeResolver::try_new(analyzer)?;
+    Some(resolver.build_rooted_edges(analyzer, token, callers, keep_file))
+}
+
+pub(crate) fn build_inbound_scala_usage_edges(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    callees: &HashSet<String>,
+) -> Option<Arc<UsageEdges>> {
+    let resolver = ScalaEdgeResolver::try_new(analyzer)?;
+    Some(Arc::new(resolver.build_inbound_edges(
+        analyzer,
+        token,
+        callees,
+        |_| true,
+    )))
+}
+
+#[cfg(test)]
 pub(crate) fn build_full_scala_usage_edges(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
@@ -132,7 +161,8 @@ pub(crate) fn dead_code_bulk_eligibility(
     let Some(scala) = resolve_analyzer::<ScalaAnalyzer>(analyzer) else {
         return ScalaDeadCodeBulkEligibility::NeedsPrecise;
     };
-    let Some(spec) = TargetSpec::from_target(scala, token, target) else {
+    let types = scala.project_types();
+    let Some(spec) = TargetSpec::from_target(scala, token, &types, target) else {
         return ScalaDeadCodeBulkEligibility::NeedsPrecise;
     };
 

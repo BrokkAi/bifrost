@@ -10,19 +10,21 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 
 use super::WorkspaceSemanticOracle;
+use crate::analyzer::languages::{LanguageSupport, language_support};
 use crate::analyzer::semantic::{
     CallSiteHandle, CallableTarget, CallableTargetResolution, CancellationToken, CandidateCoverage,
     ContentIdentity, DeclarationLocator, DeclarationSegment, DeclarationSegmentKind,
     DispatchBoundary, DispatchBoundaryKind, DispatchCandidate, DispatchExtensibility,
     DispatchOracle, DispatchResult, EvidenceCompleteness, EvidenceHandle,
-    ExactExternalProcedureTarget, OracleLimits, OracleRelationArena, OracleRelationId,
-    OracleRelationOwner, OracleRelationRecord, OracleRelationSubject, ProcedureHandle,
-    ProcedureKind, ProcedureSemantics, ProofStatus, SemanticArtifact, SemanticBudgetExceeded,
-    SemanticCallSite, SemanticCapability, SemanticGap, SemanticGapImpact, SemanticGapKind,
-    SemanticGapSubject, SemanticLanguage, SemanticLocator, SemanticOutcome, SemanticProviderError,
-    SemanticRequest, SemanticRole, SemanticWork, SourceAnchor, SourcePosition, SourceSpan,
-    StableDigest, UnmaterializedExternalTarget, WorkspaceMountId, WorkspaceRelativePath,
-    split_qualified_member, unmaterialized_external_mount, unmaterialized_external_path,
+    ExactExternalProcedureTarget, MemoryLocationKind, OracleLimits, OracleRelationArena,
+    OracleRelationId, OracleRelationOwner, OracleRelationRecord, OracleRelationSubject,
+    ProcedureHandle, ProcedureKind, ProcedureSemantics, ProofStatus, SemanticArtifact,
+    SemanticBudgetExceeded, SemanticCallSite, SemanticCapability, SemanticGap, SemanticGapImpact,
+    SemanticGapKind, SemanticGapSubject, SemanticLanguage, SemanticLocator, SemanticOutcome,
+    SemanticProviderError, SemanticRequest, SemanticRole, SemanticWork, SourceAnchor,
+    SourcePosition, SourceSpan, StableDigest, UnmaterializedExternalTarget, WorkspaceMountId,
+    WorkspaceRelativePath, split_canonical_qualified_callee, unmaterialized_external_mount,
+    unmaterialized_external_path,
 };
 use crate::analyzer::structural::resolution::MethodFamilyRelation;
 use crate::analyzer::usages::get_definition::{
@@ -698,6 +700,7 @@ impl DispatchOracle for WorkspaceSemanticOracle<'_> {
                 )
                 && !concrete_overrides_proven_absent_discharges_gap(
                     &candidates,
+                    &boundaries,
                     gap,
                     matched_concrete_groups,
                     concrete_overrides_proven_absent,
@@ -1078,14 +1081,30 @@ fn closed_dispatch_discharges_gap(candidates: &[DispatchCandidate], gap: &Semant
 /// concrete match happened at all (`concrete_overrides_proven_absent` starts
 /// `true` and is never touched): a call resolved only through a body-less
 /// declaration, or not resolved at all, must not discharge here.
+///
+/// `boundaries` must be empty because a boundary arm is exactly a dispatch
+/// arm the empty-override proof does not cover. A body-less root (an
+/// interface or abstract member) queues its workspace implementors as
+/// further target groups, and each implementor is itself a concrete match
+/// with a possibly proven-empty override set -- but the open question at
+/// such a call is the *implementor set* of the root, which the boundary
+/// pushed for the body-less declaration records and which proving each known
+/// implementor override-free does not close. The same holds for external,
+/// truncated, and unenumerated-hierarchy arms. Without this condition,
+/// `interface Shape { int area(); }` with two workspace implementors claimed
+/// an exhaustive target set (caught by
+/// `open_interface_receiver_never_upgrades_to_proven_dispatch` and
+/// `a_possible_dispatch_downgrades_a_definite_declaration_to_a_possible_effect`).
 fn concrete_overrides_proven_absent_discharges_gap(
     candidates: &[DispatchCandidate],
+    boundaries: &[DispatchBoundary],
     gap: &SemanticGap,
     matched_concrete_groups: bool,
     concrete_overrides_proven_absent: bool,
 ) -> bool {
     gap.capability == SemanticCapability::DynamicDispatch
         && !candidates.is_empty()
+        && boundaries.is_empty()
         && matched_concrete_groups
         && concrete_overrides_proven_absent
 }
@@ -1833,6 +1852,95 @@ pub(crate) fn exact_source_for_procedure(
     Ok(Some((file, source)))
 }
 
+/// Whether a `FieldMemory` gap is discharged because the field it occurs on
+/// is provably a `static final` field on an *external* type (#2538).
+///
+/// A `static final` field on an external type is, by Java Language
+/// Specification semantics, either a compile-time constant (a primitive or
+/// `String` field initialized with a constant expression) or an immutable
+/// reference (any other type); either way, reading it carries no
+/// attacker-influenced value flow. Java's own field-identity resolution
+/// (`memory_member_locator`,
+/// `crates/bifrost-analysis/src/analyzer/java/semantic/values.rs`) has no
+/// path at all for a type-qualified static access -- it only resolves
+/// `instance.field` through a local variable of a same-file-declared type --
+/// so lowering mints an ordinary, unresolved `FieldMemory` gap for every
+/// `Type.FIELD`-shaped read, external or not, and lowering itself has no
+/// access to the external declaration surface to tell the two apart: Java
+/// CFG lowering is a per-file, syntax-only pass with no analyzer or
+/// dependency access (see the #2538 ExecPlan's Decision Log for why the
+/// proof is not attempted there instead).
+///
+/// This predicate runs at query time, where full analyzer access exists, and
+/// mirrors exactly how [`exact_source_for_procedure`] and
+/// `CallRelationService::dispatch_at_bounded` already resolve an unmaterialized
+/// external *call* target above: recover the field access's own literal
+/// written spelling from the gap's own recorded source span (fetch the
+/// procedure's exact source text via [`exact_source_for_procedure`], slice it
+/// at the span), and resolve that spelling through the language's
+/// `LanguageSupport::external_compile_time_constant_member` capability (Java
+/// answers via the same resolver `#1900` built for "go to definition" and
+/// diagnostics, unmodified; every other language currently answers `false`).
+///
+/// Fails closed in every case the proof is unavailable: a non-`FieldMemory`
+/// gap, a gap not on a `MemoryLocation`, a non-`Field` memory location, a
+/// language whose support offers no external-constant proof, a dialect
+/// projection, a source fetch that comes up empty or over budget, a
+/// spelling the resolver cannot place on any external declaration, or a
+/// resolved member that is not proven both `is_static()` and
+/// `is_compile_time_constant()`. None of those return an error; they return
+/// `Ok(false)`, leaving the gap exactly as open as it was, because a missing
+/// proof for one gap must never abort the rest of the sweep it is composed
+/// into.
+pub(crate) fn external_constant_field_read_discharges_gap(
+    gap: &SemanticGap,
+    procedure: &ProcedureHandle,
+    workspace: &WorkspaceAnalyzer,
+    request: &mut SemanticRequest<'_>,
+) -> Result<bool, SemanticProviderError> {
+    if gap.capability != SemanticCapability::FieldMemory {
+        return Ok(false);
+    }
+    let SemanticGapSubject::MemoryLocation(location_id) = gap.subject else {
+        return Ok(false);
+    };
+    let LanguageDialect::Standard(language) = procedure.artifact().key().language() else {
+        return Ok(false);
+    };
+    let Some(support) = language_support(language) else {
+        return Ok(false);
+    };
+    let Some(location) = procedure.semantics().memory_location(location_id) else {
+        return Ok(false);
+    };
+    if !matches!(location.kind, MemoryLocationKind::Field { .. }) {
+        return Ok(false);
+    }
+
+    let max_source_bytes = request.budget.remaining().source_bytes;
+    let Some((file, exact_source)) =
+        exact_source_for_procedure(workspace, procedure, max_source_bytes)?
+    else {
+        // A budget-exhausted or otherwise unavailable source fetch does not
+        // abort the sweep this predicate is composed into; it only leaves
+        // this one gap undischarged.
+        return Ok(false);
+    };
+    let Some(mapping) = procedure.semantics().source_mapping(gap.source) else {
+        return Ok(false);
+    };
+    let span = mapping.locator.anchor().span();
+    let (start, end) = (span.start_byte() as usize, span.end_byte() as usize);
+    if start > end || end > exact_source.len() {
+        return Ok(false);
+    }
+    let Some(spelling) = exact_source.get(start..end) else {
+        return Ok(false);
+    };
+
+    Ok(support.external_compile_time_constant_member(workspace.analyzer(), &file, spelling))
+}
+
 fn low_level_boundary(
     boundary: &CallDispatchBoundaryKind,
     language: SemanticLanguage,
@@ -1902,25 +2010,45 @@ fn low_level_boundary(
 /// Build the canonical identity for a fully-qualified external callee that never
 /// materializes to a workspace or classpath artifact (#1978).
 ///
-/// Only fully-qualified callees are in scope: the owner must itself be a dotted
-/// FQN present verbatim in the callee text (`java.net.URLDecoder.decode`).
-/// Instance-method transforms whose owner needs type resolution (`s.trim()`) and
-/// import-qualified calls (`URLDecoder.decode`) are deliberately excluded; they
-/// need type or import resolution that this cut does not perform.
+/// Only fully-qualified callees are in scope: the owner must be a multi-segment
+/// path present verbatim in the callee text, written with the separator the
+/// language uses (`java.net.URLDecoder.decode`, `std::str::from_utf8`). The
+/// owner is published dot-joined whatever the source separator was, because
+/// that is the spelling authored summaries are indexed under (#2596).
+///
+/// Instance-method transforms whose owner needs type resolution (`s.trim()`)
+/// are deliberately excluded; they need type resolution this cut does not
+/// perform. An import-qualified call (`URLDecoder.decode`, `Path::new`) reaches
+/// here already expanded when its language could prove the expansion from its
+/// import binders, and is otherwise excluded for the same reason.
+///
+/// A language whose external surface is spelled with single-segment owners
+/// (`JSON.parse`, `path.join`) opts out of the multi-segment requirement
+/// through [`LanguageSupport::publishes_single_segment_external_owners`]
+/// (#2598). The owner such a callee arrives with has already been decided by
+/// the classification stage, which is the only place that holds the call site's
+/// file and can tell a runtime global from a parameter of the enclosing
+/// procedure. Keeping the requirement for every other language is what stops a
+/// Java `URLDecoder.decode` from minting under a bare class name that import
+/// resolution should have expanded.
 fn synthetic_unmaterialized_external(
     callee_text: &str,
     language: SemanticLanguage,
     semantic_call: &SemanticCallSite,
 ) -> Option<UnmaterializedExternalTarget> {
-    let (owner_fqn, member) = split_qualified_member(callee_text)?;
-    if !owner_fqn.contains('.') {
+    let (owner_fqn, member) = split_canonical_qualified_callee(callee_text, language.language())?;
+    if !owner_fqn.contains('.')
+        && !language_support(language.language())
+            .is_some_and(LanguageSupport::publishes_single_segment_external_owners)
+    {
         return None;
     }
     let arity = u32::try_from(semantic_call.arguments.len()).ok()?;
     let has_receiver = semantic_call.receiver.is_some();
     let anchor = zero_source_anchor();
     let owner_segment =
-        DeclarationSegment::named(DeclarationSegmentKind::Type, owner_fqn, anchor, 0).ok()?;
+        DeclarationSegment::named(DeclarationSegmentKind::Type, owner_fqn.clone(), anchor, 0)
+            .ok()?;
     // Arity and receiver shape enter the synthetic declaration, so the locator
     // distinguishes different-arity overloads of one `owner.member`. Same-arity
     // overloads that differ only by parameter type cannot be told apart for an
@@ -1930,7 +2058,8 @@ fn synthetic_unmaterialized_external(
     } else {
         DeclarationSegmentKind::Function
     };
-    let member_segment = DeclarationSegment::named(member_kind, member, anchor, arity).ok()?;
+    let member_segment =
+        DeclarationSegment::named(member_kind, member.clone(), anchor, arity).ok()?;
     let declaration = DeclarationLocator::new(vec![owner_segment, member_segment]).ok()?;
     let locator = SemanticLocator::new(
         unmaterialized_external_mount(),
@@ -2253,7 +2382,7 @@ pub(crate) fn procedures_for_definition(
     }
 }
 
-pub(crate) fn procedures_for_definition_with_limits(
+pub fn procedures_for_definition_with_limits(
     analyzer: &dyn IAnalyzer,
     definition: &CodeUnit,
     artifact: &Arc<SemanticArtifact>,
@@ -2837,6 +2966,8 @@ mod tests {
                         (*module).to_owned(),
                         std::path::PathBuf::from("unused-in-this-test.d.ts"),
                     )],
+                    scope: crate::analyzer::topology::DependencyScope::Unknown,
+                    declared_by: None,
                 })
                 .collect(),
         )
@@ -3919,6 +4050,257 @@ mod tests {
             // Boundary row plus both the boundary and relation-subject locator
             // payloads, relation handle, relation record, and one evidence.
             1 + locator_work.nested_entries.saturating_mul(2) + 3
+        );
+    }
+
+    /// The Rust fixture behind the #2596 acceptance. Each function holds one
+    /// external call, written in one of the three spellings the issue names.
+    const RUST_EXTERNAL_CALL_SOURCE: &str = r#"use std::path::Path;
+
+pub fn scoped(bytes: &[u8]) {
+    let _ = std::str::from_utf8(bytes);
+}
+
+pub fn imported(text: &str) {
+    let _ = Path::new(text);
+}
+
+pub fn prelude(text: &str) {
+    let _ = String::from(text);
+}
+"#;
+
+    /// A minted identity as `(owner FQN, member, arity, has_receiver)`, or
+    /// `None` when the call reached an external boundary that names no
+    /// bindable identity.
+    type MintedIdentity = Option<(String, String, u32, bool)>;
+
+    /// The canonical external identity every call in `source` publishes, keyed
+    /// by the exact source text of the call.
+    fn external_call_identities(
+        language: Language,
+        rel_path: &str,
+        source: &str,
+    ) -> Vec<(String, MintedIdentity)> {
+        let fixture = AnalyzerFixture::new_for_language(language, &[(rel_path, source)]);
+        let file = ProjectFile::new(fixture.project_root(), rel_path);
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = fixture
+            .analyzer
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("semantic materialization")
+            .available_value()
+            .cloned()
+            .expect("semantic artifact");
+        let oracle = fixture.analyzer.semantic_oracle_provider();
+        let mut identities = Vec::new();
+        for procedure in artifact.procedures() {
+            for call in procedure.call_sites() {
+                let handle = artifact
+                    .procedure_handle(procedure.id())
+                    .and_then(|procedure| procedure.call_site_handle(call.id))
+                    .expect("scoped call handle");
+                let span = procedure
+                    .source_mapping(call.source)
+                    .expect("call source mapping")
+                    .locator
+                    .anchor()
+                    .span();
+                let text = source[span.start_byte() as usize..span.end_byte() as usize].to_owned();
+                let mut budget = SemanticBudget::default();
+                let outcome = oracle
+                    .resolve_call(
+                        &handle,
+                        &mut SemanticRequest::new(&mut budget, &cancellation),
+                    )
+                    .expect("external dispatch runs");
+                let result = outcome
+                    .available_value()
+                    .expect("external dispatch retains a result");
+                let target = result
+                    .boundaries()
+                    .iter()
+                    .find_map(DispatchBoundary::unmaterialized_external_target)
+                    .map(|target| {
+                        (
+                            target.owner_fqn().to_owned(),
+                            target.member().to_owned(),
+                            target.arity(),
+                            target.has_receiver(),
+                        )
+                    });
+                identities.push((text, target));
+            }
+        }
+        identities.sort();
+        identities
+    }
+
+    /// #2596: a multi-segment Rust callee publishes the dot-joined canonical
+    /// identity an authored `std.str.from_utf8` summary is posted under, and a
+    /// `use`-bound single segment reaches the same shape through the file's
+    /// import binders.
+    ///
+    /// `has_receiver` is `false` for both. A Rust scoped path is not lowered as
+    /// a call receiver the way a Java qualified static is, so an authored Rust
+    /// summary must declare `"has_receiver": false`.
+    #[test]
+    fn a_qualified_rust_callee_publishes_a_dot_joined_external_identity() {
+        let identities =
+            external_call_identities(Language::Rust, "lib.rs", RUST_EXTERNAL_CALL_SOURCE);
+        assert_eq!(
+            identities,
+            vec![
+                (
+                    "Path::new(text)".to_owned(),
+                    Some(("std.path.Path".to_owned(), "new".to_owned(), 1, false))
+                ),
+                // The prelude spelling has no `use` declaration for the import
+                // binder to read, so it is deliberately out of scope and names
+                // no identity.
+                ("String::from(text)".to_owned(), None),
+                (
+                    "std::str::from_utf8(bytes)".to_owned(),
+                    Some(("std.str".to_owned(), "from_utf8".to_owned(), 1, false))
+                ),
+            ]
+        );
+    }
+
+    /// The JavaScript fixture behind the #2598 acceptance. Each function holds
+    /// one call whose owner carries a single segment -- the whole JS/TS
+    /// standard surface -- written in one of the four shapes the issue names.
+    const JS_EXTERNAL_CALL_SOURCE: &str = r#"import path from 'path';
+import p from 'path';
+import { Buffer } from 'buffer';
+import { helper } from './helper';
+const crypto = require('crypto');
+
+export function joined(a, b) {
+    return path.join(a, b);
+}
+
+export function aliased(a, b) {
+    return p.join(a, b);
+}
+
+export function buffered(raw) {
+    return Buffer.from(raw);
+}
+
+export function relative(raw) {
+    return helper.run(raw);
+}
+
+export function generated() {
+    return crypto.randomUUID();
+}
+
+export function parsed(raw) {
+    return JSON.parse(raw);
+}
+
+export function local(opts, raw) {
+    return opts.parse(raw);
+}
+
+export function shadowed(raw) {
+    const JSON = makeCodec();
+    return JSON.parse(raw);
+}
+"#;
+
+    /// #2598: a single-segment JavaScript owner publishes an external identity
+    /// exactly when the file binds it to a package or binds it to nothing, and
+    /// the identity carries the module's name rather than the local one.
+    ///
+    /// `has_receiver` is `true` for every case: unlike a Rust scoped path, a
+    /// JS/TS member call *is* lowered with a receiver, so an authored JS/TS
+    /// summary must declare `"has_receiver": true`.
+    #[test]
+    fn a_single_segment_javascript_callee_publishes_its_module_or_global_identity() {
+        let identities =
+            external_call_identities(Language::JavaScript, "lib.js", JS_EXTERNAL_CALL_SOURCE);
+        assert_eq!(
+            identities,
+            vec![
+                // A named import binds a member *of* the module, and that
+                // member is the owner: never `buffer`.
+                (
+                    "Buffer.from(raw)".to_owned(),
+                    Some(("Buffer".to_owned(), "from".to_owned(), 1, true))
+                ),
+                // The same global spelling under a local `const JSON` names
+                // that local, so it mints nothing.
+                ("JSON.parse(raw)".to_owned(), None),
+                // A global nothing in the file binds is its own owner.
+                (
+                    "JSON.parse(raw)".to_owned(),
+                    Some(("JSON".to_owned(), "parse".to_owned(), 1, true))
+                ),
+                // A CommonJS module-object binding names its module.
+                (
+                    "crypto.randomUUID()".to_owned(),
+                    Some(("crypto".to_owned(), "randomUUID".to_owned(), 0, true))
+                ),
+                // A relative specifier addresses a workspace file, not a
+                // package, so it names no external identity.
+                ("helper.run(raw)".to_owned(), None),
+                // An unqualified callee has no owner to decide at all.
+                ("makeCodec()".to_owned(), None),
+                // `opts` is a parameter. The receiver is a runtime value of the
+                // enclosing procedure and no authored summary can claim it.
+                ("opts.parse(raw)".to_owned(), None),
+                // An aliased default import keys under the module it loads, so
+                // it publishes the identity `path.join` publishes.
+                (
+                    "p.join(a, b)".to_owned(),
+                    Some(("path".to_owned(), "join".to_owned(), 2, true))
+                ),
+                (
+                    "path.join(a, b)".to_owned(),
+                    Some(("path".to_owned(), "join".to_owned(), 2, true))
+                ),
+            ]
+        );
+    }
+
+    /// The TypeScript half: one dialect-blind rule, so the same shapes answer
+    /// the same way through the TypeScript grammar.
+    #[test]
+    fn a_single_segment_typescript_callee_publishes_its_module_or_global_identity() {
+        let source = r#"import path from 'path';
+
+export function joined(a: string, b: string): string {
+    return path.join(a, b);
+}
+
+export function parsed(raw: string): unknown {
+    return JSON.parse(raw);
+}
+
+export function local(opts: { parse(raw: string): unknown }, raw: string): unknown {
+    return opts.parse(raw);
+}
+"#;
+        let identities = external_call_identities(Language::TypeScript, "lib.ts", source);
+        assert_eq!(
+            identities,
+            vec![
+                (
+                    "JSON.parse(raw)".to_owned(),
+                    Some(("JSON".to_owned(), "parse".to_owned(), 1, true))
+                ),
+                ("opts.parse(raw)".to_owned(), None),
+                (
+                    "path.join(a, b)".to_owned(),
+                    Some(("path".to_owned(), "join".to_owned(), 2, true))
+                ),
+            ]
         );
     }
 

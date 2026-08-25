@@ -16,20 +16,23 @@ pub mod resolver;
 pub mod return_type;
 
 use brokk_bifrost_core::analyzer::capabilities::TypeHierarchyProvider;
+use brokk_bifrost_core::analyzer::fq_name::FqName;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::{
-    BoundedDefinitionLookup, CodeUnitIndex, DefinitionLookupAccess, ProjectFile,
+    CodeUnit, CodeUnitIndex, DefinitionLanguageScope, ProjectFile, RelationalDefinitionFrontier,
+    RelationalDefinitionQuery, RelationalDefinitionQuestion, RelationalDefinitionValue,
+    RelationalName,
 };
 
 /// The *dispatching* analyzer's side of a Java usage-graph scan.
 ///
 /// Deliberately not the Java analyzer, for the reason recorded on
 /// `PythonGraphSource`: in a mixed workspace the query is issued against a
-/// `MultiAnalyzer`, whose `definitions` merges every language's shards and whose
-/// `get_ancestors` crosses language boundaries. Java depends on that reach
-/// twice over -- the JVM realm is one candidate space (#1237), so a Java file
-/// naming a Kotlin or Scala class next door resolves only through the merged
-/// index -- so this stays separate from the
+/// `MultiAnalyzer`, whose relational frontier spans every language delegate and
+/// whose `get_ancestors` crosses language boundaries. Java depends on that
+/// reach twice over -- the JVM realm is one candidate space (#1237), so a Java
+/// file naming a Kotlin or Scala class next door resolves only through the
+/// workspace frontier -- so this stays separate from the
 /// [`JavaSource`](crate::java::graph_support::JavaSource) that answers the
 /// Java-only questions.
 #[derive(Clone, Copy)]
@@ -39,7 +42,8 @@ pub struct JavaGraphSource<'a> {
     pub token: QueryToken<'a>,
     pub index: &'a dyn CodeUnitIndex,
     pub hierarchy: Option<&'a dyn TypeHierarchyProvider>,
-    pub definitions: &'a DefinitionLookupAccess<'a>,
+    /// Request-local store answers for structured graph questions.
+    pub relational_definitions: &'a dyn RelationalDefinitionFrontier,
     pub import_statements: &'a ImportStatementAccess<'a>,
 }
 
@@ -49,15 +53,20 @@ pub struct JavaGraphSource<'a> {
 pub type ImportStatementAccess<'a> = dyn Fn(&ProjectFile) -> Vec<String> + Sync + 'a;
 
 impl JavaGraphSource<'_> {
-    /// Run `read` against the dispatching analyzer's definition index.
-    pub fn with_definitions<R>(&self, read: impl FnOnce(&dyn BoundedDefinitionLookup) -> R) -> R {
-        let mut read = Some(read);
-        let mut resolved = None;
-        (self.definitions)(&mut |lookup| {
-            if let Some(read) = read.take() {
-                resolved = Some(read(lookup));
-            }
-        });
-        resolved.expect("definition lookup access must invoke its consumer exactly once")
+    /// Every direct child of `owner` named `identifier`, read from the
+    /// request-local relational frontier. The owner is already a structured
+    /// declaration identity, so no rendered Java name is reconstructed here.
+    pub fn structural_members(&self, owner: &FqName, identifier: &str) -> Vec<CodeUnit> {
+        let question = RelationalDefinitionQuestion {
+            language_scope: DefinitionLanguageScope::Workspace,
+            name: RelationalName::stable(owner.clone()),
+            query: RelationalDefinitionQuery::StructuralMembers {
+                identifier: identifier.to_string(),
+            },
+        };
+        match self.relational_definitions.ask(&question) {
+            RelationalDefinitionValue::Definitions(units) => units,
+            _ => panic!("a structural-member question returned the wrong shape"),
+        }
     }
 }

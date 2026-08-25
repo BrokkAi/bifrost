@@ -2457,8 +2457,8 @@ const fn cvss_system_scope_label(value: CvssSystemScope) -> &'static str {
 #[cfg(test)]
 mod tests {
     use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
-    use brokk_bifrost_analysis::analyzer::structural::CodeQuery;
     use brokk_bifrost_analysis::schema_version::{SchemaVersionOrigin, SchemaVersionResolution};
+    use brokk_bifrost_rql::structural::CodeQuery;
     use serde_json::json;
 
     use super::*;
@@ -2644,7 +2644,8 @@ mod tests {
                     spec: TaintPolicySpec {
                         mode: MayMode::May,
                         call_modeling: CallModelingSpec {
-                            unmodeled: brokk_bifrost_analysis::analyzer::dataflow::UnmodeledCallBehavior::Optimistic,
+                            unmodeled:
+                                brokk_bifrost_flow::dataflow::UnmodeledCallBehavior::Optimistic,
                         },
                         sources: TaintEndpointSet {
                             include_sets: vec![],

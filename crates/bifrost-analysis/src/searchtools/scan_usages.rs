@@ -1,13 +1,17 @@
 use super::selectors::*;
 use super::*;
 use crate::analyzer::symbol_lookup::resolve_codeunit_fuzzy_bounded_with;
-use crate::analyzer::{AnalyzerQueryScope, QueryScope};
+use crate::analyzer::{AnalyzerQueryScope, BoundedDefinitionLookup, QueryScope};
 use crate::cancellation::CancellationToken;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use std::time::Duration;
 
 fn is_zero(value: &usize) -> bool {
     *value == 0
+}
+
+fn default_usage_graph_depth() -> usize {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,10 +72,13 @@ pub struct UsageGraphParams {
     /// Include references that live in detected test files.
     #[serde(default)]
     pub include_tests: bool,
-    /// Optional project-relative file paths or globs that bound where references
-    /// are searched. `None` searches the whole workspace.
+    /// Optional project-relative file paths or globs whose declarations are the
+    /// graph roots. `None` makes every workspace declaration a root.
     #[serde(default)]
     pub paths: Option<Vec<String>>,
+    /// Maximum number of outbound caller-to-callee hops to expand from the roots.
+    #[serde(default = "default_usage_graph_depth")]
+    pub depth: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2425,43 +2432,59 @@ fn scan_usages_backend_on_pool(
         });
     }
 
-    for resolved in resolved_targets {
+    // Resolved symbols in one request are independent semantic questions over
+    // the same immutable analyzer snapshot. Running them serially makes a
+    // multi-symbol path-scoped request spend its entire wall budget on the
+    // first broad target and report every later target as unexamined. Fan them
+    // out on the dedicated heavy-scan pool that already owns this call; each
+    // UsageFinder retains its own replay frontier and result state.
+    let resolved_queries: Vec<_> = resolved_targets
+        .into_par_iter()
+        .map(|resolved| {
+            if context.cancellation.is_cancelled() {
+                return (resolved, None);
+            }
+            let finder = scoped_usage_finder(test_files.as_ref(), query_scope.path_filter.as_ref())
+                .with_cancellation(context.cancellation.clone());
+            let max_candidate_files = if path_scoped_candidates.is_some() {
+                context.max_path_scoped_candidate_files
+            } else {
+                context.max_candidate_files
+            };
+            let query = finder.query_with_provider_and_source_budget(
+                analyzer,
+                &resolved.overloads,
+                path_scoped_candidates
+                    .as_ref()
+                    .map(|provider| provider as &dyn CandidateFileProvider),
+                max_candidate_files,
+                context.max_callsites,
+                Some(context.max_source_bytes),
+            );
+            let interrupted = context.cancellation.is_cancelled();
+            (resolved, Some((query, interrupted)))
+        })
+        .collect();
+
+    for (resolved, query) in resolved_queries {
         let IndexedResolvedScanTarget {
             request,
             symbol,
             overloads,
             location_selected,
         } = resolved;
-        if context.cancellation.is_cancelled() {
+        let Some((query, interrupted)) = query else {
             work_entries.push(incomplete_work_entry(
                 request,
                 Some(symbol),
                 context.interruption_reason(),
             ));
             continue;
-        }
+        };
         let resolved_definition = resolved_usage_definition(analyzer, &overloads);
         let target_is_method = overloads
             .iter()
             .any(|unit| unit.is_function() && display_parent_symbol_for_target(unit).is_some());
-        let finder = scoped_usage_finder(test_files.as_ref(), query_scope.path_filter.as_ref())
-            .with_cancellation(context.cancellation.clone());
-        let max_candidate_files = if path_scoped_candidates.is_some() {
-            context.max_path_scoped_candidate_files
-        } else {
-            context.max_candidate_files
-        };
-        let query = finder.query_with_provider_and_source_budget(
-            analyzer,
-            &overloads,
-            path_scoped_candidates
-                .as_ref()
-                .map(|provider| provider as &dyn CandidateFileProvider),
-            max_candidate_files,
-            context.max_callsites,
-            Some(context.max_source_bytes),
-        );
-        let interrupted = context.cancellation.is_cancelled();
         let interruption_reason = context.interruption_reason();
         let mut incomplete_reason = if interrupted {
             Some(interruption_reason)
@@ -2821,27 +2844,203 @@ pub struct UsageGraphResult {
 /// a class or function (a module- or field-level call site) is dropped, so the
 /// nodes and edges can be loaded into a graph library without phantom nodes.
 ///
-/// This is a full-workspace pass and is proportional to the number of
-/// definitions, so consumers are expected to cache the result and rebuild it
-/// only when the workspace changes.
+/// With `paths`, work starts from declarations in those files and expands only
+/// resolved endpoints up to `depth`; it does not hydrate the workspace's full
+/// declaration inventory. Without `paths`, every workspace declaration is a
+/// root and depth one is the complete graph.
 pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageGraphResult {
     let _scope = profiling::scope("searchtools::usage_graph");
+    assert!(params.depth > 0, "usage_graph depth must be positive");
 
+    let rooted = params.paths.is_some();
     let path_filter = build_scan_usages_path_filter(analyzer, params.paths.as_deref()).filter;
     let test_files = test_file_exclusion(analyzer, params.include_tests);
 
-    // Build node identity once and share it with the internal relevance graph.
-    // The catalog collapses overloads, keeps JS/TS declarations file-scoped, and
-    // chooses deterministic primary declarations using analyzer-provided ranges.
-    let catalog = WorkspaceUsageCatalog::build(analyzer);
+    let root_files: Vec<ProjectFile> = if rooted {
+        analyzer
+            .analyzed_files()
+            .into_iter()
+            .filter(|file| {
+                path_filter
+                    .as_ref()
+                    .is_some_and(|filter| filter.matches(file))
+                    && test_files
+                        .as_ref()
+                        .is_none_or(|exclusion| !exclusion.excludes(file))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let root_catalog = if rooted {
+        WorkspaceUsageCatalog::build_for_files(analyzer, &root_files)
+    } else {
+        WorkspaceUsageCatalog::build(analyzer)
+    };
+
+    let mut declarations: Vec<(CodeUnit, Option<Range>)> = root_catalog
+        .nodes
+        .iter()
+        .map(|node| (node.primary.clone(), node.primary_range))
+        .collect();
+    let mut files_by_key: HashMap<WorkspaceUsageNodeKey, HashSet<ProjectFile>> = HashMap::default();
+    let mut frontier: BTreeSet<WorkspaceUsageNodeKey> = BTreeSet::new();
+    for node in &root_catalog.nodes {
+        frontier.insert(node.key.clone());
+        files_by_key
+            .entry(node.key.clone())
+            .or_default()
+            .extend(node.declaration_files.iter().cloned());
+    }
+    let mut visited = frontier.clone();
+
+    // Edges keyed by `(ecosystem, from_fqn, to_fqn)`: both endpoints share the
+    // builder's ecosystem, so the ecosystem disambiguates a fqn that exists in
+    // more than one language. The value is the edge's call sites; its length is the
+    // edge weight (so weight and sites can never disagree).
+    let mut edge_sites: BTreeMap<(UsageEcosystem, String, String), Vec<UsageGraphCallSite>> =
+        BTreeMap::new();
+    let mut truncated: BTreeMap<(UsageEcosystem, String), usize> = BTreeMap::new();
+    let definitions = AnalyzerDefinitionLookup::new(analyzer, Language::None);
+    let mut endpoint_cache: HashMap<(UsageEcosystem, String), Vec<CodeUnit>> = HashMap::default();
+
+    for _ in 0..params.depth {
+        if frontier.is_empty() {
+            break;
+        }
+        let mut fqns_by_ecosystem: HashMap<UsageEcosystem, HashSet<String>> = HashMap::default();
+        let mut files_by_ecosystem: HashMap<UsageEcosystem, HashSet<ProjectFile>> =
+            HashMap::default();
+        for key in &frontier {
+            fqns_by_ecosystem
+                .entry(key.ecosystem)
+                .or_default()
+                .insert(key.fqn.clone());
+            if let Some(files) = files_by_key.get(key) {
+                files_by_ecosystem
+                    .entry(key.ecosystem)
+                    .or_default()
+                    .extend(files.iter().cloned());
+            }
+        }
+
+        let mut layer_edges = BTreeMap::new();
+        let mut layer_truncated = BTreeMap::new();
+        for entry in crate::analyzer::languages::edge_passes() {
+            let Some(fqns) = fqns_by_ecosystem.get(&entry.ecosystem) else {
+                continue;
+            };
+            let caller_files = files_by_ecosystem
+                .get(&entry.ecosystem)
+                .expect("every frontier declaration has a source file");
+            let keep_file = |file: &ProjectFile| {
+                caller_files.contains(file)
+                    && test_files
+                        .as_ref()
+                        .is_none_or(|exclusion| !exclusion.excludes(file))
+            };
+            let _scope = profiling::scope(format!("usage_graph::resolve_{}", entry.id.as_str()));
+            let ctx = crate::analyzer::languages::EdgeSiteScanCtx {
+                analyzer,
+                fqns,
+                keep_file: &keep_file,
+            };
+            if let Some(edges) = entry.pass.edge_sites(&ctx).map(|sites| sites.0) {
+                for ((from, to), sites) in edges.edges {
+                    layer_edges
+                        .entry((entry.ecosystem, from, to))
+                        .or_insert_with(Vec::new)
+                        .extend(sites);
+                }
+                for (fqn, count) in edges.truncated {
+                    layer_truncated
+                        .entry((entry.ecosystem, fqn))
+                        .and_modify(|current: &mut usize| *current = (*current).max(count))
+                        .or_insert(count);
+                }
+            }
+        }
+
+        let mut next = BTreeSet::new();
+        for ((ecosystem, from, to), sites) in layer_edges {
+            if !frontier.iter().any(|key| {
+                key.ecosystem == ecosystem
+                    && key.fqn == from
+                    && (!ecosystem.is_module_scoped()
+                        || sites.iter().any(|site| {
+                            key.defining_file
+                                .as_ref()
+                                .is_some_and(|file| rel_path_string(file) == site.path)
+                        }))
+            }) {
+                continue;
+            }
+            let already_known = visited
+                .iter()
+                .any(|key| key.ecosystem == ecosystem && key.fqn == to);
+            let cache_key = (ecosystem, to.clone());
+            if !already_known {
+                let endpoints = endpoint_cache.entry(cache_key).or_insert_with(|| {
+                    ecosystem_languages(ecosystem)
+                        .iter()
+                        .flat_map(|language| definitions.fqn_in_language(&to, *language))
+                        .filter(is_graph_declaration)
+                        .filter(|unit| {
+                            test_files
+                                .as_ref()
+                                .is_none_or(|exclusion| !exclusion.excludes(unit.source()))
+                        })
+                        .collect()
+                });
+                if endpoints.is_empty() {
+                    continue;
+                }
+                for unit in endpoints.iter() {
+                    let key = WorkspaceUsageNodeKey::for_declaration(unit);
+                    files_by_key
+                        .entry(key.clone())
+                        .or_default()
+                        .insert(unit.source().clone());
+                    if visited.insert(key.clone()) {
+                        next.insert(key);
+                        let range = analyzer
+                            .ranges(unit)
+                            .into_iter()
+                            .min_by_key(|range| (range.start_line, range.start_byte));
+                        declarations.push((unit.clone(), range));
+                    }
+                }
+            }
+            edge_sites
+                .entry((ecosystem, from, to))
+                .or_default()
+                .extend(sites.into_iter().map(|site| UsageGraphCallSite {
+                    path: site.path,
+                    line: site.line,
+                }));
+        }
+        for ((ecosystem, fqn), count) in layer_truncated {
+            if visited
+                .iter()
+                .any(|key| key.ecosystem == ecosystem && key.fqn == fqn)
+                || endpoint_cache
+                    .get(&(ecosystem, fqn.clone()))
+                    .is_some_and(|endpoints| !endpoints.is_empty())
+            {
+                truncated.insert((ecosystem, fqn), count);
+            }
+        }
+        frontier = next;
+    }
+
+    let catalog =
+        WorkspaceUsageCatalog::from_declarations(declarations, &CancellationToken::default())
+            .expect("uncancelled usage graph result catalog construction");
     let mut nodes: Vec<UsageGraphNode> = catalog
         .nodes
         .iter()
         .map(|node| UsageGraphNode {
             fqn: node.key.fqn.clone(),
-            // The node's own source language, not its realm: sharing a
-            // candidate space must not cost a consumer the ability to tell
-            // Java from Scala from Kotlin.
             language: node.language_label().to_string(),
             path: rel_path_string(node.primary.source()),
             start_line: node
@@ -2852,72 +3051,17 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
             signature: node.primary.signature().map(str::to_string),
         })
         .collect();
-
-    // Edges keyed by `(ecosystem, from_fqn, to_fqn)`: both endpoints share the
-    // builder's ecosystem, so the ecosystem disambiguates a fqn that exists in
-    // more than one language. The value is the edge's call sites; its length is the
-    // edge weight (so weight and sites can never disagree).
-    let mut edge_sites: BTreeMap<(UsageEcosystem, String, String), Vec<UsageGraphCallSite>> =
-        BTreeMap::new();
-    let mut truncated_symbols: Vec<UsageGraphTruncatedSymbol> = Vec::new();
-
-    // Go edges in a single inverted pass over the workspace: walk each file once
-    // and resolve every reference to its callee, instead of scanning every
-    // symbol's candidate files (quadratic on real repos). A caller file is in
-    // scope only when it survives the test / path filter, matching the per-symbol
-    // candidate filter.
-    let keep_file = |file: &ProjectFile| {
-        test_files
-            .as_ref()
-            .map(|exclusion| !exclusion.excludes(file))
-            .unwrap_or(true)
-            && path_filter
-                .as_ref()
-                .map(|filter| filter.matches(file))
-                .unwrap_or(true)
-    };
-    // Every supported language has a whole-workspace inverted builder, so all
-    // edges are produced by the passes below; merge each one's result in.
-    let record_inverted =
-        |ecosystem: UsageEcosystem,
-         edges: Option<crate::analyzer::usages::inverted_edges::UsageEdges>,
-         edge_sites: &mut BTreeMap<(UsageEcosystem, String, String), Vec<UsageGraphCallSite>>,
-         truncated_symbols: &mut Vec<UsageGraphTruncatedSymbol>| {
-            let Some(edges) = edges else {
-                return;
-            };
-            for ((from, to), sites) in edges.edges {
-                edge_sites
-                    .entry((ecosystem, from, to))
-                    .or_default()
-                    .extend(sites.into_iter().map(|site| UsageGraphCallSite {
-                        path: site.path,
-                        line: site.line,
-                    }));
-            }
-            for (fqn, total_callsites) in edges.truncated {
-                truncated_symbols.push(UsageGraphTruncatedSymbol {
-                    fqn,
-                    language: ecosystem.as_str().to_string(),
-                    total_callsites,
-                    limit: crate::analyzer::usages::inverted_edges::MAX_CALLSITES,
-                });
-            }
-        };
-    for entry in crate::analyzer::languages::edge_passes() {
-        let _scope = profiling::scope(format!("usage_graph::resolve_{}", entry.id.as_str()));
-        let ctx = crate::analyzer::languages::EdgeSiteScanCtx {
-            analyzer,
-            fqns: catalog.fqns(entry.ecosystem),
-            keep_file: &keep_file,
-        };
-        record_inverted(
-            entry.ecosystem,
-            entry.pass.edge_sites(&ctx).map(|sites| sites.0),
-            &mut edge_sites,
-            &mut truncated_symbols,
-        );
-    }
+    let mut truncated_symbols: Vec<_> = truncated
+        .into_iter()
+        .map(
+            |((ecosystem, fqn), total_callsites)| UsageGraphTruncatedSymbol {
+                fqn,
+                language: ecosystem.as_str().to_string(),
+                total_callsites,
+                limit: crate::analyzer::usages::inverted_edges::MAX_CALLSITES,
+            },
+        )
+        .collect();
 
     // Deterministic output order, independent of ecosystem enum order: nodes and
     // the truncated list by (language, fqn), edges by (language, from, to).
@@ -2934,9 +3078,11 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
 
     let mut edges: Vec<UsageGraphEdge> = edge_sites
         .into_iter()
-        .map(|((ecosystem, from, to), sites)| {
+        .map(|((ecosystem, from, to), mut sites)| {
             // Each `(ecosystem, from, to)` is produced by exactly one builder, whose
             // sites already arrive sorted; `weight` is the site count.
+            sites.sort();
+            sites.dedup();
             UsageGraphEdge {
                 from,
                 to,
@@ -2957,6 +3103,21 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
         nodes,
         edges,
         truncated_symbols,
+    }
+}
+
+fn ecosystem_languages(ecosystem: UsageEcosystem) -> &'static [Language] {
+    match ecosystem {
+        UsageEcosystem::JavaScriptTypeScript => &[Language::JavaScript, Language::TypeScript],
+        UsageEcosystem::Python => &[Language::Python],
+        UsageEcosystem::Go => &[Language::Go],
+        UsageEcosystem::Rust => &[Language::Rust],
+        UsageEcosystem::Jvm => &[Language::Java, Language::Scala, Language::Kotlin],
+        UsageEcosystem::CSharp => &[Language::CSharp],
+        UsageEcosystem::Cpp => &[Language::Cpp],
+        UsageEcosystem::Php => &[Language::Php],
+        UsageEcosystem::Ruby => &[Language::Ruby],
+        UsageEcosystem::Unknown => &[],
     }
 }
 
@@ -3276,7 +3437,28 @@ pub(super) fn external_usage_definition_ranges(
     analyzer: &dyn IAnalyzer,
     target: &CodeUnit,
 ) -> Vec<Range> {
-    let ranges = analyzer.ranges_of(target);
+    let mut ranges = analyzer.ranges_of(target);
+    if language_for_target(target) == Language::Cpp
+        && target.is_callable()
+        && ranges.len() > 1
+        && let Some(source) = analyzer.indexed_source(target.source())
+        && let Some(classifier) = cpp_occurrence_classifier_for(&source)
+    {
+        let physical_definitions: Vec<_> = ranges
+            .iter()
+            .copied()
+            .filter(|range| {
+                matches!(
+                    classifier.classify(target, range),
+                    crate::analyzer::CppOccurrenceRole::Definition
+                        | crate::analyzer::CppOccurrenceRole::Both
+                )
+            })
+            .collect();
+        if !physical_definitions.is_empty() {
+            ranges = physical_definitions;
+        }
+    }
     let narrow_to_name = target.is_class()
         || (language_for_file(target.source()) == Language::JavaScript
             && target.is_field()
@@ -4231,7 +4413,7 @@ fn authored_model_references(
 
     let mut grouped = BTreeMap::<String, Vec<UsageLocation>>::new();
     for provider in analyzer
-        .structural_search_providers()
+        .structural_fact_providers()
         .into_iter()
         .filter(|provider| provider.structural_language().config_label() == symbol.language)
     {
@@ -4832,6 +5014,53 @@ mod tests {
     use crate::test_support::AnalyzerFixture;
 
     #[test]
+    fn rooted_usage_graph_never_scans_the_workspace_declaration_inventory() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Java,
+            &[
+                (
+                    "app/Root.java",
+                    "package app; class Root { void run() { new Target().call(); } }\n",
+                ),
+                (
+                    "app/Target.java",
+                    "package app; class Target { void call() {} }\n",
+                ),
+                (
+                    "app/Unrelated.java",
+                    "package app; class Unrelated { void unused() {} }\n",
+                ),
+            ],
+        );
+        let analyzer = fixture.analyzer.analyzer();
+        analyzer
+            .test_hooks()
+            .reset_full_declaration_scan_count_for_test();
+
+        let graph = usage_graph(
+            analyzer,
+            UsageGraphParams {
+                include_tests: false,
+                paths: Some(vec!["app/Root.java".to_string()]),
+                depth: 1,
+            },
+        );
+
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|edge| edge.from == "app.Root.run" && edge.to == "app.Target.call"),
+            "the bounded graph must still resolve its direct endpoint"
+        );
+        assert_eq!(
+            analyzer.test_hooks().full_declaration_scan_count_for_test(),
+            0,
+            "a rooted usage graph must not hydrate the workspace declaration inventory"
+        );
+    }
+
+    #[test]
     fn exact_location_selector_accepts_the_indexed_declaration_range_start() {
         let source = "package repro\n\ntype Error struct{}\n\nfunc (e *Error) Error() string { return \"\" }\n";
         let fixture = AnalyzerFixture::new_for_language(
@@ -4973,7 +5202,7 @@ mod tests {
         // The check count is deterministic for a fixed fixture, so sweeping it
         // deterministically visits the window where the scan has proved sites
         // but has not finished. That entry must show them.
-        let partial = (1..=600)
+        let partial = (1..=4_000)
             .map(|checks| {
                 scan_with(
                     &analyzer,
@@ -5032,7 +5261,7 @@ mod tests {
             .expect("complete location scan counts hits");
         assert!(complete_hits > 0, "fixture must produce location hits");
 
-        let partial = (1..=600)
+        let partial = (1..=4_000)
             .map(|checks| {
                 scan_location_with(
                     &analyzer,

@@ -11,6 +11,7 @@
 
 pub mod adapter_helpers;
 pub mod callable;
+pub mod control_relation;
 pub mod edges;
 pub mod facts;
 pub mod flow_state;

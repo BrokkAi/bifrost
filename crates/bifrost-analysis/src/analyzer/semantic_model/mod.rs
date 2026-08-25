@@ -14,7 +14,6 @@ mod overlay;
 mod producer;
 mod runtime;
 mod source;
-mod summary_binding;
 mod validate;
 
 pub use artifact::{
@@ -42,11 +41,6 @@ pub use producer::{
 };
 pub use runtime::*;
 pub use source::SourceFormat;
-pub use summary_binding::{
-    ExactProcedureSummaryBoundary, ExactProcedureSummaryParameter, ExactProcedureSummaryReceiver,
-    ExactProcedureSummaryTargetBinding, ProcedureSummaryBindingError,
-    bind_compiled_procedure_summaries,
-};
 pub use validate::{Diagnostic, DiagnosticSeverity};
 
 /// Returns the version-one authoring schema as stable, pretty-printed JSON.

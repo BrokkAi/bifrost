@@ -1,6 +1,9 @@
 use super::schema::{CallTraversalCompleteness, CodeQueryExecutionMode, QueryStepOp};
 use crate::refs::{ProtocolRef, TaintResultRef, ValueFlowPlanRef};
 use brokk_bifrost_core::analyzer::Language;
+use brokk_bifrost_core::analyzer::structural::control_relation::{
+    ControlExitPartition, ControlRelationKind,
+};
 use brokk_bifrost_core::analyzer::structural::edges::{OwnerRelation, SiteClass};
 use brokk_bifrost_core::analyzer::structural::flow_state::{
     FlowCertainty, FlowRelation as FlowRelationLabel, FlowSubjectKind, StateEventClass,
@@ -106,6 +109,11 @@ pub enum QueryValueKind {
     ReferenceEdge,
     StateEvent,
     FlowRelation,
+    ControlRelation,
+    Guard,
+    SourceSet,
+    BuildTarget,
+    TopologyEdge,
     RewritePath,
     QualifiedPath,
     PathSegment,
@@ -157,6 +165,11 @@ impl QueryValueKind {
             Self::ReferenceEdge => "reference_edge",
             Self::StateEvent => "state_event",
             Self::FlowRelation => "flow_relation",
+            Self::ControlRelation => "control_relation",
+            Self::Guard => "guard",
+            Self::SourceSet => "source_set",
+            Self::BuildTarget => "build_target",
+            Self::TopologyEdge => "topology_edge",
             Self::RewritePath => "rewrite_path",
             Self::QualifiedPath => "qualified_path",
             Self::PathSegment => "path_segment",
@@ -231,6 +244,25 @@ pub struct FlowRelationFilter {
 impl FlowRelationFilter {
     pub fn is_empty(&self) -> bool {
         self.relations.is_empty() && self.certainties.is_empty()
+    }
+}
+
+/// Constrained-value filter over control-relation rows (#2443).
+///
+/// Both axes are enumerations the author writes, so an empty axis means "every
+/// value", never "no value". A filter never turns an incomplete derivation into
+/// a complete one: the diagnostics the derivation reports are emitted before any
+/// filter runs, so a `:relation postdominates` filter that drops every row still
+/// leaves the reason the row set is partial on the response.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ControlRelationFilter {
+    pub relations: Vec<ControlRelationKind>,
+    pub exit_partitions: Vec<ControlExitPartition>,
+}
+
+impl ControlRelationFilter {
+    pub fn is_empty(&self) -> bool {
+        self.relations.is_empty() && self.exit_partitions.is_empty()
     }
 }
 
@@ -381,6 +413,11 @@ pub enum QueryStep {
     FlowRelationsOf(FlowRelationFilter),
     FlowSource,
     FlowTarget,
+    ControlRelations(ControlRelationFilter),
+    GuardsOf,
+    TargetOf,
+    SourceSetOf,
+    TopologyEdgesOf,
     RewritePathsOf(RewritePathFilter),
     SegmentsOf(SegmentsOfOptions),
     SegmentTarget,
@@ -886,6 +923,11 @@ impl QueryStep {
             Self::FlowRelationsOf(_) => QueryStepOp::FlowRelationsOf,
             Self::FlowSource => QueryStepOp::FlowSource,
             Self::FlowTarget => QueryStepOp::FlowTarget,
+            Self::ControlRelations(_) => QueryStepOp::ControlRelations,
+            Self::GuardsOf => QueryStepOp::GuardsOf,
+            Self::TargetOf => QueryStepOp::TargetOf,
+            Self::SourceSetOf => QueryStepOp::SourceSetOf,
+            Self::TopologyEdgesOf => QueryStepOp::TopologyEdgesOf,
             Self::RewritePathsOf(_) => QueryStepOp::RewritePathsOf,
             Self::SegmentsOf(_) => QueryStepOp::SegmentsOf,
             Self::SegmentTarget => QueryStepOp::SegmentTarget,
@@ -969,6 +1011,13 @@ impl QueryStep {
             }
             QueryStepOp::FlowSource => Some(Self::FlowSource),
             QueryStepOp::FlowTarget => Some(Self::FlowTarget),
+            QueryStepOp::TargetOf => Some(Self::TargetOf),
+            QueryStepOp::SourceSetOf => Some(Self::SourceSetOf),
+            QueryStepOp::TopologyEdgesOf => Some(Self::TopologyEdgesOf),
+            QueryStepOp::GuardsOf => Some(Self::GuardsOf),
+            QueryStepOp::ControlRelations => {
+                Some(Self::ControlRelations(ControlRelationFilter::default()))
+            }
             QueryStepOp::RewritePathsOf => Some(Self::RewritePathsOf(RewritePathFilter::default())),
             QueryStepOp::SegmentsOf => Some(Self::SegmentsOf(SegmentsOfOptions::default())),
             QueryStepOp::SegmentTarget => Some(Self::SegmentTarget),
@@ -1210,6 +1259,19 @@ impl QueryStep {
             (Self::FlowSource | Self::FlowTarget, QueryValueKind::FlowRelation) => {
                 Some(QueryValueKind::StateEvent)
             }
+            (Self::ControlRelations(_), QueryValueKind::Procedure) => {
+                Some(QueryValueKind::ControlRelation)
+            }
+            (Self::GuardsOf, QueryValueKind::Procedure) => Some(QueryValueKind::Guard),
+            // Project topology (#2448). A file's owner is what the build
+            // declares about it, so both ownership steps are seeded from a
+            // file, and the dependency step is seeded from the target whose
+            // declared dependencies it returns.
+            (Self::TargetOf, QueryValueKind::File) => Some(QueryValueKind::BuildTarget),
+            (Self::SourceSetOf, QueryValueKind::File) => Some(QueryValueKind::SourceSet),
+            (Self::TopologyEdgesOf, QueryValueKind::BuildTarget) => {
+                Some(QueryValueKind::TopologyEdge)
+            }
             (Self::RewritePathsOf(_), QueryValueKind::File) => Some(QueryValueKind::RewritePath),
             _ => None,
         }
@@ -1310,6 +1372,10 @@ pub(super) fn validate_query_steps(
             QueryStep::StateEventsOf(_) => "procedure or declaration",
             QueryStep::FlowRelationsOf(_) => "state_event or procedure",
             QueryStep::FlowSource | QueryStep::FlowTarget => "flow_relation",
+            QueryStep::ControlRelations(_) => "procedure",
+            QueryStep::GuardsOf => "procedure",
+            QueryStep::TargetOf | QueryStep::SourceSetOf => "file",
+            QueryStep::TopologyEdgesOf => "build_target",
             QueryStep::RewritePathsOf(_) => "file",
             QueryStep::SegmentsOf(_) => "qualified_path",
             QueryStep::SegmentTarget => "path_segment",

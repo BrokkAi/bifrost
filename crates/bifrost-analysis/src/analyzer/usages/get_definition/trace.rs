@@ -1498,6 +1498,8 @@ mod boundary_evidence_tests {
                     },
                     provenance: Vec::new(),
                     artifacts: Vec::new(),
+                    scope: crate::analyzer::topology::DependencyScope::Unknown,
+                    declared_by: None,
                 })
                 .collect(),
         );

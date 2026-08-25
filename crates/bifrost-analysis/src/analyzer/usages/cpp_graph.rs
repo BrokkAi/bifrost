@@ -71,17 +71,15 @@ pub use shared::CppAuthoritativeUsageBatch;
 /// C++-only questions is resolved once here rather than at each of the nine
 /// `resolve_analyzer::<CppAnalyzer>` sites the scans used to carry.
 ///
-/// A borrowed newtype rather than a bare `&dyn IAnalyzer` because two of the
-/// questions have no core capability to sit on and `dyn IAnalyzer` cannot be
-/// unsized to another trait object: `import_statements` is `IAnalyzer`'s own,
-/// and `DefinitionIndexHandle` is built per call, so it can never be lent out
-/// as a `&dyn` for the crate to hold.
+/// A borrowed newtype rather than a bare `&dyn IAnalyzer` because the dispatch
+/// carries capabilities that cannot be combined into one trait object.
 pub(in crate::analyzer::usages) struct CppDispatch<'a> {
     analyzer: &'a dyn IAnalyzer,
     cpp: Option<&'a CppAnalyzer>,
     /// Proof that the request scope this dispatch serves is open (issue #2414
     /// step 3). Every C++ graph walk below reaches syntax through it.
     token: QueryToken<'a>,
+    frontier: Option<&'a dyn brokk_bifrost_core::analyzer::RelationalDefinitionFrontier>,
 }
 
 impl<'a> CppDispatch<'a> {
@@ -93,6 +91,20 @@ impl<'a> CppDispatch<'a> {
             analyzer,
             cpp: resolve_analyzer::<CppAnalyzer>(analyzer),
             token,
+            frontier: None,
+        }
+    }
+
+    pub(in crate::analyzer::usages) fn with_frontier(
+        analyzer: &'a dyn IAnalyzer,
+        token: QueryToken<'a>,
+        frontier: &'a dyn brokk_bifrost_core::analyzer::RelationalDefinitionFrontier,
+    ) -> Self {
+        Self {
+            analyzer,
+            cpp: resolve_analyzer::<CppAnalyzer>(analyzer),
+            token,
+            frontier: Some(frontier),
         }
     }
 
@@ -113,16 +125,108 @@ impl CppWorkspaceSource for CppDispatch<'_> {
         self.analyzer.import_statements(file)
     }
 
-    fn definitions_by_fqn(&self, _token: QueryToken<'_>, fqn: &str) -> Vec<&CodeUnit> {
-        // `into_shards` rather than a query on the handle: the matches are
-        // returned to a caller that outlives this lookup, so they must borrow
-        // the analyzer rather than a handle that dies with this call.
-        self.analyzer
-            .global_usage_definition_index()
-            .into_shards()
-            .into_iter()
-            .flat_map(|shard| shard.by_fqn(fqn).iter())
-            .collect()
+    fn definitions_by_name(
+        &self,
+        _token: QueryToken<'_>,
+        name: &brokk_bifrost_core::analyzer::fq_name::FqName,
+    ) -> Vec<CodeUnit> {
+        self.definitions(
+            name,
+            brokk_bifrost_core::analyzer::RelationalDefinitionQuery::ExactName,
+        )
+    }
+
+    fn definitions_by_identifier(
+        &self,
+        _token: QueryToken<'_>,
+        name: &brokk_bifrost_core::analyzer::fq_name::FqName,
+    ) -> Vec<CodeUnit> {
+        self.definitions(
+            name,
+            brokk_bifrost_core::analyzer::RelationalDefinitionQuery::Identifier { file: None },
+        )
+    }
+}
+
+impl CppDispatch<'_> {
+    fn definitions(
+        &self,
+        name: &brokk_bifrost_core::analyzer::fq_name::FqName,
+        query: brokk_bifrost_core::analyzer::RelationalDefinitionQuery,
+    ) -> Vec<CodeUnit> {
+        if let Some(frontier) = self.frontier {
+            return definitions_from_frontier(frontier, name, query);
+        }
+        relational_definitions(self.analyzer, name, query)
+    }
+}
+
+pub(crate) fn relational_exact_definitions(
+    analyzer: &dyn IAnalyzer,
+    name: &brokk_bifrost_core::analyzer::fq_name::FqName,
+) -> Vec<CodeUnit> {
+    relational_definitions(
+        analyzer,
+        name,
+        brokk_bifrost_core::analyzer::RelationalDefinitionQuery::ExactName,
+    )
+}
+
+pub(crate) fn relational_identifier_definitions(
+    analyzer: &dyn IAnalyzer,
+    name: &brokk_bifrost_core::analyzer::fq_name::FqName,
+) -> Vec<CodeUnit> {
+    relational_definitions(
+        analyzer,
+        name,
+        brokk_bifrost_core::analyzer::RelationalDefinitionQuery::Identifier { file: None },
+    )
+}
+
+pub(crate) fn relational_structural_members(
+    analyzer: &dyn IAnalyzer,
+    owner: &brokk_bifrost_core::analyzer::fq_name::FqName,
+    identifier: &str,
+) -> Vec<CodeUnit> {
+    relational_definitions(
+        analyzer,
+        owner,
+        brokk_bifrost_core::analyzer::RelationalDefinitionQuery::StructuralMembers {
+            identifier: identifier.to_string(),
+        },
+    )
+}
+
+fn definitions_from_frontier(
+    frontier: &dyn brokk_bifrost_core::analyzer::RelationalDefinitionFrontier,
+    name: &brokk_bifrost_core::analyzer::fq_name::FqName,
+    query: brokk_bifrost_core::analyzer::RelationalDefinitionQuery,
+) -> Vec<CodeUnit> {
+    let question = brokk_bifrost_core::analyzer::RelationalDefinitionQuestion {
+        language_scope: brokk_bifrost_core::analyzer::DefinitionLanguageScope::Workspace,
+        name: brokk_bifrost_core::analyzer::RelationalName::stable(name.clone()),
+        query,
+    };
+    match frontier.ask(&question) {
+        brokk_bifrost_core::analyzer::RelationalDefinitionValue::Definitions(units) => units,
+        _ => panic!("definition question returned the wrong result shape"),
+    }
+}
+
+fn relational_definitions(
+    analyzer: &dyn IAnalyzer,
+    name: &brokk_bifrost_core::analyzer::fq_name::FqName,
+    query: brokk_bifrost_core::analyzer::RelationalDefinitionQuery,
+) -> Vec<CodeUnit> {
+    let cancellation = crate::CancellationToken::new();
+    match crate::analyzer::relational_frontier::resolve_relational_frontier(
+        analyzer,
+        &cancellation,
+        |frontier| definitions_from_frontier(frontier, name, query.clone()),
+    ) {
+        brokk_bifrost_core::analyzer::RelationalFrontierOutcome::Complete(units) => units,
+        brokk_bifrost_core::analyzer::RelationalFrontierOutcome::Cancelled
+        | brokk_bifrost_core::analyzer::RelationalFrontierOutcome::Failed(_) => Vec::new(),
     }
 }
 
@@ -159,6 +263,18 @@ where
 {
     let resolver = CppEdgeResolver::try_new(analyzer)?;
     Some(resolver.build_edges(analyzer, nodes, keep_file))
+}
+
+pub(crate) fn build_rooted_cpp_usage_edges<F>(
+    analyzer: &dyn IAnalyzer,
+    callers: &HashSet<String>,
+    keep_file: F,
+) -> Option<UsageEdges>
+where
+    F: Fn(&ProjectFile) -> bool + Sync,
+{
+    let resolver = CppEdgeResolver::try_new(analyzer)?;
+    Some(resolver.build_rooted_edges(analyzer, callers, keep_file))
 }
 
 pub(crate) fn build_cpp_usage_edge_weights<F>(

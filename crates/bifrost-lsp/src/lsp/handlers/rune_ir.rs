@@ -1,14 +1,12 @@
 use lsp_types::{Position, Range as LspRange, TextDocumentIdentifier};
 
 use crate::analyzer::common::{display_identifier_for_target, language_for_file};
-use crate::analyzer::structural::{
-    RuneIrLanguage, RuneIrLimits, RuneIrSelection, render_source_rune_ir,
-};
 use crate::analyzer::{Project, Range as ByteRange, WorkspaceAnalyzer};
 use crate::lsp::conversion::{byte_range_to_lsp_range, position_to_byte_offset};
 use crate::lsp::handlers::document_symbol::primary_range;
 use crate::lsp::handlers::formatting::format_bifrost_sexp;
 use crate::lsp::handlers::util::read_document_for_uri;
+use crate::rql::{RuneIrLanguage, RuneIrLimits, RuneIrSelection, render_source_rune_ir};
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]

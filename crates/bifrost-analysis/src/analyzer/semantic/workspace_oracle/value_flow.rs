@@ -1,7 +1,14 @@
 //! Bounded value-flow and candidate-specific call-binding materialization.
 //!
 //! The implementation projects validated semantic IR rows into neutral oracle
-//! relations. It never reparses source or matches declarations by text.
+//! relations. It never reparses source or matches declarations by text,
+//! except for one narrow, explicitly named discharge predicate
+//! ([`super::external_constant_field_read_discharges_gap`], #2538) composed
+//! into the two gap sweeps below: it delegates to `dispatch.rs`'s own
+//! source-and-text machinery (already used there to resolve an
+//! unmaterialized external *call* target) to prove a specific `FieldMemory`
+//! gap is a `static final` read on an external type. Every other relevance
+//! and discharge decision in this file stays IR-only.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -15,12 +22,13 @@ use crate::analyzer::semantic::{
     AbstractLocation, AbstractObject, AbstractObjectIdentity, AccessPath, AccessPathRoot,
     AccessPathTail, AccessSelector, AllocationHandle, CallArgumentEndpoint, CallArgumentExpansion,
     CallArgumentGroup, CallArgumentMapping, CallArgumentMember, CallBinding, CallBindings,
-    CallPassingMode, CandidateCoverage, CaptureSource, DeclarationSegmentKind, DispatchCandidate,
-    EvidenceCompleteness, EvidenceHandle, FormalMultiplicity, IndexSelector, MemoryLocationId,
-    MemoryLocationKind, ObjectCardinality, OracleCallContext, OracleCandidate, OracleRelationArena,
-    OracleRelationHandle, OracleRelationId, OracleRelationKind, OracleRelationOwner,
-    OracleRelationRecord, ProcedureHandle, ProcedurePortHandle, ProgramPointHandle, ProofStatus,
-    ScopedSemanticLocator, SemanticCapability, SemanticEffect, SemanticGapImpact, SemanticGapKind,
+    CallPassingMode, CandidateCoverage, CaptureSource, ControlEdgeKind, DeclarationSegmentKind,
+    DispatchCandidate, EvidenceCompleteness, EvidenceHandle, FormalMultiplicity, HeapOracle,
+    IndexSelector, MemoryLocationId, MemoryLocationKind, ObjectCardinality, OracleCallContext,
+    OracleCandidate, OracleRelationArena, OracleRelationHandle, OracleRelationId,
+    OracleRelationKind, OracleRelationOwner, OracleRelationRecord, ProcedureHandle,
+    ProcedurePortHandle, ProgramPointHandle, ProgramPointId, ProofStatus, ScopedSemanticLocator,
+    SemanticCapability, SemanticEffect, SemanticGapDischarge, SemanticGapImpact, SemanticGapKind,
     SemanticGapSubject, SemanticLocator, SemanticOutcome, SemanticProviderError, SemanticRequest,
     SemanticValueKind, SemanticWork, ValueFlowEndpoint, ValueFlowKind, ValueFlowOracle,
     ValueFlowRelation, ValueFlowRelationKind, ValueFlowSnapshot, ValueHandle, ValueId,
@@ -64,6 +72,473 @@ struct FlowRelationDraft {
     proof: ProofStatus,
     completeness: EvidenceCompleteness,
     evidence: Vec<EvidenceHandle>,
+    strong_update: bool,
+}
+
+/// Which store base values this procedure can answer a strong-update question
+/// about without leaving the procedure.
+///
+/// Two things ride on that. The obvious one is cost: `update_eligibility`
+/// resolves the store's base value through the full points-to trace, and asking
+/// it for every store in a workspace would pay for a trace that cannot end in a
+/// certificate anyway. Only an allocation, a static, or a lexical cell ever
+/// reaches singleton cardinality, so a base value that is not locally allocated
+/// is a certain weak update.
+///
+/// The other is re-entrancy. The points-to trace enters a callee through
+/// `materialize_call_result`, which calls `procedure_relations` again. Asking
+/// the question from inside `procedure_relations` without this gate would make
+/// two mutually recursive procedures materialize each other until the budget
+/// ran out. A base value whose every backward producer chain ends at an
+/// allocation of this procedure never reaches that path, because the trace
+/// stops at the allocation effect.
+struct LocalStoreBases {
+    /// Copy producers, as (target, source) pairs in target order.
+    copies: Box<[(ValueId, ValueId)]>,
+    allocation_results: HashSet<ValueId>,
+    /// Values a call or a memory load produces, which the trace would follow
+    /// out of this procedure or open.
+    foreign: HashSet<ValueId>,
+}
+
+impl LocalStoreBases {
+    fn derive(semantics: &crate::analyzer::semantic::ProcedureSemantics) -> Self {
+        let mut copies = Vec::new();
+        let mut foreign = HashSet::new();
+        for point in semantics.points() {
+            for event in &point.events {
+                match event.effect {
+                    SemanticEffect::Assignment { target, value } => copies.push((target, value)),
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Local,
+                        source,
+                        target,
+                    } => copies.push((target, source)),
+                    SemanticEffect::MemoryLoad { result, .. } => {
+                        foreign.insert(result);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let allocation_results: HashSet<ValueId> = semantics
+            .allocations()
+            .iter()
+            .map(|allocation| allocation.result)
+            .collect();
+        for call in semantics.call_sites() {
+            // A constructor call whose result is this procedure's own
+            // allocation does not carry the object in from elsewhere -- it is
+            // how several adapters lower `new`. Treating it as foreign would
+            // make every constructed object unresolvable here.
+            foreign.extend(
+                call.result
+                    .filter(|result| !allocation_results.contains(result)),
+            );
+            foreign.extend(call.thrown);
+        }
+        copies.sort_unstable();
+        Self {
+            copies: copies.into_boxed_slice(),
+            allocation_results,
+            foreign,
+        }
+    }
+
+    /// Whether every backward producer chain from `base` ends at an allocation
+    /// of this procedure.
+    fn is_locally_allocated(&self, base: ValueId) -> bool {
+        let mut pending = vec![base];
+        let mut seen = HashSet::new();
+        while let Some(value) = pending.pop() {
+            if !seen.insert(value) {
+                continue;
+            }
+            if self.foreign.contains(&value) {
+                return false;
+            }
+            if self.allocation_results.contains(&value) {
+                continue;
+            }
+            let start = self.copies.partition_point(|(target, _)| *target < value);
+            let sources = self.copies[start..]
+                .iter()
+                .take_while(|(target, _)| *target == value);
+            let mut any = false;
+            for (_, source) in sources {
+                any = true;
+                pending.push(*source);
+            }
+            if !any {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Why a derived handler binding is never a proven, complete relation.
+///
+/// The IR carries no type for a thrown value and no caught type for a catch
+/// clause, so nothing at this layer can decide which alternative the runtime
+/// selects. The relation is published anyway, as a may-bind to each reachable
+/// alternative, because dropping it would leave a caught value unanalyzed
+/// while the run still looked decisive.
+const HANDLER_SELECTION_UNPROVEN: &str =
+    "handler selection is not proven: the thrown value may bind to any reachable catch clause";
+
+/// Where a thrown value can be bound by a handler of the same procedure
+/// (#2446).
+///
+/// Several adapters bind the caught value at lowering time when the handler is
+/// unambiguous: the Java lowerer writes a `ValueFlow` effect from the thrown
+/// value to the catch parameter when a `try` has exactly one catch clause with
+/// a precise type. When it cannot select the handler -- more than one clause,
+/// or a union type -- it publishes an `ExceptionalControlFlow` gap at the
+/// dispatcher instead and binds nothing, so the caught value is unreachable
+/// for every downstream client.
+///
+/// This derivation answers the part the lowering left open, from rows the IR
+/// already carries and without asking any adapter for new events:
+///
+/// * A *dispatcher* is a point that selects between handler alternatives:
+///   it has `SwitchCase` successors, an `Exceptional` successor for the
+///   throw it does not match, and an undischarged point-scoped
+///   `ExceptionalControlFlow` gap. That gap is exactly the adapter's own
+///   record that it could not select, so a handler the adapter already bound
+///   is never derived here a second time.
+/// * A handler's *binding* is the procedure-local value the runtime assigns
+///   the caught exception to. It is identified structurally: a `Local` value
+///   that no event in the procedure ever defines, and that is read at a point
+///   the handler's entry dominates. Nothing about source ranges or names
+///   enters this; the nearest dominating handler entry owns the read, so a
+///   `try` nested inside a handler body attributes its own binding to itself.
+/// * A throw reaches a dispatcher through the `Exceptional` and `Cleanup`
+///   edges the adapter already routed. The walk does not follow `SwitchCase`
+///   edges, so it passes through a dispatcher that already bound its handler
+///   by way of that dispatcher's unmatched route, which is what the runtime
+///   does.
+///
+/// Handler *selection* stays unproven. Deciding which alternative catches a
+/// given throw needs the thrown value's type and each clause's caught type,
+/// and neither is in the IR, so the derived relations bind the value to every
+/// alternative the route can reach and say so in their proof and completeness.
+/// That is an over-approximation for a may analysis, never a clean answer:
+/// a handler this derivation cannot resolve keeps the dispatcher's gap, and
+/// the gap keeps the snapshot open.
+#[derive(Debug, Default)]
+struct HandlerBindings {
+    /// Throw point -> the handler bindings that point's exception route can
+    /// reach, in dispatcher alternative order and without repeats.
+    by_throw_point: HashMap<ProgramPointId, Box<[ValueId]>>,
+    /// Handler binding -> the thrown value the runtime copies into it, for the
+    /// one throw that reaches it. A binding more than one throw reaches has no
+    /// single origin and is [`LoadOrigin::Ambiguous`].
+    ///
+    /// This is what makes a field read through the binding observe the object
+    /// the throw carried. Without it the access-path resolver roots
+    /// `caught.field` at the binding itself, which no store can ever reach,
+    /// and the derived relation would bind a value nothing then reads.
+    binder_origins: HashMap<ValueId, LoadOrigin>,
+}
+
+impl HandlerBindings {
+    fn derive(
+        procedure: &ProcedureHandle,
+        cancellation: &crate::CancellationToken,
+        mut charge: impl FnMut(SemanticWork) -> Result<(), Interruption>,
+    ) -> Result<Self, Interruption> {
+        let semantics = procedure.semantics();
+        let mut alternatives_by_dispatcher: HashMap<ProgramPointId, Vec<ProgramPointId>> =
+            HashMap::new();
+        for gap in semantics.gaps() {
+            if cancellation.is_cancelled() {
+                return Err(Interruption::Cancelled);
+            }
+            charge(SemanticWork {
+                gaps: 1,
+                ..SemanticWork::default()
+            })?;
+            if gap.capability != SemanticCapability::ExceptionalControlFlow
+                || gap.subject != SemanticGapSubject::Point
+                || gap.discharge != SemanticGapDischarge::None
+            {
+                continue;
+            }
+            let mut alternatives = Vec::new();
+            let mut has_residual_route = false;
+            for (_, edge) in semantics.successor_edges(gap.point) {
+                match edge.kind {
+                    ControlEdgeKind::SwitchCase => alternatives.push(edge.target_point),
+                    ControlEdgeKind::Exceptional => has_residual_route = true,
+                    _ => {}
+                }
+            }
+            if alternatives.is_empty() || !has_residual_route {
+                continue;
+            }
+            alternatives_by_dispatcher.insert(gap.point, alternatives);
+        }
+        if alternatives_by_dispatcher.is_empty() {
+            return Ok(Self::default());
+        }
+
+        let binders = Self::handler_binders(procedure, &alternatives_by_dispatcher, cancellation)?;
+        let mut by_throw_point = HashMap::new();
+        let mut binder_origins: HashMap<ValueId, LoadOrigin> = HashMap::new();
+        for point in semantics.points() {
+            if cancellation.is_cancelled() {
+                return Err(Interruption::Cancelled);
+            }
+            charge(SemanticWork {
+                program_points: 1,
+                ..SemanticWork::default()
+            })?;
+            if !point
+                .events
+                .iter()
+                .any(|event| matches!(event.effect, SemanticEffect::Throw { value: Some(_) }))
+            {
+                continue;
+            }
+            let mut reached = Vec::new();
+            // The route is walked in two modes. Outside a cleanup region only
+            // the abrupt edges belong to it. Inside one -- entered by a
+            // `Cleanup` edge -- the region's own statements run on ordinary
+            // edges before the route resumes, and each adapter lowers one copy
+            // of the region per completion route, so following those edges
+            // stays on this throw's route rather than joining the normal one.
+            let mut visited: HashSet<(ProgramPointId, bool)> = HashSet::new();
+            let mut pending = VecDeque::new();
+            pending.push_back((point.id, false));
+            visited.insert((point.id, false));
+            while let Some((current, in_cleanup)) = pending.pop_front() {
+                if cancellation.is_cancelled() {
+                    return Err(Interruption::Cancelled);
+                }
+                charge(SemanticWork {
+                    program_points: 1,
+                    ..SemanticWork::default()
+                })?;
+                if current != point.id
+                    && let Some(alternatives) = alternatives_by_dispatcher.get(&current)
+                {
+                    for entry in alternatives {
+                        if let Some(binder) = binders.get(entry).copied().flatten()
+                            && !reached.contains(&binder)
+                        {
+                            reached.push(binder);
+                        }
+                    }
+                    continue;
+                }
+                for (_, edge) in semantics.successor_edges(current) {
+                    let follows = match edge.kind {
+                        ControlEdgeKind::Exceptional | ControlEdgeKind::Cleanup => true,
+                        // A handler alternative is entered by selecting it,
+                        // which is the decision this walk is enumerating.
+                        ControlEdgeKind::SwitchCase => false,
+                        _ => in_cleanup,
+                    };
+                    if !follows {
+                        continue;
+                    }
+                    let next = (
+                        edge.target_point,
+                        in_cleanup || edge.kind == ControlEdgeKind::Cleanup,
+                    );
+                    if visited.insert(next) {
+                        pending.push_back(next);
+                    }
+                }
+            }
+            if reached.is_empty() {
+                continue;
+            }
+            for thrown in point.events.iter().filter_map(|event| match event.effect {
+                SemanticEffect::Throw { value } => value,
+                _ => None,
+            }) {
+                for binder in &reached {
+                    binder_origins
+                        .entry(*binder)
+                        .and_modify(|existing| {
+                            if *existing != LoadOrigin::Value(thrown) {
+                                *existing = LoadOrigin::Ambiguous;
+                            }
+                        })
+                        .or_insert(LoadOrigin::Value(thrown));
+                }
+            }
+            by_throw_point.insert(point.id, reached.into_boxed_slice());
+        }
+        Ok(Self {
+            by_throw_point,
+            binder_origins,
+        })
+    }
+
+    /// The value each handler entry binds its caught exception to.
+    ///
+    /// An entry maps to `None` when the procedure offers no unique candidate:
+    /// either nothing the entry dominates reads an undefined local, or more
+    /// than one does. Both stay unbound rather than picking one, because a
+    /// binding written to the wrong local would be a fact about a value the
+    /// handler never received.
+    fn handler_binders(
+        procedure: &ProcedureHandle,
+        alternatives_by_dispatcher: &HashMap<ProgramPointId, Vec<ProgramPointId>>,
+        cancellation: &crate::CancellationToken,
+    ) -> Result<HashMap<ProgramPointId, Option<ValueId>>, Interruption> {
+        let semantics = procedure.semantics();
+        let mut binders: HashMap<ProgramPointId, Option<ValueId>> = HashMap::new();
+        for entries in alternatives_by_dispatcher.values() {
+            for entry in entries {
+                binders.insert(*entry, None);
+            }
+        }
+
+        let mut defined: HashSet<ValueId> = semantics
+            .allocations()
+            .iter()
+            .map(|allocation| allocation.result)
+            .collect();
+        for call in semantics.call_sites() {
+            defined.extend(call.result);
+            defined.extend(call.thrown);
+        }
+        for point in semantics.points() {
+            for event in &point.events {
+                match &event.effect {
+                    SemanticEffect::Assignment { target, .. }
+                    | SemanticEffect::ValueFlow { target, .. } => {
+                        defined.insert(*target);
+                    }
+                    SemanticEffect::MemoryLoad { result, .. }
+                    | SemanticEffect::CallableCreation { result, .. }
+                    | SemanticEffect::CallableReference { result, .. } => {
+                        defined.insert(*result);
+                    }
+                    SemanticEffect::AsyncResume { result, .. } => {
+                        defined.extend(*result);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let mut budget = crate::analyzer::semantic::cfg_algorithms::CfgAlgorithmBudget::default();
+        let mut request = crate::analyzer::semantic::cfg_algorithms::CfgAlgorithmRequest::new(
+            &mut budget,
+            cancellation,
+        );
+        let dominators = match crate::analyzer::semantic::cfg_algorithms::dominators(
+            semantics,
+            semantics.entry_point(),
+            &mut request,
+        ) {
+            Ok(dominators) => dominators,
+            Err(crate::analyzer::semantic::cfg_algorithms::CfgAlgorithmError::Cancelled {
+                ..
+            }) => return Err(Interruption::Cancelled),
+            // A procedure whose dominance the shared budget will not pay for
+            // publishes no handler binding. Its dispatcher gap is untouched,
+            // so the answer stays open rather than becoming clean.
+            Err(_) => return Ok(binders),
+        };
+
+        let mut ambiguous: HashSet<ProgramPointId> = HashSet::new();
+        for (point, value) in read_values(semantics) {
+            if cancellation.is_cancelled() {
+                return Err(Interruption::Cancelled);
+            }
+            if defined.contains(&value)
+                || !matches!(
+                    semantics.value(value).map(|row| &row.kind),
+                    Some(SemanticValueKind::Local)
+                )
+            {
+                continue;
+            }
+            // The nearest dominating handler entry owns the read. The chain
+            // strictly ascends, so the walk terminates.
+            let mut cursor = Some(point);
+            while let Some(current) = cursor {
+                if let Some(slot) = binders.get_mut(&current) {
+                    match slot {
+                        Some(existing) if *existing == value => {}
+                        Some(_) => {
+                            ambiguous.insert(current);
+                        }
+                        None if ambiguous.contains(&current) => {}
+                        None => *slot = Some(value),
+                    }
+                    break;
+                }
+                cursor = dominators.immediate_dominator(semantics, current);
+            }
+        }
+        for entry in ambiguous {
+            binders.insert(entry, None);
+        }
+        Ok(binders)
+    }
+
+    fn alternatives_for(&self, point: ProgramPointId) -> &[ValueId] {
+        self.by_throw_point
+            .get(&point)
+            .map_or(&[][..], |values| &values[..])
+    }
+
+    fn binder_origins(&self) -> &HashMap<ValueId, LoadOrigin> {
+        &self.binder_origins
+    }
+}
+
+/// Every value one procedure reads, paired with the point that reads it.
+///
+/// Reads are enumerated from the events and call rows that name a value in an
+/// operand position. A value that only appears as the base of a memory row is
+/// deliberately absent: the adapters lower a base into an operand of its own
+/// before the access, so the operand position is the one that names it.
+fn read_values(
+    semantics: &crate::analyzer::semantic::ProcedureSemantics,
+) -> impl Iterator<Item = (ProgramPointId, ValueId)> + '_ {
+    let event_reads = semantics.points().iter().flat_map(move |point| {
+        point
+            .events
+            .iter()
+            .flat_map(move |event| -> Vec<ValueId> {
+                match &event.effect {
+                    SemanticEffect::Assignment { value, .. } => vec![*value],
+                    SemanticEffect::ValueFlow { source, .. } => vec![*source],
+                    SemanticEffect::MemoryStore { value, .. } => vec![*value],
+                    SemanticEffect::ProcedureReturn { value } | SemanticEffect::Throw { value } => {
+                        value.iter().copied().collect()
+                    }
+                    SemanticEffect::AsyncSuspend { awaited, .. } => {
+                        awaited.iter().copied().collect()
+                    }
+                    SemanticEffect::CaptureBind { capture } => semantics
+                        .capture(*capture)
+                        .and_then(|row| match row.captured {
+                            CaptureSource::Value(value) => Some(value),
+                            CaptureSource::Location(_) => None,
+                        })
+                        .into_iter()
+                        .collect(),
+                    _ => Vec::new(),
+                }
+            })
+            .map(move |value| (point.id, value))
+    });
+    let call_reads = semantics.call_sites().iter().flat_map(|call| {
+        std::iter::once(call.callee)
+            .chain(call.receiver)
+            .chain(call.arguments.iter().map(|argument| argument.value))
+            .map(move |value| (call.point, value))
+    });
+    event_reads.chain(call_reads)
 }
 
 /// Whether this procedure's relation stream is open because of a capability
@@ -77,7 +552,7 @@ struct FlowRelationDraft {
 /// by construction unused here; a construct the adapter could not lower is
 /// reported through its per-construct semantic gap instead, which the gap
 /// sweep in `procedure_relations` already applies.
-pub(crate) fn value_flow_capabilities_are_open(procedure: &ProcedureHandle) -> bool {
+pub fn value_flow_capabilities_are_open(procedure: &ProcedureHandle) -> bool {
     let capabilities = procedure.artifact().capabilities();
     if [
         SemanticCapability::Values,
@@ -124,7 +599,7 @@ pub(crate) fn value_flow_capabilities_are_open(procedure: &ProcedureHandle) -> b
 /// that a complete resolution and binding of its call answers the question --
 /// for example Scala argument-evaluation strictness, where a deferring callee
 /// carries its own procedure-level gap that keeps every binding to it open.
-pub(crate) fn call_target_refinement_call(
+pub fn call_target_refinement_call(
     semantics: &crate::analyzer::semantic::ProcedureSemantics,
     gap: &crate::analyzer::semantic::SemanticGap,
 ) -> Option<crate::analyzer::semantic::CallSiteId> {
@@ -157,7 +632,7 @@ pub(crate) fn call_target_refinement_call(
 /// allocation whose constructor body is not materialized. The allocation
 /// effect itself gives heap flow a complete identity; constructor dispatch is
 /// retained as a structured gap but does not invalidate that identity.
-pub(crate) fn constructor_call_gap_is_discharged(
+pub fn constructor_call_gap_is_discharged(
     semantics: &crate::analyzer::semantic::ProcedureSemantics,
     gap: &crate::analyzer::semantic::SemanticGap,
 ) -> bool {
@@ -196,7 +671,7 @@ pub(crate) fn constructor_allocation_identity_discharges_gap(
 
 /// Whether a call's retained allocation result makes an unresolved
 /// zero-argument constructor boundary fully modeled for value flow.
-pub(crate) fn allocation_call_is_dischargeable(
+pub fn allocation_call_is_dischargeable(
     semantics: &crate::analyzer::semantic::ProcedureSemantics,
     call: &crate::analyzer::semantic::SemanticCallSite,
 ) -> bool {
@@ -210,6 +685,28 @@ pub(crate) fn allocation_call_is_dischargeable(
         .allocations()
         .iter()
         .any(|allocation| allocation.result == result)
+}
+
+/// The allocation site a constructor call's own result names, when this call
+/// *is* an object-creation expression (`new Type(...)`) -- any argument
+/// count, unlike `allocation_call_is_dischargeable`'s zero-argument
+/// restriction (a different question: whether an *unresolved* dispatch
+/// still leaves the allocated object's own identity provable). A `new
+/// Type(...)` call site spells no receiver operand at all: there is no
+/// existing object to invoke on, only the one this expression is about to
+/// create. The constructor procedure's own `this` is exactly that object,
+/// regardless of how many constructor parameters it takes, so the call
+/// site's own `result` -- not a sibling-`this` guess -- is the structurally
+/// correct actual for the callee's `Receiver` port (#2574).
+fn constructor_call_allocation_site<'a>(
+    semantics: &'a crate::analyzer::semantic::ProcedureSemantics,
+    call: &crate::analyzer::semantic::SemanticCallSite,
+) -> Option<&'a crate::analyzer::semantic::AllocationSite> {
+    let result = call.result?;
+    semantics
+        .allocations()
+        .iter()
+        .find(|allocation| allocation.result == result)
 }
 
 /// Whether a call-target refinement gap is discharged directly by the
@@ -232,7 +729,7 @@ fn declared_proven_target_discharges_gap(
 }
 
 /// Whether a snapshot gap's impacts can affect value-flow relations at all.
-pub(crate) fn gap_impacts_value_flow(gap: &crate::analyzer::semantic::SemanticGap) -> bool {
+pub fn gap_impacts_value_flow(gap: &crate::analyzer::semantic::SemanticGap) -> bool {
     gap.impacts.contains(SemanticGapImpact::ValueFlow)
         || gap.impacts.contains(SemanticGapImpact::ReturnTransfer)
         || gap.impacts.contains(SemanticGapImpact::HeapRead)
@@ -250,7 +747,7 @@ pub(crate) fn gap_impacts_value_flow(gap: &crate::analyzer::semantic::SemanticGa
 /// a value flow and must not open the snapshot (#1952). When aborts can run
 /// user code, the gap keeps standing: a flow into that code may depend on the
 /// missing edge.
-pub(crate) fn abort_paths_run_user_code(
+pub fn abort_paths_run_user_code(
     semantics: &crate::analyzer::semantic::ProcedureSemantics,
 ) -> bool {
     let exceptional_exit = semantics.exceptional_exit_point();
@@ -311,7 +808,7 @@ pub(crate) fn abort_paths_run_user_code(
 /// panic propagation, destructor unwinding) makes the represented route
 /// itself uncertain and always keeps standing, matching the matched-return
 /// rule in the ICFG exit profiles.
-pub(crate) fn implicit_abort_gap_is_discharged(
+pub fn implicit_abort_gap_is_discharged(
     gap: &crate::analyzer::semantic::SemanticGap,
     abort_user_code: bool,
 ) -> bool {
@@ -415,13 +912,39 @@ enum AccessPathResolution {
     Interrupted(Interruption),
 }
 
-fn memory_load_origins(
+/// What one backward scan over a procedure's events establishes about its
+/// values.
+///
+/// Both facts are read off the same event, so they are derived by one
+/// traversal rather than two. A second pass would not only cost a second walk;
+/// it would charge a second program-point census against the caller's semantic
+/// budget, which is a published cost model (`#2295`) and not free to move.
+struct ProcedureValueFacts {
+    /// Where each value's defining copy or load came from, or `Ambiguous` when
+    /// more than one event defines it differently.
+    load_origins: HashMap<ValueId, LoadOrigin>,
+    /// Values some consumption reads as a whole object (#2444 slice 2): a call
+    /// argument, a call receiver, a returned value, or a value stored as a
+    /// whole. These are the reads a container collapse is published at, and
+    /// deliberately not every read of a value -- see `ContainerRead`.
+    whole_container_reads: HashSet<ValueId>,
+}
+
+fn procedure_value_facts(
     procedure: &ProcedureHandle,
+    seeded: &HashMap<ValueId, LoadOrigin>,
     cancellation: &crate::CancellationToken,
     mut charge: impl FnMut(SemanticWork) -> Result<(), Interruption>,
-) -> Result<HashMap<ValueId, LoadOrigin>, Interruption> {
-    let mut origins = HashMap::new();
-    for point in procedure.semantics().points() {
+) -> Result<ProcedureValueFacts, Interruption> {
+    // The derived handler bindings (#2446) are copies the runtime performs
+    // rather than copies an event records, so they are seeded here instead of
+    // being discovered by the event scan below. A binding a later event also
+    // defines would resolve to `Ambiguous` through the same merge rule as any
+    // other conflicting origin.
+    let mut origins = seeded.clone();
+    let mut whole_container_reads = HashSet::new();
+    let semantics = procedure.semantics();
+    for point in semantics.points() {
         if cancellation.is_cancelled() {
             return Err(Interruption::Cancelled);
         }
@@ -462,6 +985,32 @@ fn memory_load_origins(
                     })?;
                     Some((result, LoadOrigin::Unique(location)))
                 }
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Return,
+                    source,
+                    ..
+                }
+                | SemanticEffect::MemoryStore { value: source, .. } => {
+                    charge(SemanticWork {
+                        values: 1,
+                        ..SemanticWork::default()
+                    })?;
+                    whole_container_reads.insert(source);
+                    None
+                }
+                SemanticEffect::Invoke { call_site } => {
+                    if let Some(call) = semantics.call_site(call_site) {
+                        charge(SemanticWork {
+                            call_sites: 1,
+                            values: call.arguments.len() + usize::from(call.receiver.is_some()),
+                            ..SemanticWork::default()
+                        })?;
+                        whole_container_reads.extend(call.receiver);
+                        whole_container_reads
+                            .extend(call.arguments.iter().map(|argument| argument.value));
+                    }
+                    None
+                }
                 _ => None,
             };
             if let Some((value, origin)) = origin {
@@ -476,7 +1025,10 @@ fn memory_load_origins(
             }
         }
     }
-    Ok(origins)
+    Ok(ProcedureValueFacts {
+        load_origins: origins,
+        whole_container_reads,
+    })
 }
 
 fn retain_selector(
@@ -489,6 +1041,59 @@ fn retain_selector(
     if selectors.len() > limit {
         selectors.pop_front();
         *summarized = true;
+    }
+}
+
+/// Where a backward walk over copy origins ended.
+enum ValueOriginWalk {
+    /// The walk reached a value nothing else in this procedure defines, or it
+    /// stopped on a join it cannot see through. `summarized` records the
+    /// second case, where the value named is the last unambiguous step rather
+    /// than a proven origin.
+    Root { value: ValueId, summarized: bool },
+    /// The walk reached a value a memory load defines. `value` is that value,
+    /// so a caller that declines to follow the load still names a root.
+    Load {
+        location: MemoryLocationId,
+        value: ValueId,
+    },
+}
+
+/// Walk one value back through the unconditional copies that define it.
+///
+/// This is the canonicalization that makes `alias.value` and `box.value` name
+/// one location, and #2444 slice 2 asks the same question of a value that is
+/// read as a whole, so the walk is shared rather than restated. `visited` is
+/// the caller's own cycle guard, carried across calls because one access path
+/// can walk several bases.
+fn walk_value_origin(
+    load_origins: &HashMap<ValueId, LoadOrigin>,
+    start: ValueId,
+    visited: &mut HashSet<ValueId>,
+) -> ValueOriginWalk {
+    let mut current = start;
+    loop {
+        match load_origins.get(&current) {
+            Some(LoadOrigin::Value(next)) if visited.insert(current) => current = *next,
+            Some(LoadOrigin::Unique(location)) => {
+                return ValueOriginWalk::Load {
+                    location: *location,
+                    value: current,
+                };
+            }
+            Some(LoadOrigin::Value(_)) | Some(LoadOrigin::Ambiguous) => {
+                return ValueOriginWalk::Root {
+                    value: current,
+                    summarized: true,
+                };
+            }
+            None => {
+                return ValueOriginWalk::Root {
+                    value: current,
+                    summarized: false,
+                };
+            }
+        }
     }
 }
 
@@ -559,26 +1164,23 @@ fn resolve_access_path<'location>(
             }
         };
 
-        let mut root_value = base;
-        let root = loop {
-            match load_origins.get(&root_value) {
-                Some(LoadOrigin::Value(next)) if visited_values.insert(root_value) => {
-                    root_value = *next;
-                }
-                Some(LoadOrigin::Unique(next)) if !visited.contains(next) => {
-                    current = *next;
-                    continue 'locations;
-                }
-                Some(LoadOrigin::Value(_))
-                | Some(LoadOrigin::Unique(_))
-                | Some(LoadOrigin::Ambiguous) => {
-                    summarized = true;
-                    break AccessPathRootDraft::Value(root_value);
-                }
-                None => break AccessPathRootDraft::Value(root_value),
+        match walk_value_origin(load_origins, base, &mut visited_values) {
+            ValueOriginWalk::Root {
+                value,
+                summarized: joined,
+            } => {
+                summarized |= joined;
+                break AccessPathRootDraft::Value(value);
             }
-        };
-        break root;
+            ValueOriginWalk::Load { location, value } => {
+                if visited.contains(&location) {
+                    summarized = true;
+                    break AccessPathRootDraft::Value(value);
+                }
+                current = location;
+                continue 'locations;
+            }
+        }
     };
 
     Ok(AccessPathResolution::Resolved(AccessPathDraft {
@@ -760,6 +1362,82 @@ fn indexed_base_value(
     value_handle(procedure, base).map(Some)
 }
 
+/// One member or element location this procedure named, and the weakest
+/// quality any relation that named it carried.
+///
+/// The quality travels with the carrier because a collapse must never be
+/// better evidenced than the access that put the label there: a member reached
+/// through a path the resolver summarized is `Partial` on its own relation,
+/// and the collapse that reads it inherits that.
+struct ContainerElement {
+    location: AbstractLocation,
+    proof: ProofStatus,
+    completeness: EvidenceCompleteness,
+}
+
+/// One event that reads a whole value which some consumption passes on.
+struct ContainerRead {
+    point: ProgramPointHandle,
+    event_index: u32,
+    value: ValueId,
+    evidence: EvidenceHandle,
+    proof: ProofStatus,
+    completeness: EvidenceCompleteness,
+}
+
+/// The member locations a procedure named, in the order they were named.
+///
+/// Insertion order is the published order of the collapse relations, so it is
+/// a `Vec` rather than a map: a hash order would make one run's relation ids,
+/// and therefore its explanations, differ from the next run's on identical
+/// input.
+#[derive(Default)]
+struct ContainerElements {
+    elements: Vec<ContainerElement>,
+    seen: HashMap<AbstractLocation, usize>,
+}
+
+impl ContainerElements {
+    fn observe(
+        &mut self,
+        endpoint: &ValueFlowEndpoint,
+        proof: &ProofStatus,
+        completeness: &EvidenceCompleteness,
+    ) {
+        let ValueFlowEndpoint::Location(location) = endpoint else {
+            return;
+        };
+        if location.path().selectors().is_empty() {
+            return;
+        }
+        match self.seen.get(location.as_ref()) {
+            Some(index) => {
+                let element = &mut self.elements[*index];
+                if !matches!(proof, ProofStatus::Proven) {
+                    element.proof = proof.clone();
+                }
+                if !matches!(completeness, EvidenceCompleteness::Complete) {
+                    element.completeness = completeness.clone();
+                }
+            }
+            None => {
+                self.seen
+                    .insert(location.as_ref().clone(), self.elements.len());
+                self.elements.push(ContainerElement {
+                    location: location.as_ref().clone(),
+                    proof: proof.clone(),
+                    completeness: completeness.clone(),
+                });
+            }
+        }
+    }
+}
+
+/// Whether `candidate` names something strictly inside `root` + `prefix`.
+fn selectors_extend(candidate: &[AccessSelector], prefix: &[AccessSelector]) -> bool {
+    candidate.len() > prefix.len() && candidate.starts_with(prefix)
+}
+
 fn materialize_abstract_location(
     procedure: &ProcedureHandle,
     draft: AccessPathDraft,
@@ -853,12 +1531,19 @@ fn push_flow_relation(
     true
 }
 
+/// How a strong-update query stopped when it did not produce a verdict.
+enum StrongUpdateStop {
+    Interruption(Interruption),
+    Provider(SemanticProviderError),
+}
+
 fn materialize_flow_snapshot(
     procedure: &ProcedureHandle,
     context: &OracleCallContext,
     drafts: Vec<FlowRelationDraft>,
     coverage: CandidateCoverage,
     limits: crate::analyzer::semantic::OracleLimits,
+    discharged_gaps: Vec<crate::analyzer::semantic::SemanticGapId>,
 ) -> Result<ValueFlowSnapshot, SemanticProviderError> {
     let records = drafts
         .iter()
@@ -898,15 +1583,17 @@ fn materialize_flow_snapshot(
                 target: draft.target,
                 proof: draft.proof,
                 completeness: draft.completeness,
+                strong_update: draft.strong_update,
             })
         })
         .collect::<Result<Vec<_>, SemanticProviderError>>()?;
-    ValueFlowSnapshot::new(
+    ValueFlowSnapshot::with_discharged_gaps(
         procedure.clone(),
         context.clone(),
         relations,
         coverage,
         limits,
+        discharged_gaps,
     )
     .map_err(|error| internal_contract("invalid value-flow snapshot", error))
 }
@@ -1203,6 +1890,169 @@ fn interrupted_call_bindings(
     })
 }
 
+impl WorkspaceSemanticOracle<'_> {
+    /// Whether the heap oracle certifies this store as a strong update.
+    ///
+    /// This is the first production consumer of `update_eligibility` (#2444).
+    /// The query is demand-driven twice over: the caller only reaches it for a
+    /// proven, complete `MemoryStore` whose resolved location is exact, and
+    /// this method declines before asking whenever the store's base value is
+    /// not locally allocated -- which covers both the shapes that cannot be
+    /// certified and the shapes whose points-to trace would re-enter
+    /// `procedure_relations`.
+    ///
+    /// The queried target is built from the store's own memory row, not from
+    /// the relation's resolved access path. A certificate is bound to the IR
+    /// address it overwrites, while the resolver deliberately rewrites a base
+    /// value to the canonical origin it copies from -- `holder` at two
+    /// statements resolves to the one allocation, which is what gives the two
+    /// stores one carrier in the first place. The certificate covers that
+    /// address, so it licenses replacing the facts at the carrier the resolver
+    /// produced for it.
+    ///
+    /// Only a `Complete` outcome licenses the flag. A partial verdict from an
+    /// exhausted budget or an open trace is exactly the case where the store
+    /// may not have overwritten what a client would otherwise kill.
+    #[allow(clippy::too_many_arguments)]
+    fn store_holds_strong_update(
+        &self,
+        procedure: &ProcedureHandle,
+        context: &OracleCallContext,
+        point: &ProgramPointHandle,
+        event_index: usize,
+        location: MemoryLocationId,
+        stored: ValueId,
+        bases: &LocalStoreBases,
+        staged: &mut WorkStager,
+        cancellation: &crate::cancellation::CancellationToken,
+    ) -> Result<bool, StrongUpdateStop> {
+        let row = procedure
+            .semantics()
+            .memory_location(location)
+            .ok_or_else(|| {
+                StrongUpdateStop::Provider(SemanticProviderError::internal(
+                    "memory-store effect has a stale location",
+                ))
+            })?;
+        let scoped = |member: &SemanticLocator| {
+            ScopedSemanticLocator::new(Arc::clone(procedure.artifact()), member.clone())
+                .map_err(|error| internal_contract("invalid store locator", error))
+        };
+        let (base, root, selectors) = match &row.kind {
+            MemoryLocationKind::Field { base, member } => {
+                if !bases.is_locally_allocated(*base) {
+                    return Ok(false);
+                }
+                (
+                    Some(*base),
+                    AccessPathRoot::Value(
+                        value_handle(procedure, *base).map_err(StrongUpdateStop::Provider)?,
+                    ),
+                    vec![AccessSelector::Field(
+                        scoped(member).map_err(StrongUpdateStop::Provider)?,
+                    )],
+                )
+            }
+            MemoryLocationKind::Index { base, index } => {
+                // A subscript the analysis cannot pin names a summary cell, and
+                // a summary cell can never be strongly updated (#2453).
+                let Some(index) = index else {
+                    return Ok(false);
+                };
+                if !bases.is_locally_allocated(*base) {
+                    return Ok(false);
+                }
+                (
+                    Some(*base),
+                    AccessPathRoot::Value(
+                        value_handle(procedure, *base).map_err(StrongUpdateStop::Provider)?,
+                    ),
+                    vec![AccessSelector::Index(IndexSelector::Exact(
+                        value_handle(procedure, *index).map_err(StrongUpdateStop::Provider)?,
+                    ))],
+                )
+            }
+            MemoryLocationKind::Static { member } => (
+                None,
+                AccessPathRoot::Static(scoped(member).map_err(StrongUpdateStop::Provider)?),
+                Vec::new(),
+            ),
+            MemoryLocationKind::LexicalCell { .. } => {
+                let handle = procedure.memory_location_handle(location).ok_or_else(|| {
+                    StrongUpdateStop::Provider(SemanticProviderError::internal(
+                        "lexical-cell store names a stale location",
+                    ))
+                })?;
+                (None, AccessPathRoot::LexicalCell(handle), Vec::new())
+            }
+            MemoryLocationKind::Capture { .. } => {
+                let port =
+                    ProcedurePortHandle::capture(procedure.clone(), location).map_err(|error| {
+                        StrongUpdateStop::Provider(internal_contract("invalid capture port", error))
+                    })?;
+                (None, AccessPathRoot::CaptureSlot(port), Vec::new())
+            }
+        };
+        let Ok(path) = AccessPath::exact(root, selectors, *self.limits()) else {
+            return Ok(false);
+        };
+        let Ok(store) =
+            crate::analyzer::semantic::MemoryStoreHandle::new(point.clone(), event_index)
+        else {
+            return Ok(false);
+        };
+        let observe = |value: ValueId| {
+            value_handle(procedure, value).and_then(|value| {
+                crate::analyzer::semantic::ValueAtPoint::new(
+                    value,
+                    point.clone(),
+                    crate::analyzer::semantic::ObservationPhase::BeforeEffects,
+                    context.clone(),
+                )
+                .map_err(|error| internal_contract("invalid store observation", error))
+            })
+        };
+        let stored = observe(stored).map_err(StrongUpdateStop::Provider)?;
+        let base = base
+            .map(observe)
+            .transpose()
+            .map_err(StrongUpdateStop::Provider)?;
+        let Ok(target) = crate::analyzer::semantic::AccessPathAtPoint::new(
+            path,
+            point.clone(),
+            crate::analyzer::semantic::ObservationPhase::BeforeEffects,
+            context.clone(),
+        ) else {
+            return Ok(false);
+        };
+        let Ok(store) = crate::analyzer::semantic::StoreAtPoint::new(store, target, stored, base)
+        else {
+            return Ok(false);
+        };
+        let outcome = {
+            let mut request = staged.request(cancellation);
+            self.update_eligibility(&store, &mut request)
+                .map_err(StrongUpdateStop::Provider)?
+        };
+        staged.work = staged.work.conservative_add(outcome.work());
+        match outcome {
+            SemanticOutcome::Complete {
+                value: crate::analyzer::semantic::UpdateEligibility::Strong(_),
+                ..
+            } => Ok(true),
+            // A shortfall is reported, not swallowed: the snapshot spent this
+            // request's budget on the question and must say so.
+            SemanticOutcome::ExceededBudget { exceeded, .. } => Err(
+                StrongUpdateStop::Interruption(Interruption::Budget(exceeded)),
+            ),
+            SemanticOutcome::Cancelled { .. } => {
+                Err(StrongUpdateStop::Interruption(Interruption::Cancelled))
+            }
+            _ => Ok(false),
+        }
+    }
+}
+
 impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
     fn procedure_relations(
         &self,
@@ -1234,6 +2084,14 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
 
         let mut open = value_flow_capabilities_are_open(procedure);
         let mut gap_quality = None;
+        // #2545: every gap this sweep proves discharged (impacts value flow,
+        // but a predicate proved it does not apply), so a downstream
+        // consumer that re-examines this procedure's raw gap list -- most
+        // notably `ValueFlowPlan`'s own "refinable" residual check, which has
+        // no analyzer access and cannot re-run these predicates itself --
+        // can see this sweep's own judgment instead of re-deriving (or
+        // failing to re-derive) it. See `ValueFlowSnapshot::gap_is_discharged`.
+        let mut discharged_gaps = Vec::new();
         if interrupted.is_none() {
             let abort_user_code = abort_paths_run_user_code(procedure.semantics());
             for gap in procedure.semantics().gaps() {
@@ -1248,10 +2106,20 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                     interrupted = Some(stop);
                     break;
                 }
-                let relevant = gap_impacts_value_flow(gap)
+                let impacts_value_flow = gap_impacts_value_flow(gap);
+                let relevant = impacts_value_flow
                     && !declared_proven_target_discharges_gap(procedure.semantics(), gap)
                     && !constructor_call_gap_is_discharged(procedure.semantics(), gap)
-                    && !implicit_abort_gap_is_discharged(gap, abort_user_code);
+                    && !implicit_abort_gap_is_discharged(gap, abort_user_code)
+                    && !super::external_constant_field_read_discharges_gap(
+                        gap,
+                        procedure,
+                        self.workspace,
+                        request,
+                    )?;
+                if impacts_value_flow && !relevant {
+                    discharged_gaps.push(gap.id);
+                }
                 open |= relevant;
                 if relevant {
                     gap_quality = merge_gap_quality(gap_quality, gap);
@@ -1259,21 +2127,61 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
             }
         }
 
-        let load_origins = if interrupted.is_none() {
-            match memory_load_origins(procedure, request.cancellation, |work| staged.charge(work)) {
-                Ok(origins) => origins,
+        // #2446: derived before the access-path origins, because a handler
+        // binding is one of them. Nothing is derived for a procedure whose
+        // adapter already selected every handler.
+        let mut handler_bindings = HandlerBindings::default();
+        if interrupted.is_none() {
+            match HandlerBindings::derive(procedure, request.cancellation, |work| {
+                staged.charge(work)
+            }) {
+                Ok(derived) => handler_bindings = derived,
+                Err(stop) => interrupted = Some(stop),
+            }
+        }
+
+        // The access-path origins, and (#2444 slice 2) which values some
+        // consumption reads as a whole object. Both are established before the
+        // relation pass, so a whole read that precedes every member store in
+        // event order still collapses.
+        let ProcedureValueFacts {
+            load_origins,
+            whole_container_reads,
+        } = if interrupted.is_none() {
+            match procedure_value_facts(
+                procedure,
+                handler_bindings.binder_origins(),
+                request.cancellation,
+                |work| staged.charge(work),
+            ) {
+                Ok(facts) => facts,
                 Err(stop) => {
                     interrupted = Some(stop);
-                    HashMap::new()
+                    ProcedureValueFacts {
+                        load_origins: HashMap::new(),
+                        whole_container_reads: HashSet::new(),
+                    }
                 }
             }
         } else {
-            HashMap::new()
+            ProcedureValueFacts {
+                load_origins: HashMap::new(),
+                whole_container_reads: HashSet::new(),
+            }
         };
 
         let mut drafts = Vec::new();
         let mut retained_evidence = 0usize;
         let mut truncated = false;
+        // Derived at most once, and only when a store asks for it.
+        let mut store_bases: Option<LocalStoreBases> = None;
+        // #2444 slice 2: the member carriers this procedure named, and the
+        // events that read a whole value some consumption passes on. The
+        // collapse relations that join them are published after this pass,
+        // because a member store can follow the read that observes it in
+        // event order while preceding it in execution order.
+        let mut container_elements = ContainerElements::default();
+        let mut container_reads: Vec<ContainerRead> = Vec::new();
         'points: for point in procedure.semantics().points() {
             if interrupted.is_some() {
                 break;
@@ -1431,16 +2339,26 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                 let evidence = evidence_handle(procedure, event.evidence)?;
                 let (proof, mut completeness) = evidence_quality(std::slice::from_ref(&evidence));
                 let mut exact_index = false;
+                /// One relation derived from the event being projected, rather
+                /// than from the event's own endpoints.
+                ///
+                /// `quality` is `None` when the derived relation is exactly as
+                /// well evidenced as the event it rides -- the #2453 smashed
+                /// container cells, which restate one access -- and `Some`
+                /// when the derivation itself is weaker than the event, as a
+                /// #2446 handler binding is.
+                struct DerivedRelation {
+                    kind: ValueFlowRelationKind,
+                    source: ValueFlowEndpoint,
+                    target: ValueFlowEndpoint,
+                    quality: Option<(ProofStatus, EvidenceCompleteness)>,
+                }
                 // #2453: the extra relations an indexed access publishes, so a
                 // label on the array itself is not silently lost at the
                 // subscript. They ride the same event, so they carry the same
                 // evidence, proof and completeness as the access they derive
                 // from.
-                let mut smashed: Vec<(
-                    ValueFlowRelationKind,
-                    ValueFlowEndpoint,
-                    ValueFlowEndpoint,
-                )> = Vec::new();
+                let mut smashed: Vec<DerivedRelation> = Vec::new();
                 let (kind, source, target, summary) = match &event.effect {
                     SemanticEffect::Assignment { target, value } => (
                         ValueFlowRelationKind::Assignment,
@@ -1576,20 +2494,22 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                         // before that origin, and is also what a store through
                         // an unprovable subscript marks.
                         if let Some(base) = indexed_base_value(procedure, *memory)? {
-                            smashed.push((
-                                ValueFlowRelationKind::MemoryLoad,
-                                ValueFlowEndpoint::Value(base),
-                                loaded.clone(),
-                            ));
+                            smashed.push(DerivedRelation {
+                                kind: ValueFlowRelationKind::MemoryLoad,
+                                source: ValueFlowEndpoint::Value(base),
+                                target: loaded.clone(),
+                                quality: None,
+                            });
                         }
                         if let Some(container) =
                             indexed_container_endpoint(&location, *self.limits())?
                         {
-                            smashed.push((
-                                ValueFlowRelationKind::MemoryLoad,
-                                container,
-                                loaded.clone(),
-                            ));
+                            smashed.push(DerivedRelation {
+                                kind: ValueFlowRelationKind::MemoryLoad,
+                                source: container,
+                                target: loaded.clone(),
+                                quality: None,
+                            });
                         }
                         // A subscript the analysis cannot prove reads whatever
                         // any store put in the array, so it reads the wildcard
@@ -1599,7 +2519,12 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                         if unproven_index
                             && let Some(cell) = wildcard_index_endpoint(&location, *self.limits())?
                         {
-                            smashed.push((ValueFlowRelationKind::MemoryLoad, cell, loaded.clone()));
+                            smashed.push(DerivedRelation {
+                                kind: ValueFlowRelationKind::MemoryLoad,
+                                source: cell,
+                                target: loaded.clone(),
+                                quality: None,
+                            });
                         }
                         (
                             ValueFlowRelationKind::MemoryLoad,
@@ -1623,11 +2548,12 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                         // writes the wildcard cell, which is what an unprovable
                         // subscript later reads.
                         if let Some(cell) = wildcard_index_endpoint(&location, *self.limits())? {
-                            smashed.push((
-                                ValueFlowRelationKind::MemoryStore,
-                                stored.clone(),
-                                cell,
-                            ));
+                            smashed.push(DerivedRelation {
+                                kind: ValueFlowRelationKind::MemoryStore,
+                                source: stored.clone(),
+                                target: cell,
+                                quality: None,
+                            });
                         }
                         // A store *through* an unprovable subscript could have
                         // landed anywhere in the array, so it marks the array
@@ -1638,11 +2564,12 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                             && let Some(container) =
                                 indexed_container_endpoint(&location, *self.limits())?
                         {
-                            smashed.push((
-                                ValueFlowRelationKind::MemoryStore,
-                                stored.clone(),
-                                container,
-                            ));
+                            smashed.push(DerivedRelation {
+                                kind: ValueFlowRelationKind::MemoryStore,
+                                source: stored.clone(),
+                                target: container,
+                                quality: None,
+                            });
                         }
                         (
                             ValueFlowRelationKind::MemoryStore,
@@ -1689,14 +2616,33 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                             false,
                         )
                     }
-                    SemanticEffect::Throw { value: Some(value) } => (
-                        ValueFlowRelationKind::ExceptionalReturn,
-                        ValueFlowEndpoint::Value(value_handle(procedure, *value)?),
-                        ValueFlowEndpoint::Port(ProcedurePortHandle::exceptional_return(
-                            procedure.clone(),
-                        )),
-                        false,
-                    ),
+                    SemanticEffect::Throw { value: Some(value) } => {
+                        // #2446: the same thrown value the exceptional-return
+                        // port receives is also what a handler of this
+                        // procedure binds, when the adapter left the handler
+                        // selection open. Both relations ride this event.
+                        for binder in handler_bindings.alternatives_for(point.id) {
+                            smashed.push(DerivedRelation {
+                                kind: ValueFlowRelationKind::HandlerBinding,
+                                source: ValueFlowEndpoint::Value(value_handle(procedure, *value)?),
+                                target: ValueFlowEndpoint::Value(value_handle(procedure, *binder)?),
+                                quality: Some((
+                                    ProofStatus::Unproven(HANDLER_SELECTION_UNPROVEN.into()),
+                                    EvidenceCompleteness::Partial(
+                                        HANDLER_SELECTION_UNPROVEN.into(),
+                                    ),
+                                )),
+                            });
+                        }
+                        (
+                            ValueFlowRelationKind::ExceptionalReturn,
+                            ValueFlowEndpoint::Value(value_handle(procedure, *value)?),
+                            ValueFlowEndpoint::Port(ProcedurePortHandle::exceptional_return(
+                                procedure.clone(),
+                            )),
+                            false,
+                        )
+                    }
                     _ => unreachable!("relation-producing effects were classified above"),
                 };
                 if summary {
@@ -1715,6 +2661,66 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                 let relation_event = u32::try_from(event_index).map_err(|_| {
                     SemanticProviderError::internal("value-flow event ordinal exceeds u32")
                 })?;
+                // #2444: the store's own strong-update verdict, asked only for a
+                // store that could hold one. Everything else keeps joining.
+                let strong_update = if kind == ValueFlowRelationKind::MemoryStore
+                    && matches!(proof, ProofStatus::Proven)
+                    && matches!(completeness, EvidenceCompleteness::Complete)
+                    && let SemanticEffect::MemoryStore {
+                        location, value, ..
+                    } = &event.effect
+                    && let ValueFlowEndpoint::Location(stored_location) = &target
+                    && stored_location.path().is_exact()
+                {
+                    let bases = store_bases
+                        .get_or_insert_with(|| LocalStoreBases::derive(procedure.semantics()));
+                    match self.store_holds_strong_update(
+                        procedure,
+                        context,
+                        &relation_point,
+                        event_index,
+                        *location,
+                        *value,
+                        bases,
+                        &mut staged,
+                        request.cancellation,
+                    ) {
+                        Ok(strong) => strong,
+                        Err(StrongUpdateStop::Provider(error)) => return Err(error),
+                        Err(StrongUpdateStop::Interruption(stop)) => {
+                            interrupted = Some(stop);
+                            break 'points;
+                        }
+                    }
+                } else {
+                    false
+                };
+                // #2444 slice 2: every member carrier this event named, and
+                // whether this event reads a value a consumption passes on as
+                // a whole object. Recorded before the endpoints are moved into
+                // the draft.
+                container_elements.observe(&source, &proof, &completeness);
+                container_elements.observe(&target, &proof, &completeness);
+                if let Some(read) = match event.effect {
+                    SemanticEffect::Assignment { target, .. }
+                    | SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Local,
+                        target,
+                        ..
+                    }
+                    | SemanticEffect::MemoryLoad { result: target, .. } => Some(target),
+                    _ => None,
+                } && whole_container_reads.contains(&read)
+                {
+                    container_reads.push(ContainerRead {
+                        point: relation_point.clone(),
+                        event_index: relation_event,
+                        value: read,
+                        evidence: evidence.clone(),
+                        proof: proof.clone(),
+                        completeness: completeness.clone(),
+                    });
+                }
                 let draft = FlowRelationDraft {
                     point: relation_point.clone(),
                     event_index: relation_event,
@@ -1724,6 +2730,7 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                     proof: proof.clone(),
                     completeness: completeness.clone(),
                     evidence: vec![evidence.clone()],
+                    strong_update,
                 };
                 if !push_flow_relation(&mut drafts, &mut retained_evidence, *self.limits(), draft) {
                     truncated = true;
@@ -1733,16 +2740,37 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                 // access. They are published after the access they derive from
                 // so the primary relation is never dropped in favour of one of
                 // them when the provenance budget runs out.
-                for (kind, source, target) in smashed {
+                for derived in smashed {
+                    let (derived_proof, derived_completeness) = derived
+                        .quality
+                        .unwrap_or_else(|| (proof.clone(), completeness.clone()));
+                    container_elements.observe(
+                        &derived.source,
+                        &derived_proof,
+                        &derived_completeness,
+                    );
+                    container_elements.observe(
+                        &derived.target,
+                        &derived_proof,
+                        &derived_completeness,
+                    );
                     let draft = FlowRelationDraft {
                         point: relation_point.clone(),
                         event_index: relation_event,
-                        kind,
-                        source,
-                        target,
-                        proof: proof.clone(),
-                        completeness: completeness.clone(),
+                        kind: derived.kind,
+                        source: derived.source,
+                        target: derived.target,
+                        proof: derived_proof,
+                        completeness: derived_completeness,
                         evidence: vec![evidence.clone()],
+                        // No derived relation replaces what its target holds.
+                        // A smashed container cell is a summary of many
+                        // elements by construction, so no store into it can
+                        // replace what another store put there (#2453), and a
+                        // handler binding the analysis did not prove is
+                        // selected must join with whatever else reaches the
+                        // binding (#2446).
+                        strong_update: false,
                     };
                     if !push_flow_relation(
                         &mut drafts,
@@ -1752,6 +2780,127 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                     ) {
                         truncated = true;
                         break 'points;
+                    }
+                }
+            }
+        }
+
+        // #2444 slice 2: reading a container as a whole reads what is inside
+        // it. Every member carrier of the object the read is rooted at flows
+        // into the value the read produces, and nothing flows the other way,
+        // so element separation, field separation and every strong-update kill
+        // keep the behaviour they already had. The relation rides the read's
+        // own event, which is what makes the solver ask what the member holds
+        // *at the read* rather than what was ever written into it.
+        if interrupted.is_none() && !truncated && !container_elements.elements.is_empty() {
+            'reads: for read in &container_reads {
+                if request.cancellation.is_cancelled() {
+                    interrupted = Some(Interruption::Cancelled);
+                    break;
+                }
+                let mut visited_values = HashSet::new();
+                let (root, prefix, summarized) =
+                    match walk_value_origin(&load_origins, read.value, &mut visited_values) {
+                        ValueOriginWalk::Root { value, summarized } => (
+                            AccessPathRoot::Value(value_handle(procedure, value)?),
+                            Vec::new(),
+                            summarized,
+                        ),
+                        ValueOriginWalk::Load { location, .. } => {
+                            // The whole value was loaded out of memory, so the
+                            // object it denotes is whatever that load names.
+                            match resolve_access_path(
+                                location,
+                                &load_origins,
+                                self.limits().access_path_length(),
+                                request.cancellation,
+                                |id| {
+                                    procedure
+                                        .semantics()
+                                        .memory_location(id)
+                                        .map(|row| &row.kind)
+                                },
+                                |work| staged.charge(work),
+                            )? {
+                                AccessPathResolution::Resolved(resolved) => {
+                                    let (location, summary) = materialize_abstract_location(
+                                        procedure,
+                                        resolved,
+                                        *self.limits(),
+                                    )?;
+                                    (
+                                        location.path().root().clone(),
+                                        location.path().selectors().to_vec(),
+                                        summary,
+                                    )
+                                }
+                                AccessPathResolution::Interrupted(stop) => {
+                                    interrupted = Some(stop);
+                                    break 'reads;
+                                }
+                            }
+                        }
+                    };
+                for element in &container_elements.elements {
+                    if element.location.path().root() != &root
+                        || !selectors_extend(element.location.path().selectors(), &prefix)
+                    {
+                        continue;
+                    }
+                    if let Err(stop) = staged.charge(SemanticWork {
+                        values: 1,
+                        memory_locations: 1,
+                        evidence: 1,
+                        nested_entries: 1,
+                        ..SemanticWork::default()
+                    }) {
+                        interrupted = Some(stop);
+                        break 'reads;
+                    }
+                    // The collapse is never better evidenced than the access
+                    // that put a label on the member, nor than the read that
+                    // observes it: a member reached through a summarized path
+                    // stays partial, and a read whose own object identity was
+                    // joined does too.
+                    let proof = match (&read.proof, &element.proof) {
+                        (ProofStatus::Proven, ProofStatus::Proven) => ProofStatus::Proven,
+                        (ProofStatus::Unproven(reason), _) | (_, ProofStatus::Unproven(reason)) => {
+                            ProofStatus::Unproven(reason.clone())
+                        }
+                    };
+                    let completeness = match (&read.completeness, &element.completeness) {
+                        _ if summarized => EvidenceCompleteness::Partial(
+                            "the whole value read does not resolve to one proven object".into(),
+                        ),
+                        (EvidenceCompleteness::Complete, EvidenceCompleteness::Complete) => {
+                            EvidenceCompleteness::Complete
+                        }
+                        (EvidenceCompleteness::Partial(reason), _)
+                        | (_, EvidenceCompleteness::Partial(reason)) => {
+                            EvidenceCompleteness::Partial(reason.clone())
+                        }
+                    };
+                    let draft = FlowRelationDraft {
+                        point: read.point.clone(),
+                        event_index: read.event_index,
+                        kind: ValueFlowRelationKind::ContainerCollapse,
+                        source: ValueFlowEndpoint::Location(Box::new(element.location.clone())),
+                        target: ValueFlowEndpoint::Value(value_handle(procedure, read.value)?),
+                        proof,
+                        completeness,
+                        evidence: vec![read.evidence.clone()],
+                        // A collapse only ever adds what a member holds to
+                        // what the whole value holds. It replaces nothing.
+                        strong_update: false,
+                    };
+                    if !push_flow_relation(
+                        &mut drafts,
+                        &mut retained_evidence,
+                        *self.limits(),
+                        draft,
+                    ) {
+                        truncated = true;
+                        break 'reads;
                     }
                 }
             }
@@ -1768,8 +2917,14 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
         } else {
             CandidateCoverage::Exhaustive
         };
-        let snapshot =
-            materialize_flow_snapshot(procedure, context, drafts, coverage, *self.limits())?;
+        let snapshot = materialize_flow_snapshot(
+            procedure,
+            context,
+            drafts,
+            coverage,
+            *self.limits(),
+            discharged_gaps,
+        )?;
         if interrupted.is_none() && !request.cancellation.is_cancelled() {
             *request.budget = staged.budget;
         } else if interrupted.is_none() {
@@ -1886,7 +3041,13 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                 || gap.impacts.contains(SemanticGapImpact::ReturnTransfer)
                 || gap.impacts.contains(SemanticGapImpact::ValueFlow))
                 && call_target_refinement_call(callee.semantics(), gap).is_none()
-                && !implicit_abort_gap_is_discharged(gap, callee_abort_user_code);
+                && !implicit_abort_gap_is_discharged(gap, callee_abort_user_code)
+                && !super::external_constant_field_read_discharges_gap(
+                    gap,
+                    callee,
+                    self.workspace,
+                    request,
+                )?;
             build.open |= relevant;
             if relevant {
                 build.gap_quality = merge_gap_quality(build.gap_quality, gap);
@@ -1945,20 +3106,48 @@ impl ValueFlowOracle for WorkspaceSemanticOracle<'_> {
                 .find(|value| matches!(value.kind, SemanticValueKind::Receiver { .. }))
         {
             // A call that spells no receiver operand can still dispatch on
-            // one: a bare call between members of the same declaring type
-            // runs on the caller's own `this`. Bind that implicit actual only
-            // when the sibling identity is structurally proven; otherwise the
-            // missing operand keeps the binding honestly open.
+            // one, two different ways.
+            //
+            // The first is a constructor call: `new Type(...)` spells no
+            // receiver syntax at all (there is no existing object to invoke
+            // on), but the call's own `result` names the object it is about
+            // to allocate, and that is exactly what the constructor's own
+            // `this` binds to (#2574) -- true for any argument count, not
+            // only the zero-argument case `allocation_call_is_dischargeable`
+            // restricts itself to for its own, different question (whether
+            // an *unresolved* dispatch still leaves the allocated identity
+            // provable).
+            //
+            // The second is a bare call between members of one declaring
+            // type, which runs on the caller's own `this`. Bind that
+            // implicit actual only when the sibling identity is
+            // structurally proven; otherwise the missing operand keeps the
+            // binding honestly open.
             let (actual, extra_evidence) = match call_row.receiver {
                 Some(actual_id) => (Some(actual_id), None),
                 None => {
-                    match implicit_dispatch_receiver_actual(call.procedure(), callee, receiver_row)
+                    match constructor_call_allocation_site(call.procedure().semantics(), &call_row)
                     {
-                        Some(caller_receiver) => (
-                            Some(caller_receiver.id),
-                            Some(evidence_handle(call.procedure(), caller_receiver.evidence)?),
+                        Some(allocation) => (
+                            Some(allocation.result),
+                            Some(evidence_handle(call.procedure(), allocation.evidence)?),
                         ),
-                        None => (None, None),
+                        None => {
+                            match implicit_dispatch_receiver_actual(
+                                call.procedure(),
+                                callee,
+                                receiver_row,
+                            ) {
+                                Some(caller_receiver) => (
+                                    Some(caller_receiver.id),
+                                    Some(evidence_handle(
+                                        call.procedure(),
+                                        caller_receiver.evidence,
+                                    )?),
+                                ),
+                                None => (None, None),
+                            }
+                        }
                     }
                 }
             };

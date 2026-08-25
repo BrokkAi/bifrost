@@ -6,6 +6,7 @@ use crate::analyzer::semantic_model::{
     DependencyPackLimits, DependencyProvenance, ExternalArtifactKind, ResolvedDependency,
     ResolvedDependencyArtifact, SemanticModelActivationEvidence,
 };
+use crate::analyzer::topology::DependencyScope;
 use crate::analyzer::{GoAnalyzerConfig, GoDependencyDiscoveryConfig, Project};
 use crate::process::{BoundedProcessRequest, run_bounded_process};
 use semver::Version;
@@ -719,6 +720,8 @@ fn build_outcome(
                 group.root,
                 group.source_paths,
             )],
+            scope: DependencyScope::Unknown,
+            declared_by: None,
         });
     }
     let mut suppressed_diagnostics = 0;

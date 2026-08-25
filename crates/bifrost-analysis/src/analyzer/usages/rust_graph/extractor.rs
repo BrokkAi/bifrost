@@ -7,9 +7,11 @@ use crate::analyzer::rust::{
     is_rust_trait_declaration, is_rust_trait_impl_member_declaration,
     resolve_imported_export_from_binder_forward, trait_implementer_names,
     usage_binding_local_names, usage_binding_names, usage_binding_seeds,
-    usage_declaration_visible_at, usage_exact_root_for_resolution, usage_has_exact_scoped_binding,
-    usage_identity_visible_at, usage_importers, usage_local_module_prefix_visible_at,
-    usage_reference_at, usage_root_declaration_matches_at,
+    usage_declaration_visible_at, usage_exact_root_for_resolution,
+    usage_exact_root_for_resolution_with_walks, usage_has_exact_scoped_binding,
+    usage_identity_visible_at, usage_import_path_matches_seed, usage_importers,
+    usage_local_module_prefix_visible_at, usage_reference_at, usage_reference_at_with_walks,
+    usage_root_declaration_matches_at,
 };
 use crate::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use crate::analyzer::usages::ImportKind;
@@ -20,10 +22,11 @@ use crate::analyzer::usages::common::{
 // five helpers it needed from this file and `hits.rs` are pure AST readers, and
 // this file is parked on the definition route's `RustTypeLookupCache`.
 use crate::analyzer::usages::get_definition::{
-    AnalyzerRustDefinitionProvider, RustTypeLookupCache, ingest_file_macro_matcher_roles,
-    rust_associated_call_applicable_candidates, rust_expression_type_definition_candidates_cached,
-    rust_expression_type_definition_fqn_cached, rust_field_definition_type_candidates_cached,
-    rust_is_type_definition, rust_resolve_type_node_fqn,
+    AnalyzerRustDefinitionProvider, RustMacroMatcherCandidateGate, RustTypeLookupCache,
+    ingest_file_macro_matcher_roles, rust_associated_call_applicable_candidates,
+    rust_expression_type_definition_candidates_cached, rust_expression_type_definition_fqn_cached,
+    rust_field_definition_type_candidates_cached, rust_is_type_definition,
+    rust_resolve_type_node_fqn,
 };
 use crate::analyzer::usages::local_inference::{LocalInferenceConfig, LocalInferenceEngine};
 use crate::analyzer::usages::model::{UsageHit, UsageHitSurface};
@@ -46,7 +49,8 @@ use crate::analyzer::{
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
-use brokk_bifrost_core::analyzer::rust_facts::RustIncludeBindingKind;
+use brokk_bifrost_core::analyzer::rust_facts::{RUST_OCCURRENCE_CODE, RustIncludeBindingKind};
+use brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix;
 use brokk_bifrost_rust::field_roles::rust_struct_field_references;
 use brokk_bifrost_rust::graph::ast::is_rust_type_node;
 pub(super) use brokk_bifrost_rust::graph::ast::{
@@ -58,7 +62,10 @@ use brokk_bifrost_rust::graph_support::{
 };
 use brokk_bifrost_rust::imports::rust_crate_root_package;
 use brokk_bifrost_rust::lexical_scope::{self, RustLexicalScopeIndex};
+use brokk_bifrost_rust::usage::RustReferenceResolution;
 use brokk_bifrost_rust::usage_includes::RustIncludeRoutes;
+use brokk_bifrost_rust::usage_queries::RustUsageQueries;
+use brokk_bifrost_rust::usage_walks::RustUsageWalks;
 use rayon::prelude::*;
 use std::collections::BTreeSet;
 use std::sync::Mutex;
@@ -123,12 +130,27 @@ fn effective_scan_files_with_additional_importers(
     let _scope = crate::profiling::scope("rust_graph::effective_scan_files");
     let candidate_files = scan_scope.candidate_files();
     let analyzed = analyzer.get_analyzed_files();
+    let seed_names: HashSet<&str> = seeds.candidate_names().collect();
+    let mentioned_files = if target.is_module() {
+        HashSet::default()
+    } else {
+        let queries = RustUsageQueries::new(analyzer);
+        std::iter::once(target.identifier())
+            .chain(seed_names.iter().copied())
+            .flat_map(|name| queries.files_mentioning(name, RUST_OCCURRENCE_CODE))
+            .collect()
+    };
     let filtered_candidates: HashSet<_> = candidate_files
         .iter()
         .filter(|file| analyzed.contains(*file))
+        // The binding graph supplies a conservative file universe. For a
+        // non-module target, every reportable site must still spell either the
+        // declaration name or one of the structurally verified aliases carried
+        // by the seed closure. This is admission only; the AST resolver remains
+        // the proof for every retained site.
+        .filter(|file| target.is_module() || mentioned_files.contains(*file))
         .cloned()
         .collect();
-    let seed_names: HashSet<&str> = seeds.candidate_names().collect();
     let include_files: HashSet<_> = if scan_scope.is_authoritative() {
         HashSet::default()
     } else {
@@ -137,14 +159,7 @@ fn effective_scan_files_with_additional_importers(
             .all_included_files()
             .iter()
             .filter(|file| analyzed.contains(*file))
-            .filter(|file| {
-                file.read_to_string().ok().is_some_and(|source| {
-                    source.contains(target.identifier())
-                        || seed_names
-                            .iter()
-                            .any(|seed_name| source.contains(seed_name))
-                })
-            })
+            .filter(|file| target.is_module() || mentioned_files.contains(*file))
             .cloned()
             .collect()
     };
@@ -312,7 +327,6 @@ pub(super) fn scan_files_for_target(
     cancellation: Option<&CancellationToken>,
     max_usages: usize,
 ) -> BTreeSet<UsageHit> {
-    let target_fqn = target.fq_name();
     let hits = Mutex::new(BTreeSet::new());
     let cap = UsageCapStop::new(max_usages);
     let files_vec: Vec<_> = files.into_iter().collect();
@@ -324,6 +338,7 @@ pub(super) fn scan_files_for_target(
         Some(seeds) => seeds.candidate_names().collect(),
         None => HashSet::default(),
     };
+    let keep_going = || !cancellation.is_some_and(CancellationToken::is_cancelled);
 
     // Parsing each file inside the scan, rather than prefetching every candidate
     // up front, keeps hits accumulating from the first file onward: a scan that
@@ -370,15 +385,16 @@ pub(super) fn scan_files_for_target(
                 Some(seeds) => usage_binding_names(rust, token, file, seeds),
                 None => (HashSet::default(), HashSet::default()),
             };
-            // A file that re-exports a seed (`pub use path::name`) can also reference
-            // `name` directly in its own body, but a re-export is not recorded as a
-            // local import binding. Treat any seed rooted in this file as a direct name
-            // so those in-module references resolve.
+            // Prepared seeds already carry every verified direct alias. Glob
+            // edges are normalized to named edges and namespace edges to
+            // qualified paths while the seed closure is built, so scanning
+            // every binder/export name and resolving it back to the target is
+            // redundant here. Treat identities rooted in this file as direct
+            // names as well, including a re-export beside its declaration.
             if let Some(seeds) = seeds {
                 for identity in seeds.identities_in_file(file) {
                     direct_names.insert(identity.name().to_string());
                 }
-                direct_names.extend(refs.bare_names_resolving_to(&target_fqn));
             }
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 return;
@@ -388,6 +404,31 @@ pub(super) fn scan_files_for_target(
                     || seed_names.contains(name)
                     || direct_names.contains(name)
             });
+            let mut macro_candidate_names = HashSet::default();
+            if !target.is_module() {
+                macro_candidate_names
+                    .insert(strip_raw_identifier_prefix(target.identifier()).to_string());
+                macro_candidate_names.extend(
+                    seed_names
+                        .iter()
+                        .map(|name| strip_raw_identifier_prefix(name).to_string()),
+                );
+                macro_candidate_names.extend(
+                    direct_names
+                        .iter()
+                        .map(|name| strip_raw_identifier_prefix(name).to_string()),
+                );
+                macro_candidate_names.extend(
+                    use_binding_names
+                        .iter()
+                        .map(|name| strip_raw_identifier_prefix(name).to_string()),
+                );
+            }
+            let macro_candidate_gate = if target.is_module() {
+                RustMacroMatcherCandidateGate::All
+            } else {
+                RustMacroMatcherCandidateGate::Names(&macro_candidate_names)
+            };
             let mut token_tree_roles = RustTokenTreeRoleCache::default();
             ingest_file_macro_matcher_roles(
                 &mut token_tree_roles,
@@ -397,7 +438,17 @@ pub(super) fn scan_files_for_target(
                 file,
                 source,
                 tree,
+                macro_candidate_gate,
+                cancellation,
             );
+            let usage_walks = if seeds.is_some() {
+                RustUsageWalks::new_while(rust, token, &keep_going)
+            } else {
+                None
+            };
+            if seeds.is_some() && usage_walks.is_none() {
+                return;
+            }
             let mut local_hits = BTreeSet::new();
             let mut ctx = ScanCtx {
                 file,
@@ -422,6 +473,7 @@ pub(super) fn scan_files_for_target(
                 direct_names: &direct_names,
                 lexical_scope: &lexical_scope,
                 include_routes: &include_routes,
+                usage_walks,
                 token_tree_roles,
                 cancellation,
                 cancellation_checks_remaining: 0,
@@ -429,15 +481,32 @@ pub(super) fn scan_files_for_target(
             };
             let started = RustScanPhaseTimings::start();
             scan_node(tree.root_node(), token, &mut ctx);
-            if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                return;
+            let primary_scan_ms = started.map(|started| started.elapsed().as_secs_f64() * 1_000.0);
+            let qualified_started = RustScanPhaseTimings::start();
+            if !cancellation.is_some_and(CancellationToken::is_cancelled) {
+                record_module_qualified_hits(tree.root_node(), &mut ctx);
             }
-            record_module_qualified_hits(tree.root_node(), &mut ctx);
+            let qualified_scan_ms = qualified_started
+                .map(|started| started.elapsed().as_secs_f64() * 1_000.0)
+                .unwrap_or_default();
+            if let Some(started) = started
+                && started.elapsed().as_millis() >= 100
+            {
+                crate::profiling::note_with(|| {
+                    format!(
+                        "rust_graph slow AST scan file={file:?} bytes={} primary_ms={:.1} qualified_ms={qualified_scan_ms:.1} elapsed_ms={:.1}",
+                        source.len(),
+                        primary_scan_ms.unwrap_or_default(),
+                        started.elapsed().as_secs_f64() * 1_000.0,
+                    )
+                });
+            }
             RustScanPhaseTimings::record(&timings.ast_scan_ns, started);
-            if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                return;
-            }
 
+            // A cancellation checkpoint can stop the iterative AST walk after
+            // it has already proved direct hits in this file. Commit those
+            // hits before returning so a narrowed, single-file candidate scope
+            // retains the same partial-result contract as a multi-file scan.
             let local_hits = classify_recursive_hits(analyzer, local_hits, target);
             if !local_hits.is_empty() {
                 cap.record(&local_hits);
@@ -470,6 +539,7 @@ pub(super) struct ScanCtx<'a> {
     direct_names: &'a HashSet<String>,
     lexical_scope: &'a RustLexicalScopeIndex,
     include_routes: &'a RustIncludeRoutes<'a>,
+    usage_walks: Option<RustUsageWalks<'a>>,
     token_tree_roles: RustTokenTreeRoleCache,
     pub(super) cancellation: Option<&'a CancellationToken>,
     cancellation_checks_remaining: usize,
@@ -760,7 +830,7 @@ impl ScanCtx<'_> {
     /// resolves segments structurally and yields Module identities only, so a
     /// module target can be reached by a path that never spells it (`super::*`,
     /// an aliased module prefix) and cannot be gated on names at all.
-    fn path_could_name_target(&self, segments: &[&str]) -> bool {
+    pub(super) fn path_could_name_target(&self, segments: &[&str]) -> bool {
         if self.target_is_module {
             return true;
         }
@@ -784,6 +854,29 @@ impl ScanCtx<'_> {
     /// position rather than only the one that terminates the written path.
     pub(super) fn token_path_name_admits(&self, name: &str) -> bool {
         self.target_is_path_qualifier || self.identifier_could_name_target(name)
+    }
+
+    pub(super) fn node_could_name_target(&self, node: Node<'_>) -> bool {
+        if self.target_is_module {
+            return true;
+        }
+        let mut stack = vec![node];
+        while let Some(candidate) = stack.pop() {
+            if matches!(
+                candidate.kind(),
+                "identifier" | "type_identifier" | "self" | "crate" | "super"
+            ) {
+                let Some(text) = simple_node_text(candidate, self.source) else {
+                    continue;
+                };
+                if self.name_gate.admits(strip_raw_identifier_prefix(&text)) {
+                    return true;
+                }
+            }
+            let mut cursor = candidate.walk();
+            stack.extend(candidate.children(&mut cursor));
+        }
+        false
     }
 
     pub(super) fn cancellation_requested(&mut self) -> bool {
@@ -963,9 +1056,7 @@ impl ScanCtx<'_> {
             return false;
         }
         if self.seeds.is_none_or(|seeds| {
-            let resolution = usage_reference_at(
-                self.rust,
-                self.refs.token(),
+            let resolution = self.resolve_reference_at(
                 self.file,
                 seeds,
                 &[text],
@@ -1048,9 +1139,7 @@ impl ScanCtx<'_> {
             return true;
         }
         if self.seeds.is_some_and(|seeds| {
-            let resolution = usage_reference_at(
-                self.rust,
-                self.refs.token(),
+            let resolution = self.resolve_reference_at(
                 self.file,
                 seeds,
                 segments,
@@ -1171,6 +1260,43 @@ impl ScanCtx<'_> {
         self.matches_unique_visible_candidate_in_namespace(self.support.fqn(fqn), byte, namespace)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_reference_at(
+        &self,
+        file: &ProjectFile,
+        seeds: &RustBindingSeeds,
+        segments: &[&str],
+        byte: usize,
+        namespace: RustReferenceNamespace,
+        root_shadowed: bool,
+        leading_absolute: bool,
+    ) -> RustReferenceResolution {
+        match self.usage_walks.as_ref() {
+            Some(walks) => usage_reference_at_with_walks(
+                self.rust,
+                walks,
+                file,
+                seeds,
+                segments,
+                byte,
+                namespace,
+                root_shadowed,
+                leading_absolute,
+            ),
+            None => usage_reference_at(
+                self.rust,
+                self.refs.token(),
+                file,
+                seeds,
+                segments,
+                byte,
+                namespace,
+                root_shadowed,
+                leading_absolute,
+            ),
+        }
+    }
+
     fn matches_resolved_target_path_in_namespace(
         &self,
         fqn: &str,
@@ -1199,9 +1325,7 @@ impl ScanCtx<'_> {
     ) -> bool {
         let roots = BTreeSet::from([self.target.clone()]);
         let seeds = usage_binding_seeds(self.rust, self.refs.token(), &roots);
-        let resolution = usage_reference_at(
-            self.rust,
-            self.refs.token(),
+        let resolution = self.resolve_reference_at(
             self.file,
             &seeds,
             segments,
@@ -1210,8 +1334,14 @@ impl ScanCtx<'_> {
             false,
             leading_absolute,
         );
-        usage_exact_root_for_resolution(self.rust, self.refs.token(), &resolution, &seeds).as_ref()
-            == Some(self.target)
+        let root = self
+            .usage_walks
+            .as_ref()
+            .map(|walks| usage_exact_root_for_resolution_with_walks(walks, &resolution, &seeds))
+            .unwrap_or_else(|| {
+                usage_exact_root_for_resolution(self.rust, self.refs.token(), &resolution, &seeds)
+            });
+        root.as_ref() == Some(self.target)
     }
 }
 
@@ -1244,7 +1374,22 @@ fn scan_node(root: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
             }
             match node.kind() {
                 "use_declaration" => {
-                    record_use_import_hits(node, token, ctx);
+                    if ctx.node_could_name_target(node) {
+                        let started = RustScanPhaseTimings::start();
+                        record_use_import_hits(node, token, ctx);
+                        if let Some(started) = started
+                            && started.elapsed().as_millis() >= 10
+                        {
+                            crate::profiling::note_with(|| {
+                                format!(
+                                    "rust_graph slow use resolution file={:?} byte={} elapsed_ms={:.1}",
+                                    ctx.file,
+                                    node.start_byte(),
+                                    started.elapsed().as_secs_f64() * 1_000.0,
+                                )
+                            });
+                        }
+                    }
                     return TreeWalkAction::Skip;
                 }
                 "scoped_identifier" | "scoped_type_identifier" if !ctx.target_is_module => {
@@ -1291,17 +1436,30 @@ fn scan_node(root: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
                         .ok()
                         .map(str::trim)
                         .unwrap_or_default();
-                    // `Self` names the target through the enclosing impl type
-                    // rather than by spelling it, so it bypasses the name gate.
-                    let matching_self_type =
-                        text == "Self" && self_reference_matches_target(node, token, ctx);
+                    if !ctx.name_gate.admits(text) {
+                        return TreeWalkAction::Descend;
+                    }
+                    if brokk_bifrost_rust::graph::ast::is_rust_declaration_name(node) {
+                        return TreeWalkAction::Descend;
+                    }
                     // `matches_identifier` gates on the same condition; checking it
                     // here also skips token-tree role classification and the
                     // whole-tree shadowing walk.
-                    if matching_self_type
-                        || (ctx.name_gate.admits(text)
-                            && identifier_matches_target(node, root, text, ctx))
+                    let resolution_started = RustScanPhaseTimings::start();
+                    let matches = identifier_matches_target(node, root, text, ctx);
+                    if let Some(started) = resolution_started
+                        && started.elapsed().as_millis() >= 10
                     {
+                        crate::profiling::note_with(|| {
+                            format!(
+                                "rust_graph slow identifier resolution file={:?} text={text:?} byte={} elapsed_ms={:.1}",
+                                ctx.file,
+                                node.start_byte(),
+                                started.elapsed().as_secs_f64() * 1_000.0,
+                            )
+                        });
+                    }
+                    if matches {
                         record_hit(node, ctx);
                     }
                 }
@@ -1430,49 +1588,11 @@ fn identifier_is_scoped_path_part(node: Node<'_>) -> bool {
         })
 }
 
-fn self_reference_matches_target(node: Node<'_>, token: QueryToken<'_>, ctx: &ScanCtx<'_>) -> bool {
-    if !ctx.target.is_class() {
-        return false;
-    }
-    let Some(type_node) =
-        enclosing_impl_item(node).and_then(|impl_item| impl_item.child_by_field_name("type"))
-    else {
-        return false;
-    };
-    if let Some(path) = rust_path_segments(type_node) {
-        let segments = path
-            .iter()
-            .filter_map(|segment| simple_node_text(*segment, ctx.source))
-            .collect::<Vec<_>>();
-        if segments.len() == path.len() {
-            let segment_refs = segments.iter().map(String::as_str).collect::<Vec<_>>();
-            let root = path[0];
-            let root_name = segment_refs[0];
-            let root_shadowed = ctx.path_root_shadowed_at(root_name, root.start_byte());
-            if ctx.matches_path(
-                &segment_refs,
-                type_node.start_byte(),
-                RustReferenceNamespace::Type,
-                root_shadowed,
-                crate::analyzer::usages::rust_graph::hits::rust_path_is_leading_absolute(type_node),
-            ) {
-                return true;
-            }
-        }
-    }
-    let resolved = rust_resolve_type_node_fqn(
-        ctx.analyzer,
-        token,
-        ctx.support,
-        ctx.file,
-        ctx.source,
-        type_node,
-        Some(type_node.start_byte()),
-    );
-    resolved.is_some_and(|fqn| fqn_matches_owner(ctx.rust, token, ctx.support, &fqn, ctx.target))
-}
-
 fn record_use_import_hits(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
+    let imports = brokk_bifrost_rust::imports::rust_imports_with_visibility_from_use_declaration(
+        node, ctx.source,
+    );
+    let cfg_condition = brokk_bifrost_rust::lexical_scope::rust_cfg_condition(node, ctx.source);
     walk_tree_iterative(
         node,
         ctx,
@@ -1485,6 +1605,29 @@ fn record_use_import_hits(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanC
                         crate::analyzer::rust::rust_focused_use_path(current, ctx.source)
                 {
                     let segments = path.segments.iter().map(String::as_str).collect::<Vec<_>>();
+                    let namespace = if current.kind() == "self" {
+                        RustReferenceNamespace::PathPrefix
+                    } else {
+                        ctx.target_reference_namespace()
+                    };
+                    let could_name_target = ctx.path_could_name_target(&segments);
+                    let exact_seed_import = could_name_target
+                        && ctx.seeds.is_some_and(|seeds| {
+                            imports.iter().any(|import| {
+                                import.path == path.segments
+                                    && usage_import_path_matches_seed(
+                                        ctx.rust,
+                                        ctx.refs.token(),
+                                        ctx.file,
+                                        seeds,
+                                        &import.path,
+                                        import.info.local_name().unwrap_or_default(),
+                                        current.start_byte(),
+                                        namespace,
+                                        &cfg_condition,
+                                    )
+                            })
+                        });
                     let root_name = path
                         .root
                         .utf8_text(ctx.source.as_bytes())
@@ -1492,19 +1635,18 @@ fn record_use_import_hits(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanC
                         .map(str::trim)
                         .map(|name| if name == "$crate" { "crate" } else { name })
                         .unwrap_or_default();
-                    if ctx.matches_path(
-                        &segments,
-                        current.start_byte(),
-                        if current.kind() == "self" {
-                            RustReferenceNamespace::PathPrefix
-                        } else {
-                            ctx.target_reference_namespace()
-                        },
-                        ctx.path_root_shadowed_at(root_name, path.root.start_byte()),
-                        crate::analyzer::usages::rust_graph::hits::rust_path_is_leading_absolute(
-                            path.root,
-                        ),
-                    ) || rust_exported_macro_import_matches_target(node, token, current, ctx)
+                    if exact_seed_import
+                        || (could_name_target
+                            && ctx.matches_path(
+                                &segments,
+                                current.start_byte(),
+                                namespace,
+                                ctx.path_root_shadowed_at(root_name, path.root.start_byte()),
+                                crate::analyzer::usages::rust_graph::hits::rust_path_is_leading_absolute(
+                                    path.root,
+                                ),
+                            ))
+                        || rust_exported_macro_import_matches_target(node, token, current, ctx)
                     {
                         record_import_hit(current, ctx);
                     }
@@ -1764,6 +1906,9 @@ pub(super) fn scan_files_for_member_target(
                 || has_static_trait_call;
             let mut type_lookup_cache = RustTypeLookupCache::default();
             let mut token_tree_roles = RustTokenTreeRoleCache::default();
+            let macro_candidate_names = [strip_raw_identifier_prefix(&member_name).to_string()]
+                .into_iter()
+                .collect::<HashSet<_>>();
             ingest_file_macro_matcher_roles(
                 &mut token_tree_roles,
                 token,
@@ -1772,6 +1917,8 @@ pub(super) fn scan_files_for_member_target(
                 file,
                 source,
                 tree,
+                RustMacroMatcherCandidateGate::Names(&macro_candidate_names),
+                cancellation,
             );
             let mut local_hits = BTreeSet::new();
             let mut local_unproven_hits = BTreeSet::new();

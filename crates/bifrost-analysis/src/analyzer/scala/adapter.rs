@@ -4,7 +4,7 @@
 //! is left here but the trait impl itself.
 
 use crate::analyzer::cognitive_complexity;
-use crate::analyzer::{CodeUnit, Language, LanguageAdapter, ProjectFile, SignatureMetadata};
+use crate::analyzer::{CodeUnit, Language, LanguageAdapter, ProjectFile};
 use brokk_bifrost_jvm::queries::SCALA_QUERY_DIRECTORY;
 use brokk_bifrost_jvm::scala::adapter::{
     SCALA_COGNITIVE_CONFIG, SCALA_FILE_EXTENSION, scala_extract_call_receiver,
@@ -12,10 +12,7 @@ use brokk_bifrost_jvm::scala::adapter::{
 };
 use brokk_bifrost_jvm::scala::declarations::parse_scala_file;
 use brokk_bifrost_jvm::scala::test_detection::scala_contains_tests;
-use brokk_bifrost_jvm::scala::{
-    scala_member_signature_arity, scala_normalize_full_name, scala_signature_return_type,
-    scala_simple_type_name,
-};
+use brokk_bifrost_jvm::scala::{scala_normalize_full_name, scala_simple_type_name};
 use tree_sitter::Tree;
 
 use crate::analyzer::tree_sitter_analyzer::lookup_suffix_candidates;
@@ -42,6 +39,10 @@ impl LanguageAdapter for ScalaAdapter {
         scala_normalize_full_name(fq_name)
     }
 
+    fn normalize_fq_name(&self, fq_name: &crate::analyzer::FqName) -> crate::analyzer::FqName {
+        brokk_bifrost_jvm::scala::scala_normalize_fq_name(fq_name)
+    }
+
     /// Scala peels on `.` alone: its cons class is named `::`, so a `::` in a
     /// scala spelling is a declaration's own name and never a join.
     fn lookup_candidate_separators(&self) -> &'static [&'static str] {
@@ -62,28 +63,6 @@ impl LanguageAdapter for ScalaAdapter {
 
     fn simple_type_name(&self, unit: &CodeUnit) -> String {
         scala_simple_type_name(unit)
-    }
-
-    fn callable_arity(
-        &self,
-        signature: &str,
-        metadata: Option<&SignatureMetadata>,
-    ) -> Option<usize> {
-        metadata
-            .and_then(SignatureMetadata::callable_arity)
-            .map(|arity| arity.total())
-            .or_else(|| scala_member_signature_arity(signature))
-    }
-
-    fn callable_return_type_text<'a>(&self, signature: &'a str) -> Option<&'a str> {
-        scala_signature_return_type(signature)
-    }
-
-    fn preferred_type_candidate<'a>(&self, candidates: &'a [CodeUnit]) -> Option<&'a CodeUnit> {
-        candidates
-            .iter()
-            .find(|unit| !unit.short_name().ends_with('$'))
-            .or_else(|| candidates.first())
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {

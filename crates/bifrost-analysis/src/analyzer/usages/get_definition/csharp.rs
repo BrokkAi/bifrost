@@ -589,6 +589,70 @@ pub(crate) fn csharp_type_lookup_resolution_in_session(
     )
 }
 
+fn csharp_using_alias_definition(
+    root: Node<'_>,
+    source: &str,
+    reference: &str,
+) -> Option<LexicalDefinition> {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "using_directive"
+            && let Some(name) = node.child_by_field_name("name")
+            && csharp_node_text(name, source).trim() == reference
+        {
+            let range = |node: Node<'_>| Range {
+                start_byte: node.start_byte(),
+                end_byte: node.end_byte(),
+                start_line: node.start_position().row + 1,
+                end_line: node.end_position().row + 1,
+            };
+            return Some(LexicalDefinition {
+                identifier: reference.to_string(),
+                kind: DeclarationKind::ImportAlias,
+                name_range: range(name),
+                declaration_range: range(node),
+            });
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    None
+}
+
+/// The written `using` binder navigation should land on for `reference`, or
+/// `None` when the reference is not an alias or the alias leaves the workspace.
+///
+/// Commit 9a9c6dedf made navigation on a C# using alias reach the alias binder
+/// rather than the canonical type, matching what Roslyn's go-to-definition does.
+/// That binder is only a useful destination while the alias target is indexed:
+/// the caller lands on the `using` line and can keep navigating from it. When
+/// the target is outside the workspace the binder is a dead end, and answering
+/// `resolved` there would replace the `unresolvable_import_boundary` status with
+/// a location that never tells the caller navigation left the indexed
+/// workspace. The alias-target-not-indexed predicate below is the same one the
+/// type path uses to raise that boundary, so declining here hands the reference
+/// back to it.
+#[allow(clippy::too_many_arguments)]
+fn csharp_navigable_using_alias_binding(
+    csharp: &CSharpAnalyzer,
+    token: QueryToken<'_>,
+    definitions: &CSharpDefinitionProvider<'_>,
+    file: &ProjectFile,
+    root: Node<'_>,
+    source: &str,
+    reference: &str,
+) -> Option<LexicalDefinition> {
+    if !definitions
+        .using_aliases(token, file)
+        .contains_key(reference)
+        || csharp_alias_using_boundary_for_type(csharp, token, definitions, file, reference)
+    {
+        return None;
+    }
+    csharp_using_alias_definition(root, source, reference)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn resolve_csharp(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
@@ -597,8 +661,18 @@ pub(super) fn resolve_csharp(
     source: &str,
     tree: Option<&Tree>,
     site: &ResolvedReferenceSite,
+    preserve_using_alias: bool,
 ) -> DefinitionLookupOutcome {
-    resolve_csharp_in_session(analyzer, token, definitions, file, source, tree, site)
+    resolve_csharp_in_session(
+        analyzer,
+        token,
+        definitions,
+        file,
+        source,
+        tree,
+        site,
+        preserve_using_alias,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -620,8 +694,16 @@ pub(crate) fn resolve_csharp_bounded(
         ));
     };
     let definitions = CSharpDefinitionProvider::bounded(csharp, &session);
-    let outcome =
-        resolve_csharp_in_session(analyzer, token, &definitions, file, source, tree, site);
+    let outcome = resolve_csharp_in_session(
+        analyzer,
+        token,
+        &definitions,
+        file,
+        source,
+        tree,
+        site,
+        false,
+    );
     session.finish(outcome)
 }
 
@@ -634,6 +716,7 @@ fn resolve_csharp_in_session(
     source: &str,
     tree: Option<&Tree>,
     site: &ResolvedReferenceSite,
+    preserve_using_alias: bool,
 ) -> DefinitionLookupOutcome {
     let Some(csharp) = resolve_analyzer::<CSharpAnalyzer>(analyzer) else {
         return no_definition("csharp_analyzer_unavailable", "C# analyzer is unavailable");
@@ -707,6 +790,19 @@ fn resolve_csharp_in_session(
         }
         Some(CSharpReferenceNode::Type(type_node)) => {
             let reference = csharp_reference_type_text(type_node, source);
+            if preserve_using_alias
+                && let Some(alias) = csharp_navigable_using_alias_binding(
+                    csharp,
+                    token,
+                    definitions,
+                    file,
+                    tree.root_node(),
+                    source,
+                    &reference,
+                )
+            {
+                return lexical_definition_outcome(alias);
+            }
             if csharp_alias_qualified_boundary(definitions, token, file, type_node, source) {
                 // gated upstream: the alias target names neither an indexed
                 // type nor an indexed namespace, so the qualifier itself is
@@ -749,6 +845,24 @@ fn resolve_csharp_in_session(
             )
         }
         Some(CSharpReferenceNode::Constructor(creation)) => {
+            if preserve_using_alias
+                && let Some(type_node) = creation
+                    .child_by_field_name("type")
+                    .or_else(|| csharp_first_type_child(creation))
+            {
+                let reference = csharp_reference_type_text(type_node, source);
+                if let Some(alias) = csharp_navigable_using_alias_binding(
+                    csharp,
+                    token,
+                    definitions,
+                    file,
+                    tree.root_node(),
+                    source,
+                    &reference,
+                ) {
+                    return lexical_definition_outcome(alias);
+                }
+            }
             resolve_csharp_constructor(analyzer, token, csharp, definitions, file, source, creation)
         }
         Some(CSharpReferenceNode::Member { receiver, name }) => {

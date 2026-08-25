@@ -153,14 +153,25 @@ pub fn report_dead_code_and_unused_abstraction_smells(
                     proof,
                     memo: proof.new_memo(),
                     candidates: Vec::new(),
+                    precise_candidates: Vec::new(),
                 });
-            if !proof.needs_precise_scan(DeadCodeRouting {
+            let routing = DeadCodeRouting {
+                analyzer,
+                candidate,
+                file_cap: usage_candidate_file_cap,
+                memo: bucket.memo.as_mut(),
+            };
+            if !proof.needs_precise_scan(routing) {
+                bucket.candidates.push(candidate.clone());
+                continue;
+            }
+            if proof.supports_precise_inbound_preflight(DeadCodeRouting {
                 analyzer,
                 candidate,
                 file_cap: usage_candidate_file_cap,
                 memo: bucket.memo.as_mut(),
             }) {
-                bucket.candidates.push(candidate.clone());
+                bucket.precise_candidates.push(candidate.clone());
                 continue;
             }
         }
@@ -179,6 +190,18 @@ pub fn report_dead_code_and_unused_abstraction_smells(
         let Some(bucket) = buckets.remove(&id) else {
             continue;
         };
+        findings.extend(
+            preflight_precise_candidates(
+                analyzer,
+                bucket.proof,
+                &bucket.precise_candidates,
+                usage_candidate_file_cap,
+                usage_cap,
+                &mut skipped,
+            )
+            .into_iter()
+            .filter(|finding| finding.score >= threshold),
+        );
         findings.extend(
             prove_bulk_candidates(
                 analyzer,
@@ -421,7 +444,10 @@ fn canonical_file_identity(file: &ProjectFile) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::canonical_file_identity;
+    use super::{
+        PreciseInboundPreflightDecision, canonical_file_identity,
+        inbound_usage_inconclusive_reason, precise_inbound_preflight_decision,
+    };
     use crate::analyzer::ProjectFile;
 
     #[test]
@@ -438,6 +464,45 @@ mod tests {
         assert_eq!(
             canonical_file_identity(&from_workspace_root),
             canonical_file_identity(&from_nested_root),
+        );
+    }
+
+    #[test]
+    fn truncated_inbound_usage_is_inconclusive_without_a_workspace_fixture() {
+        let total = crate::analyzer::usages::inverted_edges::MAX_CALLSITES + 1;
+        let reason = inbound_usage_inconclusive_reason("helpers.helper", Some(total), 0, 1, 0)
+            .expect("truncated usage must be inconclusive");
+
+        assert_eq!(
+            reason,
+            format!(
+                "`helpers.helper`: too many workspace inbound call sites ({total}, limit {}); evidence is inconclusive",
+                crate::analyzer::usages::inverted_edges::MAX_CALLSITES
+            )
+        );
+    }
+
+    #[test]
+    fn precise_inbound_preflight_never_proves_absence_from_an_fqn_graph() {
+        assert_eq!(
+            precise_inbound_preflight_decision(true, false, 1, 1, 0),
+            PreciseInboundPreflightDecision::SkipInconclusive
+        );
+        assert_eq!(
+            precise_inbound_preflight_decision(false, false, 0, 1, 0),
+            PreciseInboundPreflightDecision::SkipInconclusive
+        );
+        assert_eq!(
+            precise_inbound_preflight_decision(false, false, 0, 1, 1),
+            PreciseInboundPreflightDecision::SkipInconclusive
+        );
+        assert_eq!(
+            precise_inbound_preflight_decision(false, true, 1, 1, 0),
+            PreciseInboundPreflightDecision::SkipInconclusive
+        );
+        assert_eq!(
+            precise_inbound_preflight_decision(false, false, 1, 1, 0),
+            PreciseInboundPreflightDecision::RetireUsed
         );
     }
 }
@@ -686,6 +751,129 @@ struct DeadCodeBulkBucket {
     proof: &'static dyn DeadCodeBulkProof,
     memo: Box<dyn Any + Send>,
     candidates: Vec<CodeUnit>,
+    precise_candidates: Vec<CodeUnit>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreciseInboundPreflightDecision {
+    RetireUsed,
+    SkipInconclusive,
+}
+
+/// Decide what a conservative inbound preflight may do with a candidate that
+/// was routed to the precise path. An FQN-keyed graph can prove that some
+/// declaration with this name is used, but cannot prove which overload it is.
+/// It therefore never produces a finding for a precise candidate.
+fn precise_inbound_preflight_decision(
+    ambiguous_fqn: bool,
+    truncated: bool,
+    usage_total: usize,
+    usage_cap: usize,
+    unproven_inbound: usize,
+) -> PreciseInboundPreflightDecision {
+    if ambiguous_fqn
+        || truncated
+        || usage_total > usage_cap
+        || unproven_inbound > 0
+        || usage_total == 0
+    {
+        PreciseInboundPreflightDecision::SkipInconclusive
+    } else {
+        PreciseInboundPreflightDecision::RetireUsed
+    }
+}
+
+fn preflight_precise_candidates(
+    analyzer: &dyn IAnalyzer,
+    proof: &'static dyn DeadCodeBulkProof,
+    candidates: &[CodeUnit],
+    usage_candidate_file_cap: usize,
+    usage_cap: usize,
+    skipped: &mut Vec<String>,
+) -> Vec<DeadCodeFinding> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let mut findings = Vec::new();
+
+    if !matches!(
+        proof.preflight(analyzer),
+        DeadCodeBulkPreflight::Ready { files, .. } if files <= usage_candidate_file_cap
+    ) {
+        for candidate in candidates {
+            if let Some(finding) = analyze_candidate(
+                analyzer,
+                candidate,
+                usage_candidate_file_cap,
+                usage_cap,
+                skipped,
+            ) {
+                findings.push(finding);
+            }
+        }
+        return findings;
+    }
+
+    let Some(DeadCodeBulkEdges::Fqn(edges)) = proof.build(analyzer, candidates) else {
+        for candidate in candidates {
+            if let Some(finding) = analyze_candidate(
+                analyzer,
+                candidate,
+                usage_candidate_file_cap,
+                usage_cap,
+                skipped,
+            ) {
+                findings.push(finding);
+            }
+        }
+        return findings;
+    };
+
+    let language = code_unit_language(&candidates[0]);
+    let incoming = incoming_usage_by_callee(&edges);
+    for candidate in candidates {
+        let candidate_fqn = candidate.fq_name();
+        let usage = incoming.get(&candidate_fqn).cloned().unwrap_or_default();
+        let ambiguous_fqn = analyzer
+            .get_definitions(&candidate_fqn)
+            .into_iter()
+            .filter(|definition| {
+                code_unit_language(definition) == language
+                    && !definition.is_synthetic()
+                    && definition.is_function()
+            })
+            .take(2)
+            .count()
+            > 1;
+        let decision = precise_inbound_preflight_decision(
+            ambiguous_fqn,
+            edges.truncated.contains_key(&candidate_fqn),
+            usage.total,
+            usage_cap,
+            usage.unproven_inbound,
+        );
+        match decision {
+            PreciseInboundPreflightDecision::RetireUsed => {}
+            PreciseInboundPreflightDecision::SkipInconclusive => {
+                if let Some(reason) = inbound_usage_inconclusive_reason(
+                    &candidate_fqn,
+                    edges.truncated.get(&candidate_fqn).copied(),
+                    usage.total,
+                    usage_cap,
+                    usage.unproven_inbound,
+                ) {
+                    skipped.push(reason);
+                } else {
+                    skipped.push(format!(
+                        "`{candidate_fqn}`: precise candidate inbound evidence cannot distinguish declarations sharing this FQN; evidence is inconclusive"
+                    ));
+                }
+            }
+        }
+    }
+
+    findings
 }
 
 /// Prove a bucket of candidates against its language family's whole-workspace edges.
@@ -765,38 +953,61 @@ fn prove_fqn_candidates(
             .all(|candidate| code_unit_language(candidate) == language),
         "an fqn-keyed bulk bucket holds exactly one language"
     );
-    let declarations_by_fqn = declarations_by_fqn_for_language(analyzer, language);
     let incoming = incoming_usage_by_callee(edges);
 
     candidates
         .iter()
         .filter_map(|candidate| {
             let candidate_fqn = candidate.fq_name();
-            if let Some(total_callsites) = edges.truncated.get(&candidate_fqn) {
-                skipped.push(format!(
-                    "`{candidate_fqn}`: too many workspace inbound call sites ({total_callsites}, limit {}); evidence is inconclusive",
-                    crate::analyzer::usages::inverted_edges::MAX_CALLSITES
-                ));
-                return None;
-            }
             let usage = incoming.get(&candidate_fqn).cloned().unwrap_or_default();
-            if usage.total > usage_cap {
-                skipped.push(format!(
-                    "`{candidate_fqn}`: too many workspace inbound call sites ({}, limit {usage_cap}); evidence is inconclusive",
-                    usage.total
-                ));
+            if let Some(reason) = inbound_usage_inconclusive_reason(
+                &candidate_fqn,
+                edges.truncated.get(&candidate_fqn).copied(),
+                usage.total,
+                usage_cap,
+                usage.unproven_inbound,
+            ) {
+                skipped.push(reason);
                 return None;
             }
-            if usage.total == 0 && usage.unproven_inbound > 0 {
-                skipped.push(format!(
-                    "`{candidate_fqn}`: {} structurally matching usage site(s) could not be proven or disproven; evidence is inconclusive",
-                    usage.unproven_inbound
-                ));
-                return None;
-            }
+            let declarations_by_fqn = if usage.total == 0 {
+                BTreeMap::new()
+            } else {
+                requested_declarations_by_fqn_for_language(
+                    analyzer,
+                    language,
+                    usage.callers.keys().map(String::as_str),
+                )
+            };
             bulk_graph_finding(analyzer, &declarations_by_fqn, candidate, usage)
         })
         .collect()
+}
+
+fn inbound_usage_inconclusive_reason(
+    candidate_fqn: &str,
+    truncated_total: Option<usize>,
+    usage_total: usize,
+    usage_cap: usize,
+    unproven_inbound: usize,
+) -> Option<String> {
+    if let Some(total_callsites) = truncated_total {
+        return Some(format!(
+            "`{candidate_fqn}`: too many workspace inbound call sites ({total_callsites}, limit {}); evidence is inconclusive",
+            crate::analyzer::usages::inverted_edges::MAX_CALLSITES
+        ));
+    }
+    if usage_total > usage_cap {
+        return Some(format!(
+            "`{candidate_fqn}`: too many workspace inbound call sites ({usage_total}, limit {usage_cap}); evidence is inconclusive"
+        ));
+    }
+    if usage_total == 0 && unproven_inbound > 0 {
+        return Some(format!(
+            "`{candidate_fqn}`: {unproven_inbound} structurally matching usage site(s) could not be proven or disproven; evidence is inconclusive"
+        ));
+    }
+    None
 }
 
 /// Score one bulk-proven candidate.
@@ -827,7 +1038,14 @@ fn bulk_graph_finding(
             candidate,
             usage,
         ),
-        Language::JavaScript | Language::TypeScript | Language::Kotlin | Language::None => {
+        Language::Kotlin => graph_finding_for_language(
+            analyzer,
+            Language::Kotlin,
+            declarations_by_fqn,
+            candidate,
+            usage,
+        ),
+        Language::JavaScript | Language::TypeScript | Language::None => {
             unreachable!("{language:?} candidates never reach the fqn-keyed bulk proof")
         }
     }
@@ -919,29 +1137,15 @@ fn prove_scoped_candidates(
                     return None;
                 }
             }
-            if let Some(total_callsites) = truncated.get(&candidate_key) {
-                skipped.push(format!(
-                    "`{}`: too many workspace inbound call sites ({total_callsites}, limit {}); evidence is inconclusive",
-                    candidate.fq_name(),
-                    crate::analyzer::usages::inverted_edges::MAX_CALLSITES
-                ));
-                return None;
-            }
             let usage = incoming.get(&candidate_key).cloned().unwrap_or_default();
-            if usage.total > usage_cap {
-                skipped.push(format!(
-                    "`{}`: too many workspace inbound call sites ({}, limit {usage_cap}); evidence is inconclusive",
-                    candidate.fq_name(),
-                    usage.total
-                ));
-                return None;
-            }
-            if usage.total == 0 && usage.unproven_inbound > 0 {
-                skipped.push(format!(
-                    "`{}`: {} structurally matching usage site(s) could not be proven or disproven; evidence is inconclusive",
-                    candidate.fq_name(),
-                    usage.unproven_inbound
-                ));
+            if let Some(reason) = inbound_usage_inconclusive_reason(
+                &candidate.fq_name(),
+                truncated.get(&candidate_key).copied(),
+                usage.total,
+                usage_cap,
+                usage.unproven_inbound,
+            ) {
+                skipped.push(reason);
                 return None;
             }
             scoped_graph_finding_for_language(
@@ -1546,19 +1750,22 @@ pub(crate) fn contains_java_visibility_modifier(source: &str, modifier: &str) ->
         .any(|token| token == modifier)
 }
 
-fn declarations_by_fqn_for_language(
+fn requested_declarations_by_fqn_for_language<'a, I>(
     analyzer: &dyn IAnalyzer,
     language: Language,
-) -> BTreeMap<String, Vec<CodeUnit>> {
+    fqns: I,
+) -> BTreeMap<String, Vec<CodeUnit>>
+where
+    I: IntoIterator<Item = &'a str>,
+{
     let mut declarations: BTreeMap<String, Vec<CodeUnit>> = BTreeMap::new();
-    for declaration in analyzer
-        .all_declarations()
-        .filter(|unit| code_unit_language(unit) == language)
-    {
-        declarations
-            .entry(declaration.fq_name())
-            .or_default()
-            .push(declaration.clone());
+    for fqn in fqns {
+        let definitions = analyzer
+            .get_definitions(fqn)
+            .into_iter()
+            .filter(|unit| code_unit_language(unit) == language)
+            .collect();
+        declarations.insert(fqn.to_string(), definitions);
     }
     declarations
 }

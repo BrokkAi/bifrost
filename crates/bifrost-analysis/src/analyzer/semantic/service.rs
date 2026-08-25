@@ -200,7 +200,7 @@ fn retained_artifact_bytes(key: &SemanticArtifactKey, artifact: &SemanticArtifac
         .max(1)
 }
 
-pub(crate) fn semantic_artifact_retained_bytes(artifact: &SemanticArtifact) -> u64 {
+pub fn semantic_artifact_retained_bytes(artifact: &SemanticArtifact) -> u64 {
     retained_artifact_bytes(artifact.key(), artifact)
 }
 

@@ -35,19 +35,19 @@ use std::time::Duration;
 use semver::Version;
 use serde::Serialize;
 
-use brokk_bifrost_analysis::analyzer::dataflow::{SemanticInputStatus, SummaryBoundaryKind};
 use brokk_bifrost_analysis::analyzer::semantic::SemanticLocator;
 use brokk_bifrost_analysis::analyzer::semantic_model::{
-    CatalogCoordinate, CatalogOptions, CompiledSemanticModelPack, CompilerOptions,
-    SemanticModelActivationControl, SemanticModelActivationEvidence,
-    SemanticModelActivationRequest, SemanticModelControlAction, SemanticModelControlScope,
-    SemanticModelPackSelector, SemanticModelRuntimeLimits, SemanticPackCatalog, SessionPackSource,
-    SessionPackSourceKind, SourceFormat, compile_source,
+    CatalogCoordinate, CatalogOpenMode, CatalogOptions, CompiledSemanticModelPack, CompilerOptions,
+    DependencyPackLimits, DependencyPackPreparationOutcome, SemanticModelActivationControl,
+    SemanticModelActivationEvidence, SemanticModelActivationRequest, SemanticModelControlAction,
+    SemanticModelControlScope, SemanticModelPackSelector, SemanticModelRuntimeLimits,
+    SemanticPackCatalog, SessionPackSource, SessionPackSourceKind, SourceFormat, compile_source,
 };
 use brokk_bifrost_analysis::{
-    AnalyzerConfig, CancellationToken, FilesystemProject, JvmDependencyDiscoveryMode,
-    JvmExternalArtifact, Project, WorkspaceAnalyzer,
+    AnalyzerConfig, CancellationToken, DependencyPackEcosystem, DependencyPackWorkspaceContext,
+    FilesystemProject, JvmDependencyDiscoveryMode, JvmExternalArtifact, Project, WorkspaceAnalyzer,
 };
+use brokk_bifrost_flow::dataflow::{SemanticInputStatus, SummaryBoundaryKind};
 use brokk_bifrost_policy::{
     PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions,
     PolicySemanticModelContext, PolicySourceIdentity,
@@ -747,6 +747,135 @@ fn jdk_toolchain() -> CatalogCoordinate {
     }
 }
 
+// ===========================================================================
+// #2558: JDK dependency pack, routed through the product activation path
+// ===========================================================================
+//
+// Every other pack this module loads is authored bakeoff content (sanitizer
+// knowledge, servlet/JDK behavioral summaries) with no real generation-time
+// extraction behind it, so `SemanticPackCatalog::register_session_pack` --
+// which only validates a pack's own shape and never consults `Completeness`
+// or gap accounting -- is the right mechanism for it (#2401's central
+// finding). The JDK declaration pack is different: it is a real, generated
+// extraction of the JDK's own `src.zip` (44 shards, 52,996 records, 3,791
+// named warning-grade gaps for `bifrost.jdk@21.0.8`), and it exists
+// specifically so `prepare_dependency_semantic_packs`'s declaration-scoped
+// completeness gate (`crates/bifrost-analysis/src/analyzer/semantic_model/dependency.rs`,
+// landed for #2401) has something real to activate. Loading it through
+// `register_session_pack` would skip that gate entirely -- exactly the
+// bakeoff-vs-product divergence issue #2558 exists to close.
+
+/// The exact JDK release the pinned `bifrost.jdk` pack targets
+/// (`semantic-packs/jvm/temurin-jdk-21.0.8+9.json`). The installed pack's own
+/// activation selector requires this exact version, so a caller who wants a
+/// different JDK release needs a differently pinned pack, not a flag here.
+const JDK_PACK_VERSION: &str = "21.0.8";
+
+/// Write an evidence-only JDK home: a `release` file naming the exact
+/// version and no `lib/src.zip`. JVM dependency discovery
+/// (`discover_jdk_semantic_pack_dependencies` in
+/// `crates/bifrost-analysis/src/analyzer/jvm/external.rs`) then resolves a
+/// zero-artifact JDK dependency, which is what forces
+/// `prepare_dependency_semantic_packs` through its installed-pack lookup
+/// (`compatible_installed_pack`) instead of local production. A real
+/// `JAVA_HOME` with an actual `src.zip` would instead have Bifrost
+/// regenerate a fresh JDK pack in-process on every run, which is not how a
+/// customer runs the shipped, pre-installed `bifrost.jdk` release bundle.
+/// This is the same evidence-only-home shape #2401's own Butterknife
+/// acceptance smoke used, and the one
+/// `tests/suite_semantic/dependency_pack_version_selection.rs`'s
+/// `write_jdk_home` helper exercises.
+fn write_evidence_only_jdk_home(root: &Path, version: &str) -> Result<PathBuf, String> {
+    let home = root.join(format!("jdk-{version}"));
+    fs::create_dir_all(&home).map_err(|error| format!("mkdir {}: {error}", home.display()))?;
+    let release = home.join("release");
+    fs::write(&release, format!("JAVA_VERSION=\"{version}\"\n"))
+        .map_err(|error| format!("write {}: {error}", release.display()))?;
+    Ok(home)
+}
+
+/// Activate the JDK declaration pack through the PRODUCT path:
+/// `WorkspaceAnalyzer::activate_dependency_packs` ->
+/// `prepare_dependency_semantic_packs`. This is the same function
+/// `crates/bifrost-analysis/src/analyzer/packs_document.rs::activate_workspace_packs`
+/// calls when a host activates packs from a checked-in `.bifrost/packs.json`
+/// (`activate_workspace_packs` is a thin wrapper around exactly this call
+/// with `workspace_model_root: None`, verified by reading its source); the
+/// harness calls it directly because it builds its activation evidence in
+/// Rust rather than from a JSON document, the same way it already does for
+/// its own session packs, and a document layer here would only add an
+/// artificial workspace-relative catalog path with no behavioral difference.
+///
+/// `catalog` must already have the real `bifrost.jdk` release bundle
+/// installed (`bifrost-semantic-pack install <bundle> <catalog>`); this
+/// function never installs or mutates it. On success, returns `request` with
+/// the JDK's own dependency evidence folded in (so the caller's later
+/// per-category resolution sees it) and the preparation outcome (for
+/// completeness/gap reporting). On any refusal -- discovery incomplete, or
+/// the completeness gate declining the installed pack -- returns `Err`
+/// naming the reason; this function never silently drops the JDK from the
+/// active set.
+pub fn activate_jdk_dependency_pack(
+    workspace: &WorkspaceAnalyzer,
+    catalog: &SemanticPackCatalog,
+    request: SemanticModelActivationRequest,
+    jdk_version: &str,
+    cancellation: &CancellationToken,
+) -> Result<
+    (
+        SemanticModelActivationRequest,
+        DependencyPackPreparationOutcome,
+    ),
+    String,
+> {
+    let scratch = tempfile::tempdir()
+        .map_err(|error| format!("create scratch dir for JDK evidence home: {error}"))?;
+    let jdk_home = write_evidence_only_jdk_home(scratch.path(), jdk_version)?;
+
+    let mut jdk_config = AnalyzerConfig::default();
+    jdk_config.jvm.dependency_discovery.mode = JvmDependencyDiscoveryMode::Disabled;
+    jdk_config.jvm.standard_library_discovery.discover_java_home = false;
+    jdk_config.jvm.standard_library_discovery.jdk_homes = vec![jdk_home];
+
+    let outcome = workspace.activate_dependency_packs(
+        &jdk_config,
+        &[DependencyPackEcosystem::Jvm],
+        DependencyPackWorkspaceContext {
+            catalog,
+            persistence: None,
+            activation: &request,
+            limits: DependencyPackLimits::default(),
+            cancellation,
+        },
+    );
+    let ecosystem =
+        outcome.ecosystems.into_iter().next().ok_or_else(|| {
+            "JVM dependency-pack activation produced no ecosystem outcome".to_owned()
+        })?;
+    if !ecosystem.discovery.complete {
+        return Err(format!(
+            "JDK dependency discovery was incomplete: {:?}",
+            ecosystem.discovery.diagnostics
+        ));
+    }
+    let preparation = ecosystem
+        .preparation
+        .ok_or_else(|| "JDK dependency-pack preparation did not run".to_owned())?;
+    if !preparation.complete {
+        return Err(format!(
+            "JDK dependency-pack preparation was refused by the declaration-scoped \
+             completeness gate: {:?}",
+            preparation.diagnostics
+        ));
+    }
+    let merged = preparation
+        .compose_activation_request(request)
+        .ok_or_else(|| {
+            "JDK dependency-pack preparation produced no activation evidence".to_owned()
+        })?;
+    Ok((merged, preparation))
+}
+
 /// Configuration for one live run.
 pub struct RunConfig {
     /// The built Benchmark checkout root.
@@ -764,6 +893,13 @@ pub struct RunConfig {
     /// Optional cap on the number of cases scored, for a smoke run. `None`
     /// scores the whole subset.
     pub case_limit: Option<usize>,
+    /// #2558: an operator catalog directory with the real `bifrost.jdk`
+    /// release bundle already installed
+    /// (`bifrost-semantic-pack install <bundle> <this dir>`). The JDK
+    /// declaration pack activates from here through the product dependency
+    /// path (`activate_jdk_dependency_pack`), not as a curated session pack.
+    /// Opened read-only: a run never installs into or otherwise mutates it.
+    pub jdk_catalog_root: PathBuf,
 }
 
 /// A pack to load: its id, its JSON on disk, and the coordinate evidence to
@@ -804,6 +940,14 @@ pub struct RunResult {
     /// artifact has to carry the denominator (#1936).
     pub analyzed_files: usize,
     pub analyzed_source_bytes: u64,
+    /// #2558: the named warning-grade extraction gaps the activated
+    /// `bifrost.jdk` release bundle carries (3,791 for `bifrost.jdk@21.0.8`,
+    /// per the #2401 verification). A reference to a gapped declaration
+    /// degrades to a typed `PackExtractionGap` incomplete reason rather than
+    /// a false absence proof; this count is the honesty budget the product
+    /// activation path enforces, restated here so it is visible in the
+    /// artifact rather than only in a log line.
+    pub jdk_pack_gaps: usize,
 }
 
 /// The run-level taint completion for one category, with sample diagnostics.
@@ -916,8 +1060,23 @@ pub fn run(config: &RunConfig) -> Result<RunResult, String> {
         })
         .sum();
 
-    let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
-        .map_err(|error| format!("open pack catalog: {error}"))?;
+    // #2558: the catalog is opened read-only at the operator catalog
+    // directory carrying the real, pre-installed `bifrost.jdk` release
+    // bundle, not an ephemeral in-memory catalog. Session packs (authored
+    // sanitizer/summary content) register into this same handle below, so
+    // one catalog and one activation request serve both the curated content
+    // and the product-path JDK dependency pack.
+    let catalog = SemanticPackCatalog::open(
+        &config.jdk_catalog_root,
+        CatalogOpenMode::ReadOnly,
+        CatalogOptions::default(),
+    )
+    .map_err(|error| {
+        format!(
+            "open JDK operator catalog {}: {error}",
+            config.jdk_catalog_root.display()
+        )
+    })?;
     let mut evidence = Vec::new();
     let mut controls = Vec::new();
     let mut activated_pack_ids = Vec::new();
@@ -969,6 +1128,31 @@ pub fn run(config: &RunConfig) -> Result<RunResult, String> {
         limits: SemanticModelRuntimeLimits::default(),
     };
 
+    // #2558: fold the JDK dependency pack's own evidence into `request`
+    // through the product activation path. Mandatory, like the curated
+    // packs above: a refusal here (discovery incomplete, or the
+    // declaration-scoped completeness gate declining the installed pack)
+    // aborts the run rather than silently scoring without the JDK pack.
+    let jdk_activation_cancellation = CancellationToken::new().with_timeout(config.timeout);
+    let (request, jdk_preparation) = activate_jdk_dependency_pack(
+        &workspace,
+        &catalog,
+        request,
+        JDK_PACK_VERSION,
+        &jdk_activation_cancellation,
+    )?;
+    activated_pack_ids.extend(
+        jdk_preparation
+            .installed_packs
+            .iter()
+            .map(|_| "bifrost.jdk".to_owned()),
+    );
+    let jdk_pack_gaps: usize = jdk_preparation
+        .installed_packs
+        .iter()
+        .map(|pack| pack.gaps)
+        .sum();
+
     let options = PolicyEvaluationOptions::new(
         PolicyEvaluationDate::from_ymd(2026, 1, 1).expect("a fixed evaluation date"),
     );
@@ -983,6 +1167,7 @@ pub fn run(config: &RunConfig) -> Result<RunResult, String> {
     let mut findings_total = 0usize;
     let mut taint_roots = 0usize;
     let mut category_runs = Vec::new();
+    let flow_state = brokk_bifrost_flow::FlowWorkspaceState::new();
 
     for category in InjectionCategory::ALL {
         // One deadline per category, not one shared across all six. A single
@@ -1003,6 +1188,7 @@ pub fn run(config: &RunConfig) -> Result<RunResult, String> {
             &config.benchmark_root,
             &inputs,
             &workspace,
+            &flow_state,
             &options,
             PolicySemanticModelContext {
                 catalog: &catalog,
@@ -1250,6 +1436,7 @@ pub fn run(config: &RunConfig) -> Result<RunResult, String> {
         category_runs,
         analyzed_files,
         analyzed_source_bytes,
+        jdk_pack_gaps,
     })
 }
 
@@ -1514,6 +1701,142 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains(digest)
+        );
+    }
+
+    /// #2558 fail-before: a Partial JDK pack installed with no gap
+    /// accounting (the pre-#2401 shape) is exactly the kind of pack
+    /// `register_session_pack` accepts without complaint -- it only
+    /// validates a pack's own shape and never consults `Completeness`. The
+    /// product-path route this module now uses for the JDK pack,
+    /// `activate_jdk_dependency_pack`, must refuse the same pack instead of
+    /// silently activating it. This proves the harness actually exercises
+    /// `prepare_dependency_semantic_packs`'s declaration-scoped completeness
+    /// gate for the JDK pack, not just a second copy of the old
+    /// no-gate-at-all path.
+    #[test]
+    fn jdk_pack_activation_refuses_a_gap_unaccounted_partial_pack_where_register_session_pack_would_accept_it()
+     {
+        use brokk_bifrost_analysis::analyzer::semantic_model::{
+            DurablePackSource, DurablePackSourceKind,
+        };
+
+        const GAP_UNACCOUNTED_PARTIAL_JDK_PACK: &str = r#"{
+          "schema_version": 1,
+          "pack_id": "test.fail-before.jdk",
+          "version": "21.0.2",
+          "producer": { "name": "bifrost-fixture", "version": "1.0.0" },
+          "language": "java",
+          "ecosystem": "jdk",
+          "compatibility": {
+            "bifrost": ">=0.8.0, <1.0.0",
+            "toolchains": [{ "name": "jdk", "requirement": "=21.0.2" }]
+          },
+          "provenance": { "source": "test fixture", "revision": "fail-before" },
+          "license": "GPL-2.0-only WITH Classpath-exception-2.0",
+          "completeness": "partial",
+          "safety": { "generated_code_only": false, "review_required": false },
+          "shards": [{
+            "id": "jdk.core",
+            "activation": [{
+              "toolchain": { "name": "jdk", "version": "=21.0.2" },
+              "targets": ["jvm"]
+            }],
+            "payload": {
+              "kind": "declaration_facts",
+              "types": [{
+                "id": "jdk.java-util-arraylist",
+                "name": "java.util.ArrayList",
+                "type_kind": "class",
+                "visibility": "public",
+                "type_parameters": [],
+                "hierarchy": [],
+                "aliases": [],
+                "extension_surfaces": [],
+                "locator": {
+                  "kind": "artifact",
+                  "path": "java.base/java/util/ArrayList.java",
+                  "symbol": "java.util.ArrayList"
+                }
+              }],
+              "members": [],
+              "relations": []
+            }
+          }]
+        }"#;
+
+        let pack = compile_source(
+            SourceFormat::Json,
+            GAP_UNACCOUNTED_PARTIAL_JDK_PACK.as_bytes(),
+            &CompilerOptions::default(),
+        )
+        .unwrap_or_else(|diagnostics| panic!("fixture compilation failed: {diagnostics:#?}"));
+
+        // `register_session_pack` -- the mechanism this module used for the
+        // JDK pack before #2558, and still uses for authored sanitizer and
+        // summary content -- has no completeness gate at all and accepts
+        // this Partial, gap-unaccounted pack with no complaint.
+        let session_catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
+            .expect("open ephemeral catalog");
+        session_catalog
+            .register_session_pack(
+                &pack,
+                &SessionPackSource {
+                    kind: SessionPackSourceKind::Embedded,
+                    source_id: "test:register-session-pack".to_owned(),
+                },
+            )
+            .expect(
+                "register_session_pack must accept a gap-unaccounted Partial pack: it has no \
+                 completeness gate to refuse it with (#2401's central finding)",
+            );
+
+        // The installed-pack catalog the product path reads from, carrying
+        // the same pack installed with NO gap accounting (`catalog.install`,
+        // not `catalog.install_release`), matching
+        // `partial_jdk_pack_without_gap_accounting_stays_blocked` in
+        // `tests/suite_semantic/dependency_pack_version_selection.rs`.
+        let installed_catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
+            .expect("open ephemeral catalog");
+        installed_catalog
+            .install(
+                &pack,
+                &DurablePackSource {
+                    kind: DurablePackSourceKind::PreShipped,
+                    source_id: "test:fail-before.jdk@21.0.2".to_owned(),
+                },
+            )
+            .expect("install the fixture pack with no gap accounting");
+
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        std::fs::write(scratch.path().join("Main.java"), "final class Main {}")
+            .expect("write fixture source");
+        let project: Arc<dyn Project> =
+            Arc::new(FilesystemProject::new(scratch.path()).expect("open fixture project"));
+        let workspace = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
+            .expect("build ephemeral workspace");
+        let cancellation = CancellationToken::new();
+        let request = SemanticModelActivationRequest {
+            bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+            evidence: Vec::new(),
+            controls: Vec::new(),
+            limits: SemanticModelRuntimeLimits::default(),
+        };
+
+        let error = activate_jdk_dependency_pack(
+            &workspace,
+            &installed_catalog,
+            request,
+            "21.0.2",
+            &cancellation,
+        )
+        .expect_err(
+            "the product path must refuse a Partial pack with no gap accounting, not silently \
+             activate it the way register_session_pack did above",
+        );
+        assert!(
+            error.contains("completeness gate"),
+            "the refusal must name the completeness gate: {error}"
         );
     }
 }

@@ -14,8 +14,9 @@ const PHP = "brokk-bifrost-php";
 const PYTHON = "brokk-bifrost-python";
 const RUBY = "brokk-bifrost-ruby";
 const RUST = "brokk-bifrost-rust";
-const RQL = "brokk-bifrost-rql";
 const ANALYSIS = "brokk-bifrost-analysis";
+const FLOW = "brokk-bifrost-flow";
+const RQL = "brokk-bifrost-rql";
 const NLP = "brokk-bifrost-nlp";
 const POLICY = "brokk-bifrost-policy";
 const RUNTIME = "brokk-bifrost-runtime";
@@ -35,8 +36,9 @@ const EXPECTED_MEMBERS = new Set([
   PYTHON,
   RUBY,
   RUST,
-  RQL,
   ANALYSIS,
+  FLOW,
+  RQL,
   NLP,
   POLICY,
   RUNTIME,
@@ -45,7 +47,8 @@ const EXPECTED_MEMBERS = new Set([
   SEMANTIC_PACKS,
 ]);
 // Core is the bottom of the graph and depends on no workspace package; the
-// analysis crate sits directly on it. The RQL syntax crate sits directly on it.
+// analysis crate sits above core and the language crates. Flow owns solver
+// engines above analysis, and RQL owns query execution above flow.
 // The per-language crates (cpp, csharp, go,
 // jvm, php, python, ruby, rust) sit between the two and depend on core alone -- that is what keeps a
 // language's knowledge out of the analysis compilation unit. `jvm` is one crate
@@ -54,8 +57,7 @@ const EXPECTED_MEMBERS = new Set([
 // crate for JavaScript and TypeScript for the same reason -- one module, one
 // `EdgePassId`, one usage strategy and one `JsTsAnalyzerConfig`. Policy and nlp sit directly
 // on analysis as siblings (#1548) so that neither can be pulled into the
-// analysis compilation unit again. Analysis owns RQL execution and sits above
-// the analyzer-independent RQL syntax crate.
+// analysis compilation unit again. Policy composes analysis, flow, and RQL.
 const ALLOWED_WORKSPACE_DEPENDENCIES = new Map([
   [CORE, new Set()],
   [CPP, new Set([CORE])],
@@ -67,15 +69,16 @@ const ALLOWED_WORKSPACE_DEPENDENCIES = new Map([
   [PYTHON, new Set([CORE])],
   [RUBY, new Set([CORE])],
   [RUST, new Set([CORE])],
-  [RQL, new Set([CORE])],
-  [ANALYSIS, new Set([CORE, CPP, CSHARP, GO, JS_TS, JVM, PHP, PYTHON, RUBY, RUST, RQL])],
+  [ANALYSIS, new Set([CORE, CPP, CSHARP, GO, JS_TS, JVM, PHP, PYTHON, RUBY, RUST])],
+  [FLOW, new Set([CORE, ANALYSIS])],
+  [RQL, new Set([CORE, ANALYSIS, FLOW])],
   [NLP, new Set([ANALYSIS])],
-  [POLICY, new Set([ANALYSIS, RQL])],
-  [SEMANTIC_PACKS, new Set([ANALYSIS])],
-  [RUNTIME, new Set([ANALYSIS, POLICY])],
-  [MCP, new Set([ANALYSIS, NLP, POLICY, RUNTIME, RQL])],
-  [LSP, new Set([ANALYSIS, POLICY, RUNTIME, RQL])],
-  [FACADE, new Set([ANALYSIS, NLP, POLICY, RUNTIME, MCP, LSP, SEMANTIC_PACKS, RQL])],
+  [POLICY, new Set([ANALYSIS, FLOW, RQL])],
+  [SEMANTIC_PACKS, new Set([ANALYSIS, FLOW])],
+  [RUNTIME, new Set([ANALYSIS, FLOW, POLICY, RQL])],
+  [MCP, new Set([ANALYSIS, FLOW, NLP, POLICY, RUNTIME, RQL])],
+  [LSP, new Set([ANALYSIS, FLOW, POLICY, RUNTIME, RQL])],
+  [FACADE, new Set([ANALYSIS, FLOW, NLP, POLICY, RUNTIME, MCP, LSP, SEMANTIC_PACKS, RQL])],
 ]);
 const REQUIRED_WORKSPACE_DEPENDENCIES = new Map([
   [CORE, new Set()],
@@ -88,14 +91,15 @@ const REQUIRED_WORKSPACE_DEPENDENCIES = new Map([
   [PYTHON, new Set([CORE])],
   [RUBY, new Set([CORE])],
   [RUST, new Set([CORE])],
-  [RQL, new Set([CORE])],
-  [ANALYSIS, new Set([CORE, CPP, CSHARP, GO, JS_TS, JVM, PHP, PYTHON, RUBY, RUST, RQL])],
+  [ANALYSIS, new Set([CORE, CPP, CSHARP, GO, JS_TS, JVM, PHP, PYTHON, RUBY, RUST])],
+  [FLOW, new Set([CORE, ANALYSIS])],
+  [RQL, new Set([CORE, ANALYSIS, FLOW])],
   [NLP, new Set([ANALYSIS])],
-  [POLICY, new Set([ANALYSIS])],
-  [SEMANTIC_PACKS, new Set([ANALYSIS])],
-  [RUNTIME, new Set([ANALYSIS, POLICY])],
-  [MCP, new Set([ANALYSIS, POLICY, RUNTIME])],
-  [LSP, new Set([ANALYSIS, POLICY, RUNTIME])],
+  [POLICY, new Set([ANALYSIS, FLOW, RQL])],
+  [SEMANTIC_PACKS, new Set([ANALYSIS, FLOW])],
+  [RUNTIME, new Set([ANALYSIS, FLOW, POLICY, RQL])],
+  [MCP, new Set([ANALYSIS, FLOW, POLICY, RUNTIME, RQL])],
+  [LSP, new Set([ANALYSIS, FLOW, POLICY, RUNTIME, RQL])],
   [FACADE, new Set()],
 ]);
 const FORBIDDEN_EXTERNAL_DEPENDENCIES = new Map([
@@ -148,6 +152,11 @@ const FORBIDDEN_EXTERNAL_DEPENDENCIES = new Map([
     ANALYSIS,
     new Set(["lsp-server", "lsp-types", "pyo3", "hf-hub", "tokenizers", "fastrq"]),
   ],
+  [
+    FLOW,
+    new Set(["lsp-server", "lsp-types", "pyo3", "hf-hub", "tokenizers", "fastrq"]),
+  ],
+  [RQL, new Set(["lsp-server", "lsp-types", "pyo3"])],
   [NLP, new Set(["lsp-server", "lsp-types", "pyo3"])],
   [POLICY, new Set(["lsp-server", "lsp-types", "pyo3"])],
   [SEMANTIC_PACKS, new Set(["lsp-server", "lsp-types", "pyo3"])],

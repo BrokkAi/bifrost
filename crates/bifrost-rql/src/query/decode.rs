@@ -2,17 +2,17 @@ use super::ir::{
     ArityConstraint, BindingFilter, BindingOfOptions, BindingSeed, CallInputSelector,
     CallSiteTraversalFilter, CallTraversalFilter, CandidateFilter, CandidateOutcomeLabel,
     CodeQuery, CodeQueryPlan, CodeQueryPlanSource, CodeQueryResultDetail, CodeQuerySeed,
-    DEFAULT_LIMIT, DeclarationStateFilter, EdgeFilter, ExportFilter, ExportSeed,
-    FlowRelationFilter, GenerationSiteFilter, GenerationSiteSeed, HierarchyTraversal, MAX_ARITY,
-    MAX_BINDING_NAME_LENGTH, MAX_CAPTURE_LENGTH, MAX_ENVIRONMENT_FILTER_ENTRIES, MAX_GLOB_LENGTH,
-    MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT,
-    MAX_OCCURRENCE_FILTER_ENTRIES, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES, MAX_QUERY_BRANCHES,
-    MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES,
-    MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, OccurrenceFilter, OccurrenceSeed, PathFilter,
-    PathSeed, Pattern, QueryError, QueryStep, ReceiverTraversalFilter, ReferenceTraversalFilter,
-    RewritePathFilter, ScopeFilter, ScopeSeed, SegmentsOfOptions, SetOperator, StateEventFilter,
-    StringPredicate, TaintTraversal, TypestateTraversal, UNATTRIBUTED_TIER_LABEL,
-    ValueFlowTraversal, WitnessTraversal,
+    ControlRelationFilter, DEFAULT_LIMIT, DeclarationStateFilter, EdgeFilter, ExportFilter,
+    ExportSeed, FlowRelationFilter, GenerationSiteFilter, GenerationSiteSeed, HierarchyTraversal,
+    MAX_ARITY, MAX_BINDING_NAME_LENGTH, MAX_CAPTURE_LENGTH, MAX_ENVIRONMENT_FILTER_ENTRIES,
+    MAX_GLOB_LENGTH, MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH, MAX_KWARGS,
+    MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_OCCURRENCE_FILTER_ENTRIES, MAX_PATTERN_DEPTH,
+    MAX_PATTERN_NODES, MAX_QUERY_BRANCHES, MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES,
+    MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS,
+    OccurrenceFilter, OccurrenceSeed, PathFilter, PathSeed, Pattern, QueryError, QueryStep,
+    ReceiverTraversalFilter, ReferenceTraversalFilter, RewritePathFilter, ScopeFilter, ScopeSeed,
+    SegmentsOfOptions, SetOperator, StateEventFilter, StringPredicate, TaintTraversal,
+    TypestateTraversal, UNATTRIBUTED_TIER_LABEL, ValueFlowTraversal, WitnessTraversal,
 };
 use super::schema::{
     ALL_QUERY_STEP_OPS, CodeQueryExecutionMode, PatternField, QueryField, QueryStepField,
@@ -21,6 +21,9 @@ use super::schema::{
     usage_surface_from_label,
 };
 use brokk_bifrost_core::analyzer::Language;
+use brokk_bifrost_core::analyzer::structural::control_relation::{
+    ControlExitPartition, ControlRelationKind,
+};
 use brokk_bifrost_core::analyzer::structural::edges::{OwnerRelation, SiteClass};
 use brokk_bifrost_core::analyzer::structural::flow_state::{
     FlowCertainty, FlowRelation as FlowRelationLabel, FlowSubjectKind, StateEventClass,
@@ -853,6 +856,36 @@ pub(super) fn decode_flow_relation_filter(
     })
 }
 
+pub(super) fn decode_control_relation_filter(
+    object: &Map<String, Value>,
+    path: &str,
+) -> Result<ControlRelationFilter, QueryError> {
+    let relations = QueryStepField::ControlRelations.label();
+    let partitions = QueryStepField::ControlExitPartitions.label();
+    reject_unknown_filter_fields(
+        object,
+        path,
+        &[relations, partitions, "op"],
+        "control relation",
+    )?;
+    Ok(ControlRelationFilter {
+        relations: decode_environment_axis(
+            object,
+            path,
+            relations,
+            "control relation",
+            ControlRelationKind::from_label,
+        )?,
+        exit_partitions: decode_environment_axis(
+            object,
+            path,
+            partitions,
+            "control exit partition",
+            ControlExitPartition::from_label,
+        )?,
+    })
+}
+
 pub(super) fn decode_rewrite_path_filter(
     object: &Map<String, Value>,
     path: &str,
@@ -1219,6 +1252,7 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
         let edge = matches!(step, QueryStep::EdgesOf(_) | QueryStep::EdgesFrom(_));
         let state_event = matches!(step, QueryStep::StateEventsOf(_));
         let flow_relation = matches!(step, QueryStep::FlowRelationsOf(_));
+        let control_relation = matches!(step, QueryStep::ControlRelations(_));
         let rewrite_path = matches!(step, QueryStep::RewritePathsOf(_));
         let segments = matches!(step, QueryStep::SegmentsOf(_));
         for key in object.keys() {
@@ -1280,6 +1314,8 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     if flow_relation => {}
                 Some(QueryStepField::RewriteDomains | QueryStepField::RewriteOutcomes)
                     if rewrite_path => {}
+                Some(QueryStepField::ControlRelations | QueryStepField::ControlExitPartitions)
+                    if control_relation => {}
                 Some(
                     QueryStepField::Depth
                     | QueryStepField::Transitive
@@ -1318,6 +1354,8 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::FlowCertainties
                     | QueryStepField::RewriteDomains
                     | QueryStepField::RewriteOutcomes
+                    | QueryStepField::ControlRelations
+                    | QueryStepField::ControlExitPartitions
                     | QueryStepField::Resolved,
                 )
                 | None => {
@@ -1376,6 +1414,9 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
             step = QueryStep::StateEventsOf(decode_state_event_filter(object, &entry_path)?);
         } else if flow_relation {
             step = QueryStep::FlowRelationsOf(decode_flow_relation_filter(object, &entry_path)?);
+        } else if control_relation {
+            step =
+                QueryStep::ControlRelations(decode_control_relation_filter(object, &entry_path)?);
         } else if rewrite_path {
             step = QueryStep::RewritePathsOf(decode_rewrite_path_filter(object, &entry_path)?);
         } else if edge {

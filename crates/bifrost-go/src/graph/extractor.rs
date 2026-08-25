@@ -613,9 +613,7 @@ fn scan_selector_like(
         } else if receiver_resolution
             .as_precise()
             .is_some_and(|targets| targets.contains(NON_OWNER_TOKEN))
-        {
-            return;
-        } else if !ctx.bindings.namespace_names.contains(&qualifier)
+            || !ctx.bindings.namespace_names.contains(&qualifier)
             || locals.is_shadowed(&qualifier)
         {
             record_unproven_hit(field_node, ctx);

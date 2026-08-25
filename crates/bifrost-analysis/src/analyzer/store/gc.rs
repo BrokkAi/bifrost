@@ -19,16 +19,37 @@ fn run_gc(db_path: PathBuf, repo: &git2::Repository, workspace_root: &Path) -> R
 ///
 /// The final store-context drop joins outstanding tasks, so callers can delete
 /// a closed workspace without a detached GC thread recreating its cache files.
-#[derive(Default)]
 pub(crate) struct AnalyzerGcCoordinator {
+    automatic: bool,
     closing: AtomicBool,
     tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
+impl Default for AnalyzerGcCoordinator {
+    fn default() -> Self {
+        Self {
+            automatic: true,
+            closing: AtomicBool::new(false),
+            tasks: Mutex::new(Vec::new()),
+        }
+    }
+}
+
 impl AnalyzerGcCoordinator {
+    pub(crate) fn disabled() -> Self {
+        Self {
+            automatic: false,
+            closing: AtomicBool::new(false),
+            tasks: Mutex::new(Vec::new()),
+        }
+    }
+
     /// Run a throttled GC after a persisted analyzer build/update.
     /// Plain in-memory stores never GC.
     pub(crate) fn schedule(self: &Arc<Self>, workspace_root: &Path, store: Arc<AnalyzerStore>) {
+        if !self.automatic {
+            return;
+        }
         let Some(db_path) = store.db_path().map(Path::to_path_buf) else {
             return;
         };

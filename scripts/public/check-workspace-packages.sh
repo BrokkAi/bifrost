@@ -194,8 +194,9 @@ brokk-bifrost-php = { path = "$unpacked/brokk-bifrost-php-$version" }
 brokk-bifrost-python = { path = "$unpacked/brokk-bifrost-python-$version" }
 brokk-bifrost-ruby = { path = "$unpacked/brokk-bifrost-ruby-$version" }
 brokk-bifrost-rust = { path = "$unpacked/brokk-bifrost-rust-$version" }
-brokk-bifrost-rql = { path = "$unpacked/brokk-bifrost-rql-$version" }
 brokk-bifrost-analysis = { path = "$unpacked/brokk-bifrost-analysis-$version" }
+brokk-bifrost-flow = { path = "$unpacked/brokk-bifrost-flow-$version" }
+brokk-bifrost-rql = { path = "$unpacked/brokk-bifrost-rql-$version" }
 brokk-bifrost-nlp = { path = "$unpacked/brokk-bifrost-nlp-$version" }
 brokk-bifrost-policy = { path = "$unpacked/brokk-bifrost-policy-$version" }
 brokk-bifrost-semantic-packs = { path = "$unpacked/brokk-bifrost-semantic-packs-$version" }
@@ -236,7 +237,6 @@ brokk-bifrost-php = { path = "$unpacked/brokk-bifrost-php-$version" }
 brokk-bifrost-python = { path = "$unpacked/brokk-bifrost-python-$version" }
 brokk-bifrost-ruby = { path = "$unpacked/brokk-bifrost-ruby-$version" }
 brokk-bifrost-rust = { path = "$unpacked/brokk-bifrost-rust-$version" }
-brokk-bifrost-rql = { path = "$unpacked/brokk-bifrost-rql-$version" }
 EOF
 cat > "$analysis_consumer/src/main.rs" <<'EOF'
 fn main() {
@@ -269,8 +269,9 @@ brokk-bifrost-php = { path = "$unpacked/brokk-bifrost-php-$version" }
 brokk-bifrost-python = { path = "$unpacked/brokk-bifrost-python-$version" }
 brokk-bifrost-ruby = { path = "$unpacked/brokk-bifrost-ruby-$version" }
 brokk-bifrost-rust = { path = "$unpacked/brokk-bifrost-rust-$version" }
-brokk-bifrost-rql = { path = "$unpacked/brokk-bifrost-rql-$version" }
 brokk-bifrost-analysis = { path = "$unpacked/brokk-bifrost-analysis-$version" }
+brokk-bifrost-flow = { path = "$unpacked/brokk-bifrost-flow-$version" }
+brokk-bifrost-rql = { path = "$unpacked/brokk-bifrost-rql-$version" }
 brokk-bifrost-policy = { path = "$unpacked/brokk-bifrost-policy-$version" }
 EOF
 cat > "$extension_consumer/src/main.rs" <<'EOF'

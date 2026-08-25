@@ -24,6 +24,7 @@ test("build, packaging, dependency, and workflow changes conservatively select t
   for (const changedPaths of [
     fixture("cargo"),
     ["crates/bifrost-analysis/Cargo.toml"],
+    ["crates/bifrost-flow/Cargo.toml"],
     ["crates/bifrost-analysis/resources/treesitter/java/definitions.scm"],
     ["schemas/semantic-model-pack-v1.schema.json"],
     ["pyproject.toml"],
@@ -61,7 +62,30 @@ test("documentation mixed with component changes retains component validation", 
 test("RQL changes select runtime, host, policy-pack, and editor coverage", () => {
   const decision = classifyChangeSet({ eventName: "pull_request", changedPaths: fixture("rql") });
   assert.equal(decision.mode, "impact");
-  assert.deepEqual(selected(decision), ["lsp_contract", "mcp_contract", "policy_pack", "rql_runtime", "vscode"]);
+  assert.deepEqual(selected(decision), [
+    "lsp_contract",
+    "mcp_contract",
+    "policy_pack",
+    "rql_runtime",
+    "rust",
+    "vscode",
+  ]);
+});
+
+test("flow changes select query, host, policy, editor, and Rust coverage", () => {
+  const decision = classifyChangeSet({
+    eventName: "pull_request",
+    changedPaths: ["crates/bifrost-flow/src/value_flow/client.rs"],
+  });
+  assert.equal(decision.mode, "impact");
+  assert.deepEqual(selected(decision), [
+    "lsp_contract",
+    "mcp_contract",
+    "policy_pack",
+    "rql_runtime",
+    "rust",
+    "vscode",
+  ]);
 });
 
 test("runtime and individual host paths select their contracts", () => {
@@ -144,8 +168,8 @@ test("broad analyzer PRs avoid unrelated packaging and plugin lanes", () => {
     changedPaths: [
       ".agents/plans/issue-1364-standalone-taint-codequery.md",
       "bifrost_searchtools/client.py",
-      "crates/bifrost-analysis/src/analyzer/taint/client.rs",
-      "crates/bifrost-analysis/src/analyzer/policy/taint_policy.rs",
+      "crates/bifrost-flow/src/taint/client.rs",
+      "crates/bifrost-policy/src/taint_policy.rs",
       "crates/bifrost-mcp/src/mcp_extended.rs",
       "crates/bifrost-runtime/src/code_intelligence.rs",
       "docs/src/content/docs/code-querying.md",

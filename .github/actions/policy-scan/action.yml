@@ -19,7 +19,7 @@ inputs:
       install and uses a release or debug `bifrost` binary from the checkout,
       otherwise the `bifrost` already on PATH.
     required: false
-    default: v0.10.5
+    default: v0.10.6
   policy-packs:
     description: Space-separated built-in pack IDs to run.
     required: false
@@ -147,9 +147,9 @@ runs:
       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
       with:
         path: .bifrost/cache
-        key: bifrost-policy-cache-${{ runner.os }}-${{ github.run_id }}
+        key: bifrost-policy-cache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}-${{ github.run_id }}
         restore-keys: |
-          bifrost-policy-cache-${{ runner.os }}-
+          bifrost-policy-cache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}-
 
     - name: Run policies
       id: run
@@ -224,90 +224,124 @@ runs:
       env:
         CODE: ${{ steps.run.outputs.exit-code }}
         FAIL_ON: ${{ inputs.fail-on }}
+        DIFF_BASE: ${{ inputs.diff-base }}
         SARIF_PATH: ${{ steps.run.outputs.sarif-file }}
       run: |
+        set -euo pipefail
+        if [ ! -f "${SARIF_PATH}" ]; then
+          echo "::error::Bifrost policy scan did not emit a SARIF report at ${SARIF_PATH}."
+          exit 1
+        fi
+        if ! command -v jq >/dev/null 2>&1; then
+          echo "::error::jq is required to validate and gate the Bifrost SARIF report."
+          exit 1
+        fi
+        if ! jq -e '
+          .version == "2.1.0"
+          and (.runs | type == "array" and length > 0)
+          and all(.runs[];
+            type == "object"
+            and (.results | type == "array")
+            and all(.results[]; type == "object")
+            and (.invocations | type == "array" and length > 0)
+            and all(.invocations[]; type == "object" and (.executionSuccessful | type == "boolean"))
+            and (.properties | type == "object")
+          )
+        ' "${SARIF_PATH}" >/dev/null; then
+          echo "::error::invalid SARIF report at ${SARIF_PATH}; expected a SARIF 2.1.0 object with runs and result arrays."
+          exit 1
+        fi
         case "${CODE}" in
           0)
+            if ! jq -e '
+              all(.runs[]; all(.invocations[]; .executionSuccessful == true))
+            ' "${SARIF_PATH}" >/dev/null; then
+              echo "::error::Bifrost returned clean status 0 but the SARIF report contains an unsuccessful invocation."
+              exit 1
+            fi
             echo "Bifrost policy scan is clean."
             ;;
           1)
-            if [ -f "${SARIF_PATH}" ]; then
-              echo "::group::Bifrost policy findings at or above fail-on threshold"
-              if command -v jq >/dev/null 2>&1; then
-                if findings=$(jq -r --arg fail_on "${FAIL_ON}" '
-                  def severity:
-                    if . == "error" then 3
-                    elif . == "warning" then 2
-                    elif . == "note" then 1
-                    else 0
-                    end;
-                  def gates:
-                    if $fail_on == "never" then false
-                    elif $fail_on == "finding" then true
-                    elif $fail_on == "error" then (.level | severity) >= 3
-                    elif $fail_on == "warning" then (.level | severity) >= 2
-                    elif $fail_on == "note" then (.level | severity) >= 1
-                    else true
-                    end;
-                  .runs[]?.results[]?
-                  | select((.properties["bifrost.diffDisposition"] // "new") == "new")
-                  | select(((.suppressions // []) | map(select(.status != "accepted")) | length) > 0 or ((.suppressions // []) | length) == 0)
-                  | select(gates)
-                  | (.ruleId // .rule?.id // "unknown-rule") as $rule
-                  | (.locations[0].physicalLocation // {}) as $location
-                  | ($location.artifactLocation.uri // "<unknown-path>") as $path
-                  | ($location.region.startLine // "?") as $line
-                  | (.message.text // "<no-message>") as $message
-                  | (.properties["bifrost.findingId"] // .partialFingerprints["bifrostFinding/v1"] // "") as $finding_id
-                  | if $finding_id == ""
-                    then "\($rule) \($path):\($line) \($message)"
-                    else "\($rule) \($path):\($line) \($message) [finding: \($finding_id)]"
-                    end
-                ' "${SARIF_PATH}"); then
-                  if [ -n "${findings}" ]; then
-                    printf '%s\n' "${findings}"
-                  else
-                    echo "No new findings at or above fail-on '${FAIL_ON}' were emitted in ${SARIF_PATH}."
-                  fi
-                else
-                  echo "::warning::unable to extract gating findings from ${SARIF_PATH}"
-                fi
-              else
-                echo "::warning::jq is unavailable; gating findings are in ${SARIF_PATH}"
-              fi
+            echo "::group::Bifrost policy findings at or above fail-on threshold"
+            if ! findings=$(jq -r --arg fail_on "${FAIL_ON}" '
+              def severity:
+                if . == "error" then 3
+                elif . == "warning" then 2
+                elif . == "note" then 1
+                else 0
+                end;
+              def gates:
+                if $fail_on == "never" then false
+                elif $fail_on == "finding" then true
+                elif $fail_on == "error" then (.level | severity) >= 3
+                elif $fail_on == "warning" then (.level | severity) >= 2
+                elif $fail_on == "note" then (.level | severity) >= 1
+                else true
+                end;
+              .runs[].results[]
+              | select((.properties["bifrost.diffDisposition"] // .baselineState // "new") == "new")
+              | select(((.suppressions // []) | map(select(.status != "accepted")) | length) > 0 or ((.suppressions // []) | length) == 0)
+              | select(gates)
+              | (.ruleId // .rule?.id // "unknown-rule") as $rule
+              | (.locations[0].physicalLocation // {}) as $location
+              | ($location.artifactLocation.uri // "<unknown-path>") as $path
+              | ($location.region.startLine // "?") as $line
+              | (.message.text // "<no-message>") as $message
+              | (.properties["bifrost.findingId"] // .partialFingerprints["bifrostFinding/v1"] // "") as $finding_id
+              | if $finding_id == ""
+                then "\($rule) \($path):\($line) \($message)"
+                else "\($rule) \($path):\($line) \($message) [finding: \($finding_id)]"
+                end
+            ' "${SARIF_PATH}"); then
               echo "::endgroup::"
-            else
-              echo "::warning::no SARIF report was emitted; gating findings are unavailable"
+              echo "::error::unable to extract gating findings from ${SARIF_PATH}."
+              exit 1
             fi
-            echo "::error::Bifrost policy scan found findings at or above the fail-on threshold. See the code-scanning alerts or the SARIF report."
-            exit 1
+            if [ -n "${findings}" ]; then
+              printf '%s\n' "${findings}"
+              echo "::endgroup::"
+              echo "::error::Bifrost policy scan found findings at or above the fail-on threshold. See the code-scanning alerts or the SARIF report."
+              exit 1
+            fi
+            if [ -z "${DIFF_BASE}" ]; then
+              echo "::endgroup::"
+              echo "::error::Bifrost returned status 1 without a diff-base; findings cannot be overridden as baseline-only."
+              exit 1
+            fi
+            if ! jq -e '
+              all(.runs[];
+                (.properties["bifrost.diffBaseline"] | type == "object")
+                and (.properties["bifrost.diffBaseline"].degraded == false)
+                and all(.invocations[]; .executionSuccessful == true)
+              )
+            ' "${SARIF_PATH}" >/dev/null; then
+              echo "::endgroup::"
+              echo "::error::Bifrost returned status 1 but the SARIF report does not prove a reliable diff-aware run."
+              exit 1
+            fi
+            echo "No new findings at or above fail-on '${FAIL_ON}' were emitted in ${SARIF_PATH}."
+            echo "::endgroup::"
             ;;
           2)
-            if [ -f "${SARIF_PATH}" ]; then
-              echo "::group::Bifrost policy report diagnostics"
-              if command -v jq >/dev/null 2>&1; then
-                if diagnostics=$(jq -r '
-                  .runs[]?.invocations[]?.toolExecutionNotifications[]?
-                  | select(.descriptor.id == "BIFROST_REPORT_DIAGNOSTIC")
-                  | .properties["bifrost.reportDiagnostic"] as $diagnostic
-                  | "\($diagnostic.code // "unknown"): \(.message.text)"
-                ' "${SARIF_PATH}"); then
-                  if [ -n "${diagnostics}" ]; then
-                    printf '%s\n' "${diagnostics}"
-                  else
-                    echo "No report diagnostics were emitted in ${SARIF_PATH}."
-                  fi
-                else
-                  echo "::warning::unable to extract report diagnostics from ${SARIF_PATH}"
-                fi
+            echo "::group::Bifrost policy report diagnostics"
+            if diagnostics=$(jq -r '
+              .runs[].invocations[]?.toolExecutionNotifications[]?
+              | select(.descriptor.id == "BIFROST_REPORT_DIAGNOSTIC")
+              | .properties["bifrost.reportDiagnostic"] as $diagnostic
+              | "\($diagnostic.code // "unknown"): \(.message.text // "<no-message>")"
+            ' "${SARIF_PATH}"); then
+              if [ -n "${diagnostics}" ]; then
+                printf '%s\n' "${diagnostics}"
               else
-                echo "::warning::jq is unavailable; report diagnostics are in ${SARIF_PATH}"
+                echo "No report diagnostics were emitted in ${SARIF_PATH}."
               fi
-              echo "::endgroup::"
             else
-              echo "::warning::no SARIF report was emitted; Bifrost diagnostics are unavailable"
+              echo "::endgroup::"
+              echo "::error::unable to extract report diagnostics from ${SARIF_PATH}."
+              exit 1
             fi
             echo "::error::Bifrost policy scan is UNRELIABLE. The run could not prove its own completeness. Read the report diagnostics. Do not treat this result as clean."
+            echo "::endgroup::"
             exit 2
             ;;
           *)

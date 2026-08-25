@@ -77,6 +77,4 @@ pub use suppression::*;
 // The retained plan/report pair and its phase metrics are produced by the taint
 // engine, not by policy. They are re-exported here because they are part of this
 // crate's public authoring and reporting surface.
-pub use brokk_bifrost_analysis::analyzer::taint::{
-    ProductionTaintAnalysisResult, ProductionTaintPhaseMetrics,
-};
+pub use brokk_bifrost_flow::taint::{ProductionTaintAnalysisResult, ProductionTaintPhaseMetrics};

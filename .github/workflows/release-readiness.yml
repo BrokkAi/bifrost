@@ -86,9 +86,11 @@ jobs:
         run: node scripts/public/release-version.mjs check --tag "$RELEASE_TAG" --github-output "$GITHUB_OUTPUT"
 
       - name: Validate curated release notes
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
         run: >-
           node scripts/public/extract-changelog-entry.mjs
-          --version "${{ inputs.version }}"
+          --version "$RELEASE_VERSION"
           --require-date
 
       - name: Install uv
@@ -123,7 +125,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          toolchain: 1.96.0
+          toolchain: 1.97.1
 
       # The key is bound to the exact public commit. Readiness never restores
       # a cache produced by a different candidate or private source tree.
@@ -169,7 +171,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          toolchain: 1.96.0
+          toolchain: 1.97.1
 
       # Keep package preparation isolated to this exact public commit.
       - name: Cache Cargo dependencies for crate packages
@@ -209,7 +211,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          toolchain: 1.96.0
+          toolchain: 1.97.1
 
       # Keep semantic-pack build inputs isolated to this exact public commit;
       # no private projection or NLP model cache is involved.
@@ -295,7 +297,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          toolchain: 1.96.0
+          toolchain: 1.97.1
       # The exact public commit is part of the cache namespace. This avoids
       # restoring build state across candidate refs or private/public edges.
       - name: Cache Cargo dependencies for binary build
@@ -420,7 +422,7 @@ jobs:
       - name: Install Rust toolchain for wheel cache
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          toolchain: 1.96.0
+          toolchain: 1.97.1
           targets: ${{ matrix.target }}
       - name: Cache Cargo dependencies for Python wheel
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -434,7 +436,7 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.kind == 'linux' && '2014' || 'auto' }}
           args: --release --locked --out dist
-          rust-toolchain: '1.96.0'
+          rust-toolchain: '1.97.1'
       - name: Upload exact Python wheel
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
@@ -482,7 +484,7 @@ jobs:
       - name: Install Rust toolchain for wheel cache
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          toolchain: 1.96.0
+          toolchain: 1.97.1
           targets: ${{ matrix.target }}
       - name: Cache Cargo dependencies for uv wheel
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -498,7 +500,7 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.kind == 'linux' && '2014' || 'auto' }}
           args: --release --locked --out dist
-          rust-toolchain: '1.96.0'
+          rust-toolchain: '1.97.1'
           working-directory: packaging/bifrost-cli
       - name: Upload exact uv CLI wheel
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
@@ -936,6 +938,20 @@ jobs:
       - name: Verify expected release inventory is present
         shell: bash
         run: bash scripts/public/check-qualification-inventory.sh qualification-bundle
+
+      - name: Verify source qualification bundle before relabeling
+        env:
+          BUNDLE_DIR: qualification-bundle
+          MANIFEST_FILE: qualification-bundle/release-qualification.json
+          SOURCE_COMMIT: ${{ steps.source.outputs.source_commit }}
+        run: >-
+          node scripts/public/release-qualification.mjs verify
+          --bundle "$BUNDLE_DIR"
+          --manifest "$MANIFEST_FILE"
+          --repository "$PUBLIC_REPOSITORY"
+          --commit "$SOURCE_COMMIT"
+          --version "$RELEASE_VERSION"
+          --run-id "$SOURCE_RUN_ID"
 
       - name: Write qualification identity for the corrected commit
         env:

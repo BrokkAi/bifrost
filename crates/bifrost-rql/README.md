@@ -1,10 +1,10 @@
 # brokk-bifrost-rql
 
-Analyzer-independent RQL syntax, schema, typed IR, and validation for
+RQL syntax, schema, typed IR, planning, execution, and result projection for
 brokk-bifrost.
 
-This crate exists for build-graph relief and abstraction hygiene. It keeps the
-RQL parse, validate, and IR boundary independent from analyzer execution.
+This crate owns the query layer above `brokk-bifrost-analysis` and
+`brokk-bifrost-flow`. Workspace execution receives caller-owned analyzer and
+flow state explicitly.
 
-The release owner must bootstrap this crate on crates.io and configure its
-trusted publisher before the next version release.
+Most consumers should depend on the `brokk-bifrost` facade instead.

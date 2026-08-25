@@ -6,6 +6,7 @@ use brokk_bifrost_core::analyzer::model::{
     StructuredTypeIdentity, StructuredTypeName,
 };
 use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
+use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 use brokk_bifrost_core::analyzer::usages::model::{ImportBinder, ImportBinding, ImportKind};
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile, Range};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
@@ -2099,12 +2100,19 @@ fn enclosing_rust_impl_item(node: Node<'_>) -> Option<Node<'_>> {
 
 fn rust_signature_metadata(signature: String, node: Node<'_>, source: &str) -> SignatureMetadata {
     let dispatch = rust_callable_dispatch_extensibility(node);
-    let Some(parameters_node) = node.child_by_field_name("parameters") else {
-        return SignatureMetadata::new(signature, Vec::new()).with_dispatch_extensibility(dispatch);
+    let parameters_node = node.child_by_field_name("parameters");
+    let callable_is_static = !parameters_node.is_some_and(rust_parameters_have_self);
+    let with_modifiers = |metadata: SignatureMetadata| {
+        metadata
+            .with_dispatch_extensibility(dispatch)
+            .with_callable_modifiers(callable_is_static, false, DeclaredVisibility::Unknown)
+    };
+    let Some(parameters_node) = parameters_node else {
+        return with_modifiers(SignatureMetadata::new(signature, Vec::new()));
     };
     let parameter_text = rust_node_text(parameters_node, source).trim();
     let Some(parameters_start) = signature.find(parameter_text) else {
-        return SignatureMetadata::new(signature, Vec::new()).with_dispatch_extensibility(dispatch);
+        return with_modifiers(SignatureMetadata::new(signature, Vec::new()));
     };
     let parameters_end = parameters_start + parameter_text.len();
     let mut search_start = parameters_start;
@@ -2123,12 +2131,18 @@ fn rust_signature_metadata(signature: String, node: Node<'_>, source: &str) -> S
             Some(ParameterMetadata::new(label, start_byte, end_byte))
         })
         .collect();
-    let metadata =
-        SignatureMetadata::new(signature, parameters).with_dispatch_extensibility(dispatch);
+    let metadata = with_modifiers(SignatureMetadata::new(signature, parameters));
     match rust_callable_parameter_type_spellings(parameters_node, source) {
         Some(parameter_types) => metadata.with_callable_parameter_types(parameter_types),
         None => metadata,
     }
+}
+
+fn rust_parameters_have_self(parameters: Node<'_>) -> bool {
+    let mut cursor = parameters.walk();
+    parameters
+        .named_children(&mut cursor)
+        .any(|parameter| parameter.kind() == "self_parameter")
 }
 
 fn rust_callable_parameter_type_spellings(
@@ -2205,6 +2219,43 @@ mod structured_package_tests {
                 ("Type", "Pattern".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn callable_metadata_records_rust_self_parameter_structurally() {
+        let source = "pub fn free(value: i32) {}\n\nstruct Thing;\nimpl Thing {\n    fn method(&self, value: i32) {}\n    fn associated(value: i32) {}\n}\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("Rust parser language");
+        let tree = parser.parse(source, None).expect("parse Rust fixture");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = ProjectFile::new(
+            temp.path().canonicalize().expect("canonical root"),
+            "lib.rs",
+        );
+        let parsed = parse_rust_file(&file, source, &tree);
+
+        let metadata_for = |name: &str| {
+            parsed
+                .signature_metadata
+                .iter()
+                .find(|(unit, _)| unit.identifier() == name)
+                .and_then(|(_, metadata)| metadata.first())
+                .unwrap_or_else(|| panic!("missing Rust callable {name}"))
+        };
+        let free = metadata_for("free");
+        assert!(free.callable_modifiers_recorded());
+        assert!(free.callable_is_static());
+        assert!(!free.callable_is_constructor());
+
+        let method = metadata_for("method");
+        assert!(method.callable_modifiers_recorded());
+        assert!(!method.callable_is_static());
+
+        let associated = metadata_for("associated");
+        assert!(associated.callable_modifiers_recorded());
+        assert!(associated.callable_is_static());
     }
 }
 

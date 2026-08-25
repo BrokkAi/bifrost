@@ -14,7 +14,7 @@
 //!   is present only because nothing was found to remove it, so it is not
 //!   witness-sound and can never support a finding.
 
-use brokk_bifrost_analysis::analyzer::structural::search::CodeQueryResultItem;
+use brokk_bifrost_rql::structural::search::CodeQueryResultItem;
 
 use crate::definition::{PolicyAssertId, RowBindingName, RowGroupName};
 use crate::finding::{PolicyCapability, PolicyIncompleteReason};

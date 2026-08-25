@@ -15,8 +15,9 @@ const names = [
   "brokk-bifrost-python",
   "brokk-bifrost-ruby",
   "brokk-bifrost-rust",
-  "brokk-bifrost-rql",
   "brokk-bifrost-analysis",
+  "brokk-bifrost-flow",
+  "brokk-bifrost-rql",
   "brokk-bifrost-nlp",
   "brokk-bifrost-policy",
   "brokk-bifrost-runtime",
@@ -42,7 +43,6 @@ function metadata(overrides = {}) {
     "brokk-bifrost-python": [dependency("brokk-bifrost-core")],
     "brokk-bifrost-ruby": [dependency("brokk-bifrost-core")],
     "brokk-bifrost-rust": [dependency("brokk-bifrost-core")],
-    "brokk-bifrost-rql": [dependency("brokk-bifrost-core")],
     "brokk-bifrost-analysis": [
       dependency("brokk-bifrost-core"),
       dependency("brokk-bifrost-cpp"),
@@ -54,30 +54,46 @@ function metadata(overrides = {}) {
       dependency("brokk-bifrost-python"),
       dependency("brokk-bifrost-ruby"),
       dependency("brokk-bifrost-rust"),
-      dependency("brokk-bifrost-rql"),
+    ],
+    "brokk-bifrost-flow": [
+      dependency("brokk-bifrost-core"),
+      dependency("brokk-bifrost-analysis"),
+    ],
+    "brokk-bifrost-rql": [
+      dependency("brokk-bifrost-core"),
+      dependency("brokk-bifrost-analysis"),
+      dependency("brokk-bifrost-flow"),
     ],
     "brokk-bifrost-nlp": [dependency("brokk-bifrost-analysis")],
     "brokk-bifrost-policy": [
       dependency("brokk-bifrost-analysis"),
+      dependency("brokk-bifrost-flow"),
       dependency("brokk-bifrost-rql"),
     ],
     "brokk-bifrost-runtime": [
       dependency("brokk-bifrost-analysis"),
+      dependency("brokk-bifrost-flow"),
       dependency("brokk-bifrost-policy"),
+      dependency("brokk-bifrost-rql"),
     ],
     "brokk-bifrost-mcp": [
       dependency("brokk-bifrost-analysis"),
+      dependency("brokk-bifrost-flow"),
       dependency("brokk-bifrost-policy"),
       dependency("brokk-bifrost-runtime"),
       dependency("brokk-bifrost-rql"),
     ],
     "brokk-bifrost-lsp": [
       dependency("brokk-bifrost-analysis"),
+      dependency("brokk-bifrost-flow"),
       dependency("brokk-bifrost-policy"),
       dependency("brokk-bifrost-runtime"),
       dependency("brokk-bifrost-rql"),
     ],
-    "brokk-bifrost-semantic-packs": [dependency("brokk-bifrost-analysis")],
+    "brokk-bifrost-semantic-packs": [
+      dependency("brokk-bifrost-analysis"),
+      dependency("brokk-bifrost-flow"),
+    ],
     ...overrides.dependencies,
   };
   const versions = { ...Object.fromEntries(names.map((name) => [name, "0.8.12"])), ...overrides.versions };
@@ -104,7 +120,9 @@ test("rejects a runtime dependency on a protocol host", () => {
       dependencies: {
         "brokk-bifrost-runtime": [
           dependency("brokk-bifrost-analysis"),
+          dependency("brokk-bifrost-flow"),
           dependency("brokk-bifrost-policy"),
+          dependency("brokk-bifrost-rql"),
           dependency("brokk-bifrost-lsp"),
         ],
       },
@@ -126,12 +144,11 @@ test("rejects an analysis dependency on prebuilt semantic packs", () => {
             dependency("brokk-bifrost-csharp"),
             dependency("brokk-bifrost-go"),
             dependency("brokk-bifrost-js-ts"),
-      dependency("brokk-bifrost-jvm"),
+            dependency("brokk-bifrost-jvm"),
             dependency("brokk-bifrost-php"),
             dependency("brokk-bifrost-python"),
             dependency("brokk-bifrost-ruby"),
             dependency("brokk-bifrost-rust"),
-            dependency("brokk-bifrost-rql"),
             dependency("brokk-bifrost-semantic-packs"),
           ],
         },
@@ -139,6 +156,50 @@ test("rejects an analysis dependency on prebuilt semantic packs", () => {
     ),
     [
       "brokk-bifrost-analysis must not depend on workspace package brokk-bifrost-semantic-packs",
+    ],
+  );
+});
+
+test("rejects analysis dependencies on flow, RQL, and policy", () => {
+  const analysis = metadata().packages.find(
+    (pkg) => pkg.name === "brokk-bifrost-analysis",
+  ).dependencies;
+  const errors = validateWorkspaceGraph(
+    metadata({
+      dependencies: {
+        "brokk-bifrost-analysis": [
+          ...analysis,
+          dependency("brokk-bifrost-flow"),
+          dependency("brokk-bifrost-rql"),
+          dependency("brokk-bifrost-policy"),
+        ],
+      },
+    }),
+  );
+  assert.deepEqual(errors, [
+    "brokk-bifrost-analysis must not depend on workspace package brokk-bifrost-flow",
+    "brokk-bifrost-analysis must not depend on workspace package brokk-bifrost-rql",
+    "brokk-bifrost-analysis must not depend on workspace package brokk-bifrost-policy",
+  ]);
+});
+
+test("rejects flow dependencies on RQL and policy", () => {
+  assert.deepEqual(
+    validateWorkspaceGraph(
+      metadata({
+        dependencies: {
+          "brokk-bifrost-flow": [
+            dependency("brokk-bifrost-core"),
+            dependency("brokk-bifrost-analysis"),
+            dependency("brokk-bifrost-rql"),
+            dependency("brokk-bifrost-policy"),
+          ],
+        },
+      }),
+    ),
+    [
+      "brokk-bifrost-flow must not depend on workspace package brokk-bifrost-rql",
+      "brokk-bifrost-flow must not depend on workspace package brokk-bifrost-policy",
     ],
   );
 });
@@ -156,12 +217,16 @@ test("rejects a core dependency back on analysis", () => {
   );
 });
 
-test("accepts an RQL dependency on core but rejects analysis", () => {
+test("accepts RQL above analysis and flow but rejects policy", () => {
   assert.deepEqual(
     validateWorkspaceGraph(
       metadata({
         dependencies: {
-          "brokk-bifrost-rql": [dependency("brokk-bifrost-core")],
+          "brokk-bifrost-rql": [
+            dependency("brokk-bifrost-core"),
+            dependency("brokk-bifrost-analysis"),
+            dependency("brokk-bifrost-flow"),
+          ],
         },
       }),
     ),
@@ -174,11 +239,13 @@ test("accepts an RQL dependency on core but rejects analysis", () => {
           "brokk-bifrost-rql": [
             dependency("brokk-bifrost-core"),
             dependency("brokk-bifrost-analysis"),
+            dependency("brokk-bifrost-flow"),
+            dependency("brokk-bifrost-policy"),
           ],
         },
       }),
     ),
-    ["brokk-bifrost-rql must not depend on workspace package brokk-bifrost-analysis"],
+    ["brokk-bifrost-rql must not depend on workspace package brokk-bifrost-policy"],
   );
 });
 
@@ -189,7 +256,9 @@ test("rejects a missing required runtime dependency", () => {
     ),
     [
       "brokk-bifrost-runtime must depend on workspace package brokk-bifrost-analysis",
+      "brokk-bifrost-runtime must depend on workspace package brokk-bifrost-flow",
       "brokk-bifrost-runtime must depend on workspace package brokk-bifrost-policy",
+      "brokk-bifrost-runtime must depend on workspace package brokk-bifrost-rql",
     ],
   );
 });
@@ -200,8 +269,10 @@ test("rejects MCP dependencies on LSP transport packages", () => {
       dependencies: {
         "brokk-bifrost-mcp": [
           dependency("brokk-bifrost-analysis"),
+          dependency("brokk-bifrost-flow"),
           dependency("brokk-bifrost-policy"),
           dependency("brokk-bifrost-runtime"),
+          dependency("brokk-bifrost-rql"),
           dependency("lsp-types"),
         ],
       },
@@ -228,7 +299,9 @@ test("rejects a non-exact implementation dependency version", () => {
         dependencies: {
           "brokk-bifrost-runtime": [
             { name: "brokk-bifrost-analysis", req: "^0.8.12" },
+            dependency("brokk-bifrost-flow"),
             dependency("brokk-bifrost-policy"),
+            dependency("brokk-bifrost-rql"),
           ],
         },
       }),

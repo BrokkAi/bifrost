@@ -30,16 +30,13 @@ pub struct PhpGraphSource<'a> {
     pub facts: &'a dyn PhpCallableFacts,
 }
 
-/// The two declared-return-type answers PHP reads out of the analyzer's
-/// usage-facts index.
-///
-/// `UsageFactsIndex` is analysis-owned and its entries are `pub(crate)` there, so
-/// the crate line is drawn at the answers rather than the index: a scan asks for
-/// a declaration's or an fqn's return type and never sees the facts themselves.
+/// The two declared-return-type answers PHP reads from request-local callable
+/// facts. The crate line is drawn at the answers: a scan asks about one reached
+/// declaration or callable name and never owns analyzer storage.
 pub trait PhpCallableFacts: Send + Sync {
-    /// `usage_facts_index().fact_for_declaration(unit)`'s `return_type_fqn`.
+    /// Resolve one declaration's return type.
     fn declaration_return_type_fqn(&self, unit: &CodeUnit) -> Option<String>;
 
-    /// `usage_facts_index().callable_return_type(callable_fqn)`.
+    /// Resolve one callable name's unambiguous return type.
     fn callable_return_type_fqn(&self, callable_fqn: &str) -> Option<String>;
 }

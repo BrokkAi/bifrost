@@ -17,6 +17,7 @@ use crate::analyzer::semantic_model::{
 };
 use crate::analyzer::semantic_model::{SemanticModelCompleteness, SemanticModelOverlay};
 use crate::analyzer::structural::BoundaryStatus;
+use crate::analyzer::topology::DependencyScope;
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::analyzer::{Language, Project};
 use crate::hash::HashMap;
@@ -672,6 +673,8 @@ pub fn resolve_cpp_semantic_pack_dependencies(
                 root,
                 paths,
             )],
+            scope: DependencyScope::Unknown,
+            declared_by: None,
         });
     }
     if dependency_limit_hit {

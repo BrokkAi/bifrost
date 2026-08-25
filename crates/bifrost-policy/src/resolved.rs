@@ -10,8 +10,8 @@ use std::fmt;
 use std::str::FromStr;
 
 use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
-use brokk_bifrost_analysis::analyzer::structural::CodeQuery;
 use brokk_bifrost_analysis::schema_version::SchemaVersionResolution;
+use brokk_bifrost_rql::structural::CodeQuery;
 
 use super::canonical_loaded;
 use super::definition::*;

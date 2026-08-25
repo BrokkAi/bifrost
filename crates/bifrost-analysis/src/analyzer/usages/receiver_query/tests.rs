@@ -44,7 +44,7 @@ fn range_at(source: &str, marker: &str, start_byte: usize) -> Range {
 fn csharp_structural_facts(workspace: &WorkspaceAnalyzer, file: &ProjectFile) -> Arc<FileFacts> {
     workspace
         .analyzer()
-        .structural_search_providers()
+        .structural_fact_providers()
         .into_iter()
         .find(|provider| provider.structural_language() == Language::CSharp)
         .and_then(|provider| provider.structural_facts(file))

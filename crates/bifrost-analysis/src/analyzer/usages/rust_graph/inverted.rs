@@ -6,19 +6,18 @@
 //! sources, and the request-scoped bounded definition lookup.
 
 use crate::analyzer::usages::inverted_edges::{
-    UsageEdgeBuildOutput, build_edge_output, parse_and_collect,
+    EdgeNodeDomain, UsageEdgeBuildOutput, build_edge_output, parse_and_collect_with_domain,
 };
 use crate::analyzer::usages::parsed_tree::ParseSpec;
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::analyzer::{CodeUnitIndex, IAnalyzer, ProjectFile, RustAnalyzer};
-use crate::hash::HashSet;
 use brokk_bifrost_rust::graph::inverted::{RustSeedsCache, scan_file};
 
 /// Build the whole Rust `caller -> callee` edge set in a single inverted pass.
 pub(super) fn build_rust_edges<Output, F>(
     analyzer: &dyn IAnalyzer,
     rust: &RustAnalyzer,
-    nodes: &HashSet<String>,
+    domain: EdgeNodeDomain<'_>,
     keep_file: F,
 ) -> Output
 where
@@ -39,10 +38,10 @@ where
     build_edge_output(&files, keep_file, |file| {
         keep_file(file).then_some(())?;
         let refs = rust.reference_context_of_while(token, file, || keep_file(file));
-        parse_and_collect(
+        parse_and_collect_with_domain(
             analyzer,
             file,
-            nodes,
+            domain,
             ParseSpec::whole(&language),
             |input| {
                 scan_file(rust, &support, seeds_cache, file, refs, input, &|| {

@@ -12,6 +12,7 @@ use crate::analyzer::semantic_model::{
     ResolvedDependency, ResolvedDependencyArtifact, SemanticModelActivationEvidence,
     read_exact_artifact_while,
 };
+use crate::analyzer::topology::DependencyScope;
 use crate::analyzer::{Project, RustAnalyzerConfig, RustDependencyApiEvidence};
 use crate::hash::{HashMap, HashSet};
 
@@ -401,6 +402,8 @@ fn resolve_rust_dependency_evidence(
                 ExternalArtifactKind::RustdocJson,
                 artifact.path,
             )],
+            scope: DependencyScope::Unknown,
+            declared_by: None,
         });
     }
     Ok(resolved)

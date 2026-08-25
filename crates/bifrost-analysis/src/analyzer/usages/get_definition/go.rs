@@ -1,9 +1,6 @@
 use super::*;
 use crate::analyzer::CodeUnitIndex;
-use crate::analyzer::{
-    GlobalUsageDefinitionIndex, SignatureMetadata, StructuredTypeIdentity,
-    go_internal_import_allowed,
-};
+use crate::analyzer::{SignatureMetadata, StructuredTypeIdentity, go_internal_import_allowed};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use tree_sitter::Tree;
 
@@ -50,16 +47,6 @@ pub(crate) trait GoDefinitionProvider {
 
     fn fqn_exists(&self, fqn: &str) -> bool {
         !self.fqn(fqn).is_empty()
-    }
-}
-
-impl GoDefinitionProvider for GlobalUsageDefinitionIndex {
-    fn fqn(&self, fqn: &str) -> Vec<CodeUnit> {
-        GlobalUsageDefinitionIndex::fqn(self, fqn)
-    }
-
-    fn fqn_prefix_exists(&self, prefix: &str) -> bool {
-        GlobalUsageDefinitionIndex::fqn_prefix_exists(self, prefix)
     }
 }
 
@@ -1297,6 +1284,26 @@ fn go_package_member_candidates(
     candidates
 }
 
+fn go_unqualified_package_member_candidates(
+    support: &dyn GoDefinitionProvider,
+    token: QueryToken<'_>,
+    go: &GoAnalyzer,
+    file: &ProjectFile,
+    package: &str,
+    name: &str,
+) -> Vec<CodeUnit> {
+    let mut candidates = go_package_member_candidates(support, package, name);
+    for import_path in go_dot_import_paths(go, support, token, file) {
+        if !support.scope_step() {
+            break;
+        }
+        candidates.extend(go_package_member_candidates(support, &import_path, name));
+    }
+    sort_units(&mut candidates);
+    candidates.dedup();
+    candidates
+}
+
 fn go_package_selector_chain_outcome(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
@@ -2132,7 +2139,9 @@ fn go_expression_inferred_type(
                                     values.push(go_callable_return_inferred_type(
                                         analyzer,
                                         support,
-                                        go_package_member_candidates(support, &package, name),
+                                        go_unqualified_package_member_candidates(
+                                            support, token, go, file, &package, name,
+                                        ),
                                     )?);
                                 }
                             }
@@ -3324,7 +3333,26 @@ fn go_resolve_structured_type_fqn(
 ) -> Option<String> {
     let name = identity.nominal_name_with(|| support.scope_step())?;
     match name.path() {
-        [name] => go_resolve_exact_type_name_in_package(support, default_package, name),
+        [name] => {
+            let mut candidates = Vec::new();
+            if let Some(fqn) = go_resolve_exact_type_name_in_package(support, default_package, name)
+            {
+                candidates.push(fqn);
+            }
+            for import_path in go_dot_import_paths(go, support, token, file) {
+                if !support.scope_step() {
+                    return None;
+                }
+                if let Some(fqn) =
+                    go_resolve_exact_type_name_in_package(support, &import_path, name)
+                {
+                    candidates.push(fqn);
+                }
+            }
+            candidates.sort();
+            candidates.dedup();
+            (candidates.len() == 1).then(|| candidates.pop()).flatten()
+        }
         [qualifier, name] => {
             let import_path = go_import_paths(support, token, go, file).remove(qualifier)?;
             let fqn = format!("{import_path}.{name}");
@@ -3575,6 +3603,74 @@ import (
                     .iter()
                     .any(|definition| definition.fq_name() == "example.com/app/service.Service"),
                 "{value:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_go_dot_import_types_local_receivers_from_calls_and_annotations() {
+        let source = r#"package main
+
+import . "example.com/app/worker"
+
+func use() {
+    worker := NewWorker()
+    worker.Record()
+    _, paired := 0, NewWorker()
+    paired.Record()
+    var recorder Recorder = worker
+    recorder.Record()
+}
+"#;
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Go,
+            &[
+                ("go.mod", "module example.com/app\n"),
+                (
+                    "worker/worker.go",
+                    r#"package worker
+
+type Worker struct{}
+func (Worker) Record() {}
+
+type Recorder interface {
+    Record()
+}
+
+func NewWorker() Worker { return Worker{} }
+"#,
+                ),
+                ("main.go", source),
+            ],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "main.go");
+        let tree = parse_go_tree(source).expect("Go tree");
+
+        for (expression, target) in [
+            ("worker.Record()", "example.com/app/worker.Worker.Record"),
+            ("paired.Record()", "example.com/app/worker.Worker.Record"),
+            (
+                "recorder.Record()",
+                "example.com/app/worker.Recorder.Record",
+            ),
+        ] {
+            let site = site_for(&file, source, expression, "Record");
+            let outcome = resolve_go_bounded(
+                fixture.analyzer.analyzer(),
+                &file,
+                source,
+                Some(&tree),
+                &site,
+                ReceiverAnalysisBudget::default(),
+                None,
+            );
+            let BoundedResolution::Complete { value, .. } = outcome else {
+                panic!("{expression} should complete: {outcome:#?}");
+            };
+            assert_eq!(value.status, DefinitionLookupStatus::Resolved, "{value:#?}");
+            assert!(
+                matches!(value.definitions.as_slice(), [definition] if definition.fq_name() == target),
+                "{expression}: {value:#?}"
             );
         }
     }

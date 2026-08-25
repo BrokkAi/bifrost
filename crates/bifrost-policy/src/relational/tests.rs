@@ -9,16 +9,16 @@
 
 use std::str::FromStr;
 
-use brokk_bifrost_analysis::analyzer::structural::search::{
+use brokk_bifrost_rql::structural::search::{
     CodeQueryCallShapeArgument, CodeQueryResultItem, DetailedCodeQueryDomain,
 };
-use brokk_bifrost_analysis::analyzer::structural::{CodeQueryRange, CodeQueryResultValue};
+use brokk_bifrost_rql::structural::{CodeQueryRange, CodeQueryResultValue};
 
 use crate::definition::{AssertCardinality, PolicyAssertId, RowBindingName, RowLiteral};
 use crate::finding::PolicyIncompleteReason;
 
 use super::coverage::{RelationCoverage, RelationalInput, RelationalObligationKind};
-use super::eval::{RelationalAssertionEvaluation, evaluate_plan_ir};
+use super::eval::{RelationalAssertionEvaluation, RelationalViolationRow, evaluate_plan_ir};
 use super::ir::{
     IrAggregate, IrAggregateOp, IrAssertion, IrColumn, IrCompareOp, IrEquiKey, IrJoinKind,
     IrLimits, IrOperand, IrPredicate, IrRelation, IrRelationId, IrRelationOp, RelationalPlanIr,
@@ -365,18 +365,24 @@ fn an_unsupported_relation_blocks_the_clean_verdict_with_a_capability_reason() {
 // ---------------------------------------------------------------------------
 
 fn join_plan(kind: IrJoinKind, cardinality: AssertCardinality) -> RelationalPlanIr {
-    let left = source(0, "arg");
-    let right = source(1, "other");
-    let joined = join(
-        2,
-        &left,
-        &right,
+    join_plan_with_keys(
         kind,
+        cardinality,
         vec![IrEquiKey {
             left: column("arg", "site_id"),
             right: column("other", "site_id"),
         }],
-    );
+    )
+}
+
+fn join_plan_with_keys(
+    kind: IrJoinKind,
+    cardinality: AssertCardinality,
+    on: Vec<IrEquiKey>,
+) -> RelationalPlanIr {
+    let left = source(0, "arg");
+    let right = source(1, "other");
+    let joined = join(2, &left, &right, kind, on);
     let grouped = group(
         3,
         "by-site",
@@ -414,6 +420,130 @@ fn a_semi_join_keeps_each_left_row_once() {
         ],
     );
     assert_eq!(verdicts(&inner), vec![("site".to_string(), 2)]);
+}
+
+/// Every right-side duplicate is retained in source order, and each pair is
+/// emitted left-major before the next left tuple is probed.
+#[test]
+fn an_inner_join_preserves_duplicate_order_and_contributors() {
+    let left = vec![
+        argument("site", "arg-0", 0, None, false),
+        argument("site", "arg-1", 0, None, false),
+    ];
+    let right = vec![
+        argument("site", "other-0", 0, None, false),
+        argument("site", "other-1", 0, None, false),
+    ];
+    let evaluation = evaluate(
+        &join_plan(IrJoinKind::Inner, AssertCardinality::AtMost(0)),
+        &[
+            ("arg", &left, RelationCoverage::Exhaustive),
+            ("other", &right, RelationCoverage::Exhaustive),
+        ],
+    );
+    assert_eq!(verdicts(&evaluation), vec![("site".to_string(), 4)]);
+    assert_eq!(
+        evaluation.violations[0].representatives,
+        vec![
+            vec![
+                RelationalViolationRow {
+                    binding: binding("arg"),
+                    row: 0,
+                },
+                RelationalViolationRow {
+                    binding: binding("other"),
+                    row: 0,
+                },
+            ],
+            vec![
+                RelationalViolationRow {
+                    binding: binding("arg"),
+                    row: 0,
+                },
+                RelationalViolationRow {
+                    binding: binding("other"),
+                    row: 1,
+                },
+            ],
+            vec![
+                RelationalViolationRow {
+                    binding: binding("arg"),
+                    row: 1,
+                },
+                RelationalViolationRow {
+                    binding: binding("other"),
+                    row: 0,
+                },
+            ],
+            vec![
+                RelationalViolationRow {
+                    binding: binding("arg"),
+                    row: 1,
+                },
+                RelationalViolationRow {
+                    binding: binding("other"),
+                    row: 1,
+                },
+            ],
+        ]
+    );
+}
+
+/// A composite key only joins when every equality component matches; matching
+/// the site while differing in argument position is a near miss.
+#[test]
+fn a_composite_key_rejects_a_partial_match() {
+    let left = vec![
+        argument("site", "arg-0", 0, None, false),
+        argument("site", "arg-1", 1, None, false),
+    ];
+    let right = vec![
+        argument("site", "other-0", 0, None, false),
+        argument("site", "other-1", 2, None, false),
+    ];
+    let evaluation = evaluate(
+        &join_plan_with_keys(
+            IrJoinKind::Inner,
+            AssertCardinality::AtMost(0),
+            vec![
+                IrEquiKey {
+                    left: column("arg", "site_id"),
+                    right: column("other", "site_id"),
+                },
+                IrEquiKey {
+                    left: column("arg", "argument_index"),
+                    right: column("other", "argument_index"),
+                },
+            ],
+        ),
+        &[
+            ("arg", &left, RelationCoverage::Exhaustive),
+            ("other", &right, RelationCoverage::Exhaustive),
+        ],
+    );
+    assert_eq!(verdicts(&evaluation), vec![("site".to_string(), 1)]);
+}
+
+/// `None` is a real equality-key value, just as it was in the nested loop.
+#[test]
+fn nullable_join_keys_use_option_equality() {
+    let left = vec![argument("site", "arg-0", 0, None, false)];
+    let right = vec![argument("site", "other-0", 0, None, false)];
+    let evaluation = evaluate(
+        &join_plan_with_keys(
+            IrJoinKind::Inner,
+            AssertCardinality::AtMost(0),
+            vec![IrEquiKey {
+                left: column("arg", "name"),
+                right: column("other", "name"),
+            }],
+        ),
+        &[
+            ("arg", &left, RelationCoverage::Exhaustive),
+            ("other", &right, RelationCoverage::Exhaustive),
+        ],
+    );
+    assert_eq!(verdicts(&evaluation), vec![("site".to_string(), 1)]);
 }
 
 /// A left row with no partner is dropped by a semi join and kept by an anti
@@ -598,6 +728,55 @@ fn the_comparison_and_joined_row_bounds_truncate() {
         assert!(evaluation.limit_exceeded);
         assert!(!evaluation.exhaustive);
     }
+}
+
+/// Duplicate matches can produce a Cartesian number of output rows without
+/// consuming one comparison budget unit per pair.
+#[test]
+fn the_probe_budget_allows_a_large_duplicate_cartesian_output() {
+    let left = vec![
+        argument("site", "arg-0", 0, None, false),
+        argument("site", "arg-1", 0, None, false),
+    ];
+    let right = vec![
+        argument("site", "other-0", 0, None, false),
+        argument("site", "other-1", 0, None, false),
+    ];
+    let mut plan = join_plan(IrJoinKind::Inner, AssertCardinality::AtMost(0));
+    plan.limits.max_join_comparisons = 2;
+    let evaluation = evaluate(
+        &plan,
+        &[
+            ("arg", &left, RelationCoverage::Exhaustive),
+            ("other", &right, RelationCoverage::Exhaustive),
+        ],
+    );
+    assert_eq!(verdicts(&evaluation), vec![("site".to_string(), 4)]);
+    assert!(!evaluation.limit_exceeded);
+    assert!(evaluation.exhaustive);
+}
+
+/// Even an empty right relation consumes one probe per left tuple, so a plan
+/// with more left keys than its budget remains incomplete.
+#[test]
+fn too_many_left_probes_still_truncate_the_join() {
+    let left = vec![
+        argument("site-a", "arg-0", 0, None, false),
+        argument("site-b", "arg-1", 0, None, false),
+        argument("site-c", "arg-2", 0, None, false),
+    ];
+    let right = Vec::new();
+    let mut plan = join_plan(IrJoinKind::Semi, AssertCardinality::AtMost(0));
+    plan.limits.max_join_comparisons = 2;
+    let evaluation = evaluate(
+        &plan,
+        &[
+            ("arg", &left, RelationCoverage::Exhaustive),
+            ("other", &right, RelationCoverage::Exhaustive),
+        ],
+    );
+    assert!(evaluation.limit_exceeded);
+    assert!(!evaluation.exhaustive);
 }
 
 #[test]

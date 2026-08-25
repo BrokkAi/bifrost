@@ -15,7 +15,8 @@ use crate::analyzer::usages::common::{
     analyzed_files_for_language, classify_recursive_hits, language_for_target,
 };
 use crate::analyzer::usages::inverted_edges::{
-    UsageEdgeBuildOutput, UsageEdgeWeights, UsageEdges, build_edge_output, parse_and_collect,
+    EdgeNodeDomain, UsageEdgeBuildOutput, UsageEdgeWeights, UsageEdges, build_edge_output,
+    parse_and_collect_with_domain,
 };
 use crate::analyzer::usages::model::{FuzzyResult, UsageAnalysisDiagnostic};
 use crate::analyzer::usages::outcome::{
@@ -63,7 +64,7 @@ pub(crate) use brokk_bifrost_go::graph::resolver::{go_simple_type_name, go_type_
 fn build_go_edges<Output, F>(
     analyzer: &dyn IAnalyzer,
     index: &GoEdgeIndex,
-    nodes: &HashSet<String>,
+    domain: EdgeNodeDomain<'_>,
     keep_file: F,
 ) -> Output
 where
@@ -74,10 +75,10 @@ where
     let language = tree_sitter_go::LANGUAGE.into();
     build_edge_output(&files, keep_file, |file| {
         let file_pkg = index.package_name_of(file)?;
-        parse_and_collect(
+        parse_and_collect_with_domain(
             analyzer,
             file,
-            nodes,
+            domain,
             ParseSpec::whole(&language),
             |input| {
                 let (alias_packages, dot_packages) = index.namespace_packages(file);
@@ -111,6 +112,19 @@ where
 {
     let resolver = GoEdgeResolver::try_new(analyzer, token)?;
     Some(resolver.build_edges(analyzer, nodes, keep_file))
+}
+
+pub(crate) fn build_rooted_go_usage_edges<F>(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    callers: &HashSet<String>,
+    keep_file: F,
+) -> Option<UsageEdges>
+where
+    F: Fn(&ProjectFile) -> bool + Sync,
+{
+    let resolver = GoEdgeResolver::try_new(analyzer, token)?;
+    Some(resolver.build_rooted_edges(analyzer, callers, keep_file))
 }
 
 pub(crate) fn build_go_usage_edge_weights<F>(
@@ -225,7 +239,29 @@ impl GoEdgeResolver {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        build_go_edges(analyzer, &self.index, nodes, keep_file)
+        build_go_edges(
+            analyzer,
+            &self.index,
+            EdgeNodeDomain::Closed(nodes),
+            keep_file,
+        )
+    }
+
+    pub(crate) fn build_rooted_edges<F>(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        callers: &HashSet<String>,
+        keep_file: F,
+    ) -> UsageEdges
+    where
+        F: Fn(&ProjectFile) -> bool + Sync,
+    {
+        build_go_edges(
+            analyzer,
+            &self.index,
+            EdgeNodeDomain::Rooted(callers),
+            keep_file,
+        )
     }
 
     pub(crate) fn build_edge_weights<F>(
@@ -237,7 +273,12 @@ impl GoEdgeResolver {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        build_go_edges(analyzer, &self.index, nodes, keep_file)
+        build_go_edges(
+            analyzer,
+            &self.index,
+            EdgeNodeDomain::Closed(nodes),
+            keep_file,
+        )
     }
 }
 

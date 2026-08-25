@@ -20,14 +20,25 @@ pub(super) fn record_module_qualified_hits(root: Node<'_>, ctx: &mut ScanCtx<'_>
         }
         match node.kind() {
             "scoped_identifier" | "scoped_type_identifier" => {
+                if !ctx.target_is_module
+                    && rust_path_segments(node).is_none_or(|path| {
+                        let segments = path_segment_texts(&path, ctx.source);
+                        !ctx.path_could_name_target(&segments)
+                    })
+                {
+                    continue;
+                }
                 record_scoped_identifier_hit(node, ctx)
             }
             "scoped_use_list" | "use_wildcard"
-                if ctx.target_is_module || ctx.target_is_path_qualifier =>
+                if (ctx.target_is_module || ctx.target_is_path_qualifier)
+                    && ctx.node_could_name_target(node) =>
             {
                 record_use_tree_prefix_hit(node, ctx)
             }
-            "token_tree" => record_token_tree_qualified_hits(node, ctx),
+            "token_tree" if ctx.node_could_name_target(node) => {
+                record_token_tree_qualified_hits(node, ctx)
+            }
             _ => {}
         }
 
@@ -369,6 +380,9 @@ fn focused_use_path_matches(
         return false;
     };
     let segments = path.segments.iter().map(String::as_str).collect::<Vec<_>>();
+    if !ctx.path_could_name_target(&segments) {
+        return false;
+    }
     ctx.matches_path(
         &segments,
         focused.start_byte(),

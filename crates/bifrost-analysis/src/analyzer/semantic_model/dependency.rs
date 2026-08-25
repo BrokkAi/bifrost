@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use crate::CancellationToken;
 use crate::analyzer::canonical_hash::{CanonicalHasher, lower_hex_string};
+use crate::analyzer::topology::DependencyScope;
 use crate::hash::{HashSet, set_with_capacity};
 
 use super::{
@@ -160,12 +161,158 @@ pub struct ResolvedDependency {
     /// coordinate or asset role).
     pub provenance: Vec<DependencyProvenance>,
     pub artifacts: Vec<ResolvedDependencyArtifact>,
+    /// The scope the build declares this dependency in, where the resolver can
+    /// prove it (#2442). The vocabulary is shared with internal topology
+    /// edges, so "compile-scoped" means one thing across the whole envelope.
+    ///
+    /// [`DependencyScope::Unknown`] is the default and the honest answer for a
+    /// resolver that reads an installed-artifact layout rather than a
+    /// declaration: a lockfile entry or a site-packages distribution says the
+    /// package is present, not what depends on it and how.
+    ///
+    /// This deliberately does not feed the dependency input digest. Scope is
+    /// evidence about the build, not about the artifact bytes a pack is
+    /// produced from, so a dependency that moves from `compile` to `test`
+    /// scope must not invalidate an otherwise identical generated pack.
+    pub scope: DependencyScope,
+    /// The topology entity that declares this dependency, where the resolver
+    /// can prove it: the Maven target whose pom lists it, the Gradle project
+    /// whose lockfile carries it. `None` when the evidence names no declaring
+    /// entity, which is every ecosystem whose resolver reads an installed
+    /// layout.
+    pub declared_by: Option<String>,
+}
+
+impl ResolvedDependency {
+    /// A dependency whose build scope and declaring entity are not established
+    /// by the evidence the resolver read.
+    ///
+    /// Most resolvers are in this position by construction: they enumerate an
+    /// installed artifact layout, which proves presence and nothing about the
+    /// declaration. Naming that here keeps the twenty-odd construction sites
+    /// from each repeating two `Unknown`s.
+    pub fn undeclared_scope(
+        id: String,
+        evidence: SemanticModelActivationEvidence,
+        provenance: Vec<DependencyProvenance>,
+        artifacts: Vec<ResolvedDependencyArtifact>,
+    ) -> Self {
+        Self {
+            id,
+            evidence,
+            provenance,
+            artifacts,
+            scope: DependencyScope::Unknown,
+            declared_by: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DependencyProvenance {
     pub key: String,
     pub value: String,
+}
+
+/// Whether one resolver may start a process (#2442).
+///
+/// This exists because the claim it replaces was false. The
+/// `DependencyPackEcosystem::dependency_inputs` doc comment said "no resolver
+/// runs a package manager and none opens a network connection", while JVM
+/// discovery in `JvmDependencyDiscoveryMode::OfflineBuildTools` runs `mvn
+/// dependency:list` and an init-script Gradle task, and Go discovery runs `go
+/// list`. A per-resolver, configuration-aware answer cannot drift from the
+/// resolvers the way one prose sentence did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubprocessPolicy {
+    /// The resolver only reads files. Every network-facing tool stays
+    /// unstarted.
+    Forbidden,
+    /// The resolver may run the configured build tool in its offline mode,
+    /// under the bounded-process timeout and output caps. Still no network is
+    /// opened by Bifrost; whether the tool itself honours offline mode is the
+    /// tool's contract, which is why this is a distinct policy rather than a
+    /// footnote on `Forbidden`.
+    OfflineBuildTools,
+}
+
+impl SubprocessPolicy {
+    pub const fn runs_processes(self) -> bool {
+        matches!(self, Self::OfflineBuildTools)
+    }
+}
+
+/// The work one dependency resolver may do before it must answer incomplete.
+///
+/// Each resolver declares the caps it enforces, so a host can compare
+/// ecosystems and a reviewer can see one table instead of nine sets of private
+/// constants. The values are per-resolver rather than global because the
+/// ecosystems differ in kind: reading a `project.assets.json` is one file, and
+/// walking a Python environment is a directory tree whose size is the
+/// environment's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DependencyResolverBounds {
+    /// Upper bound on filesystem entries the resolver visits beyond the
+    /// project's own file listing. `None` where the walk is that listing plus
+    /// `DependencyPackLimits::max_dependencies`, which is most of them.
+    pub max_files_walked: Option<usize>,
+    /// Upper bound on bytes of build metadata the resolver reads from one
+    /// file. `None` where the resolver reads whole artifacts under
+    /// `DependencyPackLimits`'s byte budget instead of a per-file cap of its
+    /// own.
+    pub max_metadata_bytes: Option<u64>,
+    pub subprocess: SubprocessPolicy,
+    /// Upper bound on the resolver's own wall clock. `None` where the resolver
+    /// starts no process, so there is no clock to bound: file reads are
+    /// bounded by the byte and count caps above.
+    pub wall_clock: Option<std::time::Duration>,
+}
+
+/// One ecosystem's dependency resolver.
+///
+/// Before this, the nine resolvers were free functions behind a hard-coded
+/// `match` in `WorkspaceAnalyzer::activate_dependency_packs`, each with its own
+/// signature, its own private caps, and its own relationship to the pack
+/// adapter that consumes it. The trait makes the four things a caller needs --
+/// which adapter pairs with it, which files invalidate it, what it is allowed
+/// to spend, and how to run it -- one uniform surface, so activation dispatches
+/// through a registry instead of restating the pairing.
+///
+/// Implementations live with the ecosystem they know about; the registry that
+/// names them is `DependencyPackEcosystem::resolver`.
+pub trait DependencyResolver: Send + Sync {
+    /// The pack adapter that produces semantic packs from what this resolver
+    /// resolves. Pairing them here is what removes the chance of activating an
+    /// ecosystem's dependencies through another's adapter.
+    fn adapter(&self) -> &'static dyn DependencyPackAdapter;
+
+    /// Base names of the files whose change can invalidate this resolver's
+    /// answer.
+    fn dependency_inputs(&self) -> &'static [&'static str];
+
+    /// The bounds this resolver runs under for the given configuration. The
+    /// subprocess policy depends on configuration for the two ecosystems that
+    /// have a build-tool mode at all.
+    fn bounds(&self, config: &crate::analyzer::AnalyzerConfig) -> DependencyResolverBounds;
+
+    /// Widen the shared pack limits where this ecosystem's artifact shape
+    /// needs it. Called once per activation, before `resolve`, so the same
+    /// limits govern discovery and preparation.
+    fn adjust_limits(
+        &self,
+        _config: &crate::analyzer::AnalyzerConfig,
+        _limits: &mut DependencyPackLimits,
+    ) {
+    }
+
+    /// Discover this ecosystem's exact local dependencies.
+    fn resolve(
+        &self,
+        config: &crate::analyzer::AnalyzerConfig,
+        project: &dyn crate::analyzer::Project,
+        limits: &DependencyPackLimits,
+        cancellation: Option<&CancellationToken>,
+    ) -> DependencyDiscoveryOutcome;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

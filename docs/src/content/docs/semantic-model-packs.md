@@ -177,6 +177,19 @@ an `enable` control names its pack id. `bifrost --policy-file` reads that list
 from `.bifrost/packs.json` and reports an inert pack as a
 `workspace-model-inert` warning.
 
+Procedure-summary targets use the declaration identity that Bifrost publishes;
+they are not source-text search patterns. For Rust, `target.path` is the
+artifact-relative path and `target.symbol` must be the declaration row's exact
+dot-qualified `fq_name`, with the authored `has_receiver` flag and
+`parameter_count` matching that declaration's structured callable signature.
+For example, a free function declared as `parse_ruby_tree` in
+`crates/bifrost-ruby/src/declarations.rs` is authored as
+`crates.bifrost-ruby.src.declarations.parse_ruby_tree` with
+`"has_receiver": false`. Bifrost reports per-summary match counts in the pack
+activation review; an active reviewed workspace summary that matches zero
+procedures emits a `workspace-model-inert` warning naming the model, summary,
+and symbol.
+
 Workspace files are data only. The loader uses the normal safe YAML or JSON
 parser. It does not load arbitrary code, follow links, execute a generator,
 download content, or read outside the workspace trust boundary. A content edit

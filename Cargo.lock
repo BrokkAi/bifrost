@@ -178,10 +178,11 @@ checksum = "dc0b364ead1874514c8c2855ab558056ebfeb775653e7ae45ff72f28f8f3166c"
 
 [[package]]
 name = "brokk-bifrost"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "bincode",
  "brokk-bifrost-analysis",
+ "brokk-bifrost-flow",
  "brokk-bifrost-lsp",
  "brokk-bifrost-mcp",
  "brokk-bifrost-nlp",
@@ -225,7 +226,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-analysis"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "arc-swap",
  "bincode",
@@ -237,7 +238,6 @@ dependencies = [
  "brokk-bifrost-jvm",
  "brokk-bifrost-php",
  "brokk-bifrost-python",
- "brokk-bifrost-rql",
  "brokk-bifrost-ruby",
  "brokk-bifrost-rust",
  "cap-fs-ext",
@@ -290,12 +290,13 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-core"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "bincode",
  "git2",
  "growable-bloom-filter",
  "ignore",
+ "libc",
  "moka",
  "once_cell",
  "rayon",
@@ -312,7 +313,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-cpp"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "brokk-bifrost-core",
  "regex",
@@ -326,7 +327,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-csharp"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "brokk-bifrost-core",
  "regex",
@@ -335,8 +336,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "brokk-bifrost-flow"
+version = "0.10.6"
+dependencies = [
+ "brokk-bifrost-analysis",
+ "brokk-bifrost-core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "brokk-bifrost-go"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "brokk-bifrost-core",
  "rayon",
@@ -348,7 +361,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-js-ts"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "brokk-bifrost-core",
  "rayon",
@@ -362,7 +375,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-jvm"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "brokk-bifrost-core",
  "brokk-tree-sitter-kotlin",
@@ -376,9 +389,10 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-lsp"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "brokk-bifrost-analysis",
+ "brokk-bifrost-flow",
  "brokk-bifrost-policy",
  "brokk-bifrost-rql",
  "brokk-bifrost-runtime",
@@ -399,9 +413,10 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-mcp"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "brokk-bifrost-analysis",
+ "brokk-bifrost-flow",
  "brokk-bifrost-nlp",
  "brokk-bifrost-policy",
  "brokk-bifrost-rql",
@@ -427,7 +442,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-nlp"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "brokk-bifrost-analysis",
  "fastrq",
@@ -446,7 +461,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-php"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "brokk-bifrost-core",
  "regex",
@@ -457,9 +472,10 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-policy"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "brokk-bifrost-analysis",
+ "brokk-bifrost-flow",
  "brokk-bifrost-rql",
  "cap-std",
  "chrono",
@@ -476,7 +492,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-python"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "brokk-bifrost-core",
  "rayon",
@@ -489,21 +505,26 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-rql"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
+ "brokk-bifrost-analysis",
  "brokk-bifrost-core",
+ "brokk-bifrost-flow",
+ "git2",
  "glob",
  "json-spanned-value",
  "regex",
  "regex-syntax",
  "serde",
  "serde_json",
+ "sha2",
  "strsim",
+ "tempfile",
 ]
 
 [[package]]
 name = "brokk-bifrost-ruby"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "brokk-bifrost-core",
  "serde_json",
@@ -513,10 +534,12 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-runtime"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "brokk-bifrost-analysis",
+ "brokk-bifrost-flow",
  "brokk-bifrost-policy",
+ "brokk-bifrost-rql",
  "git2",
  "serde",
  "serde_json",
@@ -526,7 +549,7 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-rust"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "brokk-bifrost-core",
  "filetime",
@@ -543,9 +566,10 @@ dependencies = [
 
 [[package]]
 name = "brokk-bifrost-semantic-packs"
-version = "0.10.5"
+version = "0.10.6"
 dependencies = [
  "brokk-bifrost-analysis",
+ "brokk-bifrost-flow",
  "flate2",
  "semver",
  "serde",

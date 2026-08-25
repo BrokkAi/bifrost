@@ -10,6 +10,8 @@ use super::relation::{
     CandidateCoverage, OracleRelationHandle, OracleRelationKind, OracleRelationOwner,
     collect_candidate_provenance, validate_retained_relation_arenas,
 };
+use crate::analyzer::Language;
+use crate::analyzer::languages::{LanguageSupport, language_support};
 
 /// One materialized workspace target for an exact semantic call site.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -357,7 +359,7 @@ pub(crate) fn unmaterialized_external_path() -> WorkspaceRelativePath {
 
 /// Whether `key` is the synthetic provenance artifact of an unmaterialized
 /// external target rather than a real materialized artifact (#1978).
-pub(crate) fn is_unmaterialized_external_artifact(key: &SemanticArtifactKey) -> bool {
+pub fn is_unmaterialized_external_artifact(key: &SemanticArtifactKey) -> bool {
     key.mount() == unmaterialized_external_mount()
 }
 
@@ -377,6 +379,46 @@ pub fn split_qualified_member(symbol: &str) -> Option<(&str, &str)> {
     let without_parameters = symbol.split_once('(').map_or(symbol, |(head, _tail)| head);
     let (owner, member) = without_parameters.rsplit_once('.')?;
     (!owner.is_empty() && !member.is_empty()).then_some((owner.trim(), member.trim()))
+}
+
+/// Split a *call-site* callee spelling into the canonical dot-joined
+/// `(owner FQN, member)` identity, cutting it with the separator `language`
+/// writes in source (#2596).
+///
+/// [`split_qualified_member`] reads a resolved or authored symbol, which is
+/// already dot-qualified. A call site instead carries the spelling the source
+/// wrote, and Rust writes `std::str::from_utf8` where Java writes
+/// `java.net.URLDecoder.decode`. Only the cut is language-specific: the owner
+/// is always published dot-joined, because the posting side derives its
+/// `(owner, member)` key by dot-splitting the authored summary symbol
+/// (`semantic_model::runtime`), and the documented Rust authoring contract is
+/// dot-qualified. So `std::str::from_utf8` and an authored
+/// `std.str.from_utf8` must both key on owner `std.str`, member `from_utf8`.
+///
+/// Empty segments are dropped, so a leading path root (`::std::str::from_utf8`)
+/// canonicalizes to the same owner as the rootless spelling.
+pub fn split_canonical_qualified_callee(
+    callee_text: &str,
+    language: Language,
+) -> Option<(String, String)> {
+    let separator =
+        language_support(language).map_or(".", LanguageSupport::qualified_call_separator);
+    if separator == "." {
+        return split_qualified_member(callee_text)
+            .map(|(owner, member)| (owner.to_owned(), member.to_owned()));
+    }
+    let without_parameters = callee_text
+        .split_once('(')
+        .map_or(callee_text, |(head, _tail)| head);
+    let (owner, member) = without_parameters.rsplit_once(separator)?;
+    let member = member.trim();
+    let owner = owner
+        .split(separator)
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join(".");
+    (!owner.is_empty() && !member.is_empty()).then(|| (owner, member.to_owned()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -603,5 +645,71 @@ mod split_qualified_member_tests {
             split_qualified_member("a.b.C.m(int, long)").expect("qualified split");
         assert_eq!(owner, "a.b.C");
         assert_eq!(member, "m");
+    }
+}
+
+#[cfg(test)]
+mod split_canonical_qualified_callee_tests {
+    use super::split_canonical_qualified_callee;
+    use crate::analyzer::Language;
+
+    /// #2596: a Rust call-site spelling is cut on `::` and published with a
+    /// dot-joined owner, which is the exact key an authored `std.str.from_utf8`
+    /// summary posts under.
+    #[test]
+    fn canonicalizes_a_rust_scoped_path_to_the_dotted_authoring_spelling() {
+        assert_eq!(
+            split_canonical_qualified_callee("std::str::from_utf8", Language::Rust),
+            Some(("std.str".to_owned(), "from_utf8".to_owned()))
+        );
+        // A leading path root is the same identity.
+        assert_eq!(
+            split_canonical_qualified_callee("::std::str::from_utf8", Language::Rust),
+            Some(("std.str".to_owned(), "from_utf8".to_owned()))
+        );
+    }
+
+    /// A single-segment Rust owner still splits, so the caller's multi-segment
+    /// gate is what rejects an unexpanded import or prelude spelling.
+    #[test]
+    fn keeps_a_single_segment_rust_owner_for_the_callers_gate() {
+        assert_eq!(
+            split_canonical_qualified_callee("Path::new", Language::Rust),
+            Some(("Path".to_owned(), "new".to_owned()))
+        );
+        assert_eq!(
+            split_canonical_qualified_callee("String::from", Language::Rust),
+            Some(("String".to_owned(), "from".to_owned()))
+        );
+    }
+
+    #[test]
+    fn rejects_an_unqualified_rust_callee() {
+        assert_eq!(
+            split_canonical_qualified_callee("from_utf8", Language::Rust),
+            None
+        );
+        assert_eq!(
+            split_canonical_qualified_callee("from_utf8(x)", Language::Rust),
+            None
+        );
+    }
+
+    /// A dotted language keeps exactly the dot-only interpretation, so a Rust
+    /// spelling is not silently reinterpreted for Java and a Java spelling
+    /// keeps its owner verbatim.
+    #[test]
+    fn a_dotted_language_is_unchanged() {
+        assert_eq!(
+            split_canonical_qualified_callee(
+                "java.net.URLDecoder.decode(java.lang.String)",
+                Language::Java
+            ),
+            Some(("java.net.URLDecoder".to_owned(), "decode".to_owned()))
+        );
+        assert_eq!(
+            split_canonical_qualified_callee("std::str::from_utf8", Language::Java),
+            None
+        );
     }
 }

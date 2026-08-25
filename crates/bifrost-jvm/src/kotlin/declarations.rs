@@ -21,7 +21,9 @@
 //! tier.
 
 use crate::kotlin::syntax::{
-    kotlin_binding_type_text, kotlin_declared_return_type_text, kotlin_extension_receiver_text,
+    kotlin_binding_type_components, kotlin_binding_type_text,
+    kotlin_declared_return_type_components, kotlin_declared_return_type_text,
+    kotlin_extension_receiver_components, kotlin_extension_receiver_text,
 };
 use brokk_bifrost_core::analyzer::common::{
     collapse_whitespace, node_source_text as node_text,
@@ -29,7 +31,8 @@ use brokk_bifrost_core::analyzer::common::{
 };
 use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentId, SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::model::{
-    CallableArity, CodeUnitType, ParameterMetadata, SignatureMetadata,
+    CallableArity, CodeUnitType, ParameterMetadata, SignatureMetadata, StructuredTypeIdentity,
+    StructuredTypeIdentityBuilder, StructuredTypeName,
 };
 use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
 use brokk_bifrost_core::analyzer::tree_walk::{
@@ -97,16 +100,29 @@ pub fn parse_kotlin_file(file: &ProjectFile, source: &str, tree: &Tree) -> Parse
 }
 
 pub fn kotlin_package_name(root: Node<'_>, source: &str) -> String {
+    kotlin_package_components(root, source).join(".")
+}
+
+pub fn kotlin_package_components(root: Node<'_>, source: &str) -> Vec<String> {
     first_named_child(root, "package_header")
         .and_then(|header| first_named_child(header, "identifier"))
         .map(|identifier| {
-            // The `identifier` node is a dotted qualified name; strip any
-            // interior whitespace/newlines from odd formatting.
-            node_text(identifier, source)
-                .split_whitespace()
-                .collect::<String>()
+            named_children_of(identifier)
+                .into_iter()
+                .filter(|child| child.kind() == "simple_identifier")
+                .filter_map(|child| child.utf8_text(source.as_bytes()).ok())
+                .filter(|component| !component.is_empty())
+                .map(str::to_string)
+                .collect()
         })
         .unwrap_or_default()
+}
+
+fn kotlin_nominal_type_identity(components: Option<Vec<String>>) -> Option<StructuredTypeIdentity> {
+    let name = StructuredTypeName::new(components?, Vec::new(), false)?;
+    let mut builder = StructuredTypeIdentityBuilder::default();
+    let root = builder.named(name)?;
+    builder.finish(root)
 }
 
 fn collect_kotlin_imports(root: Node<'_>, source: &str, parsed: &mut ParsedFile) {
@@ -389,7 +405,8 @@ impl<'a> KotlinVisitor<'a> {
             let metadata = kotlin_signature_metadata(
                 signature,
                 kotlin_class_parameter_facts(&parameters, self.source),
-            );
+            )
+            .with_callable_constructor();
             self.parsed
                 .add_signature_with_metadata(constructor, metadata);
         }
@@ -423,7 +440,10 @@ impl<'a> KotlinVisitor<'a> {
             self.parsed.add_signature_with_metadata(
                 field,
                 SignatureMetadata::new(format!("{binding} {name}{type_text}"), Vec::new())
-                    .with_return_type_text(kotlin_binding_type_text(parameter, self.source)),
+                    .with_return_type_text(kotlin_binding_type_text(parameter, self.source))
+                    .with_return_type_identity(kotlin_nominal_type_identity(
+                        kotlin_binding_type_components(parameter, self.source),
+                    )),
             );
         }
     }
@@ -463,8 +483,10 @@ impl<'a> KotlinVisitor<'a> {
         let facts = parameter_list
             .map(|list| kotlin_function_parameter_facts(list, self.source))
             .unwrap_or_else(|| kotlin_parameter_facts_from(Vec::new(), 0, false));
-        self.parsed
-            .add_signature_with_metadata(code_unit, kotlin_signature_metadata(signature, facts));
+        self.parsed.add_signature_with_metadata(
+            code_unit,
+            kotlin_signature_metadata(signature, facts).with_callable_constructor(),
+        );
     }
 
     fn visit_property(&mut self, node: Node<'_>, parent: Option<&CodeUnit>) {
@@ -521,7 +543,16 @@ impl<'a> KotlinVisitor<'a> {
                     Vec::new(),
                 )
                 .with_return_type_text(kotlin_binding_type_text(variable, self.source))
-                .with_extension_receiver_type(kotlin_extension_receiver_text(node, self.source)),
+                .with_return_type_identity(kotlin_nominal_type_identity(
+                    kotlin_binding_type_components(variable, self.source),
+                ))
+                .with_extension_receiver_type(kotlin_extension_receiver_text(node, self.source))
+                .with_extension_receiver_type_identity(
+                    kotlin_nominal_type_identity(kotlin_extension_receiver_components(
+                        node,
+                        self.source,
+                    )),
+                ),
             );
         }
     }
@@ -867,7 +898,13 @@ fn kotlin_callable_signature_metadata(
     // whatever the file that wrote it says it means.
     kotlin_signature_metadata(signature, facts)
         .with_return_type_text(kotlin_declared_return_type_text(node, source))
+        .with_return_type_identity(kotlin_nominal_type_identity(
+            kotlin_declared_return_type_components(node, source),
+        ))
         .with_extension_receiver_type(kotlin_extension_receiver_text(node, source))
+        .with_extension_receiver_type_identity(kotlin_nominal_type_identity(
+            kotlin_extension_receiver_components(node, source),
+        ))
 }
 
 #[cfg(test)]
@@ -1018,6 +1055,33 @@ fun mixed(a: Int, b: Int = 2, c: String = "x"): Int = a + b
         assert!(spread.accepts(0) && spread.accepts(5));
         let mixed = arity_of("arity.mixed");
         assert!(mixed.accepts(1) && mixed.accepts(3) && !mixed.accepts(0) && !mixed.accepts(4));
+    }
+
+    #[test]
+    fn constructor_signatures_record_constructor_metadata() {
+        let source = r#"package constructors
+
+class Widget(val value: Int) {
+    constructor() : this(0)
+}
+"#;
+        let (_, parsed) = parse(source);
+        let constructor = parsed
+            .declarations()
+            .iter()
+            .find(|unit| unit.fq_name() == "constructors.Widget.Widget")
+            .expect("primary and secondary constructors share one declaration");
+        let metadata = parsed
+            .signature_metadata
+            .get(constructor)
+            .expect("constructors publish signature metadata");
+
+        assert_eq!(metadata.len(), 2);
+        assert!(
+            metadata
+                .iter()
+                .all(SignatureMetadata::callable_is_constructor)
+        );
     }
 
     #[test]

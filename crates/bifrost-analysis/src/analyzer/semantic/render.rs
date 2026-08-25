@@ -5,7 +5,7 @@
 
 use std::fmt;
 
-use crate::analyzer::bounded_output::{BalancedWriter, TruncationStyle, quoted};
+use brokk_bifrost_core::bounded_output::{BalancedWriter, TruncationStyle, quoted};
 
 use super::capabilities::{CapabilitySupport, SemanticCapabilities};
 use super::ids::{

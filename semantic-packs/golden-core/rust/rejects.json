@@ -1,0 +1,17 @@
+{
+  "format": "bifrost_golden_pack_audit/v1",
+  "candidates_total": 9,
+  "shipped_summaries": 9,
+  "rejected": 0,
+  "rejects": [],
+  "packs": [
+    {
+      "pack_id": "bifrost.rust-std-golden-summaries",
+      "artifact": "cargo",
+      "pinned": false,
+      "ecosystem": "cargo",
+      "completeness": "complete",
+      "shipped_summaries": 9
+    }
+  ]
+}

@@ -26,6 +26,163 @@ pub struct PythonModuleReplacement {
     pub target_module: String,
 }
 
+/// Return the absolute module named by the last direct assignment to `local`
+/// that dominates `reference` when that assignment has the exact structured
+/// shape `local = importlib_binding.import_module("module.name")`.
+///
+/// Assignments hidden in a branch do not dominate the reference. Any later
+/// direct binding of `local` invalidates an earlier result. The caller proves
+/// that the receiver of `import_module` is an in-scope namespace binding for
+/// Python's `importlib` module; this helper only interprets the syntax and
+/// statement order.
+pub(crate) fn imported_module_assignment_at(
+    reference: Node<'_>,
+    local: &str,
+    source: &str,
+    mut is_importlib_binding: impl FnMut(&str) -> bool,
+) -> Option<String> {
+    let suite = enclosing_execution_suite(reference)?;
+    let mut resolved = None;
+    let mut cursor = suite.walk();
+    for statement in suite.named_children(&mut cursor) {
+        if statement.start_byte() >= reference.start_byte()
+            || (statement.start_byte() <= reference.start_byte()
+                && reference.end_byte() <= statement.end_byte())
+        {
+            break;
+        }
+
+        let expression = if statement.kind() == "expression_statement" {
+            statement.named_child(0).unwrap_or(statement)
+        } else {
+            statement
+        };
+        if expression.kind() == "assignment"
+            && expression.child_by_field_name("left").is_some_and(|left| {
+                left.kind() == "identifier" && node_source_text(left, source) == local
+            })
+        {
+            resolved = expression
+                .child_by_field_name("right")
+                .and_then(|right| importlib_call_module(right, source, &mut is_importlib_binding));
+            continue;
+        }
+
+        let binds_local = python_direct_scope_bindings_bounded(statement, source, || true)
+            .expect("unbounded binding collection cannot be cancelled")
+            .into_iter()
+            .any(|binding| node_source_text(binding.declaration, source) == local);
+        if binds_local {
+            resolved = None;
+        }
+    }
+    resolved
+}
+
+fn enclosing_execution_suite(mut node: Node<'_>) -> Option<Node<'_>> {
+    while let Some(parent) = node.parent() {
+        if matches!(parent.kind(), "function_definition" | "lambda") {
+            return parent.child_by_field_name("body");
+        }
+        if parent.kind() == "module" {
+            return Some(parent);
+        }
+        node = parent;
+    }
+    None
+}
+
+fn importlib_call_module(
+    call: Node<'_>,
+    source: &str,
+    is_importlib_binding: &mut impl FnMut(&str) -> bool,
+) -> Option<String> {
+    if call.kind() != "call" {
+        return None;
+    }
+    let function = call.child_by_field_name("function")?;
+    if function.kind() != "attribute" {
+        return None;
+    }
+    let (object, attribute) = (
+        function.child_by_field_name("object")?,
+        function.child_by_field_name("attribute")?,
+    );
+    if object.kind() != "identifier"
+        || attribute.kind() != "identifier"
+        || node_source_text(attribute, source) != "import_module"
+        || !is_importlib_binding(node_source_text(object, source))
+    {
+        return None;
+    }
+
+    let arguments = call.child_by_field_name("arguments")?;
+    if arguments.named_child_count() != 1 {
+        return None;
+    }
+    let literal = arguments.named_child(0)?;
+    if literal.kind() != "string"
+        || literal
+            .parent()
+            .is_some_and(|parent| parent.kind() == "concatenated_string")
+    {
+        return None;
+    }
+    let mut content = None;
+    for index in 0..literal.named_child_count() {
+        let child = literal.named_child(index)?;
+        match child.kind() {
+            "string_start" | "string_end" => {}
+            "string_content" if content.is_none() && child.named_child_count() == 0 => {
+                content = Some(child);
+            }
+            _ => return None,
+        }
+    }
+    let content = content?;
+    let module = node_source_text(content, source);
+    (!module.is_empty() && !module.starts_with('.')).then(|| module.to_string())
+}
+
+/// Collect absolute module names from structurally exact
+/// `local = importlib.import_module("...")` assignments. This is a conservative
+/// candidate-file index: dominance and local shadowing are checked later at the
+/// reference site by [`imported_module_assignment_at`].
+pub(crate) fn literal_importlib_modules(
+    source: &str,
+    bindings: &HashMap<String, ImportBinding>,
+) -> HashSet<String> {
+    let Some(tree) = parse_python_tree(source) else {
+        return HashSet::default();
+    };
+    let mut modules = HashSet::default();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "assignment"
+            && node
+                .child_by_field_name("left")
+                .is_some_and(|left| left.kind() == "identifier")
+            && let Some(module) = node.child_by_field_name("right").and_then(|right| {
+                importlib_call_module(right, source, &mut |local| {
+                    bindings.get(local).is_some_and(|binding| {
+                        binding.kind == ImportKind::Namespace
+                            && binding
+                                .namespace_imported_module
+                                .as_deref()
+                                .unwrap_or(&binding.module_specifier)
+                                == "importlib"
+                    })
+                })
+            })
+        {
+            modules.insert(module);
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    modules
+}
+
 /// Recognize the compatibility-shim idiom that replaces the current module
 /// object with an imported workspace module:
 ///
@@ -161,7 +318,14 @@ pub fn parse_python_import_bindings(source: &str) -> Vec<PythonImportBinding> {
     let Some(tree) = parser.parse(source, None) else {
         return Vec::new();
     };
-    let mut pending = vec![tree.root_node()];
+    python_import_bindings_from_tree(tree.root_node(), source)
+}
+
+/// Return structured import bindings from a tree the caller already owns.
+/// Query paths use this form so one request never reparses a document merely
+/// to recover function-local import scope.
+pub fn python_import_bindings_from_tree(root: Node<'_>, source: &str) -> Vec<PythonImportBinding> {
+    let mut pending = vec![root];
     let mut nodes = Vec::new();
     while let Some(node) = pending.pop() {
         if matches!(node.kind(), "import_statement" | "import_from_statement") {
@@ -235,6 +399,92 @@ fn python_import_binding_scope(node: Node<'_>, source_len: usize) -> (usize, usi
 mod tests {
     use super::*;
     use brokk_bifrost_core::analyzer::usages::model::ImportBinder;
+
+    fn importlib_assignment_for(source: &str, importlib_local: &str) -> Option<String> {
+        let tree = parse_python_tree(source).expect("valid Python fixture");
+        let reference_start = source.rfind("canonical.setup").expect("reference site");
+        let mut stack = vec![tree.root_node()];
+        let mut reference = None;
+        while let Some(node) = stack.pop() {
+            if node.kind() == "identifier"
+                && node.start_byte() == reference_start
+                && node_source_text(node, source) == "canonical"
+            {
+                reference = Some(node);
+                break;
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        imported_module_assignment_at(
+            reference.expect("canonical reference node"),
+            "canonical",
+            source,
+            |local| local == importlib_local,
+        )
+    }
+
+    #[test]
+    fn existing_tree_import_bindings_preserve_function_scope_and_relative_identity() {
+        let source = r#"def register():
+    from .workers.special import Worker
+    return Worker()
+"#;
+        let tree = parse_python_tree(source).expect("Python tree");
+        let bindings = python_import_bindings_from_tree(tree.root_node(), source);
+
+        assert_eq!(bindings.len(), 1, "{bindings:#?}");
+        assert!(bindings[0].is_function_scoped(), "{bindings:#?}");
+        assert_eq!(bindings[0].local_name, "Worker");
+        assert_eq!(bindings[0].qualified_name, ".workers.special.Worker");
+        assert!(bindings[0].scope_start_byte <= bindings[0].start_byte);
+        assert!(bindings[0].scope_end_byte >= source.rfind("Worker()").unwrap());
+    }
+
+    #[test]
+    fn importlib_assignment_requires_a_direct_literal_dominating_write() {
+        let valid = r#"import importlib as loader
+
+def test():
+    canonical = loader.import_module("routes.contacts.contacts_routes")
+    assert canonical.setup_contacts_routes
+"#;
+        assert_eq!(
+            importlib_assignment_for(valid, "loader"),
+            Some("routes.contacts.contacts_routes".to_string())
+        );
+
+        for near_miss in [
+            r#"import importlib as loader
+def test(module_name):
+    canonical = loader.import_module(module_name)
+    assert canonical.setup_contacts_routes
+"#,
+            r#"import importlib as loader
+def test():
+    if enabled:
+        canonical = loader.import_module("routes.contacts.contacts_routes")
+    assert canonical.setup_contacts_routes
+"#,
+            r#"import importlib as loader
+def test():
+    canonical = loader.import_module("routes.contacts.contacts_routes")
+    canonical = object()
+    assert canonical.setup_contacts_routes
+"#,
+        ] {
+            assert_eq!(
+                importlib_assignment_for(near_miss, "loader"),
+                None,
+                "near miss must not infer a module receiver: {near_miss:?}"
+            );
+        }
+        assert_eq!(
+            importlib_assignment_for(valid, "shadowed_loader"),
+            None,
+            "a similarly shaped non-importlib receiver must not resolve"
+        );
+    }
 
     fn replacement_for(source: &str, binder: &ImportBinder) -> Option<PythonModuleReplacement> {
         let tree = parse_python_tree(source).expect("valid Python fixture");

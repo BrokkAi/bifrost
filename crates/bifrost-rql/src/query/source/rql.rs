@@ -630,7 +630,10 @@ fn validate_wrapper(
         RqlForm::EdgesOf | RqlForm::EdgesFrom => {
             validate_edge_wrapper(form, args, query, analysis);
         }
-        RqlForm::StateEventsOf | RqlForm::FlowRelationsOf | RqlForm::RewritePathsOf => {
+        RqlForm::StateEventsOf
+        | RqlForm::FlowRelationsOf
+        | RqlForm::ControlRelations
+        | RqlForm::RewritePathsOf => {
             validate_constrained_option_wrapper(form, args, query, analysis);
         }
         RqlForm::SegmentsOf => {
@@ -648,6 +651,10 @@ fn validate_wrapper(
         | RqlForm::EdgeTarget
         | RqlForm::FlowSource
         | RqlForm::FlowTarget
+        | RqlForm::TargetOf
+        | RqlForm::SourceSetOf
+        | RqlForm::TopologyEdgesOf
+        | RqlForm::GuardsOf
         | RqlForm::SegmentTarget
         | RqlForm::ReceiverOutcome
         | RqlForm::ReceiverEvidence
@@ -1928,6 +1935,8 @@ fn validate_property_value(
         | super::schema::ValueShape::FlowCertaintyList
         | super::schema::ValueShape::RewriteDomainList
         | super::schema::ValueShape::RewriteOutcomeList
+        | super::schema::ValueShape::ControlRelationKindList
+        | super::schema::ValueShape::ControlExitPartitionList
         | super::schema::ValueShape::ScopeFilter
         | super::schema::ValueShape::BindingFilter
         | super::schema::ValueShape::PathFilter

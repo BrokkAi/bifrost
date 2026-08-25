@@ -132,7 +132,7 @@ impl<'a> UsageFinder<'a> {
         )
     }
 
-    pub(crate) fn query_with_source_budget(
+    pub fn query_with_source_budget(
         &self,
         analyzer: &dyn IAnalyzer,
         overloads: &[CodeUnit],
@@ -252,6 +252,7 @@ impl<'a> UsageFinder<'a> {
         // Protected files are everything discovered so far; the supplemental files join
         // only afterwards, so both budgets below drop them before touching anything here.
         let mut protected_candidates = candidates.clone();
+        let supplemental_count = supplemental.len();
         candidates.extend(supplemental);
 
         if let Some(filter) = self.file_filter.as_ref() {
@@ -263,6 +264,15 @@ impl<'a> UsageFinder<'a> {
         }
 
         let all_candidates = candidates.clone();
+        crate::profiling::note_with(|| {
+            format!(
+                "usages.candidates target={} total={} protected={} supplemental={}",
+                target.fq_name(),
+                all_candidates.len(),
+                protected_candidates.len(),
+                supplemental_count
+            )
+        });
         let candidate_files_budget_exhausted = candidates.len() > max_files;
         if candidate_files_budget_exhausted {
             candidates = truncate_candidates(candidates, &protected_candidates, max_files);
@@ -674,7 +684,7 @@ mod tests {
             "fixture must produce hits for the sweep to be meaningful"
         );
 
-        let partial_with_hits = (1..=400).find_map(|checks| {
+        let partial_with_hits = (1..=4_000).find_map(|checks| {
             let result = UsageFinder::new()
                 .with_cancellation(CancellationToken::cancel_after_checks_for_test(checks))
                 .query(
@@ -725,6 +735,73 @@ mod tests {
             analyzer,
             &DescendantIndexScope::whole_workspace(&uncancelled),
         )
+    }
+
+    #[test]
+    fn cpp_free_function_candidates_require_the_written_identifier() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonicalize temp dir");
+        write_fixture(
+            &root,
+            &[
+                (
+                    "api.h",
+                    "#pragma once\nvoid UtilMount();\nstruct Number { Number operator+(const Number&) const; };\n",
+                ),
+                (
+                    "api.cpp",
+                    "#include \"api.h\"\nvoid UtilMount() {}\nNumber Number::operator+(const Number&) const { return {}; }\n",
+                ),
+                (
+                    "caller.cpp",
+                    "#include \"api.h\"\nvoid call() { UtilMount(); }\n",
+                ),
+                (
+                    "address.cpp",
+                    "#include \"api.h\"\nauto mount_callback = &UtilMount;\n",
+                ),
+                (
+                    "unrelated.cpp",
+                    "#include \"api.h\"\nvoid unrelated(Number a, Number b) { auto sum = a + b; }\n",
+                ),
+            ],
+        );
+
+        let analyzer = crate::analyzer::CppAnalyzer::from_project(
+            crate::analyzer::TestProject::new(root.clone(), Language::Cpp),
+        );
+        let api = ProjectFile::new(root.clone(), "api.h");
+        let declarations = analyzer.declarations(&api);
+        let free_function = declarations
+            .iter()
+            .find(|unit| unit.identifier() == "UtilMount")
+            .expect("fixture declares UtilMount");
+        let operator = declarations
+            .iter()
+            .find(|unit| unit.identifier().starts_with("operator"))
+            .expect("fixture declares operator+");
+
+        let free_function_candidates = default_route_candidates(&analyzer, free_function);
+        let relative_paths = |files: &HashSet<ProjectFile>| {
+            files
+                .iter()
+                .map(|file| file.rel_path().to_string_lossy().into_owned())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(
+            relative_paths(&free_function_candidates),
+            ["address.cpp", "api.cpp", "api.h", "caller.cpp"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            "candidate admission may use the required spelling, while the graph still proves hits"
+        );
+
+        let operator_candidates = default_route_candidates(&analyzer, operator);
+        assert!(
+            operator_candidates.contains(&ProjectFile::new(root, "unrelated.cpp")),
+            "operator syntax need not spell the declaration identifier and must remain graph-routed"
+        );
     }
 
     /// A protected augmentation competes with the generic candidates for the file-count

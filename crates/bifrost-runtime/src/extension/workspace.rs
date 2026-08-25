@@ -6,13 +6,13 @@ use brokk_bifrost_analysis::analyzer::semantic::{
     ValueFlowOracle, ValueFlowRelationKind, WorkspaceSemanticOracle,
     cfg_algorithms::derive_procedure_control_dependence,
 };
-use brokk_bifrost_analysis::analyzer::structural::{
-    CodeQueryCompletion, CodeQueryExecutionLimits, execute_workspace_request_with_cancellation,
-};
-use brokk_bifrost_analysis::analyzer::value_flow::ValueFlowCarrier;
 use brokk_bifrost_analysis::analyzer::{
     AnalyzerConfig, AnalyzerQueryScope, FilesystemProject, InformationTier, OverlayProject,
     Project, ProjectFile, WorkspaceAnalyzer,
+};
+use brokk_bifrost_flow::{FlowWorkspaceState, value_flow::ValueFlowCarrier};
+use brokk_bifrost_rql::{
+    CodeQueryCompletion, CodeQueryExecutionLimits, execute_workspace_request_with_cancellation,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
@@ -149,8 +149,19 @@ pub struct ExtensionCapabilityReport {
 pub struct ExtensionWorkspaceDescription {
     pub api: ExtensionApiVersion,
     pub generation: WorkspaceGeneration,
+    /// Comparison identity for analyzed workspace content. The derivation does
+    /// not add the absolute root or package version; different roots agree
+    /// when their literal analyzer configurations agree. Path-bearing configs
+    /// can still differ, and this does not replace the local, store-scoped
+    /// `generation`.
+    pub content_identity: WorkspaceContentIdentity,
     pub capabilities: ExtensionCapabilityReport,
     pub store: ExtensionStoreReport,
+    /// Information tiers crossed while the analyzer was constructed by open.
+    /// This is separate from per-operation reports, whose scopes begin only
+    /// after the workspace exists.
+    #[serde(default)]
+    pub open_tiers: ExtensionTierReport,
     /// Workspace files excluded from analysis at open time (for example
     /// binary content, which cannot enter the UTF-8 source overlay). Recorded
     /// so an extension can distinguish "present but not analyzed" from
@@ -161,10 +172,13 @@ pub struct ExtensionWorkspaceDescription {
 
 pub struct ExtensionWorkspace {
     generation: WorkspaceGeneration,
+    content_identity: WorkspaceContentIdentity,
     capabilities: ExtensionCapabilityReport,
     store: ExtensionStoreReport,
+    open_tiers: ExtensionTierReport,
     open_diagnostics: Box<[ExtensionDiagnostic]>,
     analyzer: WorkspaceAnalyzer,
+    flow_state: FlowWorkspaceState,
 }
 
 impl ExtensionWorkspace {
@@ -219,19 +233,25 @@ impl ExtensionWorkspace {
             }
         }
         let project: Arc<dyn Project> = Arc::new(frozen.snapshot());
-        let analyzer = match options.persistence {
-            ExtensionPersistenceMode::Ephemeral => WorkspaceAnalyzer::build_ephemeral(
-                Arc::clone(&project),
-                options.analyzer_config.clone(),
-            )
-            .map_err(|error| {
-                ExtensionWorkspaceError::Analyzer(error.to_string().into_boxed_str())
-            })?,
-            ExtensionPersistenceMode::Persisted => WorkspaceAnalyzer::build_persisted(
-                Arc::clone(&project),
-                options.analyzer_config.clone(),
-            )
-            .map_err(|error| ExtensionWorkspaceError::Store(error.to_string().into_boxed_str()))?,
+        let (analyzer, build_tier_access) = match options.persistence {
+            ExtensionPersistenceMode::Ephemeral => {
+                WorkspaceAnalyzer::build_ephemeral_with_tier_access(
+                    Arc::clone(&project),
+                    options.analyzer_config.clone(),
+                )
+                .map_err(|error| {
+                    ExtensionWorkspaceError::Analyzer(error.to_string().into_boxed_str())
+                })?
+            }
+            ExtensionPersistenceMode::Persisted => {
+                WorkspaceAnalyzer::build_persisted_with_tier_access(
+                    Arc::clone(&project),
+                    options.analyzer_config.clone(),
+                )
+                .map_err(|error| {
+                    ExtensionWorkspaceError::Store(error.to_string().into_boxed_str())
+                })?
+            }
         };
         // Report the store the build actually produced rather than echoing the
         // request: a persisted request against a project with no persistence
@@ -263,7 +283,13 @@ impl ExtensionWorkspace {
                 diagnostics: Box::new([]),
             },
         };
-        let generation = generation_for(&analyzer, &options.analyzer_config)?;
+        let identities = workspace_identities_for(&analyzer, &options.analyzer_config)?;
+        let open_tiers = ExtensionTierReport {
+            syntax: build_tier_access.tier_access_count(InformationTier::Syntax) as u64,
+            imports: build_tier_access.tier_access_count(InformationTier::Imports) as u64,
+            supertypes: build_tier_access.tier_access_count(InformationTier::Supertypes) as u64,
+            usage_graph: build_tier_access.tier_access_count(InformationTier::UsageGraph) as u64,
+        };
         let languages = analyzer
             .analyzer()
             .languages()
@@ -279,7 +305,7 @@ impl ExtensionWorkspace {
             .collect::<Vec<_>>()
             .into_boxed_slice();
         let capabilities = ExtensionCapabilityReport {
-            generation: generation.clone(),
+            generation: identities.generation.clone(),
             languages,
             operations: vec![
                 OperationCapability {
@@ -311,15 +337,28 @@ impl ExtensionWorkspace {
             .into_boxed_slice(),
         };
         Ok(Self {
-            generation,
+            generation: identities.generation,
+            content_identity: identities.content_identity,
             capabilities,
             store,
+            open_tiers,
             open_diagnostics: open_diagnostics.into_boxed_slice(),
             analyzer,
+            flow_state: FlowWorkspaceState::new(),
         })
     }
     pub fn generation(&self) -> &WorkspaceGeneration {
         &self.generation
+    }
+    /// Returns the portable identity of this open workspace's frozen content.
+    ///
+    /// The identity hashes normalized workspace source, the literal analyzer
+    /// configuration representation, and a manually versioned content domain;
+    /// it does not add the absolute root or package version. External
+    /// dependency bytes are represented separately by artifact manifest
+    /// dependency fingerprints.
+    pub fn content_identity(&self) -> &WorkspaceContentIdentity {
+        &self.content_identity
     }
     pub fn capabilities(&self) -> &ExtensionCapabilityReport {
         &self.capabilities
@@ -333,12 +372,22 @@ impl ExtensionWorkspace {
     pub fn open_diagnostics(&self) -> &[ExtensionDiagnostic] {
         &self.open_diagnostics
     }
+
+    /// Information tiers crossed while constructing this workspace.
+    ///
+    /// This report is complete when [`Self::open`] returns and is independent
+    /// from the per-operation tier reports returned by later requests.
+    pub fn open_tiers(&self) -> ExtensionTierReport {
+        self.open_tiers
+    }
     pub fn describe(&self) -> ExtensionWorkspaceDescription {
         ExtensionWorkspaceDescription {
             api: EXTENSION_API_VERSION,
             generation: self.generation.clone(),
+            content_identity: self.content_identity.clone(),
             capabilities: self.capabilities.clone(),
             store: self.store.clone(),
+            open_tiers: self.open_tiers,
             open_diagnostics: self.open_diagnostics.clone(),
         }
     }
@@ -386,6 +435,7 @@ impl ExtensionWorkspace {
             AnalyzerQueryScope::with_cancellation(self.analyzer.analyzer(), cancellation.token());
         let response = execute_workspace_request_with_cancellation(
             &self.analyzer,
+            &self.flow_state,
             &request.query,
             limits,
             cancellation.token(),
@@ -996,37 +1046,72 @@ const fn value_subtype(kind: ValueFlowRelationKind) -> ValueDependenceSubtype {
         ValueFlowRelationKind::MemoryLoad => ValueDependenceSubtype::FieldLoad,
         ValueFlowRelationKind::MemoryStore => ValueDependenceSubtype::FieldStore,
         ValueFlowRelationKind::Capture => ValueDependenceSubtype::Capture,
-        ValueFlowRelationKind::LanguageDefined => ValueDependenceSubtype::LanguageDefined,
+        // A handler binding is performed by the language runtime rather than
+        // by any expression the program wrote, so it reports as the
+        // language-defined transfer family. A container collapse (#2444
+        // slice 2) is the same case for the same reason: reading a whole
+        // object reads what is inside it, which no single expression in the
+        // program spells. The #2103 subtype list is a wire vocabulary a
+        // deployed extension host decodes exhaustively; adding a label to it
+        // is its own compatibility decision and not part of either slice.
+        ValueFlowRelationKind::HandlerBinding
+        | ValueFlowRelationKind::ContainerCollapse
+        | ValueFlowRelationKind::LanguageDefined => ValueDependenceSubtype::LanguageDefined,
     }
 }
 
-fn generation_for(
+struct WorkspaceIdentities {
+    generation: WorkspaceGeneration,
+    content_identity: WorkspaceContentIdentity,
+}
+
+fn workspace_identities_for(
     analyzer: &WorkspaceAnalyzer,
     config: &AnalyzerConfig,
-) -> Result<WorkspaceGeneration, ExtensionWorkspaceError> {
-    let mut hasher = Sha256::new();
-    hasher.update(b"brokk-bifrost-extension-workspace-generation-v1\0");
-    hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
-    hasher.update(EXTENSION_API_VERSION.major.to_le_bytes());
-    hasher.update(format!("{config:?}").as_bytes());
+) -> Result<WorkspaceIdentities, ExtensionWorkspaceError> {
+    let config_debug = format!("{config:?}");
+    let mut generation_hasher = Sha256::new();
+    generation_hasher.update(b"brokk-bifrost-extension-workspace-generation-v1\0");
+    generation_hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
+    generation_hasher.update(EXTENSION_API_VERSION.major.to_le_bytes());
+    generation_hasher.update(config_debug.as_bytes());
+
+    let mut content_hasher = Sha256::new();
+    content_hasher.update(b"brokk-bifrost-extension-workspace-content-v1\0");
+    let api_major = EXTENSION_API_VERSION.major.to_le_bytes();
+    update_framed(&mut content_hasher, &api_major);
+    update_framed(&mut content_hasher, config_debug.as_bytes());
+
     let project = analyzer.analyzer().project();
-    hasher.update(project.root().to_string_lossy().as_bytes());
-    for file in project
+    generation_hasher.update(project.root().to_string_lossy().as_bytes());
+    let files = project
         .all_files_shared()
-        .map_err(|error| ExtensionWorkspaceError::Project(error.to_string().into_boxed_str()))?
-        .iter()
-    {
-        hasher.update([0]);
-        hasher.update(file.rel_path().to_string_lossy().as_bytes());
-        hasher.update([0]);
+        .map_err(|error| ExtensionWorkspaceError::Project(error.to_string().into_boxed_str()))?;
+    for file in files.iter() {
+        // Keep this stream byte-for-byte compatible with the pre-existing
+        // local generation. The portable identity below deliberately uses
+        // framed, slash-normalized paths instead.
+        generation_hasher.update([0]);
+        generation_hasher.update(file.rel_path().to_string_lossy().as_bytes());
+        generation_hasher.update([0]);
+
+        content_hasher.update([1]);
+        let rel_path = brokk_bifrost_analysis::path_utils::rel_path_string(file);
+        update_framed(&mut content_hasher, rel_path.as_bytes());
         match project.read_source_snapshot(file) {
-            Ok(source) => hasher.update(source.source().as_bytes()),
+            Ok(source) => {
+                let source = source.source().as_bytes();
+                generation_hasher.update(source);
+                update_framed(&mut content_hasher, source);
+            }
             // A file skipped at open time for binary content still exists in
             // the workspace. Its path plus a fixed marker participate in the
             // generation so adding, removing, or renaming such a file changes
             // the generation even though its content is never analyzed.
             Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
-                hasher.update(b"<unsupported-file-content>");
+                let marker = b"<unsupported-file-content>";
+                generation_hasher.update(marker);
+                update_framed(&mut content_hasher, marker);
             }
             Err(error) => {
                 return Err(ExtensionWorkspaceError::Project(
@@ -1035,9 +1120,21 @@ fn generation_for(
             }
         }
     }
-    Ok(WorkspaceGeneration::new(
-        StableDigest::parse(format!("{:x}", hasher.finalize())).expect("SHA-256 is canonical"),
-    ))
+    Ok(WorkspaceIdentities {
+        generation: WorkspaceGeneration::new(
+            StableDigest::parse(format!("{:x}", generation_hasher.finalize()))
+                .expect("SHA-256 is canonical"),
+        ),
+        content_identity: WorkspaceContentIdentity::new(
+            StableDigest::parse(format!("{:x}", content_hasher.finalize()))
+                .expect("SHA-256 is canonical"),
+        ),
+    })
+}
+
+fn update_framed(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
 }
 /// Diagnostic for a workspace file skipped at open time because its content
 /// is not valid UTF-8 (binary assets, mixed-encoding files). The span is
@@ -1267,7 +1364,7 @@ pub struct StructuralResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brokk_bifrost_analysis::analyzer::structural::StructuralSearchProvider;
+    use brokk_bifrost_analysis::analyzer::structural::StructuralFactProvider;
     use std::{
         path::Path,
         time::{Duration, Instant},
@@ -1290,8 +1387,36 @@ mod tests {
         ExtensionWorkspace::open(options).unwrap()
     }
 
-    fn provider(workspace: &ExtensionWorkspace) -> &dyn StructuralSearchProvider {
-        workspace.analyzer.analyzer().structural_search_providers()[0]
+    fn legacy_generation_for(
+        workspace: &ExtensionWorkspace,
+        config: &AnalyzerConfig,
+    ) -> WorkspaceGeneration {
+        let mut hasher = Sha256::new();
+        hasher.update(b"brokk-bifrost-extension-workspace-generation-v1\0");
+        hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
+        hasher.update(EXTENSION_API_VERSION.major.to_le_bytes());
+        hasher.update(format!("{config:?}").as_bytes());
+        let project = workspace.analyzer.analyzer().project();
+        hasher.update(project.root().to_string_lossy().as_bytes());
+        for file in project.all_files_shared().unwrap().iter() {
+            hasher.update([0]);
+            hasher.update(file.rel_path().to_string_lossy().as_bytes());
+            hasher.update([0]);
+            match project.read_source_snapshot(file) {
+                Ok(source) => hasher.update(source.source().as_bytes()),
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                    hasher.update(b"<unsupported-file-content>");
+                }
+                Err(error) => panic!("unexpected source read error: {error}"),
+            }
+        }
+        WorkspaceGeneration::new(
+            StableDigest::parse(format!("{:x}", hasher.finalize())).expect("SHA-256 is canonical"),
+        )
+    }
+
+    fn provider(workspace: &ExtensionWorkspace) -> &dyn StructuralFactProvider {
+        workspace.analyzer.analyzer().structural_fact_providers()[0]
     }
 
     fn commit_all(repo: &git2::Repository) {
@@ -1321,6 +1446,59 @@ mod tests {
         assert!(
             !root.join(".bifrost").exists(),
             "an ephemeral open must not create an on-disk cache"
+        );
+    }
+
+    #[test]
+    fn content_identity_is_portable_and_tracks_source_and_configuration() {
+        let temp = tempfile::tempdir().unwrap();
+        let first_root = temp.path().join("first");
+        let second_root = temp.path().join("second");
+        std::fs::create_dir_all(&first_root).unwrap();
+        std::fs::create_dir_all(&second_root).unwrap();
+        write_project(&first_root);
+        write_project(&second_root);
+
+        let first_root = first_root.canonicalize().unwrap();
+        let second_root = second_root.canonicalize().unwrap();
+        let first = open(&first_root, false);
+        let second = open(&second_root, false);
+        assert_ne!(first.generation(), second.generation());
+        assert_eq!(first.content_identity(), second.content_identity());
+        let description = first.describe();
+        assert_eq!(&description.content_identity, first.content_identity());
+
+        std::fs::write(
+            first_root.join("app.ts"),
+            "export function answer() { return 43; }\n",
+        )
+        .unwrap();
+        let source_changed = open(&first_root, false);
+        assert_ne!(first.content_identity(), source_changed.content_identity());
+
+        let mut options = ExtensionWorkspaceOptions::new(&second_root);
+        options.analyzer_config.dispatch_hierarchy_expansion =
+            brokk_bifrost_analysis::analyzer::DispatchHierarchyExpansion::CONCRETE_OVERRIDES;
+        let configuration_changed = ExtensionWorkspace::open(options).unwrap();
+        assert_ne!(
+            second.content_identity(),
+            configuration_changed.content_identity()
+        );
+    }
+
+    #[test]
+    fn generation_preserves_the_legacy_byte_stream() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        write_project(&root);
+        let config = AnalyzerConfig::default();
+        let mut options = ExtensionWorkspaceOptions::new(&root);
+        options.analyzer_config = config.clone();
+        let workspace = ExtensionWorkspace::open(options).unwrap();
+
+        assert_eq!(
+            workspace.generation(),
+            &legacy_generation_for(&workspace, &config)
         );
     }
 

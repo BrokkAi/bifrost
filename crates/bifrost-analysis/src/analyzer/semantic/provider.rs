@@ -17,7 +17,7 @@ define_work_dimensions! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub enum SemanticBudgetDimension;
     /// Work performed or limits applied while materializing semantic facts.
-    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
     pub struct SemanticWork;
     all: pub [16];
     SourceBytes => source_bytes = 16 * 1024 * 1024,
@@ -41,12 +41,12 @@ define_work_dimensions! {
 impl SemanticWork {
     /// Add work conservatively, using a uniformly maximal sentinel if any
     /// dimension overflows.
-    pub(crate) fn conservative_add(self, other: Self) -> Self {
+    pub fn conservative_add(self, other: Self) -> Self {
         self.checked_add(other)
             .unwrap_or_else(|| Self::uniform(usize::MAX))
     }
 
-    pub(crate) fn component_max(self, other: Self) -> Self {
+    pub fn component_max(self, other: Self) -> Self {
         Self {
             source_bytes: self.source_bytes.max(other.source_bytes),
             procedures: self.procedures.max(other.procedures),
@@ -198,14 +198,14 @@ impl SemanticBudget {
 
     /// Whether this budget has already been charged one artifact's full
     /// retained-row census.
-    pub(crate) fn has_charged_artifact(&self, artifact: StableDigest) -> bool {
+    pub fn has_charged_artifact(&self, artifact: StableDigest) -> bool {
         self.charged_artifacts.contains(&artifact)
     }
 
     /// Record that this budget has paid one artifact's full retained-row
     /// census, so a later cache hit on the same artifact is charged as the
     /// lookup it is.
-    pub(crate) fn record_charged_artifact(&mut self, artifact: StableDigest) {
+    pub fn record_charged_artifact(&mut self, artifact: StableDigest) {
         if self.charged_artifacts.contains(&artifact) {
             return;
         }
@@ -213,7 +213,7 @@ impl SemanticBudget {
     }
 
     #[cfg(test)]
-    pub(crate) fn charged_artifact_count(&self) -> usize {
+    pub fn charged_artifact_count(&self) -> usize {
         self.charged_artifacts.len()
     }
 }
@@ -254,7 +254,7 @@ struct SemanticExecutionBudgetState {
 /// another slot, so two ledgers with equal remaining counts are not
 /// behaviorally interchangeable.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct SemanticExecutionBudgetSnapshot {
+pub struct SemanticExecutionBudgetSnapshot {
     max_materialized_files: usize,
     max_traversal_steps: usize,
     materialized_files: Box<[ProjectFile]>,
@@ -281,7 +281,7 @@ impl SemanticExecutionBudgetSnapshot {
         }
     }
 
-    pub(crate) fn retained_bytes(&self) -> usize {
+    pub fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
             .saturating_add(std::mem::size_of_val(self.materialized_files.as_ref()))
     }
@@ -289,7 +289,7 @@ impl SemanticExecutionBudgetSnapshot {
 
 /// Provider-execution work that an exact cached result must replay.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SemanticExecutionBudgetCharge {
+pub struct SemanticExecutionBudgetCharge {
     materialized_files: Box<[ProjectFile]>,
     externally_materialized_files: usize,
     traversal_steps: usize,
@@ -297,7 +297,7 @@ pub(crate) struct SemanticExecutionBudgetCharge {
 }
 
 impl SemanticExecutionBudgetCharge {
-    pub(crate) fn retained_bytes(&self) -> usize {
+    pub fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
             .saturating_add(std::mem::size_of_val(self.materialized_files.as_ref()))
     }
@@ -335,12 +335,12 @@ impl SemanticExecutionBudget {
         }
     }
 
-    pub(crate) fn snapshot(&self) -> SemanticExecutionBudgetSnapshot {
+    pub fn snapshot(&self) -> SemanticExecutionBudgetSnapshot {
         let state = self.state.lock().expect("semantic execution budget lock");
         SemanticExecutionBudgetSnapshot::from_state(&state)
     }
 
-    pub(crate) fn charge_since(
+    pub fn charge_since(
         &self,
         before: &SemanticExecutionBudgetSnapshot,
     ) -> Option<SemanticExecutionBudgetCharge> {
@@ -382,7 +382,7 @@ impl SemanticExecutionBudget {
     }
 
     /// Atomically reproduce provider work from an exact cached solve.
-    pub(crate) fn replay_charge(
+    pub fn replay_charge(
         &self,
         expected_before: &SemanticExecutionBudgetSnapshot,
         charge: &SemanticExecutionBudgetCharge,
@@ -434,7 +434,7 @@ impl SemanticExecutionBudget {
             .saturating_sub(state.traversal_steps)
     }
 
-    pub(crate) fn admit_materialization(&self, file: &ProjectFile) -> bool {
+    pub fn admit_materialization(&self, file: &ProjectFile) -> bool {
         let mut state = self.state.lock().expect("semantic execution budget lock");
         if state.materialized_files.contains(file) {
             return true;
@@ -638,7 +638,7 @@ impl<'a> SemanticRequest<'a> {
         }
     }
 
-    pub(crate) fn staged<'b>(&self, budget: &'b mut SemanticBudget) -> SemanticRequest<'b>
+    pub fn staged<'b>(&self, budget: &'b mut SemanticBudget) -> SemanticRequest<'b>
     where
         'a: 'b,
     {
@@ -649,17 +649,17 @@ impl<'a> SemanticRequest<'a> {
         }
     }
 
-    pub(crate) fn execution_budget(&self) -> Option<&SemanticExecutionBudget> {
+    pub fn execution_budget(&self) -> Option<&SemanticExecutionBudget> {
         self.execution.as_ref()
     }
 
-    pub(crate) fn admit_materialization(&self, file: &ProjectFile) -> bool {
+    pub fn admit_materialization(&self, file: &ProjectFile) -> bool {
         self.execution
             .as_ref()
             .is_none_or(|execution| execution.admit_materialization(file))
     }
 
-    pub(crate) fn charge_execution_traversal(&self, steps: usize) -> bool {
+    pub fn charge_execution_traversal(&self, steps: usize) -> bool {
         self.execution
             .as_ref()
             .is_none_or(|execution| execution.charge_traversal(steps))
@@ -735,7 +735,7 @@ pub struct SemanticArtifactSourceSnapshot {
 }
 
 impl SemanticArtifactSourceSnapshot {
-    pub(crate) fn new(key: SemanticArtifactKey, source: Arc<str>) -> Self {
+    pub fn new(key: SemanticArtifactKey, source: Arc<str>) -> Self {
         Self { key, source }
     }
 
@@ -749,7 +749,7 @@ impl SemanticArtifactSourceSnapshot {
         &self.source
     }
 
-    pub(crate) fn into_parts(self) -> (SemanticArtifactKey, Arc<str>) {
+    pub fn into_parts(self) -> (SemanticArtifactKey, Arc<str>) {
         (self.key, self.source)
     }
 }

@@ -29,7 +29,7 @@ use crate::graph::resolver::{
     node_text, object_initializer_for_label, object_initializer_owner_type_node,
     reference_type_text, resolve_arity_free_type_fq_name_at, resolve_type_fq_name_at,
     resolve_unqualified_method_group_for_owner, same_node, unqualified_member_has_local_binding,
-    unqualified_member_has_structured_shadow, usage_direct_base,
+    unqualified_member_has_structured_shadow, usage_class_field_receiver_type, usage_direct_base,
     usage_member_declared_type_fq_name, usage_method_return_type_fq_name_for_arity,
     usage_relational_generic_call_has_type_argument, usage_unqualified_value_member_shadows_type,
     usage_visible_extension_method_candidates,
@@ -42,17 +42,19 @@ use crate::syntax::{
     csharp_member_access_type_receiver, csharp_member_name, csharp_named_argument_label,
     csharp_nameof_type_candidates, csharp_relational_generic_call,
     csharp_relational_generic_call_for_argument, csharp_type_leftmost_identifier,
-    csharp_type_reference_root, csharp_unqualified_invocation_for_name,
+    csharp_type_reference_root, csharp_type_terminal_identifier,
+    csharp_unqualified_invocation_for_name,
 };
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::usages::inverted_edges::{
     ClassRangeIndex, FileEdgeScanInput, PerFileEdges, classify_reference_node, first_precise,
 };
 use brokk_bifrost_core::analyzer::usages::local_inference::{
-    LocalInferenceConfig, LocalInferenceEngine,
+    LocalInferenceConfig, LocalInferenceEngine, SymbolResolution,
 };
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::hash::HashMap;
+use std::sync::Arc;
 use tree_sitter::Node;
 
 /// One file's `caller -> callee` edges, for the whole-workspace inverted pass.
@@ -74,6 +76,7 @@ pub fn scan_file(
         file,
         source: input.source,
         class_ranges: ClassRangeIndex::build(graph.index, file),
+        using_aliases: csharp.using_aliases_of(file),
         method_group_cache: HashMap::default(),
         member_cache: HashMap::default(),
         extension_cache: HashMap::default(),
@@ -91,6 +94,7 @@ struct CsScan<'a> {
     file: &'a ProjectFile,
     source: &'a str,
     class_ranges: ClassRangeIndex,
+    using_aliases: Arc<HashMap<String, String>>,
     method_group_cache: HashMap<(String, String), UnqualifiedMethodGroupResolution>,
     member_cache: HashMap<MemberCacheKey, Vec<String>>,
     extension_cache: HashMap<ExtensionCacheKey, Vec<String>>,
@@ -102,6 +106,52 @@ type ExtensionCacheKey = (String, String, usize, Option<usize>, usize, usize);
 type MemberCacheKey = (String, String, Option<usize>, Option<usize>);
 
 impl CsScan<'_> {
+    /// Reject a terminal that cannot name any requested callee before entering
+    /// the type/member resolver. Rooted scans intentionally leave this open.
+    fn may_match_terminal(&self, name: &str) -> bool {
+        self.input.may_match_terminal(name)
+    }
+
+    /// Type aliases do not repeat their target's terminal in the source. Admit
+    /// an alias only when its structured target is one of the requested nodes;
+    /// a coincidentally matching alias spelling must not widen the candidate
+    /// set to an unrelated declaration.
+    fn may_match_type_candidate(&self, candidate: Node<'_>) -> bool {
+        let Some(terminal) = csharp_type_terminal_identifier(candidate) else {
+            // An unfamiliar structured type shape is retained conservatively.
+            return true;
+        };
+        let name = node_text(terminal, self.source);
+        if name.is_empty() {
+            return true;
+        }
+        self.using_aliases.get(name).map_or_else(
+            || self.may_match_terminal(name),
+            |target| self.input.is_node(target),
+        )
+    }
+
+    /// Attributes can use the source spelling without the declaration's
+    /// `Attribute` suffix, so check both structured spellings before hierarchy
+    /// resolution. Attribute aliases still require their exact target node.
+    fn may_match_attribute_name(&self, name: Node<'_>) -> bool {
+        let Some(terminal) = csharp_type_terminal_identifier(name) else {
+            return true;
+        };
+        let raw_name = node_text(terminal, self.source);
+        if raw_name.is_empty() {
+            return true;
+        }
+        if let Some(target) = self.using_aliases.get(raw_name) {
+            return self.input.is_node(target);
+        }
+        let candidates = csharp_attribute_type_names(name, self.source);
+        candidates.is_empty()
+            || candidates
+                .iter()
+                .any(|candidate| self.may_match_terminal(candidate))
+    }
+
     /// Resolve a type reference's text to its fqn via lexical scope, then visible types.
     fn resolve_type_fqn_at(
         &self,
@@ -156,6 +206,9 @@ impl CsScan<'_> {
         explicit_generic_arity: Option<usize>,
         same_owner: bool,
     ) {
+        if !self.may_match_terminal(name) {
+            return;
+        }
         let key = (
             owner_fqn.to_string(),
             name.to_string(),
@@ -318,8 +371,13 @@ fn record_reference(
     ctx: &mut CsScan<'_>,
     bindings: &LocalInferenceEngine<String>,
 ) {
-    let recovered_method_group =
-        csharp_relational_generic_call_for_argument(node).is_some_and(|call| {
+    let recovered_method_group = csharp_relational_generic_call_for_argument(node)
+        .filter(|call| {
+            csharp_member_name(call.member_access).is_none_or(|member| {
+                ctx.may_match_terminal(node_text(member.identifier, ctx.source))
+            })
+        })
+        .is_some_and(|call| {
             usage_relational_generic_call_has_type_argument(
                 call,
                 ctx.graph,
@@ -355,6 +413,9 @@ fn record_reference(
             let Some(name) = node.child_by_field_name("name") else {
                 return;
             };
+            if !ctx.may_match_attribute_name(name) {
+                return;
+            }
             let names = csharp_attribute_type_names(name, ctx.source);
             for candidate in hierarchy::usage_unambiguous_attribute_type_candidates(
                 ctx.csharp, token, ctx.file, &names,
@@ -374,6 +435,9 @@ fn record_reference(
                 // `name:` label names a parameter, which is not a declaration.
                 if let CSharpNamedArgumentLabel::AttributeMember { attribute_name } = shape {
                     let name = node_text(node, ctx.source);
+                    if !ctx.may_match_terminal(name) {
+                        return;
+                    }
                     let names = csharp_attribute_type_names(attribute_name, ctx.source);
                     let owners = hierarchy::usage_unambiguous_attribute_type_candidates(
                         ctx.csharp, token, ctx.file, &names,
@@ -401,6 +465,7 @@ fn record_reference(
             {
                 let name = node_text(node, ctx.source);
                 if let Some(type_node) = object_initializer_owner_type_node(initializer)
+                    && ctx.may_match_terminal(name)
                     && let Some(owner) = ctx.resolve_type_fqn_at(
                         token,
                         &reference_type_text(type_node, ctx.source),
@@ -420,6 +485,7 @@ fn record_reference(
                 let name = node_text(node, ctx.source);
                 if unqualified_member_has_local_binding(node, ctx.source, bindings)
                     || unqualified_member_has_structured_shadow(node, ctx.source)
+                    || !ctx.may_match_terminal(name)
                 {
                     return;
                 }
@@ -453,7 +519,9 @@ fn record_reference(
                         return;
                     };
                     let name = node_text(node, ctx.source).to_string();
-                    if unqualified_member_has_local_binding(node, ctx.source, bindings) {
+                    if unqualified_member_has_local_binding(node, ctx.source, bindings)
+                        || !ctx.may_match_terminal(&name)
+                    {
                         return;
                     }
                     let key = (owner_fqn.clone(), name.clone());
@@ -495,6 +563,9 @@ fn record_reference(
                 }
                 return;
             }
+            if !ctx.may_match_type_candidate(node) {
+                return;
+            }
             let reference = reference_type_text(node, ctx.source);
             if let Some(fqn) = ctx.resolve_type_fqn_at(token, &reference, node) {
                 ctx.record(fqn, node);
@@ -516,6 +587,9 @@ fn record_reference(
             };
             let name = node_text(name_shape.identifier, ctx.source);
             if name.is_empty() {
+                return;
+            }
+            if !ctx.may_match_terminal(name) {
                 return;
             }
             if let Some(owner) = receiver_type_fqn(receiver, token, ctx, bindings) {
@@ -571,6 +645,9 @@ fn record_structured_type_candidate(
     ctx: &mut CsScan<'_>,
     bindings: &LocalInferenceEngine<String>,
 ) -> bool {
+    if !ctx.may_match_type_candidate(candidate) {
+        return false;
+    }
     let Some(reference) =
         structured_type_candidate_reference(candidate, token, reject_value_receiver, ctx, bindings)
     else {
@@ -590,6 +667,9 @@ fn record_arity_free_type_candidate(
     ctx: &mut CsScan<'_>,
     bindings: &LocalInferenceEngine<String>,
 ) -> bool {
+    if !ctx.may_match_type_candidate(candidate) {
+        return false;
+    }
     let Some(reference) =
         structured_type_candidate_reference(candidate, token, true, ctx, bindings)
     else {
@@ -686,15 +766,16 @@ fn receiver_type_fqn(
     match receiver.kind() {
         "identifier" => {
             let name = node_text(receiver, ctx.source);
-            // A typed local resolves to its type; otherwise the name may be a
-            // class field/property or a static type, unless it is shadowed.
-            first_precise(bindings, name).or_else(|| {
-                if bindings.is_shadowed(name) {
-                    return None;
+            // A typed local or nearest inherited member wins over the type
+            // namespace. An ambiguous value binding must not fall through to
+            // a same-named visible static type.
+            match unqualified_value_type_fqn(receiver, token, name, ctx, bindings) {
+                SymbolResolution::Precise(targets) if targets.len() == 1 => {
+                    targets.into_iter().next()
                 }
-                enclosing_member_type_fqn(receiver, token, name, ctx)
-                    .or_else(|| ctx.resolve_type_fqn_at(token, name, receiver))
-            })
+                SymbolResolution::Unknown => ctx.resolve_type_fqn_at(token, name, receiver),
+                SymbolResolution::Precise(_) | SymbolResolution::Ambiguous => None,
+            }
         }
         "this" => ctx
             .enclosing_class(receiver.start_byte())
@@ -916,25 +997,34 @@ fn expression_type_fqn(
         }
         "identifier" => {
             let name = node_text(expression, ctx.source);
-            first_precise(bindings, name).or_else(|| {
-                (!bindings.is_shadowed(name))
-                    .then(|| enclosing_member_type_fqn(expression, token, name, ctx))
-                    .flatten()
-            })
+            match unqualified_value_type_fqn(expression, token, name, ctx, bindings) {
+                SymbolResolution::Precise(targets) if targets.len() == 1 => {
+                    targets.into_iter().next()
+                }
+                SymbolResolution::Precise(_)
+                | SymbolResolution::Ambiguous
+                | SymbolResolution::Unknown => None,
+            }
         }
         _ => None,
     }
 }
 
-fn enclosing_member_type_fqn(
+fn unqualified_value_type_fqn(
     node: Node<'_>,
     token: QueryToken<'_>,
     name: &str,
     ctx: &CsScan<'_>,
-) -> Option<String> {
-    let owner_fqn = ctx.enclosing_class(node.start_byte())?;
-    let owner = class_unit_for_fq_name(ctx.csharp, token, owner_fqn)?;
-    usage_member_declared_type_fq_name(ctx.csharp, token, &owner, name)
+    bindings: &LocalInferenceEngine<String>,
+) -> SymbolResolution<String> {
+    match bindings.resolve_symbol(name) {
+        SymbolResolution::Unknown if !bindings.is_shadowed(name) => {
+            usage_class_field_receiver_type(
+                node, name, ctx.graph, ctx.csharp, token, ctx.file, ctx.source,
+            )
+        }
+        resolution => resolution,
+    }
 }
 
 fn invocation_return_type_fqn(

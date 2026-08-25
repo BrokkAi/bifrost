@@ -23,9 +23,6 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use brokk_bifrost_analysis::analyzer::dataflow::{
-    DataflowRequest, SemanticInputStatus, SolverBudget, SolverTermination, UnmodeledCallBehavior,
-};
 use brokk_bifrost_analysis::analyzer::semantic::{
     CallBindings, CallSiteId, CancellationToken, DeclarationLocator, DeclarationSegmentKind,
     DispatchBoundaryKind, DispatchOracle, EvidenceCompleteness, OracleCallContext, ProcedureHandle,
@@ -37,13 +34,16 @@ use brokk_bifrost_analysis::analyzer::semantic::{
 use brokk_bifrost_analysis::analyzer::semantic_model::{
     AuthoredSummaryExitKind, AuthoredSummaryInput, AuthoredSummaryOutput, AuthoredSummaryTransfer,
 };
-use brokk_bifrost_analysis::analyzer::value_flow::{
+use brokk_bifrost_analysis::analyzer::{
+    AnalyzerConfig, FilesystemProject, Language, Project, ProjectFile, Range, WorkspaceAnalyzer,
+};
+use brokk_bifrost_flow::dataflow::{
+    DataflowRequest, SemanticInputStatus, SolverBudget, SolverTermination, UnmodeledCallBehavior,
+};
+use brokk_bifrost_flow::value_flow::{
     ValueFlowCarrier, ValueFlowCarrierKey, ValueFlowEventKey, ValueFlowEventKind, ValueFlowInput,
     ValueFlowObservationPhase, ValueFlowPlan, ValueFlowPortKey, ValueFlowSelectorKey,
     ValueFlowSinkSpec, ValueFlowSourceSpec, solve_value_flow_with_summaries,
-};
-use brokk_bifrost_analysis::analyzer::{
-    AnalyzerConfig, FilesystemProject, Language, Project, ProjectFile, Range, WorkspaceAnalyzer,
 };
 
 use super::FoundryError;

@@ -35,9 +35,9 @@ pub(in crate::analyzer::usages) use brokk_bifrost_js_ts::syntax::compute_import_
 use crate::analyzer::js_ts::providers::resolve_js_ts_source;
 use crate::analyzer::usages::common::analyzed_files_for_language;
 use crate::analyzer::usages::inverted_edges::{
-    CallSite, JsTsScopedNodeStatus, JsTsScopedUsageEdges, UsageEdgeBuildOutput, UsageEdgeWeights,
-    UsageEdges, UsageNodeKey, build_edge_output, build_edge_weights, collect_file_edges,
-    parse_and_collect,
+    CallSite, EdgeNodeDomain, JsTsScopedNodeStatus, JsTsScopedUsageEdges, UsageEdgeBuildOutput,
+    UsageEdgeWeights, UsageEdges, UsageNodeKey, build_edge_output, build_edge_weights,
+    collect_file_edges, parse_and_collect_with_domain,
 };
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{
@@ -83,13 +83,10 @@ fn js_ts_hosts(analyzer: &dyn IAnalyzer) -> JsTsHosts<'_> {
     )
 }
 
-/// Build the whole JS/TS `caller -> callee` edge set in a single inverted pass per
-/// language present, merging TypeScript and JavaScript. Returns `None` when the
-/// workspace has no JS/TS files. `nodes`/`keep_file` mirror the Go builder.
-pub(crate) fn build_jsts_usage_edges<F>(
+pub(crate) fn build_rooted_jsts_usage_edges<F>(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
-    nodes: &HashSet<String>,
+    callers: &HashSet<String>,
     keep_file: F,
 ) -> Option<UsageEdges>
 where
@@ -101,7 +98,7 @@ where
             let _ = prewarm_cached_jsts_index(analyzer, language);
         }
     }
-    Some(resolver.build_edges(analyzer, token, nodes, keep_file))
+    Some(resolver.build_rooted_edges(analyzer, token, callers, keep_file))
 }
 
 /// Borrow the analyzer-cached [`JsTsUsageIndex`] for `language` off the concrete TS/JS
@@ -217,11 +214,24 @@ impl JsTsEdgeResolver {
         has_jsts.then_some(Self)
     }
 
-    pub(crate) fn build_edges<F>(
+    pub(crate) fn build_rooted_edges<F>(
         &self,
         analyzer: &dyn IAnalyzer,
         token: QueryToken<'_>,
-        nodes: &HashSet<String>,
+        callers: &HashSet<String>,
+        keep_file: F,
+    ) -> UsageEdges
+    where
+        F: Fn(&ProjectFile) -> bool + Sync,
+    {
+        self.build_edges_with_domain(analyzer, token, EdgeNodeDomain::Rooted(callers), keep_file)
+    }
+
+    fn build_edges_with_domain<F>(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        token: QueryToken<'_>,
+        domain: EdgeNodeDomain<'_>,
         keep_file: F,
     ) -> UsageEdges
     where
@@ -237,7 +247,7 @@ impl JsTsEdgeResolver {
                 continue;
             }
             let result: UsageEdges =
-                build_jsts_edges(analyzer, token, &hosts, language, nodes, &keep_file);
+                build_jsts_edges(analyzer, token, &hosts, language, domain, &keep_file);
             for (key, sites) in result.edges {
                 edges.entry(key).or_default().extend(sites);
             }
@@ -270,7 +280,7 @@ fn build_jsts_edges<Output, F>(
     token: QueryToken<'_>,
     hosts: &JsTsHosts<'_>,
     language: Language,
-    nodes: &HashSet<String>,
+    domain: EdgeNodeDomain<'_>,
     keep_file: F,
 ) -> Output
 where
@@ -292,12 +302,12 @@ where
         // declaration pass. Receiver analysis can consult the analyzer-cached
         // resolution index, so it is pre-materialized before this parallel scan.
         let parser_language = js_ts_tree_sitter_language_for_file(file, language)?;
-        parse_and_collect(
+        parse_and_collect_with_domain(
             analyzer,
             file,
-            nodes,
+            domain,
             ParseSpec::whole(&parser_language),
-            |input| inverted::scan_file(host, token, analyzer, language, file, nodes, input),
+            |input| inverted::scan_file(host, token, analyzer, language, file, input),
         )
     })
 }

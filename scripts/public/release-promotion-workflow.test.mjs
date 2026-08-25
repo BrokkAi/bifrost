@@ -67,6 +67,11 @@ function jobBlock(workflow, job) {
   return nextJob === -1 ? afterStart : afterStart.slice(0, nextJob);
 }
 
+function stepBlocks(job) {
+  const starts = [...job.matchAll(/^      - name: [^\n]+$/gmu)].map((match) => match.index);
+  return starts.map((start, index) => job.slice(start, starts[index + 1] ?? job.length));
+}
+
 test("release triggers stay independent from source projection", () => {
   assert.match(release, /^  push:\n    tags:/mu);
   assert.match(release, /^  workflow_dispatch:/mu);
@@ -255,10 +260,6 @@ test("publisher dependency order and protected identities remain explicit", () =
       /^    needs: \[release-context, promote-qualification, publish-crate-core\]$/mu,
     );
   }
-  assert.match(
-    jobBlock(release, "publish-crate-rql"),
-    /^    needs: \[release-context, promote-qualification, publish-crate-core\]$/mu,
-  );
   const analysisBlock = jobBlock(release, "publish-crate-analysis");
   const analysisNeeds = analysisBlock.match(/^    needs: \[([^\]]*)\]$/mu);
   assert.ok(analysisNeeds, "analysis crate must declare a dependency list");
@@ -268,23 +269,32 @@ test("publisher dependency order and protected identities remain explicit", () =
     "promote-qualification",
     "publish-crate-core",
     ...languageCrates.map((language) => `publish-crate-${language}`),
-    "publish-crate-rql",
   ]) {
     assert.equal(analysisDependencies.has(dependency), true, `analysis crate must wait for ${dependency}`);
   }
-  for (const sibling of ["policy", "nlp", "semantic-packs"]) {
+  for (const sibling of ["flow", "nlp"]) {
     assert.match(
       jobBlock(release, `publish-crate-${sibling}`),
       /^    needs: \[release-context, promote-qualification, publish-crate-analysis\]$/mu,
     );
   }
+  for (const sibling of ["rql", "semantic-packs"]) {
+    assert.match(
+      jobBlock(release, `publish-crate-${sibling}`),
+      /^    needs: \[release-context, promote-qualification, publish-crate-flow, publish-crate-nlp\]$/mu,
+    );
+  }
+  assert.match(
+    jobBlock(release, "publish-crate-policy"),
+    /^    needs: \[release-context, promote-qualification, publish-crate-rql, publish-crate-semantic-packs\]$/mu,
+  );
   assert.match(
     jobBlock(release, "publish-crate-runtime"),
     /^    needs: \[release-context, promote-qualification, publish-crate-policy\]$/mu,
   );
   assert.match(
     jobBlock(release, "publish-crate-mcp"),
-    /^    needs: \[release-context, promote-qualification, publish-crate-runtime, publish-crate-nlp\]$/mu,
+    /^    needs: \[release-context, promote-qualification, publish-crate-runtime\]$/mu,
   );
   assert.match(
     jobBlock(release, "publish-crate-lsp"),
@@ -292,7 +302,7 @@ test("publisher dependency order and protected identities remain explicit", () =
   );
   assert.match(
     jobBlock(release, "publish-crate-facade"),
-    /^    needs: \[release-context, promote-qualification, publish-crate-mcp, publish-crate-lsp, publish-crate-semantic-packs, publish-crate-nlp\]$/mu,
+    /^    needs: \[release-context, promote-qualification, publish-crate-mcp, publish-crate-lsp\]$/mu,
   );
   assert.match(cratePublisher, /^      id-token:\s*write$/mu);
   assert.match(cratePublisher, /crates-io-auth-action/u);
@@ -542,6 +552,28 @@ readinessTest("release readiness creates and verifies a retained commit/version 
   const qualificationName = readiness.match(/^\s*name:\s*[^\n]*qualification[^\n]*$/imu)?.[0] ?? "";
   assert.match(qualificationName, /(?:commit|sha)/iu);
   assert.match(qualificationName, /version/iu);
+});
+
+readinessTest("requalification verifies the source bundle before relabeling it", () => {
+  const requalify = jobBlock(readiness, "requalify");
+  const steps = stepBlocks(requalify);
+  const verifyIndex = steps.findIndex((step) => /release-qualification\.mjs verify/u.test(step));
+  const removeManifestIndex = steps.findIndex((step) => /rm -f qualification-bundle\/release-qualification\.json/u.test(step));
+  const regenerateManifestIndex = steps.findIndex((step) => /release-qualification\.mjs manifest/u.test(step));
+
+  assert.notEqual(verifyIndex, -1, "expected source qualification verification in requalify job");
+  assert.notEqual(removeManifestIndex, -1, "expected source manifest removal in requalify job");
+  assert.notEqual(regenerateManifestIndex, -1, "expected source manifest regeneration in requalify job");
+  assert.ok(verifyIndex < removeManifestIndex, "source verification must precede manifest removal");
+  assert.ok(verifyIndex < regenerateManifestIndex, "source verification must precede manifest regeneration");
+
+  const verifyStep = steps[verifyIndex];
+  assert.match(verifyStep, /SOURCE_COMMIT: \$\{\{ steps\.source\.outputs\.source_commit \}\}/u);
+  assert.match(verifyStep, /--repository "\$PUBLIC_REPOSITORY"/u);
+  assert.match(verifyStep, /--commit "\$SOURCE_COMMIT"/u);
+  assert.match(verifyStep, /--version "\$RELEASE_VERSION"/u);
+  assert.match(verifyStep, /--run-id "\$SOURCE_RUN_ID"/u);
+  assert.match(requalify, /SOURCE_RUN_ID: \$\{\{ inputs\.requalify_from_run \}\}/u);
 });
 
 readinessTest("release readiness records Codex and Claude list_policies prepublish smoke evidence", () => {

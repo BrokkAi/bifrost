@@ -27,7 +27,9 @@ use crate::graph_support::{
     PythonSource, PythonUsageSource, export_index_from_file_facts, import_binder_from_imports,
     import_bindings_from_imports,
 };
-use crate::imports::{module_replacement_of, resolve_python_relative_module};
+use crate::imports::{
+    literal_importlib_modules, module_replacement_of, resolve_python_relative_module,
+};
 
 /// Re-export and reverse-import indices over the Python workspace.
 #[derive(Debug, Default)]
@@ -37,6 +39,7 @@ pub struct PythonUsageIndex {
     reexport_edges: HashMap<(ProjectFile, String), Vec<(ProjectFile, String)>>,
     star_reexports: HashMap<ProjectFile, Vec<ProjectFile>>,
     importer_reverse: HashMap<ProjectFile, Vec<ImportEdge>>,
+    literal_importlib_importers: HashMap<ProjectFile, Vec<ProjectFile>>,
     module_binding_timelines: Mutex<HashMap<ProjectFile, Arc<ModuleBindingTimeline>>>,
     scope_facts_by_file: Mutex<HashMap<ProjectFile, Arc<PythonScopeFacts>>>,
 }
@@ -95,6 +98,15 @@ fn is_sys_namespace_binding(binding: &ImportBinding) -> bool {
             == "sys"
 }
 
+fn is_importlib_namespace_binding(binding: &ImportBinding) -> bool {
+    binding.kind == ImportKind::Namespace
+        && binding
+            .namespace_imported_module
+            .as_deref()
+            .unwrap_or(&binding.module_specifier)
+            == "importlib"
+}
+
 impl PythonUsageIndex {
     /// Takes [`PythonSource`], not [`PythonUsageSource`]: the cell this
     /// build fills is only reachable through the latter, so the narrower
@@ -114,6 +126,8 @@ impl PythonUsageIndex {
         let mut binders_by_file: HashMap<ProjectFile, Arc<ImportBinder>> = HashMap::default();
         let mut import_bindings_by_file: HashMap<ProjectFile, Vec<(String, ImportBinding)>> =
             HashMap::default();
+        let mut literal_importlib_modules_by_file: HashMap<ProjectFile, HashSet<String>> =
+            HashMap::default();
         let mut replacement_modules: HashMap<ProjectFile, String> = HashMap::default();
         python.visit_file_facts(&files, &mut |file, facts| {
             let module_name = facts
@@ -132,6 +146,12 @@ impl PythonUsageIndex {
             if let Some(facts) = facts {
                 let import_bindings = import_bindings_from_imports(python, file, facts.imports());
                 let binder = Arc::new(import_binder_from_imports(python, file, facts.imports()));
+                if binder.bindings.values().any(is_importlib_namespace_binding) {
+                    literal_importlib_modules_by_file.insert(
+                        file.clone(),
+                        literal_importlib_modules(facts.source(), &binder.bindings),
+                    );
+                }
                 if binder.bindings.values().any(is_sys_namespace_binding)
                     && let Some(replacement) = module_replacement_of(python, file, facts.source())
                 {
@@ -152,11 +172,18 @@ impl PythonUsageIndex {
             } else {
                 exports_by_file.insert(file.clone(), python.export_index_of(file));
                 let binder = python.import_binder_of(file);
-                if binder.bindings.values().any(is_sys_namespace_binding)
-                    && let Ok(source) = python.project().read_source(file)
-                    && let Some(replacement) = module_replacement_of(python, file, &source)
-                {
-                    replacement_modules.insert(file.clone(), replacement.target_module);
+                if let Ok(source) = python.project().read_source(file) {
+                    if binder.bindings.values().any(is_importlib_namespace_binding) {
+                        literal_importlib_modules_by_file.insert(
+                            file.clone(),
+                            literal_importlib_modules(&source, &binder.bindings),
+                        );
+                    }
+                    if binder.bindings.values().any(is_sys_namespace_binding)
+                        && let Some(replacement) = module_replacement_of(python, file, &source)
+                    {
+                        replacement_modules.insert(file.clone(), replacement.target_module);
+                    }
                 }
                 let imports = python.import_info_of(token, file);
                 import_bindings_by_file.insert(
@@ -256,6 +283,22 @@ impl PythonUsageIndex {
             &import_bindings_by_file,
             &exports_by_file,
         );
+        let mut literal_importlib_importers: HashMap<ProjectFile, Vec<ProjectFile>> =
+            HashMap::default();
+        for (importer, modules) in literal_importlib_modules_by_file {
+            for module in modules {
+                for target_file in resolve_module(&module_index, &importer, &module) {
+                    literal_importlib_importers
+                        .entry(target_file.clone())
+                        .or_default()
+                        .push(importer.clone());
+                }
+            }
+        }
+        for importers in literal_importlib_importers.values_mut() {
+            importers.sort();
+            importers.dedup();
+        }
 
         Self {
             module_index,
@@ -263,6 +306,7 @@ impl PythonUsageIndex {
             reexport_edges,
             star_reexports,
             importer_reverse,
+            literal_importlib_importers,
             module_binding_timelines: Mutex::new(HashMap::default()),
             scope_facts_by_file: Mutex::new(HashMap::default()),
         }
@@ -342,15 +386,17 @@ impl PythonUsageIndex {
     ) -> HashSet<ProjectFile> {
         let mut importers = HashSet::default();
         for (target_file, _) in seeds {
-            let Some(edges) = self.importer_reverse.get(target_file) else {
-                continue;
-            };
-            importers.extend(
-                edges
-                    .iter()
-                    .filter(|edge| edge_matches_seed(edge, seeds))
-                    .map(|edge| edge.importer.clone()),
-            );
+            if let Some(edges) = self.importer_reverse.get(target_file) {
+                importers.extend(
+                    edges
+                        .iter()
+                        .filter(|edge| edge_matches_seed(edge, seeds))
+                        .map(|edge| edge.importer.clone()),
+                );
+            }
+            if let Some(dynamic_importers) = self.literal_importlib_importers.get(target_file) {
+                importers.extend(dynamic_importers.iter().cloned());
+            }
         }
         importers
     }

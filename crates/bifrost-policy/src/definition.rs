@@ -7,23 +7,19 @@
 use std::fmt;
 use std::str::FromStr;
 
-use brokk_bifrost_analysis::analyzer::dataflow::UnmodeledCallBehavior;
 use brokk_bifrost_analysis::analyzer::identifier::define_identifier;
 use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
-use brokk_bifrost_analysis::analyzer::structural::CodeQuery;
-use brokk_bifrost_analysis::analyzer::structural::flow_state::{FlowRelation, FlowStateAxis};
-use brokk_bifrost_analysis::analyzer::structural::materialization::{
-    DeclarationOrigin, GenerationKind,
-};
-use brokk_bifrost_analysis::analyzer::structural::occurrences::{
-    Namespace, OccurrenceClass, OccurrenceRole,
-};
-use brokk_bifrost_analysis::analyzer::structural::rewrite_path::RewriteDomainKind;
-use brokk_bifrost_analysis::analyzer::structural::{
-    BoundaryStatus, OwnerRelation, PrecedenceTier, RouteHopKind, SiteClass,
-};
 use brokk_bifrost_analysis::analyzer::usages::{ReferenceKind, UsageHitKind, UsageHitSurface};
 use brokk_bifrost_analysis::schema_version::SchemaVersionResolution;
+use brokk_bifrost_flow::dataflow::UnmodeledCallBehavior;
+use brokk_bifrost_flow::flow_state::{FlowRelation, FlowStateAxis};
+use brokk_bifrost_rql::structural::CodeQuery;
+use brokk_bifrost_rql::structural::materialization::{DeclarationOrigin, GenerationKind};
+use brokk_bifrost_rql::structural::occurrences::{Namespace, OccurrenceClass, OccurrenceRole};
+use brokk_bifrost_rql::structural::rewrite_path::RewriteDomainKind;
+use brokk_bifrost_rql::structural::{
+    BoundaryStatus, OwnerRelation, PrecedenceTier, RouteHopKind, SiteClass,
+};
 
 pub const POLICY_DOCUMENT_SCHEMA_VERSION: u32 = 1;
 
@@ -789,7 +785,7 @@ impl ResolutionAssert {
     /// assert for which no tier can, so the evaluator never runs a comparison
     /// whose verdict was fixed before it saw a row.
     pub fn is_satisfiable(&self) -> bool {
-        brokk_bifrost_analysis::analyzer::structural::ALL_PRECEDENCE_TIERS
+        brokk_bifrost_rql::structural::ALL_PRECEDENCE_TIERS
             .iter()
             .any(|tier| self.accepts(*tier))
     }

@@ -714,8 +714,8 @@ fn merge_manifests(
 mod tests {
     use super::*;
     use crate::{EndpointAnalysisProjectionHash, EndpointSemanticHash};
-    use brokk_bifrost_analysis::analyzer::structural::{CodeQuery, SCHEMA_VERSION};
     use brokk_bifrost_analysis::schema_version::{SchemaVersionOrigin, SchemaVersionResolution};
+    use brokk_bifrost_rql::structural::{CodeQuery, SCHEMA_VERSION};
 
     fn selector(name: &str) -> PolicySelector {
         PolicySelector::Inline {

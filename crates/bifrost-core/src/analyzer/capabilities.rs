@@ -30,6 +30,35 @@ pub trait ImportAnalysisProvider: CapabilityProvider + Send + Sync {
     fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>>;
     fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile>;
 
+    /// Return the union of files that reference any `target`, restricted to
+    /// the caller's candidate universe.
+    ///
+    /// A depth-bounded caller already knows both sets and must not be forced to
+    /// initialize a provider's whole-workspace reverse index once per target.
+    /// Providers with a structured batch representation can override this.
+    /// The default preserves the file-at-a-time result for every existing
+    /// provider.
+    fn referencing_files_of_targets(
+        &self,
+        targets: &HashSet<ProjectFile>,
+        candidates: &[ProjectFile],
+        cancellation: &CancellationToken,
+    ) -> HashSet<ProjectFile> {
+        let candidate_set: HashSet<ProjectFile> = candidates.iter().cloned().collect();
+        let mut referencing = HashSet::default();
+        for target in targets {
+            if cancellation.is_cancelled() {
+                break;
+            }
+            referencing.extend(
+                self.referencing_files_of(target)
+                    .into_iter()
+                    .filter(|file| candidate_set.contains(file)),
+            );
+        }
+        referencing
+    }
+
     /// Return import facts for a group of files without requiring each caller
     /// to hydrate a complete per-file analyzer state. `None` preserves the
     /// existing file-at-a-time behavior for providers without a bulk read model.

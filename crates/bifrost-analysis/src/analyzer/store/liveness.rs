@@ -1,16 +1,18 @@
+use std::collections::BTreeSet;
 use std::fs::Metadata;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
 use git2::{ObjectType, Oid, Repository};
-use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 
 use crate::analyzer::ProjectFile;
+use crate::analyzer::semantic::ids::StableDigest;
 use crate::gitblob;
 use crate::hash::{HashMap, map_with_capacity};
+use crate::path_utils::rel_path_string;
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -18,6 +20,8 @@ pub struct Liveness {
     repo: Mutex<Repository>,
     workdir: PathBuf,
     startup_identity: Mutex<Option<Arc<gitblob::WorkingTreeIdentity>>>,
+    #[cfg(test)]
+    startup_oid_batches: Arc<AtomicUsize>,
     snapshot: Mutex<Option<MemoizedSnapshot>>,
     overlay: Mutex<OverlayState>,
     /// Canonical form of each project root this handle has been asked about.
@@ -38,6 +42,8 @@ impl Liveness {
             repo: Mutex::new(repo),
             workdir,
             startup_identity: Mutex::new(None),
+            #[cfg(test)]
+            startup_oid_batches: Arc::new(AtomicUsize::new(0)),
             snapshot: Mutex::new(None),
             overlay: Mutex::new(OverlayState::default()),
             canonical_roots: Mutex::new(HashMap::default()),
@@ -69,6 +75,23 @@ impl Liveness {
     /// re-resolution -- `update_paths`, a watcher delta, `refresh` -- report
     /// the edited blob rather than the one the scan saw.
     pub fn oids_for_files(&self, files: &[ProjectFile]) -> Result<HashMap<ProjectFile, Oid>> {
+        Ok(self
+            .oids_and_stats_for_files(files)?
+            .into_iter()
+            .map(|(file, (oid, _stat))| (file, oid))
+            .collect())
+    }
+
+    /// Resolve a batch once and retain the filesystem observation paired with
+    /// each returned OID. Workspace startup uses this to avoid a separate
+    /// pre-stat and post-stat walk over the same files.
+    pub(crate) fn oids_and_stats_for_files(
+        &self,
+        files: &[ProjectFile],
+    ) -> Result<HashMap<ProjectFile, (Oid, FileStatStamp)>> {
+        #[cfg(test)]
+        self.startup_oid_batches
+            .fetch_add(1, AtomicOrdering::Relaxed);
         let identity = {
             let mut guard = self
                 .startup_identity
@@ -85,38 +108,30 @@ impl Liveness {
             )
         };
 
-        // Apache Camel has tens of thousands of Java files. Keep the lock only
-        // around the one-time Git scan, then let language analyzers project
-        // their file sets in parallel. Only requested dirty files are hashed,
-        // so an unreadable file elsewhere in the worktree (for example another
-        // process's live database) cannot fail this projection.
-        let planned = files
-            .par_iter()
-            .map(|file| {
-                let rel_path = self.rel_path_from_workdir(file)?;
-                // Git paths use forward slashes on every host. This conversion
-                // stays at the Git API boundary.
-                let rel = rel_path.to_string_lossy().replace('\\', "/");
-                let abs_path = self.workdir.join(&rel_path);
-                let repo = self.repo.lock().expect("liveness repo mutex poisoned");
-                if let Some(oid) = identity.clean_index_oid(&repo, &rel, &abs_path) {
-                    return Ok(Some((file.clone(), oid)));
-                }
-                // Dirty, untracked, ignored, or edited after the scan: the
-                // visible working bytes are the identity.
-                if !abs_path.is_file() {
-                    return Ok(None);
-                }
-                Oid::hash_file(ObjectType::Blob, &abs_path)
-                    .map(|oid| Some((file.clone(), oid)))
-                    .map_err(|err| err.to_string())
-            })
-            .collect::<Vec<Result<Option<(ProjectFile, Oid)>>>>();
-        let mut resolved = map_with_capacity(files.len());
-        for entry in planned {
-            if let Some((file, oid)) = entry? {
-                resolved.insert(file, oid);
-            }
+        // Apache Camel has tens of thousands of Java files. Keep the lock
+        // around one batched identity resolution, including its canonical blob
+        // size lookup, then let language analyzers consume the result. The
+        // returned metadata is converted to the analysis-layer opaque token
+        // without another filesystem stat.
+        let mut rel_paths = Vec::with_capacity(files.len());
+        for file in files {
+            let rel_path = self.rel_path_from_workdir(file)?;
+            rel_paths.push(rel_path.to_string_lossy().replace('\\', "/"));
+        }
+        let repo = self.repo.lock().expect("liveness repo mutex poisoned");
+        let batched = identity.resolve_with_metadata(&repo, &rel_paths)?;
+        let mut resolved = map_with_capacity(batched.len());
+        for (file, rel) in files.iter().zip(rel_paths) {
+            let Some(resolution) = batched.get(&rel) else {
+                continue;
+            };
+            resolved.insert(
+                file.clone(),
+                (
+                    resolution.oid,
+                    FileStatStamp(FileStat::from_metadata(&resolution.metadata)),
+                ),
+            );
         }
         Ok(resolved)
     }
@@ -146,6 +161,11 @@ impl Liveness {
             .startup_identity
             .lock()
             .expect("liveness startup identity mutex poisoned") = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn startup_oid_batch_counter(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.startup_oid_batches)
     }
 
     /// Full live view; rebuilt when the Git index bytes or overlay generation change.
@@ -324,6 +344,11 @@ struct IndexFingerprint {
 #[derive(Clone)]
 struct PathState {
     oid: Oid,
+    /// Whether the bytes named by `oid` came from an unsaved project overlay.
+    /// This provenance survives in a frozen snapshot after the mutable
+    /// `Project` overlay has moved on, and therefore decides whether readers
+    /// must prefer an in-memory file state over persisted rows.
+    is_overlay: bool,
     /// The stat this entry's *liveness* is checked against. `Some` means "a
     /// disk change invalidates this generation": the entry is dropped from a
     /// snapshot and refused by `validated_oid_for_path` once the file moves.
@@ -358,7 +383,8 @@ struct PathState {
 
 impl PartialEq for PathState {
     /// Deliberately ignores `validated`: it is build provenance, not part of
-    /// a path's live content, so two states that agree on `oid`/`stat` must
+    /// a path's live content, so two states that agree on
+    /// `oid`/`stat`/`is_overlay` must
     /// compare equal regardless of which one (if either) has been through a
     /// `LiveSnapshot` validation pass. `refresh`/`replace_all` rely on this
     /// to detect genuine content changes without being fooled into treating
@@ -368,6 +394,10 @@ impl PartialEq for PathState {
     /// way and documents the intent explicitly rather than relying on that
     /// invariant silently holding).
     ///
+    /// Overlay provenance is included even when the oid is unchanged. Equal
+    /// bytes do not make disk and an unsaved buffer interchangeable: readers
+    /// select different authoritative derived state for the two sources.
+    ///
     /// It ignores `capture_stat` for a related reason: a file that was touched
     /// without changing its bytes keeps the same `oid`, so it is not a content
     /// change and must not bump the map's generation. The retained older
@@ -375,7 +405,7 @@ impl PartialEq for PathState {
     /// `reusable_oid_for_path` simply declines until the identity is
     /// captured again, which is the conservative direction.
     fn eq(&self, other: &Self) -> bool {
-        self.oid == other.oid && self.stat == other.stat
+        self.oid == other.oid && self.stat == other.stat && self.is_overlay == other.is_overlay
     }
 }
 
@@ -406,6 +436,7 @@ impl PathState {
         };
         Some(Self {
             oid,
+            is_overlay: matches!(validation, LivePathValidation::Overlay),
             stat,
             capture_stat,
             generation_trusted: !revalidate_filesystem && validation.is_filesystem(),
@@ -472,6 +503,14 @@ impl LivePathEntry {
             validation: LivePathValidation::Overlay,
         }
     }
+
+    pub(crate) fn oid(&self) -> Oid {
+        self.oid
+    }
+
+    pub(crate) fn is_overlay(&self) -> bool {
+        matches!(self.validation, LivePathValidation::Overlay)
+    }
 }
 
 pub struct LivePathMap {
@@ -483,6 +522,7 @@ pub struct LivePathMap {
 struct LivePathMapState {
     generation: u64,
     paths: HashMap<ProjectFile, PathState>,
+    additional_mounts: HashMap<ProjectFile, BTreeSet<String>>,
     snapshot: Option<MemoizedLivePathMapSnapshot>,
 }
 
@@ -515,6 +555,7 @@ impl LivePathMap {
             state: Mutex::new(LivePathMapState {
                 generation: guard.generation,
                 paths: guard.paths.clone(),
+                additional_mounts: guard.additional_mounts.clone(),
                 snapshot: None,
             }),
         }
@@ -531,6 +572,7 @@ impl LivePathMap {
                 self.revalidate_filesystem,
             ) else {
                 changed |= guard.paths.remove(&entry.file).is_some();
+                changed |= guard.additional_mounts.remove(&entry.file).is_some();
                 continue;
             };
             if guard.paths.get(&entry.file) != Some(&path_state) {
@@ -560,6 +602,12 @@ impl LivePathMap {
         let mut guard = self.state.lock().expect("live path map mutex poisoned");
         if guard.paths != next_paths {
             guard.paths = next_paths;
+            let LivePathMapState {
+                paths,
+                additional_mounts,
+                ..
+            } = &mut *guard;
+            additional_mounts.retain(|file, _| paths.contains_key(file));
             guard.generation = guard.generation.wrapping_add(1);
             guard.snapshot = None;
         }
@@ -570,6 +618,35 @@ impl LivePathMap {
         let mut changed = false;
         for file in files {
             changed |= guard.paths.remove(&file).is_some();
+            changed |= guard.additional_mounts.remove(&file).is_some();
+        }
+        if changed {
+            guard.generation = guard.generation.wrapping_add(1);
+            guard.snapshot = None;
+        }
+    }
+
+    pub(crate) fn replace_additional_mounts(
+        &self,
+        storage_lang: &str,
+        files: impl IntoIterator<Item = ProjectFile>,
+    ) {
+        let mut guard = self.state.lock().expect("live path map mutex poisoned");
+        let mut changed = false;
+        for mounts in guard.additional_mounts.values_mut() {
+            changed |= mounts.remove(storage_lang);
+        }
+        guard
+            .additional_mounts
+            .retain(|_, mounts| !mounts.is_empty());
+        for file in files {
+            if guard.paths.contains_key(&file) {
+                changed |= guard
+                    .additional_mounts
+                    .entry(file)
+                    .or_default()
+                    .insert(storage_lang.to_string());
+            }
         }
         if changed {
             guard.generation = guard.generation.wrapping_add(1);
@@ -586,6 +663,7 @@ impl LivePathMap {
         }
         let snapshot = Arc::new(snapshot_from_path_states(
             &guard.paths,
+            &guard.additional_mounts,
             self.revalidate_filesystem,
         ));
         guard.snapshot = Some(MemoizedLivePathMapSnapshot {
@@ -599,11 +677,78 @@ impl LivePathMap {
 pub struct LiveSnapshot {
     oid_to_paths: HashMap<Oid, Vec<ProjectFile>>,
     path_to_state: HashMap<ProjectFile, PathState>,
+    additional_mounts: HashMap<ProjectFile, BTreeSet<String>>,
+    /// The #2449 content identity of this exact live file set, derived once.
+    ///
+    /// A snapshot is immutable and is itself memoized by its owning
+    /// [`LivePathMap`] until the map's paths change, so deriving the digest
+    /// here makes it a once-per-analyzer-update cost rather than a per-query
+    /// one. See [`Self::content_digest`].
+    content_digest: OnceLock<StableDigest>,
+    /// The same digest taken with one overlay set's paths neutralized, kept
+    /// for the last overlay set asked about. See [`Self::content_digest`].
+    overlaid_content_digest: Mutex<Option<([u8; 32], StableDigest)>>,
 }
 
 impl LiveSnapshot {
     pub(crate) fn oids(&self) -> impl Iterator<Item = Oid> + '_ {
         self.oid_to_paths.keys().copied()
+    }
+
+    /// A digest over this snapshot's (workspace-relative path, blob identity)
+    /// pairs.
+    ///
+    /// This is the analyzed-content half of a
+    /// [`crate::analyzer::content_identity::WorkspaceContentIdentity`]: the
+    /// identity of the exact content the analyzer indexed, with no absolute
+    /// path and no generation counter in it. The recorded blob identity is
+    /// used as-is rather than re-stat-validated, because that is what the
+    /// analyzer's derived values were built from; a filesystem edit the
+    /// analyzer has not been told about is invisible to its derived values by
+    /// the same rule that makes it invisible to its declarations.
+    ///
+    /// Cost is one sort and one hash over the live path set, paid once per
+    /// snapshot. A snapshot is minted only when the path map changes, so an
+    /// unchanged language pays nothing for another language's edit.
+    ///
+    /// `overlaid` names the files whose content the caller takes from the
+    /// project instead. Their blob identity here is replaced by a fixed
+    /// marker, for a reason that is the whole overlay half of #2449: this map
+    /// learns an overlay's identity lazily, when something first parses that
+    /// buffer, so an entry for an overlaid path moves *during* a request. A
+    /// derived value keyed on that would be rejected as stale the moment it
+    /// was built. The path still contributes -- dropping it would make the
+    /// identity equal to a workspace where the file does not exist -- but what
+    /// it contributes says only "the project supplies this one".
+    pub(crate) fn content_digest(
+        &self,
+        overlaid: Option<&brokk_bifrost_core::analyzer::project::WorkspaceOverlayContent>,
+    ) -> StableDigest {
+        let Some(overlaid) = overlaid.filter(|overlaid| !overlaid.entries().is_empty()) else {
+            return *self.content_digest.get_or_init(|| {
+                crate::analyzer::content_identity::analyzed_file_set_digest(
+                    self.path_to_state
+                        .iter()
+                        .map(|(file, state)| (rel_path_string(file), state.oid)),
+                )
+            });
+        };
+        let mut memo = self
+            .overlaid_content_digest
+            .lock()
+            .expect("overlaid content digest memo poisoned");
+        if let Some((overlay_digest, digest)) = memo.as_ref()
+            && *overlay_digest == overlaid.digest()
+        {
+            return *digest;
+        }
+        let digest = crate::analyzer::content_identity::analyzed_file_set_digest_with_overlays(
+            self.path_to_state
+                .iter()
+                .map(|(file, state)| (rel_path_string(file), state.oid, overlaid.contains(file))),
+        );
+        *memo = Some((overlaid.digest(), digest));
+        digest
     }
 
     pub fn paths_for_oid(&self, oid: Oid) -> &[ProjectFile] {
@@ -615,6 +760,27 @@ impl LiveSnapshot {
 
     pub fn oid_for_path(&self, file: &ProjectFile) -> Option<Oid> {
         self.path_to_state.get(file).map(|state| state.oid)
+    }
+
+    pub(crate) fn is_mounted_under(
+        &self,
+        file: &ProjectFile,
+        primary_storage_lang: &str,
+        storage_lang: &str,
+    ) -> bool {
+        primary_storage_lang == storage_lang
+            || self
+                .additional_mounts
+                .get(file)
+                .is_some_and(|mounts| mounts.contains(storage_lang))
+    }
+
+    /// Whether this exact frozen generation takes `file` from an unsaved
+    /// overlay rather than the filesystem.
+    pub(crate) fn is_overlay_path(&self, file: &ProjectFile) -> bool {
+        self.path_to_state
+            .get(file)
+            .is_some_and(|state| state.is_overlay)
     }
 
     pub fn validated_oid_for_path(&self, file: &ProjectFile) -> Option<Oid> {
@@ -714,6 +880,7 @@ fn build_snapshot(
             file,
             PathState {
                 oid,
+                is_overlay: false,
                 stat: Some(stat.clone()),
                 capture_stat: Some(stat),
                 generation_trusted: false,
@@ -747,11 +914,15 @@ fn build_snapshot(
     Ok(LiveSnapshot {
         oid_to_paths,
         path_to_state,
+        additional_mounts: HashMap::default(),
+        content_digest: OnceLock::new(),
+        overlaid_content_digest: Mutex::new(None),
     })
 }
 
 fn snapshot_from_path_states(
     path_to_state: &HashMap<ProjectFile, PathState>,
+    additional_mounts: &HashMap<ProjectFile, BTreeSet<String>>,
     revalidate_filesystem: bool,
 ) -> LiveSnapshot {
     let mut oid_to_paths: HashMap<Oid, Vec<ProjectFile>> = HashMap::default();
@@ -775,6 +946,13 @@ fn snapshot_from_path_states(
     LiveSnapshot {
         oid_to_paths,
         path_to_state: live_states,
+        additional_mounts: additional_mounts
+            .iter()
+            .filter(|(file, _)| path_to_state.contains_key(*file))
+            .map(|(file, mounts)| (file.clone(), mounts.clone()))
+            .collect(),
+        content_digest: OnceLock::new(),
+        overlaid_content_digest: Mutex::new(None),
     }
 }
 
@@ -819,6 +997,12 @@ struct FileStat {
     platform: PlatformStat,
 }
 
+/// Opaque filesystem state captured alongside a startup identity. Callers can
+/// ask this module whether the state still matches without depending on the
+/// platform-specific fields inside [`FileStat`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FileStatStamp(FileStat);
+
 impl FileStat {
     fn from_path(path: &Path) -> Option<Self> {
         #[cfg(test)]
@@ -836,6 +1020,12 @@ impl FileStat {
             modified: metadata.modified().ok(),
             platform: PlatformStat::from_metadata(metadata),
         }
+    }
+}
+
+impl Liveness {
+    pub(crate) fn file_stat_matches(file: &ProjectFile, expected: &FileStatStamp) -> bool {
+        FileStat::from_path(&file.abs_path()).as_ref() == Some(&expected.0)
     }
 }
 
@@ -1265,6 +1455,7 @@ mod tests {
 
         let snapshot = liveness.snapshot().unwrap();
         assert_eq!(snapshot.oid_for_path(&file), Some(overlay_oid));
+        assert!(snapshot.is_overlay_path(&file));
         assert_eq!(snapshot.paths_for_oid(overlay_oid), &[file]);
     }
 
@@ -1432,6 +1623,7 @@ mod tests {
         overlay_map.refresh([LivePathEntry::overlay(file.clone(), oid)]);
         let overlay_snapshot = overlay_map.snapshot();
         assert_eq!(overlay_snapshot.oid_for_path(&file), Some(oid));
+        assert!(overlay_snapshot.is_overlay_path(&file));
         assert_eq!(overlay_snapshot.reusable_oid_for_path(&file), None);
 
         // An analyzer that owns its filesystem generation needs no stat: an
@@ -1471,6 +1663,25 @@ mod tests {
             hashed_map.fork().snapshot().validated_oid_for_path(&file),
             Some(oid)
         );
+    }
+
+    #[test]
+    fn equal_content_transition_from_overlay_to_filesystem_changes_provenance() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::write(temp.path().join("a.rs"), "fn a() {}\n").unwrap();
+        let file = project_file(temp.path(), "a.rs");
+        let oid = Oid::hash_object(ObjectType::Blob, b"fn a() {}\n").unwrap();
+
+        let map = LivePathMap::trust_filesystem_generation();
+        map.refresh([LivePathEntry::overlay(file.clone(), oid)]);
+        let overlay_snapshot = map.snapshot();
+        assert!(overlay_snapshot.is_overlay_path(&file));
+
+        map.refresh([LivePathEntry::filesystem(file.clone(), oid)]);
+        let filesystem_snapshot = map.snapshot();
+        assert!(!Arc::ptr_eq(&overlay_snapshot, &filesystem_snapshot));
+        assert!(!filesystem_snapshot.is_overlay_path(&file));
+        assert_eq!(filesystem_snapshot.reusable_oid_for_path(&file), Some(oid));
     }
 
     #[test]

@@ -7,7 +7,6 @@ use crate::analyzer::cognitive_complexity;
 use crate::analyzer::{Language, LanguageAdapter, ProjectFile};
 use brokk_bifrost_php::adapter::{
     PHP_COGNITIVE_CONFIG, PHP_FILE_EXTENSION, php_extract_call_receiver,
-    php_signature_return_type_text,
 };
 use brokk_bifrost_php::declarations::parse_php_file;
 use brokk_bifrost_php::queries::PHP_QUERY_DIRECTORY;
@@ -44,10 +43,6 @@ impl LanguageAdapter for PhpAdapter {
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {
         php_extract_call_receiver(reference)
-    }
-
-    fn callable_return_type_text<'a>(&self, signature: &'a str) -> Option<&'a str> {
-        php_signature_return_type_text(signature)
     }
 
     fn parse_file(

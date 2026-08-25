@@ -14,14 +14,15 @@ use crate::analyzer::common::language_for_file;
 use crate::analyzer::ruby::parse_ruby_tree;
 use crate::analyzer::usages::common::{classify_recursive_hits, language_for_target};
 use crate::analyzer::usages::inverted_edges::{
-    UsageEdgeBuildOutput, UsageEdgeWeights, UsageEdges, build_edge_output, parse_and_collect,
+    EdgeNodeDomain, UsageEdgeBuildOutput, UsageEdgeWeights, UsageEdges, build_edge_output,
+    parse_and_collect_with_domain,
 };
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::{UsageAnalyzer, UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{
-    BoundedDefinitionLookup, CodeUnit, IAnalyzer, Language, ProjectFile, RubyAnalyzer,
-    resolve_analyzer,
+    AnalyzerDefinitionLookup, BoundedDefinitionLookup, CodeUnit, IAnalyzer, Language, ProjectFile,
+    RubyAnalyzer, resolve_analyzer,
 };
 use crate::hash::HashSet;
 use crate::text_utils::compute_line_starts;
@@ -38,17 +39,16 @@ const STRATEGY: &str = "RubyUsageGraphStrategy";
 /// Run `visit` with the [`RubyGraphSource`] built from the *dispatching*
 /// analyzer.
 ///
-/// A callback rather than a constructor because the definition-index accessor is
-/// itself a borrowed closure: `analyzer.global_usage_definition_index()` returns
-/// a handle that borrows the analyzer, and the Ruby side takes it lazily so the
-/// diagnostics pass -- which builds a `RubySemanticIndex` and never resolves a
-/// factory return -- never pays for the build.
+/// A callback rather than a constructor because the request-local bounded
+/// lookup borrows the dispatching analyzer and must outlive every synchronous
+/// Ruby resolution performed by `visit`.
 pub(crate) fn with_ruby_graph_source<R>(
     analyzer: &dyn IAnalyzer,
     visit: impl FnOnce(RubyGraphSource<'_>) -> R,
 ) -> R {
+    let support = AnalyzerDefinitionLookup::new(analyzer, Language::None);
     let definitions = |consume: &mut dyn FnMut(&dyn BoundedDefinitionLookup)| {
-        consume(&analyzer.global_usage_definition_index());
+        consume(&support);
     };
     let scope = AnalyzerQueryScope::new(analyzer);
     visit(RubyGraphSource {
@@ -66,7 +66,7 @@ fn build_ruby_edges<Output, F>(
     analyzer: &dyn IAnalyzer,
     ruby: &RubyAnalyzer,
     files: &[ProjectFile],
-    nodes: &HashSet<String>,
+    domain: EdgeNodeDomain<'_>,
     keep_file: F,
 ) -> Output
 where
@@ -75,14 +75,17 @@ where
 {
     let language = tree_sitter_ruby::LANGUAGE.into();
     build_edge_output(files, keep_file, |file| {
-        parse_and_collect(
+        parse_and_collect_with_domain(
             analyzer,
             file,
-            nodes,
+            domain,
             ParseSpec::whole(&language),
             |input| {
-                let support = analyzer.global_usage_definition_index();
-                brokk_bifrost_ruby::graph::inverted::scan_file(graph, ruby, &support, file, input)
+                graph.with_definitions(|support| {
+                    brokk_bifrost_ruby::graph::inverted::scan_file(
+                        graph, ruby, support, file, input,
+                    )
+                })
             },
         )
     })
@@ -95,6 +98,15 @@ pub fn build_ruby_usage_edges(
 ) -> Option<UsageEdges> {
     let resolver = RubyEdgeResolver::try_new(analyzer)?;
     Some(resolver.build_edges(analyzer, nodes, keep_file))
+}
+
+pub(crate) fn build_rooted_ruby_usage_edges(
+    analyzer: &dyn IAnalyzer,
+    callers: &HashSet<String>,
+    keep_file: impl Fn(&ProjectFile) -> bool + Sync,
+) -> Option<UsageEdges> {
+    let resolver = RubyEdgeResolver::try_new(analyzer)?;
+    Some(resolver.build_rooted_edges(analyzer, callers, keep_file))
 }
 
 pub(crate) fn build_ruby_usage_edge_weights(
@@ -189,20 +201,21 @@ impl RubyQueryResolver<'_> {
             };
             let line_starts = compute_line_starts(&source);
             let visible_files = semantic.visible_files_from(file);
-            let support = analyzer.global_usage_definition_index();
-            let mut scan = RubyFileScan {
-                index: analyzer,
-                semantic: &semantic,
-                support: &support,
-                file,
-                source: &source,
-                line_starts: &line_starts,
-                visible_files,
-                spec: &spec,
-                hits: &mut hits,
-                unproven_hits: &mut unproven_hits,
-            };
-            scan.scan(tree.root_node());
+            graph.with_definitions(|support| {
+                let mut scan = RubyFileScan {
+                    index: analyzer,
+                    semantic: &semantic,
+                    support,
+                    file,
+                    source: &source,
+                    line_starts: &line_starts,
+                    visible_files,
+                    spec: &spec,
+                    hits: &mut hits,
+                    unproven_hits: &mut unproven_hits,
+                };
+                scan.scan(tree.root_node());
+            });
         }
 
         // A proven hit inside the target itself is a recursive call (#1638):

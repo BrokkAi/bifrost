@@ -339,6 +339,7 @@ pub struct TargetSpec {
     pub param_types: Option<Vec<String>>,
     pub enum_owner_kind: EnumOwnerKind,
     pub owner_is_forward_declaration: bool,
+    pub callable_has_definition_body: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -450,6 +451,8 @@ impl TargetSpec {
                 cpp_callable_parameter_types(analyzer, target),
             );
             spec.owner_is_forward_declaration = owner_is_forward_declaration;
+            spec.callable_has_definition_body =
+                callable_target_has_definition_body(analyzer, target);
             return Some(spec);
         }
 
@@ -520,8 +523,36 @@ impl TargetSpec {
             param_types,
             enum_owner_kind: EnumOwnerKind::NonEnum,
             owner_is_forward_declaration: false,
+            callable_has_definition_body: false,
         }
     }
+}
+
+fn callable_target_has_definition_body(analyzer: &CppGraphSource<'_>, target: &CodeUnit) -> bool {
+    let Some(cpp) = analyzer.cpp else {
+        return false;
+    };
+    let Some(prepared) = cpp.prepared_syntax(analyzer.token, target.source()) else {
+        return false;
+    };
+    analyzer.ranges(target).into_iter().any(|range| {
+        let end = range
+            .start_byte
+            .saturating_add(1)
+            .min(prepared.source().len());
+        let mut current = prepared
+            .tree()
+            .root_node()
+            .descendant_for_byte_range(range.start_byte, end);
+        while let Some(node) = current {
+            match node.kind() {
+                "function_definition" => return true,
+                "declaration" => return false,
+                _ => current = node.parent(),
+            }
+        }
+        false
+    })
 }
 
 fn logical_symbol_key(unit: &CodeUnit) -> LogicalSymbolKey {
@@ -5950,29 +5981,31 @@ impl<'a> VisibilityIndex<'a> {
         analyzer: &CppGraphSource<'_>,
         name: &StructuredTypeName,
     ) -> Option<CodeUnit> {
-        let definitions = analyzer.global_usage_definition_index();
+        let definitions = analyzer.workspace_definitions();
+        let interner = segment_interner();
         let first_depth = if name.is_absolute() {
             0
         } else {
             name.lexical_scope().len()
         };
         for depth in (0..=first_depth).rev() {
-            let mut components = Vec::with_capacity(depth.saturating_add(name.path().len()));
-            components.extend_from_slice(&name.lexical_scope()[..depth]);
-            components.extend_from_slice(name.path());
-            let mut candidates =
-                definitions
-                    .fqn(&components.join("."))
-                    .into_iter()
-                    .filter(|unit| {
-                        unit.kind() == CodeUnitType::Class || declared_type_alias(analyzer, unit)
-                    });
+            let mut structured = FqName::new();
+            for component in name.lexical_scope()[..depth].iter().chain(name.path()) {
+                structured.push(interner.intern(component, SegmentKind::Unknown));
+            }
+            let mut candidates = definitions
+                .identifier(&structured)
+                .into_iter()
+                .filter(|unit| unit.fq().same_segment_texts(&structured))
+                .filter(|unit| {
+                    unit.kind() == CodeUnitType::Class || declared_type_alias(analyzer, unit)
+                });
             let Some(first) = candidates.next() else {
                 continue;
             };
             return candidates
-                .all(|unit| same_logical_symbol(unit, first))
-                .then(|| first.clone());
+                .all(|unit| same_logical_symbol(&unit, &first))
+                .then_some(first);
         }
         None
     }
@@ -11191,32 +11224,6 @@ pub fn qualified_owner_components<'tree>(
     })
 }
 
-/// Return the terminal type-name occurrence in an out-of-line destructor
-/// declarator such as `endpoint::~endpoint`.  Unlike an ordinary terminal
-/// method name, this identifier is a second reference to the owner type.
-///
-/// Every extra qualifier nests another `qualified_identifier` in the `name`
-/// field, so `zmq::pair_t::~pair_t` reaches the destructor only two levels
-/// down. Reading one level dropped the terminal occurrence for every
-/// file-scope out-of-line member libzmq writes (#1831).
-pub fn out_of_line_destructor_type_reference(node: Node<'_>) -> Option<Node<'_>> {
-    if node.kind() != "qualified_identifier" {
-        return None;
-    }
-    let mut qualified = node;
-    let destructor = loop {
-        let name = qualified.child_by_field_name("name")?;
-        match name.kind() {
-            "qualified_identifier" => qualified = name,
-            "destructor_name" => break name,
-            _ => return None,
-        }
-    };
-    (0..destructor.named_child_count())
-        .filter_map(|index| destructor.named_child(index))
-        .find(|child| matches!(child.kind(), "identifier" | "type_identifier"))
-}
-
 pub fn out_of_line_member_definition_owner<'tree>(
     analyzer: &CppGraphSource<'_>,
     visibility: &VisibilityIndex<'_>,
@@ -11369,6 +11376,37 @@ pub fn cpp_type_name_components(node: Node<'_>, source: &str) -> Option<Vec<Stri
     let mut components = Vec::new();
     append_cpp_name_components(node, source, &mut components)?;
     Some(components)
+}
+
+/// Resolve a structured type spelling from an object-like macro replacement
+/// when definition-site source order has no answer.
+///
+/// Macro replacement tokens are looked up where the macro is expanded, so a
+/// type declared later in the defining header can still be their destination.
+/// Without expanding every invocation, accept only one include-visible logical
+/// class or alias whose structured path ends in the replacement components.
+/// An ordinary lexical answer always takes precedence at the call site.
+pub fn unique_macro_replacement_type_candidate(
+    analyzer: &CppGraphSource<'_>,
+    visibility: &VisibilityIndex<'_>,
+    file: &ProjectFile,
+    components: &[String],
+) -> Option<CodeUnit> {
+    let terminal = components.last()?;
+    let mut candidates = Vec::new();
+    for candidate in visibility
+        .visible_identifier_candidates(file, terminal)
+        .filter(|candidate| candidate.is_class() || declared_type_alias(analyzer, candidate))
+        .filter(|candidate| canonical_cpp_scope_components(candidate).ends_with(components))
+    {
+        if !candidates
+            .iter()
+            .any(|existing| same_logical_symbol(existing, candidate))
+        {
+            candidates.push(candidate.clone());
+        }
+    }
+    (candidates.len() == 1).then(|| candidates.remove(0))
 }
 
 /// The base scopes named by member using-declarations for `member` in one
@@ -12755,7 +12793,12 @@ fn target_forward_owner_resolution(
     if !code_unit.is_function() {
         return None;
     }
-    let owner_fqn = brokk_bifrost_core::analyzer::default_parent_fq_name(code_unit)?;
+    // A top-level free function has no owner at all, and `FqName::parent`
+    // answers the empty name rather than `None` for a one-segment identity.
+    // `default_parent_fq_name`, which this replaced, filtered that case out;
+    // asking the relational store for the empty name is a batch error that
+    // fails the whole target frontier.
+    let owner_name = code_unit.fq().parent().filter(|owner| !owner.is_empty())?;
     let cpp = analyzer.cpp?;
     let mut visible_files = HashSet::default();
     collect_include_closure(
@@ -12767,14 +12810,14 @@ fn target_forward_owner_resolution(
     );
     let mut forward = None;
     for candidate in analyzer
-        .global_usage_definition_index()
-        .fqn(&owner_fqn)
+        .workspace_definitions()
+        .exact(&owner_name)
         .into_iter()
         .filter(|candidate| candidate.is_class() && visible_files.contains(candidate.source()))
     {
-        match cpp_class_declaration_strength(analyzer, candidate) {
+        match cpp_class_declaration_strength(analyzer, &candidate) {
             CppClassDeclarationStrength::Forward if forward.is_none() => {
-                forward = Some(candidate.clone());
+                forward = Some(candidate);
             }
             CppClassDeclarationStrength::Forward
             | CppClassDeclarationStrength::Full
@@ -12810,27 +12853,18 @@ fn precise_parent_resolution(
         });
     }
     let fallback = analyzer.parent_of(code_unit);
-    // fqname-M4: `owner_name` is used both bare (passed standalone to the
-    // owner-resolution calls below) and manually recombined with
-    // `package_name()` a few lines down, so this needs the package-less
-    // `short_name` owner specifically; `default_parent_fq_name`/`fq.parent()`
-    // would render the package-qualified owner instead, changing both uses.
-    let Some(owner_name) = code_unit
-        .short_name()
-        .rsplit_once('.')
-        .map(|(owner, _)| owner)
-    else {
+    if !code_unit.owner_is_type_scope() {
         return fallback.map(|unit| ResolvedTypeOwner {
             unit,
             is_forward_declaration: false,
         });
-    };
-    let owner_fqn = if code_unit.package_name().is_empty() {
-        owner_name.to_string()
-    } else {
-        format!("{}.{}", code_unit.package_name(), owner_name)
-    };
-    match same_source_owner(analyzer, code_unit, &owner_fqn, owner_name) {
+    }
+    let owner_fq = code_unit
+        .fq()
+        .parent()
+        .expect("a unit with an owner identifier has a structured parent");
+    let owner_candidates = analyzer.workspace_definitions().exact(&owner_fq);
+    match same_source_owner(analyzer, code_unit, &owner_candidates) {
         DirectOwnerResolution::UniqueFull(owner) => {
             return Some(ResolvedTypeOwner {
                 unit: owner,
@@ -12840,14 +12874,14 @@ fn precise_parent_resolution(
         DirectOwnerResolution::Ambiguous => return None,
         DirectOwnerResolution::ForwardsOnly(_) | DirectOwnerResolution::None => {}
     }
-    match directly_included_owner(analyzer, code_unit, &owner_fqn, owner_name) {
+    match directly_included_owner(analyzer, code_unit, &owner_candidates) {
         DirectOwnerResolution::UniqueFull(owner) => Some(ResolvedTypeOwner {
             unit: owner,
             is_forward_declaration: false,
         }),
         DirectOwnerResolution::Ambiguous => None,
         DirectOwnerResolution::ForwardsOnly(forwards) => {
-            match visible_full_cpp_owner(analyzer, code_unit, &owner_fqn, owner_name) {
+            match visible_full_cpp_owner(analyzer, code_unit, &owner_candidates) {
                 FullOwnerResolution::Unique(owner) => Some(ResolvedTypeOwner {
                     unit: owner,
                     is_forward_declaration: false,
@@ -12862,7 +12896,7 @@ fn precise_parent_resolution(
             }
         }
         DirectOwnerResolution::None => {
-            match visible_full_cpp_owner(analyzer, code_unit, &owner_fqn, owner_name) {
+            match visible_full_cpp_owner(analyzer, code_unit, &owner_candidates) {
                 FullOwnerResolution::Unique(owner) => Some(ResolvedTypeOwner {
                     unit: owner,
                     is_forward_declaration: false,
@@ -12871,8 +12905,7 @@ fn precise_parent_resolution(
                 FullOwnerResolution::None => fallback
                     .filter(|parent| {
                         parent.source() == code_unit.source()
-                            && parent.short_name() == owner_name
-                            && parent.package_name() == code_unit.package_name()
+                            && parent.fq() == &owner_fq
                             && (!parent.is_class()
                                 || cpp_class_declaration_strength(analyzer, parent)
                                     == CppClassDeclarationStrength::Full)
@@ -12906,19 +12939,12 @@ fn exact_structural_type_parent(
 fn same_source_owner(
     analyzer: &CppGraphSource<'_>,
     code_unit: &CodeUnit,
-    owner_fqn: &str,
-    owner_name: &str,
+    owner_candidates: &[CodeUnit],
 ) -> DirectOwnerResolution {
-    let candidates = analyzer
-        .global_usage_definition_index()
-        .fqn(owner_fqn)
-        .into_iter()
-        .filter(|candidate| {
-            candidate.is_class()
-                && candidate.source() == code_unit.source()
-                && candidate.short_name() == owner_name
-                && candidate.package_name() == code_unit.package_name()
-        })
+    let candidates = owner_candidates
+        .iter()
+        .filter(|candidate| candidate.is_class() && candidate.source() == code_unit.source())
+        .cloned()
         .collect::<Vec<_>>();
     let candidates = prefer_member_declaring_owners(analyzer, code_unit, candidates);
     classify_direct_owner_candidates(analyzer, candidates.into_iter())
@@ -12927,8 +12953,7 @@ fn same_source_owner(
 fn visible_full_cpp_owner(
     analyzer: &CppGraphSource<'_>,
     code_unit: &CodeUnit,
-    owner_fqn: &str,
-    owner_name: &str,
+    owner_candidates: &[CodeUnit],
 ) -> FullOwnerResolution {
     let Some(cpp) = analyzer.cpp else {
         return FullOwnerResolution::None;
@@ -12941,25 +12966,19 @@ fn visible_full_cpp_owner(
         &mut visible_files,
         None,
     );
-    let candidates = analyzer
-        .global_usage_definition_index()
-        .fqn(owner_fqn)
-        .into_iter()
-        .filter(|candidate| {
-            candidate.is_class()
-                && candidate.short_name() == owner_name
-                && candidate.package_name() == code_unit.package_name()
-                && visible_files.contains(candidate.source())
-        })
+    let candidates = owner_candidates
+        .iter()
+        .filter(|candidate| candidate.is_class() && visible_files.contains(candidate.source()))
+        .cloned()
         .collect::<Vec<_>>();
     let candidates = prefer_member_declaring_owners(analyzer, code_unit, candidates);
     let mut full_definition = None;
     for candidate in candidates {
-        match cpp_class_declaration_strength(analyzer, candidate) {
+        match cpp_class_declaration_strength(analyzer, &candidate) {
             CppClassDeclarationStrength::Full if full_definition.is_some() => {
                 return FullOwnerResolution::Ambiguous;
             }
-            CppClassDeclarationStrength::Full => full_definition = Some(candidate.clone()),
+            CppClassDeclarationStrength::Full => full_definition = Some(candidate),
             CppClassDeclarationStrength::Forward => {}
             CppClassDeclarationStrength::Unknown => return FullOwnerResolution::Ambiguous,
         }
@@ -12990,8 +13009,7 @@ pub enum CppClassDeclarationStrength {
 fn directly_included_owner(
     analyzer: &CppGraphSource<'_>,
     code_unit: &CodeUnit,
-    owner_fqn: &str,
-    owner_name: &str,
+    owner_candidates: &[CodeUnit],
 ) -> DirectOwnerResolution {
     let Some(cpp) = analyzer.cpp else {
         return DirectOwnerResolution::None;
@@ -13007,30 +13025,24 @@ fn directly_included_owner(
             )
         })
         .collect();
-    let candidates = analyzer
-        .global_usage_definition_index()
-        .fqn(owner_fqn)
-        .into_iter()
-        .filter(|candidate| {
-            candidate.is_class()
-                && candidate.short_name() == owner_name
-                && candidate.package_name() == code_unit.package_name()
-                && direct_includes.contains(candidate.source())
-        })
+    let candidates = owner_candidates
+        .iter()
+        .filter(|candidate| candidate.is_class() && direct_includes.contains(candidate.source()))
+        .cloned()
         .collect::<Vec<_>>();
     let candidates = prefer_member_declaring_owners(analyzer, code_unit, candidates);
     classify_direct_owner_candidates(analyzer, candidates.into_iter())
 }
 
-fn prefer_member_declaring_owners<'a>(
+fn prefer_member_declaring_owners(
     analyzer: &CppGraphSource<'_>,
     member: &CodeUnit,
-    candidates: Vec<&'a CodeUnit>,
-) -> Vec<&'a CodeUnit> {
+    candidates: Vec<CodeUnit>,
+) -> Vec<CodeUnit> {
     let matching = candidates
         .iter()
-        .copied()
         .filter(|owner| owner_declares_member(analyzer, owner, member))
+        .cloned()
         .collect::<Vec<_>>();
     if matching.is_empty() {
         candidates
@@ -13051,15 +13063,13 @@ fn owner_declares_member(
     })
 }
 
-fn classify_direct_owner_candidates<'a>(
+fn classify_direct_owner_candidates(
     analyzer: &CppGraphSource<'_>,
-    candidates: impl Iterator<Item = &'a CodeUnit>,
+    candidates: impl Iterator<Item = CodeUnit>,
 ) -> DirectOwnerResolution {
     collapse_owner_candidates(candidates.map(|candidate| {
-        (
-            candidate.clone(),
-            cpp_class_declaration_strength(analyzer, candidate),
-        )
+        let strength = cpp_class_declaration_strength(analyzer, &candidate);
+        (candidate, strength)
     }))
 }
 
@@ -13201,30 +13211,15 @@ fn cpp_class_node_has_body(node: Node<'_>) -> bool {
 }
 
 pub fn visible_owner_from_member_name(ctx: &ScanCtx<'_>, code_unit: &CodeUnit) -> Option<CodeUnit> {
-    // fqname-M4: `owner_name` is used both bare and manually recombined with
-    // `package_name()` below (same package-less short_name owner shape as
-    // `precise_parent_resolution` above); `default_parent_fq_name` would
-    // render the package-qualified owner instead, changing both uses.
-    let owner_name = code_unit
-        .short_name()
-        .rsplit_once('.')
-        .map(|(owner, _)| owner)?;
-    let owner_fqn = if code_unit.package_name().is_empty() {
-        owner_name.to_string()
-    } else {
-        format!("{}.{}", code_unit.package_name(), owner_name)
-    };
+    if !code_unit.owner_is_type_scope() {
+        return None;
+    }
+    let owner_fq = code_unit.fq().parent()?;
     ctx.analyzer
-        .global_usage_definition_index()
-        .fqn(&owner_fqn)
+        .workspace_definitions()
+        .exact(&owner_fq)
         .into_iter()
-        .find(|candidate| {
-            candidate.is_class()
-                && ctx.visibility.is_visible(ctx.file, candidate)
-                && candidate.short_name() == owner_name
-                && candidate.package_name() == code_unit.package_name()
-        })
-        .cloned()
+        .find(|candidate| candidate.is_class() && ctx.visibility.is_visible(ctx.file, candidate))
 }
 
 pub fn same_symbol(left: &CodeUnit, right: &CodeUnit) -> bool {
@@ -13320,7 +13315,7 @@ pub fn cpp_global_field_has_internal_linkage(
         CppFieldLinkage::External => false,
         CppFieldLinkage::InternalUnlessExternalPeer => {
             !cpp_global_field_linkage_peers(analyzer, candidate)
-                .filter_map(|peer| cpp_global_field_declaration_linkage(analyzer, peer))
+                .filter_map(|peer| cpp_global_field_declaration_linkage(analyzer, &peer))
                 .any(|linkage| matches!(linkage, CppFieldLinkage::External))
         }
     }
@@ -13329,17 +13324,14 @@ pub fn cpp_global_field_has_internal_linkage(
 fn cpp_global_field_linkage_peers<'a>(
     analyzer: &CppGraphSource<'a>,
     candidate: &'a CodeUnit,
-) -> impl Iterator<Item = &'a CodeUnit> + 'a {
-    // These peers are returned to the caller, so they must borrow the analyzer
-    // for `'a` rather than a handle that dies with this call. `fqn` reads the
-    // shards directly for exactly that reason.
-    let fq_name = candidate.fq_name();
+) -> impl Iterator<Item = CodeUnit> + 'a {
+    let name = candidate.fq().clone();
     analyzer
-        .global_usage_definition_index()
-        .fqn(&fq_name)
+        .workspace_definitions()
+        .exact(&name)
         .into_iter()
         .filter(move |peer| {
-            if *peer == candidate {
+            if peer == candidate {
                 return false;
             }
             #[cfg(any(test, feature = "test-support"))]

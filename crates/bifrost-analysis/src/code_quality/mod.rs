@@ -220,7 +220,7 @@ pub(crate) fn cyclomatic_complexities_for_file(
     }
 }
 
-fn cyclomatic_complexities_from_projection(
+pub(crate) fn cyclomatic_complexities_from_projection(
     projection: &SummaryFileProjection,
     source: &str,
 ) -> Vec<(CodeUnit, u32)> {

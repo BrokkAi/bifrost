@@ -403,7 +403,7 @@ impl FileFacts {
         &self.source
     }
 
-    pub(crate) const fn source_identity(&self) -> ContentIdentity {
+    pub const fn source_identity(&self) -> ContentIdentity {
         self.source_identity
     }
 
@@ -653,7 +653,7 @@ impl FileFacts {
     ///
     /// Normalized nodes and their semantic role edges share the CodeQuery
     /// fact budget: either collection can grow independently for valid syntax.
-    pub(crate) fn work_item_count(&self) -> usize {
+    pub fn work_item_count(&self) -> usize {
         self.nodes.len().saturating_add(self.roles.len())
     }
 

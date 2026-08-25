@@ -12,8 +12,8 @@
 
 use std::fmt;
 
-use brokk_bifrost_analysis::analyzer::structural::search::DetailedCodeQueryDomain;
-use brokk_bifrost_analysis::analyzer::structural::{
+use brokk_bifrost_rql::structural::search::DetailedCodeQueryDomain;
+use brokk_bifrost_rql::structural::{
     CodeQueryEnumDomain, CodeQueryRowScalarRef, CodeQueryRowScalarType,
 };
 

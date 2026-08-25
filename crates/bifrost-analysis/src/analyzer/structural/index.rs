@@ -5,26 +5,33 @@
 //! containment, and nested predicates are always verified by the matcher.
 
 use super::facts::FileFacts;
-use super::kinds::{NormalizedKind, Role};
-use super::planner::{
+use super::index_query::{
     SourceAnchorGroup, StructuralAccessPathEstimate, StructuralAccessPathKind,
     StructuralAccessRequirements, StructuralPostingEstimate, StructuralPostingTerm,
     supports_exact_role_name_posting,
 };
-use super::provider::{StructuralFactsCacheOutcome, StructuralSearchProvider};
+use super::kinds::{NormalizedKind, Role};
+use super::provider::{StructuralFactProvider, StructuralFactsCacheOutcome};
 use crate::ProjectFile;
 use crate::analyzer::complete_value_cache::{
     CompleteValueAcquisition, CompleteValueCache, CompleteValueWait,
 };
+use crate::analyzer::content_identity::WorkspaceContentIdentity;
+use crate::analyzer::invalidation::{
+    ArtifactVerdict, ArtifactVerdictLog, DerivedArtifactId, DerivedArtifactKind,
+    InvalidationReason, RetentionReason,
+};
+use crate::analyzer::semantic::ids::StableDigest;
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, map_with_capacity};
+use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
 use rayon::prelude::*;
 use std::mem::size_of;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-pub(crate) const STRUCTURAL_INDEX_REPRESENTATION_VERSION: u32 = 1;
+pub const STRUCTURAL_INDEX_REPRESENTATION_VERSION: u32 = 1;
 const MAX_INDEX_FILES: usize = 1_000_000;
 const MAX_INDEX_FACT_NODES: u64 = 100_000_000;
 const MAX_INDEX_SOURCE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
@@ -38,23 +45,55 @@ const BUILD_WORKING_BYTES_MULTIPLIER: u64 = 3;
 /// hold beyond the provider's own facts cache.
 const INDEX_BUILD_ACQUISITION_CHUNK: usize = 256;
 
+/// The identity of one immutable posting set.
+///
+/// Before #2449 the second field was the project's process-local
+/// `analysis_generation()`, so every accepted change in the process retired
+/// every language's postings. It is now the content identity of exactly the
+/// files this provider indexes: an edit to another language leaves it alone, a
+/// no-op update leaves it alone, and a grammar or configuration change rotates
+/// it because both are folded into the identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct StructuralIndexKey {
     representation_version: u32,
-    source_generation: u64,
+    content_identity: WorkspaceContentIdentity,
+}
+
+impl StructuralIndexKey {
+    const ARTIFACT_DOMAIN: &[u8] = b"bifrost-structural-index-key:v1";
+
+    fn new(content_identity: WorkspaceContentIdentity) -> Self {
+        Self {
+            representation_version: STRUCTURAL_INDEX_REPRESENTATION_VERSION,
+            content_identity,
+        }
+    }
+
+    fn artifact(self) -> DerivedArtifactId {
+        let mut hasher = CanonicalHasher::new(Self::ARTIFACT_DOMAIN);
+        hasher.field(
+            "representation_version",
+            &self.representation_version.to_be_bytes(),
+        );
+        hasher.field("content", self.content_identity.digest().as_bytes());
+        DerivedArtifactId::new(
+            DerivedArtifactKind::StructuralIndex,
+            StableDigest::from_array(hasher.finish()),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct FactAddress {
-    pub(crate) file: u32,
-    pub(crate) fact: u32,
+pub struct FactAddress {
+    pub file: u32,
+    pub fact: u32,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct StructuralIndexFile {
-    pub(crate) file: ProjectFile,
-    pub(crate) source_bytes: u64,
-    pub(crate) fact_nodes: u32,
+pub struct StructuralIndexFile {
+    pub file: ProjectFile,
+    pub source_bytes: u64,
+    pub fact_nodes: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -68,8 +107,8 @@ type KindNamePostings = HashMap<Box<str>, Vec<(NormalizedKind, Box<[FactAddress]
 type MutableKindNamePostings = HashMap<Box<str>, Vec<(NormalizedKind, Vec<FactAddress>)>>;
 
 #[derive(Debug)]
-pub(crate) struct SnapshotStructuralIndex {
-    source_generation: u64,
+pub struct SnapshotStructuralIndex {
+    content_identity: WorkspaceContentIdentity,
     files: Box<[StructuralIndexFile]>,
     file_ids: HashMap<ProjectFile, u32>,
     kind_postings: HashMap<NormalizedKind, Box<[FactAddress]>>,
@@ -84,16 +123,16 @@ pub(crate) struct SnapshotStructuralIndex {
 }
 
 impl SnapshotStructuralIndex {
-    pub(crate) const fn source_generation(&self) -> u64 {
-        self.source_generation
+    pub const fn content_identity(&self) -> WorkspaceContentIdentity {
+        self.content_identity
     }
 
-    pub(crate) fn file(&self, file: &ProjectFile) -> Option<&StructuralIndexFile> {
+    pub fn file(&self, file: &ProjectFile) -> Option<&StructuralIndexFile> {
         let id = self.file_ids.get(file).copied()?;
         self.files.get(id as usize)
     }
 
-    pub(crate) fn retained_bytes(&self) -> u64 {
+    pub fn retained_bytes(&self) -> u64 {
         self.retained_bytes
     }
 
@@ -101,7 +140,7 @@ impl SnapshotStructuralIndex {
     /// alternative definitely absent from the indexed source. Hash collisions
     /// can return true for an absent anchor, in which case the caller
     /// verifies with `str::contains`.
-    pub(crate) fn source_may_contain(
+    pub fn source_may_contain(
         &self,
         file: &ProjectFile,
         required_anchors: &[SourceAnchorGroup],
@@ -118,7 +157,7 @@ impl SnapshotStructuralIndex {
         }))
     }
 
-    pub(crate) fn select(
+    pub fn select(
         &self,
         requirements: &StructuralAccessRequirements,
         scoped_files: &[ProjectFile],
@@ -515,39 +554,39 @@ fn scoped_posting_rows(
 }
 
 #[derive(Debug)]
-pub(crate) struct StructuralCandidateSet {
-    pub(crate) selected: String,
-    pub(crate) estimate: StructuralAccessPathEstimate,
+pub struct StructuralCandidateSet {
+    pub selected: String,
+    pub estimate: StructuralAccessPathEstimate,
     by_file: HashMap<ProjectFile, Vec<u32>>,
 }
 
 impl StructuralCandidateSet {
-    pub(crate) fn facts_for(&self, file: &ProjectFile) -> &[u32] {
+    pub fn facts_for(&self, file: &ProjectFile) -> &[u32] {
         self.by_file.get(file).map_or(&[], Vec::as_slice)
     }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct StructuralIndexBuildMetrics {
-    pub(crate) files: u64,
-    pub(crate) source_bytes: u64,
-    pub(crate) fact_nodes: u64,
-    pub(crate) facts_bytes: u64,
-    pub(crate) memory_hits: u64,
-    pub(crate) persisted_hydrations: u64,
-    pub(crate) extractions: u64,
-    pub(crate) unavailable: u64,
-    pub(crate) unknown_outcomes: u64,
-    pub(crate) elapsed_ns: u64,
+pub struct StructuralIndexBuildMetrics {
+    pub files: u64,
+    pub source_bytes: u64,
+    pub fact_nodes: u64,
+    pub facts_bytes: u64,
+    pub memory_hits: u64,
+    pub persisted_hydrations: u64,
+    pub extractions: u64,
+    pub unavailable: u64,
+    pub unknown_outcomes: u64,
+    pub elapsed_ns: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StructuralIndexLifecycle {
+pub enum StructuralIndexLifecycle {
     Hit,
     Built,
 }
 
-pub(crate) enum StructuralIndexAcquisition {
+pub enum StructuralIndexAcquisition {
     Ready {
         index: Arc<SnapshotStructuralIndex>,
         lifecycle: StructuralIndexLifecycle,
@@ -565,72 +604,82 @@ pub(crate) enum StructuralIndexAcquisition {
     },
 }
 
+/// Snapshot-owned complete postings, keyed by the content they were built from.
+///
+/// The cache outlives an analyzer update (#2449): `from_state` hands the next
+/// generation this same cache instead of an empty one, because a key nothing
+/// asks for again is retired by the byte budget rather than by a rotation that
+/// also discards the keys that are still exact.
 #[derive(Clone)]
-pub(crate) struct SnapshotStructuralIndexCache {
+pub struct SnapshotStructuralIndexCache {
     complete: CompleteValueCache<StructuralIndexKey, SnapshotStructuralIndex>,
     max_retained_bytes: u64,
-    auto_reuse_generation: Arc<AtomicU64>,
+    auto_reuse_content: Arc<Mutex<Option<WorkspaceContentIdentity>>>,
     rejected: Arc<Mutex<Option<StructuralIndexRejection>>>,
+    verdicts: Arc<ArtifactVerdictLog>,
 }
 
 /// Request-scoped structural-index lifecycle shared by serial and parallel
 /// seed branches. Deferred Auto observations are published only after the
-/// whole request finishes, and selected source generations remain guarded
-/// through replay and rendering.
+/// whole request finishes, and the workspace content the selection was made
+/// against remains guarded through replay and rendering.
 #[derive(Clone, Default)]
-pub(crate) struct QueryStructuralIndexSession {
-    deferred_auto: Arc<Mutex<HashMap<(usize, u64), SnapshotStructuralIndexCache>>>,
-    selected_generations: Arc<Mutex<Option<Box<[u64]>>>>,
+pub struct QueryStructuralIndexSession {
+    deferred_auto:
+        Arc<Mutex<HashMap<(usize, WorkspaceContentIdentity), SnapshotStructuralIndexCache>>>,
+    selected_content: Arc<Mutex<Option<WorkspaceContentIdentity>>>,
     inconsistent_selection: Arc<AtomicBool>,
 }
 
 impl QueryStructuralIndexSession {
-    pub(crate) fn defer_auto_build(
+    pub fn defer_auto_build(
         &self,
         cache: &SnapshotStructuralIndexCache,
-        source_generation: u64,
+        content_identity: WorkspaceContentIdentity,
     ) {
         self.deferred_auto
             .lock()
             .expect("structural index Auto deferral lock poisoned")
-            .entry((cache.owner_identity(), source_generation))
+            .entry((cache.owner_identity(), content_identity))
             .or_insert_with(|| cache.clone());
     }
 
-    pub(crate) fn publish_auto_observations(&self) {
+    pub fn publish_auto_observations(&self) {
         let deferred = std::mem::take(
             &mut *self
                 .deferred_auto
                 .lock()
                 .expect("structural index Auto deferral lock poisoned"),
         );
-        for ((_, source_generation), cache) in deferred {
-            cache.record_auto_reuse_opportunity(source_generation);
+        for ((_, content_identity), cache) in deferred {
+            cache.record_auto_reuse_opportunity(content_identity);
         }
     }
 
-    pub(crate) fn record_selection(&self, source_generations: &[u64]) {
+    pub fn record_selection(&self, content_identity: WorkspaceContentIdentity) {
         let mut selected = self
-            .selected_generations
+            .selected_content
             .lock()
-            .expect("structural index generation guard lock poisoned");
-        if let Some(existing) = selected.as_deref() {
-            if existing != source_generations {
+            .expect("structural index content guard lock poisoned");
+        match *selected {
+            Some(existing) if existing != content_identity => {
                 self.inconsistent_selection.store(true, Ordering::Release);
             }
-        } else {
-            *selected = Some(source_generations.into());
+            Some(_) => {}
+            None => *selected = Some(content_identity),
         }
     }
 
-    pub(crate) fn selections_are_current(&self, is_current: impl FnOnce(&[u64]) -> bool) -> bool {
+    pub fn selections_are_current(
+        &self,
+        is_current: impl FnOnce(WorkspaceContentIdentity) -> bool,
+    ) -> bool {
         if self.inconsistent_selection.load(Ordering::Acquire) {
             return false;
         }
-        self.selected_generations
+        self.selected_content
             .lock()
-            .expect("structural index generation guard lock poisoned")
-            .as_deref()
+            .expect("structural index content guard lock poisoned")
             .is_none_or(is_current)
     }
 }
@@ -642,16 +691,21 @@ struct StructuralIndexRejection {
 }
 
 impl SnapshotStructuralIndexCache {
-    pub(crate) fn new(max_retained_bytes: u64) -> Self {
+    pub fn new(max_retained_bytes: u64) -> Self {
         Self {
             complete: CompleteValueCache::<StructuralIndexKey, SnapshotStructuralIndex>::new(
                 max_retained_bytes,
                 |_, index| index.retained_bytes().clamp(1, u32::MAX as u64) as u32,
             ),
             max_retained_bytes,
-            auto_reuse_generation: Arc::new(AtomicU64::new(u64::MAX)),
+            auto_reuse_content: Arc::new(Mutex::new(None)),
             rejected: Arc::new(Mutex::new(None)),
+            verdicts: Arc::new(ArtifactVerdictLog::default()),
         }
+    }
+
+    pub fn verdicts(&self) -> &ArtifactVerdictLog {
+        &self.verdicts
     }
 
     fn rejection_for(&self, key: StructuralIndexKey) -> Option<Arc<str>> {
@@ -663,28 +717,42 @@ impl SnapshotStructuralIndexCache {
             .map(|rejection| Arc::clone(&rejection.reason))
     }
 
+    /// Retain the most recent rejection.
+    ///
+    /// Source generations were ordered, so the old rule kept the newest by
+    /// comparison. Content identities are not ordered and must not be: the
+    /// question a rejection answers is "did the build for *this exact* content
+    /// fail", and `rejection_for` already compares the whole key, so the last
+    /// writer is the right one to keep.
     fn record_rejection(&self, key: StructuralIndexKey, reason: Arc<str>) {
-        let mut rejected = self
+        *self
             .rejected
             .lock()
-            .expect("structural index rejection lock poisoned");
-        if rejected
-            .as_ref()
-            .is_none_or(|current| current.key.source_generation <= key.source_generation)
-        {
-            *rejected = Some(StructuralIndexRejection { key, reason });
-        }
+            .expect("structural index rejection lock poisoned") =
+            Some(StructuralIndexRejection { key, reason });
     }
 
-    pub(crate) fn acquire(
+    pub fn acquire(
         &self,
-        provider: &dyn StructuralSearchProvider,
+        provider: &dyn StructuralFactProvider,
         cancellation: &CancellationToken,
     ) -> StructuralIndexAcquisition {
-        let key = StructuralIndexKey {
-            representation_version: STRUCTURAL_INDEX_REPRESENTATION_VERSION,
-            source_generation: provider.structural_source_generation(),
+        let Some(content_identity) = provider.structural_content_identity() else {
+            self.verdicts.record(ArtifactVerdict::Invalidated(
+                InvalidationReason::ContentIdentityEvidenceMissing {
+                    artifact: StructuralIndexKey::new(WorkspaceContentIdentity::unattested())
+                        .artifact(),
+                },
+            ));
+            return StructuralIndexAcquisition::Unavailable {
+                reason: Arc::from(
+                    "structural provider states no content identity for its analyzed files",
+                ),
+                wait: CompleteValueWait::default(),
+                build: StructuralIndexBuildMetrics::default(),
+            };
         };
+        let key = StructuralIndexKey::new(content_identity);
         if let Some(reason) = self.rejection_for(key) {
             return StructuralIndexAcquisition::Unavailable {
                 reason,
@@ -694,12 +762,19 @@ impl SnapshotStructuralIndexCache {
         }
         let (acquisition, wait) = self.complete.acquire(&key, cancellation);
         match acquisition {
-            CompleteValueAcquisition::Cached { value } => StructuralIndexAcquisition::Ready {
-                index: value,
-                lifecycle: StructuralIndexLifecycle::Hit,
-                wait,
-                build: StructuralIndexBuildMetrics::default(),
-            },
+            CompleteValueAcquisition::Cached { value } => {
+                self.verdicts.record(ArtifactVerdict::Retained(
+                    RetentionReason::InputsUnchanged {
+                        artifact: key.artifact(),
+                    },
+                ));
+                StructuralIndexAcquisition::Ready {
+                    index: value,
+                    lifecycle: StructuralIndexLifecycle::Hit,
+                    wait,
+                    build: StructuralIndexBuildMetrics::default(),
+                }
+            }
             CompleteValueAcquisition::Cancelled => StructuralIndexAcquisition::Cancelled {
                 wait,
                 build: StructuralIndexBuildMetrics::default(),
@@ -720,20 +795,25 @@ impl SnapshotStructuralIndexCache {
                         build: StructuralIndexBuildMetrics::default(),
                     };
                 }
+                self.verdicts.record(ArtifactVerdict::Invalidated(
+                    InvalidationReason::NoRetainedArtifact {
+                        artifact: key.artifact(),
+                    },
+                ));
                 match build_index(
                     provider,
                     cancellation,
                     self.max_retained_bytes,
-                    key.source_generation,
+                    key.content_identity,
                 ) {
                     Ok((_index, build)) if cancellation.is_cancelled() => {
                         StructuralIndexAcquisition::Cancelled { wait, build }
                     }
                     Ok((_index, build))
-                        if provider.structural_source_generation() != key.source_generation =>
+                        if provider.structural_content_identity() != Some(key.content_identity) =>
                     {
                         let reason: Arc<str> = Arc::from(
-                            "structural source generation changed during index construction",
+                            "structural analyzed content changed during index construction",
                         );
                         self.record_rejection(key, Arc::clone(&reason));
                         permit.publish_rejected();
@@ -773,35 +853,46 @@ impl SnapshotStructuralIndexCache {
         }
     }
 
-    pub(crate) fn get_ready(
+    pub fn get_ready(
         &self,
-        source_generation: u64,
+        content_identity: WorkspaceContentIdentity,
         cancellation: &CancellationToken,
     ) -> Option<Arc<SnapshotStructuralIndex>> {
-        self.complete.get_ready(
-            &StructuralIndexKey {
-                representation_version: STRUCTURAL_INDEX_REPRESENTATION_VERSION,
-                source_generation,
-            },
-            cancellation,
-        )
+        let ready = self
+            .complete
+            .get_ready(&StructuralIndexKey::new(content_identity), cancellation);
+        self.verdicts.record(match ready {
+            Some(_) => ArtifactVerdict::Retained(RetentionReason::InputsUnchanged {
+                artifact: StructuralIndexKey::new(content_identity).artifact(),
+            }),
+            None => ArtifactVerdict::Invalidated(InvalidationReason::NoRetainedArtifact {
+                artifact: StructuralIndexKey::new(content_identity).artifact(),
+            }),
+        });
+        ready
     }
 
     /// Auto avoids paying a whole-snapshot construction cost for a query that
     /// may run only once. The first viable request records reuse interest and
     /// scans; a subsequent request may build. Forced indexed tests bypass this
     /// policy and exercise construction directly.
-    pub(crate) fn auto_reuse_observed(&self, source_generation: u64) -> bool {
-        self.auto_reuse_generation.load(Ordering::Acquire) == source_generation
+    pub fn auto_reuse_observed(&self, content_identity: WorkspaceContentIdentity) -> bool {
+        *self
+            .auto_reuse_content
+            .lock()
+            .expect("structural index Auto reuse lock poisoned")
+            == Some(content_identity)
     }
 
-    fn record_auto_reuse_opportunity(&self, source_generation: u64) {
-        self.auto_reuse_generation
-            .store(source_generation, Ordering::Release);
+    fn record_auto_reuse_opportunity(&self, content_identity: WorkspaceContentIdentity) {
+        *self
+            .auto_reuse_content
+            .lock()
+            .expect("structural index Auto reuse lock poisoned") = Some(content_identity);
     }
 
     fn owner_identity(&self) -> usize {
-        Arc::as_ptr(&self.auto_reuse_generation) as usize
+        Arc::as_ptr(&self.auto_reuse_content) as usize
     }
 
     #[cfg(test)]
@@ -912,10 +1003,10 @@ fn working_budget_exceeded(estimated_working_bytes: u64, max_retained_bytes: u64
 }
 
 fn build_index(
-    provider: &dyn StructuralSearchProvider,
+    provider: &dyn StructuralFactProvider,
     cancellation: &CancellationToken,
     max_retained_bytes: u64,
-    source_generation: u64,
+    content_identity: WorkspaceContentIdentity,
 ) -> Result<(SnapshotStructuralIndex, StructuralIndexBuildMetrics), BuildFailure> {
     let started = Instant::now();
     let mut files = provider.structural_files();
@@ -1302,7 +1393,7 @@ fn build_index(
         return Err(cancelled_failure(started, metrics));
     };
     let mut index = SnapshotStructuralIndex {
-        source_generation,
+        content_identity,
         files: indexed_files.into_boxed_slice(),
         file_ids,
         kind_postings,
@@ -1453,9 +1544,19 @@ mod tests {
         facts: HashMap<ProjectFile, Arc<FileFacts>>,
     }
 
-    impl StructuralSearchProvider for FakeProvider {
+    fn content(seed: u64) -> WorkspaceContentIdentity {
+        WorkspaceContentIdentity::for_test(seed)
+    }
+
+    impl StructuralFactProvider for FakeProvider {
         fn structural_language(&self) -> Language {
             Language::Python
+        }
+
+        fn structural_content_identity(&self) -> Option<WorkspaceContentIdentity> {
+            // A fake provider's analyzed content is fixed for its lifetime, so
+            // one identity per distinct file set is exactly right here.
+            Some(content(self.files.len() as u64))
         }
 
         fn structural_files(&self) -> Vec<ProjectFile> {
@@ -1607,9 +1708,13 @@ mod tests {
     #[test]
     fn exact_kind_and_name_postings_select_dense_addresses() {
         let provider = provider();
-        let (index, metrics) =
-            build_index(&provider, &CancellationToken::default(), 1024 * 1024, 0)
-                .expect("index builds");
+        let (index, metrics) = build_index(
+            &provider,
+            &CancellationToken::default(),
+            1024 * 1024,
+            content(1),
+        )
+        .expect("index builds");
         let requirements = StructuralAccessRequirements::new_for_test(vec![
             StructuralPostingTerm::Kinds(vec![NormalizedKind::Declaration]),
             StructuralPostingTerm::ExactName(vec!["App".to_string()]),
@@ -1635,8 +1740,13 @@ mod tests {
     #[test]
     fn non_redundant_kind_name_posting_is_selected() {
         let provider = ambiguous_name_provider();
-        let (index, _) = build_index(&provider, &CancellationToken::default(), 1024 * 1024, 0)
-            .expect("index builds");
+        let (index, _) = build_index(
+            &provider,
+            &CancellationToken::default(),
+            1024 * 1024,
+            content(1),
+        )
+        .expect("index builds");
         let requirements = StructuralAccessRequirements::new_for_test(vec![
             StructuralPostingTerm::Kinds(vec![NormalizedKind::Class]),
             StructuralPostingTerm::ExactName(vec!["Shared".to_string()]),
@@ -1666,8 +1776,13 @@ mod tests {
     #[test]
     fn source_filter_has_no_false_negatives_and_short_anchors_verify() {
         let provider = provider();
-        let (index, _) = build_index(&provider, &CancellationToken::default(), 1024 * 1024, 0)
-            .expect("index builds");
+        let (index, _) = build_index(
+            &provider,
+            &CancellationToken::default(),
+            1024 * 1024,
+            content(1),
+        )
+        .expect("index builds");
         let file = &provider.files[0];
 
         assert_eq!(
@@ -1715,27 +1830,133 @@ mod tests {
     }
 
     #[test]
-    fn request_session_defers_auto_admission_and_guards_every_selection_generation() {
+    fn request_session_defers_auto_admission_and_guards_every_selected_content() {
         let cache = SnapshotStructuralIndexCache::new(1024 * 1024);
         let session = QueryStructuralIndexSession::default();
 
-        assert!(!cache.auto_reuse_observed(7));
-        session.defer_auto_build(&cache, 7);
-        session.defer_auto_build(&cache, 7);
+        assert!(!cache.auto_reuse_observed(content(7)));
+        session.defer_auto_build(&cache, content(7));
+        session.defer_auto_build(&cache, content(7));
         assert!(
-            !cache.auto_reuse_observed(7),
+            !cache.auto_reuse_observed(content(7)),
             "sibling branches must not publish a later-request observation"
         );
         session.publish_auto_observations();
-        assert!(cache.auto_reuse_observed(7));
+        assert!(cache.auto_reuse_observed(content(7)));
 
-        session.record_selection(&[7, 11]);
-        assert!(session.selections_are_current(|expected| expected == [7, 11]));
-        assert!(!session.selections_are_current(|expected| expected == [8, 11]));
-        session.record_selection(&[7, 12]);
+        session.record_selection(content(11));
+        assert!(session.selections_are_current(|selected| selected == content(11)));
+        assert!(!session.selections_are_current(|selected| selected == content(12)));
+        session.record_selection(content(12));
         assert!(
             !session.selections_are_current(|_| true),
-            "one request cannot combine posting selections from different generations"
+            "one request cannot combine posting selections from different workspace content"
+        );
+    }
+
+    /// Milestone J (#2449): a provider that states no content identity gets no
+    /// index at all -- not an index keyed by a constant, which is what the old
+    /// zero-generation default silently gave it.
+    #[test]
+    fn a_provider_without_a_content_identity_is_never_served_from_the_index() {
+        struct UnattestedProvider(FakeProvider);
+
+        impl StructuralFactProvider for UnattestedProvider {
+            fn structural_language(&self) -> Language {
+                self.0.structural_language()
+            }
+
+            fn structural_content_identity(&self) -> Option<WorkspaceContentIdentity> {
+                None
+            }
+
+            fn structural_files(&self) -> Vec<ProjectFile> {
+                self.0.structural_files()
+            }
+
+            fn structural_source(&self, file: &ProjectFile) -> Option<String> {
+                self.0.structural_source(file)
+            }
+
+            fn structural_facts(&self, file: &ProjectFile) -> Option<Arc<FileFacts>> {
+                self.0.structural_facts(file)
+            }
+
+            fn structural_extraction_count(&self) -> u64 {
+                0
+            }
+
+            fn structural_hydration_count(&self) -> u64 {
+                0
+            }
+
+            fn structural_supports_kind(&self, kind: NormalizedKind) -> bool {
+                self.0.structural_supports_kind(kind)
+            }
+
+            fn structural_supports_role(&self, role: Role) -> bool {
+                self.0.structural_supports_role(role)
+            }
+
+            fn structural_supports_occurrence_role(
+                &self,
+                role: super::super::occurrences::OccurrenceRole,
+            ) -> bool {
+                self.0.structural_supports_occurrence_role(role)
+            }
+
+            fn structural_supports_environment_axis(
+                &self,
+                axis: super::super::resolution::EnvironmentAxis,
+            ) -> bool {
+                self.0.structural_supports_environment_axis(axis)
+            }
+
+            fn structural_supports_materialization_axis(
+                &self,
+                axis: super::super::materialization::MaterializationAxis,
+            ) -> bool {
+                self.0.structural_supports_materialization_axis(axis)
+            }
+
+            fn structural_supports_edge_axis(&self, axis: super::super::edges::EdgeAxis) -> bool {
+                self.0.structural_supports_edge_axis(axis)
+            }
+
+            fn structural_supports_identity_axis(
+                &self,
+                axis: super::super::routes::IdentityAxis,
+            ) -> bool {
+                self.0.structural_supports_identity_axis(axis)
+            }
+
+            fn structural_supports_route_relation(
+                &self,
+                relation: super::super::routes::RouteHopKind,
+            ) -> bool {
+                self.0.structural_supports_route_relation(relation)
+            }
+        }
+
+        let cache = SnapshotStructuralIndexCache::new(1024 * 1024);
+        let provider = UnattestedProvider(provider());
+
+        assert!(matches!(
+            cache.acquire(&provider, &CancellationToken::default()),
+            StructuralIndexAcquisition::Unavailable { reason, .. }
+                if reason.contains("no content identity")
+        ));
+        assert_eq!(cache.len_for_test(), 0);
+        let (retained, invalidated) = cache.verdicts().totals();
+        assert_eq!((0, 1), (retained, invalidated));
+        assert_eq!(
+            vec!["content_identity_evidence_missing"],
+            cache
+                .verdicts()
+                .recent()
+                .iter()
+                .map(|verdict| verdict.stable_label())
+                .collect::<Vec<_>>()
         );
     }
 
@@ -1841,8 +2062,13 @@ mod tests {
             facts: HashMap::from_iter([(file, Arc::new(facts))]),
         };
 
-        let failure = build_index(&provider, &CancellationToken::default(), 32 * 1024, 0)
-            .expect_err("identifier key must be rejected by construction budget");
+        let failure = build_index(
+            &provider,
+            &CancellationToken::default(),
+            32 * 1024,
+            content(1),
+        )
+        .expect_err("identifier key must be rejected by construction budget");
         assert!(matches!(
             failure,
             BuildFailure::Unavailable { reason, .. }
@@ -1890,7 +2116,7 @@ mod tests {
         let analyzer = crate::analyzer::PythonAnalyzer::from_project(
             crate::analyzer::TestProject::new(root, crate::analyzer::Language::Python),
         );
-        let providers = crate::analyzer::IAnalyzer::structural_search_providers(&analyzer);
+        let providers = crate::analyzer::IAnalyzer::structural_fact_providers(&analyzer);
         let provider = *providers.first().expect("python structural provider");
 
         let cache = SnapshotStructuralIndexCache::new(64 * 1024 * 1024);
@@ -1906,8 +2132,13 @@ mod tests {
     #[test]
     fn cancelled_candidate_selection_stops_without_rows() {
         let provider = ambiguous_name_provider();
-        let (index, _) = build_index(&provider, &CancellationToken::default(), 1024 * 1024, 0)
-            .expect("index builds");
+        let (index, _) = build_index(
+            &provider,
+            &CancellationToken::default(),
+            1024 * 1024,
+            content(1),
+        )
+        .expect("index builds");
         let requirements = StructuralAccessRequirements::new_for_test(vec![
             StructuralPostingTerm::Kinds(vec![NormalizedKind::Class]),
             StructuralPostingTerm::ExactName(vec!["Shared".to_string()]),
@@ -1927,10 +2158,20 @@ mod tests {
     fn retained_census_grows_with_posting_content() {
         let simple = provider();
         let ambiguous = ambiguous_name_provider();
-        let (simple, _) = build_index(&simple, &CancellationToken::default(), 1024 * 1024, 0)
-            .expect("simple index builds");
-        let (ambiguous, _) = build_index(&ambiguous, &CancellationToken::default(), 1024 * 1024, 0)
-            .expect("larger index builds");
+        let (simple, _) = build_index(
+            &simple,
+            &CancellationToken::default(),
+            1024 * 1024,
+            content(1),
+        )
+        .expect("simple index builds");
+        let (ambiguous, _) = build_index(
+            &ambiguous,
+            &CancellationToken::default(),
+            1024 * 1024,
+            content(2),
+        )
+        .expect("larger index builds");
 
         assert!(ambiguous.retained_bytes() > simple.retained_bytes());
     }

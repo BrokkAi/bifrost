@@ -21,6 +21,7 @@ use crate::analyzer::semantic_model::{
     SemanticModelActivationEvidence, Signature, TypeFact, TypeIdentity, TypeKind, TypeRef,
     Visibility, member_declaration_id, read_exact_artifact_while, type_declaration_id,
 };
+use crate::analyzer::topology::DependencyScope;
 use crate::analyzer::{JsTsDependencyDiscoveryConfig, Project};
 use crate::hash::HashMap;
 use brokk_bifrost_js_ts::model::node_text;
@@ -1805,6 +1806,8 @@ fn resolve_locked_package(
                         canonical_package.join(entry.relative_path),
                     ),
                 ],
+                scope: DependencyScope::Unknown,
+                declared_by: None,
             }
         })
         .collect())

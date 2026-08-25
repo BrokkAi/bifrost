@@ -2004,6 +2004,14 @@ impl SignatureMetadata {
         self
     }
 
+    /// Record that this callable is a constructor independently of ordinary
+    /// declaration modifiers. Some languages represent constructor identity in
+    /// the declaration shape rather than in a modifier list.
+    pub fn with_callable_constructor(mut self) -> Self {
+        self.callable_is_constructor = true;
+        self
+    }
+
     /// Restore the four callable modifier facts independently, as a store
     /// rehydrating a persisted row must.
     ///
@@ -2866,6 +2874,17 @@ impl CodeUnit {
 
     pub fn package_fq(&self) -> FqName {
         self.0.fq.prefix(self.0.package_segment_count)
+    }
+
+    /// The final parser-derived package segment, without recovering a
+    /// component boundary from the rendered package spelling.
+    pub fn package_terminal_name(&self) -> Option<&str> {
+        let package = self
+            .0
+            .fq
+            .segments()
+            .get(self.0.package_segment_count.checked_sub(1)?)?;
+        Some(segment_interner().resolve(*package).0)
     }
 
     /// This declaration's qualified name as its recorded segment texts, root to
@@ -3971,6 +3990,7 @@ mod semantic_diagnostic_report_tests {
 pub enum DeclarationKind {
     Parameter,
     ReceiverParameter,
+    ImportAlias,
     LocalVariable,
     CatchParameter,
     EnhancedForVariable,
@@ -3985,6 +4005,7 @@ impl DeclarationKind {
         match self {
             Self::Parameter => "parameter",
             Self::ReceiverParameter => "receiver_parameter",
+            Self::ImportAlias => "import_alias",
             Self::LocalVariable => "local_variable",
             Self::CatchParameter => "catch_parameter",
             Self::EnhancedForVariable => "enhanced_for_variable",

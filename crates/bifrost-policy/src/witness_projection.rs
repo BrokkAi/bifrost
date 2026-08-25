@@ -1,7 +1,7 @@
 use crate::finding::{BoundedWitness, WitnessStep, WitnessStepKind};
 use crate::finding_identity::WitnessId;
 use brokk_bifrost_analysis::analyzer::WorkspaceAnalyzer;
-use brokk_bifrost_analysis::analyzer::dataflow::{SummaryWitness, SummaryWitnessStepKind};
+use brokk_bifrost_flow::dataflow::{SummaryWitness, SummaryWitnessStepKind};
 
 pub(super) fn project_summary_witness(
     workspace: &WorkspaceAnalyzer,

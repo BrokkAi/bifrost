@@ -27,9 +27,8 @@ use tree_sitter::Node;
 
 /// Owned, query-shaped declaration access used by Rust forward resolution.
 ///
-/// The legacy `GlobalUsageDefinitionIndex` implementation keeps usage-graph callers
-/// working, while point lookups can answer these operations from persisted,
-/// bounded analyzer queries without materializing every workspace declaration.
+/// Point and graph lookups answer these operations from persisted, bounded
+/// analyzer queries without materializing every workspace declaration.
 pub trait RustDefinitionProvider {
     fn fqn(&self, fqn: &str) -> Vec<CodeUnit>;
     fn file_identifier(&self, file: &ProjectFile, identifier: &str) -> Vec<CodeUnit>;

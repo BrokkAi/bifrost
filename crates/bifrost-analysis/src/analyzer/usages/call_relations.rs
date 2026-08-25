@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crate::analyzer::common::language_for_file;
-use crate::analyzer::languages::language_support;
+use crate::analyzer::languages::{ExternalCalleeSite, language_support};
 use crate::analyzer::lexical_definitions::{
     FormalParameterLayout, PythonMethodBinding, formal_parameter_slots,
 };
@@ -28,14 +28,14 @@ use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use super::{FuzzyResult, UsageFinder, UsageHit, UsageHitKind, UsageProof, UsageQueryCompletion};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct CallArgument {
-    pub(crate) range: Range,
-    pub(crate) name: Option<String>,
-    pub(crate) position: Option<usize>,
-    pub(crate) formal_index: Option<usize>,
-    pub(crate) formal_name: Option<String>,
-    pub(crate) variadic: bool,
-    pub(crate) spread: bool,
+pub struct CallArgument {
+    pub range: Range,
+    pub name: Option<String>,
+    pub position: Option<usize>,
+    pub formal_index: Option<usize>,
+    pub formal_name: Option<String>,
+    pub variadic: bool,
+    pub spread: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -45,10 +45,10 @@ pub struct CallSite {
     pub callee_range: Range,
     pub caller: CodeUnit,
     pub callee: CodeUnit,
-    pub(crate) kind: CallSyntaxKind,
+    pub kind: CallSyntaxKind,
     pub proof: UsageProof,
     pub receiver: Option<Range>,
-    pub(crate) arguments: Vec<CallArgument>,
+    pub arguments: Vec<CallArgument>,
 }
 
 /// One exact source-backed call expression. The range covers the complete
@@ -119,21 +119,21 @@ pub(crate) struct CallDispatchLookup {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct CallRelationLimits {
-    pub(crate) max_files: usize,
-    pub(crate) max_source_bytes: usize,
-    pub(crate) max_candidates: usize,
+pub struct CallRelationLimits {
+    pub max_files: usize,
+    pub max_source_bytes: usize,
+    pub max_candidates: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct CallRelationWork {
-    pub(crate) scanned_files: usize,
-    pub(crate) scanned_source_bytes: usize,
-    pub(crate) examined_candidates: usize,
+pub struct CallRelationWork {
+    pub scanned_files: usize,
+    pub scanned_source_bytes: usize,
+    pub examined_candidates: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum CallRelationDiagnosticCode {
+pub enum CallRelationDiagnosticCode {
     BudgetExhausted,
     ParseFailed,
     CandidatesOmitted,
@@ -143,14 +143,14 @@ pub(crate) enum CallRelationDiagnosticCode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct CallRelationDiagnostic {
-    pub(crate) code: CallRelationDiagnosticCode,
-    pub(crate) message: String,
+pub struct CallRelationDiagnostic {
+    pub code: CallRelationDiagnosticCode,
+    pub message: String,
     /// Stable producer context for debugging without parsing the message.
-    pub(crate) context: String,
+    pub context: String,
     /// Structured usage-analysis reason when this originated below the call
     /// relation layer.
-    pub(crate) reason_kind: Option<String>,
+    pub reason_kind: Option<String>,
 }
 
 impl CallRelationDiagnostic {
@@ -188,14 +188,14 @@ impl CallRelationWork {
 #[derive(Debug, Clone, Default)]
 pub struct CallRelationResult {
     pub sites: Vec<CallSite>,
-    pub(crate) truncated: bool,
-    pub(crate) cancelled: bool,
-    pub(crate) diagnostics: Vec<CallRelationDiagnostic>,
-    pub(crate) work: CallRelationWork,
+    pub truncated: bool,
+    pub cancelled: bool,
+    pub diagnostics: Vec<CallRelationDiagnostic>,
+    pub work: CallRelationWork,
 }
 
 #[derive(Default)]
-pub(crate) struct CallBindingCache {
+pub struct CallBindingCache {
     formals: HashMap<CodeUnit, Option<FormalParameterLayout>>,
     python_receiver_is_class: HashMap<(ProjectFile, usize, usize), Option<bool>>,
 }
@@ -204,7 +204,7 @@ impl CallBindingCache {
     /// The callable's syntax-derived formal parameter layout, read once per
     /// declaration. Shared with the `call_binding` row producer so both read
     /// one cache entry rather than re-parsing the declaring file twice.
-    pub(crate) fn formal_layout(
+    pub fn formal_layout(
         &mut self,
         analyzer: &dyn IAnalyzer,
         unit: &CodeUnit,
@@ -217,7 +217,7 @@ impl CallBindingCache {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum CallBindingStatus {
+pub enum CallBindingStatus {
     Complete,
     Unavailable,
 }
@@ -233,7 +233,7 @@ impl CallSyntaxCache {
             .entry(file.clone())
             .or_insert_with(|| {
                 analyzer
-                    .structural_search_providers()
+                    .structural_fact_providers()
                     .into_iter()
                     .find_map(|provider| provider.structural_facts(file))
             })
@@ -542,6 +542,12 @@ impl CallRelationService {
             &mut lookup,
             expand_imported_external_callee(analyzer, &location.file, outcome),
             limits.max_candidates,
+            language,
+            Some(&ExternalCalleeSite {
+                source: &exact_source,
+                tree: &tree,
+                callee_start_byte: callee_range.start_byte,
+            }),
         );
         lookup.cancelled |= cancellation.is_some_and(CancellationToken::is_cancelled);
         lookup
@@ -567,7 +573,7 @@ impl CallRelationService {
         )
     }
 
-    pub(crate) fn incoming_bounded(
+    pub fn incoming_bounded(
         analyzer: &dyn IAnalyzer,
         token: QueryToken<'_>,
         target: &CodeUnit,
@@ -737,7 +743,7 @@ impl CallRelationService {
         )
     }
 
-    pub(crate) fn outgoing_bounded(
+    pub fn outgoing_bounded(
         analyzer: &dyn IAnalyzer,
         token: QueryToken<'_>,
         caller: &CodeUnit,
@@ -992,22 +998,46 @@ fn unresolved_dispatch_lookup(
 }
 
 #[cfg(test)]
+/// The test-facing entry point, which has no parsed file behind it. A call
+/// site with no file evidence can never admit a single-segment external owner;
+/// that decision belongs to [`apply_call_target_outcome`], which the production
+/// path uses.
 fn apply_dispatch_outcome(
     lookup: &mut CallDispatchLookup,
     outcome: DefinitionLookupOutcome,
     max_targets: usize,
+    language: Language,
 ) {
-    apply_dispatch_outcome_with_flags(lookup, outcome, max_targets, false, false, false);
+    apply_dispatch_outcome_with_flags(
+        lookup,
+        outcome,
+        max_targets,
+        language,
+        None,
+        false,
+        false,
+        false,
+    );
 }
 
 /// Give the owning language a chance to expand an imported callee spelling to
 /// the external identity that semantic models publish.
+///
+/// Both statuses that can publish an external boundary carrying a callee text
+/// are offered the expansion. Java's import-qualified callees land on
+/// `NoDefinition` (#2364); Rust's land on `UnresolvableImportBoundary`, because
+/// its resolver followed the `use` out of the workspace before giving up
+/// (#2596). Gating on only one of the two would have made the expansion dead
+/// for one of the two languages that implement it.
 fn expand_imported_external_callee(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     mut outcome: CallTargetLookupOutcome,
 ) -> CallTargetLookupOutcome {
-    if outcome.outcome.status != DefinitionLookupStatus::NoDefinition {
+    if !matches!(
+        outcome.outcome.status,
+        DefinitionLookupStatus::NoDefinition | DefinitionLookupStatus::UnresolvableImportBoundary
+    ) {
         return outcome;
     }
     let Some(text) = outcome.outcome.resolved_reference_target() else {
@@ -1028,21 +1058,30 @@ fn apply_call_target_outcome(
     lookup: &mut CallDispatchLookup,
     outcome: CallTargetLookupOutcome,
     max_targets: usize,
+    language: Language,
+    site: Option<&ExternalCalleeSite<'_>>,
 ) {
     apply_dispatch_outcome_with_flags(
         lookup,
         outcome.outcome,
         max_targets,
+        language,
+        site,
         outcome.structure_unavailable,
         outcome.unproven_link_unit,
         outcome.truncated,
     );
 }
 
+/// The arguments are the outcome plus the four independent facts the caller
+/// already proved about it; a struct would only rename them.
+#[allow(clippy::too_many_arguments)]
 fn apply_dispatch_outcome_with_flags(
     lookup: &mut CallDispatchLookup,
     outcome: DefinitionLookupOutcome,
     max_targets: usize,
+    language: Language,
+    site: Option<&ExternalCalleeSite<'_>>,
     structure_unavailable: bool,
     unproven_link_unit: bool,
     navigation_targets_truncated: bool,
@@ -1054,12 +1093,15 @@ fn apply_dispatch_outcome_with_flags(
         diagnostics,
         reference,
     } = outcome;
-    // The dotted syntactic callee text (`java.net.URLDecoder.decode`) is the only
+    // The syntactic callee text (`java.net.URLDecoder.decode`) is the only
     // identity an unmaterialized external callee leaves behind, so retain it on
-    // the external boundary instead of dropping it (#1978).
+    // the external boundary instead of dropping it (#1978). Canonicalizing it
+    // once here is what makes every external route below carry an identity that
+    // is bindable, or none at all (#2598).
     let external_callee_text: Option<Box<str>> = reference
         .as_ref()
-        .map(|reference| Box::<str>::from(reference.text.as_str()));
+        .and_then(|reference| canonical_external_callee(&reference.text, language, site))
+        .map(Box::<str>::from);
     let unproven_target_identity = structure_unavailable || unproven_link_unit;
     let partial_external_boundary = diagnostics
         .iter()
@@ -1150,17 +1192,15 @@ fn apply_dispatch_outcome_with_flags(
         // to the external boundary that can carry an activated summary. Every
         // other `NoDefinition` -- an unqualified or single-segment callee -- keeps
         // its unresolved boundary, so the classification blast radius is limited
-        // to fully-qualified external callees.
-        DefinitionLookupStatus::NoDefinition => {
-            match external_callee_text.filter(|text| is_fully_qualified_callee(text)) {
-                Some(text) => lookup
-                    .boundaries
-                    .push(CallDispatchBoundaryKind::External(Some(text))),
-                None => lookup
-                    .boundaries
-                    .push(CallDispatchBoundaryKind::Unresolved(status)),
-            }
-        }
+        // to callees that name a bindable external identity.
+        DefinitionLookupStatus::NoDefinition => match external_callee_text {
+            Some(text) => lookup
+                .boundaries
+                .push(CallDispatchBoundaryKind::External(Some(text))),
+            None => lookup
+                .boundaries
+                .push(CallDispatchBoundaryKind::Unresolved(status)),
+        },
         DefinitionLookupStatus::UnsupportedLanguage
         | DefinitionLookupStatus::InvalidLocation
         | DefinitionLookupStatus::NotFound => lookup
@@ -1169,14 +1209,51 @@ fn apply_dispatch_outcome_with_flags(
     }
 }
 
-/// Whether `callee_text` is a fully-qualified external callee whose owner is a
-/// dotted FQN present verbatim (`java.net.URLDecoder.decode`), the only shape in
-/// scope for unmaterialized external summary binding (#1978). An unqualified
-/// (`trim`) or single-segment (`URLDecoder.decode`) callee needs import or type
-/// resolution and is excluded.
-fn is_fully_qualified_callee(callee_text: &str) -> bool {
-    crate::analyzer::semantic::split_qualified_member(callee_text)
-        .is_some_and(|(owner, _member)| owner.contains('.'))
+/// The external identity `callee_text` names, or `None` when it names none.
+///
+/// A multi-segment owner present verbatim in the spelling the source wrote
+/// (`java.net.URLDecoder.decode`, `std::str::from_utf8`) is an identity on its
+/// own evidence and is returned unchanged (#1978, #2596): the cut follows the
+/// language's own separator, and the owner is compared in its canonical
+/// dot-joined form, so one rule serves both spellings. The text is returned as
+/// written rather than dot-joined, because the minting side re-cuts it with the
+/// same separator.
+///
+/// An unqualified callee (`trim`) names nothing here; resolving it needs type
+/// information this cut does not have. A single-segment owner
+/// (`URLDecoder.decode`, `Path::new`, `JSON.parse`) is offered to the language
+/// (#2598), which is the only party that can say whether such an owner is an
+/// identity in its surface and, if so, which one. A language that can prove an
+/// import expansion instead performs it upstream in
+/// [`expand_imported_external_callee`], so a callee it handles arrives here
+/// already multi-segment.
+///
+/// Constraint (#2596): an implicit-prelude spelling stays excluded. Rust's
+/// `String::from(x)` has no `use` declaration for the import binder to read, so
+/// admitting it would need a checked-in prelude table -- reviewed content
+/// rather than resolution -- which Bifrost does not carry. Such a call keeps
+/// the boundary it already had and binds no authored summary.
+fn canonical_external_callee(
+    callee_text: &str,
+    language: Language,
+    site: Option<&ExternalCalleeSite<'_>>,
+) -> Option<String> {
+    let (owner, member) =
+        crate::analyzer::semantic::split_canonical_qualified_callee(callee_text, language)?;
+    if owner.contains('.') {
+        return Some(callee_text.to_owned());
+    }
+    let support = language_support(language)?;
+    if !support.publishes_single_segment_external_owners() {
+        return None;
+    }
+    // Without the call site's own file evidence there is nothing to decide a
+    // single-segment owner on, and guessing one is exactly what #2598 forbids.
+    let canonical_owner = support.single_segment_external_owner(&owner, site?)?;
+    Some(format!(
+        "{canonical_owner}{}{member}",
+        support.qualified_call_separator()
+    ))
 }
 
 fn call_hits(
@@ -1316,7 +1393,7 @@ fn raw_call_site(
     }
 }
 
-pub(crate) fn bind_call_site_arguments(
+pub fn bind_call_site_arguments(
     analyzer: &dyn IAnalyzer,
     site: &mut CallSite,
     cache: &mut CallBindingCache,
@@ -1365,7 +1442,7 @@ pub(crate) fn bind_call_site_arguments(
 /// `self` the allocation binds; a class in any other language names no
 /// parameter list this seam can read. Shared with the `call_binding` row
 /// producer so both answer from one rule (issue #2499).
-pub(crate) fn formal_owner_for_callee(
+pub fn formal_owner_for_callee(
     analyzer: &dyn IAnalyzer,
     callee: &CodeUnit,
 ) -> Option<(CodeUnit, bool)> {
@@ -1393,7 +1470,7 @@ pub(crate) fn formal_owner_for_callee(
 /// first written actual reaches. `None` means the receiver's own resolution
 /// failed, which is undecidable rather than "not bound" -- a caller that
 /// guessed here would report every actual one slot off.
-pub(crate) fn python_first_formal_is_bound(
+pub fn python_first_formal_is_bound(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     receiver: Option<Range>,
@@ -1657,9 +1734,15 @@ mod tests {
             Some(BoundaryStatus::ExternalUnknown),
             "{lookup:#?}"
         );
+        // The payload of an external boundary is the canonical external
+        // identity, not the raw callee text (#2598). `work` names no owner at
+        // all, so it identifies nothing an authored summary could be keyed
+        // under, and the boundary says so instead of carrying a spelling the
+        // minting side would discard anyway. The refined status above is what
+        // this test is about and is unchanged.
         assert_eq!(
             lookup.boundaries,
-            vec![CallDispatchBoundaryKind::External(Some("work".into()))],
+            vec![CallDispatchBoundaryKind::External(None)],
             "{lookup:#?}"
         );
     }
@@ -1861,6 +1944,8 @@ int caller() { return local_target(1); }
             &mut unavailable,
             outcome(DefinitionLookupStatus::Resolved, true, false),
             8,
+            Language::Cpp,
+            None,
         );
         assert_eq!(unavailable.targets.len(), 1, "{unavailable:#?}");
         assert_eq!(unavailable.targets[0].proof, UsageProof::Unproven);
@@ -1879,6 +1964,8 @@ int caller() { return local_target(1); }
             &mut truncated,
             outcome(DefinitionLookupStatus::Ambiguous, false, true),
             8,
+            Language::Cpp,
+            None,
         );
         assert_eq!(truncated.targets.len(), 1, "{truncated:#?}");
         assert_eq!(truncated.targets[0].proof, UsageProof::Unproven);
@@ -2332,6 +2419,7 @@ object Calls {
                 }],
             },
             2,
+            Language::TypeScript,
         );
         assert_eq!(ambiguous.status, Some(DefinitionLookupStatus::Ambiguous));
         assert_eq!(
@@ -2375,6 +2463,7 @@ object Calls {
                 ],
             },
             2,
+            Language::TypeScript,
         );
         assert_eq!(partial_ambiguous.targets.len(), 1);
         assert_eq!(
@@ -2399,6 +2488,7 @@ object Calls {
                 }],
             },
             1,
+            Language::TypeScript,
         );
         assert_eq!(
             empty_ambiguous.boundaries,
@@ -2418,6 +2508,7 @@ object Calls {
                 diagnostics: Vec::new(),
             },
             1,
+            Language::TypeScript,
         );
         assert_eq!(
             external.boundaries,
@@ -2441,6 +2532,7 @@ object Calls {
                     diagnostics: Vec::new(),
                 },
                 1,
+                Language::TypeScript,
             );
             assert_eq!(unresolved.status, Some(status));
             assert_eq!(

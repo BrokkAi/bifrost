@@ -256,7 +256,7 @@ pub fn qualified_paths_for_file(
         ));
     };
     let facts = analyzer
-        .structural_search_providers()
+        .structural_fact_providers()
         .into_iter()
         .find(|provider| provider.structural_language() == language)
         .and_then(|provider| provider.structural_facts(file));

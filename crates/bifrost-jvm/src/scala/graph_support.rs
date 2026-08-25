@@ -17,14 +17,11 @@
 //! they make is Scala's, but one of the facts it reads is not reachable from
 //! this crate.
 //!
-//! The three types beneath the trait are the same story told about indexes
-//! rather than about the analyzer. [`ScalaDefinitionIndex`] and
-//! [`ScalaCallableFactsIndex`] are the exact slices of the analysis-side
-//! `GlobalUsageDefinitionIndex` and `UsageFactsIndex` that the graph reads;
-//! lowering either whole would move a genuinely analysis-side product for a
-//! handful of questions, so the crate line is drawn at the answers -- the
-//! `PhpCallableFacts` precedent. [`ScalaFileFacts`] is the same cut through the
-//! analyzer's per-file `FileState`: thirteen fields of the twenty-five it
+//! The three types beneath the trait are the same story told about query-shaped
+//! data rather than about the analyzer. [`ScalaDefinitionIndex`] and
+//! [`ScalaCallableFactsIndex`] expose only the request-local relational answers
+//! the graph reads. [`ScalaFileFacts`] is the same cut through the analyzer's
+//! per-file `FileState`: thirteen fields of the twenty-five it
 //! carries, decoded shim-side and handed across, the way Ruby's owner-relation
 //! facts cross.
 
@@ -33,10 +30,11 @@ use std::sync::Arc;
 use brokk_bifrost_core::analyzer::capabilities::{
     ImportAnalysisProvider, TypeAliasProvider, TypeHierarchyProvider,
 };
-use brokk_bifrost_core::analyzer::model::{
-    CallableFacts, ImportInfo, ScalaExportInfo, SignatureMetadata,
+use brokk_bifrost_core::analyzer::fq_name::FqName;
+use brokk_bifrost_core::analyzer::model::{ImportInfo, ScalaExportInfo, SignatureMetadata};
+use brokk_bifrost_core::analyzer::{
+    CodeUnit, CodeUnitIndex, ProjectFile, Range, RelationalCallableFact,
 };
-use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, ProjectFile, Range};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 
 use crate::proof::JvmActiveSemanticModel;
@@ -161,53 +159,46 @@ pub trait ScalaWorkspaceSource {
     fn ranges(&self, code_unit: &CodeUnit) -> Vec<Range>;
 
     /// See [`ScalaSource::definitions_by_normalized_fqn`]; this one answers
-    /// from every language's shard.
+    /// from the dispatching workspace.
     fn definitions_by_normalized_fqn(&self, normalized: &str) -> Vec<CodeUnit>;
 }
 
-/// The slice of the workspace declaration index [`ProjectTypes`] holds.
-///
-/// Eleven questions out of `GlobalUsageDefinitionIndex`'s surface, three of
-/// them already spelled by core's `BoundedDefinitionLookup` and the rest the
-/// index's own secondary catalogs. The four `&[CodeUnit]` returns borrow on
-/// purpose: the whole-workspace scan asks them per reference, and the analysis
-/// index answers each from a map it already owns.
+/// The request-local relational definition surface [`ProjectTypes`] reads.
 pub trait ScalaDefinitionIndex: Send + Sync {
-    fn by_fqn(&self, fqn: &str) -> &[CodeUnit];
-    fn by_normalized_fqn(&self, normalized: &str) -> &[CodeUnit];
-    fn types_in_package(&self, package: &str, simple: &str) -> &[CodeUnit];
-    fn identifier(&self, ident: &str) -> &[CodeUnit];
+    fn by_fqn(&self, fqn: &str) -> Vec<CodeUnit>;
+    fn by_normalized_fqn(&self, normalized: &str) -> Vec<CodeUnit>;
+    fn types_in_package(&self, package: &str, simple: &str) -> Vec<CodeUnit>;
+    fn identifier(&self, ident: &str) -> Vec<CodeUnit>;
     fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit>;
     fn fqn_exists(&self, fqn: &str) -> bool;
     fn package_exists(&self, package: &str) -> bool;
     fn package_container_exists(&self, package: &str) -> bool;
     fn child_packages(&self, package: &str) -> Vec<String>;
 
+    /// Direct children of one already-resolved structured owner named `name`.
+    /// Callers that hold a `CodeUnit` must use this form so the lookup retains
+    /// the declaration's authoritative segment kinds instead of rendering and
+    /// reparsing them as an unresolved user path.
+    fn members_for_structured_owner(&self, owner: &FqName, name: &str) -> Vec<CodeUnit>;
+
     /// Direct children of `owner_fqn` named `name`, falling back to the
     /// normalized spelling when the exact fq misses. Both spellings are the
     /// caller's because normalization is Scala's `$`-companion rule, which the
     /// index does not know.
-    fn members_for_owner_name<'a>(
-        &'a self,
+    fn members_for_owner_name(
+        &self,
         owner_fqn: &str,
         normalized_owner_fqn: &str,
         name: &str,
-    ) -> Vec<&'a CodeUnit>;
+    ) -> Vec<CodeUnit>;
 
-    /// Every `(package, simple type name) -> declarations` entry the index
-    /// catalogs, in the index's own iteration order.
-    fn package_types(&self) -> ScalaPackageTypeEntries<'_>;
+    /// Every simple type-name bucket in one exact package.
+    fn package_types_in(&self, package: &str) -> Vec<(String, Vec<CodeUnit>)>;
 }
-
-/// The `(package, simple type name) -> declarations` stream
-/// [`ScalaDefinitionIndex::package_types`] yields. Boxed rather than `impl
-/// Iterator` because the index crosses the crate line as a trait object.
-pub type ScalaPackageTypeEntries<'a> =
-    Box<dyn Iterator<Item = (&'a (String, String), &'a [CodeUnit])> + 'a>;
 
 /// The one question [`ProjectTypes`] asks the workspace usage-facts index.
 pub trait ScalaCallableFactsIndex: Send + Sync {
-    fn fact_for_declaration(&self, declaration: &CodeUnit) -> Option<&CallableFacts>;
+    fn facts_for_declaration(&self, declaration: &CodeUnit) -> Vec<RelationalCallableFact>;
 }
 
 /// The thirteen per-file declaration facts the Scala graph reads out of the

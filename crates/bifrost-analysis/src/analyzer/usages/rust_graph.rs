@@ -9,7 +9,7 @@ use crate::analyzer::usages::traits::{GraphUsageAnalyzer, PreparedUsageQuery};
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 
 use crate::analyzer::usages::common::language_for_target;
-use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
+use crate::analyzer::usages::inverted_edges::{EdgeNodeDomain, UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::model::{FuzzyResult, ReferenceGraphResult};
 use crate::analyzer::usages::outcome::{
     CandidateUsageHits, GraphFailureReason, GraphUsageOutcome, union_candidate_usages,
@@ -28,6 +28,8 @@ use crate::analyzer::usages::traits::{UsageAnalyzer, UsageQueryResolver, UsageSc
 use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, RustAnalyzer, resolve_analyzer};
 use crate::cancellation::CancellationToken;
 use crate::hash::HashSet;
+use brokk_bifrost_rust::usage::usage_candidate_files_visible_to_binding_seeds_with_walks;
+use brokk_bifrost_rust::usage_walks::RustUsageWalks;
 use std::collections::BTreeSet;
 
 pub(crate) use resolver::{
@@ -57,6 +59,18 @@ where
 {
     let resolver = RustEdgeResolver::try_new(analyzer)?;
     Some(resolver.build_edges(analyzer, nodes, keep_file))
+}
+
+pub(crate) fn build_rooted_rust_usage_edges<F>(
+    analyzer: &dyn IAnalyzer,
+    callers: &HashSet<String>,
+    keep_file: F,
+) -> Option<UsageEdges>
+where
+    F: Fn(&ProjectFile) -> bool + Sync,
+{
+    let resolver = RustEdgeResolver::try_new(analyzer)?;
+    Some(resolver.build_rooted_edges(analyzer, callers, keep_file))
 }
 
 pub(crate) fn build_rust_usage_edge_weights<F>(
@@ -146,10 +160,10 @@ impl PreparedRustUsageQuery {
                 usage_binding_seeds_while(rust, token, &seed_result.roots, &keep_going)?
             };
             crate::profiling::note_with(|| {
+                let candidate_names = seeds.candidate_names().collect::<Vec<_>>();
                 format!(
-                    "rust_graph seed roots={} candidate_names={}",
+                    "rust_graph seed roots={} candidate_names={candidate_names:?}",
                     seed_result.roots.len(),
-                    seeds.candidate_names().count()
                 )
             });
             let graph_visible = !member || is_graph_visible_member_target(rust, &target);
@@ -176,6 +190,12 @@ impl PreparedRustUsageQuery {
         // The outer finder admits the union, but each overload keeps its own
         // protected closure. Letting one overload inherit another's importers
         // makes every semantic scan wider without improving soundness.
+        let candidate_walks = if include_finder_augmentation {
+            Some(RustUsageWalks::new_while(rust, token, &keep_going)?)
+        } else {
+            None
+        };
+        let mut scoped_candidates = HashSet::default();
         let mut graph_candidates = HashSet::default();
         for prepared in &mut targets {
             let Some(PreparedRustTargetReady {
@@ -192,7 +212,22 @@ impl PreparedRustUsageQuery {
             if *member && *kind == RustGraphSeedKind::Export && !*graph_visible && !authoritative {
                 continue;
             }
-            let mut planning_candidates = supplied_candidates.clone();
+            let mut planning_candidates = if let Some(walks) = candidate_walks.as_ref() {
+                let filtered = usage_candidate_files_visible_to_binding_seeds_with_walks(
+                    rust,
+                    walks,
+                    supplied_candidates,
+                    prepared.target.source(),
+                    seeds,
+                )?;
+                scoped_candidates.extend(filtered.iter().cloned());
+                filtered
+            } else {
+                supplied_candidates.clone()
+            };
+            if include_finder_augmentation {
+                scoped_candidates.extend(protected_files.iter().cloned());
+            }
             planning_candidates.extend(std::mem::take(protected_files));
             let planning_scope = UsageScanScope::with_cancellation(
                 &planning_candidates,
@@ -221,6 +256,9 @@ impl PreparedRustUsageQuery {
             keep_going().then_some(())?;
             graph_candidates.extend(target_files.iter().cloned());
             *planned_files = target_files;
+        }
+        if include_finder_augmentation {
+            candidate_files = scoped_candidates;
         }
         candidate_files.extend(graph_candidates);
 
@@ -419,7 +457,29 @@ impl<'a> RustEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        inverted::build_rust_edges(analyzer, self.rust, nodes, keep_file)
+        inverted::build_rust_edges(
+            analyzer,
+            self.rust,
+            EdgeNodeDomain::Closed(nodes),
+            keep_file,
+        )
+    }
+
+    pub(crate) fn build_rooted_edges<F>(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        callers: &HashSet<String>,
+        keep_file: F,
+    ) -> UsageEdges
+    where
+        F: Fn(&ProjectFile) -> bool + Sync,
+    {
+        inverted::build_rust_edges(
+            analyzer,
+            self.rust,
+            EdgeNodeDomain::Rooted(callers),
+            keep_file,
+        )
     }
 
     pub(crate) fn build_edge_weights<F>(
@@ -431,7 +491,12 @@ impl<'a> RustEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        inverted::build_rust_edges(analyzer, self.rust, nodes, keep_file)
+        inverted::build_rust_edges(
+            analyzer,
+            self.rust,
+            EdgeNodeDomain::Closed(nodes),
+            keep_file,
+        )
     }
 }
 
@@ -632,6 +697,60 @@ mod tests {
     }
 
     #[test]
+    fn usage_scan_opens_only_candidates_that_spell_a_verified_name() {
+        let mut files = vec![
+            (
+                "Cargo.toml".to_string(),
+                "[package]\nname = \"bounded\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+                    .to_string(),
+            ),
+            (
+                "src/lib.rs".to_string(),
+                "pub mod service;\npub mod consumer;\n".to_string(),
+            ),
+            (
+                "src/service.rs".to_string(),
+                "pub struct Service;\n".to_string(),
+            ),
+            (
+                "src/consumer.rs".to_string(),
+                "use crate::service::Service as S;\npub fn build() { let _ = S; }\n".to_string(),
+            ),
+        ];
+        for index in 0..20 {
+            files.push((
+                format!("src/unrelated{index}.rs"),
+                format!("pub fn unrelated{index}() {{}}\n"),
+            ));
+        }
+        let fixture = fixture_for(&files);
+        let analyzer = RustAnalyzer::from_project(fixture.test_project().clone());
+        let root = fixture.project_root();
+        let target_file = ProjectFile::new(root.clone(), "src/service.rs");
+        let consumer_file = ProjectFile::new(root, "src/consumer.rs");
+        let target = declaration_named(&analyzer, &target_file, "Service");
+        let candidates: HashSet<_> = analyzer.get_analyzed_files().into_iter().collect();
+
+        analyzer.reset_scanned_candidate_file_count_for_test();
+        let scope = UsageScanScope::new(&candidates, false);
+        let outcome = RustExportUsageGraphStrategy::new()
+            .find_graph_usages(&analyzer, std::slice::from_ref(&target), &scope, 1000)
+            .into_fuzzy_result();
+
+        let hits = outcome.all_hits();
+        assert!(
+            hits.iter()
+                .any(|hit| hit.file == consumer_file && hit.snippet.contains("S")),
+            "the verified alias must remain visible: {hits:#?}"
+        );
+        assert_eq!(
+            analyzer.scanned_candidate_file_count_for_test(),
+            2,
+            "only the declaration and alias consumer should reach AST scanning"
+        );
+    }
+
+    #[test]
     fn rust_usage_scan_uses_indexed_definition_queries() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().canonicalize().expect("canonical root");
@@ -664,9 +783,6 @@ mod tests {
         ]));
         analyzer
             .test_hooks()
-            .reset_global_usage_definition_index_build_count_for_test();
-        analyzer
-            .test_hooks()
             .reset_definition_candidates_query_count_for_test();
         let candidates: HashSet<_> = [target_file].into_iter().collect();
         let scope = UsageScanScope::new(&candidates, true);
@@ -676,16 +792,6 @@ mod tests {
             .into_fuzzy_result();
 
         assert_eq!(outcome.all_hits_including_imports().len(), 1);
-        for (language, delegate) in analyzer.delegates() {
-            let builds = delegate
-                .analyzer()
-                .test_hooks()
-                .global_usage_definition_index_build_count_for_test();
-            assert_eq!(
-                builds, 0,
-                "Rust usage scan built the {language:?} definition shard"
-            );
-        }
         assert!(
             analyzer
                 .test_hooks()
@@ -883,6 +989,62 @@ mod tests {
         assert!(!beta_plan.planned_files.contains(&alpha_caller));
         assert!(prepared.candidate_files().contains(&alpha_caller));
         assert!(prepared.candidate_files().contains(&beta_caller));
+    }
+
+    #[test]
+    fn prepared_private_target_drops_siblings_but_keeps_descendant_modules() {
+        let files = vec![
+            (
+                "Cargo.toml".to_string(),
+                "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+                    .to_string(),
+            ),
+            (
+                "src/lib.rs".to_string(),
+                "mod owner;\nmod sibling;\n".to_string(),
+            ),
+            (
+                "src/owner.rs".to_string(),
+                "struct Target;\nmod child;\n".to_string(),
+            ),
+            (
+                "src/owner/child.rs".to_string(),
+                "fn use_target(_: super::Target) {}\n".to_string(),
+            ),
+            (
+                "src/sibling.rs".to_string(),
+                "fn unrelated() { let _ = \"Target\"; }\n".to_string(),
+            ),
+        ];
+        let fixture = fixture_for(&files);
+        let analyzer = RustAnalyzer::from_project(fixture.test_project().clone());
+        let root = fixture.project_root();
+        let owner = ProjectFile::new(root.clone(), "src/owner.rs");
+        let child = ProjectFile::new(root.clone(), "src/owner/child.rs");
+        let sibling = ProjectFile::new(root, "src/sibling.rs");
+        let target = declaration_named(&analyzer, &owner, "Target");
+        let supplied = [owner.clone(), child.clone(), sibling.clone()]
+            .into_iter()
+            .collect();
+
+        let prepared = PreparedRustUsageQuery::prepare(
+            &analyzer,
+            std::slice::from_ref(&target),
+            &supplied,
+            false,
+            true,
+            &CancellationToken::new(),
+        )
+        .expect("prepared private target");
+        let plan = prepared.targets[0].ready.as_ref().expect("target plan");
+
+        assert!(plan.planned_files.contains(&owner));
+        assert!(plan.planned_files.contains(&child));
+        assert!(
+            !plan.planned_files.contains(&sibling),
+            "an unrelated sibling cannot see the private target: {:?}",
+            plan.planned_files
+        );
     }
 
     #[test]

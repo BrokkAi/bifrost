@@ -1,4 +1,5 @@
 use super::*;
+use crate::analyzer::AnalyzerDefinitionLookup;
 use crate::analyzer::BoundedDefinitionLookup;
 use crate::analyzer::RubyMethodDispatchMode;
 use crate::analyzer::lexical_definitions::formal_parameter_slots_for_owner_bounded;
@@ -94,6 +95,15 @@ impl BoundedDefinitionLookup for RubyDefinitionProvider<'_> {
             self.session.mark_scope_incomplete();
             Vec::new()
         }
+    }
+
+    fn members_for_owner_name(
+        &self,
+        owner_fqn: &str,
+        _normalized_owner_fqn: &str,
+        name: &str,
+    ) -> Vec<CodeUnit> {
+        RubyDefinitionProvider::members_for_owner_name(self, owner_fqn, name)
     }
 
     fn file_identifier(&self, file: &ProjectFile, ident: &str) -> Vec<CodeUnit> {
@@ -1005,8 +1015,9 @@ pub(super) fn resolve_ruby(
         );
     };
 
+    let bounded_definitions = AnalyzerDefinitionLookup::new(analyzer, Language::None);
     let definitions = |consume: &mut dyn FnMut(&dyn BoundedDefinitionLookup)| {
-        consume(&analyzer.global_usage_definition_index());
+        consume(&bounded_definitions);
     };
     let scope = AnalyzerQueryScope::new(analyzer);
     let semantic = RubySemanticIndex::build_for_lookup(

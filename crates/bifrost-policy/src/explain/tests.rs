@@ -7,8 +7,8 @@
 
 use std::sync::Arc;
 
-use brokk_bifrost_analysis::analyzer::structural::CodeQueryExecutionLimits;
 use brokk_bifrost_analysis::analyzer::{Language, ProjectFile, TestProject, TypescriptAnalyzer};
+use brokk_bifrost_rql::structural::CodeQueryExecutionLimits;
 
 use crate::budget::PolicyBudget;
 use crate::catalog::{CatalogRegistryLimits, TaintCatalogRegistry};
@@ -141,6 +141,7 @@ const TWO_BINDING_RELATIONAL: &str = r#"(policy
 struct Fixture {
     _temp: tempfile::TempDir,
     analyzer: TypescriptAnalyzer,
+    flow_state: brokk_bifrost_flow::FlowWorkspaceState,
 }
 
 impl Fixture {
@@ -159,6 +160,7 @@ impl Fixture {
         Self {
             _temp: temp,
             analyzer,
+            flow_state: brokk_bifrost_flow::FlowWorkspaceState::new(),
         }
     }
 
@@ -166,6 +168,7 @@ impl Fixture {
         PolicyEvaluationContext {
             analyzer: &self.analyzer,
             workspace: None,
+            flow_state: &self.flow_state,
             cancellation: None,
             cvss_overlays: &[],
             organizational_risk: &[],
@@ -1364,6 +1367,7 @@ fn the_host_explains_a_relational_finding_from_a_workspace_policy_file() {
         &ExplanationTarget::Candidate(candidate),
         None,
         None,
+        None,
         &ExplanationLimits::default(),
     )
     .expect("the host answers why-not");
@@ -1377,6 +1381,7 @@ fn the_host_explains_a_relational_finding_from_a_workspace_policy_file() {
         &root,
         &inputs,
         &ExplanationTarget::Finding(id),
+        None,
         None,
         None,
         &ExplanationLimits::default(),
@@ -1401,6 +1406,7 @@ fn the_host_refuses_a_selection_that_is_not_exactly_one_policy() {
         &ExplanationTarget::Candidate(candidate.clone()),
         None,
         None,
+        None,
         &ExplanationLimits::default(),
     )
     .expect_err("an explanation is about one policy");
@@ -1421,6 +1427,7 @@ fn the_host_refuses_a_selection_that_is_not_exactly_one_policy() {
         &ExplanationTarget::Candidate(candidate),
         None,
         None,
+        None,
         &ExplanationLimits::default(),
     )
     .expect_err("an explanation is about one policy");
@@ -1438,6 +1445,7 @@ fn the_host_reports_an_unloadable_policy_as_a_stated_condition() {
             "policies/absent.rqlp",
         )],
         &ExplanationTarget::Candidate(candidate),
+        None,
         None,
         None,
         &ExplanationLimits::default(),
@@ -1605,6 +1613,7 @@ fn fake_projection(
             "function:store",
         )
         .expect("a stable sink identity"),
+        0,
         source.analysis_projection_hash,
         sink.analysis_projection_hash,
         crate::cvss::SourceScenarioSetHash::try_from_scenarios(vec![scenario.clone()])

@@ -32,26 +32,19 @@
 //! and `.agents/plans/issue-449-query-code-reference.md` for the public rename.
 
 pub(crate) mod adapter_helpers;
-pub mod analysis_context;
-pub(crate) mod capabilities;
-pub(crate) mod execution;
+pub mod derived_cache;
 pub mod extract;
 pub mod facts;
-pub mod flow_state;
 pub mod identity_routes;
-pub(crate) mod index;
+pub mod index;
+pub mod index_query;
 pub mod lexical_environment;
-pub mod matcher;
 pub mod materialization_rows;
 pub mod occurrence_rows;
-pub mod planner;
 pub mod provider;
 pub mod qualified_paths;
-pub use brokk_bifrost_rql::query;
 pub mod reference_edges;
 pub mod rewrite_paths;
-pub mod rune_ir;
-pub mod search;
 
 // The normalized kind/role registry and the spec trait a language implements
 // live in `brokk-bifrost-core`, below every grammar; only the engine that
@@ -62,44 +55,11 @@ pub use brokk_bifrost_core::analyzer::structural::{
     edges, kinds, materialization, occurrences, resolution, rewrite_path, routes, spec,
 };
 
-pub use analysis_context::{
-    MAX_PROTOCOL_NAME_BYTES, MAX_PROTOCOL_NAMESPACE_BYTES, MAX_PROTOCOL_REF_BYTES,
-    MAX_PROTOCOL_REFS, MAX_PROTOCOL_REGISTRATIONS, MAX_QUERY_REGISTRATION_VALIDATION_ARTIFACTS,
-    MAX_QUERY_REGISTRATION_VALIDATION_SOURCE_BYTES, MAX_REGISTRATION_ARTIFACT_SOURCE_BYTES,
-    MAX_RETAINED_BINDING_PLAN_BYTES, MAX_RETAINED_PROTOCOL_BYTES,
-    MAX_RETAINED_REGISTRATION_ARTIFACT_BYTES, MAX_RETAINED_TAINT_ARTIFACT_BYTES,
-    MAX_RETAINED_TAINT_PLAN_BYTES, MAX_RETAINED_TAINT_REPORT_BYTES,
-    MAX_RETAINED_VALUE_FLOW_ARTIFACT_BYTES, MAX_RETAINED_VALUE_FLOW_PLAN_BYTES,
-    MAX_TAINT_RESULT_REF_BYTES, MAX_TAINT_RESULT_REFS, MAX_TAINT_RESULT_REGISTRATIONS,
-    MAX_TAINT_RESULTS_PER_REGISTRATION, MAX_VALUE_FLOW_PLAN_REFS,
-    MAX_VALUE_FLOW_PLAN_REGISTRATIONS, ProtocolHandle, ProtocolNameError, ProtocolNamespaceError,
-    ProtocolRef, ProtocolRefError, ProtocolRegistration, ProtocolRegistrationError,
-    ProtocolRegistrationLimits, ProtocolRegistrationOutcome, ProtocolRegistrationSet,
-    ProtocolRegistrationSetError, QueryAnalysisContext, QueryAnalysisContextError,
-    QueryAnalysisValidationLimits, TaintResultHandle, TaintResultNameError,
-    TaintResultNamespaceError, TaintResultRef, TaintResultRefError, TaintResultRegistration,
-    TaintResultRegistrationError, TaintResultRegistrationLimits, TaintResultRegistrationOutcome,
-    TaintResultRegistrationSet, TaintResultRegistrationSetError, ValueFlowPlanHandle,
-    ValueFlowPlanNameError, ValueFlowPlanNamespaceError, ValueFlowPlanRef, ValueFlowPlanRefError,
-    ValueFlowPlanRegistration, ValueFlowPlanRegistrationLimits, ValueFlowPlanRegistrationOutcome,
-    ValueFlowPlanRegistrationSet, ValueFlowPlanRegistrationSetError,
-};
 pub use edges::{
     ALL_EDGE_AXES, ALL_EDGE_PROVENANCES, ALL_OWNER_RELATIONS, ALL_SITE_CLASSES,
     DEEP_REFERENCE_EDGE_SUPPORT, EdgeAxis, EdgeProvenance, EdgeSupport,
     INVERSE_REFERENCE_EDGE_SUPPORT, NO_REFERENCE_EDGE_SUPPORT, OwnerRelation, ReferenceEdgeSupport,
     SiteClass,
-};
-pub use execution::{
-    CodeQueryAccessPathProfile, CodeQueryBoundedDispatchProfile, CodeQueryCacheMetricsKind,
-    CodeQueryDerivedLayerCacheCounters, CodeQueryExplain, CodeQueryExplainScheduling,
-    CodeQueryLogicalNode, CodeQueryLogicalOperation, CodeQueryLogicalPlan,
-    CodeQueryOperatorDisposition, CodeQueryOperatorObservation, CodeQueryOperatorTermination,
-    CodeQueryOperatorTimings, CodeQueryPhysicalNode, CodeQueryPhysicalOperator,
-    CodeQueryPhysicalPlan, CodeQueryProfile, CodeQueryProfileCacheCounters,
-    CodeQueryProfileCacheLayer, CodeQueryProfileRequestTimings, CodeQueryProfileScheduling,
-    CodeQueryProfileTimings, CodeQueryProfileWork, CodeQuerySchedulingPolicy,
-    CodeQuerySelectedScheduling, CodeQueryStructuralFactsCacheCounters,
 };
 pub use facts::{FileFacts, NormalizedNode, RoleTarget, Span};
 pub use identity_routes::{
@@ -137,21 +97,12 @@ pub use occurrences::{
     ALL_OCCURRENCE_ROLES, NO_OCCURRENCE_ROLE_SUPPORT, Namespace, OccurrenceClass, OccurrenceRole,
     OccurrenceRoleSupport, OccurrenceSupport, default_occurrence_namespace,
 };
-pub use provider::{StructuralFactsCache, StructuralSearchProvider, StructuralSearchSnapshotCache};
+pub use provider::{StructuralFactProvider, StructuralFactSnapshotCache, StructuralFactsCache};
 pub use qualified_paths::{
     PathSegmentRow, QUALIFIED_PATH_PRODUCER_AXES, QualifiedPathCompleteness,
     QualifiedPathDerivationOptions, QualifiedPathIncompleteReason, QualifiedPathRow,
     QualifiedPathsCancelled, QualifiedPathsFileResult, SegmentPrefixResolution,
     qualified_paths_for_file,
-};
-pub use query::{
-    CodeQuery, CodeQueryExecutionMode, CodeQueryPlan, CodeQueryPlanSource, CodeQueryResultDetail,
-    CodeQuerySeed, DEFAULT_LIMIT, MAX_BINDING_NAME_LENGTH, MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH,
-    MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_PATTERN_DEPTH,
-    MAX_PATTERN_NODES, MAX_QUERY_BRANCHES, MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES,
-    MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, Pattern,
-    QueryError, QueryStep, QueryValueKind, ReceiverTraversalFilter, ReferenceTraversalFilter,
-    SCHEMA_VERSION, SetOperator, StringPredicate,
 };
 pub use resolution::{
     ALL_BINDING_KINDS, ALL_BOUNDARY_STATUSES, ALL_DECLARED_VISIBILITIES, ALL_ENVIRONMENT_AXES,
@@ -169,43 +120,4 @@ pub use routes::{
     DEEP_IDENTITY_AXES, IdentityAxis, IdentityRouteSupport, IdentitySupport,
     NO_IDENTITY_ROUTE_SUPPORT, RouteHopKind, RouteTermination, SegmentResolutionStatus,
 };
-pub use rune_ir::{
-    RenderedRuneIr, RuneIrError, RuneIrLanguage, RuneIrLimits, RuneIrSelection,
-    render_source_rune_ir,
-};
-pub use search::{
-    ALL_DETAILED_CODE_QUERY_DOMAINS, CodeQueryCallArgument, CodeQueryCallSite, CodeQueryCapture,
-    CodeQueryCompletion, CodeQueryControlEdge, CodeQueryDeclaration, CodeQueryDiagnostic,
-    CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact, CodeQueryEnumDomain,
-    CodeQueryExecutionLimits, CodeQueryExecutionWork, CodeQueryExpressionSite, CodeQueryFile,
-    CodeQueryFlowCarrierSymbol, CodeQueryFlowCertainty, CodeQueryFlowCompletion,
-    CodeQueryFlowDeclarationSegment, CodeQueryFlowEndpoint, CodeQueryFlowEvent,
-    CodeQueryFlowFactSymbol, CodeQueryFlowMustStatus, CodeQueryFlowPortSymbol,
-    CodeQueryFlowReachability, CodeQueryFlowSelectorSymbol, CodeQueryFlowSolverTermination,
-    CodeQueryFlowSymbolSite, CodeQueryFlowWitness, CodeQueryFlowWitnessStep,
-    CodeQueryFlowWitnessStepKind, CodeQueryMatch, CodeQueryProcedure, CodeQueryProgramPoint,
-    CodeQueryProgramPointBoundary, CodeQueryProgramPointRef, CodeQueryProvenance,
-    CodeQueryProvenanceStep, CodeQueryRange, CodeQueryReceiverAnalysis, CodeQueryReceiverValue,
-    CodeQueryReferenceEdge, CodeQueryReferenceSite, CodeQueryResponse, CodeQueryResult,
-    CodeQueryResultItem, CodeQueryResultRef, CodeQueryResultValue, CodeQueryRowField,
-    CodeQueryRowFieldError, CodeQueryRowRef, CodeQueryRowScalarRef, CodeQueryRowScalarType,
-    CodeQuerySemanticCompleteness, CodeQuerySemanticEvidence, CodeQuerySemanticLimits,
-    CodeQuerySemanticProof, CodeQuerySemanticWork, CodeQuerySourceSite, CodeQueryTaintFinding,
-    CodeQueryTaintLimits, CodeQueryTaintOrigin, CodeQueryTaintProjectionLimits,
-    CodeQueryTaintWitness, CodeQueryTypestateCertainty, CodeQueryTypestateFinding,
-    CodeQueryTypestateFindingKind, CodeQueryTypestateLimits, CodeQueryTypestateSubject,
-    CodeQueryTypestateUncertainty, CodeQueryTypestateWitness, CodeQueryTypestateWitnessStep,
-    CodeQueryTypestateWitnessStepKind, CodeQueryTypestateWork, CodeQueryValueFlowLimits,
-    CodeQueryValueFlowWork, execute, execute_request, execute_request_with_cancellation,
-    execute_request_with_limits, execute_with_limits, execute_workspace, execute_workspace_request,
-    execute_workspace_request_with_all_analysis_registration_lease,
-    execute_workspace_request_with_analysis_registration_lease,
-    execute_workspace_request_with_cancellation, execute_workspace_request_with_limits,
-    execute_workspace_request_with_registration_cancellation,
-    execute_workspace_request_with_registration_lease,
-    execute_workspace_request_with_registration_limits,
-    execute_workspace_request_with_registrations, execute_workspace_with_limits,
-    project_taint_finding_report,
-};
-pub(crate) use search::{BoundedTaintProjection, project_taint_finding_report_bounded};
 pub use spec::{RoleSink, StructuralSpec};

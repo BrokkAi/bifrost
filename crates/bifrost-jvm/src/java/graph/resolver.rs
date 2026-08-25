@@ -5,12 +5,11 @@ use super::return_type::{
     FileReturnCache, JavaReturnTypeContext, LexicalTypeResolution, METHOD_RECEIVER_CHAIN_LIMIT,
     MethodAnonymousReturnCache, MethodReturnCache, is_java_nominal_type_node,
     java_call_answering_units, java_lexical_type_from_declaration, java_lexical_type_from_node,
-    java_type_name_from_node, merge_receiver_type_outcomes,
+    java_type_name_components, merge_receiver_type_outcomes,
     method_anonymous_return_type_for_owner_fqn, method_return_type_for_owner_fqns,
 };
 use crate::java::graph_support::{
-    JavaSource, normalize_java_type_text, resolve_java_usage_type_name,
-    resolve_java_usage_type_name_in,
+    JavaSource, normalize_java_type_text, resolve_java_usage_type_components_in,
 };
 use crate::java::hierarchy::java_nearest_declaring_ancestors;
 use brokk_bifrost_core::analyzer::model::{CallableArity, CodeUnit, Language, ProjectFile};
@@ -36,7 +35,6 @@ pub struct TargetSpec {
     pub kind: TargetKind,
     pub owner: CodeUnit,
     pub receiver_owner_fq_names: HashSet<String>,
-    pub declaration_owner_fq_names: HashSet<String>,
     pub member_name: String,
     pub callable_arities: Option<HashSet<CallableArity>>,
 }
@@ -49,12 +47,22 @@ pub enum ReceiverTargetMatch {
 }
 
 impl TargetSpec {
-    pub fn from_targets(
-        analyzer: &dyn JavaSource,
-        token: QueryToken<'_>,
-        targets: &[CodeUnit],
-    ) -> Option<Self> {
-        let mut spec = Self::from_target(analyzer, token, targets.first()?)?;
+    pub fn kind_for_target(analyzer: &dyn JavaSource, target: &CodeUnit) -> Option<TargetKind> {
+        if target.is_class() {
+            return Some(TargetKind::Type);
+        }
+        let owner = analyzer.parent_of(target)?;
+        Some(if target.is_field() {
+            TargetKind::Field
+        } else if target.identifier() == owner.identifier() {
+            TargetKind::Constructor
+        } else {
+            TargetKind::Method
+        })
+    }
+
+    pub fn from_targets(analyzer: &dyn JavaSource, targets: &[CodeUnit]) -> Option<Self> {
+        let mut spec = Self::from_target(analyzer, targets.first()?)?;
         spec.targets.extend(targets.iter().cloned());
         if let Some(arities) = spec.callable_arities.as_mut() {
             for target in &targets[1..] {
@@ -66,46 +74,30 @@ impl TargetSpec {
         Some(spec)
     }
 
-    pub fn from_target(
-        analyzer: &dyn JavaSource,
-        token: QueryToken<'_>,
-        target: &CodeUnit,
-    ) -> Option<Self> {
-        if target.is_class() {
+    pub fn from_target(analyzer: &dyn JavaSource, target: &CodeUnit) -> Option<Self> {
+        let kind = Self::kind_for_target(analyzer, target)?;
+        if kind == TargetKind::Type {
             let fq_name = target.fq_name();
             return Some(Self {
                 target: target.clone(),
                 targets: HashSet::from_iter([target.clone()]),
                 kind: TargetKind::Type,
                 owner: target.clone(),
-                receiver_owner_fq_names: [fq_name.clone()].into_iter().collect(),
-                declaration_owner_fq_names: [fq_name].into_iter().collect(),
+                receiver_owner_fq_names: [fq_name].into_iter().collect(),
                 member_name: target.identifier().to_string(),
                 callable_arities: None,
             });
         }
-
         let owner = analyzer.parent_of(target)?;
-        let kind = if target.is_field() {
-            TargetKind::Field
-        } else if target.identifier() == owner.identifier() {
-            TargetKind::Constructor
-        } else {
-            TargetKind::Method
-        };
-
-        let owner_sets = target_owner_sets(analyzer, token, target, &owner, kind);
-
         Some(Self {
             target: target.clone(),
             targets: HashSet::from_iter([target.clone()]),
             kind,
-            receiver_owner_fq_names: owner_sets.receiver,
-            declaration_owner_fq_names: owner_sets.declarations,
+            receiver_owner_fq_names: HashSet::from_iter([owner.fq_name()]),
+            owner,
             member_name: target.identifier().to_string(),
             callable_arities: (kind == TargetKind::Method || kind == TargetKind::Constructor)
                 .then(|| HashSet::from_iter([java_callable_arity(analyzer, target)])),
-            owner,
         })
     }
 }
@@ -126,53 +118,15 @@ pub fn constructor_method_reference_receiver(node: Node<'_>) -> Option<Node<'_>>
     children.into_iter().find(|child| child.is_named())
 }
 
-struct TargetOwnerSets {
-    receiver: HashSet<String>,
-    declarations: HashSet<String>,
-}
-
-fn target_owner_sets(
-    analyzer: &dyn JavaSource,
-    token: QueryToken<'_>,
-    target: &CodeUnit,
-    owner: &CodeUnit,
-    kind: TargetKind,
-) -> TargetOwnerSets {
-    let receiver = HashSet::from_iter([owner.fq_name()]);
-    let mut declarations = HashSet::from_iter([owner.fq_name()]);
-    if kind != TargetKind::Method {
-        return TargetOwnerSets {
-            receiver,
-            declarations,
-        };
-    }
-    for descendant in analyzer.get_descendants(owner) {
-        if java_owner_declares_matching_method(analyzer, token, &descendant, target) {
-            declarations.insert(descendant.fq_name());
-        }
-    }
-    for ancestor in analyzer.get_ancestors(owner) {
-        if java_owner_declares_matching_method(analyzer, token, &ancestor, target) {
-            declarations.insert(ancestor.fq_name());
-        }
-    }
-    TargetOwnerSets {
-        receiver,
-        declarations,
-    }
-}
-
 fn java_owner_declares_matching_method(
-    analyzer: &dyn JavaSource,
-    token: QueryToken<'_>,
+    ctx: &ScanCtx<'_>,
     owner: &CodeUnit,
     target: &CodeUnit,
 ) -> bool {
-    analyzer
-        .usage_definitions(token)
-        .fqn(&format!("{}.{}", owner.fq_name(), target.identifier()))
+    ctx.graph
+        .structural_members(owner.fq(), target.identifier())
         .iter()
-        .any(|unit| unit.is_function() && java_method_signatures_match(analyzer, target, unit))
+        .any(|unit| unit.is_function() && java_method_signatures_match(ctx.java, target, unit))
 }
 
 pub fn java_method_signatures_match(
@@ -218,13 +172,21 @@ pub fn signature_arity(signature: Option<&str>) -> usize {
 pub fn seed_class_binding(
     java: &dyn JavaSource,
     token: QueryToken<'_>,
+    graph: &JavaGraphSource<'_>,
     file: &ProjectFile,
     spec: &TargetSpec,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
+    let owner_components = vec![spec.owner.identifier().to_string()];
     if spec.kind == TargetKind::Type
-        || resolve_java_usage_type_name(java, token, file, spec.owner.identifier())
-            .is_some_and(|resolved| resolved.fq_name() == spec.owner.fq_name())
+        || resolve_java_usage_type_components_in(
+            java,
+            token,
+            graph.relational_definitions,
+            file,
+            &owner_components,
+        )
+        .is_some_and(|resolved| resolved.fq_name() == spec.owner.fq_name())
     {
         bindings.seed_symbol(spec.owner.identifier().to_string(), spec.owner.fq_name());
     }
@@ -233,6 +195,25 @@ pub fn seed_class_binding(
 impl JavaReturnTypeContext for ScanCtx<'_> {
     fn java(&self) -> &dyn JavaSource {
         self.java
+    }
+
+    fn relational_definitions(
+        &self,
+    ) -> &dyn brokk_bifrost_core::analyzer::RelationalDefinitionFrontier {
+        self.graph.relational_definitions
+    }
+
+    fn call_answering_units(&self, owner: &str, name: &str, arity: usize) -> Vec<CodeUnit> {
+        let Some(owner) = self.graph.index.definitions(owner).next() else {
+            return Vec::new();
+        };
+        self.graph
+            .structural_members(owner.fq(), name)
+            .into_iter()
+            .filter(|unit| {
+                unit.is_function() && java_callable_arity(self.java, unit).accepts(arity)
+            })
+            .collect()
     }
 
     fn file(&self) -> &ProjectFile {
@@ -344,7 +325,7 @@ fn field_access_receiver_type(
                 Ok(resolve_type_from_node(base, token, ctx))
             }
         },
-        |qualified| ctx.resolve_realm_type_name(qualified),
+        |qualified| ctx.resolve_realm_type_components(qualified),
         |owner, name| nested_type_for_owner(owner, name, ctx),
     )
     .or_else(|| field_access_value_type(node, token, ctx, 0))
@@ -406,10 +387,7 @@ fn directly_declared_field_type(
     field: &str,
     ctx: &ScanCtx<'_>,
 ) -> FieldTypeResolution {
-    let candidates =
-        ctx.java
-            .usage_definitions(token)
-            .fqn(&format!("{}.{}", owner.fq_name(), field));
+    let candidates = ctx.graph.structural_members(owner.fq(), field);
     let Some(unit) = candidates.iter().find(|unit| unit.is_field()) else {
         return FieldTypeResolution::NotDeclared;
     };
@@ -426,29 +404,21 @@ fn directly_declared_field_type(
     // sibling nested type such as `MultiMap.MultiMapEntry` is written
     // unqualified inside `MultiMap` and names no file-scope type -- and only
     // then the declaring file's imports and package.
-    match java_lexical_type_from_declaration(
-        ctx.java,
-        token,
-        unit,
-        &parse_symbol_path(Language::Java, spelled),
-    ) {
+    let components = parse_symbol_path(Language::Java, spelled);
+    match java_lexical_type_from_declaration(ctx.java, token, unit, &components) {
         LexicalTypeResolution::Resolved(resolved) => FieldTypeResolution::Resolved(resolved),
         LexicalTypeResolution::Blocked => FieldTypeResolution::Unresolved,
-        LexicalTypeResolution::NotFound => ctx
-            .graph
-            .with_definitions(|definitions| {
-                resolve_java_usage_type_name_in(
-                    ctx.java,
-                    ctx.graph.token,
-                    definitions,
-                    unit.source(),
-                    spelled,
-                )
-            })
-            .map_or(
-                FieldTypeResolution::Unresolved,
-                FieldTypeResolution::Resolved,
-            ),
+        LexicalTypeResolution::NotFound => resolve_java_usage_type_components_in(
+            ctx.java,
+            ctx.graph.token,
+            ctx.graph.relational_definitions,
+            unit.source(),
+            &components,
+        )
+        .map_or(
+            FieldTypeResolution::Unresolved,
+            FieldTypeResolution::Resolved,
+        ),
     }
 }
 
@@ -571,7 +541,7 @@ fn receiver_type_matches_target_uncached(
         return ReceiverTargetMatch::Unresolved;
     };
     if ctx.spec.kind == TargetKind::Method {
-        if java_owner_declares_matching_method(ctx.java, token, receiver_type, &ctx.spec.target) {
+        if java_owner_declares_matching_method(ctx, receiver_type, &ctx.spec.target) {
             return ReceiverTargetMatch::Incompatible;
         }
         if !provider
@@ -581,8 +551,7 @@ fn receiver_type_matches_target_uncached(
         {
             return ReceiverTargetMatch::Incompatible;
         }
-        if java_owner_declares_same_arity_overload(ctx.java, token, receiver_type, &ctx.spec.target)
-        {
+        if java_owner_declares_same_arity_overload(ctx, receiver_type, &ctx.spec.target) {
             return ReceiverTargetMatch::Unresolved;
         }
         if provider
@@ -590,13 +559,13 @@ fn receiver_type_matches_target_uncached(
             .iter()
             .filter(|ancestor| *ancestor != &ctx.spec.owner)
             .any(|ancestor| {
-                java_owner_declares_same_arity_overload(ctx.java, token, ancestor, &ctx.spec.target)
+                java_owner_declares_same_arity_overload(ctx, ancestor, &ctx.spec.target)
             })
         {
             return ReceiverTargetMatch::Unresolved;
         }
         if nearest_declaring_ancestor_matches_target(ctx, receiver_type, |ancestor| {
-            java_owner_declares_matching_method(ctx.java, token, ancestor, &ctx.spec.target)
+            java_owner_declares_matching_method(ctx, ancestor, &ctx.spec.target)
         })
         .unwrap_or(false)
         {
@@ -621,20 +590,18 @@ fn receiver_type_matches_target_uncached(
 }
 
 fn java_owner_declares_same_arity_overload(
-    analyzer: &dyn JavaSource,
-    token: QueryToken<'_>,
+    ctx: &ScanCtx<'_>,
     owner: &CodeUnit,
     target: &CodeUnit,
 ) -> bool {
-    let target_arity = java_callable_arity(analyzer, target);
-    analyzer
-        .usage_definitions(token)
-        .fqn(&format!("{}.{}", owner.fq_name(), target.identifier()))
+    let target_arity = java_callable_arity(ctx.java, target);
+    ctx.graph
+        .structural_members(owner.fq(), target.identifier())
         .iter()
         .any(|unit| {
             unit.is_function()
-                && java_callable_arity(analyzer, unit) == target_arity
-                && !java_method_signatures_match(analyzer, target, unit)
+                && java_callable_arity(ctx.java, unit) == target_arity
+                && !java_method_signatures_match(ctx.java, target, unit)
         })
 }
 
@@ -746,12 +713,14 @@ pub fn has_proven_static_import(token: QueryToken<'_>, ctx: &ScanCtx<'_>) -> boo
 
 fn java_static_import_owner_matches_target(
     owner_fq_name: &str,
-    token: QueryToken<'_>,
+    _token: QueryToken<'_>,
     ctx: &ScanCtx<'_>,
 ) -> bool {
-    ctx.java
-        .usage_definitions(token)
-        .fqn(&format!("{owner_fq_name}.{}", ctx.spec.member_name))
+    let Some(owner) = ctx.graph.index.definitions(owner_fq_name).next() else {
+        return false;
+    };
+    ctx.graph
+        .structural_members(owner.fq(), &ctx.spec.member_name)
         .iter()
         .any(|candidate| java_static_import_candidate_matches_target(candidate, ctx))
 }
@@ -779,7 +748,7 @@ fn java_static_import_callable_matches_target(candidate: &CodeUnit, ctx: &ScanCt
 
 pub fn bare_method_context_matches_target(
     node: Node<'_>,
-    token: QueryToken<'_>,
+    _token: QueryToken<'_>,
     ctx: &mut ScanCtx<'_>,
 ) -> bool {
     let context = enclosing_context(node, ctx);
@@ -789,11 +758,11 @@ pub fn bare_method_context_matches_target(
     if owner.fq_name() == ctx.spec.owner.fq_name() {
         return true;
     }
-    if java_owner_declares_matching_method(ctx.java, token, owner, &ctx.spec.target) {
+    if java_owner_declares_matching_method(ctx, owner, &ctx.spec.target) {
         return false;
     }
     nearest_declaring_ancestor_matches_target(ctx, owner, |ancestor| {
-        java_owner_declares_matching_method(ctx.java, token, ancestor, &ctx.spec.target)
+        java_owner_declares_matching_method(ctx, ancestor, &ctx.spec.target)
     })
     .unwrap_or(false)
 }
@@ -846,10 +815,13 @@ pub fn bare_field_context_matches_target(
     false
 }
 
-fn owner_declares_target_field(owner: &CodeUnit, token: QueryToken<'_>, ctx: &ScanCtx<'_>) -> bool {
-    ctx.java
-        .usage_definitions(token)
-        .fqn(&format!("{}.{}", owner.fq_name(), ctx.spec.member_name))
+fn owner_declares_target_field(
+    owner: &CodeUnit,
+    _token: QueryToken<'_>,
+    ctx: &ScanCtx<'_>,
+) -> bool {
+    ctx.graph
+        .structural_members(owner.fq(), &ctx.spec.member_name)
         .iter()
         .any(CodeUnit::is_field)
 }
@@ -945,8 +917,8 @@ pub fn resolve_non_nested_type_from_node(
         LexicalTypeResolution::NotFound => {}
     }
 
-    let type_name = java_type_name_from_node(node, ctx.source)?;
-    ctx.resolve_realm_type_name(&type_name)
+    let components = java_type_name_components(node, ctx.source)?;
+    ctx.resolve_realm_type_components(&components)
 }
 
 /// Resolves each semantic class segment in a Java type reference, preserving the
@@ -1048,7 +1020,7 @@ pub fn resolve_field_access_type<ResolveBase, ResolveQualified, ResolveNested>(
 ) -> Option<CodeUnit>
 where
     ResolveBase: FnMut(Node<'_>) -> Result<Option<CodeUnit>, ()>,
-    ResolveQualified: FnMut(&str) -> Option<CodeUnit>,
+    ResolveQualified: FnMut(&[String]) -> Option<CodeUnit>,
     ResolveNested: FnMut(&CodeUnit, &str) -> Option<CodeUnit>,
 {
     let terminal = node.child_by_field_name("field")?;
@@ -1080,7 +1052,7 @@ pub fn resolve_field_access_type_segments<'tree, ResolveBase, ResolveQualified, 
 ) -> Vec<(CodeUnit, Node<'tree>)>
 where
     ResolveBase: FnMut(Node<'tree>) -> Result<Option<CodeUnit>, ()>,
-    ResolveQualified: FnMut(&str) -> Option<CodeUnit>,
+    ResolveQualified: FnMut(&[String]) -> Option<CodeUnit>,
     ResolveNested: FnMut(&CodeUnit, &str) -> Option<CodeUnit>,
 {
     if node.kind() != "field_access" {
@@ -1108,10 +1080,11 @@ where
     components.push(current);
     components.reverse();
 
-    let mut qualified = node_text(components[0], source).to_string();
-    if qualified.is_empty() {
+    let first = node_text(components[0], source);
+    if first.is_empty() {
         return Vec::new();
     }
+    let mut qualified = vec![first.to_string()];
     let Ok(mut owner) = resolve_base(components[0]) else {
         return Vec::new();
     };
@@ -1126,8 +1099,7 @@ where
             if name.is_empty() {
                 return Vec::new();
             }
-            qualified.push('.');
-            qualified.push_str(name);
+            qualified.push(name.to_string());
             if let Some(resolved) = resolve_qualified(&qualified) {
                 segments.push((resolved.clone(), *component));
                 owner = Some(resolved);
@@ -1220,13 +1192,10 @@ pub fn resolve_nested_type_for_owner(
     name: &str,
 ) -> Option<CodeUnit> {
     let nested = |candidate: &CodeUnit| {
-        graph.with_definitions(|definitions| {
-            definitions
-                .fqn(&format!("{}.{}", candidate.fq_name(), name))
-                .iter()
-                .find(|unit| unit.is_class())
-                .cloned()
-        })
+        graph
+            .structural_members(candidate.fq(), name)
+            .into_iter()
+            .find(CodeUnit::is_class)
     };
     nested(owner).or_else(|| {
         graph
@@ -1407,13 +1376,10 @@ fn single_return_class(
 }
 
 fn class_definition(ctx: &ScanCtx<'_>, fq_name: &str) -> Option<CodeUnit> {
-    ctx.graph.with_definitions(|definitions| {
-        definitions
-            .fqn(fq_name)
-            .iter()
-            .find(|unit| unit.is_class())
-            .cloned()
-    })
+    ctx.graph
+        .index
+        .definitions(fq_name)
+        .find(CodeUnit::is_class)
 }
 
 fn enclosing_owner(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<CodeUnit> {
@@ -1429,6 +1395,21 @@ pub fn is_ignored_type_context(node: Node<'_>) -> bool {
         parent.kind(),
         "package_declaration" | "import_declaration" | "class_declaration"
     ) && parent.child_by_field_name("name") == Some(node)
+}
+
+/// Whether an identifier is the type position of a Java record pattern.
+///
+/// tree-sitter-java uses `identifier` for the leading type of
+/// `case Point(var x, var y)`, unlike ordinary type positions, which use
+/// `type_identifier`. Keep the admission tied to the first structured child of
+/// `record_pattern` so component binders never enter type lookup.
+pub fn is_record_pattern_type_reference(node: Node<'_>) -> bool {
+    if !matches!(node.kind(), "identifier" | "scoped_identifier") {
+        return false;
+    }
+    node.parent().is_some_and(|parent| {
+        parent.kind() == "record_pattern" && parent.named_child(0) == Some(node)
+    })
 }
 
 /// Whether `node` is a class-name position in a Java module descriptor.

@@ -89,10 +89,10 @@ impl SearchToolsNativeSession {
         self.inner.close().map_err(service_error_to_py)
     }
 
-    /// Force a git-reachability GC of the semantic index and block until done.
+    /// Force a git-reachability GC of the unified cache and block until done.
     /// Releases the GIL while waiting; not for the retrieval path.
     fn gc(&self, py: Python<'_>) -> PyResult<()> {
-        py.allow_threads(|| self.inner.request_semantic_gc())
+        py.allow_threads(|| self.inner.request_cache_gc())
             .map_err(service_error_to_py)
     }
 }

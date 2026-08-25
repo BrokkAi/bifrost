@@ -181,7 +181,7 @@ fn resolve_kotlin_head_segment(
     }
 
     for package in KOTLIN_DEFAULT_IMPORT_PACKAGES {
-        let candidate = qualify(package, head);
+        let candidate = qualify(package.rendered, head);
         if exists(&candidate) {
             return KotlinTypeName::Resolved(candidate);
         }
@@ -398,11 +398,14 @@ pub fn kotlin_source_type_by_fqn(
     token: QueryToken<'_>,
     fqn: &str,
 ) -> Option<CodeUnit> {
-    source
-        .usage_definitions(token)
-        .fqn(fqn)
-        .into_iter()
-        .find(|unit| unit.is_class() && unit.fq_name() == fqn && !unit.is_synthetic())
+    let mut result = None;
+    source.with_usage_definitions(token, &mut |definitions| {
+        result = definitions
+            .fqn(fqn)
+            .into_iter()
+            .find(|unit| unit.is_class() && unit.fq_name() == fqn && !unit.is_synthetic());
+    });
+    result
 }
 
 /// A type named `fqn` anywhere in the JVM realm: Kotlin's own declarations

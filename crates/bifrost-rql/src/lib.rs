@@ -1,8 +1,14 @@
-//! Analyzer-independent RQL syntax, schema, typed IR, and validation.
+//! RQL syntax, typed IR, planning, execution, and result contracts.
+
+extern crate self as brokk_bifrost_rql;
 
 pub mod query;
 pub mod refs;
 pub mod sexp;
+pub mod structural;
+
+pub use brokk_bifrost_analysis::{analyzer, path_utils, profiling};
+pub use brokk_bifrost_core::{cancellation, hash, text_utils};
 
 pub use query::*;
 pub use refs::{
@@ -14,3 +20,4 @@ pub use refs::{
     TaintResultRefError, ValueFlowPlanNameError, ValueFlowPlanNamespaceError, ValueFlowPlanRef,
     ValueFlowPlanRefError,
 };
+pub use structural::*;

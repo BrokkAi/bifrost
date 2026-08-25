@@ -2,11 +2,14 @@ use brokk_bifrost_core::analyzer::fq_name::{
     FqName, SegmentId, SegmentKind, joined_segments, normalize_joined, segment_interner,
 };
 use brokk_bifrost_core::analyzer::model::{
-    CodeUnitType, ParameterMetadata, Range, SignatureMetadata,
+    CodeUnitType, ParameterMetadata, Range, SignatureMetadata, StructuredTypeIdentity,
+    StructuredTypeIdentityBuilder, StructuredTypeName,
 };
 use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
 use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use tree_sitter::{Node, Point, Tree};
+
+use crate::aliases::{php_file_context_from_tree_at, resolve_php_type_node};
 
 /// Intern one qualified-name segment in the process-global interner.
 fn php_segment(text: &str, kind: SegmentKind) -> SegmentId {
@@ -338,7 +341,8 @@ impl<'a> PhpVisitor<'a> {
             self.parsed.add_signature_with_metadata(
                 code_unit,
                 SignatureMetadata::new(signature, Vec::new())
-                    .with_return_type_text(php_declared_type_text(node, self.source)),
+                    .with_return_type_text(php_declared_type_text(node, self.source))
+                    .with_return_type_identity(php_declared_type_identity(node, self.source)),
             );
         }
     }
@@ -488,7 +492,8 @@ impl<'a> PhpVisitor<'a> {
             self.parsed.add_signature_with_metadata(
                 code_unit,
                 SignatureMetadata::new(signature, Vec::new())
-                    .with_return_type_text(php_declared_type_text(parameter, self.source)),
+                    .with_return_type_text(php_declared_type_text(parameter, self.source))
+                    .with_return_type_identity(php_declared_type_identity(parameter, self.source)),
             );
         }
     }
@@ -634,12 +639,34 @@ fn php_signature_metadata(signature: String, node: Node<'_>, source: &str) -> Si
         .collect();
     SignatureMetadata::new(signature, parameters)
         .with_return_type_text(php_declared_type_text(node, source))
+        .with_return_type_identity(php_declared_type_identity(node, source))
 }
 
 fn php_declared_type_text(node: Node<'_>, source: &str) -> Option<String> {
     php_declared_type_node(node)
         .map(|type_node| php_node_text(type_node, source).trim().to_string())
         .filter(|text| !text.is_empty())
+}
+
+/// Persist the one nominal PHP type named by this declaration as a canonical,
+/// absolute component path. Alias and namespace resolution happen while the
+/// parser tree is present, so readers of this nominal case never reconstruct
+/// PHP type syntax from signature text.
+fn php_declared_type_identity(node: Node<'_>, source: &str) -> Option<StructuredTypeIdentity> {
+    let type_node = php_declared_type_node(node)?;
+    let mut root = node;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    let context = php_file_context_from_tree_at(root, source, node.start_byte(), || true)?;
+    let resolved = resolve_php_type_node(type_node, source, &context, || true)?;
+    let path = joined_segments(&resolved, PHP_PACKAGE_SEPARATOR)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let name = StructuredTypeName::new(path, Vec::new(), true)?;
+    let mut builder = StructuredTypeIdentityBuilder::default();
+    let root = builder.named(name)?;
+    builder.finish(root)
 }
 
 pub fn php_declared_type_node(node: Node<'_>) -> Option<Node<'_>> {

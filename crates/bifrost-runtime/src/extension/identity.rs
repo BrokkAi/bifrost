@@ -56,6 +56,39 @@ impl fmt::Display for WorkspaceGeneration {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+/// Portable identity for the analysis-relevant content of one workspace.
+///
+/// The derivation does not add the absolute workspace root or package version,
+/// so equal trees opened at different roots agree when their literal
+/// [`AnalyzerConfig`](brokk_bifrost_analysis::analyzer::AnalyzerConfig) debug
+/// representations also agree. A path-bearing configuration can still make
+/// the identities differ. The digest is domain-separated with a manually
+/// versioned workspace-content domain and hashes slash-normalized
+/// workspace-relative paths, source bytes, and that literal configuration
+/// representation. External dependency bytes are intentionally not part of
+/// this identity; artifact manifests carry `dependency_fingerprints`
+/// separately.
+///
+/// This is a portable comparison key, not a replacement for
+/// [`WorkspaceGeneration`], which remains the local stale-request and analyzer
+/// store-scoping identity.
+pub struct WorkspaceContentIdentity(StableDigest);
+impl WorkspaceContentIdentity {
+    pub(crate) fn new(digest: StableDigest) -> Self {
+        Self(digest)
+    }
+    pub fn digest(&self) -> &StableDigest {
+        &self.0
+    }
+}
+impl fmt::Display for WorkspaceContentIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NormalizedRelativePath(Box<str>);
 impl NormalizedRelativePath {

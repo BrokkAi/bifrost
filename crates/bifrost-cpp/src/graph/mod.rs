@@ -19,6 +19,7 @@ pub mod syntax;
 
 use crate::graph_support::CppSource;
 use brokk_bifrost_core::analyzer::capabilities::{TypeAliasProvider, TypeHierarchyProvider};
+use brokk_bifrost_core::analyzer::fq_name::FqName;
 use brokk_bifrost_core::analyzer::model::{CppFieldLinkage, SignatureMetadata};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, ProjectFile, Range};
@@ -27,32 +28,26 @@ use std::collections::BTreeSet;
 /// The workspace-wide questions a C++ scan asks of the *dispatching* analyzer
 /// rather than of the C++ analyzer.
 ///
-/// Two of them have no core capability to sit on: `import_statements` is
-/// `IAnalyzer`'s raw `#include` lines, and the workspace definition index is
-/// reached through an analysis-side `DefinitionIndexHandle` that is built per
-/// call and so cannot be borrowed as a `&dyn BoundedDefinitionLookup`. Both
-/// stay the dispatching analyzer's job -- in a mixed workspace the query is
-/// issued against a `MultiAnalyzer` whose shards span languages, and the C++
-/// owner resolution depends on that reach.
+/// `import_statements` is `IAnalyzer`'s raw `#include` lines. Definition reads
+/// also stay the dispatching analyzer's job: the language crate can issue the
+/// core relational request but cannot own SQLite, and a mixed workspace must
+/// coordinate its language-local snapshots through `MultiAnalyzer`.
 pub trait CppWorkspaceSource {
     /// The raw import (`#include`) lines recorded for `file`.
     fn import_statements(&self, file: &ProjectFile) -> Vec<String>;
 
-    /// Declarations in the workspace usage-definition index whose fq name is
-    /// exactly `fqn`, across every shard.
-    ///
-    /// Borrows the shard-owned units rather than cloning them. Two constraints
-    /// make that the only workable shape. Every owner-resolution caller filters
-    /// the result and clones at most one survivor, so cloning every match per
-    /// reference was pure waste; and the global-field linkage walk returns its
-    /// matches to a caller that outlives the lookup, so they must borrow the
-    /// analyzer. Both are why the impls read the index shard-by-shard: the
-    /// per-call `DefinitionIndexHandle` dies with the call.
-    fn definitions_by_fqn(&self, token: QueryToken<'_>, fqn: &str) -> Vec<&CodeUnit>;
+    /// Exact lookup for a name already carried as extractor-owned segments.
+    /// Results are owned because the relational store, not a generation-wide
+    /// Rust map, owns the rows.
+    fn definitions_by_name(&self, token: QueryToken<'_>, name: &FqName) -> Vec<CodeUnit>;
+
+    /// Identifier-bounded candidates for a structurally segmented source path
+    /// whose intermediate kinds are not known until resolution.
+    fn definitions_by_identifier(&self, token: QueryToken<'_>, name: &FqName) -> Vec<CodeUnit>;
 }
 
-/// The workspace definition index, spelled so a call reads exactly as it did
-/// against `IAnalyzer::global_usage_definition_index`.
+/// The workspace definition query surface, spelled so the C++ resolver does
+/// not depend on the analysis crate's store implementation.
 ///
 /// Carries the request scope's [`QueryToken`] alongside the source, so a
 /// lookup made through it is proof-carrying without every C++ call site
@@ -61,10 +56,12 @@ pub trait CppWorkspaceSource {
 pub struct CppWorkspaceDefinitions<'a>(&'a dyn CppWorkspaceSource, QueryToken<'a>);
 
 impl<'a> CppWorkspaceDefinitions<'a> {
-    // `self.0` is copied out rather than reborrowed through `&self`, so the
-    // returned borrows carry the source's `'a` and can outlive this call.
-    pub fn fqn(&self, fqn: &str) -> Vec<&'a CodeUnit> {
-        self.0.definitions_by_fqn(self.1, fqn)
+    pub fn exact(&self, name: &FqName) -> Vec<CodeUnit> {
+        self.0.definitions_by_name(self.1, name)
+    }
+
+    pub fn identifier(&self, name: &FqName) -> Vec<CodeUnit> {
+        self.0.definitions_by_identifier(self.1, name)
     }
 }
 
@@ -122,7 +119,7 @@ impl<'a> CppGraphSource<'a> {
         self.workspace.import_statements(file)
     }
 
-    pub fn global_usage_definition_index(&self) -> CppWorkspaceDefinitions<'a> {
+    pub fn workspace_definitions(&self) -> CppWorkspaceDefinitions<'a> {
         CppWorkspaceDefinitions(self.workspace, self.token)
     }
 
@@ -220,6 +217,41 @@ pub fn callable_definitions_share_identity_evidence(
 ) -> bool {
     crate::identity::cpp_callable_definitions_share_identity_evidence(
         analyzer.index,
+        left,
+        right,
+        |left_source, right_source| {
+            let Some(implementation) =
+                crate::identity::cpp_header_body_implementation_file(left_source, right_source)
+            else {
+                return false;
+            };
+            let Some(cpp) = analyzer.cpp else {
+                return false;
+            };
+            crate::identity::cpp_header_body_files_are_related(
+                left_source,
+                right_source,
+                &analyzer.import_statements(implementation),
+                cpp.include_target_index(),
+            )
+        },
+    )
+}
+
+/// The structured-parameter variant of
+/// [`callable_definitions_share_identity_evidence`].
+///
+/// Use this when the two declarations may differ in non-identity parameter
+/// syntax, such as a default argument written only on the header prototype.
+pub fn callable_definitions_share_identity_evidence_with_visibility(
+    analyzer: &CppGraphSource<'_>,
+    visibility: &resolver::VisibilityIndex<'_>,
+    left: &CodeUnit,
+    right: &CodeUnit,
+) -> bool {
+    crate::identity::cpp_callable_definitions_share_identity_evidence_with_visibility(
+        analyzer,
+        visibility,
         left,
         right,
         |left_source, right_source| {

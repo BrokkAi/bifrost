@@ -17,6 +17,9 @@ use brokk_bifrost_python::bindings::{
     PythonLexicalNameResolution, python_unambiguous_module_class_binding_bounded,
 };
 use brokk_bifrost_python::graph::resolver::annotation_reference_candidates_at_focus;
+use brokk_bifrost_python::imports::{
+    PythonImportBinding, python_import_bindings_from_tree, resolve_python_relative_module,
+};
 use std::sync::Mutex;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -64,10 +67,10 @@ impl<'a> PythonDefinitionProvider<'a> {
             .collect()
     }
 
-    pub(crate) fn members_for_owner_name(&self, owner_fqn: &str, name: &str) -> Vec<CodeUnit> {
+    pub(crate) fn members_for_owner(&self, owner: &CodeUnit, name: &str) -> Vec<CodeUnit> {
         let mut units = self.session.query_limited_rows(|limit| {
             self.python
-                .member_candidates_for_owner_limited(owner_fqn, name, limit, || {
+                .member_candidates_for_owner_limited(owner, name, limit, || {
                     self.session.observe_cancellation()
                 })
         });
@@ -141,6 +144,11 @@ pub(crate) fn resolve_python_bounded(
             ),
         ));
     };
+    if let Some(module_fqn) = python_import_module_fqn(file, source, node)
+        && let Some(Some(module)) = session.query(|| resolve_module_code_unit(python, &module_fqn))
+    {
+        return session.finish(candidates_outcome(vec![module]));
+    }
     if python_is_non_reference_context(node) || python_is_declaration_identifier(node) {
         return session.finish(no_definition(
             "declaration_or_import_site",
@@ -161,7 +169,7 @@ pub(crate) fn resolve_python_bounded(
             );
             match receiver {
                 Some(receiver) if !member.is_empty() => {
-                    let candidates = support.members_for_owner_name(&receiver.fq_name(), member);
+                    let candidates = support.members_for_owner(&receiver, member);
                     if candidates.is_empty() {
                         no_definition(
                             "no_indexed_definition",
@@ -499,7 +507,7 @@ fn python_type_for_expression_bounded(
                     )?;
                     unique_python_candidate(
                         support
-                            .members_for_owner_name(&receiver.fq_name(), member)
+                            .members_for_owner(&receiver, member)
                             .into_iter()
                             .filter(CodeUnit::is_function)
                             .collect(),
@@ -534,9 +542,8 @@ fn python_type_for_expression_bounded(
                 object,
                 depth + 1,
             )?;
-            let declaration = unique_python_candidate(
-                support.members_for_owner_name(&receiver.fq_name(), member),
-            )?;
+            let declaration =
+                unique_python_candidate(support.members_for_owner(&receiver, member))?;
             python_member_declared_type_bounded(
                 support,
                 token,
@@ -1486,6 +1493,11 @@ pub(super) fn resolve_python(
             ),
         );
     };
+    if let Some(module_fqn) = python_import_module_fqn(file, source, node)
+        && let Some(module) = resolve_module_code_unit(py, &module_fqn)
+    {
+        return candidates_outcome(vec![module]);
+    }
     if python_is_non_reference_context(node) || python_is_declaration_identifier(node) {
         return no_definition(
             "declaration_or_import_site",
@@ -1609,6 +1621,26 @@ pub(super) fn resolve_python(
             };
             if text.is_empty() {
                 return no_definition("no_reference_text", "Python identifier is blank");
+            }
+            if let Some(candidates) = python_function_import_binding_candidates(
+                py,
+                support,
+                &ctx,
+                source,
+                tree.root_node(),
+                identifier,
+                text,
+            ) {
+                return if candidates.is_empty() {
+                    no_definition(
+                        "local_variable_reference",
+                        format!(
+                            "`{text}` has a function-local Python binding without one indexed import target"
+                        ),
+                    )
+                } else {
+                    candidates_outcome(candidates)
+                };
             }
             if python_name_shadowed_at(text, identifier, source) {
                 return no_definition(
@@ -1901,6 +1933,43 @@ fn python_visible_module_binding_candidates(
     Some(candidates)
 }
 
+fn python_function_import_binding_candidates(
+    py: &PythonAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    context: &PythonDefinitionContext,
+    source: &str,
+    root: Node<'_>,
+    node: Node<'_>,
+    name: &str,
+) -> Option<Vec<CodeUnit>> {
+    let bindings = context.scoped_import_bindings(source, root);
+    let binding = bindings.iter().rev().find(|binding| {
+        binding.is_function_scoped()
+            && binding.start_byte <= node.start_byte()
+            && binding.scope_start_byte <= node.start_byte()
+            && node.end_byte() <= binding.scope_end_byte
+            && binding.local_name == name
+    })?;
+
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(parent.kind(), "function_definition" | "lambda") {
+            let inventory = python_lexical_scope_inventory_bounded(parent, source, || true)?;
+            if inventory.has_runtime_callable_binding_at(name, node) {
+                return Some(Vec::new());
+            }
+            break;
+        }
+        current = parent.parent();
+    }
+
+    let qualified_name = resolve_python_relative_module(&context.file, &binding.qualified_name)
+        .unwrap_or_else(|| binding.qualified_name.clone());
+    Some(resolve_fqn_candidates(py, &qualified_name, |candidate| {
+        support.fqn(candidate)
+    }))
+}
+
 fn python_same_file_candidates_for_binding_event(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
@@ -2138,6 +2207,7 @@ pub(super) struct PythonDefinitionContext {
     same_file: HashMap<String, Vec<CodeUnit>>,
     scope_facts: OnceLock<Arc<HashMap<CodeUnit, LocalBindingsSnapshot<String>>>>,
     module_bindings: OnceLock<Arc<ModuleBindingTimeline>>,
+    scoped_import_bindings: OnceLock<Arc<Vec<PythonImportBinding>>>,
     receiver_types: Mutex<PythonReceiverTypeCache>,
     #[cfg(test)]
     build_counters: Arc<PythonDefinitionBuildCounters>,
@@ -2201,6 +2271,7 @@ impl PythonDefinitionContext {
             same_file,
             scope_facts: OnceLock::new(),
             module_bindings: OnceLock::new(),
+            scoped_import_bindings: OnceLock::new(),
             receiver_types: Mutex::new(PythonReceiverTypeCache::new(
                 PYTHON_RECEIVER_TYPE_CACHE_LIMIT,
             )),
@@ -2354,6 +2425,16 @@ impl PythonDefinitionContext {
     fn module_bindings(&self, source: &str, root: Node<'_>) -> Arc<ModuleBindingTimeline> {
         self.module_bindings
             .get_or_init(|| Arc::new(collect_module_binding_timeline(root, source)))
+            .clone()
+    }
+
+    fn scoped_import_bindings(
+        &self,
+        source: &str,
+        root: Node<'_>,
+    ) -> Arc<Vec<PythonImportBinding>> {
+        self.scoped_import_bindings
+            .get_or_init(|| Arc::new(python_import_bindings_from_tree(root, source)))
             .clone()
     }
 }
@@ -2526,22 +2607,7 @@ fn python_member_outcome(
     // index, not Python's, so the exact-fq member lookup has to follow it there.
     let receiver_language = language_for_file(receiver_type.source());
     let cross_language_owner = receiver_language != Language::Python;
-    // Members use a `.` separator; a nested class is indexed with `$`
-    // (`Outer$Inner`), so try both.
-    let member_candidates = |owner: &str| {
-        let mut units = support.fqn(&format!("{owner}.{member}"));
-        if units.is_empty() {
-            units = support.fqn(&format!("{owner}${member}"));
-        }
-        if units.is_empty() && cross_language_owner {
-            units = python_cross_language_declarations(support, &format!("{owner}.{member}"));
-            if units.is_empty() {
-                units = python_cross_language_declarations(support, &format!("{owner}${member}"));
-            }
-        }
-        units
-    };
-    let mut candidates = member_candidates(&receiver_type.fq_name());
+    let mut candidates = support.members_for_owner(&receiver_type, member);
     // The member attribution this seam can name: every candidate was found by
     // asking the index for `<owner fq>.<member>`, so the owner is exactly the
     // type the lookup asked about, and the hop distance is that type's distance
@@ -2559,7 +2625,7 @@ fn python_member_outcome(
             PythonAncestorRoutes::default()
         };
         for ancestor in provider.get_ancestors(&receiver_type) {
-            let found = member_candidates(&ancestor.fq_name());
+            let found = support.members_for_owner(&ancestor, member);
             attribution.record_inherited(&receiver_type, &ancestor, &found, &routes);
             candidates.extend(found);
         }
@@ -3120,6 +3186,46 @@ fn python_is_non_reference_context(node: Node<'_>) -> bool {
     false
 }
 
+fn python_import_module_fqn(file: &ProjectFile, source: &str, focus: Node<'_>) -> Option<String> {
+    let mut current = Some(focus);
+    while let Some(node) = current {
+        let module = match node.kind() {
+            "import_from_statement" => node.child_by_field_name("module_name"),
+            "import_statement" => {
+                let mut cursor = node.walk();
+                node.children_by_field_name("name", &mut cursor)
+                    .find_map(|imported| {
+                        let module = if imported.kind() == "aliased_import" {
+                            imported.child_by_field_name("name")?
+                        } else {
+                            imported
+                        };
+                        (module.start_byte() <= focus.start_byte()
+                            && focus.end_byte() <= module.end_byte())
+                        .then_some(module)
+                    })
+            }
+            _ => None,
+        };
+        if let Some(module) = module
+            && module.start_byte() <= focus.start_byte()
+            && focus.end_byte() <= module.end_byte()
+        {
+            let raw = python_slice(module, source);
+            if raw.is_empty() {
+                return None;
+            }
+            return if module.kind() == "relative_import" {
+                resolve_python_relative_module(file, raw)
+            } else {
+                Some(raw.to_string())
+            };
+        }
+        current = node.parent();
+    }
+    None
+}
+
 #[cfg(test)]
 mod bounded_tests {
     use super::*;
@@ -3193,6 +3299,57 @@ mod bounded_tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn bounded_python_from_import_module_segment_resolves_module_anchor() {
+        let source = "from example.service import Repository\n";
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Python,
+            &[
+                ("src/example/__init__.py", ""),
+                ("src/example/service.py", "class Repository:\n    pass\n"),
+                ("tests/test_service.py", source),
+            ],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "tests/test_service.py");
+        let tree = parse_python_tree(source).expect("Python tree");
+        let start_byte = source.find("service").expect("module segment");
+        let site = ResolvedReferenceSite {
+            path: rel_path_string(&file),
+            text: "service".to_string(),
+            range: Range {
+                start_byte,
+                end_byte: start_byte + "service".len(),
+                start_line: 1,
+                end_line: 1,
+            },
+            focus_start_byte: start_byte,
+            focus_end_byte: start_byte + "service".len(),
+        };
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let outcome = resolve_python_bounded(
+            fixture.analyzer.analyzer(),
+            scope.token(),
+            &file,
+            source,
+            Some(&tree),
+            &site,
+            ReceiverAnalysisBudget::default(),
+            None,
+        );
+
+        let BoundedResolution::Complete { value, .. } = outcome else {
+            panic!("Python module lookup should complete: {outcome:#?}");
+        };
+        assert_eq!(value.status, DefinitionLookupStatus::Resolved, "{value:#?}");
+        assert!(
+            matches!(value.definitions.as_slice(), [definition]
+                if definition.is_module()
+                    && definition.fq_name() == "example.service"
+                    && rel_path_string(definition.source()) == "src/example/service.py"),
+            "{value:#?}"
+        );
     }
 
     #[test]

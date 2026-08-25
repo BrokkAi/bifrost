@@ -30,6 +30,7 @@ use super::spec::StructuralSpec;
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::lexical_definitions::LexicalDefinition;
 use crate::analyzer::semantic::{ContentIdentity, LengthDelimitedDigest};
+use crate::analyzer::structural::StructuralFactProvider;
 use crate::analyzer::structural_spec_for;
 use crate::analyzer::usages::get_definition::{
     DefinitionLookupRequest, DefinitionLookupStatus, ResolutionTraceResult, TraceCandidate,
@@ -50,7 +51,7 @@ const AST_NODE_ID_DOMAIN: &[u8] = b"bifrost.code_query.ast_node.v1";
 ///
 /// Both an occurrence row and a structural capture over the same node mint
 /// this string, so equality of the two digests *is* the correlation join.
-pub(crate) fn ast_id(content_identity: ContentIdentity, node: u32) -> String {
+pub fn ast_id(content_identity: ContentIdentity, node: u32) -> String {
     let mut digest = LengthDelimitedDigest::new(AST_NODE_ID_DOMAIN);
     digest.push(content_identity.as_bytes());
     digest.push(&node.to_le_bytes());
@@ -280,7 +281,7 @@ pub fn occurrences_for_file_with_options(
 /// strings, enclosing-declaration lookups, and target resolutions. The result
 /// retains the producer's complete role-support account, so an empty selected
 /// role remains trustworthy only when the adapter proves it complete.
-pub(crate) fn occurrences_for_file_with_options_and_roles(
+pub fn occurrences_for_file_with_options_and_roles(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     options: OccurrenceDerivationOptions,
@@ -295,11 +296,14 @@ pub(crate) fn occurrences_for_file_with_options_and_roles(
     let Some(spec) = structural_spec_for(language) else {
         return Ok(unavailable(OccurrenceIncompleteReason::NoStructuralAdapter));
     };
-    let facts = analyzer
-        .structural_search_providers()
+    let Some(provider) = analyzer
+        .structural_fact_providers()
         .into_iter()
         .find(|provider| provider.structural_language() == language)
-        .and_then(|provider| provider.structural_facts(file));
+    else {
+        return Ok(unavailable(OccurrenceIncompleteReason::FactsUnavailable));
+    };
+    let facts = provider.structural_facts(file);
     let Some(facts) = facts else {
         return Ok(unavailable(OccurrenceIncompleteReason::FactsUnavailable));
     };
@@ -316,7 +320,7 @@ pub(crate) fn occurrences_for_file_with_options_and_roles(
     if cancellation.is_cancelled() {
         return Err(OccurrencesCancelled);
     }
-    attach_enclosing(analyzer, file, &mut rows);
+    attach_enclosing(provider, analyzer, file, &mut rows);
     if cancellation.is_cancelled() {
         return Err(OccurrencesCancelled);
     }
@@ -426,7 +430,24 @@ pub(super) fn declared_fact_kind(facts: &FileFacts, node: u32) -> Option<Normali
     (parent.name? == normalized.span()).then_some(parent.kind)
 }
 
-fn attach_enclosing(analyzer: &dyn IAnalyzer, file: &ProjectFile, rows: &mut [OccurrenceRow]) {
+fn attach_enclosing(
+    provider: &dyn StructuralFactProvider,
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    rows: &mut [OccurrenceRow],
+) {
+    let ranges = rows.iter().map(|row| row.range).collect::<Vec<_>>();
+    if let Some(enclosures) = provider.structural_enclosing_code_units(file, &ranges) {
+        assert_eq!(
+            enclosures.len(),
+            rows.len(),
+            "structural enclosure providers must preserve the input cardinality"
+        );
+        for (row, enclosing) in rows.iter_mut().zip(enclosures) {
+            row.enclosing = enclosing;
+        }
+        return;
+    }
     for row in rows.iter_mut() {
         row.enclosing = analyzer.enclosing_code_unit(file, &row.range);
     }
@@ -1400,6 +1421,8 @@ mod tests {
                         (*module).to_owned(),
                         PathBuf::from("unused-in-this-test.pyi"),
                     )],
+                    scope: crate::analyzer::topology::DependencyScope::Unknown,
+                    declared_by: None,
                 })
                 .collect(),
         )

@@ -36,7 +36,7 @@ fn node_range(node: Node<'_>) -> crate::analyzer::Range {
 /// Returns `None` only when the parser cannot be constructed; an empty source
 /// yields an empty fact set (#1459), and parse *errors* still yield facts for
 /// the recoverable parts of the tree (tree-sitter trees are total).
-pub(crate) fn extract_file_facts(
+pub fn extract_file_facts(
     spec: &dyn StructuralSpec,
     grammar: &TsLanguage,
     source: &str,

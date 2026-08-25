@@ -23,11 +23,11 @@ use super::extractor::{
 };
 use super::resolver::{
     annotation_reference_candidates, resolve_callable_parameter_default_types,
-    resolve_constructor_types, resolve_receiver_type,
+    resolve_constructor_types, resolve_receiver_type, resolved_member_declarations,
 };
 use crate::graph::PythonGraphSource;
 use crate::graph_support::PythonUsageSource;
-use crate::imports::resolve_fqn_candidates;
+use crate::imports::{imported_module_assignment_at, resolve_fqn_candidates};
 use crate::usage_index::{usage_resolve_module_files, usage_scope_facts};
 use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
 use brokk_bifrost_core::analyzer::usages::inverted_edges::{
@@ -47,7 +47,7 @@ use tree_sitter::Node;
 /// `brokk-bifrost-analysis`'s fan-out (`build_edge_output` + `parse_and_collect`,
 /// both analysis-owned) can hold it across the parallel closure.
 pub struct PythonEdgeScan<'a> {
-    targets: &'a HashSet<String>,
+    targets: Option<&'a HashSet<String>>,
     targets_by_terminal: HashMap<String, Vec<String>>,
     canonical_namespace_candidates: Mutex<HashMap<String, Arc<Vec<String>>>>,
 }
@@ -72,8 +72,19 @@ impl<'a> PythonEdgeScan<'a> {
                 .push(target.clone());
         }
         Self {
-            targets,
+            targets: Some(targets),
             targets_by_terminal,
+            canonical_namespace_candidates: Mutex::new(HashMap::default()),
+        }
+    }
+
+    /// Build a rooted scan without pre-enumerating its callee universe.
+    /// Exact targets are checked against the bounded definition index as they
+    /// are resolved, and the analysis layer validates graph-node eligibility.
+    pub fn new_rooted() -> Self {
+        Self {
+            targets: None,
+            targets_by_terminal: HashMap::default(),
             canonical_namespace_candidates: Mutex::new(HashMap::default()),
         }
     }
@@ -212,7 +223,7 @@ fn canonical_import_module_fqn(
 struct PyScan<'a> {
     graph: &'a PythonGraphSource<'a>,
     python: &'a dyn PythonUsageSource,
-    targets: &'a HashSet<String>,
+    targets: Option<&'a HashSet<String>>,
     targets_by_terminal: &'a HashMap<String, Vec<String>>,
     file: &'a ProjectFile,
     source: &'a str,
@@ -269,7 +280,7 @@ impl PyScan<'_> {
     }
 
     fn record(&mut self, callee: String, node: Node<'_>) {
-        if !self.targets.contains(&callee) {
+        if !self.accepts_target(&callee) {
             return;
         }
         self.edges.record_kind(
@@ -293,6 +304,17 @@ impl PyScan<'_> {
                 node.end_byte(),
             );
         }
+    }
+
+    fn accepts_target(&self, fqn: &str) -> bool {
+        self.targets.map_or_else(
+            || self.graph.index.definitions(fqn).next().is_some(),
+            |targets| targets.contains(fqn),
+        )
+    }
+
+    fn may_have_target_terminal(&self, terminal: &str) -> bool {
+        self.targets.is_none() || self.targets_by_terminal.contains_key(terminal)
     }
 
     fn canonical_namespace_candidates(&self, direct: &str) -> Arc<Vec<String>> {
@@ -559,17 +581,36 @@ fn handle_attribute(
     if object_text.is_empty() || attribute_text.is_empty() {
         return;
     }
-    if object.kind() == "call" && ctx.targets_by_terminal.contains_key(attribute_text) {
+    if object.kind() == "identifier"
+        && ctx.may_have_target_terminal(attribute_text)
+        && let Some(module) =
+            imported_module_assignment_at(node, object_text, ctx.source, |local| {
+                !is_shadowed(scopes, local)
+                    && ctx.namespace.get(local).is_some_and(|binding| {
+                        binding.module == "importlib" && binding.consumed_attributes == 0
+                    })
+            })
+    {
+        let direct = format!("{module}.{attribute_text}");
+        if ctx.accepts_target(&direct) {
+            ctx.record(direct, attribute);
+        } else {
+            for resolved in ctx.canonical_namespace_candidates(&direct).iter() {
+                ctx.record(resolved.clone(), attribute);
+            }
+        }
+    }
+    if object.kind() == "call" && ctx.may_have_target_terminal(attribute_text) {
         for class in call_result_types(ctx.graph, ctx.python, ctx.file, ctx.source, object, facts) {
             let direct = format!("{}.{attribute_text}", class.fq_name());
-            if ctx.targets.contains(&direct) {
+            if ctx.accepts_target(&direct) {
                 ctx.record(direct, attribute);
                 continue;
             }
             if let Some(provider) = ctx.graph.hierarchy {
                 for ancestor in provider.get_ancestors(&class) {
                     let inherited = format!("{}.{attribute_text}", ancestor.fq_name());
-                    if ctx.targets.contains(&inherited) {
+                    if ctx.accepts_target(&inherited) {
                         ctx.record(inherited, attribute);
                     }
                 }
@@ -588,7 +629,7 @@ fn handle_attribute(
             let mut direct = binding.module.clone();
             let workspace_module = binding.workspace_module;
             let consumed_attributes = binding.consumed_attributes;
-            if object.kind() == "identifier" && ctx.targets.contains(&direct) {
+            if object.kind() == "identifier" && ctx.accepts_target(&direct) {
                 ctx.record(direct.clone(), object);
             }
             for member in attributes.into_iter().skip(consumed_attributes) {
@@ -599,7 +640,7 @@ fn handle_attribute(
                 direct.push('.');
                 direct.push_str(member_text);
             }
-            if ctx.targets.contains(&direct) {
+            if ctx.accepts_target(&direct) {
                 ctx.record(direct, attribute);
                 return;
             }
@@ -623,7 +664,7 @@ fn handle_attribute(
     // member may be reachable, so bulk dead-code treats the candidate as
     // inconclusive instead of dead.
     if let Some(facts) = facts
-        && ctx.targets_by_terminal.contains_key(attribute_text)
+        && ctx.may_have_target_terminal(attribute_text)
     {
         if matches!(object_text, "self" | "cls") {
             // `self.member` / `cls.member` is a same-owner reference (#1138):
@@ -659,7 +700,7 @@ fn handle_keyword_argument(node: Node<'_>, ctx: &mut PyScan<'_>, scopes: &[Funct
         return;
     };
     let member = slice(name, ctx.source);
-    if member.is_empty() || !ctx.targets_by_terminal.contains_key(member) {
+    if member.is_empty() || !ctx.may_have_target_terminal(member) {
         return;
     }
     let scoped_class_fqn = if function.kind() == "identifier" {
@@ -695,17 +736,10 @@ fn handle_keyword_argument(node: Node<'_>, ctx: &mut PyScan<'_>, scopes: &[Funct
         classes.dedup();
     }
     for class in classes {
-        let direct = format!("{}.{member}", class.fq_name());
-        if ctx.targets.contains(&direct) {
-            ctx.record(direct, name);
-            continue;
-        }
-        if let Some(provider) = ctx.graph.hierarchy {
-            for ancestor in provider.get_ancestors(&class) {
-                let inherited = format!("{}.{member}", ancestor.fq_name());
-                if ctx.targets.contains(&inherited) {
-                    ctx.record(inherited, name);
-                }
+        for declaration in resolved_member_declarations(ctx.graph, &class, member) {
+            let fqn = declaration.fq_name();
+            if ctx.accepts_target(&fqn) {
+                ctx.record(fqn, name);
             }
         }
     }

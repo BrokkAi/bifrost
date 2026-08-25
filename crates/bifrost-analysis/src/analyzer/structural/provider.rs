@@ -2,7 +2,7 @@
 //! plus the per-analyzer facts cache behind it.
 //!
 //! Follows the `import_analysis_provider()` idiom: `IAnalyzer` has a default
-//! `structural_search_providers()` returning nothing; each language analyzer
+//! `structural_fact_providers()` returning nothing; each language analyzer
 //! whose adapter supplies a [`super::spec::StructuralSpec`] exposes its inner
 //! `TreeSitterAnalyzer` as a provider, and `MultiAnalyzer` concatenates its
 //! delegates'. Each provider covers exactly one language.
@@ -16,10 +16,11 @@ use super::occurrences::OccurrenceRole;
 use super::resolution::EnvironmentAxis;
 use super::routes::{IdentityAxis, RouteHopKind};
 use crate::analyzer::QueryScope;
+use crate::analyzer::content_identity::WorkspaceContentIdentity;
 use crate::analyzer::tree_sitter_analyzer::{
     LanguageAdapter, PreparedSyntaxLimitedOutcome, PreparedSyntaxTree, TreeSitterAnalyzer,
 };
-use crate::analyzer::{Language, ProjectFile};
+use crate::analyzer::{CodeUnit, Language, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
 use moka::sync::Cache;
 use std::hash::Hasher;
@@ -28,26 +29,26 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Opaque snapshot-local acceleration capability for built-in structural
 /// providers. This type is public only so external implementations of
-/// [`StructuralSearchProvider`] can name the defaulted method's return type;
+/// [`StructuralFactProvider`] can name the defaulted method's return type;
 /// concrete cache representation and lifecycle remain crate-private.
 #[doc(hidden)]
-pub struct StructuralSearchSnapshotCache {
+pub struct StructuralFactSnapshotCache {
     inner: super::index::SnapshotStructuralIndexCache,
 }
 
-impl StructuralSearchSnapshotCache {
+impl StructuralFactSnapshotCache {
     pub(crate) fn new(max_retained_bytes: u64) -> Self {
         Self {
             inner: super::index::SnapshotStructuralIndexCache::new(max_retained_bytes),
         }
     }
 
-    pub(crate) fn inner(&self) -> &super::index::SnapshotStructuralIndexCache {
+    pub fn inner(&self) -> &super::index::SnapshotStructuralIndexCache {
         &self.inner
     }
 }
 
-pub trait StructuralSearchProvider: Send + Sync {
+pub trait StructuralFactProvider: Send + Sync {
     fn structural_language(&self) -> Language;
 
     /// Every analyzed file of this provider's language, unsorted; callers
@@ -111,6 +112,21 @@ pub trait StructuralSearchProvider: Send + Sync {
         )
     }
 
+    /// Enclose several ranges in one file using a provider-owned index when
+    /// available. `None` means that the provider does not implement the batch
+    /// capability, so callers must preserve the single-range fallback.
+    ///
+    /// The returned vector has one entry for every input range, in the same
+    /// order. A `None` entry is a valid negative answer, not an unavailable
+    /// capability.
+    fn structural_enclosing_code_units(
+        &self,
+        _file: &ProjectFile,
+        _ranges: &[Range],
+    ) -> Option<Vec<Option<CodeUnit>>> {
+        None
+    }
+
     /// Materialize one complete facts snapshot without crossing
     /// `max_fact_nodes` total normalized nodes and semantic role edges, and
     /// stop cooperatively when `cancellation` fires.
@@ -169,15 +185,20 @@ pub trait StructuralSearchProvider: Send + Sync {
     /// indirection. Total by construction.
     fn structural_supports_route_relation(&self, relation: RouteHopKind) -> bool;
 
-    /// Monotonic source generation for providers backed by a live overlay.
-    /// Ordinary immutable analyzer generations keep the zero default.
-    fn structural_source_generation(&self) -> u64 {
-        0
+    /// The content identity of this provider's analyzed file set (#2449).
+    ///
+    /// The posting index is keyed by it, so a provider that cannot answer gets
+    /// no index reuse at all rather than reuse it cannot prove. That is the
+    /// default for a third-party provider, which previously reported a
+    /// constant zero generation and could therefore serve postings built from
+    /// content it had since replaced.
+    fn structural_content_identity(&self) -> Option<WorkspaceContentIdentity> {
+        None
     }
 
     /// Snapshot-owned immutable posting cache. Third-party providers may keep
     /// the default and use scan-only execution.
-    fn snapshot_structural_index_cache(&self) -> Option<&StructuralSearchSnapshotCache> {
+    fn snapshot_structural_index_cache(&self) -> Option<&StructuralFactSnapshotCache> {
         None
     }
 }
@@ -338,7 +359,7 @@ impl StructuralFactsCache {
     }
 }
 
-impl<A: LanguageAdapter> StructuralSearchProvider for TreeSitterAnalyzer<A> {
+impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
     fn structural_language(&self) -> Language {
         self.adapter().language()
     }
@@ -444,6 +465,14 @@ impl<A: LanguageAdapter> StructuralSearchProvider for TreeSitterAnalyzer<A> {
                 Some(facts)
             },
         )
+    }
+
+    fn structural_enclosing_code_units(
+        &self,
+        file: &ProjectFile,
+        ranges: &[Range],
+    ) -> Option<Vec<Option<CodeUnit>>> {
+        self.enclosing_code_units_for_ranges(file, ranges)
     }
 
     fn structural_facts_limited(
@@ -566,11 +595,13 @@ impl<A: LanguageAdapter> StructuralSearchProvider for TreeSitterAnalyzer<A> {
             .is_some_and(|spec| spec.identity_route_support().supports_relation(relation))
     }
 
-    fn structural_source_generation(&self) -> u64 {
-        self.project().analysis_generation()
+    fn structural_content_identity(&self) -> Option<WorkspaceContentIdentity> {
+        Some(WorkspaceContentIdentity::from_digest(
+            self.language_content_identity(),
+        ))
     }
 
-    fn snapshot_structural_index_cache(&self) -> Option<&StructuralSearchSnapshotCache> {
+    fn snapshot_structural_index_cache(&self) -> Option<&StructuralFactSnapshotCache> {
         Some(self.structural_index_cache())
     }
 }
@@ -646,7 +677,7 @@ mod tests {
         let analyzer =
             TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
         let provider = analyzer
-            .structural_search_providers()
+            .structural_fact_providers()
             .into_iter()
             .next()
             .expect("TypeScript structural provider");
@@ -682,7 +713,7 @@ mod tests {
         let analyzer =
             TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
         let provider = analyzer
-            .structural_search_providers()
+            .structural_fact_providers()
             .into_iter()
             .next()
             .expect("TypeScript structural provider");
@@ -736,7 +767,7 @@ mod tests {
         let measured_analyzer =
             TypescriptAnalyzer::from_project(TestProject::new(measured_root, Language::TypeScript));
         let measured_provider = measured_analyzer
-            .structural_search_providers()
+            .structural_fact_providers()
             .into_iter()
             .next()
             .expect("measured TypeScript provider");
@@ -763,7 +794,7 @@ mod tests {
         let capped_analyzer =
             TypescriptAnalyzer::from_project(TestProject::new(capped_root, Language::TypeScript));
         let capped_provider = capped_analyzer
-            .structural_search_providers()
+            .structural_fact_providers()
             .into_iter()
             .next()
             .expect("capped TypeScript provider");
@@ -797,7 +828,7 @@ mod tests {
         let analyzer =
             TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
         let provider = analyzer
-            .structural_search_providers()
+            .structural_fact_providers()
             .into_iter()
             .next()
             .expect("TypeScript structural provider");

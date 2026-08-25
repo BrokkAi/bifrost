@@ -38,13 +38,13 @@ use brokk_bifrost_jvm::scala::graph::syntax::{
     ScalaCallableSourceAlternative, ScalaDeclaredResult, ScalaFunctionParameterShape,
     ScalaParameterListKind, ScalaParameterTypeIdentity, ScalaQualifiedStableTypeRole,
     applied_expression_for_reference, call_arities_for_reference, call_site_shape_for_reference,
-    enclosing_template_declarations, is_extractor_reference, is_infix_type_operator_reference,
-    is_scala_case_pattern_binder, is_scala_class_reference, is_scala_named_argument_assignment,
-    named_argument_invocation_owner, qualified_stable_type_reference,
-    scala_callable_alternative_is_candidate, scala_callable_alternative_matches,
-    scala_callable_alternative_mismatch, scala_callable_completes_call,
-    scala_definition_binder_names, scala_pattern_binder_names, scala_source_facts,
-    template_self_types,
+    enclosing_template_declarations, is_enclosing_template_qualifier_reference,
+    is_extractor_reference, is_infix_type_operator_reference, is_scala_case_pattern_binder,
+    is_scala_class_reference, is_scala_named_argument_assignment, named_argument_invocation_owner,
+    qualified_stable_type_reference, scala_callable_alternative_is_candidate,
+    scala_callable_alternative_matches, scala_callable_alternative_mismatch,
+    scala_callable_completes_call, scala_definition_binder_names, scala_pattern_binder_names,
+    scala_source_facts, template_self_types,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
@@ -1449,7 +1449,7 @@ fn scala_is_callable_declaration_name(parent: Node<'_>, name: Node<'_>) -> bool 
 
 #[allow(clippy::too_many_arguments)]
 fn bounded_scala_definition_resolution(
-    _scala: &ScalaAnalyzer,
+    scala: &ScalaAnalyzer,
     token: QueryToken<'_>,
     provider: &ScalaDefinitionProvider<'_>,
     batch: &ScalaDefinitionContext,
@@ -1510,6 +1510,9 @@ fn bounded_scala_definition_resolution(
             );
         };
         let member_name = scala_node_text(reference.member, source).trim();
+        if member_name == "copy" && scala.is_case_class_declaration(&owner) {
+            return candidates_outcome(vec![owner]);
+        }
         let direct = if reference.receiver_scope == ScalaBoundedReceiverScope::Super {
             ScalaBoundedMemberCandidates::NoMatch
         } else {
@@ -2024,6 +2027,9 @@ fn bounded_scala_member_return_type(
     member: &str,
     receiver_scope: ScalaBoundedReceiverScope,
 ) -> Option<CodeUnit> {
+    if member == "copy" && ctx.provider.scala.is_case_class_declaration(owner) {
+        return Some(owner.clone());
+    }
     let selected = if receiver_scope == ScalaBoundedReceiverScope::Super {
         bounded_scala_inherited_members(ctx, token, owner, member, ScalaBoundedCallShape::Access)
     } else {
@@ -3786,6 +3792,21 @@ fn resolve_scala_with_context(
             format!("`{}` is a local Scala pattern binding", site.text),
         );
     }
+    if is_enclosing_template_qualifier_reference(node, source) {
+        let name = scala_node_text(node, source).trim();
+        return scala_enclosing_template_units(scala, analyzer, file, node)
+            .into_iter()
+            .find(|owner| scala_simple_type_name(owner) == name)
+            .map_or_else(
+                || {
+                    no_definition(
+                        "no_enclosing_scala_template",
+                        format!("`{name}` names no enclosing Scala template"),
+                    )
+                },
+                |owner| candidates_outcome(vec![owner]),
+            );
+    }
     let qualified_type_root = scala_qualified_type_root(node);
     let qualified_type_segments = scala_type_lookup_segments(qualified_type_root, source);
     let structured_type_reference = node.kind() == "type_identifier"
@@ -4311,9 +4332,15 @@ fn scala_import_reference_outcome(
                     return Some(candidates_outcome(indexed));
                 }
             }
+            // A caret on the import path's own terminal segment names the
+            // imported declaration just as directly as a selector or an alias
+            // does, so it takes the indexed candidate too. Only a caret on an
+            // earlier segment declines it: that segment names a package or an
+            // owner prefix, and the loops above own those answers.
             for tier in resolver.structured_import_type_candidate_tiers(structured_path, &[]) {
                 if let Some(indexed) = scala_fqn_probe(support, tier) {
-                    return selected_name.then(|| candidates_outcome(indexed));
+                    return (selected_name || focused_terminal_segment)
+                        .then(|| candidates_outcome(indexed));
                 }
             }
         }
@@ -8056,6 +8083,11 @@ fn resolve_scala_field(
     };
     if let Some(owner) = owner {
         let owner_fqn = owner.fq_name();
+        if member == "copy"
+            && let Some(case_class) = scala_case_class_owner(ctx, &owner_fqn)
+        {
+            return candidates_outcome(vec![case_class]);
+        }
         if let ScalaReceiverOwner::Exact(exact_owner) = &owner {
             match scala_exact_owner_member_candidate_units(ctx, token, exact_owner, member, false) {
                 ScalaExactMemberResolution::Found(candidates) => {
@@ -8174,6 +8206,22 @@ fn resolve_scala_field(
         member,
         format!("receiver for Scala member `{member}` is not resolved"),
     )
+}
+
+fn scala_case_class_owner(ctx: ScalaLookupCtx<'_>, owner_fqn: &str) -> Option<CodeUnit> {
+    let mut candidates = ctx
+        .support
+        .fqn(owner_fqn)
+        .into_iter()
+        .filter(|candidate| candidate.is_class() && candidate.fq_name() == owner_fqn)
+        .filter(|candidate| ctx.scala.is_case_class_declaration(candidate))
+        .collect::<Vec<_>>();
+    sort_units(&mut candidates);
+    candidates.dedup();
+    match candidates.as_slice() {
+        [candidate] => Some(candidate.clone()),
+        _ => None,
+    }
 }
 
 /// What a Scala member access reports when its receiver is not a type this
@@ -10142,17 +10190,15 @@ fn scala_unit_mismatch(
     if !alternatives.is_empty() {
         let mut mismatches = Vec::new();
         for alternative in &alternatives {
-            match scala_callable_alternative_mismatch(
+            let mismatch = scala_callable_alternative_mismatch(
                 alternative.role,
                 &alternative.shape,
                 alternative.result,
                 call_shape,
                 site_role,
                 unique_callable,
-            ) {
-                None => return None,
-                Some(mismatch) => mismatches.push(mismatch),
-            }
+            )?;
+            mismatches.push(mismatch);
         }
         return Some(
             mismatches
@@ -11759,6 +11805,35 @@ fn scala_resolve_visible_type_node_after_lexical_miss(
     }
 }
 
+/// Indexed template declarations enclosing `node`, innermost first.
+///
+/// Start from the analyzer's exact enclosing declaration and retain structured
+/// parent identities throughout. This supplies the same lexical template chain
+/// to ordinary type lookup and to the dedicated `private[X]` / `X.this`
+/// namespace without reconstructing owners from rendered names.
+fn scala_enclosing_template_units(
+    scala: &ScalaAnalyzer,
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    node: Node<'_>,
+) -> Vec<CodeUnit> {
+    let range = Range {
+        start_byte: node.start_byte(),
+        end_byte: node.end_byte(),
+        start_line: node.start_position().row,
+        end_line: node.end_position().row,
+    };
+    let mut owners = Vec::new();
+    let mut current = analyzer.enclosing_code_unit(file, &range);
+    while let Some(unit) = current {
+        current = scala.structural_parent_of(&unit);
+        if unit.is_class() {
+            owners.push(unit);
+        }
+    }
+    owners
+}
+
 fn scala_exact_lexical_type_namespace(
     ctx: ScalaLookupCtx<'_>,
     token: QueryToken<'_>,
@@ -11795,20 +11870,7 @@ fn scala_exact_lexical_type_namespace(
             }
         };
     }
-    let range = Range {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line: node.start_position().row,
-        end_line: node.end_position().row,
-    };
-    let mut owners = Vec::new();
-    let mut current = ctx.analyzer.enclosing_code_unit(ctx.file, &range);
-    while let Some(unit) = current {
-        current = ctx.scala.structural_parent_of(&unit);
-        if unit.is_class() {
-            owners.push(unit);
-        }
-    }
+    let owners = scala_enclosing_template_units(ctx.scala, ctx.analyzer, ctx.file, node);
     // The exact type members one enclosing owner declares in its own body, in
     // the type namespace: nested classes and traits (never their companion
     // objects) plus type aliases.
@@ -12984,6 +13046,9 @@ fn scala_call_result_type(
             }
             let owner =
                 scala_receiver_type_fqn_with_bindings(ctx, token, resolver, receiver, bindings)?;
+            if member == "copy" && scala_case_class_owner(ctx, &owner).is_some() {
+                return Some(owner);
+            }
             let include_companion = scala_receiver_allows_companion_lookup_with_bindings(
                 ctx,
                 token,

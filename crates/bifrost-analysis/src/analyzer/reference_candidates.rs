@@ -90,7 +90,7 @@ pub fn reference_candidate_requires_point_lookup(
     }
 }
 
-pub(crate) fn reference_candidate_ranges_cancellable(
+pub fn reference_candidate_ranges_cancellable(
     root: Node<'_>,
     language: Language,
     limit: usize,

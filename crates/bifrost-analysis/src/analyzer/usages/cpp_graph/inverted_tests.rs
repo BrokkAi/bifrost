@@ -62,7 +62,7 @@ ABSL_NAMESPACE_END
             token,
             std::slice::from_ref(&file),
             &visibility,
-            &nodes,
+            crate::analyzer::usages::inverted_edges::EdgeNodeDomain::Closed(&nodes),
             |_| true,
         );
 
@@ -112,7 +112,7 @@ int use(void) { return LIMIT + 1; }
             token,
             std::slice::from_ref(&file),
             &visibility,
-            &nodes,
+            crate::analyzer::usages::inverted_edges::EdgeNodeDomain::Closed(&nodes),
             |_| true,
         );
 

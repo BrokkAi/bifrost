@@ -1103,7 +1103,10 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
             step.insert("op".to_string(), Value::String(op.label().to_string()));
             append_step(expr, &items[1], step)
         }
-        RqlForm::StateEventsOf | RqlForm::FlowRelationsOf | RqlForm::RewritePathsOf => {
+        RqlForm::StateEventsOf
+        | RqlForm::FlowRelationsOf
+        | RqlForm::ControlRelations
+        | RqlForm::RewritePathsOf => {
             if items.len() < 2 || !(items.len() - 2).is_multiple_of(2) {
                 return Err(lower_error(
                     expr,
@@ -1151,7 +1154,12 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
             }
             append_step(expr, &items[items.len() - 1], step)
         }
-        RqlForm::FlowSource | RqlForm::FlowTarget => {
+        RqlForm::FlowSource
+        | RqlForm::FlowTarget
+        | RqlForm::TargetOf
+        | RqlForm::SourceSetOf
+        | RqlForm::TopologyEdgesOf
+        | RqlForm::GuardsOf => {
             expect_len(expr, items, 2, head)?;
             let op = form
                 .query_step_op()
@@ -1653,7 +1661,12 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::StateEventsOf
         | RqlForm::FlowRelationsOf
         | RqlForm::FlowSource
+        | RqlForm::TargetOf
+        | RqlForm::SourceSetOf
+        | RqlForm::TopologyEdgesOf
+        | RqlForm::GuardsOf
         | RqlForm::FlowTarget
+        | RqlForm::ControlRelations
         | RqlForm::RewritePathsOf => unreachable!("wrapper filtered above"),
         RqlForm::Paths | RqlForm::SegmentsOf | RqlForm::SegmentTarget => {
             unreachable!("wrapper filtered above")

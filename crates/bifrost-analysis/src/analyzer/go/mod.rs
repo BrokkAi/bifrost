@@ -588,6 +588,8 @@ impl CodeUnitIndex for GoAnalyzer {
 }
 
 impl IAnalyzer for GoAnalyzer {
+    crate::analyzer::i_analyzer::forward_relational_definition_batch!();
+
     #[cfg(any(test, feature = "test-support"))]
     fn test_hooks(&self) -> &dyn crate::analyzer::AnalyzerTestHooks {
         self
@@ -628,13 +630,6 @@ impl IAnalyzer for GoAnalyzer {
 
     fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
         self.inner.workspace_file_index_cell()
-    }
-
-    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
-        // Trait signature is fixed, so this boundary opens the scope the
-        // usage-graph funnel now demands proof of (issue #2423 milestone B).
-        let scope = crate::analyzer::AnalyzerQueryScope::new(self);
-        self.inner.global_usage_definition_index(scope.token())
     }
 
     fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
@@ -719,14 +714,20 @@ impl IAnalyzer for GoAnalyzer {
         Some(self)
     }
 
-    fn structural_search_providers(
+    fn structural_fact_providers(
         &self,
-    ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
-        self.inner.structural_search_providers()
+    ) -> Vec<&dyn crate::analyzer::structural::StructuralFactProvider> {
+        self.inner.structural_fact_providers()
     }
 
     fn snapshot_caches(&self) -> Option<&crate::analyzer::AnalyzerSnapshotCaches> {
         Some(self.inner.snapshot_caches())
+    }
+
+    fn workspace_content_identities(
+        &self,
+    ) -> Option<crate::analyzer::content_identity::WorkspaceContentIdentities> {
+        self.inner.workspace_content_identities()
     }
 
     fn contains_tests(&self, file: &ProjectFile) -> bool {
@@ -776,18 +777,6 @@ impl IAnalyzer for GoAnalyzer {
 
 #[cfg(any(test, feature = "test-support"))]
 impl crate::analyzer::AnalyzerTestHooks for GoAnalyzer {
-    fn reset_global_usage_definition_index_build_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_global_usage_definition_index_build_count_for_test();
-    }
-
-    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .global_usage_definition_index_build_count_for_test()
-    }
-
     fn reset_full_declaration_scan_count_for_test(&self) {
         self.inner
             .test_hooks()
@@ -903,7 +892,13 @@ impl LanguageEdgePass for GoEdgePass {
     fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
         let scope = AnalyzerQueryScope::new(ctx.analyzer);
         let token = scope.token();
-        build_go_usage_edges(ctx.analyzer, token, ctx.fqns, ctx.keep_file).map(LanguageEdgeSites)
+        crate::analyzer::usages::go_graph::build_rooted_go_usage_edges(
+            ctx.analyzer,
+            token,
+            ctx.fqns,
+            ctx.keep_file,
+        )
+        .map(LanguageEdgeSites)
     }
 
     fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {

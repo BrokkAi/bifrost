@@ -13,6 +13,7 @@
 //! language registry -- including the batched symbol search, whose request type
 //! owns compiled `regex` values.
 
+use crate::analyzer::fq_name::{FqName, segment_interner};
 use crate::analyzer::model::{
     CodeUnit, Language, ProjectFile, Range, SignatureMetadata, SummaryFileProjection,
 };
@@ -141,6 +142,18 @@ pub trait CodeUnitIndex: Send + Sync {
         self.definitions(fq_name).collect()
     }
 
+    /// Exact definitions for a name whose segment boundaries and kinds are
+    /// already known. Persisted analyzers override this to keep the structured
+    /// identity intact through their relational query. The default preserves
+    /// compatibility for indexes that only implement the rendered lookup.
+    fn definitions_by_structured_name(
+        &self,
+        fq_name: &FqName,
+        language: Language,
+    ) -> Vec<CodeUnit> {
+        self.get_definitions(&fq_name.display_native(language, segment_interner()))
+    }
+
     /// Candidate declarations whose persisted short names match a qualified
     /// lookup input. Implementations return an empty set when they cannot
     /// answer this cheaply; callers retain their broader lookup path then.
@@ -237,8 +250,14 @@ pub trait CodeUnitIndex: Send + Sync {
     }
 
     fn parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
-        let parent_name = default_parent_fq_name(code_unit)?;
-        self.definitions(&parent_name).next()
+        let parent_name = code_unit
+            .fq()
+            .parent()
+            .filter(|parent| !parent.is_empty())?;
+        let language = crate::analyzer::common::language_for_file(code_unit.source());
+        self.definitions_by_structured_name(&parent_name, language)
+            .into_iter()
+            .next()
     }
 
     fn ranges(&self, _code_unit: &CodeUnit) -> Vec<Range> {

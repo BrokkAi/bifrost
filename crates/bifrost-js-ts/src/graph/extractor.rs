@@ -9,15 +9,15 @@ use crate::graph::resolver::{
 };
 use crate::imports::require_call_module_specifier;
 use crate::parse::{flow_dialect_blocks_extraction, js_ts_tree_sitter_language_for_file};
-use crate::providers::JsTsSource;
+use crate::providers::{JsTsSource, with_usage_definitions};
 use crate::syntax::{
     JsTsImportBinder, JsTsLexicalBindingIndex, JsTsLexicalBindingScope,
     declarator_module_value_specifier, direct_pattern_binding, direct_property_definitions,
     is_declaration_identifier, is_lexically_nested_type_declaration,
     is_named_function_expression_declaration, is_object_in_member_expression,
     is_property_key_in_member, js_program_is_external_module, nested_type_identifier_parts,
-    object_pattern_entries, pattern_binder_identifiers, slice, static_member_receiver,
-    typescript_enclosing_enum_initializer,
+    object_pattern_entries, pattern_binder_identifiers, slice, static_member_property,
+    static_member_receiver, typescript_enclosing_enum_initializer,
 };
 use crate::ts_owners::ts_resolve_type_text_to_property_owners;
 use crate::type_text::ts_type_annotation_text;
@@ -30,7 +30,9 @@ use brokk_bifrost_core::analyzer::usages::model::{ExportEntry, ExportIndex, Impo
 use brokk_bifrost_core::analyzer::usages::receiver_analysis::{
     ReceiverAnalysisBudget, ReceiverAnalysisOutcome, ReceiverValue,
 };
-use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, Language, ProjectFile, Range};
+use brokk_bifrost_core::analyzer::{
+    BoundedDefinitionLookup, CodeUnit, CodeUnitIndex, Language, ProjectFile, Range,
+};
 use brokk_bifrost_core::cancellation::CancellationToken;
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use brokk_bifrost_core::text_utils::compute_line_starts;
@@ -222,66 +224,67 @@ pub fn scan_files_for_seeds(
                 );
                 (!definitions.is_empty()).then_some(definitions)
             });
-        let definitions = host.usage_definitions(token);
-        let receiver_facts = JsTsReceiverFactProvider::new(
-            host,
-            definitions,
-            language,
-            file,
-            source_str,
-            root,
-            imports.clone(),
-        );
         let initial_binding_engine = binding_engine.clone();
         let initial_type_binding_engine =
             LocalInferenceEngine::new(LocalInferenceConfig::default());
-        let mut scan_ctx = ScanCtx {
-            file,
-            source: source_str,
-            line_starts: &line_starts,
-            analyzer,
-            host,
-            token,
-            target,
-            target_short: &target_short,
-            target_member: target_member.as_deref(),
-            browser_global_object,
-            lookup_only_local_property,
-            local_property_definitions,
-            global_property_receivers: &global_property_receivers,
-            target_property_receivers: &target_property_receivers,
-            script_global_bare_target,
-            file_is_script,
-            edges: &edges,
-            seeds,
-            target_self_file,
-            target_is_static_member: is_static_member(target),
-            target_owner: target_owner.as_ref(),
-            target_owner_source: target_owner_source.as_ref(),
-            imports,
-            receiver_facts,
-            language,
-            lexical_bindings,
-            scope_stack: vec![HashMap::default()],
-            lexical_shadow_scopes: Vec::new(),
-            binding_engine,
-            type_binding_engine: initial_type_binding_engine.clone(),
-            target_object_parameters: HashMap::default(),
-            hits: &mut local_hits,
-            unproven_hits: &mut local_unproven_hits,
-        };
-
-        loop {
-            let parameter_count = scan_ctx.target_object_parameter_count();
-            scan_node(tree_ref.root_node(), &mut scan_ctx);
-            if scan_ctx.target_object_parameter_count() == parameter_count {
-                break;
-            }
-            scan_ctx.reset_for_additional_pass(
-                initial_binding_engine.clone(),
-                initial_type_binding_engine.clone(),
+        with_usage_definitions(host, token, |definitions| {
+            let receiver_facts = JsTsReceiverFactProvider::new(
+                host,
+                definitions,
+                language,
+                file,
+                source_str,
+                root,
+                imports.clone(),
             );
-        }
+            let mut scan_ctx = ScanCtx {
+                file,
+                source: source_str,
+                line_starts: &line_starts,
+                analyzer,
+                host,
+                definitions,
+                target,
+                target_short: &target_short,
+                target_member: target_member.as_deref(),
+                browser_global_object,
+                lookup_only_local_property,
+                local_property_definitions,
+                global_property_receivers: &global_property_receivers,
+                target_property_receivers: &target_property_receivers,
+                script_global_bare_target,
+                file_is_script,
+                edges: &edges,
+                seeds,
+                target_self_file,
+                target_is_static_member: is_static_member(target),
+                target_owner: target_owner.as_ref(),
+                target_owner_source: target_owner_source.as_ref(),
+                imports,
+                receiver_facts,
+                language,
+                lexical_bindings,
+                scope_stack: vec![HashMap::default()],
+                lexical_shadow_scopes: Vec::new(),
+                binding_engine,
+                type_binding_engine: initial_type_binding_engine.clone(),
+                target_object_parameters: HashMap::default(),
+                hits: &mut local_hits,
+                unproven_hits: &mut local_unproven_hits,
+            };
+
+            loop {
+                let parameter_count = scan_ctx.target_object_parameter_count();
+                scan_node(tree_ref.root_node(), &mut scan_ctx);
+                if scan_ctx.target_object_parameter_count() == parameter_count {
+                    break;
+                }
+                scan_ctx.reset_for_additional_pass(
+                    initial_binding_engine.clone(),
+                    initial_type_binding_engine.clone(),
+                );
+            }
+        });
 
         if !local_hits.is_empty() {
             let mut sink = collected
@@ -394,9 +397,7 @@ pub struct ScanCtx<'a> {
     /// The JS/TS host for `language`, resolved once by `scan_files_for_seeds`, for the
     /// parts of the scan that call the host-parameterized owner resolution.
     host: &'a dyn JsTsSource,
-    /// Proof that the request scope this per-file scan runs under is open, so
-    /// the usage-graph lookups below take it from here (issue #2423).
-    token: QueryToken<'a>,
+    definitions: &'a dyn BoundedDefinitionLookup,
     target: &'a CodeUnit,
     /// Top-level identifier (the class/function/field's own name component).
     target_short: &'a str,
@@ -1071,7 +1072,7 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         "identifier" | "type_identifier" | "shorthand_property_identifier" => {
             handle_identifier_candidate(node, ctx);
         }
-        "member_expression" => handle_member_expression(node, ctx),
+        "member_expression" | "subscript_expression" => handle_member_expression(node, ctx),
         "call_expression" => register_target_object_call_arguments(node, ctx),
         "object" => handle_contextual_object_literal(node, ctx),
         "jsx_opening_element" | "jsx_self_closing_element" => handle_jsx_element(node, ctx),
@@ -1803,8 +1804,7 @@ fn local_function_target_for_reference(reference: Node<'_>, ctx: &ScanCtx<'_>) -
         .as_ref()?
         .binding_scope_at(name, reference.start_byte())?;
     let mut candidates = ctx
-        .host
-        .usage_definitions(ctx.token)
+        .definitions
         .file_identifier(ctx.file, name)
         .into_iter()
         .filter(|candidate| candidate.source() == ctx.file && candidate.is_function())
@@ -1834,8 +1834,7 @@ fn local_function_target_for_declaration(
         end_line: 0,
     };
     let mut candidates = ctx
-        .host
-        .usage_definitions(ctx.token)
+        .definitions
         .file_identifier(ctx.file, name)
         .into_iter()
         .filter(|candidate| candidate.source() == ctx.file && candidate.is_function())
@@ -2188,11 +2187,10 @@ fn handle_member_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let Some(object) = node.child_by_field_name("object") else {
         return;
     };
-    let Some(property) = node.child_by_field_name("property") else {
+    let Some((property, property_text)) = static_member_property(node, ctx.source) else {
         return;
     };
     let object_text = slice(object, ctx.source);
-    let property_text = slice(property, ctx.source);
 
     if ctx
         .target_member
@@ -2265,7 +2263,7 @@ fn handle_member_expression(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     // `Namespace.Foo` / `require("./mod").Foo` style access. ESM namespace imports
     // still key by the target's local name; CommonJS module-object edges carry the
     // exported property name so aliases such as `module.exports = { Bar: Foo }` work.
-    if namespace_member_matches_target(object, object_text, property_text, ctx) {
+    if namespace_member_matches_target(object, object_text, &property_text, ctx) {
         record_hit(property, ctx);
         return;
     }
@@ -2356,7 +2354,7 @@ fn contextual_object_literal_owners(node: Node<'_>, ctx: &ScanCtx<'_>) -> Vec<Co
     {
         return ts_resolve_type_text_to_property_owners(
             ctx.host,
-            ctx.host.usage_definitions(ctx.token),
+            ctx.definitions,
             ctx.file,
             ctx.source,
             &ctx.imports,
@@ -2388,7 +2386,7 @@ fn contextual_object_literal_owners(node: Node<'_>, ctx: &ScanCtx<'_>) -> Vec<Co
     };
     ts_resolve_type_text_to_property_owners(
         ctx.host,
-        ctx.host.usage_definitions(ctx.token),
+        ctx.definitions,
         ctx.file,
         ctx.source,
         &ctx.imports,

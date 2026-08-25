@@ -929,9 +929,10 @@ impl RustCargoRouteIndex {
         route_name: &str,
     ) -> Option<RustCargoRoute> {
         let normalized = normalize_crate_name(route_name);
-        let mut resolved = self
-            .target_roots_by_file
-            .get(file)?
+        let Some(target_roots) = self.target_roots_by_file.get(file) else {
+            return self.resolve_unique_unscoped_library_route(&normalized);
+        };
+        let mut resolved = target_roots
             .iter()
             .filter_map(|root| self.targets_by_root.get(root))
             .flatten()
@@ -957,6 +958,41 @@ impl RustCargoRouteIndex {
         });
         match resolved.as_slice() {
             [route] => Some(route.clone()),
+            _ => None,
+        }
+    }
+
+    /// Resolve a crate spelling for an analyzed Rust file that belongs to no
+    /// Cargo target, such as a checked-in standalone example.
+    ///
+    /// There is no dependency table to establish visibility for such a file.
+    /// A unique indexed workspace library is still a structured best-effort
+    /// answer; more than one physical library root with that exposed name
+    /// remains ambiguous and fails closed. Files with known Cargo membership
+    /// never use this path and retain strict dependency visibility.
+    fn resolve_unique_unscoped_library_route(
+        &self,
+        normalized_route: &str,
+    ) -> Option<RustCargoRoute> {
+        let mut resolved = self
+            .routes_by_manifest_and_name
+            .iter()
+            .filter(|((_, name), _)| name == normalized_route)
+            .flat_map(|(_, routes)| routes)
+            .cloned()
+            .collect::<Vec<_>>();
+        resolved.sort_by(|left, right| {
+            left.root_file
+                .cmp(&right.root_file)
+                .then_with(|| left.package.cmp(&right.package))
+        });
+        resolved.dedup_by(|duplicate, retained| duplicate.root_file == retained.root_file);
+        match resolved.as_slice() {
+            [route] => {
+                let mut route = route.clone();
+                route.kind = RustCargoRouteKind::Dependency;
+                Some(route)
+            }
             _ => None,
         }
     }

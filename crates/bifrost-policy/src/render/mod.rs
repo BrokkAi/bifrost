@@ -398,6 +398,7 @@ mod tests {
                 &PolicyEvaluationContext {
                     analyzer: &analyzer,
                     workspace: None,
+                    flow_state: &brokk_bifrost_flow::FlowWorkspaceState::new(),
                     cancellation,
                     cvss_overlays: &[],
                     organizational_risk: &[],

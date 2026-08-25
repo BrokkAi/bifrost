@@ -111,13 +111,15 @@ pub trait JsTsSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyProv
         None
     }
 
-    /// The workspace's usage-definition index, as the bounded lookup contract.
-    ///
-    /// The `JavaSource::usage_definitions` spelling. Before the extraction the
-    /// scan called `IAnalyzer::global_usage_definition_index`, which has no
-    /// core spelling because it hands back an analysis-side handle; the bounded
-    /// lookup is the part of it this crate actually reads.
-    fn usage_definitions(&self, token: QueryToken<'_>) -> &dyn BoundedDefinitionLookup;
+    /// Run one synchronous resolution step against a step-local bounded
+    /// definition lookup. A file scan keeps the callback open for its complete
+    /// AST walk, so its receiver provider and nested resolvers share one memo
+    /// without publishing lookup state as analyzer-generation state.
+    fn with_usage_definitions(
+        &self,
+        token: QueryToken<'_>,
+        read: &mut dyn FnMut(&dyn BoundedDefinitionLookup),
+    );
 
     /// The analyzer-cached JS/TS resolution index for this source's own language,
     /// built on first use. `None` only when `cancellation` fires mid-build.
@@ -125,6 +127,21 @@ pub trait JsTsSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyProv
     /// The memo cell behind it is a `PoolSafeMemo` on the analysis-side cache
     /// bucket; this is the product, not the cell.
     fn usage_index(&self, cancellation: Option<&CancellationToken>) -> Option<Arc<JsTsUsageIndex>>;
+}
+
+pub(crate) fn with_usage_definitions<R>(
+    source: &dyn JsTsSource,
+    token: QueryToken<'_>,
+    read: impl FnOnce(&dyn BoundedDefinitionLookup) -> R,
+) -> R {
+    let mut read = Some(read);
+    let mut result = None;
+    source.with_usage_definitions(token, &mut |lookup| {
+        if let Some(read) = read.take() {
+            result = Some(read(lookup));
+        }
+    });
+    result.expect("JS/TS definition lookup access must invoke its consumer exactly once")
 }
 
 // --- ImportAnalysisProvider ------------------------------------------------

@@ -377,7 +377,7 @@ impl Hash for OracleRelationHandle {
 ///
 /// Dense relation IDs are only unique within one arena, so deterministic
 /// consumers must include arena identity before comparing IDs.
-pub(crate) fn compare_relation_provenance(
+pub fn compare_relation_provenance(
     left: &[OracleRelationHandle],
     right: &[OracleRelationHandle],
 ) -> Ordering {

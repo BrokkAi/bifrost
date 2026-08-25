@@ -505,9 +505,14 @@ pub fn static_member_receiver<'tree>(
 ) -> Option<JsTsStaticMemberReceiver<'tree>> {
     let mut current = node;
     let mut members = Vec::new();
-    while current.kind() == "member_expression" {
-        let property = current.child_by_field_name("property")?;
-        if property.kind() != "property_identifier" || slice(property, source).is_empty() {
+    while matches!(current.kind(), "member_expression" | "subscript_expression") {
+        let (property, _) = static_member_property(current, source)?;
+        // A private name is a static *member* name but not a receiver-chain
+        // segment: `other.#inner.value` names a field of whatever `other` is,
+        // and nothing in the chain text says which class that is. The chain
+        // walk therefore stops here, as it did before the shared property
+        // helper existed.
+        if property.kind() == "private_property_identifier" {
             return None;
         }
         members.push(property);
@@ -521,6 +526,59 @@ pub fn static_member_receiver<'tree>(
         root: current,
         members,
     })
+}
+
+/// The name-bearing node and decoded name of a statically nameable member.
+///
+/// Dot properties use their identifier node. A computed string property uses
+/// its sole `string_fragment`, which both rejects escapes/dynamic expressions
+/// and retains the editor-visible range inside the quotes.
+///
+/// A private name (`#field`) is a dot property like any other: the grammar
+/// gives it its own node kind, the `#` is part of the name, and the field it
+/// names is indexed under its exact class owner (#1926). Callers that need a
+/// receiver *chain* rather than a member name reject it themselves; see
+/// [`static_member_receiver`].
+pub fn static_member_property<'tree>(
+    member_expression: Node<'tree>,
+    source: &str,
+) -> Option<(Node<'tree>, String)> {
+    let (property, computed) = match member_expression.kind() {
+        "member_expression" => (member_expression.child_by_field_name("property")?, false),
+        "subscript_expression" => (member_expression.child_by_field_name("index")?, true),
+        _ => return None,
+    };
+    match property.kind() {
+        "property_identifier" | "identifier" | "private_property_identifier" if !computed => {
+            let name = slice(property, source);
+            (!name.is_empty()).then(|| (property, name.to_string()))
+        }
+        "string" => static_string_property(property, source),
+        "computed_property_name" => {
+            let mut cursor = property.walk();
+            let mut children = property.named_children(&mut cursor);
+            let value = children.next()?;
+            if children.next().is_some() || value.kind() != "string" {
+                return None;
+            }
+            static_string_property(value, source)
+        }
+        _ => None,
+    }
+}
+
+fn static_string_property<'tree>(
+    string: Node<'tree>,
+    source: &str,
+) -> Option<(Node<'tree>, String)> {
+    let mut cursor = string.walk();
+    let mut children = string.named_children(&mut cursor);
+    let fragment = children.next()?;
+    if fragment.kind() != "string_fragment" || children.next().is_some() {
+        return None;
+    }
+    let name = slice(fragment, source);
+    (!name.is_empty()).then(|| (fragment, name.to_string()))
 }
 
 /// The identifier at the root of a static member chain (`module` in
@@ -1577,6 +1635,42 @@ relay();
                 .kind()
         );
         assert!(static_member_receiver(private_receiver, source).is_none());
+    }
+
+    #[test]
+    fn static_member_property_names_a_private_field_access() {
+        let source = "class Box { #inner; read(other) { return other.#inner.value; } }";
+        let tree = parse_javascript(source);
+        let private_access = find_node(tree.root_node(), source, "other.#inner");
+
+        let (name_node, name) =
+            static_member_property(private_access, source).expect("private property name");
+        assert_eq!("#inner", name);
+        assert_eq!("private_property_identifier", name_node.kind());
+        assert_eq!(
+            "#inner",
+            slice(name_node, source),
+            "the `#` belongs to the name the class indexed it under"
+        );
+    }
+
+    #[test]
+    fn static_member_property_accepts_only_literal_computed_names() {
+        let source = r#"task["finish"](); task[name](); task["fi\nish"]();"#;
+        let tree = parse_javascript(source);
+        let literal = find_node(tree.root_node(), source, r#"task["finish"]"#);
+        let dynamic = find_node(tree.root_node(), source, "task[name]");
+        let escaped = find_node(tree.root_node(), source, r#"task["fi\nish"]"#);
+
+        let (name_node, name) =
+            static_member_property(literal, source).expect("literal property name");
+        assert_eq!(name, "finish");
+        assert_eq!(slice(name_node, source), "finish");
+        let receiver = static_member_receiver(literal, source).expect("literal member receiver");
+        assert_eq!(slice(receiver.root, source), "task");
+        assert_eq!(receiver.members, vec![name_node]);
+        assert!(static_member_property(dynamic, source).is_none());
+        assert!(static_member_property(escaped, source).is_none());
     }
 
     #[test]

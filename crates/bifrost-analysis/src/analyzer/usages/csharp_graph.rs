@@ -38,7 +38,8 @@ use crate::analyzer::usages::common::language_for_target;
 use crate::analyzer::usages::csharp_graph::shared::{CSharpEdgeResolver, CSharpQueryResolver};
 use crate::analyzer::usages::get_definition::ResolutionSession;
 use crate::analyzer::usages::inverted_edges::{
-    UsageEdgeBuildOutput, UsageEdgeWeights, UsageEdges, build_edge_output, parse_and_collect,
+    EdgeNodeDomain, UsageEdgeBuildOutput, UsageEdgeWeights, UsageEdges, build_edge_output,
+    parse_and_collect_with_domain,
 };
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
@@ -217,7 +218,7 @@ fn build_csharp_edges<Output, F>(
     token: QueryToken<'_>,
     csharp: &CSharpAnalyzer,
     files: &[ProjectFile],
-    nodes: &HashSet<String>,
+    domain: EdgeNodeDomain<'_>,
     keep_file: F,
 ) -> Output
 where
@@ -227,10 +228,10 @@ where
     let language = tree_sitter_c_sharp::LANGUAGE.into();
     let graph = csharp_graph_source(analyzer);
     build_edge_output(files, keep_file, |file| {
-        parse_and_collect(
+        parse_and_collect_with_domain(
             analyzer,
             file,
-            nodes,
+            domain,
             brokk_bifrost_csharp::preprocessor::csharp_parse_spec(&language),
             |input| {
                 brokk_bifrost_csharp::graph::inverted::scan_file(&graph, csharp, token, file, input)
@@ -239,17 +240,26 @@ where
     })
 }
 
-pub(crate) fn build_csharp_usage_edges<F>(
+pub(crate) fn build_rooted_csharp_usage_edges<F>(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
-    nodes: &HashSet<String>,
+    callers: &HashSet<String>,
     keep_file: F,
 ) -> Option<UsageEdges>
 where
     F: Fn(&ProjectFile) -> bool + Sync,
 {
     let resolver = CSharpEdgeResolver::try_new(analyzer)?;
-    Some(resolver.build_edges(analyzer, token, nodes, keep_file))
+    Some(resolver.build_rooted_edges(analyzer, token, callers, keep_file))
+}
+
+pub(crate) fn build_inbound_csharp_usage_edges(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    callees: &HashSet<String>,
+) -> Option<UsageEdges> {
+    let resolver = CSharpEdgeResolver::try_new(analyzer)?;
+    Some(resolver.build_inbound_edges(analyzer, token, callees, |_| true))
 }
 
 pub(crate) fn build_csharp_usage_edge_weights<F>(

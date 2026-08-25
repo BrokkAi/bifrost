@@ -29,7 +29,8 @@ use crate::analyzer::languages::{
     BoundedReceiverQuery, DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof,
     DeadCodeRouting, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
     LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport,
-    StructuralReceiverResolver, analyzable_file_count, fqn_bulk_nodes, overloaded_function_fqns,
+    StructuralReceiverResolver, analyzable_file_count, candidate_fqns,
+    fqn_has_multiple_function_definitions,
 };
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::type_relations::TypeRelation;
@@ -40,8 +41,7 @@ use crate::analyzer::usages::get_definition::{
 use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_scala_type_bounded};
 use crate::analyzer::usages::scala_graph::{
     ScalaDeadCodeBulkContext, ScalaDeadCodeBulkEligibility, ScalaUsageGraphStrategy,
-    build_full_scala_usage_edges, build_scala_usage_edge_weights, build_scala_usage_edges,
-    dead_code_bulk_eligibility,
+    build_inbound_scala_usage_edges, build_scala_usage_edge_weights, dead_code_bulk_eligibility,
 };
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::weighted_cache::{
@@ -53,11 +53,18 @@ use crate::analyzer::{
     ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider, JvmAnalyzerConfig, Language,
     PoolSafeMemo, Project, ProjectFile, SignatureMetadata, TestAssertionSmell,
     TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeAliasProvider,
-    TypeHierarchyProvider, UsageFactsIndex, resolve_analyzer,
+    TypeHierarchyProvider, resolve_analyzer,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
+use brokk_bifrost_core::CancellationToken;
 use brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus;
+use brokk_bifrost_core::analyzer::{
+    BoundedDefinitionLookup, DefinitionLanguageScope, PackageRelationKind, PackageRelationValue,
+    RelationalDefinitionFrontier, RelationalDefinitionLookup, RelationalDefinitionQuery,
+    RelationalDefinitionQuestion, RelationalDefinitionValue, RelationalName,
+    RelationalPointOutcome,
+};
 use moka::sync::Cache;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -70,6 +77,7 @@ pub(crate) use brokk_bifrost_jvm::proof::{
     JvmActiveSemanticModel, JvmModelDisposition, JvmProofGap, model_disposition_over_tiers,
     prove_against_active_model,
 };
+use brokk_bifrost_jvm::scala::graph::inverted::ScalaProjectTypesSeed;
 pub(crate) use brokk_bifrost_jvm::scala::graph_support::{
     ScalaCallableFactsIndex, ScalaDefinitionIndex, ScalaFileFacts, ScalaForwardOwnerFacts,
     ScalaNameProof, ScalaSource,
@@ -86,7 +94,7 @@ use brokk_bifrost_jvm::scala::test_detection::detect_scala_test_assertion_smells
 /// strings only, so they moved with the language knowledge they serve.
 pub(crate) use brokk_bifrost_jvm::scala::{
     scala_default_type_name, scala_nested_type_candidates, scala_normalize_full_name,
-    scala_simple_type_name,
+    scala_package_fq_name, scala_simple_type_name,
 };
 use clones::build_scala_clone_candidate_data;
 pub(crate) use wildcard_imports::{
@@ -120,54 +128,442 @@ fn scala_file_facts(state: FileState) -> ScalaFileFacts {
     }
 }
 
+#[derive(Clone)]
+enum ScalaRelationalBackend {
+    Store(Box<TreeSitterAnalyzer<ScalaAdapter>>),
+    Frontier(Arc<dyn RelationalDefinitionFrontier>),
+}
+
+struct ScalaRelationalDefinitionIndex {
+    backend: ScalaRelationalBackend,
+}
+
+impl ScalaRelationalDefinitionIndex {
+    fn definition_query(
+        &self,
+        name: RelationalName,
+        query: RelationalDefinitionQuery,
+    ) -> RelationalDefinitionValue {
+        let question = RelationalDefinitionQuestion {
+            language_scope: DefinitionLanguageScope::Language(Language::Scala),
+            name,
+            query,
+        };
+        match &self.backend {
+            ScalaRelationalBackend::Frontier(frontier) => frontier.ask(&question),
+            ScalaRelationalBackend::Store(inner) => {
+                let request = question.request(0);
+                match inner.point(&request, &CancellationToken::new()) {
+                    RelationalPointOutcome::Complete(result) => result.value,
+                    RelationalPointOutcome::Cancelled => {
+                        RelationalDefinitionValue::empty_for(&request.query)
+                    }
+                    RelationalPointOutcome::Failed(error) => {
+                        inner.record_query_failure(crate::analyzer::store::StoreError::new(
+                            error.message(),
+                        ));
+                        RelationalDefinitionValue::empty_for(&request.query)
+                    }
+                }
+            }
+        }
+    }
+
+    fn package_query(
+        &self,
+        package: &str,
+        query: RelationalDefinitionQuery,
+    ) -> RelationalDefinitionValue {
+        self.definition_query(
+            RelationalName::stable(scala_package_fq_name(package)),
+            query,
+        )
+    }
+
+    fn rendered_name_query(
+        &self,
+        name: &str,
+        query: RelationalDefinitionQuery,
+    ) -> RelationalDefinitionValue {
+        self.structured_name_query(self.rendered_fq(name), query)
+    }
+
+    fn rendered_fq(&self, name: &str) -> crate::analyzer::FqName {
+        brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path_fq(
+            Language::Scala,
+            name,
+            crate::analyzer::fq_name::segment_interner(),
+        )
+    }
+
+    fn terminal_identifier<'a>(&self, name: &'a crate::analyzer::FqName) -> &'a str {
+        crate::analyzer::fq_name::segment_interner()
+            .resolve(
+                name.last()
+                    .expect("a Scala definition lookup name is non-empty"),
+            )
+            .0
+    }
+
+    fn structured_name_query(
+        &self,
+        name: crate::analyzer::FqName,
+        query: RelationalDefinitionQuery,
+    ) -> RelationalDefinitionValue {
+        self.definition_query(RelationalName::stable(name), query)
+    }
+
+    fn identifier_query(&self, identifier: &str, file: Option<ProjectFile>) -> Vec<CodeUnit> {
+        let mut name = crate::analyzer::FqName::new();
+        name.push(
+            crate::analyzer::fq_name::segment_interner()
+                .intern(identifier, crate::analyzer::fq_name::SegmentKind::Unknown),
+        );
+        match self.structured_name_query(name, RelationalDefinitionQuery::Identifier { file }) {
+            RelationalDefinitionValue::Definitions(units) => units,
+            _ => unreachable!("Scala identifier query returned the wrong shape"),
+        }
+    }
+}
+
+impl ScalaDefinitionIndex for ScalaRelationalDefinitionIndex {
+    fn by_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+        if fqn.is_empty() {
+            return Vec::new();
+        }
+        let structured = self.rendered_fq(fqn);
+        let mut candidates = match self
+            .structured_name_query(structured.clone(), RelationalDefinitionQuery::ExactName)
+        {
+            RelationalDefinitionValue::Definitions(units) => units,
+            _ => unreachable!("Scala exact-name query returned the wrong shape"),
+        };
+        candidates.extend(self.identifier_query(self.terminal_identifier(&structured), None));
+        candidates.retain(|unit| unit.fq_name() == fqn);
+        candidates.sort();
+        candidates.dedup();
+        candidates
+    }
+
+    fn by_normalized_fqn(&self, normalized: &str) -> Vec<CodeUnit> {
+        if normalized.is_empty() {
+            return Vec::new();
+        }
+        let mut candidates =
+            match self.rendered_name_query(normalized, RelationalDefinitionQuery::NormalizedName) {
+                RelationalDefinitionValue::Definitions(units) => units,
+                _ => unreachable!("Scala normalized-name query returned the wrong shape"),
+            };
+        let structured = self.rendered_fq(normalized);
+        let terminal = self.terminal_identifier(&structured);
+        candidates.extend(self.identifier_query(terminal, None));
+        candidates.extend(self.identifier_query(&format!("{terminal}$"), None));
+        candidates.retain(|unit| scala_normalize_full_name(&unit.fq_name()) == normalized);
+        candidates.sort();
+        candidates.dedup();
+        candidates
+    }
+
+    fn types_in_package(&self, package: &str, simple: &str) -> Vec<CodeUnit> {
+        match self.package_query(
+            package,
+            RelationalDefinitionQuery::PackageTypes {
+                simple_name: simple.to_string(),
+            },
+        ) {
+            RelationalDefinitionValue::Definitions(units) => units,
+            _ => unreachable!("Scala package-type query returned the wrong shape"),
+        }
+    }
+
+    fn identifier(&self, ident: &str) -> Vec<CodeUnit> {
+        self.identifier_query(ident, None)
+    }
+
+    fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit> {
+        let mut children =
+            match self.rendered_name_query(fqn, RelationalDefinitionQuery::StructuralChildren) {
+                RelationalDefinitionValue::Definitions(units) => units,
+                _ => unreachable!("Scala structural-children query returned the wrong shape"),
+            };
+        let normalized = scala_normalize_full_name(fqn);
+        let mut owners = ScalaDefinitionIndex::by_fqn(self, fqn);
+        if owners.is_empty() {
+            owners.extend(ScalaDefinitionIndex::by_normalized_fqn(self, &normalized));
+        }
+        owners.sort();
+        owners.dedup();
+        for owner in owners {
+            children.extend(
+                match self.structured_name_query(
+                    owner.fq().clone(),
+                    RelationalDefinitionQuery::StructuralChildren,
+                ) {
+                    RelationalDefinitionValue::Definitions(units) => units,
+                    _ => unreachable!("Scala structural-children query returned the wrong shape"),
+                },
+            );
+        }
+        children.sort();
+        children.dedup();
+        children
+    }
+
+    fn fqn_exists(&self, fqn: &str) -> bool {
+        !ScalaDefinitionIndex::by_fqn(self, fqn).is_empty()
+    }
+
+    fn package_exists(&self, package: &str) -> bool {
+        matches!(
+            self.package_query(
+                package,
+                RelationalDefinitionQuery::PackageRelation(PackageRelationKind::Exists),
+            ),
+            RelationalDefinitionValue::PackageRelation(PackageRelationValue::Exists(true))
+        )
+    }
+
+    fn package_container_exists(&self, package: &str) -> bool {
+        ScalaDefinitionIndex::package_exists(self, package)
+            || !ScalaDefinitionIndex::child_packages(self, package).is_empty()
+    }
+
+    fn child_packages(&self, package: &str) -> Vec<String> {
+        match self.package_query(
+            package,
+            RelationalDefinitionQuery::PackageRelation(PackageRelationKind::Children),
+        ) {
+            RelationalDefinitionValue::PackageRelation(PackageRelationValue::Packages(
+                packages,
+            )) => packages,
+            _ => unreachable!("Scala child-package query returned the wrong shape"),
+        }
+    }
+
+    fn members_for_structured_owner(
+        &self,
+        owner: &crate::analyzer::FqName,
+        name: &str,
+    ) -> Vec<CodeUnit> {
+        match self.structured_name_query(
+            owner.clone(),
+            RelationalDefinitionQuery::StructuralMembers {
+                identifier: name.to_string(),
+            },
+        ) {
+            RelationalDefinitionValue::Definitions(units) => units,
+            _ => unreachable!("Scala structured-owner query returned the wrong shape"),
+        }
+    }
+
+    fn members_for_owner_name(
+        &self,
+        owner_fqn: &str,
+        normalized_owner_fqn: &str,
+        name: &str,
+    ) -> Vec<CodeUnit> {
+        let query = RelationalDefinitionQuery::StructuralMembers {
+            identifier: name.to_string(),
+        };
+        let definitions = |value| match value {
+            RelationalDefinitionValue::Definitions(units) => units,
+            _ => unreachable!("Scala structural-members query returned the wrong shape"),
+        };
+        let exact = definitions(self.rendered_name_query(owner_fqn, query.clone()));
+        let mut normalized = ScalaDefinitionIndex::by_normalized_fqn(self, normalized_owner_fqn)
+            .into_iter()
+            .flat_map(
+                |owner| match self.structured_name_query(owner.fq().clone(), query.clone()) {
+                    RelationalDefinitionValue::Definitions(units) => units,
+                    _ => unreachable!("Scala structural-members query returned the wrong shape"),
+                },
+            )
+            .collect::<Vec<_>>();
+        normalized.extend(
+            self.identifier_query(name, None)
+                .into_iter()
+                .filter(|unit| {
+                    brokk_bifrost_core::analyzer::default_parent_fq_name(unit).is_some_and(
+                        |owner| {
+                            owner == owner_fqn
+                                || scala_normalize_full_name(&owner) == normalized_owner_fqn
+                        },
+                    )
+                }),
+        );
+        normalized.extend(exact);
+        normalized.sort();
+        normalized.dedup();
+        normalized
+    }
+
+    fn package_types_in(&self, package: &str) -> Vec<(String, Vec<CodeUnit>)> {
+        let mut grouped: HashMap<String, Vec<CodeUnit>> = HashMap::default();
+        let units =
+            match self.package_query(package, RelationalDefinitionQuery::PackageTypesInPackage) {
+                RelationalDefinitionValue::Definitions(units) => units,
+                _ => unreachable!("Scala package-types query returned the wrong shape"),
+            };
+        for unit in units {
+            grouped
+                .entry(scala_simple_type_name(&unit))
+                .or_default()
+                .push(unit);
+        }
+        let mut grouped = grouped.into_iter().collect::<Vec<_>>();
+        grouped.sort_by(|left, right| left.0.cmp(&right.0));
+        for (_, units) in &mut grouped {
+            units.sort();
+            units.dedup();
+        }
+        grouped
+    }
+}
+
+impl BoundedDefinitionLookup for ScalaRelationalDefinitionIndex {
+    fn fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+        ScalaDefinitionIndex::by_fqn(self, fqn)
+    }
+
+    fn fqn_in_language(&self, fqn: &str, language: Language) -> Vec<CodeUnit> {
+        if language == Language::Scala {
+            ScalaDefinitionIndex::by_fqn(self, fqn)
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn types_in_package(&self, package: &str, simple: &str) -> Vec<CodeUnit> {
+        ScalaDefinitionIndex::types_in_package(self, package, simple)
+    }
+
+    fn by_normalized_fqn(&self, normalized: &str) -> Vec<CodeUnit> {
+        ScalaDefinitionIndex::by_normalized_fqn(self, normalized)
+    }
+
+    fn identifier(&self, ident: &str) -> Vec<CodeUnit> {
+        ScalaDefinitionIndex::identifier(self, ident)
+    }
+
+    fn members_for_owner_name(
+        &self,
+        owner_fqn: &str,
+        normalized_owner_fqn: &str,
+        name: &str,
+    ) -> Vec<CodeUnit> {
+        ScalaDefinitionIndex::members_for_owner_name(self, owner_fqn, normalized_owner_fqn, name)
+    }
+
+    fn file_identifier(&self, file: &ProjectFile, ident: &str) -> Vec<CodeUnit> {
+        self.identifier_query(ident, Some(file.clone()))
+    }
+
+    fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit> {
+        ScalaDefinitionIndex::fqn_direct_children(self, fqn)
+    }
+
+    fn fqn_exists(&self, fqn: &str) -> bool {
+        ScalaDefinitionIndex::fqn_exists(self, fqn)
+    }
+
+    fn package_exists(&self, package: &str) -> bool {
+        ScalaDefinitionIndex::package_exists(self, package)
+    }
+
+    fn package_exists_in_language(&self, package: &str, language: Language) -> bool {
+        language == Language::Scala && ScalaDefinitionIndex::package_exists(self, package)
+    }
+
+    fn fqn_prefix_exists(&self, prefix: &str) -> bool {
+        match &self.backend {
+            ScalaRelationalBackend::Store(inner) => inner.forward_fqn_prefix_exists(prefix),
+            ScalaRelationalBackend::Frontier(_) => false,
+        }
+    }
+}
+
+struct ScalaRelationalCallableFacts {
+    backend: ScalaRelationalBackend,
+}
+
+impl ScalaCallableFactsIndex for ScalaRelationalCallableFacts {
+    fn facts_for_declaration(
+        &self,
+        declaration: &CodeUnit,
+    ) -> Vec<crate::analyzer::RelationalCallableFact> {
+        if !declaration.is_function() && !declaration.is_field() {
+            return Vec::new();
+        }
+        let question = RelationalDefinitionQuestion {
+            language_scope: DefinitionLanguageScope::Language(Language::Scala),
+            name: RelationalName::stable(declaration.fq().clone()),
+            query: RelationalDefinitionQuery::CallableFacts,
+        };
+        match &self.backend {
+            ScalaRelationalBackend::Frontier(frontier) => match frontier.ask(&question) {
+                RelationalDefinitionValue::CallableFacts(facts) => facts,
+                _ => unreachable!("Scala callable-facts query returned the wrong shape"),
+            },
+            ScalaRelationalBackend::Store(inner) => {
+                let request = question.request(0);
+                match inner.point(&request, &CancellationToken::new()) {
+                    RelationalPointOutcome::Complete(result) => match result.value {
+                        RelationalDefinitionValue::CallableFacts(facts) => facts,
+                        _ => unreachable!("Scala callable-facts query returned the wrong shape"),
+                    },
+                    RelationalPointOutcome::Cancelled => Vec::new(),
+                    RelationalPointOutcome::Failed(error) => {
+                        inner.record_query_failure(crate::analyzer::store::StoreError::new(
+                            error.message(),
+                        ));
+                        Vec::new()
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Build the crate-side [`ScalaProjectTypes`] out of a bulk file-state read.
-///
-/// The two indexes it stands on are analysis products --
-/// `GlobalUsageDefinitionIndex::from_declarations`,
-/// `UsageFactsIndex::build_from_declarations` over a `DefinitionIndexHandle`
-/// and [`ScalaAdapter`] -- so their construction stays here and the finished
-/// pair crosses as `Arc<dyn ..>`. Which declarations enter is Scala's decision
-/// and answers from the crate.
+/// Definition and callable questions stay store-backed; the bulk facts below
+/// are the Scala graph's pre-existing structural state, not replacement lookup
+/// indexes.
 pub(crate) fn build_scala_project_types(
+    inner: TreeSitterAnalyzer<ScalaAdapter>,
     file_states: HashMap<ProjectFile, FileState>,
 ) -> ScalaProjectTypes {
     let file_states: HashMap<ProjectFile, ScalaFileFacts> = file_states
         .into_iter()
         .map(|(file, state)| (file, scala_file_facts(state)))
         .collect();
-    let declarations = ScalaProjectTypes::indexable_declarations(&file_states);
-    let index = Arc::new(
-        crate::analyzer::GlobalUsageDefinitionIndex::from_declarations(
-            declarations.iter(),
-            scala_normalize_full_name,
-            scala_simple_type_name,
-        ),
-    );
-    let definitions = crate::analyzer::DefinitionIndexHandle::Single(&index);
-    let facts = Arc::new(UsageFactsIndex::build_from_declarations(
-        &definitions,
-        declarations.iter(),
-        |unit| {
-            file_states
-                .get(unit.source())
-                .and_then(|state| state.signatures.get(unit).and_then(|values| values.first()))
-                .cloned()
-                .or_else(|| unit.signature().map(str::to_string))
-        },
-        |unit| {
-            file_states
-                .get(unit.source())
-                .and_then(|state| {
-                    state
-                        .signature_metadata
-                        .get(unit)
-                        .and_then(|values| values.first())
-                })
-                .cloned()
-        },
-        &ScalaAdapter,
-    ));
+    let index = Arc::new(ScalaRelationalDefinitionIndex {
+        backend: ScalaRelationalBackend::Store(Box::new(inner.clone())),
+    });
+    let facts = Arc::new(ScalaRelationalCallableFacts {
+        backend: ScalaRelationalBackend::Store(Box::new(inner)),
+    });
     ScalaProjectTypes::from_parts(index, facts, file_states)
+}
+
+fn scala_project_types_seed(file_states: HashMap<ProjectFile, FileState>) -> ScalaProjectTypesSeed {
+    let file_states = file_states
+        .into_iter()
+        .map(|(file, state)| (file, scala_file_facts(state)))
+        .collect();
+    ScalaProjectTypes::seed(Arc::new(file_states))
+}
+
+fn build_scala_project_types_from_frontier(
+    frontier: Arc<dyn RelationalDefinitionFrontier>,
+    seed: ScalaProjectTypesSeed,
+) -> ScalaProjectTypes {
+    let index = Arc::new(ScalaRelationalDefinitionIndex {
+        backend: ScalaRelationalBackend::Frontier(frontier.clone()),
+    });
+    let facts = Arc::new(ScalaRelationalCallableFacts {
+        backend: ScalaRelationalBackend::Frontier(frontier),
+    });
+    ScalaProjectTypes::from_seed(index, facts, seed)
 }
 
 #[derive(Clone)]
@@ -359,6 +755,34 @@ impl ScalaAnalyzer {
             .is_some_and(|node| node.kind() == "full_enum_case")
     }
 
+    pub(crate) fn is_case_class_declaration(&self, code_unit: &CodeUnit) -> bool {
+        if !code_unit.is_class() {
+            return false;
+        }
+        let Some(range) = self.ranges(code_unit).into_iter().next() else {
+            return false;
+        };
+        let scope = AnalyzerQueryScope::new(self);
+        let Some(prepared) = self
+            .inner
+            .prepared_syntax(scope.token(), code_unit.source())
+        else {
+            return false;
+        };
+        let Some(node) = prepared
+            .tree()
+            .root_node()
+            .descendant_for_byte_range(range.start_byte, range.end_byte)
+        else {
+            return false;
+        };
+        node.kind() == "full_enum_case"
+            || node.kind() == "class_definition"
+                && (0..node.child_count())
+                    .filter_map(|index| node.child(index))
+                    .any(|child| child.kind() == "case")
+    }
+
     pub(crate) fn forward_owner_facts(
         &self,
         code_unit: &CodeUnit,
@@ -443,21 +867,6 @@ impl ScalaAnalyzer {
             scala_query_walk_count: Arc::new(AtomicUsize::new(0)),
             type_relations: Arc::new(OnceLock::new()),
         }
-    }
-
-    /// Owned handles to the workspace indexes (refcount bumps, not map
-    /// clones), for per-query views held behind `Arc` caches.
-    #[allow(dead_code)]
-    pub(crate) fn global_usage_definition_index_shared(
-        &self,
-        token: QueryToken<'_>,
-    ) -> Arc<crate::analyzer::GlobalUsageDefinitionIndex> {
-        self.inner.global_usage_definition_index_shared(token)
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn usage_facts_index_shared(&self, token: QueryToken<'_>) -> Arc<UsageFactsIndex> {
-        self.inner.usage_facts_index_shared(token)
     }
 
     pub(crate) fn project_types(&self) -> Arc<ScalaProjectTypes> {
@@ -643,7 +1052,7 @@ impl ScalaAnalyzer {
         if self.inner.declarations(file).iter().any(matches_name) {
             return true;
         }
-        self.global_usage_definition_index()
+        crate::analyzer::AnalyzerDefinitionLookup::new(self, Language::Scala)
             .types_in_package(package_name, name)
             .iter()
             .any(|unit| {
@@ -653,6 +1062,7 @@ impl ScalaAnalyzer {
             })
     }
 
+    #[cfg(test)]
     pub(crate) fn full_usage_edges(
         &self,
         nodes: &HashSet<String>,
@@ -683,6 +1093,28 @@ impl ScalaAnalyzer {
         self.initialize_project_types(|| file_states)
     }
 
+    pub(crate) fn build_project_types_from_file_states(
+        &self,
+        file_states: HashMap<ProjectFile, FileState>,
+    ) -> ScalaProjectTypes {
+        build_scala_project_types(self.inner.clone(), file_states)
+    }
+
+    pub(crate) fn project_types_seed_from_file_states(
+        &self,
+        file_states: HashMap<ProjectFile, FileState>,
+    ) -> ScalaProjectTypesSeed {
+        scala_project_types_seed(file_states)
+    }
+
+    pub(crate) fn build_project_types_from_frontier(
+        &self,
+        frontier: Arc<dyn RelationalDefinitionFrontier>,
+        seed: ScalaProjectTypesSeed,
+    ) -> ScalaProjectTypes {
+        build_scala_project_types_from_frontier(frontier, seed)
+    }
+
     fn initialize_project_types<F>(&self, file_states: F) -> Arc<ScalaProjectTypes>
     where
         F: FnOnce() -> HashMap<ProjectFile, FileState>,
@@ -691,7 +1123,7 @@ impl ScalaAnalyzer {
             .get_or_init(|| {
                 self.project_types_build_count
                     .fetch_add(1, Ordering::Relaxed);
-                Arc::new(build_scala_project_types(file_states()))
+                Arc::new(build_scala_project_types(self.inner.clone(), file_states()))
             })
             .clone()
     }
@@ -982,12 +1414,12 @@ impl ScalaSource for ScalaAnalyzer {
     }
 
     fn definitions_by_normalized_fqn(&self, normalized: &str) -> Vec<CodeUnit> {
-        self.global_usage_definition_index()
+        crate::analyzer::AnalyzerDefinitionLookup::new(self, Language::Scala)
             .by_normalized_fqn(normalized)
     }
 
     fn types_in_package(&self, package: &str, simple: &str) -> Vec<CodeUnit> {
-        self.global_usage_definition_index()
+        crate::analyzer::AnalyzerDefinitionLookup::new(self, Language::Scala)
             .types_in_package(package, simple)
     }
 
@@ -1009,75 +1441,6 @@ impl ScalaSource for ScalaAnalyzer {
 /// The declaration-index questions the Scala graph asks, answered by the
 /// analyzer's own workspace index. Nothing narrows or reorders: each member is
 /// the identically named inherent accessor or `BoundedDefinitionLookup` method.
-impl ScalaDefinitionIndex for crate::analyzer::GlobalUsageDefinitionIndex {
-    fn by_fqn(&self, fqn: &str) -> &[CodeUnit] {
-        crate::analyzer::GlobalUsageDefinitionIndex::by_fqn(self, fqn)
-    }
-
-    fn by_normalized_fqn(&self, normalized: &str) -> &[CodeUnit] {
-        crate::analyzer::GlobalUsageDefinitionIndex::by_normalized_fqn(self, normalized)
-    }
-
-    fn types_in_package(&self, package: &str, simple: &str) -> &[CodeUnit] {
-        crate::analyzer::GlobalUsageDefinitionIndex::types_in_package(self, package, simple)
-    }
-
-    fn identifier(&self, ident: &str) -> &[CodeUnit] {
-        crate::analyzer::GlobalUsageDefinitionIndex::identifier(self, ident)
-    }
-
-    fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit> {
-        crate::analyzer::GlobalUsageDefinitionIndex::fqn_direct_children(self, fqn)
-    }
-
-    fn fqn_exists(&self, fqn: &str) -> bool {
-        crate::analyzer::GlobalUsageDefinitionIndex::fqn_exists(self, fqn)
-    }
-
-    fn package_exists(&self, package: &str) -> bool {
-        crate::analyzer::GlobalUsageDefinitionIndex::package_exists(self, package)
-    }
-
-    fn package_container_exists(&self, package: &str) -> bool {
-        crate::analyzer::GlobalUsageDefinitionIndex::package_container_exists(self, package)
-    }
-
-    fn child_packages(&self, package: &str) -> Vec<String> {
-        crate::analyzer::GlobalUsageDefinitionIndex::child_packages(self, package)
-    }
-
-    fn members_for_owner_name<'a>(
-        &'a self,
-        owner_fqn: &str,
-        normalized_owner_fqn: &str,
-        name: &str,
-    ) -> Vec<&'a CodeUnit> {
-        crate::analyzer::GlobalUsageDefinitionIndex::members_for_owner_name(
-            self,
-            owner_fqn,
-            normalized_owner_fqn,
-            name,
-        )
-    }
-
-    fn package_types(
-        &self,
-    ) -> brokk_bifrost_jvm::scala::graph_support::ScalaPackageTypeEntries<'_> {
-        Box::new(crate::analyzer::GlobalUsageDefinitionIndex::package_types(
-            self,
-        ))
-    }
-}
-
-impl ScalaCallableFactsIndex for UsageFactsIndex {
-    fn fact_for_declaration(
-        &self,
-        declaration: &CodeUnit,
-    ) -> Option<&crate::analyzer::CallableFacts> {
-        UsageFactsIndex::fact_for_declaration(self, declaration)
-    }
-}
-
 impl TestDetectionProvider for ScalaAnalyzer {}
 
 impl TypeAliasProvider for ScalaAnalyzer {
@@ -1115,7 +1478,11 @@ impl CodeUnitIndex for ScalaAnalyzer {
         &self,
         file: &ProjectFile,
     ) -> Option<Arc<crate::analyzer::SummaryFileProjection>> {
-        self.inner.summary_file_projection(file)
+        let mut projection = (*self.inner.summary_file_projection(file)?).clone();
+        for children in projection.children.values_mut() {
+            children.retain(|child| !child.is_synthetic());
+        }
+        Some(Arc::new(projection))
     }
 
     fn analyzed_files(&self) -> Vec<ProjectFile> {
@@ -1261,6 +1628,8 @@ impl CodeUnitIndex for ScalaAnalyzer {
 }
 
 impl IAnalyzer for ScalaAnalyzer {
+    crate::analyzer::i_analyzer::forward_relational_definition_batch!();
+
     #[cfg(any(test, feature = "test-support"))]
     fn test_hooks(&self) -> &dyn crate::analyzer::AnalyzerTestHooks {
         self
@@ -1302,25 +1671,20 @@ impl IAnalyzer for ScalaAnalyzer {
         self.inner.workspace_file_index_cell()
     }
 
-    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
-        // Trait signature is fixed, so this boundary opens the scope the
-        // usage-graph funnel now demands proof of (issue #2423 milestone B).
-        let scope = crate::analyzer::AnalyzerQueryScope::new(self);
-        self.inner.global_usage_definition_index(scope.token())
-    }
-
-    fn usage_facts_index(&self) -> &UsageFactsIndex {
-        self.inner.usage_facts_index()
-    }
-
-    fn structural_search_providers(
+    fn structural_fact_providers(
         &self,
-    ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
-        self.inner.structural_search_providers()
+    ) -> Vec<&dyn crate::analyzer::structural::StructuralFactProvider> {
+        self.inner.structural_fact_providers()
     }
 
     fn snapshot_caches(&self) -> Option<&crate::analyzer::AnalyzerSnapshotCaches> {
         Some(self.inner.snapshot_caches())
+    }
+
+    fn workspace_content_identities(
+        &self,
+    ) -> Option<crate::analyzer::content_identity::WorkspaceContentIdentities> {
+        self.inner.workspace_content_identities()
     }
 
     fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
@@ -1489,18 +1853,6 @@ impl IAnalyzer for ScalaAnalyzer {
 
 #[cfg(any(test, feature = "test-support"))]
 impl crate::analyzer::AnalyzerTestHooks for ScalaAnalyzer {
-    fn reset_global_usage_definition_index_build_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_global_usage_definition_index_build_count_for_test();
-    }
-
-    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .global_usage_definition_index_build_count_for_test()
-    }
-
     fn reset_full_declaration_scan_count_for_test(&self) {
         self.inner
             .test_hooks()
@@ -1665,7 +2017,13 @@ impl LanguageEdgePass for ScalaEdgePass {
     fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
         let scope = AnalyzerQueryScope::new(ctx.analyzer);
         let token = scope.token();
-        build_scala_usage_edges(ctx.analyzer, token, ctx.fqns, ctx.keep_file).map(LanguageEdgeSites)
+        crate::analyzer::usages::scala_graph::build_rooted_scala_usage_edges(
+            ctx.analyzer,
+            token,
+            ctx.fqns,
+            ctx.keep_file,
+        )
+        .map(LanguageEdgeSites)
     }
 
     fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {
@@ -2057,7 +2415,7 @@ mod knownness_tests {
 #[derive(Default)]
 struct ScalaDeadCodeMemo {
     file_count: Option<usize>,
-    overloaded_fqns: Option<HashSet<String>>,
+    overloaded_fqns: HashMap<String, bool>,
     bulk_context: Option<Option<ScalaDeadCodeBulkContext>>,
 }
 
@@ -2096,13 +2454,15 @@ impl DeadCodeBulkProof for ScalaDeadCodeBulk {
             return false;
         }
 
-        let empty_overloads = HashSet::default();
-        let overloads = if candidate.is_function() {
-            overloaded_fqns
-                .get_or_insert_with(|| overloaded_function_fqns(analyzer, Language::Scala))
-        } else {
-            &empty_overloads
-        };
+        let mut overloads = HashSet::default();
+        if candidate.is_function() {
+            let fqn = candidate.fq_name();
+            if *overloaded_fqns.entry(fqn.clone()).or_insert_with(|| {
+                fqn_has_multiple_function_definitions(analyzer, Language::Scala, &fqn)
+            }) {
+                overloads.insert(fqn);
+            }
+        }
         let Some(context) = bulk_context
             .get_or_insert_with(|| ScalaDeadCodeBulkContext::from_analyzer(analyzer))
             .as_ref()
@@ -2111,9 +2471,22 @@ impl DeadCodeBulkProof for ScalaDeadCodeBulk {
         };
 
         matches!(
-            dead_code_bulk_eligibility(analyzer, token, candidate, overloads, context),
+            dead_code_bulk_eligibility(analyzer, token, candidate, &overloads, context),
             ScalaDeadCodeBulkEligibility::NeedsPrecise
         )
+    }
+
+    fn supports_precise_inbound_preflight(&self, routing: DeadCodeRouting<'_>) -> bool {
+        let ScalaDeadCodeMemo {
+            overloaded_fqns, ..
+        } = routing.memo.downcast_mut().expect("Scala bulk memo");
+        if !routing.candidate.is_function() {
+            return false;
+        }
+        let fqn = routing.candidate.fq_name();
+        *overloaded_fqns.entry(fqn.clone()).or_insert_with(|| {
+            fqn_has_multiple_function_definitions(routing.analyzer, Language::Scala, &fqn)
+        })
     }
 
     fn preflight(&self, analyzer: &dyn IAnalyzer) -> DeadCodeBulkPreflight {
@@ -2132,12 +2505,7 @@ impl DeadCodeBulkProof for ScalaDeadCodeBulk {
     ) -> Option<DeadCodeBulkEdges> {
         let scope = AnalyzerQueryScope::new(analyzer);
         let token = scope.token();
-        let nodes = fqn_bulk_nodes(
-            analyzer,
-            Language::Scala,
-            |unit| unit.is_function() || unit.is_class(),
-            candidates,
-        );
-        build_full_scala_usage_edges(analyzer, token, &nodes).map(DeadCodeBulkEdges::Fqn)
+        let callees = candidate_fqns(candidates);
+        build_inbound_scala_usage_edges(analyzer, token, &callees).map(DeadCodeBulkEdges::Fqn)
     }
 }

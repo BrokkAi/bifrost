@@ -2688,6 +2688,20 @@ pub fn enclosing_template_declarations(node: Node<'_>) -> Vec<Node<'_>> {
     declarations
 }
 
+/// Whether `node` names a lexically enclosing template rather than an
+/// ordinary type or term.
+///
+/// Scala gives the qualifier in `private[X]` / `protected[X]` and the owner in
+/// `X.this` this dedicated meaning. In particular, a same-named type member in
+/// the template body cannot shadow `X` at either site.
+pub fn is_enclosing_template_qualifier_reference(node: Node<'_>, source: &str) -> bool {
+    node.parent().is_some_and(|parent| {
+        parent.kind() == "access_qualifier"
+            || (is_owner_qualified_this(parent, source)
+                && parent.child_by_field_name("value") == Some(node))
+    })
+}
+
 pub fn template_self_types(declaration: Node<'_>) -> Vec<Node<'_>> {
     let mut declaration_cursor = declaration.walk();
     let Some(bound) = declaration
@@ -2825,6 +2839,34 @@ mod tests {
             arity: CallableArity::exact(arity),
             kind: ScalaParameterListKind::Contextual,
         }
+    }
+
+    #[test]
+    fn enclosing_template_qualifiers_follow_parser_context() {
+        let source = r#"trait Commands {
+  private[Commands] def restricted(): Unit = ()
+  def member: Commands = Commands.this
+}
+"#;
+        let mut parser = Parser::new();
+        parser
+            .set_language(&crate::scala::language::LANGUAGE.into())
+            .expect("Scala grammar");
+        let tree = parser.parse(source, None).expect("Scala tree");
+        let mut qualifier_offsets = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if matches!(node.kind(), "identifier" | "type_identifier")
+                && node_text(node, source) == "Commands"
+                && is_enclosing_template_qualifier_reference(node, source)
+            {
+                qualifier_offsets.push(node.start_byte());
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        qualifier_offsets.sort_unstable();
+        assert_eq!(qualifier_offsets.len(), 2, "{}", tree.root_node().to_sexp());
     }
 
     #[test]

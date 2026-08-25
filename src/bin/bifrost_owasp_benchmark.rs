@@ -5,10 +5,16 @@
 //!   promote-esapi --staged <path> --jar <path> --out <path>
 //!       Digest the resolved ESAPI jar and write the pinned sanitizer pack.
 //!
-//!   run --benchmark <dir> --packs-dir <dir> --deps <dir> --out <path>
-//!       [--esapi-digest <hex>] [--limit <n>] [--timeout-secs <s>]
-//!       Build the Benchmark workspace, activate the sanitizer packs, run one
-//!       require-model taint policy per category, score, and write the artifact.
+//!   run --benchmark <dir> --packs-dir <dir> --deps <dir> --jdk-catalog <dir>
+//!       --out <path> [--esapi-digest <hex>] [--limit <n>] [--timeout-secs <s>]
+//!       Build the Benchmark workspace, activate the curated sanitizer/summary
+//!       packs and, through the product dependency-pack path (#2558), the real
+//!       `bifrost.jdk` release bundle installed at `--jdk-catalog`; run one
+//!       require-model taint policy per category, score, and write the
+//!       artifact. `--jdk-catalog` must already have the bundle installed
+//!       (`bifrost-semantic-pack install <bundle-dir> <catalog-dir>`,
+//!       built by `scripts/public/build-pinned-jvm-semantic-packs.sh`); the
+//!       runner never installs into it and opens it read-only.
 //!
 //! The heavy logic is gated behind the `release-tooling` feature so it stays out
 //! of normal runtime builds, matching the other facade tooling binaries.
@@ -148,13 +154,31 @@ mod imp {
         pinned_to_esapi_digest: bool,
     }
 
-    /// The packs the bakeoff activates. The mandatory set is the four-blocker
-    /// punch-list content (#1935): the two sanitizer packs (so ESAPI-sanitized
-    /// fake cases clear), the JDK and servlet framework-declaration packs (so
-    /// servlet/JDBC/java.lang types resolve as external declarations), and the
-    /// golden JDK procedure-summary pack (so require-model can pass taint through
-    /// the JDK transforms the Benchmark routes every flow through). The remaining
-    /// staged library sanitizer packs are best-effort extras.
+    /// The packs the bakeoff activates as curated session content (#1935's
+    /// four-blocker punch list, minus the JDK declaration pack). Each is
+    /// authored bakeoff content with no real generation-time extraction
+    /// behind it: sanitizer knowledge, or behavioral procedure summaries that
+    /// mechanical extraction cannot produce from bytecode or source alone.
+    /// `SemanticPackCatalog::register_session_pack` is the right mechanism
+    /// for exactly this content, because it never has a completeness gate to
+    /// bypass -- there is no generation-time `Completeness` to check for
+    /// something that was never mechanically extracted.
+    ///
+    /// This is deliberately not the whole activated set (#2558): the JDK
+    /// *declaration* pack is real, generated content (a full extraction of
+    /// the JDK's own `src.zip`), and it activates separately through the
+    /// product dependency path (`activate_jdk_dependency_pack`, using
+    /// `--jdk-catalog`) so #2401's declaration-scoped completeness gate and
+    /// gap accounting run on it exactly as they would for a customer. The
+    /// servlet-API declaration pack stays here, unlike the JDK one, because
+    /// there is no real product-path input for it to converge onto: the
+    /// Benchmark's `pom.xml` never declares `javax.servlet-api` (the servlet
+    /// container supplies it at deploy time, container-provided rather than
+    /// a real Maven dependency), so `target/dependency` never contains its
+    /// jar and dependency discovery has nothing to find or produce a pack
+    /// from -- converging it would mean fabricating a product-path input a
+    /// real customer workspace does not have, which is a different kind of
+    /// dishonesty than the one this issue closes.
     const PACKS: &[PackDescriptor] = &[
         PackDescriptor {
             pack_id: "bifrost.java-sanitizers",
@@ -174,15 +198,10 @@ mod imp {
             mandatory: true,
             pinned_to_esapi_digest: true,
         },
-        PackDescriptor {
-            pack_id: "bifrost.jdk-framework-decls",
-            file: "framework-decls/bifrost.jdk-framework-decls.json",
-            ecosystem: "jdk",
-            package: None,
-            package_version: None,
-            mandatory: true,
-            pinned_to_esapi_digest: false,
-        },
+        // bifrost.jdk-framework-decls converged onto the product dependency
+        // path (#2558): see the doc comment on `PACKS` above. It is no
+        // longer loaded as a session pack; `activate_jdk_dependency_pack`
+        // activates the real `bifrost.jdk` bundle instead.
         PackDescriptor {
             pack_id: "bifrost.javax.servlet-api-framework-decls",
             file: "framework-decls/staged/bifrost.javax.servlet-api-framework-decls.json",
@@ -448,12 +467,27 @@ mod imp {
         activated: Vec<String>,
         skipped: Vec<SkippedPack>,
         esapi: EsapiMeta,
+        /// #2558: the JDK declaration pack, activated through the product
+        /// dependency path rather than as a curated session pack.
+        jdk: JdkPackMeta,
     }
 
     #[derive(Serialize)]
     struct SkippedPack {
         pack_id: String,
         reason: String,
+    }
+
+    #[derive(Serialize)]
+    struct JdkPackMeta {
+        pack_version: &'static str,
+        activation_route: &'static str,
+        /// Named warning-grade extraction gaps the activated bundle carries.
+        /// A reference to a gapped declaration degrades to a typed
+        /// `PackExtractionGap` incomplete reason rather than a false absence
+        /// proof (#2401); this is the honesty budget the product activation
+        /// path enforces.
+        gaps: usize,
     }
 
     #[derive(Serialize)]
@@ -501,6 +535,16 @@ mod imp {
         let out = flags
             .get("out")
             .ok_or_else(|| "--out <path> is required".to_owned())?;
+        // #2558: an operator catalog directory with the real `bifrost.jdk`
+        // release bundle already installed
+        // (`bifrost-semantic-pack install <bundle> <this dir>`). The JDK
+        // declaration pack activates from here through the product
+        // dependency-pack path, not as a curated session pack.
+        let jdk_catalog_root = PathBuf::from(
+            flags
+                .get("jdk-catalog")
+                .ok_or_else(|| "--jdk-catalog <dir> is required".to_owned())?,
+        );
         let esapi_digest = flags.get("esapi-digest").cloned();
         let dependency_jars = match flags.get("deps") {
             Some(dir) => collect_dependency_jars(Path::new(dir))?,
@@ -558,6 +602,7 @@ mod imp {
             packs,
             timeout,
             case_limit,
+            jdk_catalog_root,
         };
 
         eprintln!("building benchmark workspace and running taint policies...");
@@ -636,6 +681,11 @@ mod imp {
                 esapi: EsapiMeta {
                     coordinate: "org.owasp.esapi:esapi:2.7.0.0",
                     artifact_sha256: esapi_digest,
+                },
+                jdk: JdkPackMeta {
+                    pack_version: "21.0.8",
+                    activation_route: "product:activate_dependency_packs",
+                    gaps: result.jdk_pack_gaps,
                 },
             },
             run: RunMeta {

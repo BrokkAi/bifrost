@@ -4,7 +4,7 @@
 //! analyzer-backed evaluation, canonical report assembly, and CLI status
 //! selection. Renderers consume only the returned [`PolicyReportDocument`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,19 +14,22 @@ use sha2::{Digest, Sha256};
 
 use brokk_bifrost_analysis::CancellationToken;
 use brokk_bifrost_analysis::FileSetProject;
+use brokk_bifrost_analysis::analyzer::IAnalyzer;
 use brokk_bifrost_analysis::analyzer::packs_document::{
     WORKSPACE_PACKS_DOCUMENT_PATH, WorkspaceActivationError, WorkspaceActivationSources,
     WorkspacePacksActivation, WorkspacePacksConfig, activate_workspace_semantic_sources,
     load_workspace_packs_config, load_workspace_packs_config_at,
 };
-use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
+use brokk_bifrost_analysis::analyzer::semantic::{WorkspaceRelativePath, split_qualified_member};
 use brokk_bifrost_analysis::analyzer::semantic_model::{
-    ActiveSemanticModelShard, SemanticModelActivationExplanation,
-    SemanticModelActivationPersistence, SemanticModelActivationRequest,
-    SemanticModelActivationStatus, SemanticModelRuntimeOutcome, SemanticPackCatalog,
-    WORKSPACE_SEMANTIC_MODEL_DIRECTORY, acquire_active_semantic_models,
+    ActiveSemanticModelShard, CatalogPackSourceKind, ResolvedActiveSemanticModels,
+    SemanticModelActivationExplanation, SemanticModelActivationPersistence,
+    SemanticModelActivationRequest, SemanticModelActivationStatus, SemanticModelRuntimeOutcome,
+    SemanticPackCatalog, WORKSPACE_SEMANTIC_MODEL_DIRECTORY, acquire_active_semantic_models,
     workspace_semantic_models_not_active,
 };
+use brokk_bifrost_analysis::analyzer::usages::effects::ModeledProcedureKey;
+use brokk_bifrost_analysis::analyzer::usages::effects::modeled_procedure_key_for_unit;
 use brokk_bifrost_analysis::analyzer::{
     AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer,
 };
@@ -54,10 +57,10 @@ use super::registry::{PolicyRegistry, PolicyRegistryError, PolicyRegistryLimits}
 use super::report::{
     MAX_DIFF_FIXED_FINDINGS, PolicyDiffFixedFinding, PolicyDiffReview, PolicyExecutionMetadata,
     PolicyExecutionStage, PolicyExecutionTermination, PolicyOptionalReviews,
-    PolicyPackActivationReview, PolicyPackDecision, PolicyPackDecisionStatus, PolicyReportBuilder,
-    PolicyReportBuilderError, PolicyReportDiagnostic, PolicyReportDiagnosticCode,
-    PolicyReportDocument, PolicyRetentionOutcome, PolicyRuleDescriptor, PolicySourceRange,
-    PolicyStageTiming,
+    PolicyPackActivationReview, PolicyPackDecision, PolicyPackDecisionStatus,
+    PolicyPackProcedureSummaryEvidence, PolicyReportBuilder, PolicyReportBuilderError,
+    PolicyReportDiagnostic, PolicyReportDiagnosticCode, PolicyReportDocument,
+    PolicyRetentionOutcome, PolicyRuleDescriptor, PolicySourceRange, PolicyStageTiming,
 };
 use super::resolved::{
     EndpointDefinitionSchemaResolution, EndpointOrigin, LoadedPolicy, ResolvedEndpointIdentity,
@@ -76,8 +79,9 @@ use super::suppression::{
     MAX_SUPPRESSION_REKEY_CANDIDATES, PolicyEvaluationDate, PolicyReportEvaluationContext,
     PolicySuppressionDocument, PolicySuppressionDocumentState, PolicySuppressionMatchState,
     PolicySuppressionOptions, PolicySuppressionOrphanState, PolicySuppressionPolicyHashState,
-    PolicySuppressionRecord, PolicySuppressionReview, PolicySuppressionSourceState,
-    PolicySuppressionTemporalState, load_policy_suppressions_from_root,
+    PolicySuppressionPreflight, PolicySuppressionRecord, PolicySuppressionReview,
+    PolicySuppressionSourceState, PolicySuppressionTemporalState,
+    load_policy_suppressions_from_root,
 };
 use super::taint_policy::ProductionTaintPolicyEvaluator;
 use super::typestate_policy::ProductionTypestatePolicyEvaluator;
@@ -228,7 +232,7 @@ impl RetainedSize for PolicyEvaluationOptions {
 /// Complete canonical report plus the already precedence-resolved CLI status.
 pub struct PolicyBatchOutcome {
     report: PolicyReportDocument,
-    taint_findings: Vec<brokk_bifrost_analysis::analyzer::structural::CodeQueryTaintFinding>,
+    taint_findings: Vec<brokk_bifrost_rql::structural::CodeQueryTaintFinding>,
     taint_analysis_results: Vec<Arc<crate::ProductionTaintAnalysisResult>>,
     exit_status: u8,
     max_retained_report_bytes: usize,
@@ -247,6 +251,7 @@ impl PolicyBatchOutcome {
     pub fn record_preparation_timings(
         &mut self,
         selection_elapsed: Duration,
+        suppression_preflight_elapsed: Duration,
         snapshot_elapsed: Duration,
     ) {
         let current = self.report.execution();
@@ -254,25 +259,22 @@ impl PolicyBatchOutcome {
             return;
         }
         let mut stage_timings = current.stage_timings().to_vec();
-        stage_timings.push(PolicyStageTiming::from_duration(
-            PolicyExecutionStage::PolicySelection,
-            selection_elapsed,
-        ));
-        stage_timings.push(PolicyStageTiming::from_duration(
-            PolicyExecutionStage::WorkspaceSnapshot,
-            snapshot_elapsed,
-        ));
-        let preparation_elapsed_ms = stage_timings
-            .iter()
-            .filter(|timing| {
-                matches!(
-                    timing.stage(),
-                    PolicyExecutionStage::PolicySelection | PolicyExecutionStage::WorkspaceSnapshot
-                )
-            })
-            .fold(0_u64, |total, timing| {
-                total.saturating_add(timing.elapsed_ms())
-            });
+        let mut preparation_elapsed_ms = 0_u64;
+        for (stage, elapsed) in [
+            (PolicyExecutionStage::PolicySelection, selection_elapsed),
+            (
+                PolicyExecutionStage::SuppressionPreflight,
+                suppression_preflight_elapsed,
+            ),
+            (PolicyExecutionStage::WorkspaceSnapshot, snapshot_elapsed),
+        ] {
+            if stage_timings.iter().any(|timing| timing.stage() == stage) {
+                continue;
+            }
+            let timing = PolicyStageTiming::from_duration(stage, elapsed);
+            preparation_elapsed_ms = preparation_elapsed_ms.saturating_add(timing.elapsed_ms());
+            stage_timings.push(timing);
+        }
         let execution = PolicyExecutionMetadata::try_new(
             current
                 .total_elapsed_ms()
@@ -299,9 +301,7 @@ impl PolicyBatchOutcome {
 
     /// Diagnostic-neutral taint query rows retained by the same propagation
     /// runs that produced the policy report.
-    pub fn taint_findings(
-        &self,
-    ) -> &[brokk_bifrost_analysis::analyzer::structural::CodeQueryTaintFinding] {
+    pub fn taint_findings(&self) -> &[brokk_bifrost_rql::structural::CodeQueryTaintFinding] {
         &self.taint_findings
     }
 
@@ -313,11 +313,10 @@ impl PolicyBatchOutcome {
 
     pub fn taint_query_results(
         &self,
-    ) -> impl ExactSizeIterator<
-        Item = brokk_bifrost_analysis::analyzer::structural::CodeQueryResultValue,
-    > + '_ {
+    ) -> impl ExactSizeIterator<Item = brokk_bifrost_rql::structural::CodeQueryResultValue> + '_
+    {
         self.taint_findings.iter().cloned().map(|value| {
-            brokk_bifrost_analysis::analyzer::structural::CodeQueryResultValue::TaintFinding {
+            brokk_bifrost_rql::structural::CodeQueryResultValue::TaintFinding {
                 value: Box::new(value),
             }
         })
@@ -420,6 +419,7 @@ pub fn evaluate_policy_files_with_analyzer(
     root: impl AsRef<Path>,
     policy_files: &[PathBuf],
     workspace: &WorkspaceAnalyzer,
+    flow_state: &brokk_bifrost_flow::FlowWorkspaceState,
     options: &PolicyEvaluationOptions,
     cancellation: Option<&CancellationToken>,
 ) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
@@ -441,7 +441,14 @@ pub fn evaluate_policy_files_with_analyzer(
         .cloned()
         .map(PolicyEvaluationInput::WorkspaceFile)
         .collect::<Vec<_>>();
-    evaluate_policy_inputs_with_analyzer(root, &inputs, workspace, options, cancellation)
+    evaluate_policy_inputs_with_analyzer(
+        root,
+        &inputs,
+        workspace,
+        flow_state,
+        options,
+        cancellation,
+    )
 }
 
 /// Evaluate a deterministic mixture of workspace files and caller-owned policy sources.
@@ -459,6 +466,7 @@ pub fn evaluate_policy_inputs(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -467,6 +475,7 @@ pub fn evaluate_policy_inputs_with_analyzer(
     root: impl AsRef<Path>,
     policy_inputs: &[PolicyEvaluationInput],
     workspace: &WorkspaceAnalyzer,
+    flow_state: &brokk_bifrost_flow::FlowWorkspaceState,
     options: &PolicyEvaluationOptions,
     cancellation: Option<&CancellationToken>,
 ) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
@@ -477,6 +486,7 @@ pub fn evaluate_policy_inputs_with_analyzer(
         PolicyBatchBudget::default(),
         PolicyRegistryLimits::default(),
         Some(workspace),
+        Some(flow_state),
         None,
         cancellation,
     )
@@ -495,6 +505,7 @@ pub fn evaluate_policy_inputs_with_analyzer_and_semantic_models(
     root: impl AsRef<Path>,
     policy_inputs: &[PolicyEvaluationInput],
     workspace: &WorkspaceAnalyzer,
+    flow_state: &brokk_bifrost_flow::FlowWorkspaceState,
     options: &PolicyEvaluationOptions,
     semantic_models: PolicySemanticModelContext<'_>,
     cancellation: Option<&CancellationToken>,
@@ -506,6 +517,7 @@ pub fn evaluate_policy_inputs_with_analyzer_and_semantic_models(
         PolicyBatchBudget::default(),
         PolicyRegistryLimits::default(),
         Some(workspace),
+        Some(flow_state),
         Some(semantic_models),
         cancellation,
     )
@@ -521,6 +533,7 @@ pub fn evaluate_policy_source(
     source_identity: PolicySourceIdentity,
     source: &str,
     workspace: &WorkspaceAnalyzer,
+    flow_state: &brokk_bifrost_flow::FlowWorkspaceState,
     options: &PolicyEvaluationOptions,
     cancellation: Option<&CancellationToken>,
 ) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
@@ -528,9 +541,146 @@ pub fn evaluate_policy_source(
         root,
         &[PolicyEvaluationInput::embedded(source_identity, source)],
         workspace,
+        flow_state,
         options,
         cancellation,
     )
+}
+
+/// Load configured suppressions without constructing or consulting an analyzer.
+///
+/// MCP uses this boundary before workspace readiness so a malformed gate input
+/// can return a bounded canonical report immediately. Callers that continue to
+/// evaluation should move the returned preflight into the analyzer-backed
+/// evaluation entry point rather than reading the sources again.
+pub fn preflight_policy_suppressions(
+    root: impl AsRef<Path>,
+    options: &PolicyEvaluationOptions,
+) -> Result<PolicySuppressionPreflight, PolicyCoordinatorError> {
+    super::suppression::load_policy_suppressions(root.as_ref(), options.suppressions())
+        .map(PolicySuppressionPreflight::new)
+        .map_err(|error| {
+            PolicyCoordinatorError::new(format!(
+                "failed to open policy suppression sources: {error}"
+            ))
+        })
+}
+
+/// Construct the compact canonical unreliable result for a failed suppression
+/// preflight. No policy has been registered or evaluated, so the report keeps
+/// its rule/run/progress collections empty and records only stages that ran.
+pub fn suppression_preflight_failure_outcome(
+    options: &PolicyEvaluationOptions,
+    preflight: PolicySuppressionPreflight,
+    selection_elapsed: Duration,
+    suppression_preflight_elapsed: Duration,
+) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
+    let outcome = preflight.outcome();
+    let failure = outcome.failures.first().ok_or_else(|| {
+        PolicyCoordinatorError::new("suppression preflight failure has no diagnostic")
+    })?;
+    let diagnostic = report_diagnostic(
+        PolicyReportDiagnosticCode::SuppressionLoadFailed,
+        format!(
+            "failed to load policy suppressions from `{}`: {}",
+            failure.path, failure.error
+        ),
+        Some(PolicySourceIdentity::new(&failure.path)),
+        None,
+        Vec::new(),
+    )?;
+    let stage_timings = vec![
+        PolicyStageTiming::from_duration(PolicyExecutionStage::PolicySelection, selection_elapsed),
+        PolicyStageTiming::from_duration(
+            PolicyExecutionStage::SuppressionPreflight,
+            suppression_preflight_elapsed,
+        ),
+    ];
+    let total_elapsed_ms = stage_timings.iter().fold(0_u64, |total, timing| {
+        total.saturating_add(timing.elapsed_ms())
+    });
+    let execution = PolicyExecutionMetadata::try_new(
+        total_elapsed_ms,
+        stage_timings,
+        None,
+        None,
+        None,
+        Vec::new(),
+        Vec::new(),
+    )
+    .map_err(|error| {
+        PolicyCoordinatorError::new(format!(
+            "failed to construct suppression preflight metadata: {error}"
+        ))
+    })?;
+    let evaluation = PolicyReportEvaluationContext::new(
+        options.evaluation_date(),
+        outcome.sources.clone(),
+        options.scope(),
+        PolicyScopeDocumentState::NotEvaluated,
+    );
+    let report_started = Instant::now();
+    let mut report = PolicyReportDocument::try_new_with_execution(
+        evaluation,
+        execution,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        PolicyOptionalReviews::default(),
+        vec![diagnostic],
+        false,
+        0,
+        None,
+    )
+    .map_err(|error| {
+        PolicyCoordinatorError::new(format!(
+            "failed to construct suppression preflight report: {error}"
+        ))
+    })?;
+    let report_timing = PolicyStageTiming::from_duration(
+        PolicyExecutionStage::ReportConstruction,
+        report_started.elapsed(),
+    );
+    let mut complete_stage_timings = vec![
+        PolicyStageTiming::from_duration(PolicyExecutionStage::PolicySelection, selection_elapsed),
+        PolicyStageTiming::from_duration(
+            PolicyExecutionStage::SuppressionPreflight,
+            suppression_preflight_elapsed,
+        ),
+        report_timing,
+    ];
+    let complete_total_elapsed_ms = complete_stage_timings.iter().fold(0_u64, |total, timing| {
+        total.saturating_add(timing.elapsed_ms())
+    });
+    let complete_execution = PolicyExecutionMetadata::try_new(
+        complete_total_elapsed_ms,
+        std::mem::take(&mut complete_stage_timings),
+        None,
+        None,
+        None,
+        Vec::new(),
+        Vec::new(),
+    )
+    .map_err(|error| {
+        PolicyCoordinatorError::new(format!(
+            "failed to finalize suppression preflight metadata: {error}"
+        ))
+    })?;
+    report.replace_execution(complete_execution);
+    let batch_budget = PolicyBatchBudget::default();
+    assert!(
+        report.retained_size() <= batch_budget.max_retained_report_bytes(),
+        "suppression preflight report must fit the policy report budget"
+    );
+    Ok(PolicyBatchOutcome {
+        report,
+        taint_findings: Vec::new(),
+        taint_analysis_results: Vec::new(),
+        exit_status: POLICY_EXIT_UNRELIABLE,
+        max_retained_report_bytes: batch_budget.max_retained_report_bytes(),
+        max_serialized_report_bytes: batch_budget.max_serialized_report_bytes(),
+    })
 }
 
 pub fn workspace_snapshot_deadline_outcome(
@@ -557,6 +707,49 @@ pub fn workspace_snapshot_deadline_outcome(
             PolicyStageTiming::from_duration(
                 PolicyExecutionStage::PolicySelection,
                 selection_elapsed,
+            ),
+            PolicyStageTiming::from_duration(
+                PolicyExecutionStage::WorkspaceSnapshot,
+                snapshot_elapsed,
+            ),
+        ],
+        PolicyExecutionStage::WorkspaceSnapshot,
+        selected_policy_ids,
+        Some(diagnostic),
+    )
+}
+
+/// Snapshot deadline outcome when suppression configuration completed before
+/// the wait. The report preserves that source evidence and timing while still
+/// omitting analyzer execution stages.
+pub fn workspace_snapshot_deadline_outcome_with_preflight(
+    options: &PolicyEvaluationOptions,
+    selected_policy_ids: Vec<PolicyId>,
+    selection_elapsed: Duration,
+    suppression_preflight: &PolicySuppressionPreflight,
+    suppression_preflight_elapsed: Duration,
+    snapshot_elapsed: Duration,
+) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
+    let diagnostic = report_diagnostic(
+        PolicyReportDiagnosticCode::WorkspaceSnapshotDeadlineExceeded,
+        "workspace snapshot was not ready within the request-wide time budget; retry after workspace initialization completes",
+        None,
+        None,
+        Vec::new(),
+    )?;
+    deadline_before_evaluation_outcome(
+        options,
+        PolicyBatchBudget::default(),
+        suppression_preflight.outcome().sources.clone(),
+        PolicyScopeDocumentState::NotEvaluated,
+        vec![
+            PolicyStageTiming::from_duration(
+                PolicyExecutionStage::PolicySelection,
+                selection_elapsed,
+            ),
+            PolicyStageTiming::from_duration(
+                PolicyExecutionStage::SuppressionPreflight,
+                suppression_preflight_elapsed,
             ),
             PolicyStageTiming::from_duration(
                 PolicyExecutionStage::WorkspaceSnapshot,
@@ -671,6 +864,8 @@ fn evaluate_policy_files_with_limits(
         None,
         None,
         None,
+        None,
+        None,
     )
 }
 
@@ -682,6 +877,7 @@ fn evaluate_policy_inputs_with_limits(
     batch_budget: PolicyBatchBudget,
     registry_limits: PolicyRegistryLimits,
     supplied_workspace: Option<&WorkspaceAnalyzer>,
+    supplied_flow_state: Option<&brokk_bifrost_flow::FlowWorkspaceState>,
     semantic_models: Option<PolicySemanticModelContext<'_>>,
     cancellation: Option<&CancellationToken>,
 ) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
@@ -717,7 +913,59 @@ fn evaluate_policy_inputs_with_limits(
         batch_budget,
         registry_limits,
         supplied_workspace,
+        supplied_flow_state,
         semantic_models,
+        None,
+        cancellation,
+    )
+}
+
+/// Evaluate mixed policy inputs against a caller-owned snapshot and a
+/// previously completed analyzer-free suppression preflight.
+pub fn evaluate_policy_inputs_with_analyzer_and_suppression_preflight(
+    root: impl AsRef<Path>,
+    policy_inputs: &[PolicyEvaluationInput],
+    workspace: &WorkspaceAnalyzer,
+    flow_state: &brokk_bifrost_flow::FlowWorkspaceState,
+    options: &PolicyEvaluationOptions,
+    suppression_preflight: PolicySuppressionPreflight,
+    cancellation: Option<&CancellationToken>,
+) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
+    if policy_inputs.is_empty() {
+        return Err(PolicyCoordinatorError::new(
+            "policy evaluation requires at least one policy input",
+        ));
+    }
+    let batch_budget = PolicyBatchBudget::default();
+    if policy_inputs.len() > batch_budget.max_policies() {
+        return Err(PolicyCoordinatorError::new(format!(
+            "policy evaluation accepts at most {} policy inputs",
+            batch_budget.max_policies()
+        )));
+    }
+    let (root, read_root) = open_policy_workspace_root(root.as_ref())?;
+    let mut inputs = Vec::with_capacity(policy_inputs.len());
+    for input in policy_inputs {
+        check_policy_cancellation(cancellation)?;
+        inputs.push(match input {
+            PolicyEvaluationInput::WorkspaceFile(path) => prepare_input(&read_root, path)?,
+            PolicyEvaluationInput::Embedded { identity, source } => {
+                prepare_source_input(identity.clone(), source)?
+            }
+        });
+    }
+    exclude_duplicate_policy_ids(&mut inputs)?;
+    evaluate_prepared_policy_inputs(
+        &root,
+        &read_root,
+        inputs,
+        options,
+        batch_budget,
+        PolicyRegistryLimits::default(),
+        Some(workspace),
+        Some(flow_state),
+        None,
+        Some(suppression_preflight),
         cancellation,
     )
 }
@@ -753,6 +1001,144 @@ fn pack_activation_source_path(config: Option<&WorkspacePacksConfig>) -> String 
     }
 }
 
+/// Count the workspace declarations that reach each active procedure summary
+/// through the canonical member identity. This answers reachability only: a
+/// conflicting posting counts once for every record, while the runtime still
+/// refuses to choose between disagreeing claims.
+fn procedure_summary_match_evidence(
+    analyzer: &dyn IAnalyzer,
+    active: &ResolvedActiveSemanticModels,
+) -> BTreeMap<String, Vec<PolicyPackProcedureSummaryEvidence>> {
+    let mut counts = BTreeMap::<(String, String), u64>::new();
+    let mut target_members = HashSet::new();
+    let mut summaries_by_key = HashMap::<ModeledProcedureKey, Vec<(String, String)>>::new();
+    for shard in active.shards() {
+        if let Some(summaries) = shard.shard.payload().procedure_summaries() {
+            for summary in summaries {
+                if let Some((owner, member)) = split_qualified_member(&summary.target.symbol) {
+                    target_members.insert((owner.to_owned(), member.to_owned()));
+                    summaries_by_key
+                        .entry(ModeledProcedureKey {
+                            language: shard.manifest.language.clone(),
+                            owner: owner.to_owned(),
+                            member: member.to_owned(),
+                            has_receiver: summary.target.has_receiver,
+                            parameter_count: summary.target.parameter_count,
+                        })
+                        .or_default()
+                        .push((shard.manifest.content_sha256.clone(), summary.id.clone()));
+                }
+                counts.insert(
+                    (shard.manifest.content_sha256.clone(), summary.id.clone()),
+                    0,
+                );
+            }
+        }
+    }
+    for unit in analyzer.all_declarations().filter(|unit| {
+        split_qualified_member(&unit.fq_name()).is_some_and(|(owner, member)| {
+            target_members.contains(&(owner.to_owned(), member.to_owned()))
+        })
+    }) {
+        let Some(key) = modeled_procedure_key_for_unit(analyzer, &unit) else {
+            continue;
+        };
+        let Some(summaries) = summaries_by_key.get(&key) else {
+            continue;
+        };
+        for summary in summaries {
+            let count = counts
+                .get_mut(summary)
+                .expect("every active summary target was initialized");
+            *count = count.saturating_add(1);
+        }
+    }
+
+    let mut evidence = BTreeMap::<String, Vec<PolicyPackProcedureSummaryEvidence>>::new();
+    for shard in active.shards() {
+        let Some(summaries) = shard.shard.payload().procedure_summaries() else {
+            continue;
+        };
+        let entries = evidence
+            .entry(shard.manifest.content_sha256.clone())
+            .or_default();
+        for summary in summaries {
+            let match_count = counts
+                .get(&(shard.manifest.content_sha256.clone(), summary.id.clone()))
+                .copied()
+                .unwrap_or(0);
+            entries.push(PolicyPackProcedureSummaryEvidence::new(
+                summary.id.clone(),
+                summary.target.symbol.clone(),
+                match_count,
+            ));
+        }
+    }
+    evidence
+}
+
+/// Warn when an active, reviewed workspace model publishes a procedure
+/// summary that reaches no workspace declaration. Installed or optional
+/// dependency packs are intentionally excluded: this diagnostic is for an
+/// author who opted a checked-in model into the current workspace.
+fn active_workspace_model_zero_match_diagnostics(
+    activation: Option<&WorkspacePacksActivation>,
+    summary_evidence: Option<&BTreeMap<String, Vec<PolicyPackProcedureSummaryEvidence>>>,
+) -> Result<Vec<PolicyReportDiagnostic>, PolicyCoordinatorError> {
+    let Some(activation) = activation else {
+        return Ok(Vec::new());
+    };
+    let Some(summary_evidence) = summary_evidence else {
+        return Ok(Vec::new());
+    };
+    let Some(runtime) = activation.outcome.runtime.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let active = match runtime {
+        SemanticModelRuntimeOutcome::Ready { active, .. } => active,
+        SemanticModelRuntimeOutcome::Incomplete { usable, .. } => {
+            let Some(active) = usable else {
+                return Ok(Vec::new());
+            };
+            active
+        }
+        SemanticModelRuntimeOutcome::Cancelled(_) | SemanticModelRuntimeOutcome::Unavailable(_) => {
+            return Ok(Vec::new());
+        }
+    };
+    let mut diagnostics = Vec::new();
+    for model in &activation.workspace_models {
+        let Some(entries) = summary_evidence.get(&model.manifest_digest) else {
+            continue;
+        };
+        let Some(shard) = active
+            .shards()
+            .iter()
+            .find(|shard| shard.manifest.content_sha256 == model.manifest_digest)
+        else {
+            continue;
+        };
+        if shard.source_kind != CatalogPackSourceKind::EphemeralWorkspace {
+            continue;
+        }
+        for entry in entries {
+            if entry.match_count() != 0 {
+                continue;
+            }
+            diagnostics.push(workspace_model_warning(
+                format!(
+                    "the active reviewed workspace semantic model `{}` summary `{}` targeting `{}` matched zero workspace procedures",
+                    model.path,
+                    entry.summary_id(),
+                    entry.symbol(),
+                ),
+                Some(PolicySourceIdentity::new(&model.path)),
+            )?);
+        }
+    }
+    Ok(diagnostics)
+}
+
 /// Project one workspace activation transaction into the report's
 /// pack-activation review (#1868, #1884, #2493).
 ///
@@ -763,6 +1149,7 @@ fn pack_activation_source_path(config: Option<&WorkspacePacksConfig>) -> String 
 fn pack_activation_review(
     config: Option<&WorkspacePacksConfig>,
     activation: Option<&WorkspacePacksActivation>,
+    summary_evidence: Option<&BTreeMap<String, Vec<PolicyPackProcedureSummaryEvidence>>>,
 ) -> PolicyPackActivationReview {
     let Some(activation) = activation else {
         return PolicyPackActivationReview::new(
@@ -817,12 +1204,12 @@ fn pack_activation_review(
     }
     match &activation.outcome.runtime {
         Some(SemanticModelRuntimeOutcome::Ready { active, .. }) => {
-            record_active_shards(&mut decisions, active.shards());
+            record_active_shards(&mut decisions, active.shards(), summary_evidence);
             record_explanations(&mut decisions, &active.activation_report().explanations);
         }
         Some(SemanticModelRuntimeOutcome::Incomplete { usable, report }) => {
             if let Some(active) = usable {
-                record_active_shards(&mut decisions, active.shards());
+                record_active_shards(&mut decisions, active.shards(), summary_evidence);
             }
             record_explanations(&mut decisions, &report.explanations);
         }
@@ -967,13 +1354,20 @@ fn workspace_model_warning(
 fn record_active_shards(
     decisions: &mut Vec<PolicyPackDecision>,
     shards: &[ActiveSemanticModelShard],
+    summary_evidence: Option<&BTreeMap<String, Vec<PolicyPackProcedureSummaryEvidence>>>,
 ) {
     for shard in shards {
-        decisions.push(PolicyPackDecision::new(
+        let mut decision = PolicyPackDecision::new(
             format!("{}@{}", shard.manifest.pack_id, shard.manifest.version),
             PolicyPackDecisionStatus::Selected,
             None,
-        ));
+        );
+        if let Some(evidence) =
+            summary_evidence.and_then(|evidence| evidence.get(&shard.manifest.content_sha256))
+        {
+            decision = decision.with_summary_matches(evidence.clone());
+        }
+        decisions.push(decision);
     }
 }
 
@@ -1009,7 +1403,9 @@ fn evaluate_prepared_policy_inputs(
     batch_budget: PolicyBatchBudget,
     registry_limits: PolicyRegistryLimits,
     supplied_workspace: Option<&WorkspaceAnalyzer>,
+    supplied_flow_state: Option<&brokk_bifrost_flow::FlowWorkspaceState>,
     semantic_models: Option<PolicySemanticModelContext<'_>>,
+    suppression_preflight: Option<PolicySuppressionPreflight>,
     cancellation: Option<&CancellationToken>,
 ) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
     let registration_started = Instant::now();
@@ -1058,7 +1454,10 @@ fn evaluate_prepared_policy_inputs(
         );
     }
     let mut secondary_diagnostics = Vec::new();
-    let suppression_load = load_policy_suppressions_from_root(read_root, options.suppressions());
+    let suppression_load = suppression_preflight.map_or_else(
+        || load_policy_suppressions_from_root(read_root, options.suppressions()),
+        PolicySuppressionPreflight::into_outcome,
+    );
     for failure in &suppression_load.failures {
         secondary_diagnostics.push(report_diagnostic(
             PolicyReportDiagnosticCode::SuppressionLoadFailed,
@@ -1309,6 +1708,12 @@ fn evaluate_prepared_policy_inputs(
 
     let mut runs = HashMap::with_capacity(runnable_ids.len());
     let workspace = supplied_workspace.or(owned_analyzer.as_ref());
+    let owned_flow_state = supplied_flow_state
+        .is_none()
+        .then(brokk_bifrost_flow::FlowWorkspaceState::new);
+    let flow_state = supplied_flow_state
+        .or(owned_flow_state.as_ref())
+        .expect("every policy evaluation owns reusable flow state");
     // A policy subject scan is Theta(workspace facts), so the scan lanes must
     // follow the audited workspace (#1771).  Scaling is a per-lane max, so an
     // explicitly widened caller budget survives and an explicitly narrowed one
@@ -1360,11 +1765,25 @@ fn evaluate_prepared_policy_inputs(
         }
         None => None,
     };
+    let summary_evidence = workspace.and_then(|workspace| {
+        let activation = workspace_activation.as_ref()?.as_ref()?;
+        let active = match activation.outcome.runtime.as_ref()? {
+            SemanticModelRuntimeOutcome::Ready { active, .. } => Some(active),
+            SemanticModelRuntimeOutcome::Incomplete { usable, .. } => usable.as_ref(),
+            SemanticModelRuntimeOutcome::Cancelled(_)
+            | SemanticModelRuntimeOutcome::Unavailable(_) => None,
+        }?;
+        Some(procedure_summary_match_evidence(
+            workspace.analyzer(),
+            active,
+        ))
+    });
     let packs_review = match workspace_activation.as_ref() {
         // The transaction ran and has something to audit.
         Some(Some(activation)) => Some(pack_activation_review(
             packs_config.as_ref(),
             Some(activation),
+            summary_evidence.as_ref(),
         )),
         // The transaction ran and neither route contributed. A document still
         // earns a review row so its opt-in stays auditable; a run with no
@@ -1372,7 +1791,7 @@ fn evaluate_prepared_policy_inputs(
         // shape and attaches nothing.
         Some(None) => packs_config
             .as_ref()
-            .map(|config| pack_activation_review(Some(config), None)),
+            .map(|config| pack_activation_review(Some(config), None, None)),
         // No coordinator-owned analyzer, or the transaction failed and already
         // reported why.
         None => None,
@@ -1386,6 +1805,14 @@ fn evaluate_prepared_policy_inputs(
         workspace_activation
             .as_ref()
             .and_then(|activation| activation.as_ref()),
+    )? {
+        secondary_diagnostics.push(diagnostic);
+    }
+    for diagnostic in active_workspace_model_zero_match_diagnostics(
+        workspace_activation
+            .as_ref()
+            .and_then(|activation| activation.as_ref()),
+        summary_evidence.as_ref(),
     )? {
         secondary_diagnostics.push(diagnostic);
     }
@@ -1493,6 +1920,7 @@ fn evaluate_prepared_policy_inputs(
                 ))
             })?,
             workspace,
+            flow_state,
             cancellation,
             cvss_overlays: &[],
             organizational_risk: &[],
@@ -1995,6 +2423,7 @@ fn evaluate_policy_diff_baseline(
         batch_budget,
         registry_limits,
         Some(&base_workspace),
+        None,
         None,
         cancellation,
     )?;
@@ -3514,6 +3943,7 @@ mod tests {
             PolicySourceIdentity::new("policies/live.rqlp"),
             &live_source,
             &analyzer,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
             &evaluation_options(),
             None,
         )
@@ -3562,6 +3992,7 @@ mod tests {
             PolicySourceIdentity::new("policies/input.rqlp"),
             endpoint,
             &analyzer,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
             &evaluation_options(),
             None,
         )
@@ -3600,6 +4031,7 @@ mod tests {
             PolicySourceIdentity::new("policies/live.rqlp"),
             &match_policy("test.cancelled", "Cancelled"),
             &analyzer,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
             &evaluation_options(),
             Some(&cancellation),
         );
@@ -3626,6 +4058,7 @@ mod tests {
             PolicySourceIdentity::new("policies/live.rqlp"),
             &match_policy("test.timed-out", "Timed out"),
             &analyzer,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
             &evaluation_options(),
             Some(&cancellation),
         )
@@ -3668,6 +4101,7 @@ mod tests {
             PolicySourceIdentity::new("policies/live.rqlp"),
             &match_policy("test.registration-timeout", "Registration timeout"),
             &analyzer,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
             &evaluation_options(),
             Some(&cancellation),
         )
@@ -3778,6 +4212,7 @@ mod tests {
             PolicySourceIdentity::new("policies/live.rqlp"),
             &match_policy("test.deadline-race", "Deadline race"),
             &analyzer,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
             &evaluation_options(),
             Some(&cancellation),
         )

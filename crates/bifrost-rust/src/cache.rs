@@ -188,6 +188,7 @@ fn weight_import_edge(edge: &crate::usage::RustImportEdge) -> usize {
         + edge.target_file.rel_path().to_string_lossy().len()
         + edge.importer_module.weight_bytes()
         + edge.target_module.weight_bytes()
+        + edge.source_path.iter().map(String::len).sum::<usize>()
         + edge.local_name.len()
         + edge.domain.weight_bytes()
         + size_of::<crate::usage::RustImportEdge>()

@@ -20,6 +20,7 @@ use crate::analyzer::usages::php_graph::{
     PhpAnalyzerFacts, php_dynamic_type_keyword, php_graph_source, resolve_php_type_arms,
 };
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
+use brokk_bifrost_php::graph::PhpCallableFacts;
 use brokk_bifrost_php::graph_support::{
     php_direct_declared_class_parent, php_file_context_from_source, php_is_interface,
 };
@@ -2588,7 +2589,7 @@ fn php_declared_unit_type(
     if let Some(session) = session {
         return php_declared_unit_type_bounded(php, support, unit, session);
     }
-    let facts = PhpAnalyzerFacts(analyzer);
+    let facts = PhpAnalyzerFacts::new(analyzer);
     declared_type_of(php, php_graph_source(analyzer, &facts), unit)
 }
 
@@ -2886,8 +2887,8 @@ fn php_declared_callable_return_type_fqn(
         }
         return php_declared_unit_type_fqn_bounded(php, support, &callable, session);
     }
-    if let Some(return_type) = php.usage_facts_index().callable_return_type(callable_fqn) {
-        return Some(return_type.to_string());
+    if let Some(return_type) = PhpAnalyzerFacts::new(php).callable_return_type_fqn(callable_fqn) {
+        return Some(return_type);
     }
     let mut definitions = support
         .fqn(callable_fqn)
@@ -2897,7 +2898,7 @@ fn php_declared_callable_return_type_fqn(
     if definitions.next().is_some() {
         return None;
     }
-    let facts = PhpAnalyzerFacts(php);
+    let facts = PhpAnalyzerFacts::new(php);
     declared_callable_return_type_fq_name(php, php_graph_source(php, &facts), &callable)
 }
 
@@ -2911,17 +2912,14 @@ fn php_callable_return_type_fqn(
     if let Some(session) = session {
         return php_declared_unit_type_fqn_bounded(php, support, callable, session);
     }
-    if let Some(return_type) = analyzer
-        .usage_facts_index()
-        .fact_for_declaration(callable)
-        .and_then(|facts| facts.return_type_fqn.as_deref())
+    if let Some(return_type) = PhpAnalyzerFacts::new(analyzer).declaration_return_type_fqn(callable)
     {
-        return Some(return_type.to_string());
+        return Some(return_type);
     }
     session
         .is_none()
         .then(|| {
-            let facts = PhpAnalyzerFacts(analyzer);
+            let facts = PhpAnalyzerFacts::new(analyzer);
             declared_callable_return_type_fq_name(php, php_graph_source(analyzer, &facts), callable)
         })
         .flatten()
@@ -2937,17 +2935,13 @@ fn php_field_type_fqn(
     if let Some(session) = session {
         return php_declared_unit_type_fqn_bounded(php, support, field, session);
     }
-    if let Some(field_type) = analyzer
-        .usage_facts_index()
-        .fact_for_declaration(field)
-        .and_then(|facts| facts.return_type_fqn.as_deref())
-    {
-        return Some(field_type.to_string());
+    if let Some(field_type) = PhpAnalyzerFacts::new(analyzer).declaration_return_type_fqn(field) {
+        return Some(field_type);
     }
     session
         .is_none()
         .then(|| {
-            let facts = PhpAnalyzerFacts(analyzer);
+            let facts = PhpAnalyzerFacts::new(analyzer);
             declared_field_type_fq_name(php, php_graph_source(analyzer, &facts), field)
         })
         .flatten()

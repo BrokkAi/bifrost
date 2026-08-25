@@ -60,6 +60,7 @@ dense_ids! {
     SourceMappingId,
     EvidenceId,
     SemanticGapId,
+    GuardId,
 }
 
 /// One stable SHA-256 digest. Domain-specific wrappers prevent accidental key mixing.
@@ -146,7 +147,12 @@ impl WorkspaceMountId {
 pub const SEMANTIC_IR_SCHEMA_DOMAIN: &[u8] = b"bifrost-language-neutral-semantic-ir";
 
 /// Current language-neutral semantic IR schema revision.
-pub const SEMANTIC_IR_SCHEMA_VERSION: u32 = 7;
+///
+/// Revision 8 adds the `guard_facts` table (issue #2443 slice 2). Every cached
+/// semantic artifact and every wire id derived from one rotates exactly once
+/// when this constant moves; that is a mechanical consequence of adding a
+/// table, not a signal that anything else changed.
+pub const SEMANTIC_IR_SCHEMA_VERSION: u32 = 8;
 
 impl SemanticIrVersion {
     /// The contract-owned fingerprint shared by every language adapter that
@@ -772,6 +778,37 @@ impl SemanticLocator {
     pub const fn anchor(&self) -> SourceAnchor {
         self.anchor
     }
+
+    /// Push this locator's stable segments into a domain-separated digest.
+    ///
+    /// This is the sanctioned encoding of a locator inside an identity.
+    /// `Debug` output is not a stability contract: it changes with any derive
+    /// or field change, so a Debug-rendered locator inside a cache or batching
+    /// identity silently splits or merges classes that must stay equal.
+    ///
+    /// The absolute mount is deliberately excluded, the same way
+    /// [`SemanticArtifactKey::public_fingerprint`] excludes it, so the encoding
+    /// is checkout-independent. Anonymous segments are tagged rather than
+    /// rendered as an empty name, so an anonymous declaration cannot collide
+    /// with one whose name is the empty string.
+    pub fn push_stable_identity(&self, digest: &mut LengthDelimitedDigest) {
+        digest.push(self.path.as_str().as_bytes());
+        digest.push(self.language.stable_label().as_bytes());
+        digest.push(self.role.stable_label().as_bytes());
+        digest.push_anchor(self.anchor);
+        for segment in self.declaration.segments() {
+            digest.push(segment.kind().stable_label().as_bytes());
+            match segment.name() {
+                Some(name) => {
+                    digest.push(b"named");
+                    digest.push(name.as_bytes());
+                }
+                None => digest.push(b"anonymous"),
+            }
+            digest.push_anchor(segment.anchor());
+            digest.push(&segment.sibling_ordinal().to_le_bytes());
+        }
+    }
 }
 
 /// The complete validity identity for one mounted immutable semantic artifact.
@@ -875,7 +912,7 @@ impl SemanticArtifactKey {
     /// workspace-relative path, exact content, adapter semantics, IR version,
     /// configuration, and dependency identity still scope the result to the
     /// semantic inputs that can change its meaning.
-    pub(crate) fn public_fingerprint(&self) -> StableDigest {
+    pub fn public_fingerprint(&self) -> StableDigest {
         let mut digest = LengthDelimitedDigest::new(b"bifrost-semantic-public-artifact-key-v1");
         digest.push(self.path.as_str().as_bytes());
         digest.push(self.language.stable_label().as_bytes());
@@ -1072,10 +1109,10 @@ mod tests {
         let current = SemanticIrVersion::current();
         assert_eq!(
             current.to_string(),
-            "7f96f4780ba177f858826b1fd5c459f17b6d92397fa763a516fa3c5780630722"
+            "98e9be05ec247dfaff97c75a9917a01017d1b9ec4dde224c548b1dba9788b05e"
         );
         assert_ne!(current.as_bytes(), &[0_u8; 32]);
-        assert_eq!(SEMANTIC_IR_SCHEMA_VERSION, 7);
+        assert_eq!(SEMANTIC_IR_SCHEMA_VERSION, 8);
     }
 
     fn digest(label: &str) -> StableDigest {

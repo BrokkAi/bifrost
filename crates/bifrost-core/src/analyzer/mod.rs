@@ -34,9 +34,16 @@ pub mod tree_walk;
 pub mod type_relations;
 pub mod usages;
 pub mod weighted_cache;
+pub mod work_budget;
 
 pub use code_unit_index::{CodeUnitIndex, default_parent_fq_name};
-pub use definition_lookup::{BoundedDefinitionLookup, DefinitionLookupAccess};
+pub use definition_lookup::{
+    BoundedDefinitionLookup, DefinitionLanguageScope, DefinitionLookupAccess, PackageRelationKind,
+    PackageRelationValue, RelationalBatchError, RelationalBatchOutcome, RelationalCallableFact,
+    RelationalDefinitionFrontier, RelationalDefinitionLookup, RelationalDefinitionQuery,
+    RelationalDefinitionQuestion, RelationalDefinitionRequest, RelationalDefinitionResult,
+    RelationalDefinitionValue, RelationalFrontierOutcome, RelationalName, RelationalPointOutcome,
+};
 pub use model::{
     CodeUnit, Language, PackageAnchor, ProjectFile, Range, SemanticAbsenceProof,
     SemanticDiagnostic, SemanticDiagnosticDomain, SemanticDiagnosticIncompleteReason,

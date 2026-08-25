@@ -139,6 +139,72 @@ pub(super) fn callable_shape<'tree>(
     ))
 }
 
+/// Whether `node` (an Initializer-kind fragment's own syntax node, as
+/// matched by [`callable_shape`]: a `static_initializer`, an instance
+/// initializer `block`, or a field/constant `variable_declarator` that has
+/// a `value`) is provably the only member of its class's static-or-instance
+/// initializer scheduling group.
+///
+/// JLS 12.4.2 (the class initializer, `<clinit>`) and 12.5 (instance
+/// initialization, folded into `<init>`) each compose every field
+/// initializer and initializer block that shares one class body and one
+/// staticness into a single ordered sequence: a fragment's own value can
+/// depend on what an earlier sibling in that same sequence assigned. When a
+/// group has exactly one member, there is nothing to compose it with -- its
+/// value is exactly what that one fragment computes, independent of source
+/// order. This is a purely structural count over the enclosing `class_body`'s
+/// direct children; it does not require the lone member to be side-effect
+/// free or acyclic, only that no sibling exists in its own group to
+/// interleave with.
+///
+/// Returns `false` (conservative: the caller keeps the gap) when `node`'s
+/// container is not a plain `class_body` -- an interface, enum, or
+/// annotation body is not counted rather than guessed at.
+pub(super) fn is_sole_initializer_fragment(node: Node<'_>, is_static: bool) -> bool {
+    let Some(container) = enclosing_initializer_container(node) else {
+        return false;
+    };
+    let mut fragments = 0usize;
+    for child in named_children(container) {
+        fragments += match child.kind() {
+            "static_initializer" if is_static => 1,
+            "block" if !is_static => 1,
+            "field_declaration" | "constant_declaration" => {
+                let field_static =
+                    child.kind() == "constant_declaration" || has_modifier(child, "static");
+                if field_static == is_static {
+                    named_children(child)
+                        .into_iter()
+                        .filter(|declarator| {
+                            declarator.kind() == "variable_declarator"
+                                && declarator.child_by_field_name("value").is_some()
+                        })
+                        .count()
+                } else {
+                    0
+                }
+            }
+            _ => 0,
+        };
+        if fragments > 1 {
+            return false;
+        }
+    }
+    fragments == 1
+}
+
+/// The `class_body` that directly owns `node`'s initializer fragment. `None`
+/// when the immediate container is not a plain `class_body` -- for example
+/// an interface, enum, or annotation body, which use a different node kind
+/// and are outside this helper's scope.
+fn enclosing_initializer_container(node: Node<'_>) -> Option<Node<'_>> {
+    let mut current = node.parent()?;
+    if matches!(current.kind(), "field_declaration" | "constant_declaration") {
+        current = current.parent()?;
+    }
+    (current.kind() == "class_body").then_some(current)
+}
+
 fn enclosing_type_is_final(node: Node<'_>) -> bool {
     let mut current = node.parent();
     while let Some(parent) = current {
@@ -150,7 +216,7 @@ fn enclosing_type_is_final(node: Node<'_>) -> bool {
     false
 }
 
-fn has_modifier(node: Node<'_>, modifier: &str) -> bool {
+pub(super) fn has_modifier(node: Node<'_>, modifier: &str) -> bool {
     node.child_by_field_name("modifiers")
         .or_else(|| {
             named_children(node)

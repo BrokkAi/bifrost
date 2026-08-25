@@ -19,6 +19,8 @@
 
 use smallvec::SmallVec;
 use std::borrow::Cow;
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock};
 
 use crate::analyzer::Language;
@@ -126,14 +128,8 @@ impl SegmentKind {
         SegmentKind::Unknown,
     ];
 
-    /// Stable on-disk tag for the cache's `code_units.fq_segments` blob. These
-    /// numbers are a persistence contract: never renumber an existing variant
-    /// (append new ones), or previously-cached rows would decode to the wrong
-    /// kind. The analysis-epoch salt (`src/analyzer/store/epoch.rs`) guards
-    /// against a format change slipping past by forcing re-extraction, but the
-    /// tags themselves must stay stable so a mixed-vintage cache never
-    /// misinterprets a byte.
-    pub(crate) const fn persist_tag(self) -> u8 {
+    /// Compact discriminant mixed into the segment interner's shard hash.
+    pub(crate) const fn hash_tag(self) -> u8 {
         match self {
             SegmentKind::Path => 0,
             SegmentKind::Package => 1,
@@ -158,20 +154,6 @@ impl SegmentKind {
             SegmentKind::Nested => "Nested",
             SegmentKind::Member => "Member",
             SegmentKind::Unknown => "Unknown",
-        }
-    }
-
-    /// Inverse of [`Self::persist_tag`]; `None` for an unrecognized tag byte.
-    pub(crate) const fn from_persist_tag(tag: u8) -> Option<SegmentKind> {
-        match tag {
-            0 => Some(SegmentKind::Path),
-            1 => Some(SegmentKind::Package),
-            2 => Some(SegmentKind::Type),
-            3 => Some(SegmentKind::Companion),
-            4 => Some(SegmentKind::Nested),
-            5 => Some(SegmentKind::Member),
-            6 => Some(SegmentKind::Unknown),
-            _ => None,
         }
     }
 }
@@ -241,54 +223,21 @@ impl FqName {
         &self.segments
     }
 
-    /// Serialize to the compact, self-describing byte blob persisted in the
-    /// cache's `code_units.fq_segments` column. Interner IDs are process-local
-    /// and are NEVER written; each segment's `(text, kind)` pair is resolved
-    /// through `interner` and encoded as a one-byte kind tag, a little-endian
-    /// `u32` text length, then the UTF-8 text. Segment text is free-form (it can
-    /// contain `.`, `::`, `$`, `#`), so the explicit length prefix keeps decode
-    /// unambiguous with zero escaping. An empty `FqName` encodes to an empty
-    /// `Vec` (persisted as SQL NULL). See `FqName::decode_segments` for the
-    /// inverse and `migrations/cache/0012-fq-segments.sql` for the column.
-    pub fn encode_segments(&self, interner: &SegmentInterner) -> Vec<u8> {
-        let mut out = Vec::new();
-        for &id in &self.segments {
-            let (text, kind) = interner.resolve(id);
-            out.push(kind.persist_tag());
-            out.extend_from_slice(&(text.len() as u32).to_le_bytes());
-            out.extend_from_slice(text.as_bytes());
-        }
-        out
-    }
-
-    /// Re-intern the segments encoded by [`Self::encode_segments`] into a fresh
-    /// `FqName` bound to this process's interner (IDs differ every run, so the
-    /// text+kind are re-interned rather than trusted from disk). An empty slice
-    /// yields an empty `FqName`. Returns an error string on a malformed blob.
-    pub fn decode_segments(bytes: &[u8], interner: &SegmentInterner) -> Result<FqName, String> {
-        let mut fq = FqName::new();
-        let mut offset = 0usize;
-        while offset < bytes.len() {
-            let tag = bytes[offset];
-            offset += 1;
-            let kind = SegmentKind::from_persist_tag(tag)
-                .ok_or_else(|| format!("unknown fq segment kind tag {tag}"))?;
-            let len_end = offset
-                .checked_add(4)
-                .filter(|end| *end <= bytes.len())
-                .ok_or_else(|| "truncated fq segment length prefix".to_string())?;
-            let len = u32::from_le_bytes(bytes[offset..len_end].try_into().unwrap()) as usize;
-            offset = len_end;
-            let text_end = offset
-                .checked_add(len)
-                .filter(|end| *end <= bytes.len())
-                .ok_or_else(|| "truncated fq segment text".to_string())?;
-            let text = std::str::from_utf8(&bytes[offset..text_end])
-                .map_err(|err| format!("invalid utf8 in fq segment text: {err}"))?;
-            offset = text_end;
-            fq.push(interner.intern(text, kind));
-        }
-        Ok(fq)
+    /// Whether two names carry the same component text in the same order,
+    /// independent of each component's semantic kind.
+    ///
+    /// Source paths can be structurally segmented before resolution knows
+    /// whether an intermediate component denotes a package or nested type.
+    /// Such a path uses `Unknown` kinds for lookup and applies this comparison
+    /// to bounded identifier candidates; it never parses a rendered name.
+    pub fn same_segment_texts(&self, other: &Self) -> bool {
+        let interner = segment_interner();
+        self.len() == other.len()
+            && self
+                .segments
+                .iter()
+                .zip(&other.segments)
+                .all(|(&left, &right)| interner.resolve(left).0 == interner.resolve(right).0)
     }
 
     /// Append every segment of `tail` after this name's segments.
@@ -538,6 +487,26 @@ type Entry = (&'static str, SegmentKind);
 /// allocated on demand and never moved.
 type EntryChunks = [OnceLock<Box<[OnceLock<Entry>]>>; ENTRY_CHUNK_COUNT];
 
+const RECENT_INTERN_SLOTS: usize = 256;
+
+#[derive(Clone, Copy)]
+struct RecentIntern {
+    interner_identity: u64,
+    text: &'static str,
+    kind: SegmentKind,
+    id: SegmentId,
+}
+
+thread_local! {
+    /// A fixed direct-mapped hot set of already-published segment IDs.
+    ///
+    /// This is independent of workspace vocabulary size. A miss still consults
+    /// the authoritative process interner, while repeated hits avoid contending
+    /// on its shard locks.
+    static RECENT_INTERNS: RefCell<[Option<RecentIntern>; RECENT_INTERN_SLOTS]> =
+        const { RefCell::new([None; RECENT_INTERN_SLOTS]) };
+}
+
 /// The chunk and in-chunk offset holding a shard's `local`th entry. Chunk `c`
 /// holds `FIRST_ENTRY_CHUNK_LEN << c` entries starting at
 /// `FIRST_ENTRY_CHUNK_LEN * ((1 << c) - 1)`.
@@ -570,6 +539,7 @@ struct Shard {
 /// on every thread that touches a name (issue #1928 measured 6.55% of a
 /// chromium probe phase inside it).
 pub struct SegmentInterner {
+    identity: u64,
     shards: [RwLock<Shard>; SHARD_COUNT],
     /// Per-shard entry table. Written only under the shard's write lock; read
     /// without any lock. `OnceLock` is what makes that safe: a chunk is
@@ -581,7 +551,11 @@ pub struct SegmentInterner {
 
 impl SegmentInterner {
     fn new() -> Self {
+        static NEXT_IDENTITY: AtomicU64 = AtomicU64::new(1);
+        let identity = NEXT_IDENTITY.fetch_add(1, Ordering::Relaxed);
+        assert_ne!(identity, 0, "segment interner identity space exhausted");
         SegmentInterner {
+            identity,
             shards: std::array::from_fn(|_| {
                 RwLock::new(Shard {
                     by_text: HashMap::default(),
@@ -592,11 +566,43 @@ impl SegmentInterner {
         }
     }
 
-    fn shard_of(text: &str) -> usize {
+    fn text_hash(text: &str) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = rustc_hash::FxHasher::default();
         text.hash(&mut hasher);
-        (hasher.finish() as usize) % SHARD_COUNT
+        hasher.finish()
+    }
+
+    fn shard_of_hash(hash: u64) -> usize {
+        (hash as usize) % SHARD_COUNT
+    }
+
+    fn recent_slot(hash: u64, kind: SegmentKind) -> usize {
+        debug_assert!(RECENT_INTERN_SLOTS.is_power_of_two());
+        let mixed = hash ^ (u64::from(kind.hash_tag()).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        (mixed as usize) & (RECENT_INTERN_SLOTS - 1)
+    }
+
+    fn recent(&self, slot: usize, text: &str, kind: SegmentKind) -> Option<SegmentId> {
+        RECENT_INTERNS.with(|recent| {
+            recent.borrow()[slot].and_then(|entry| {
+                (entry.interner_identity == self.identity
+                    && entry.kind == kind
+                    && entry.text == text)
+                    .then_some(entry.id)
+            })
+        })
+    }
+
+    fn remember(&self, slot: usize, id: SegmentId) {
+        let (text, kind) = self.resolve(id);
+        let entry = RecentIntern {
+            interner_identity: self.identity,
+            text,
+            kind,
+            id,
+        };
+        RECENT_INTERNS.with(|recent| recent.borrow_mut()[slot] = Some(entry));
     }
 
     fn encode(shard: usize, local: usize) -> SegmentId {
@@ -611,13 +617,19 @@ impl SegmentInterner {
     pub fn intern(&self, text: &str, kind: SegmentKind) -> SegmentId {
         #[cfg(any(test, feature = "test-support"))]
         counters::record_intern();
-        let shard_idx = Self::shard_of(text);
+        let hash = Self::text_hash(text);
+        let shard_idx = Self::shard_of_hash(hash);
+        let recent_slot = Self::recent_slot(hash, kind);
+        if let Some(id) = self.recent(recent_slot, text, kind) {
+            return id;
+        }
         // Fast path: an existing entry can be found under a read lock.
         {
             let shard = self.shards[shard_idx].read().unwrap();
             if let Some(slots) = shard.by_text.get(text) {
                 for &(entry_kind, id) in slots {
                     if entry_kind == kind {
+                        self.remember(recent_slot, id);
                         return id;
                     }
                 }
@@ -628,6 +640,7 @@ impl SegmentInterner {
         if let Some(slots) = shard.by_text.get(text) {
             for &(entry_kind, id) in slots {
                 if entry_kind == kind {
+                    self.remember(recent_slot, id);
                     return id;
                 }
             }
@@ -650,10 +663,11 @@ impl SegmentInterner {
             .entry(text.to_owned())
             .or_default()
             .push((kind, id));
+        self.remember(recent_slot, id);
         id
     }
 
-    pub fn resolve(&self, id: SegmentId) -> (&str, SegmentKind) {
+    pub fn resolve(&self, id: SegmentId) -> (&'static str, SegmentKind) {
         #[cfg(any(test, feature = "test-support"))]
         counters::record_resolve();
         let shard_idx = (id.0 as usize) % SHARD_COUNT;
@@ -803,6 +817,81 @@ mod tests {
 
         assert_eq!(interner.resolve(a), ("foo", SegmentKind::Member));
         assert_eq!(interner.resolve(c), ("foo", SegmentKind::Type));
+    }
+
+    #[test]
+    fn recent_interns_preserve_interner_kind_and_collision_identity() {
+        let first = SegmentInterner::new();
+        let second = SegmentInterner::new();
+        let unknown = first.intern("same", SegmentKind::Unknown);
+
+        let second_unknown = second.intern("same", SegmentKind::Unknown);
+        let second_package = second.intern("same", SegmentKind::Package);
+        assert_eq!(
+            second.resolve(second_unknown),
+            ("same", SegmentKind::Unknown)
+        );
+        assert_eq!(
+            second.resolve(second_package),
+            ("same", SegmentKind::Package)
+        );
+        assert_ne!(second_unknown, second_package);
+
+        let slot =
+            SegmentInterner::recent_slot(SegmentInterner::text_hash("same"), SegmentKind::Unknown);
+        let collision = (0usize..)
+            .map(|index| format!("collision-{index}"))
+            .find(|candidate| {
+                SegmentInterner::recent_slot(
+                    SegmentInterner::text_hash(candidate),
+                    SegmentKind::Unknown,
+                ) == slot
+            })
+            .expect("a string maps to the same finite recent slot");
+        first.intern(&collision, SegmentKind::Unknown);
+        assert_eq!(
+            first.intern("same", SegmentKind::Unknown),
+            unknown,
+            "eviction from the recent set must fall back to the authoritative interner"
+        );
+    }
+
+    #[test]
+    fn segment_text_comparison_ignores_kinds_but_preserves_structure() {
+        let interner = segment_interner();
+        let resolved = fq(
+            interner,
+            &[
+                ("outer", SegmentKind::Package),
+                ("Widget", SegmentKind::Type),
+            ],
+        );
+        let unresolved = fq(
+            interner,
+            &[
+                ("outer", SegmentKind::Unknown),
+                ("Widget", SegmentKind::Unknown),
+            ],
+        );
+        let different_component = fq(
+            interner,
+            &[
+                ("other", SegmentKind::Unknown),
+                ("Widget", SegmentKind::Unknown),
+            ],
+        );
+        let extra_component = fq(
+            interner,
+            &[
+                ("root", SegmentKind::Unknown),
+                ("outer", SegmentKind::Unknown),
+                ("Widget", SegmentKind::Unknown),
+            ],
+        );
+
+        assert!(resolved.same_segment_texts(&unresolved));
+        assert!(!resolved.same_segment_texts(&different_component));
+        assert!(!resolved.same_segment_texts(&extra_component));
     }
 
     #[test]
@@ -1027,72 +1116,6 @@ mod tests {
             }
         }
         assert_eq!(rendered, vec!["a.B.c", "a.B", "a"]);
-    }
-
-    #[test]
-    fn encode_decode_round_trips_kind_and_text() {
-        // Every SegmentKind, plus free-form text containing the delimiters the
-        // system used to split on (`.`, `::`, `$`, `#`), must survive the cache
-        // encode/decode with kind AND text intact. Decoding re-interns into the
-        // same interner, so the round-tripped FqName is integer-equal to the
-        // original.
-        let interner = SegmentInterner::new();
-        let name = fq(
-            &interner,
-            &[
-                ("github.com", SegmentKind::Path),
-                ("cutlass::gemm", SegmentKind::Package),
-                ("Outer", SegmentKind::Type),
-                ("Inner", SegmentKind::Nested),
-                ("Companion", SegmentKind::Companion),
-                ("r#type", SegmentKind::Member),
-                ("anything", SegmentKind::Unknown),
-            ],
-        );
-        let encoded = name.encode_segments(&interner);
-        let decoded = FqName::decode_segments(&encoded, &interner).expect("decode");
-        assert_eq!(decoded, name);
-        // Text and kind are individually preserved, not just the joined string.
-        let pairs: Vec<_> = decoded
-            .segments()
-            .iter()
-            .map(|&id| interner.resolve(id))
-            .collect();
-        assert_eq!(
-            pairs,
-            vec![
-                ("github.com", SegmentKind::Path),
-                ("cutlass::gemm", SegmentKind::Package),
-                ("Outer", SegmentKind::Type),
-                ("Inner", SegmentKind::Nested),
-                ("Companion", SegmentKind::Companion),
-                ("r#type", SegmentKind::Member),
-                ("anything", SegmentKind::Unknown),
-            ]
-        );
-    }
-
-    #[test]
-    fn encode_decode_empty_is_empty() {
-        let interner = SegmentInterner::new();
-        let empty = FqName::new();
-        assert!(empty.encode_segments(&interner).is_empty());
-        assert!(
-            FqName::decode_segments(&[], &interner)
-                .expect("decode empty")
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn decode_rejects_malformed_blobs() {
-        let interner = SegmentInterner::new();
-        // Unknown kind tag.
-        assert!(FqName::decode_segments(&[200, 0, 0, 0, 0], &interner).is_err());
-        // Truncated length prefix.
-        assert!(FqName::decode_segments(&[0, 1, 2], &interner).is_err());
-        // Length claims more text than is present.
-        assert!(FqName::decode_segments(&[0, 4, 0, 0, 0, b'x'], &interner).is_err());
     }
 
     /// Memory/size measurement (M0). Builds a representative corpus from this

@@ -70,7 +70,7 @@ function fixture() {
     license_file: "LICENSE.txt",
     repository: "https://example.test/repository",
     links: "demo-native",
-    rust_version: "1.96",
+    rust_version: "1.97",
   };
   return {
     directory,
@@ -145,7 +145,7 @@ test("generates the Cargo publish object with exact dependency and field semanti
         zeta: { branch: "main", repository: "demo" },
       },
       links: "demo-native",
-      rust_version: "1.96",
+      rust_version: "1.97",
     });
   } finally {
     fs.rmSync(data.directory, { recursive: true, force: true });

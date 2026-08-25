@@ -21,12 +21,16 @@ pub const LEGACY_SEMANTIC_DB_FILE_NAME: &str = "semantic_cache.db";
 pub const LEGACY_ANALYZER_DB_FILE_NAME: &str = "analyzer_cache.db";
 /// The store file and the SQLite sidecars that belong to it.
 pub const STORE_FILE_SUFFIXES: [&str; 4] = ["", "-wal", "-shm", "-journal"];
+const ALLOW_NETWORK_CACHE_ENV: &str = "BIFROST_ALLOW_UNSAFE_NETWORK_CACHE";
 
 /// The version the baseline script creates. Versions below it are gone: the
 /// migrations that produced them were folded into the baseline, so a store
 /// older than this cannot be carried forward and is refused.
 const BASELINE_MIGRATION_VERSION: i64 = 18;
-const CURRENT_MIGRATION_VERSION: i64 = 24;
+// Version 25 belonged to a rejected local relational-key experiment. Skipping
+// it prevents an old experimental v25 store from being mistaken for this
+// schema; the version sequence is intentionally monotonic, not contiguous.
+const CURRENT_MIGRATION_VERSION: i64 = 30;
 pub const OPTIONAL_FACT_KIND_CPP_TEMPLATE_METADATA: i64 = 1;
 pub const OPTIONAL_FACT_KIND_RUBY_METHOD_DISPATCH_MODE: i64 = 2;
 pub const OPTIONAL_FACT_KIND_SCALA_TRAIT: i64 = 3;
@@ -45,6 +49,15 @@ const SIGNATURE_METADATA_COLUMNS_SQL: &str =
     include_str!("../migrations/cache/0023-signature-metadata-columns.sql");
 const LIVE_DEFINITION_VIEWS_SQL: &str =
     include_str!("../migrations/cache/0024-live-definition-views.sql");
+const RELATIONAL_DEFINITION_NAMES_SQL: &str =
+    include_str!("../migrations/cache/0026-relational-definition-names.sql");
+const RELATIONAL_DEFINITION_SET_VIEWS_SQL: &str =
+    include_str!("../migrations/cache/0027-relational-definition-set-views.sql");
+const RELATIONAL_FQ_AUTHORITY_SQL: &str = include_str!("../migrations/cache/0028-retire-fq2.sql");
+const REVERSE_IMPORT_LOOKUPS_SQL: &str =
+    include_str!("../migrations/cache/0029-reverse-import-lookups.sql");
+const RELATIONAL_DEFINITION_IDENTIFIER_VIEWS_SQL: &str =
+    include_str!("../migrations/cache/0030-relational-definition-identifier-views.sql");
 
 // Migration 0023 spells the signature-metadata byte cap as the literal 8388608,
 // because a checked-in SQL file cannot interpolate a Rust constant. The two must
@@ -65,7 +78,7 @@ struct CacheMigration {
     sql: &'static str,
 }
 
-const CACHE_MIGRATIONS: [CacheMigration; 7] = [
+const CACHE_MIGRATIONS: [CacheMigration; 12] = [
     CacheMigration {
         version: 18,
         sql: CURRENT_BASELINE_SQL,
@@ -93,6 +106,26 @@ const CACHE_MIGRATIONS: [CacheMigration; 7] = [
     CacheMigration {
         version: 24,
         sql: LIVE_DEFINITION_VIEWS_SQL,
+    },
+    CacheMigration {
+        version: 26,
+        sql: RELATIONAL_DEFINITION_NAMES_SQL,
+    },
+    CacheMigration {
+        version: 27,
+        sql: RELATIONAL_DEFINITION_SET_VIEWS_SQL,
+    },
+    CacheMigration {
+        version: 28,
+        sql: RELATIONAL_FQ_AUTHORITY_SQL,
+    },
+    CacheMigration {
+        version: 29,
+        sql: REVERSE_IMPORT_LOOKUPS_SQL,
+    },
+    CacheMigration {
+        version: 30,
+        sql: RELATIONAL_DEFINITION_IDENTIFIER_VIEWS_SQL,
     },
 ];
 
@@ -310,6 +343,7 @@ fn last_store_use_unix_seconds(store: &Path) -> Result<i64> {
 /// so a permission denial is reported with the ways out instead of SQLite's
 /// bare `unable to open database file` (issue #1544).
 pub fn open_unified_connection(db_path: &Path) -> Result<Connection> {
+    validate_writable_cache_filesystem(db_path)?;
     open_unified_connection_unclassified(db_path).map_err(|error| {
         match cache_write_denial(db_path) {
             Some(denied) => cache_permission_denied_message(db_path, &denied),
@@ -353,9 +387,11 @@ fn cache_permission_denied_message(db_path: &Path, denied: &Path) -> String {
          analyzer must already read, and every linked worktree shares it.\n\
          1. Re-run with approved or elevated filesystem permissions for {}. In a sandboxed \
          shell this is the same escalation that writing `.git` needs.\n\
-         2. If this run is deliberately transient, point BIFROST_CACHE_DIR at a throwaway \
+         2. For a durable machine-local cache, set BIFROST_CACHE_ROOT=<writable local root>. \
+         Bifrost derives one repository-specific child and keeps linked worktrees sharing it.\n\
+         3. If this run is deliberately transient, point BIFROST_CACHE_DIR at a throwaway \
          directory (`mktemp -d`) and delete it afterwards; nothing outlives the run.\n\
-         3. Last resort: set BIFROST_CACHE_DIR=<writable dir> to relocate the cache. WARNING: \
+         4. Last resort: set BIFROST_CACHE_DIR=<writable dir> to relocate the cache. WARNING: \
          that cache is separate, so it neither benefits from nor contributes to the shared \
          one; every workspace using it re-extracts everything and the two drift apart. This is \
          usually the wrong choice.",
@@ -423,6 +459,79 @@ fn open_unified_connection_unclassified(db_path: &Path) -> Result<Connection> {
         eprintln!("Bifrost cache startup cleanup skipped: {error}");
     }
     Ok(conn)
+}
+
+/// Refuse SQLite WAL placement on a network filesystem before a persisted
+/// workspace spends time discovering or parsing source files.
+pub fn validate_writable_cache_filesystem(db_path: &Path) -> Result<()> {
+    let allow_unsafe = std::env::var_os(ALLOW_NETWORK_CACHE_ENV)
+        .is_some_and(|value| value == std::ffi::OsStr::new("1"));
+    validate_network_cache_policy(db_path, network_filesystem_kind(db_path)?, allow_unsafe)
+}
+
+fn validate_network_cache_policy(
+    db_path: &Path,
+    filesystem_kind: Option<&str>,
+    allow_unsafe: bool,
+) -> Result<()> {
+    let Some(filesystem_kind) = filesystem_kind else {
+        return Ok(());
+    };
+    if allow_unsafe {
+        return Ok(());
+    }
+    Err(format!(
+        "refusing to place Bifrost SQLite WAL cache {} on {filesystem_kind}; SQLite WAL requires local filesystem locking and shared-memory semantics. Set {}=<local filesystem root> so each primary repository receives a machine-local cache. Set {ALLOW_NETWORK_CACHE_ENV}=1 only to accept the unsafe network-filesystem placement explicitly",
+        db_path.display(),
+        crate::gitblob::CACHE_ROOT_ENV,
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn network_filesystem_kind(path: &Path) -> Result<Option<&'static str>> {
+    use std::ffi::CString;
+    use std::mem::MaybeUninit;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let existing = path
+        .ancestors()
+        .find(|candidate| candidate.is_dir())
+        .ok_or_else(|| {
+            format!(
+                "cache DB path has no existing ancestor for filesystem inspection: {}",
+                path.display()
+            )
+        })?;
+    let encoded = CString::new(existing.as_os_str().as_bytes()).map_err(|_| {
+        format!(
+            "cache DB path contains a NUL byte and cannot be inspected: {}",
+            existing.display()
+        )
+    })?;
+    let mut stats = MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `encoded` is a live NUL-terminated path and `stats` points to
+    // writable storage for one `statfs` result. A successful call initializes
+    // the result before `assume_init`.
+    let status = unsafe { libc::statfs(encoded.as_ptr(), stats.as_mut_ptr()) };
+    if status != 0 {
+        return Err(format!(
+            "cache DB filesystem inspection failed for {}: {}",
+            existing.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: `statfs` returned success and initialized the output structure.
+    let filesystem_type = unsafe { stats.assume_init() }.f_type as u64 & 0xffff_ffff;
+    Ok(match filesystem_type {
+        0x6969 => Some("NFS"),
+        0xff53_4d42 => Some("CIFS/SMB"),
+        _ => None,
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn network_filesystem_kind(_path: &Path) -> Result<Option<&'static str>> {
+    Ok(None)
 }
 
 fn disused_version_stores_on_startup(db_path: &Path) -> Option<Vec<PathBuf>> {
@@ -1897,6 +2006,18 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn network_cache_policy_refuses_wal_unless_operator_explicitly_accepts_it() {
+        let db_path = Path::new("/shared/repository/.bifrost/cache/bifrost_cache.db");
+
+        let error = validate_network_cache_policy(db_path, Some("NFS"), false).unwrap_err();
+        assert!(error.contains(&db_path.display().to_string()), "{error}");
+        assert!(error.contains(crate::gitblob::CACHE_ROOT_ENV), "{error}");
+        assert!(error.contains(ALLOW_NETWORK_CACHE_ENV), "{error}");
+        assert!(validate_network_cache_policy(db_path, None, false).is_ok());
+        assert!(validate_network_cache_policy(db_path, Some("NFS"), true).is_ok());
+    }
+
     /// A workspace whose `.bifrost` parent cannot be written must say how to
     /// proceed, in the order that keeps the shared cache intact (issue #1544).
     #[test]
@@ -1924,10 +2045,13 @@ mod tests {
             "the denied path must be named: {error}"
         );
         let elevate = error.find("elevated filesystem permissions").unwrap();
+        let durable = error
+            .find("BIFROST_CACHE_ROOT=<writable local root>")
+            .unwrap();
         let transient = error.find("deliberately transient").unwrap();
         let relocate = error.find("BIFROST_CACHE_DIR=<writable dir>").unwrap();
         assert!(
-            elevate < transient && transient < relocate,
+            elevate < durable && durable < transient && transient < relocate,
             "exits must stay ordered: {error}"
         );
         assert!(
@@ -2059,6 +2183,220 @@ mod tests {
         assert!(
             plan.iter().all(|step| !step.contains("SCAN units")),
             "exact live declaration lookup must not scan code_units: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn relational_definition_views_enforce_identity_constraints_and_index_name_lookups() {
+        let conn = open_in_memory_cache();
+        conn.execute_batch(
+            "INSERT INTO analysis_epochs(lang, epoch, generation)
+               VALUES('java', 'test', 7);
+             INSERT INTO blobs(blob_oid, lang, generation)
+               VALUES('1111111111111111111111111111111111111111', 'java', 7);
+             INSERT INTO blob_meta(
+               blob_oid, lang, contains_tests, content_package,
+               stored_unit_count, range_count, signature_count,
+               signature_metadata_count, supertype_count, child_count,
+               import_statement_count, type_identifier_count, is_complete
+             ) VALUES(
+               '1111111111111111111111111111111111111111', 'java', 0, 'pkg',
+               1, 0, 0, 0, 0, 0, 0, 0, 1
+             );
+             INSERT INTO code_units(
+               blob_oid, lang, unit_key, kind, short_name, identifier,
+               content_qualifier, simple_type_name, synthetic, is_type_alias,
+               in_declarations, in_definition_lookup, fq_anchor_kind, fq_anchor_pop,
+               fq_package_tail_segments, exact_fqn_tail, normalized_fqn_tail,
+               exact_parent_fqn_tail, package_fqn_tail
+             ) VALUES(
+               '1111111111111111111111111111111111111111', 'java', 1, 0,
+               'Live$1', 'Live$1', 'pkg', 'Live', 0, 0, 1, 1, NULL, NULL,
+               1, 'pkg.Live$1', 'pkg.Live', 'pkg', 'pkg'
+             );
+             INSERT INTO unit_signatures(blob_oid, lang, unit_key, ordinal, text)
+               VALUES('1111111111111111111111111111111111111111', 'java', 1, 0,
+                      'class Live$1');
+             INSERT INTO workspace_snapshots(lang, generation, fingerprint)
+               VALUES('java', 7,
+                 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+             INSERT INTO workspace_files(lang, generation, rel_path, blob_oid)
+               VALUES('java', 7, 'src/Live.java',
+                 '1111111111111111111111111111111111111111');",
+        )
+        .unwrap();
+
+        let exact: Vec<String> = conn
+            .prepare(
+                "SELECT tail FROM live_definition_exact_names
+                 WHERE lang = 'java' AND source_kind = 'content'
+                   AND tail = 'pkg.Live$1'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(exact, ["pkg.Live$1"]);
+        let normalized: Vec<String> = conn
+            .prepare(
+                "SELECT tail FROM live_definition_normalized_names
+                 WHERE lang = 'java' AND source_kind = 'content'
+                   AND tail = 'pkg.Live'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(normalized, ["pkg.Live"]);
+
+        for (sql, expected_index) in [
+            (
+                "SELECT blob_oid FROM live_structural_members
+                 WHERE lang = 'java' AND source_kind = 'content'
+                   AND exact_parent_tail = 'pkg'",
+                "idx_code_units_stable_parent_identifier",
+            ),
+            (
+                "SELECT blob_oid FROM live_structural_members
+                 WHERE lang = 'java' AND source_kind = 'content'
+                   AND exact_parent_tail = 'pkg' AND identifier = 'Live$1'",
+                "idx_code_units_stable_parent_identifier",
+            ),
+            (
+                "SELECT blob_oid FROM live_definition_normalized_names
+                 WHERE lang = 'java' AND source_kind = 'content'
+                   AND tail = 'pkg.Live'",
+                "idx_code_units_stable_normalized_tail",
+            ),
+            (
+                "SELECT blob_oid FROM live_package_types
+                 WHERE lang = 'java' AND source_kind = 'content'
+                   AND prefix = '' AND package_tail = 'pkg'
+                   AND simple_type_name = 'Live'",
+                "idx_code_units_stable_package_type",
+            ),
+            (
+                "SELECT blob_oid FROM live_package_types
+                 WHERE lang = 'java' AND source_kind = 'content'
+                   AND prefix = '' AND package_tail = 'pkg'",
+                "idx_code_units_stable_package_type",
+            ),
+            // The lean 0030 identifier views (issue #2588 residual cost) must
+            // seek the identifier index for both the equality and the prefix
+            // range shape, on both the stable and the anchored arm.
+            (
+                "SELECT blob_oid FROM live_stable_definition_identifiers
+                 WHERE lang = 'java' AND identifier = 'Live$1'",
+                "idx_code_units_lang_identifier_lookup",
+            ),
+            (
+                "SELECT blob_oid FROM live_stable_definition_identifiers
+                 WHERE lang = 'java' AND identifier >= 'Live' AND identifier < 'Livf'",
+                "idx_code_units_lang_identifier_lookup",
+            ),
+            (
+                "SELECT blob_oid FROM live_anchored_definition_identifiers
+                 WHERE lang = 'java' AND identifier = 'Live$1'",
+                "idx_code_units_lang_identifier_lookup",
+            ),
+        ] {
+            let plan = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(
+                plan.iter().any(|step| step.contains(expected_index)),
+                "relational lookup must use {expected_index}: {plan:?}"
+            );
+            assert!(
+                plan.iter().all(|step| !step.contains("SCAN units")),
+                "relational lookup must not scan code_units: {plan:?}"
+            );
+        }
+
+        let blob_local_plan = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT unit_key FROM live_definition_identifiers
+                 WHERE lang = 'java'
+                   AND blob_oid = '1111111111111111111111111111111111111111'
+                   AND identifier = 'Live$1'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            blob_local_plan
+                .iter()
+                .any(|step| step.contains("PRIMARY KEY (blob_oid=? AND lang=?)")),
+            "blob-local identifier lookup must seek the code_units primary key range: \
+             {blob_local_plan:?}"
+        );
+        assert!(
+            blob_local_plan
+                .iter()
+                .all(|step| !step.contains("SCAN units")),
+            "blob-local identifier lookup must not scan code_units: {blob_local_plan:?}"
+        );
+
+        let callable_plan = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT ordinal, text FROM live_callable_facts
+                 WHERE blob_oid = '1111111111111111111111111111111111111111'
+                   AND lang = 'java' AND unit_key = 1",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            callable_plan.iter().any(|step| {
+                step.contains("PRIMARY KEY (blob_oid=? AND lang=? AND unit_key=?)")
+            }),
+            "callable facts must seek their owning unit/signature key: {callable_plan:?}"
+        );
+        assert!(
+            callable_plan
+                .iter()
+                .all(|step| !step.contains("SCAN units")),
+            "callable-fact lookup must not scan code_units: {callable_plan:?}"
+        );
+
+        let invalid_anchor = conn.execute(
+            "INSERT INTO code_units(
+               blob_oid, lang, unit_key, kind, short_name, identifier,
+               content_qualifier, synthetic, is_type_alias,
+               in_declarations, in_definition_lookup, fq_anchor_kind, fq_anchor_pop
+             ) VALUES(?1, 'java', 2, 0, 'Bad', 'Bad', 'pkg', 0, 0, 1, 1,
+                      'own_module', NULL)",
+            ["1111111111111111111111111111111111111111"],
+        );
+        assert!(
+            invalid_anchor.is_err(),
+            "anchor kind requires its paired pop"
+        );
+        let duplicate_normalized = conn.execute(
+            "INSERT INTO code_units(
+               blob_oid, lang, unit_key, kind, short_name, identifier,
+               content_qualifier, synthetic, is_type_alias,
+               in_declarations, in_definition_lookup,
+               exact_fqn_tail, normalized_fqn_tail
+             ) VALUES(?1, 'java', 3, 0, 'Bad', 'Bad', 'pkg', 0, 0, 1, 1,
+                      'pkg.Bad', 'pkg.Bad')",
+            ["1111111111111111111111111111111111111111"],
+        );
+        assert!(
+            duplicate_normalized.is_err(),
+            "identity normalization is represented by NULL, not a duplicate string"
         );
     }
 
@@ -3529,6 +3867,112 @@ mod tests {
             older_before,
             "the source stays readable for the checkouts still on it (issue #1589)"
         );
+        assert!(staged_leftovers(cache_dir).is_empty());
+    }
+
+    /// Version 28 removes the opaque identity copy without forcing a warm
+    /// version-27 analyzer cache to be reparsed. The ordered child rows are
+    /// already authoritative in version 27; migration only records their
+    /// row and byte counts on the parent and drops the redundant column.
+    #[test]
+    fn v27_relational_fq_rows_are_carried_forward_without_reanalysis() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path();
+        let older = store_path(cache_dir, 27);
+        create_store_at(&older, &migrations_through(27), 27);
+        let oid = seeded_oid("relational-fq");
+        {
+            let conn = Connection::open(&older).unwrap();
+            conn.execute(
+                "INSERT INTO blobs(blob_oid, lang) VALUES (?1, 'java')",
+                [&oid],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO code_units(
+                     blob_oid, lang, unit_key, kind, short_name, identifier,
+                     content_qualifier, synthetic, is_type_alias,
+                     in_declarations, in_definition_lookup, in_test_region,
+                     fq_segments, fq_package_tail_segments, exact_fqn_tail)
+                 VALUES (?1, 'java', 7, 0, 'Widget', 'Widget', 'pkg',
+                         0, 0, 1, 1, 0, X'46513200010203', 2,
+                         'pkg.Widget')",
+                [&oid],
+            )
+            .unwrap();
+            for (ordinal, kind, segment) in [
+                (0, "package", "pkg"),
+                (1, "package", "nested"),
+                (2, "type", "Widget"),
+            ] {
+                conn.execute(
+                    "INSERT INTO code_unit_fq_segments(
+                         blob_oid, lang, unit_key, seg_ordinal, seg_kind, segment)
+                     VALUES (?1, 'java', 7, ?2, ?3, ?4)",
+                    rusqlite::params![oid, ordinal, kind, segment],
+                )
+                .unwrap();
+            }
+        }
+        let older_before = std::fs::read(&older).unwrap();
+
+        let conn = open_unified_connection(&current_store_path(cache_dir)).unwrap();
+
+        assert!(!column_exists(&conn, "code_units", "fq_segments").unwrap());
+        assert!(column_exists(&conn, "code_units", "fq_segment_count").unwrap());
+        assert!(column_exists(&conn, "code_units", "fq_segment_bytes").unwrap());
+        assert_eq!(
+            conn.query_row(
+                "SELECT fq_segment_count FROM code_units
+                 WHERE blob_oid = ?1 AND lang = 'java' AND unit_key = 7",
+                [&oid],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            3
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT fq_segment_bytes FROM code_units
+                 WHERE blob_oid = ?1 AND lang = 'java' AND unit_key = 7",
+                [&oid],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            33
+        );
+        let segments = conn
+            .prepare(
+                "SELECT seg_ordinal, seg_kind, segment
+                 FROM code_unit_fq_segments
+                 WHERE blob_oid = ?1 AND lang = 'java' AND unit_key = 7
+                 ORDER BY seg_ordinal",
+            )
+            .unwrap()
+            .query_map([&oid], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            segments,
+            vec![
+                (0, "package".to_string(), "pkg".to_string()),
+                (1, "package".to_string(), "nested".to_string()),
+                (2, "type".to_string(), "Widget".to_string()),
+            ]
+        );
+        assert_eq!(
+            schema_object_definitions(&conn).unwrap(),
+            *CURRENT_SCHEMA_OBJECTS
+        );
+        assert!(quick_check_is_ok(&conn).unwrap());
+        assert_eq!(std::fs::read(&older).unwrap(), older_before);
         assert!(staged_leftovers(cache_dir).is_empty());
     }
 

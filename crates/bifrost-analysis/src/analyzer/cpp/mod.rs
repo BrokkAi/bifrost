@@ -28,7 +28,7 @@ use crate::analyzer::tree_sitter_analyzer::BulkFileStateSource;
 use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::cpp_graph::{
     CppDeadCodeBulkEligibility, CppUsageGraphStrategy, build_cpp_usage_edge_weights,
-    build_cpp_usage_edges, dead_code_bulk_eligibility,
+    build_cpp_usage_edges, build_rooted_cpp_usage_edges, dead_code_bulk_eligibility,
 };
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_cpp_bounded,
@@ -47,7 +47,7 @@ use crate::analyzer::{
 use crate::analyzer::{AnalyzerQueryScope, QueryScope, QueryToken};
 use crate::hash::{HashMap, HashSet};
 use moka::sync::Cache;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, OnceLock};
 
 pub(crate) use adapter::CppAdapter;
@@ -59,7 +59,7 @@ use brokk_bifrost_cpp::graph::resolver::SourceUsingIndex;
 use brokk_bifrost_cpp::graph_support::CppSource;
 use brokk_bifrost_cpp::identity::{
     CppReconcileCandidates, CppReconcileGroupKey, CppReconciledDefinitionIndex,
-    cpp_reconcile_candidates, cpp_reconcile_group, cpp_reconcile_group_key,
+    cpp_reconcile_candidates_from_units, cpp_reconcile_group, cpp_reconcile_group_key,
 };
 use brokk_bifrost_cpp::imports::IncludeTargetIndex;
 use brokk_bifrost_cpp::test_detection::detect_cpp_test_assertion_smells;
@@ -73,6 +73,7 @@ use clones::build_clone_candidate_data;
 pub(crate) use brokk_bifrost_cpp::declarations::{
     cpp_sentinel_recovered_classes, is_direct_recovered_exported_class_field_declaration, node_text,
 };
+use brokk_bifrost_cpp::identity::cpp_callable_unit_role;
 pub(crate) use brokk_bifrost_cpp::identity::{
     CppCallableUnitRole, CppOccurrenceClassifier, CppOccurrenceRole, cpp_indexed_callable_linkage,
     cpp_is_range_for_binding_name, cpp_occurrence_role_for_range,
@@ -107,10 +108,6 @@ pub struct CppAnalyzer {
     /// the two readings of that blob agree, so every question about the C view
     /// is answered from the file's own row-set.
     c_readings_by_file: Cache<ProjectFile, Option<Arc<projection::CppCReading>>>,
-    /// Every C-reading-only identity in the workspace, keyed by identifier and
-    /// by fq name (#1970). One whole-workspace pass, memoized for the analyzer
-    /// generation and reset with the other whole-workspace memos.
-    c_reading_index: Arc<PoolSafeMemo<projection::CppCReadingIndex>>,
     /// Every callable declaration sharing one member identifier, bucketed by
     /// owner terminal. The identifier-index store read and the bucketing pass
     /// that produce it are what #1908 stopped repeating per queried fq name.
@@ -187,13 +184,12 @@ pub(crate) struct ExternalHeaderClosureWorkCounts {
 }
 
 impl ForwardQueryProvider for CppAnalyzer {
+    fn normalize_rendered_name(&self, fqn: &str) -> String {
+        self.inner.normalize_rendered_name(fqn)
+    }
+
     fn forward_definition_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
-        let mut units = self.inner.forward_definition_fqn(fqn);
-        let reconciled = self.reconciled_definitions(fqn);
-        units.extend(reconciled.rekeyed.iter().cloned());
-        units.sort();
-        units.dedup();
-        units
+        self.relational_definitions_for_rendered_name(fqn)
     }
 
     fn forward_file_identifier(&self, file: &ProjectFile, identifier: &str) -> Vec<CodeUnit> {
@@ -202,6 +198,17 @@ impl ForwardQueryProvider for CppAnalyzer {
 
     fn forward_direct_children(&self, owner: &CodeUnit) -> Vec<CodeUnit> {
         self.inner.forward_direct_children(owner)
+    }
+
+    fn forward_relational_name(
+        &self,
+        unit: &CodeUnit,
+    ) -> brokk_bifrost_core::analyzer::RelationalName {
+        self.inner.relational_name_for_unit(unit)
+    }
+
+    fn forward_definition_candidate_short_names(&self, rendered: &str) -> Vec<String> {
+        self.inner.definition_candidate_short_names(rendered)
     }
 
     fn forward_package_exists(&self, package: &str) -> bool {
@@ -253,7 +260,7 @@ impl CppAnalyzer {
     }
 
     fn from_inner(inner: TreeSitterAnalyzer<CppAdapter>, memo_budget: u64) -> Self {
-        Self {
+        let analyzer = Self {
             inner,
             memo_budget,
             imported_code_units: build_weighted_cache(
@@ -275,7 +282,6 @@ impl CppAnalyzer {
                 weight_include_reachability,
             ),
             c_readings_by_file: build_weighted_cache(memo_budget / 8, cache::weight_c_reading),
-            c_reading_index: Arc::new(PoolSafeMemo::new()),
             reconcile_candidates_by_identifier: build_weighted_cache(
                 memo_budget / 8,
                 weight_reconcile_candidates,
@@ -314,7 +320,9 @@ impl CppAnalyzer {
             external_header_closure_build_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             external_header_parse_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        }
+        };
+        analyzer.sync_published_c_reading_workspace();
+        analyzer
     }
 
     /// The re-keyed reconciled definitions (if any) that belong under the
@@ -335,6 +343,14 @@ impl CppAnalyzer {
     /// (#1748), and `visible_type_units_while` already applies it one layer
     /// down.
     fn reconciled_definitions(&self, fq_name: &str) -> Arc<CppReconciledDefinitionIndex> {
+        self.reconciled_definitions_with_cancellation(fq_name, None)
+    }
+
+    fn reconciled_definitions_with_cancellation(
+        &self,
+        fq_name: &str,
+        request_cancellation: Option<&crate::CancellationToken>,
+    ) -> Arc<CppReconciledDefinitionIndex> {
         static EMPTY: OnceLock<Arc<CppReconciledDefinitionIndex>> = OnceLock::new();
         let empty = || Arc::clone(EMPTY.get_or_init(Arc::default));
         let Some(key) = cpp_reconcile_group_key(fq_name) else {
@@ -343,7 +359,9 @@ impl CppAnalyzer {
         // The request's deadline, if its opener set one. `IAnalyzer::definitions`
         // takes no token -- it is nominally a plain lookup -- and on C++ it is
         // the read that ran for 270 s in #1908 with nothing polling it.
-        let cancellation = self.inner.active_query_cancellation();
+        let cancellation = request_cancellation
+            .cloned()
+            .or_else(|| self.inner.active_query_cancellation());
         let keep_going = || {
             !cancellation
                 .as_ref()
@@ -355,7 +373,38 @@ impl CppAnalyzer {
                 #[cfg(any(test, feature = "test-support"))]
                 self.reconcile_candidate_scan_count
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                cpp_reconcile_candidates(self, &key.member_identifier, &keep_going).map(Arc::new)
+                let mut name = crate::analyzer::FqName::new();
+                name.push(crate::analyzer::fq_name::segment_interner().intern(
+                    &key.member_identifier,
+                    crate::analyzer::fq_name::SegmentKind::Unknown,
+                ));
+                let request = crate::analyzer::RelationalDefinitionRequest {
+                    ordinal: 0,
+                    language_scope: crate::analyzer::DefinitionLanguageScope::Language(
+                        Language::Cpp,
+                    ),
+                    name: brokk_bifrost_core::analyzer::RelationalName::stable(name),
+                    query: crate::analyzer::RelationalDefinitionQuery::Identifier { file: None },
+                };
+                let local_cancellation = crate::CancellationToken::new();
+                let query_cancellation = cancellation.as_ref().unwrap_or(&local_cancellation);
+                let crate::analyzer::RelationalBatchOutcome::Complete(mut results) =
+                    crate::analyzer::RelationalDefinitionLookup::batch(
+                        &self.inner,
+                        &[request],
+                        query_cancellation,
+                    )
+                else {
+                    return None;
+                };
+                let result = results
+                    .pop()
+                    .expect("one reconcile query returns one result");
+                let crate::analyzer::RelationalDefinitionValue::Definitions(units) = result.value
+                else {
+                    panic!("an identifier reconcile query returned the wrong value shape");
+                };
+                cpp_reconcile_candidates_from_units(units, &keep_going).map(Arc::new)
             })
         else {
             return empty();
@@ -390,7 +439,7 @@ impl CppAnalyzer {
     }
 
     fn with_updated_inner(&self, inner: TreeSitterAnalyzer<CppAdapter>) -> Self {
-        Self {
+        let analyzer = Self {
             inner,
             memo_budget: self.memo_budget,
             imported_code_units: build_weighted_cache(
@@ -415,7 +464,6 @@ impl CppAnalyzer {
                 weight_include_reachability,
             ),
             c_readings_by_file: build_weighted_cache(self.memo_budget / 8, cache::weight_c_reading),
-            c_reading_index: Arc::new(PoolSafeMemo::new()),
             reconcile_candidates_by_identifier: build_weighted_cache(
                 self.memo_budget / 8,
                 weight_reconcile_candidates,
@@ -454,7 +502,78 @@ impl CppAnalyzer {
             external_header_closure_build_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
             external_header_parse_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        analyzer.sync_published_c_reading_workspace();
+        analyzer
+    }
+
+    fn relational_definition_values(
+        &self,
+        name: brokk_bifrost_core::analyzer::RelationalName,
+        query: crate::analyzer::RelationalDefinitionQuery,
+    ) -> Vec<CodeUnit> {
+        let request = crate::analyzer::RelationalDefinitionRequest {
+            ordinal: 0,
+            language_scope: crate::analyzer::DefinitionLanguageScope::Language(Language::Cpp),
+            name,
+            query,
+        };
+        match self.relational_definition_batch_for_active_query(&[request]) {
+            crate::analyzer::RelationalBatchOutcome::Complete(mut results) => {
+                let result = results
+                    .pop()
+                    .expect("one relational request returns one result");
+                let crate::analyzer::RelationalDefinitionValue::Definitions(units) = result.value
+                else {
+                    panic!("a definition request returned the wrong relational value shape");
+                };
+                units
+            }
+            crate::analyzer::RelationalBatchOutcome::Cancelled => Vec::new(),
+            crate::analyzer::RelationalBatchOutcome::Failed(error) => {
+                self.inner
+                    .record_store_error(crate::analyzer::store::StoreError::new(error.message()));
+                Vec::new()
+            }
         }
+    }
+
+    fn relational_definitions_for_rendered_name(&self, fq_name: &str) -> Vec<CodeUnit> {
+        let units =
+            crate::analyzer::AnalyzerDefinitionLookup::new(self, Language::Cpp).fqn(fq_name);
+        let reconciled = self.reconciled_definitions(fq_name);
+        let mut candidates = units
+            .into_iter()
+            .map(|unit| {
+                let physical = reconciled
+                    .provisional_of
+                    .get(&unit)
+                    .cloned()
+                    .unwrap_or_else(|| unit.clone());
+                (unit, physical)
+            })
+            .collect::<Vec<_>>();
+        self.inner
+            .sort_definition_units_by_physical_identity(&mut candidates);
+        candidates
+            .into_iter()
+            .map(|(published, _)| published)
+            .collect()
+    }
+
+    fn relational_definitions_for_identifier(&self, identifier: &str) -> Vec<CodeUnit> {
+        if identifier.is_empty() {
+            return Vec::new();
+        }
+        let mut name = crate::analyzer::FqName::new();
+        name.push(
+            crate::analyzer::fq_name::segment_interner()
+                .intern(identifier, crate::analyzer::fq_name::SegmentKind::Unknown),
+        );
+        self.relational_definition_values(
+            brokk_bifrost_core::analyzer::RelationalName::stable(name),
+            crate::analyzer::RelationalDefinitionQuery::Identifier { file: None },
+        )
     }
 
     pub fn from_project<P>(project: P) -> Self
@@ -553,31 +672,6 @@ impl CppAnalyzer {
     pub(crate) fn bulk_file_states_for_query(&self, files: impl IntoIterator<Item = ProjectFile>) {
         self.inner
             .bulk_file_states_for_query(files, BulkFileStateSource::Include);
-    }
-
-    pub(crate) fn declaration_candidates_by_identifier_limited(
-        &self,
-        identifier: &str,
-        limit: usize,
-        continue_query: impl FnMut() -> bool,
-    ) -> LimitedQueryRows<CodeUnit> {
-        self.inner
-            .lookup_declarations_by_identifier_limited(identifier, limit, continue_query)
-    }
-
-    pub(crate) fn declaration_candidates_by_fqn_limited(
-        &self,
-        fqn: &str,
-        normalized: bool,
-        limit: usize,
-        continue_query: impl FnMut() -> bool,
-    ) -> LimitedQueryRows<CodeUnit> {
-        self.inner.lookup_declarations_by_persisted_fqn_limited(
-            fqn,
-            normalized,
-            limit,
-            continue_query,
-        )
     }
 
     pub(crate) fn member_candidates_for_owner_limited(
@@ -842,6 +936,10 @@ use crate::analyzer::CodeUnitIndex;
 /// the five caches, two `OnceLock`s and two `PoolSafeMemo`s stay here and no
 /// function on the other side of the crate line can reach past this surface.
 impl CppSource for CppAnalyzer {
+    fn stored_callable_unit_role(&self, callable: &CodeUnit) -> CppCallableUnitRole {
+        cpp_callable_unit_role(&self.inner, callable)
+    }
+
     fn include_target_index(&self) -> &IncludeTargetIndex {
         CppAnalyzer::include_target_index(self)
     }
@@ -1002,14 +1100,20 @@ impl CppWorkspaceSource for CppAnalyzer {
         self.import_statements_from_projection(token, file)
     }
 
-    fn definitions_by_fqn(&self, _token: QueryToken<'_>, fqn: &str) -> Vec<&CodeUnit> {
-        // `into_shards` for the same reason as the `CppDispatch` impl: the
-        // matches outlive the per-call handle, so they must borrow the shards.
-        <Self as IAnalyzer>::global_usage_definition_index(self)
-            .into_shards()
-            .into_iter()
-            .flat_map(|shard| shard.by_fqn(fqn).iter())
-            .collect()
+    fn definitions_by_name(
+        &self,
+        _token: QueryToken<'_>,
+        name: &brokk_bifrost_core::analyzer::fq_name::FqName,
+    ) -> Vec<CodeUnit> {
+        crate::analyzer::usages::cpp_graph::relational_exact_definitions(self, name)
+    }
+
+    fn definitions_by_identifier(
+        &self,
+        _token: QueryToken<'_>,
+        name: &brokk_bifrost_core::analyzer::fq_name::FqName,
+    ) -> Vec<CodeUnit> {
+        crate::analyzer::usages::cpp_graph::relational_identifier_definitions(self, name)
     }
 }
 
@@ -1071,17 +1175,11 @@ impl CodeUnitIndex for CppAnalyzer {
         self.inner.retain_analyzed(candidates)
     }
 
-    /// #1970: a header some translation unit provably compiles as C carries a
-    /// second, C-reading identity for each tag its C++ reading nested. Both
-    /// identities are real declarations of one site, so both are listed.
+    /// #1970: the relational workspace snapshot mounts a header's published C
+    /// reading under `cpp:c`, so the generic declaration scan returns both
+    /// identities of one declaration site without a Rust-side workspace map.
     fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
-        let scope = AnalyzerQueryScope::new(self);
-        let token = scope.token();
-        Box::new(
-            self.inner
-                .all_declarations()
-                .chain(self.c_reading_index_additions_for_workspace(token)),
-        )
+        self.inner.all_declarations()
     }
 
     fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
@@ -1096,36 +1194,23 @@ impl CodeUnitIndex for CppAnalyzer {
     }
 
     fn definitions(&self, fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
-        let scope = AnalyzerQueryScope::new(self);
-        let token = scope.token();
         let _scope = crate::profiling::scope(format!("cpp.definitions[{fq_name}]"));
-        let inner: Vec<CodeUnit> = {
-            let _inner = crate::profiling::scope(format!("cpp.definitions.inner[{fq_name}]"));
-            self.inner.definitions(fq_name).collect()
-        };
-        // #1134: fold in out-of-line member definitions whose per-file identity
-        // extraction could not reconcile with this canonical `fq_name`, but the
-        // include-visible class table confirms belong here, so a header
-        // declaration and its `.cpp` definition unify at resolution time.
-        let reconciled = self.reconciled_definitions(fq_name);
-        // #1970: likewise for a C-attributed header's C-reading identities,
-        // which have no `cpp` rows to be found under.
-        let c_reading_index = self.c_reading_index(token);
-        let c_reading_units = c_reading_index
-            .by_fq_name
-            .get(fq_name)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        if reconciled.rekeyed.is_empty() && c_reading_units.is_empty() {
-            return Box::new(inner.into_iter());
-        }
-        let mut definitions = inner;
-        for unit in reconciled.rekeyed.iter().chain(c_reading_units) {
-            if !definitions.contains(unit) {
-                definitions.push(unit.clone());
-            }
-        }
-        Box::new(definitions.into_iter())
+        Box::new(
+            self.relational_definitions_for_rendered_name(fq_name)
+                .into_iter(),
+        )
+    }
+
+    fn definitions_by_structured_name(
+        &self,
+        fq_name: &brokk_bifrost_core::analyzer::fq_name::FqName,
+        language: Language,
+    ) -> Vec<CodeUnit> {
+        debug_assert_eq!(language, Language::Cpp);
+        self.relational_definition_values(
+            brokk_bifrost_core::analyzer::RelationalName::stable(fq_name.clone()),
+            crate::analyzer::RelationalDefinitionQuery::ExactName,
+        )
     }
 
     fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
@@ -1213,37 +1298,11 @@ impl CodeUnitIndex for CppAnalyzer {
     /// See [`CodeUnitIndex::all_declarations`] above: both identities of a
     /// C-attributed header's declaration site are listed (#1970).
     fn get_all_declarations(&self) -> Vec<CodeUnit> {
-        let scope = AnalyzerQueryScope::new(self);
-        let token = scope.token();
-        let mut declarations = self.inner.get_all_declarations();
-        declarations.extend(self.c_reading_index_additions_for_workspace(token));
-        declarations
+        self.inner.get_all_declarations()
     }
 
     fn get_definitions(&self, fq_name: &str) -> Vec<CodeUnit> {
-        let scope = AnalyzerQueryScope::new(self);
-        let token = scope.token();
-        let mut definitions = self.inner.get_definitions(fq_name);
-        // #1134: fold in out-of-line member definitions whose per-file identity
-        // extraction could not reconcile with this canonical `fq_name`, but the
-        // include-visible class table confirms belong here (so a header
-        // declaration and its `.cpp` definition unify at query time).
-        {
-            let reconciled = self.reconciled_definitions(fq_name);
-            // #1970: and a C-attributed header's C-reading identities.
-            let c_reading_index = self.c_reading_index(token);
-            let c_reading_units = c_reading_index
-                .by_fq_name
-                .get(fq_name)
-                .map(Vec::as_slice)
-                .unwrap_or_default();
-            for unit in reconciled.rekeyed.iter().chain(c_reading_units) {
-                if !definitions.contains(unit) {
-                    definitions.push(unit.clone());
-                }
-            }
-        }
-        definitions
+        self.relational_definitions_for_rendered_name(fq_name)
     }
 
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
@@ -1284,20 +1343,141 @@ impl CodeUnitIndex for CppAnalyzer {
         self.inner.has_complete_symbol_lookup_index()
     }
 
-    /// #1970: a C-attributed header's C-reading identities are not in the
-    /// store's `cpp` rows, so the identifier index cannot answer for them.
     fn lookup_candidates_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
-        let scope = AnalyzerQueryScope::new(self);
-        let token = scope.token();
-        let mut candidates = self.inner.lookup_declarations_by_identifier(identifier);
-        if let Some(units) = self.c_reading_index(token).by_identifier.get(identifier) {
-            candidates.extend(units.iter().cloned());
-        }
-        candidates
+        self.relational_definitions_for_identifier(identifier)
+            .into_iter()
+            .collect()
     }
 }
 
 impl IAnalyzer for CppAnalyzer {
+    fn active_query_cancellation(&self) -> Option<crate::CancellationToken> {
+        self.inner.active_query_cancellation()
+    }
+
+    fn relational_definition_batch(
+        &self,
+        requests: &[crate::analyzer::RelationalDefinitionRequest],
+        cancellation: &crate::CancellationToken,
+    ) -> crate::analyzer::RelationalBatchOutcome {
+        let outcome =
+            crate::analyzer::RelationalDefinitionLookup::batch(&self.inner, requests, cancellation);
+        let crate::analyzer::RelationalBatchOutcome::Complete(mut results) = outcome else {
+            return outcome;
+        };
+        assert_eq!(results.len(), requests.len());
+
+        for (request, result) in requests.iter().zip(&mut results) {
+            if cancellation.is_cancelled() {
+                return crate::analyzer::RelationalBatchOutcome::Cancelled;
+            }
+            if !matches!(
+                request.language_scope,
+                crate::analyzer::DefinitionLanguageScope::Workspace
+                    | crate::analyzer::DefinitionLanguageScope::Language(Language::Cpp)
+            ) {
+                continue;
+            }
+
+            match &mut result.value {
+                crate::analyzer::RelationalDefinitionValue::Definitions(units) => {
+                    let additions = units
+                        .iter()
+                        .flat_map(|unit| {
+                            self.reconciled_definitions_with_cancellation(
+                                &unit.fq_name(),
+                                Some(cancellation),
+                            )
+                            .rekeyed
+                            .clone()
+                        })
+                        .filter(|unit| self.inner.unit_matches_relational_request(unit, request))
+                        .collect::<Vec<_>>();
+                    units.extend(additions);
+                }
+                crate::analyzer::RelationalDefinitionValue::CallableFacts(facts) => {
+                    let mut declaration_names = facts
+                        .iter()
+                        .map(|fact| fact.declaration.fq_name())
+                        .collect::<Vec<_>>();
+                    declaration_names.push(
+                        request
+                            .name
+                            .full_name()
+                            .display(crate::analyzer::fq_name::segment_interner()),
+                    );
+                    declaration_names.sort();
+                    declaration_names.dedup();
+                    let mut additions = Vec::new();
+                    for declaration_name in declaration_names {
+                        let reconciled = self.reconciled_definitions_with_cancellation(
+                            &declaration_name,
+                            Some(cancellation),
+                        );
+                        for rekeyed in &reconciled.rekeyed {
+                            if !self.inner.unit_matches_relational_request(rekeyed, request) {
+                                continue;
+                            }
+                            let provisional = reconciled.provisional_of.get(rekeyed).expect(
+                                "every reconciled definition records its provisional identity",
+                            );
+                            let fact_request = crate::analyzer::RelationalDefinitionRequest {
+                                ordinal: 0,
+                                language_scope: crate::analyzer::DefinitionLanguageScope::Language(
+                                    Language::Cpp,
+                                ),
+                                name: brokk_bifrost_core::analyzer::RelationalName::stable(
+                                    provisional.fq().clone(),
+                                ),
+                                query: crate::analyzer::RelationalDefinitionQuery::CallableFacts,
+                            };
+                            let mut physical_results =
+                                match crate::analyzer::RelationalDefinitionLookup::batch(
+                                    &self.inner,
+                                    &[fact_request],
+                                    cancellation,
+                                ) {
+                                    crate::analyzer::RelationalBatchOutcome::Complete(results) => {
+                                        results
+                                    }
+                                    crate::analyzer::RelationalBatchOutcome::Cancelled => {
+                                        return crate::analyzer::RelationalBatchOutcome::Cancelled;
+                                    }
+                                    crate::analyzer::RelationalBatchOutcome::Failed(error) => {
+                                        return crate::analyzer::RelationalBatchOutcome::Failed(
+                                            error,
+                                        );
+                                    }
+                                };
+                            let physical = physical_results
+                                .pop()
+                                .expect("one physical callable request returns one result");
+                            let crate::analyzer::RelationalDefinitionValue::CallableFacts(
+                                physical_facts,
+                            ) = physical.value
+                            else {
+                                panic!("a callable request returned the wrong value shape");
+                            };
+                            additions.extend(physical_facts.into_iter().filter_map(|mut fact| {
+                                (fact.declaration == *provisional).then(|| {
+                                    fact.declaration = rekeyed.clone();
+                                    fact
+                                })
+                            }));
+                        }
+                    }
+                    facts.extend(additions);
+                }
+                crate::analyzer::RelationalDefinitionValue::PackageRelation(_) => {}
+            }
+            result.value.canonicalize();
+        }
+        if cancellation.is_cancelled() {
+            return crate::analyzer::RelationalBatchOutcome::Cancelled;
+        }
+        crate::analyzer::RelationalBatchOutcome::Complete(results)
+    }
+
     fn invalidate_cached_file_identities(&self) {
         self.inner.invalidate_cached_file_identities();
     }
@@ -1337,13 +1517,6 @@ impl IAnalyzer for CppAnalyzer {
 
     fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
         self.inner.workspace_file_index_cell()
-    }
-
-    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
-        // Trait signature is fixed, so this boundary opens the scope the
-        // usage-graph funnel now demands proof of (issue #2423 milestone B).
-        let scope = crate::analyzer::AnalyzerQueryScope::new(self);
-        self.inner.global_usage_definition_index(scope.token())
     }
 
     fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
@@ -1422,14 +1595,20 @@ impl IAnalyzer for CppAnalyzer {
         Some(self)
     }
 
-    fn structural_search_providers(
+    fn structural_fact_providers(
         &self,
-    ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
-        self.inner.structural_search_providers()
+    ) -> Vec<&dyn crate::analyzer::structural::StructuralFactProvider> {
+        self.inner.structural_fact_providers()
     }
 
     fn snapshot_caches(&self) -> Option<&crate::analyzer::AnalyzerSnapshotCaches> {
         Some(self.inner.snapshot_caches())
+    }
+
+    fn workspace_content_identities(
+        &self,
+    ) -> Option<crate::analyzer::content_identity::WorkspaceContentIdentities> {
+        self.inner.workspace_content_identities()
     }
 
     fn contains_tests(&self, file: &ProjectFile) -> bool {
@@ -1508,18 +1687,6 @@ impl IAnalyzer for CppAnalyzer {
 
 #[cfg(any(test, feature = "test-support"))]
 impl crate::analyzer::AnalyzerTestHooks for CppAnalyzer {
-    fn reset_global_usage_definition_index_build_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_global_usage_definition_index_build_count_for_test();
-    }
-
-    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .global_usage_definition_index_build_count_for_test()
-    }
-
     fn reset_full_declaration_scan_count_for_test(&self) {
         self.inner
             .test_hooks()
@@ -1557,6 +1724,30 @@ pub(crate) struct CppSupport;
 impl LanguageSupport for CppSupport {
     fn language(&self) -> Language {
         Language::Cpp
+    }
+
+    fn transitive_referencing_files(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        seed_files: &BTreeSet<ProjectFile>,
+        cancellation: Option<&crate::cancellation::CancellationToken>,
+    ) -> Option<HashSet<ProjectFile>> {
+        let cpp = resolve_analyzer::<CppAnalyzer>(analyzer)?;
+        let mut reached = HashSet::default();
+        let mut visited: HashSet<ProjectFile> = seed_files.iter().cloned().collect();
+        let mut queue: VecDeque<ProjectFile> = seed_files.iter().cloned().collect();
+        while let Some(included_file) = queue.pop_front() {
+            if cancellation.is_some_and(|token| token.is_cancelled()) {
+                break;
+            }
+            for includer in cpp.referencing_files_of(&included_file) {
+                if visited.insert(includer.clone()) {
+                    reached.insert(includer.clone());
+                    queue.push_back(includer);
+                }
+            }
+        }
+        Some(reached)
     }
 
     fn skips_local_declaration(&self, node: tree_sitter::Node<'_>, source: &str) -> bool {
@@ -1649,7 +1840,7 @@ impl LanguageEdgePass for CppEdgePass {
     }
 
     fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
-        build_cpp_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file).map(LanguageEdgeSites)
+        build_rooted_cpp_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file).map(LanguageEdgeSites)
     }
 
     fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {

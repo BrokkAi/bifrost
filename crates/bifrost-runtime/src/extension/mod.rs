@@ -38,12 +38,14 @@ mod version;
 mod workspace;
 
 pub use artifacts::*;
-pub use brokk_bifrost_analysis::analyzer::structural::CodeQuery;
+pub use brokk_bifrost_rql::CodeQuery;
 pub use codec::{
     ExtensionDecodeError, ExtensionEncodeError, ExtensionRequest, ExtensionResponse,
     decode_request_json, encode_request_json, encode_response_json,
 };
-pub use identity::{NormalizedRelativePath, SourceSpan, StableDigest, WorkspaceGeneration};
+pub use identity::{
+    NormalizedRelativePath, SourceSpan, StableDigest, WorkspaceContentIdentity, WorkspaceGeneration,
+};
 pub use limits::{
     ExtensionCancellation, ExtensionLimitValues, ExtensionLimits, InvalidExtensionLimits,
 };

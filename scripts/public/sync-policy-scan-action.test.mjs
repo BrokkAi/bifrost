@@ -6,7 +6,7 @@
 // would point at a file:// bare repository; nothing ever did.
 
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -246,4 +246,171 @@ test("the canonical action description fits the Marketplace limit", () => {
     description.length < 125,
     `Marketplace requires under 125 characters; this is ${description.length}: ${description}`,
   );
+});
+
+test("the analyzer cache separates runner architectures and Bifrost versions", () => {
+  const action = fs.readFileSync(".github/actions/policy-scan/action.yml", "utf8");
+  assert.match(
+    action,
+    /key: bifrost-policy-cache-\$\{\{ runner\.os \}\}-\$\{\{ runner\.arch \}\}-\$\{\{ inputs\.version \}\}-\$\{\{ github\.run_id \}\}/u,
+  );
+  assert.match(
+    action,
+    /restore-keys: \|\n\s+bifrost-policy-cache-\$\{\{ runner\.os \}\}-\$\{\{ runner\.arch \}\}-\$\{\{ inputs\.version \}\}-/u,
+  );
+});
+
+function gateScript() {
+  const action = fs.readFileSync(
+    new URL("../../.github/actions/policy-scan/action.yml", import.meta.url),
+    "utf8",
+  );
+  const step = action.indexOf("    - name: Gate on the exit code\n");
+  assert.notEqual(step, -1, "the policy-scan action lost its gate step");
+  const run = action.indexOf("      run: |\n", step);
+  assert.notEqual(run, -1, "the policy-scan gate lost its shell body");
+  return action
+    .slice(run + "      run: |\n".length)
+    .split("\n")
+    .filter((line) => line === "" || line.startsWith("        "))
+    .map((line) => line.slice(8))
+    .join("\n");
+}
+
+function runGate({ code, diffBase = "", report, rawReport, failOn = "warning" }) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bifrost-policy-scan-gate."));
+  const reportPath = path.join(dir, "report.sarif");
+  if (rawReport !== undefined) {
+    fs.writeFileSync(reportPath, rawReport);
+  } else if (report !== undefined) {
+    fs.writeFileSync(reportPath, JSON.stringify(report));
+  }
+  try {
+    const result = spawnSync("bash", ["-c", gateScript()], {
+      cwd: dir,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        CODE: String(code),
+        DIFF_BASE: diffBase,
+        FAIL_ON: failOn,
+        SARIF_PATH: reportPath,
+      },
+    });
+    return {
+      status: result.status,
+      stdout: result.stdout,
+      stderr: result.stderr,
+    };
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function sarifReport({ results = [], diffBaseline, executionSuccessful = true, notifications = [] } = {}) {
+  const properties = {};
+  if (diffBaseline !== undefined) {
+    properties["bifrost.diffBaseline"] = diffBaseline;
+  }
+  return {
+    version: "2.1.0",
+    runs: [{
+      results,
+      invocations: [{ executionSuccessful, toolExecutionNotifications: notifications }],
+      properties,
+    }],
+  };
+}
+
+function sarifFinding({ disposition = "new", ruleId = "policy.rule", pathName = "src/main.py", line = 7, message = "policy finding", level = "warning", findingId = "finding-1" } = {}) {
+  return {
+    ruleId,
+    level,
+    message: { text: message },
+    locations: [{ physicalLocation: { artifactLocation: { uri: pathName }, region: { startLine: line } } }],
+    properties: {
+      "bifrost.diffDisposition": disposition,
+      "bifrost.findingId": findingId,
+    },
+  };
+}
+
+test("a reliable diff-aware baseline-only code 1 succeeds, but non-diff code 1 fails", () => {
+  const report = sarifReport({
+    diffBaseline: { baseRevision: "origin/master", degraded: false },
+    results: [sarifFinding({ disposition: "persisting", message: "existing finding" })],
+  });
+  const baselineOnly = runGate({ code: 1, diffBase: "origin/master", report });
+  assert.equal(baselineOnly.status, 0, baselineOnly.stderr);
+  assert.match(baselineOnly.stdout, /No new findings at or above fail-on/u);
+
+  const withoutDiff = runGate({ code: 1, report });
+  assert.equal(withoutDiff.status, 1);
+  assert.match(withoutDiff.stdout, /without a diff-base/u);
+
+  const unreliable = runGate({
+    code: 1,
+    diffBase: "origin/master",
+    report: sarifReport({
+      diffBaseline: { baseRevision: "origin/master", degraded: true },
+      results: [sarifFinding({ disposition: "persisting" })],
+      executionSuccessful: false,
+    }),
+  });
+  assert.equal(unreliable.status, 1);
+  assert.match(unreliable.stdout, /does not prove a reliable diff-aware run/u);
+});
+
+test("a new gating finding is printed and keeps code 1 failing", () => {
+  const result = runGate({
+    code: 1,
+    diffBase: "origin/master",
+    report: sarifReport({
+      diffBaseline: { baseRevision: "origin/master", degraded: false },
+      results: [sarifFinding({ ruleId: "policy.new", pathName: "src/new.py", line: 12, message: "new issue" })],
+    }),
+  });
+  assert.equal(result.status, 1);
+  assert.match(result.stdout, /policy\.new src\/new\.py:12 new issue/u);
+  assert.match(result.stdout, /found findings at or above the fail-on threshold/u);
+});
+
+test("an unreliable code 2 prints its SARIF diagnostic and fails", () => {
+  const result = runGate({
+    code: 2,
+    report: sarifReport({
+      executionSuccessful: false,
+      notifications: [{
+        descriptor: { id: "BIFROST_REPORT_DIAGNOSTIC" },
+        properties: { "bifrost.reportDiagnostic": { code: "diff-base-unreliable" } },
+        message: { text: "baseline could not be evaluated" },
+      }],
+    }),
+  });
+  assert.equal(result.status, 2);
+  assert.match(result.stdout, /diff-base-unreliable: baseline could not be evaluated/u);
+  assert.match(result.stdout, /UNRELIABLE/u);
+});
+
+test("unexpected statuses and missing or invalid SARIF fail closed", () => {
+  const valid = sarifReport();
+  const unexpected = runGate({ code: 9, report: valid });
+  assert.equal(unexpected.status, 1);
+  assert.match(unexpected.stdout, /unexpected status 9/u);
+
+  const missing = runGate({ code: 0 });
+  assert.equal(missing.status, 1);
+  assert.match(missing.stdout, /did not emit a SARIF report/u);
+
+  const unsuccessful = runGate({ code: 0, report: sarifReport({ executionSuccessful: false }) });
+  assert.equal(unsuccessful.status, 1);
+  assert.match(unsuccessful.stdout, /unsuccessful invocation/u);
+
+  const invalid = runGate({ code: 0, rawReport: "not json" });
+  assert.equal(invalid.status, 1);
+  assert.match(invalid.stdout, /invalid SARIF report/u);
+
+  const wrongShape = runGate({ code: 0, report: { version: "2.1.0", runs: [{ results: [] }] } });
+  assert.equal(wrongShape.status, 1);
+  assert.match(wrongShape.stdout, /invalid SARIF report/u);
 });

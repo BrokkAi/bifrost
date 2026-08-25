@@ -71,6 +71,36 @@ pub(crate) fn class_range_index_from_declaration_ranges(
 /// (`DEFAULT_MAX_USAGES`) so `usage_graph`'s truncation matches `scan_usages`.
 pub(crate) const MAX_CALLSITES: usize = crate::analyzer::usages::DEFAULT_MAX_USAGES;
 
+/// The endpoint-admission contract for one inverted edge build.
+///
+/// Weight consumers retain a closed graph domain. The public rooted graph uses
+/// an open callee domain so it can start with only its caller frontier and
+/// validate exact resolved targets after the scan. Inbound consumers invert
+/// that shape: every indexed enclosing declaration may be a caller, while the
+/// requested callee catalog remains closed.
+pub(crate) enum EdgeNodeDomain<'a, K = String> {
+    Closed(&'a HashSet<K>),
+    Rooted(&'a HashSet<K>),
+    Inbound(&'a HashSet<K>),
+}
+
+impl<K> Copy for EdgeNodeDomain<'_, K> {}
+
+impl<K> Clone for EdgeNodeDomain<'_, K> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<'a, K> EdgeNodeDomain<'a, K> {
+    pub(crate) fn callers(self) -> &'a HashSet<K> {
+        match self {
+            Self::Closed(nodes) | Self::Rooted(nodes) => nodes,
+            Self::Inbound(_) => unreachable!("inbound domains do not enumerate callers"),
+        }
+    }
+}
+
 /// Selects how a whole-workspace per-file scan is finalized. Language builders
 /// are generic over this trait so the AST walk is written once while callers can
 /// request either site-bearing API edges or compact weights for graph algorithms.
@@ -300,13 +330,49 @@ where
     K: NodeKey,
     S: FnOnce(&FileEdgeScanInput<'_, K>) -> PerFileEdges<K>,
 {
-    let input = FileEdgeScanInput::new(
-        &parsed.tree,
-        parsed.source.as_str(),
-        &parsed.line_starts,
-        nodes,
-        &declarations,
-    );
+    collect_file_edges_with_domain(
+        file,
+        EdgeNodeDomain::Closed(nodes),
+        parsed,
+        declarations,
+        scan,
+    )
+}
+
+pub(crate) fn collect_file_edges_with_domain<K, S>(
+    file: &ProjectFile,
+    domain: EdgeNodeDomain<'_, K>,
+    parsed: &ParsedTreeFile,
+    declarations: FileDeclarations<K>,
+    scan: S,
+) -> PerFileEdges<K>
+where
+    K: NodeKey,
+    S: FnOnce(&FileEdgeScanInput<'_, K>) -> PerFileEdges<K>,
+{
+    let input = match domain {
+        EdgeNodeDomain::Closed(nodes) => FileEdgeScanInput::new(
+            &parsed.tree,
+            parsed.source.as_str(),
+            &parsed.line_starts,
+            nodes,
+            &declarations,
+        ),
+        EdgeNodeDomain::Rooted(callers) => FileEdgeScanInput::new_rooted(
+            &parsed.tree,
+            parsed.source.as_str(),
+            &parsed.line_starts,
+            callers,
+            &declarations,
+        ),
+        EdgeNodeDomain::Inbound(callees) => FileEdgeScanInput::new_inbound(
+            &parsed.tree,
+            parsed.source.as_str(),
+            &parsed.line_starts,
+            callees,
+            &declarations,
+        ),
+    };
     let mut out = scan(&input);
     out.path = crate::path_utils::rel_path_string(file);
     out
@@ -325,10 +391,10 @@ where
 /// generalizing this over [`NodeKey`] would push file-scoping bounds onto code that
 /// has no business knowing about it. Module-scoped languages route through their own
 /// cross-file index instead of this on-demand parse.
-pub(crate) fn parse_and_collect<S>(
+pub(crate) fn parse_and_collect_with_domain<S>(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
-    nodes: &HashSet<String>,
+    domain: EdgeNodeDomain<'_>,
     spec: ParseSpec<'_>,
     scan: S,
 ) -> Option<PerFileEdges>
@@ -336,12 +402,19 @@ where
     S: FnOnce(&FileEdgeScanInput<'_>) -> PerFileEdges,
 {
     let parsed = parse_tree_sitter_file(file, spec)?;
-    Some(collect_file_edges(analyzer, file, nodes, &parsed, scan))
+    let declarations = build_file_declarations(analyzer, file);
+    Some(collect_file_edges_with_domain(
+        file,
+        domain,
+        &parsed,
+        declarations,
+        scan,
+    ))
 }
 
-pub(crate) fn parse_and_collect_with_declarations<S>(
+pub(crate) fn parse_and_collect_with_declarations_and_domain<S>(
     file: &ProjectFile,
-    nodes: &HashSet<String>,
+    domain: EdgeNodeDomain<'_>,
     spec: ParseSpec<'_>,
     declarations: FileDeclarations,
     scan: S,
@@ -350,19 +423,19 @@ where
     S: FnOnce(&FileEdgeScanInput<'_>) -> PerFileEdges,
 {
     let parsed = parse_tree_sitter_file(file, spec)?;
-    Some(collect_file_edges_with_declarations(
+    Some(collect_file_edges_with_domain(
         file,
-        nodes,
+        domain,
         &parsed,
         declarations,
         scan,
     ))
 }
 
-pub(crate) fn parse_source_and_collect_with_declarations<S>(
+pub(crate) fn parse_source_and_collect_with_declarations_and_domain<S>(
     source: String,
     file: &ProjectFile,
-    nodes: &HashSet<String>,
+    domain: EdgeNodeDomain<'_>,
     spec: ParseSpec<'_>,
     declarations: FileDeclarations,
     scan: S,
@@ -371,9 +444,9 @@ where
     S: FnOnce(&FileEdgeScanInput<'_>) -> PerFileEdges,
 {
     let parsed = parse_tree_sitter_source(source, spec)?;
-    Some(collect_file_edges_with_declarations(
+    Some(collect_file_edges_with_domain(
         file,
-        nodes,
+        domain,
         &parsed,
         declarations,
         scan,
@@ -794,5 +867,46 @@ mod tests {
             vec![3],
             "file-scoped record must emit a 1-based line (3), not 0-based (2)"
         );
+    }
+
+    #[test]
+    fn inbound_domain_bounds_callees_but_keeps_all_indexed_callers() {
+        let source = "function caller() { target(); unknown(); }";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let caller = "app.caller".to_string();
+        let callee = "app.target".to_string();
+        let other = "app.other".to_string();
+        let callees = HashSet::from_iter([callee.clone()]);
+        let declarations = FileDeclarations {
+            enclosers: vec![(0, source.len(), caller.clone())],
+            definitions: HashMap::default(),
+        };
+        let input = FileEdgeScanInput::new_inbound(&tree, source, &[0], &callees, &declarations);
+        assert!(input.may_match_terminal("target"));
+        assert!(!input.may_match_terminal("unknown"));
+
+        let callers = HashSet::from_iter([caller.clone()]);
+        let rooted = FileEdgeScanInput::new_rooted(&tree, source, &[0], &callers, &declarations);
+        assert!(rooted.may_match_terminal("unknown"));
+        let mut file = PerFileEdges::default();
+
+        file.record_kind(&input, callee.clone(), UsageReferenceKind::Call, 22, 28);
+        file.record_kind(&input, other.clone(), UsageReferenceKind::Call, 30, 37);
+        file.record_unproven(&input, callee.clone(), 22, 28);
+        file.record_unproven(&input, other, 30, 37);
+
+        assert!(file.edge_lines.contains_key(&(caller, callee.clone())));
+        assert!(
+            !file
+                .edge_lines
+                .keys()
+                .any(|(_, recorded_callee)| recorded_callee == "app.other")
+        );
+        assert_eq!(file.unproven_inbound[&callee].len(), 1);
+        assert!(!file.unproven_inbound.contains_key("app.other"));
     }
 }

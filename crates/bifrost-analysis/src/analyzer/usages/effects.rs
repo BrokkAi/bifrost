@@ -32,6 +32,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::analyzer::i_analyzer::IAnalyzer;
 use crate::analyzer::semantic::LengthDelimitedDigest;
 use crate::analyzer::semantic::cfg_algorithms::{
     CfgAlgorithmBudget, CfgAlgorithmRequest, DenseBidirectionalGraph, strongly_connected_components,
@@ -39,8 +40,10 @@ use crate::analyzer::semantic::cfg_algorithms::{
 use crate::analyzer::semantic_model::{
     CompiledDeclaredEffect, CompiledDeclaredEffectCertainty, CompiledDeclaredEffectTiming,
 };
+use crate::analyzer::usages::callable_signature::callable_signature_reports;
 use crate::analyzer::{CodeUnit, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
+use brokk_bifrost_core::analyzer::structural::callable::ReceiverContract;
 
 /// Domain separator for one direct call-effect row id.
 const CALL_EFFECT_ID_DOMAIN: &[u8] = b"bifrost.code_query.call_effect.v1";
@@ -363,8 +366,24 @@ pub struct CallEffectArm {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArmLookup {
     /// A unique activated summary models the callee; these are its
-    /// declarations, in the compiler's canonical order.
+    /// declarations, in the compiler's canonical order. The callee's own
+    /// behaviour is still reachable some other way -- a workspace body the
+    /// walk reads, or an implementation the summary does not claim to speak
+    /// for -- so the arm's own dispatch evidence still decides its coverage.
     Declared(Vec<BoundDeclaredEffect>),
+    /// A unique activated summary is the *whole* answer for a callee the
+    /// workspace does not materialize: it is authored complete, and either the
+    /// callee is receiverless (nothing can override it) or the author claimed
+    /// `covers_overrides` for every implementation outside the workspace
+    /// (#2371).
+    ///
+    /// Such an arm closes. There is no body to read, and the resolver's own
+    /// evidence about the callee is deliberately partial precisely because an
+    /// activated summary is what supplies it, so treating that partial mark as
+    /// a gap would make an authored claim unusable by construction. An empty
+    /// declaration list here is the reviewed claim that the member performs no
+    /// declared effect, not a row that went missing.
+    SummarizedExternal(Vec<BoundDeclaredEffect>),
     /// No canonical key could be built for the arm's target.
     Unkeyable,
     /// Several activated summaries disagree about the callee.
@@ -373,6 +392,18 @@ pub enum ArmLookup {
     /// this is a coverage gap depends on `analyzable`: a workspace procedure
     /// with a body is covered by propagation, an external callee is not.
     Unmodeled { analyzable: bool },
+}
+
+impl ArmLookup {
+    /// Whether an authored complete summary is this arm's evidence, so the
+    /// resolver's own `partial` mark on the arm states an absence the summary
+    /// has already filled rather than a gap.
+    ///
+    /// One predicate, used for both axes the mark feeds -- the site's coverage
+    /// and the row's certainty -- because it is one fact about the arm.
+    pub const fn is_closed_by_summary(&self) -> bool {
+        matches!(self, Self::SummarizedExternal(_))
+    }
 }
 
 /// One direct effect row of one call site.
@@ -460,12 +491,16 @@ pub fn call_effect_report(
     let mut modeled_arm_count = 0usize;
     let mut gap: Option<EffectReason> = None;
     for arm in arms {
-        if !arm.complete {
+        // A summarized external arm carries no dispatch evidence that could be
+        // incomplete: the resolver marks it partial exactly because the callee's
+        // body is outside the indexed workspace, and the complete summary is
+        // what supplies it. Every other arm's own completeness still governs.
+        if !arm.complete && !arm.lookup.is_closed_by_summary() {
             gap = gap.or(Some(EffectReason::DispatchUnresolved));
             coverage = coverage.meet(EffectCoverage::Open);
         }
         match &arm.lookup {
-            ArmLookup::Declared(effects) => {
+            ArmLookup::Declared(effects) | ArmLookup::SummarizedExternal(effects) => {
                 modeled_arm_count = modeled_arm_count.saturating_add(1);
                 for effect in effects {
                     rows.push(declared_call_effect_row(
@@ -557,7 +592,10 @@ fn declared_call_effect_row(
     // possible under a proven dispatch, and a `definite` declaration is
     // downgraded by an unproven or incomplete arm, or by a candidate set that
     // may hold another callee.
-    let dispatch_certainty = if site_definite && arm.proof == EffectProof::Proven && arm.complete {
+    let dispatch_certainty = if site_definite
+        && arm.proof == EffectProof::Proven
+        && (arm.complete || arm.lookup.is_closed_by_summary())
+    {
         EffectCertainty::Definite
     } else {
         EffectCertainty::Possible
@@ -645,6 +683,38 @@ impl Default for ProcedureEffectBudget {
     }
 }
 
+/// How one graph node's own effect set was established.
+///
+/// A node publishes an exhaustive effect set only when one of the two positive
+/// bases holds. They are genuinely different proofs of the same fact -- "every
+/// effect this procedure performs is accounted for" -- so the node records
+/// which one it has rather than collapsing them into a boolean nobody can read
+/// back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectNodeBasis {
+    /// Nothing established the node's effect set: its body was never read and
+    /// no summary states it. Every absence claim reaching it is non-exhaustive.
+    Unestablished,
+    /// The body was read and its call sites enumerated, so the node's effects
+    /// are its declarations plus whatever propagates along its outgoing edges.
+    BodyRead,
+    /// A complete activated summary states the member's effects in full. The
+    /// node is a leaf -- its own callees are outside the workspace and are not
+    /// analyzable -- and that is not a gap, because the summary's completeness
+    /// claim is exactly the assertion that nothing else is reachable through
+    /// it. An empty `declared` list under this basis is the reviewed claim
+    /// "this member performs no declared effect".
+    CompleteSummary,
+}
+
+impl EffectNodeBasis {
+    /// Whether the node's own effect set is complete, so an absence claim
+    /// through it can stay exhaustive.
+    pub const fn is_established(self) -> bool {
+        matches!(self, Self::BodyRead | Self::CompleteSummary)
+    }
+}
+
 /// One node of the reachable call graph the fixpoint runs over.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectGraphProcedure {
@@ -654,10 +724,8 @@ pub struct EffectGraphProcedure {
     pub display_name: String,
     /// Effects an activated pack declares for this procedure itself.
     pub declared: Vec<BoundDeclaredEffect>,
-    /// Whether the procedure's own body was read and its call sites
-    /// enumerated. A procedure nobody could read makes every absence claim
-    /// through it non-exhaustive.
-    pub body_read: bool,
+    /// What establishes this procedure's own effect set.
+    pub basis: EffectNodeBasis,
     /// Typed gaps found while enumerating this procedure's call sites.
     pub local_gaps: Vec<EffectReason>,
 }
@@ -1024,7 +1092,7 @@ pub fn summarize_procedure_effects(
         .iter()
         .enumerate()
         .map(|(node, procedure)| {
-            let mut value = if procedure.body_read {
+            let mut value = if procedure.basis.is_established() {
                 EffectCoverage::Exhaustive
             } else {
                 EffectCoverage::Open
@@ -1046,7 +1114,7 @@ pub fn summarize_procedure_effects(
         .iter()
         .enumerate()
         .map(|(node, procedure)| {
-            if !procedure.body_read {
+            if !procedure.basis.is_established() {
                 return Some(EffectReason::ProcedureUnreadable);
             }
             if let Some(reason) = procedure.local_gaps.first() {
@@ -1189,6 +1257,33 @@ pub fn modeled_procedure_key(
         has_receiver: has_receiver?,
         parameter_count: parameter_count?,
     })
+}
+
+/// Build the canonical procedure key for one persisted workspace declaration.
+///
+/// This is the one declaration-side key path shared by effect evaluation and
+/// report accounting. It refuses overload sets and unrecorded receiver facts;
+/// both cases lack the exact identity required to bind a reviewed summary.
+pub fn modeled_procedure_key_for_unit(
+    analyzer: &dyn IAnalyzer,
+    unit: &CodeUnit,
+) -> Option<ModeledProcedureKey> {
+    if !unit.is_callable() || unit.is_synthetic() {
+        return None;
+    }
+    let entries = analyzer.signature_metadata(unit);
+    if entries.len() != 1 {
+        return None;
+    }
+    let mut reports = callable_signature_reports("modeled-procedure-key", unit, &entries);
+    let signature = reports.pop()?.signature;
+    let has_receiver = match signature.receiver_contract? {
+        ReceiverContract::Instance | ReceiverContract::Extension => true,
+        ReceiverContract::None | ReceiverContract::StaticOrCompanion => false,
+    };
+    let parameter_count = u32::try_from(signature.parameter_count).ok()?;
+    let language = crate::analyzer::common::language_for_file(unit.source()).config_label();
+    modeled_procedure_key(language, unit, Some(has_receiver), Some(parameter_count))
 }
 
 #[cfg(test)]
@@ -1383,7 +1478,7 @@ mod tests {
             declaration_id: format!("decl:{name}"),
             display_name: name.to_owned(),
             declared,
-            body_read: true,
+            basis: EffectNodeBasis::BodyRead,
             local_gaps: Vec::new(),
         }
     }
@@ -1544,7 +1639,7 @@ mod tests {
     #[test]
     fn an_unreadable_callee_opens_every_caller_that_reaches_it() {
         let mut opaque = procedure("App.opaque", Vec::new());
-        opaque.body_read = false;
+        opaque.basis = EffectNodeBasis::Unestablished;
         let graph = EffectGraph {
             procedures: vec![procedure("App.pure", Vec::new()), opaque],
             edges: vec![edge(0, 1, "site.pure")],
@@ -1557,6 +1652,53 @@ mod tests {
             reports[0].rows[0].reason,
             Some(EffectReason::ProcedureUnreadable)
         );
+    }
+
+    #[test]
+    fn a_summarized_leaf_keeps_its_callers_exhaustive_and_propagates_its_declaration() {
+        // The external member has no body and no outgoing edge. Its complete
+        // summary is what establishes its effect set, so the caller stays
+        // exhaustive and still inherits the declaration.
+        let mut external = procedure(
+            "java.io.Writer.write/1+recv",
+            vec![declared(
+                "io.stream_write",
+                EffectTiming::Immediate,
+                EffectCertainty::Definite,
+            )],
+        );
+        external.basis = EffectNodeBasis::CompleteSummary;
+        let graph = EffectGraph {
+            procedures: vec![procedure("App.render", Vec::new()), external],
+            edges: vec![edge(0, 1, "site.render")],
+            truncated: false,
+        };
+        let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default());
+        assert_eq!(reports[0].coverage, EffectCoverage::Exhaustive);
+        assert_eq!(
+            reports[0].rows[0].effect_id.as_deref(),
+            Some("io.stream_write")
+        );
+        assert_eq!(reports[0].rows[0].derivation, EffectDerivation::Declared);
+        assert_eq!(
+            reports[0].rows[0].witness_chain().as_deref(),
+            Some("App.render -> java.io.Writer.write/1+recv")
+        );
+    }
+
+    #[test]
+    fn a_known_empty_summarized_leaf_leaves_its_caller_absence_exhaustive() {
+        let mut external = procedure("java.lang.String.length/0+recv", Vec::new());
+        external.basis = EffectNodeBasis::CompleteSummary;
+        let graph = EffectGraph {
+            procedures: vec![procedure("App.pure", Vec::new()), external],
+            edges: vec![edge(0, 1, "site.pure")],
+            truncated: false,
+        };
+        let reports = summarize_procedure_effects(&graph, ProcedureEffectBudget::default());
+        assert_eq!(reports[0].coverage, EffectCoverage::Exhaustive);
+        assert_eq!(reports[0].rows[0].derivation, EffectDerivation::None);
+        assert_eq!(reports[0].rows[0].reason, None);
     }
 
     #[test]

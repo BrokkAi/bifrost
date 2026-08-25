@@ -4,14 +4,15 @@
 //! reparse source, infer identities from names, or upgrade allocation-site
 //! identities into runtime singletons.
 
-use std::collections::VecDeque;
-
 use super::WorkspaceSemanticOracle;
 use super::common::{
     Interruption, WorkStager, dedup_evidence, evidence_handle, evidence_quality, internal_contract,
     value_handle,
 };
 use super::value_flow::constructor_allocation_identity_discharges_gap;
+use crate::analyzer::semantic::cfg_algorithms::{
+    CfgAlgorithmBudget, CfgAlgorithmError, CfgAlgorithmRequest, loop_regions,
+};
 use crate::analyzer::semantic::{
     AbstractLocation, AbstractObject, AbstractObjectIdentity, AccessPath, AccessPathAtPoint,
     AccessPathRoot, AliasExclusivity, AliasExclusivityWitness, AliasQuery, AliasRelation,
@@ -403,56 +404,104 @@ fn location_capabilities_are_open(access: &AccessPathAtPoint) -> bool {
             })
 }
 
-fn allocation_is_cyclic(
+/// Cyclic control-flow membership for one procedure, derived once per query.
+///
+/// `loop_regions` (#2102) is the workspace's one loop-membership algorithm and
+/// it is SCC-based, so it names an irreducible cycle as well as a natural loop.
+/// Membership is the whole allocation-cardinality question: a site inside a
+/// cyclic region runs an unbounded number of times per activation, so its
+/// abstraction summarizes many runtime objects, while a site outside every
+/// cyclic region runs at most once. The region's back edges are the exact
+/// evidence for that claim, which a per-allocation reachability walk could only
+/// approximate with every edge it happened to visit.
+struct CyclicRegions {
+    region_by_point: Box<[Option<usize>]>,
+    back_edge_evidence: Box<[Box<[crate::analyzer::semantic::EvidenceId]>]>,
+}
+
+impl CyclicRegions {
+    /// Evidence that the allocation point is inside a cyclic region, or `None`
+    /// when it is not.
+    fn cycle_evidence(
+        &self,
+        point: crate::analyzer::semantic::ProgramPointId,
+    ) -> Option<&[crate::analyzer::semantic::EvidenceId]> {
+        self.region_by_point
+            .get(point.index())
+            .copied()
+            .flatten()
+            .map(|region| self.back_edge_evidence[region].as_ref())
+    }
+}
+
+/// Derive cyclic membership, or `None` when the bounded algorithm could not
+/// answer. A caller that receives `None` must not claim a singleton.
+fn cyclic_regions(
     procedure: &ProcedureHandle,
-    point: crate::analyzer::semantic::ProgramPointId,
     staged: &mut WorkStager,
     cancellation: &crate::cancellation::CancellationToken,
-) -> Result<(bool, Vec<crate::analyzer::semantic::EvidenceId>), Interruption> {
-    let cfg = procedure.semantics().cfg();
-    let mut queue = VecDeque::new();
-    let mut visited = HashSet::default();
-    let mut evidence = Vec::new();
-    for (_, edge) in cfg.successor_edges(point) {
-        staged.charge(SemanticWork {
-            control_edges: 1,
-            ..SemanticWork::default()
-        })?;
-        if !evidence.contains(&edge.evidence) {
-            evidence.push(edge.evidence);
+) -> Result<Option<CyclicRegions>, Interruption> {
+    let semantics = procedure.semantics();
+    staged.charge(SemanticWork {
+        program_points: semantics.points().len(),
+        control_edges: semantics.control_edges().len(),
+        ..SemanticWork::default()
+    })?;
+    let mut budget = CfgAlgorithmBudget::default();
+    let regions = match loop_regions(
+        semantics,
+        &mut CfgAlgorithmRequest::new(&mut budget, cancellation),
+    ) {
+        Ok(regions) => regions,
+        Err(CfgAlgorithmError::Cancelled { .. }) => return Err(Interruption::Cancelled),
+        Err(CfgAlgorithmError::ExceededBudget(_) | CfgAlgorithmError::InvalidNode(_)) => {
+            return Ok(None);
         }
-        if edge.target_point == point {
-            return Ok((true, evidence));
+    };
+    let mut region_by_point = vec![None; semantics.points().len()];
+    let mut back_edge_evidence = Vec::with_capacity(regions.regions.len());
+    for (index, region) in regions.regions.iter().enumerate() {
+        for member in &region.members {
+            region_by_point[member.index()] = Some(index);
         }
-        if visited.insert(edge.target_point) {
-            queue.push_back(edge.target_point);
-        }
+        back_edge_evidence.push(
+            region
+                .back_edges
+                .iter()
+                .filter_map(|edge| semantics.control_edge(*edge).map(|row| row.evidence))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
     }
-    while let Some(current) = queue.pop_front() {
-        if cancellation.is_cancelled() {
-            return Err(Interruption::Cancelled);
-        }
-        staged.charge(SemanticWork {
-            program_points: 1,
-            ..SemanticWork::default()
-        })?;
-        for (_, edge) in cfg.successor_edges(current) {
-            staged.charge(SemanticWork {
-                control_edges: 1,
-                ..SemanticWork::default()
-            })?;
-            if !evidence.contains(&edge.evidence) {
-                evidence.push(edge.evidence);
+    Ok(Some(CyclicRegions {
+        region_by_point: region_by_point.into_boxed_slice(),
+        back_edge_evidence: back_edge_evidence.into_boxed_slice(),
+    }))
+}
+
+/// Whether a closure publishes this allocation outside its own activation.
+///
+/// A captured allocation is reachable from another procedure's activation, and
+/// this procedure's loop and recursion evidence says nothing about how many
+/// times that activation ran the site. The same rule already makes a
+/// [`AccessPathRoot::CaptureSlot`] root a summary object; applying it to the
+/// allocation the capture names keeps the two answers consistent.
+fn allocation_is_captured(
+    procedure: &ProcedureHandle,
+    allocation: crate::analyzer::semantic::AllocationId,
+    result: crate::analyzer::semantic::ValueId,
+) -> bool {
+    procedure.semantics().captures().iter().any(|capture| {
+        capture.environment == allocation
+            || capture.callable == result
+            || match capture.captured {
+                CaptureSource::Value(value) => value == result,
+                CaptureSource::Location(location) => procedure
+                    .semantics()
+                    .memory_location(location)
+                    .is_some_and(|row| memory_location_uses_value(&row.kind, result)),
             }
-            if edge.target_point == point {
-                return Ok((true, evidence));
-            }
-            if visited.insert(edge.target_point) {
-                queue.push_back(edge.target_point);
-            }
-        }
-    }
-    Ok((false, Vec::new()))
+    })
 }
 
 fn push_object(
@@ -837,6 +886,9 @@ fn resolve_objects(
     let mut truncated = false;
     let mut ambiguous = false;
     let mut abort_user_code = None;
+    // Loop membership is a property of the procedure, so the derivation runs at
+    // most once per query no matter how many allocations the trace reaches.
+    let mut cyclic: Option<Option<CyclicRegions>> = None;
 
     while let Some((state, inherited_evidence)) = stack.pop() {
         if cancellation.is_cancelled() {
@@ -928,9 +980,19 @@ fn resolve_objects(
                             ..SemanticWork::default()
                         })
                         .map_err(InterruptionOrProvider::Interruption)?;
-                    let (cyclic, cycle_evidence) =
-                        allocation_is_cyclic(procedure, allocation_row.point, staged, cancellation)
-                            .map_err(InterruptionOrProvider::Interruption)?;
+                    if cyclic.is_none() {
+                        cyclic = Some(
+                            cyclic_regions(procedure, staged, cancellation)
+                                .map_err(InterruptionOrProvider::Interruption)?,
+                        );
+                    }
+                    let regions = cyclic
+                        .as_ref()
+                        .expect("cyclic membership was derived above")
+                        .as_ref();
+                    let cycle_evidence = regions
+                        .and_then(|regions| regions.cycle_evidence(allocation_row.point))
+                        .map(<[_]>::to_vec);
                     let handle = procedure.allocation_handle(allocation).ok_or_else(|| {
                         InterruptionOrProvider::Provider(SemanticProviderError::internal(
                             "allocation handle is stale",
@@ -941,13 +1003,25 @@ fn resolve_objects(
                         .calls()
                         .iter()
                         .any(|call| call.procedure() == procedure);
+                    // #2444: an allocation denotes exactly one runtime object
+                    // when nothing can run its site twice within the activation
+                    // this query names, and when no closure can observe the
+                    // object from an activation whose loop and recursion
+                    // evidence this query does not hold. `Unknown` remains the
+                    // answer when the bounded loop derivation could not run at
+                    // all, because absence of a region is then not a proof.
+                    let cardinality = if cycle_evidence.is_some() || recursive_context {
+                        ObjectCardinality::Summary
+                    } else if regions.is_some()
+                        && !allocation_is_captured(procedure, allocation, allocation_row.result)
+                    {
+                        ObjectCardinality::Singleton
+                    } else {
+                        ObjectCardinality::Unknown
+                    };
                     let object = AbstractObject::new(
                         AbstractObjectIdentity::Allocation(handle),
-                        if cyclic || recursive_context {
-                            ObjectCardinality::Summary
-                        } else {
-                            ObjectCardinality::Unknown
-                        },
+                        cardinality,
                     )
                     .map_err(|error| {
                         InterruptionOrProvider::Provider(internal_contract(
@@ -956,6 +1030,7 @@ fn resolve_objects(
                         ))
                     })?;
                     let cycle_evidence = cycle_evidence
+                        .unwrap_or_default()
                         .into_iter()
                         .map(|id| evidence_handle(procedure, id))
                         .collect::<Result<Vec<_>, _>>()
@@ -1575,9 +1650,148 @@ fn direct_weak_reasons(
     reasons.into_boxed_slice()
 }
 
+/// Whether the object a resolved location names can be reached under a name
+/// this procedure does not control.
+///
+/// The answer is a copy closure over the procedure's own value flow. An
+/// allocation is fresh, so the only way another name can reach it is if this
+/// procedure publishes it: by capturing it in a closure, passing it to a call
+/// as callee, receiver or argument, storing it into memory, returning it, or
+/// throwing it. Each of those hands the reference to code this query does not
+/// analyse. A local copy (`alias = box`) is not a publication -- both names
+/// stay inside the procedure, and the flow client already tracks them as
+/// separate carriers.
+///
+/// A lexical cell keeps its established rule: it does not escape while no
+/// capture names it. Every other identity has no such proof available here, so
+/// it may escape.
+fn object_escape_status(
+    identity: &AbstractObjectIdentity,
+    staged: &mut WorkStager,
+    cancellation: &crate::cancellation::CancellationToken,
+) -> Result<EscapeStatus, Interruption> {
+    let allocation = match identity {
+        AbstractObjectIdentity::Allocation(allocation) => allocation,
+        AbstractObjectIdentity::LexicalCell(location) => {
+            let captured = location
+                .procedure()
+                .semantics()
+                .captures()
+                .iter()
+                .any(|capture| {
+                    matches!(
+                        capture.captured,
+                        CaptureSource::Location(captured) if captured == location.id()
+                    )
+                });
+            return Ok(if captured {
+                EscapeStatus::MayEscape
+            } else {
+                EscapeStatus::DoesNotEscape
+            });
+        }
+        _ => return Ok(EscapeStatus::MayEscape),
+    };
+    let procedure = allocation.procedure();
+    let semantics = procedure.semantics();
+    let Some(row) = semantics.allocation(allocation.id()) else {
+        return Ok(EscapeStatus::MayEscape);
+    };
+    if allocation_is_captured(procedure, allocation.id(), row.result) {
+        return Ok(EscapeStatus::MayEscape);
+    }
+
+    // One pass collects the copy edges, then a worklist closes over them. A
+    // repeated pass per name would be quadratic on a large procedure.
+    let mut copies: Vec<(
+        crate::analyzer::semantic::ValueId,
+        crate::analyzer::semantic::ValueId,
+    )> = Vec::new();
+    for point in semantics.points() {
+        staged.charge(SemanticWork {
+            program_points: 1,
+            events: point.events.len(),
+            ..SemanticWork::default()
+        })?;
+        if cancellation.is_cancelled() {
+            return Err(Interruption::Cancelled);
+        }
+        for event in &point.events {
+            match event.effect {
+                SemanticEffect::Assignment { target, value } => copies.push((value, target)),
+                SemanticEffect::ValueFlow {
+                    kind: crate::analyzer::semantic::ValueFlowKind::Local,
+                    source,
+                    target,
+                } => copies.push((source, target)),
+                _ => {}
+            }
+        }
+    }
+    let mut names = HashSet::default();
+    names.insert(row.result);
+    let mut pending = vec![row.result];
+    while let Some(current) = pending.pop() {
+        staged.charge(SemanticWork {
+            values: 1,
+            ..SemanticWork::default()
+        })?;
+        for (source, target) in &copies {
+            if *source == current && names.insert(*target) {
+                pending.push(*target);
+            }
+        }
+    }
+
+    for point in semantics.points() {
+        staged.charge(SemanticWork {
+            events: point.events.len(),
+            ..SemanticWork::default()
+        })?;
+        if cancellation.is_cancelled() {
+            return Err(Interruption::Cancelled);
+        }
+        for event in &point.events {
+            let published = match event.effect {
+                SemanticEffect::MemoryStore { value, .. } => names.contains(&value),
+                SemanticEffect::ProcedureReturn { value } | SemanticEffect::Throw { value } => {
+                    value.is_some_and(|value| names.contains(&value))
+                }
+                SemanticEffect::ValueFlow {
+                    kind:
+                        crate::analyzer::semantic::ValueFlowKind::Return
+                        | crate::analyzer::semantic::ValueFlowKind::Parameter
+                        | crate::analyzer::semantic::ValueFlowKind::Receiver,
+                    source,
+                    ..
+                } => names.contains(&source),
+                SemanticEffect::AsyncSuspend { awaited, .. } => {
+                    awaited.is_some_and(|value| names.contains(&value))
+                }
+                SemanticEffect::Invoke { call_site } => {
+                    semantics.call_site(call_site).is_some_and(|call| {
+                        names.contains(&call.callee)
+                            || call.receiver.is_some_and(|value| names.contains(&value))
+                            || call
+                                .arguments
+                                .iter()
+                                .any(|argument| names.contains(&argument.value))
+                    })
+                }
+                _ => false,
+            };
+            if published {
+                return Ok(EscapeStatus::MayEscape);
+            }
+        }
+    }
+    Ok(EscapeStatus::DoesNotEscape)
+}
+
 fn materialize_update(
     store: &StoreAtPoint,
     drafts: DraftSet<LocationDraft>,
+    escape: EscapeStatus,
     limits: crate::analyzer::semantic::OracleLimits,
 ) -> Result<UpdateEligibility, SemanticProviderError> {
     if drafts.candidates.is_empty() {
@@ -1608,17 +1822,30 @@ fn materialize_update(
         return Ok(UpdateEligibility::Weak(reasons.into_boxed_slice()));
     }
     let first = &drafts.candidates[0];
-    // Strong-update locations must retain the exact store target. A refined
-    // value-root path is still useful for aliasing, but cannot certify this
-    // store because the certificate is intentionally bound to its IR address.
+    // Strong-update locations must retain the exact store target, because the
+    // certificate is bound to this store's own IR address.
+    //
+    // A resolved location can differ from that target only in its root:
+    // `resolve_locations` copies the query's selectors and tail verbatim and
+    // rewrites the root to the object the root value was proven to denote. That
+    // refinement is not discarded here. Cardinality is a property of the
+    // runtime object, not of the syntactic root that names it, so when the
+    // resolution proved the root value denotes one object, the store target
+    // names one location -- which is exactly what a strong update needs. The
+    // syntactic default stands only when the two paths disagree about more than
+    // the root, which resolution does not produce.
     let certificate_location = if first.location.path() == store.target().path() {
         first.location.clone()
     } else {
-        let object = AbstractObject::new(
-            store.target().path().root().clone(),
-            candidate_cardinality_for_root(store.target().path().root()),
-        )
-        .map_err(|error| internal_contract("invalid store object", error))?;
+        let refines_root = first.location.path().selectors() == store.target().path().selectors()
+            && first.location.path().tail() == store.target().path().tail();
+        let cardinality = if refines_root {
+            first.location.object().cardinality()
+        } else {
+            candidate_cardinality_for_root(store.target().path().root())
+        };
+        let object = AbstractObject::new(store.target().path().root().clone(), cardinality)
+            .map_err(|error| internal_contract("invalid store object", error))?;
         AbstractLocation::new(object, store.target().path().clone())
             .map_err(|error| internal_contract("invalid store location", error))?
     };
@@ -1688,26 +1915,8 @@ fn materialize_update(
     )
     .map_err(|error| internal_contract("invalid alias-exclusivity evidence", error))?;
     let escape = OracleCandidate::new(
-        EscapeWitness::new(
-            store.clone(),
-            object.clone(),
-            if matches!(
-                object.identity(),
-                AbstractObjectIdentity::LexicalCell(location)
-                    if !location.procedure().semantics().captures().iter().any(|capture| {
-                        matches!(
-                            capture.captured,
-                            crate::analyzer::semantic::CaptureSource::Location(captured)
-                                if captured == location.id()
-                        )
-                    })
-            ) {
-                EscapeStatus::DoesNotEscape
-            } else {
-                EscapeStatus::MayEscape
-            },
-        )
-        .map_err(|error| internal_contract("invalid escape witness", error))?,
+        EscapeWitness::new(store.clone(), object.clone(), escape)
+            .map_err(|error| internal_contract("invalid escape witness", error))?,
         quality.0,
         quality.1,
         [relation(3)],
@@ -2098,7 +2307,38 @@ impl HeapOracle for WorkspaceSemanticOracle<'_> {
                 },
             });
         }
-        let eligibility = materialize_update(store, drafts, *self.limits())?;
+        // The escape proof is only reachable for a single resolved candidate,
+        // and every other shape has already returned weak above, so the walk it
+        // costs is never paid for a store that could not be strong anyway.
+        let escape = match drafts
+            .candidates
+            .first()
+            .map(|candidate| candidate.location.object().identity())
+        {
+            Some(identity) => {
+                match object_escape_status(identity, &mut staged, request.cancellation) {
+                    Ok(escape) => escape,
+                    Err(interruption) => {
+                        let partial = UpdateEligibility::Weak(
+                            [WeakUpdateReason::IncompleteEscapeEvidence].into(),
+                        );
+                        return Ok(match interruption {
+                            Interruption::Budget(exceeded) => SemanticOutcome::ExceededBudget {
+                                partial: Some(partial),
+                                exceeded,
+                                work: staged.work,
+                            },
+                            Interruption::Cancelled => SemanticOutcome::Cancelled {
+                                partial: Some(partial),
+                                work: staged.work,
+                            },
+                        });
+                    }
+                }
+            }
+            None => EscapeStatus::MayEscape,
+        };
+        let eligibility = materialize_update(store, drafts, escape, *self.limits())?;
         *request.budget = staged.budget;
         Ok(match coverage {
             CandidateCoverage::Exhaustive => SemanticOutcome::Complete {

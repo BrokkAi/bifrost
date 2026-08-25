@@ -19,13 +19,13 @@ use crate::analyzer::languages::{
     DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof, DeadCodeRouting, DeadCodeSupport,
     EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx, LanguageEdgePass, LanguageEdgeSites,
     LanguageEdgeWeights, LanguageSupport, analyzable_file_count, fqn_bulk_nodes,
-    overloaded_function_fqns,
+    overloaded_function_fqns, package_fq_name,
 };
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::java_graph::{
     JavaDeadCodeBulkEligibility, JavaUsageGraphStrategy, build_java_usage_edge_weights,
-    build_java_usage_edges, dead_code_bulk_eligibility,
+    build_java_usage_edges, build_rooted_java_usage_edges, dead_code_bulk_eligibility,
 };
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::{
@@ -33,8 +33,7 @@ use crate::analyzer::{
     CloneSmell, CloneSmellWeights, CodeUnit, DeclarationKind, ExceptionHandlingAnalysis,
     ExceptionSmellWeights, ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider, ImportInfo,
     Language, Project, ProjectFile, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
-    TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider, UsageFactsIndex,
-    resolve_analyzer,
+    TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider, resolve_analyzer,
 };
 use crate::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
@@ -72,6 +71,23 @@ pub struct JavaAnalyzer {
 crate::analyzer::impl_forward_query_provider!(JavaAnalyzer);
 
 impl JavaAnalyzer {
+    #[cfg(test)]
+    pub(crate) fn relational_batch_reader_checkouts_for_test(&self) -> usize {
+        self.inner
+            .analyzer_store()
+            .relational_batch_counts_for_test()
+            .0
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    pub fn reverse_import_indexes_ready_for_test(&self) -> (bool, bool) {
+        (
+            self.memo_caches.reverse_import_index.is_ready(),
+            self.memo_caches.same_package_reference_index.is_ready(),
+        )
+    }
+
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         let mut clone = self.clone();
         clone.inner = clone.inner.clone_with_project(project);
@@ -382,24 +398,57 @@ impl JavaSource for JavaAnalyzer {
         ForwardQueryProvider::forward_definition_fqn(self, fqn)
     }
 
-    fn usage_definitions(
+    fn with_usage_definitions(
         &self,
-        token: QueryToken<'_>,
-    ) -> &dyn crate::analyzer::BoundedDefinitionLookup {
-        self.inner.global_usage_definition_index_ref(token)
+        _token: QueryToken<'_>,
+        read: &mut dyn FnMut(&dyn crate::analyzer::BoundedDefinitionLookup),
+    ) {
+        let lookup = crate::analyzer::AnalyzerDefinitionLookup::new(self, Language::Java);
+        read(&lookup);
     }
 
-    fn source_types_in_package(&self, token: QueryToken<'_>, package_name: &str) -> Vec<CodeUnit> {
-        let mut types: Vec<_> = self
-            .inner
-            .global_usage_definition_index(token)
-            .package_types()
-            .filter(|((package, _), _)| package == package_name)
-            .flat_map(|(_, units)| units.iter().cloned())
-            .collect();
-        types.sort();
-        types.dedup();
-        types
+    fn source_types_in_packages(
+        &self,
+        _token: QueryToken<'_>,
+        package_names: &[String],
+    ) -> HashMap<String, Vec<CodeUnit>> {
+        use crate::analyzer::{
+            DefinitionLanguageScope, RelationalBatchOutcome, RelationalDefinitionQuery,
+            RelationalDefinitionRequest, RelationalDefinitionValue,
+        };
+        use brokk_bifrost_core::analyzer::RelationalName;
+
+        let unique = package_names.iter().collect::<BTreeSet<_>>();
+        let requests = unique
+            .iter()
+            .enumerate()
+            .map(|(ordinal, package)| RelationalDefinitionRequest {
+                ordinal,
+                language_scope: DefinitionLanguageScope::Language(Language::Java),
+                name: RelationalName::stable(package_fq_name(Language::Java, package)),
+                query: RelationalDefinitionQuery::PackageTypesInPackage,
+            })
+            .collect::<Vec<_>>();
+        let outcome = self
+            .relational_definition_batch(&requests, &crate::cancellation::CancellationToken::new());
+        let RelationalBatchOutcome::Complete(results) = outcome else {
+            if let RelationalBatchOutcome::Failed(error) = outcome {
+                self.record_query_failure(crate::analyzer::store::StoreError::new(error.message()));
+            }
+            return HashMap::default();
+        };
+        let packages = unique.into_iter().cloned().collect::<Vec<_>>();
+        assert_eq!(packages.len(), results.len());
+        packages
+            .into_iter()
+            .zip(results)
+            .map(|(package, result)| {
+                let RelationalDefinitionValue::Definitions(types) = result.value else {
+                    panic!("a Java package-types query returned the wrong shape")
+                };
+                (package, types)
+            })
+            .collect()
     }
 
     fn type_identifiers_of(&self, file: &ProjectFile) -> Option<HashSet<String>> {
@@ -621,6 +670,8 @@ impl CodeUnitIndex for JavaAnalyzer {
 }
 
 impl IAnalyzer for JavaAnalyzer {
+    crate::analyzer::i_analyzer::forward_relational_definition_batch!();
+
     #[cfg(any(test, feature = "test-support"))]
     fn test_hooks(&self) -> &dyn crate::analyzer::AnalyzerTestHooks {
         self
@@ -685,17 +736,6 @@ impl IAnalyzer for JavaAnalyzer {
         self.inner.workspace_file_index_cell()
     }
 
-    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
-        // Trait signature is fixed, so this boundary opens the scope the
-        // usage-graph funnel now demands proof of (issue #2423 milestone B).
-        let scope = crate::analyzer::AnalyzerQueryScope::new(self);
-        self.inner.global_usage_definition_index(scope.token())
-    }
-
-    fn usage_facts_index(&self) -> &UsageFactsIndex {
-        self.inner.usage_facts_index()
-    }
-
     fn declaration_syntax_kind(&self, code_unit: &CodeUnit) -> Option<&'static str> {
         self.inner.declaration_syntax_kind(code_unit)
     }
@@ -747,14 +787,20 @@ impl IAnalyzer for JavaAnalyzer {
         Some(self)
     }
 
-    fn structural_search_providers(
+    fn structural_fact_providers(
         &self,
-    ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
-        self.inner.structural_search_providers()
+    ) -> Vec<&dyn crate::analyzer::structural::StructuralFactProvider> {
+        self.inner.structural_fact_providers()
     }
 
     fn snapshot_caches(&self) -> Option<&crate::analyzer::AnalyzerSnapshotCaches> {
         Some(self.inner.snapshot_caches())
+    }
+
+    fn workspace_content_identities(
+        &self,
+    ) -> Option<crate::analyzer::content_identity::WorkspaceContentIdentities> {
+        self.inner.workspace_content_identities()
     }
 
     fn parse_errors(&self, file: &ProjectFile) -> Option<Vec<crate::analyzer::ParseError>> {
@@ -958,18 +1004,6 @@ impl IAnalyzer for JavaAnalyzer {
 
 #[cfg(any(test, feature = "test-support"))]
 impl crate::analyzer::AnalyzerTestHooks for JavaAnalyzer {
-    fn reset_global_usage_definition_index_build_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_global_usage_definition_index_build_count_for_test();
-    }
-
-    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .global_usage_definition_index_build_count_for_test()
-    }
-
     fn reset_full_declaration_scan_count_for_test(&self) {
         self.inner
             .test_hooks()
@@ -1010,6 +1044,29 @@ pub(crate) struct JavaSupport;
 impl LanguageSupport for JavaSupport {
     fn language(&self) -> Language {
         Language::Java
+    }
+
+    /// Answers from `JavaAnalyzer::resolve_member_name_with_external` -- the
+    /// same resolver #1900 built for "go to definition" and diagnostics,
+    /// unmodified -- and claims a constant only when the resolved member is
+    /// proven both `is_static()` and `is_compile_time_constant()` (#2538).
+    fn external_compile_time_constant_member(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        spelling: &str,
+    ) -> bool {
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let Some(java) = resolve_analyzer::<JavaAnalyzer>(analyzer) else {
+            return false;
+        };
+        java.resolve_member_name_with_external(
+            scope.token(),
+            analyzer.semantic_model_overlay(),
+            file,
+            spelling,
+        )
+        .is_some_and(|member| member.is_static() && member.is_compile_time_constant())
     }
 
     /// Java keeps method names and variable names in separate namespaces (JLS
@@ -1110,7 +1167,7 @@ impl LanguageEdgePass for JavaEdgePass {
     }
 
     fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
-        build_java_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file).map(LanguageEdgeSites)
+        build_rooted_java_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file).map(LanguageEdgeSites)
     }
 
     fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {

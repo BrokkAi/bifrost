@@ -35,6 +35,13 @@
 //! language-shaped input; everything else in the converter is shared, so the
 //! non-JVM pack passes exactly the gates the JDK pack does.
 //!
+//! A realm's toolchain pin ([`GoldenRealm::toolchain`]) is optional. An
+//! ecosystem whose discovery paths mint no toolchain evidence -- `cargo` and
+//! `npm` are the motivating cases -- can never present the coordinate a pinned
+//! selector would require, so such a realm ships `compatibility.toolchains: []`
+//! and an activation selector with no toolchain coordinate, the
+//! language-intrinsic activation form the validator sanctions explicitly.
+//!
 //! The conversion is a deterministic function of the candidate content and the
 //! realm: two runs produce byte-identical pack source and audit report, with no
 //! clock.
@@ -75,6 +82,18 @@ const PACK_CONTENT_VERSION: &str = "0.1.0";
 /// their checked-in metadata.
 const PACK_LICENSE: &str = "Apache-2.0";
 
+/// The toolchain a realm's single shard activation selector pins, combined
+/// into one field so a realm cannot declare a name without a requirement or
+/// vice versa.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolchainPin {
+    /// The toolchain the single shard's activation selector pins.
+    pub name: &'static str,
+    /// The toolchain version requirement, low enough that every claimed API
+    /// exists.
+    pub requirement: &'static str,
+}
+
 /// One standard library the golden core models. It is the converter's only
 /// language-shaped input: the pack identity, the toolchain pin, and the
 /// call-shape rule below. Everything else is shared, so a non-JVM realm passes
@@ -88,11 +107,14 @@ pub struct GoldenRealm {
     pub language: &'static str,
     /// The pack ecosystem and the artifact the audit report names.
     pub ecosystem: &'static str,
-    /// The toolchain the single shard's activation selector pins.
-    pub toolchain: &'static str,
-    /// The toolchain version requirement, low enough that every claimed API
-    /// exists.
-    pub toolchain_requirement: &'static str,
+    /// The toolchain the single shard's activation selector pins, or `None`
+    /// when the realm's discovery paths mint no toolchain evidence at all
+    /// (for example a `cargo` or `npm` ecosystem). A toolchain-less realm
+    /// ships `compatibility.toolchains: []` and an activation selector with no
+    /// toolchain coordinate, the language-intrinsic activation form the
+    /// validator sanctions explicitly (an empty coordinate selector still
+    /// requires matching language and ecosystem evidence at runtime).
+    pub toolchain: Option<ToolchainPin>,
     /// The activation target names. Empty when the realm has no target axis, as
     /// the pinned CPython declaration pack already spells it.
     pub targets: &'static [&'static str],
@@ -112,8 +134,10 @@ pub const JDK_REALM: GoldenRealm = GoldenRealm {
     pack_id: "bifrost.jdk-golden-summaries",
     language: "java",
     ecosystem: "jdk",
-    toolchain: "jdk",
-    toolchain_requirement: ">=17.0.0",
+    toolchain: Some(ToolchainPin {
+        name: "jdk",
+        requirement: ">=17.0.0",
+    }),
     targets: &["jvm"],
     provenance_source: "hand-authored golden-core JDK flow-through summaries",
     provenance_revision: "golden-core",
@@ -131,8 +155,10 @@ pub const PYTHON_REALM: GoldenRealm = GoldenRealm {
     pack_id: "bifrost.cpython-golden-summaries",
     language: "python",
     ecosystem: "python",
-    toolchain: "cpython",
-    toolchain_requirement: ">=3.8.0",
+    toolchain: Some(ToolchainPin {
+        name: "cpython",
+        requirement: ">=3.8.0",
+    }),
     targets: &[],
     provenance_source: "hand-authored golden-core CPython flow-through summaries",
     provenance_revision: "golden-core",
@@ -143,11 +169,72 @@ pub const PYTHON_REALM: GoldenRealm = GoldenRealm {
     qualified_static_call_has_receiver: true,
 };
 
+/// The Rust realm. `cargo` is the motivating toolchain-less ecosystem: nothing
+/// in Rust workspace discovery mints a toolchain coordinate, so the realm pins
+/// none and ships the language-intrinsic activation form -- language `rust`,
+/// ecosystem `cargo`, no toolchain, no target. Every claimed API is in `std`
+/// and has been since Rust 1.0.
+pub const RUST_REALM: GoldenRealm = GoldenRealm {
+    pack_id: "bifrost.rust-std-golden-summaries",
+    language: "rust",
+    ecosystem: "cargo",
+    toolchain: None,
+    targets: &[],
+    provenance_source: "hand-authored golden-core Rust std flow-through summaries",
+    provenance_revision: "golden-core",
+    // Rust is the exception to the Java and Python rule. A scoped path is NOT
+    // lowered as a call receiver: `std::str::from_utf8(raw)` publishes owner
+    // `std.str`, member `from_utf8`, and no receiver (#2596). A shipped target
+    // that claimed one would simply never match the canonical binding key.
+    qualified_static_call_has_receiver: false,
+};
+
+/// The JavaScript realm. `npm` is the second toolchain-less ecosystem: nothing
+/// in JavaScript workspace discovery mints a toolchain coordinate, so the realm
+/// pins none and ships the language-intrinsic activation form -- language
+/// `javascript`, ecosystem `npm`, no toolchain, no target.
+///
+/// It shares its candidate directory with [`TYPESCRIPT_REALM`]: the claims are
+/// the same runtime's, and the only thing that differs is the language the pack
+/// declares, so the two packs are two runs of the converter over one input.
+pub const JAVASCRIPT_REALM: GoldenRealm = GoldenRealm {
+    pack_id: "bifrost.javascript-golden-summaries",
+    language: "javascript",
+    ecosystem: "npm",
+    toolchain: None,
+    targets: &[],
+    provenance_source: "hand-authored golden-core JavaScript and TypeScript flow-through summaries",
+    provenance_revision: "golden-core",
+    // A JS/TS member call IS lowered with a receiver, the opposite of a Rust
+    // scoped path: `JSON.parse(raw)` publishes owner `JSON`, member `parse`,
+    // and a receiver, and `path.join(a, b)` publishes the module specifier as
+    // the owner and a receiver too (#2598).
+    qualified_static_call_has_receiver: true,
+};
+
+/// The TypeScript realm. Identical to [`JAVASCRIPT_REALM`] except for the pack
+/// id and the language it declares, because the analyzer reports `javascript`
+/// and `typescript` as distinct language names and a pack activates on one of
+/// them. Both are generated from the one `golden-js-ts` candidate directory.
+pub const TYPESCRIPT_REALM: GoldenRealm = GoldenRealm {
+    pack_id: "bifrost.typescript-golden-summaries",
+    language: "typescript",
+    ecosystem: "npm",
+    toolchain: None,
+    targets: &[],
+    provenance_source: "hand-authored golden-core JavaScript and TypeScript flow-through summaries",
+    provenance_revision: "golden-core",
+    qualified_static_call_has_receiver: true,
+};
+
 /// Resolve a realm from its short name, as the CLI spells it.
 pub fn realm_by_name(name: &str) -> Option<GoldenRealm> {
     match name {
         "jdk" => Some(JDK_REALM),
         "python" => Some(PYTHON_REALM),
+        "rust" => Some(RUST_REALM),
+        "javascript" => Some(JAVASCRIPT_REALM),
+        "typescript" => Some(TYPESCRIPT_REALM),
         _ => None,
     }
 }
@@ -185,8 +272,11 @@ pub struct GeneratedGoldenPack {
     pub artifact: String,
     /// The path under the output root.
     pub relative_path: PathBuf,
-    /// A golden pack is pinned by the JDK toolchain selector, the same real pin
-    /// the JDK declaration and sanitizer packs use.
+    /// Whether the realm pins a toolchain: `true` for the JDK and CPython
+    /// realms, the same real pin the JDK declaration and sanitizer packs use.
+    /// A toolchain-less realm (a `cargo` or `npm` ecosystem, whose discovery
+    /// paths mint no toolchain evidence) ships unpinned, activating on
+    /// language-intrinsic evidence alone.
     pub pinned: bool,
     /// The pack source JSON, pretty-printed with a trailing newline. This is the
     /// exact checked-in bytes and the exact input to `compile_source`.
@@ -463,7 +553,7 @@ fn build_conversion(
         packs: vec![GoldenPackAudit {
             pack_id: realm.pack_id.to_owned(),
             artifact: realm.ecosystem.to_owned(),
-            pinned: true,
+            pinned: realm.toolchain.is_some(),
             ecosystem: realm.ecosystem.to_owned(),
             completeness,
             shipped_summaries,
@@ -475,7 +565,7 @@ fn build_conversion(
             pack_id: realm.pack_id.to_owned(),
             artifact: realm.ecosystem.to_owned(),
             relative_path: PathBuf::from(format!("{}.json", realm.pack_id)),
-            pinned: true,
+            pinned: realm.toolchain.is_some(),
             source_json,
         }],
         audit,
@@ -680,10 +770,15 @@ fn build_pack(
         ecosystem: realm.ecosystem.to_owned(),
         compatibility: Compatibility {
             bifrost: FOUNDRY_BIFROST_REQUIREMENT.to_owned(),
-            toolchains: vec![VersionConstraint {
-                name: realm.toolchain.to_owned(),
-                requirement: realm.toolchain_requirement.to_owned(),
-            }],
+            toolchains: realm
+                .toolchain
+                .map(|pin| {
+                    vec![VersionConstraint {
+                        name: pin.name.to_owned(),
+                        requirement: pin.requirement.to_owned(),
+                    }]
+                })
+                .unwrap_or_default(),
         },
         provenance: Provenance {
             source: realm.provenance_source.to_owned(),
@@ -700,9 +795,9 @@ fn build_pack(
             activation: vec![ActivationSelector {
                 package: None,
                 module: None,
-                toolchain: Some(NameSelector {
-                    name: realm.toolchain.to_owned(),
-                    version: Some(realm.toolchain_requirement.to_owned()),
+                toolchain: realm.toolchain.map(|pin| NameSelector {
+                    name: pin.name.to_owned(),
+                    version: Some(pin.requirement.to_owned()),
                 }),
                 targets: realm
                     .targets
@@ -934,6 +1029,142 @@ mod tests {
         assert_eq!(
             value["shards"][0]["payload"]["summaries"][0]["target"]["has_receiver"],
             serde_json::Value::Bool(true)
+        );
+    }
+
+    /// A realm with no toolchain pin (the shape a future `cargo`- or
+    /// `npm`-ecosystem realm needs, since their discovery paths mint no
+    /// toolchain evidence) ships `compatibility.toolchains: []` and an
+    /// activation selector with no toolchain coordinate -- the
+    /// language-intrinsic activation form the validator sanctions explicitly
+    /// -- and the generated pack still compiles and reports unpinned.
+    const TOOLCHAIN_LESS_REALM: GoldenRealm = GoldenRealm {
+        pack_id: "bifrost.toolchainless-golden-summaries",
+        language: "rust",
+        ecosystem: "cargo",
+        toolchain: None,
+        targets: &[],
+        provenance_source: "test-only toolchain-less realm",
+        provenance_revision: "test",
+        qualified_static_call_has_receiver: true,
+    };
+
+    #[test]
+    fn a_toolchain_less_realm_ships_an_unpinned_pack_that_validates() {
+        let module_function = r#"[{
+          "target": {"path": "src/lib.rs", "symbol": "acme.run(str)", "has_receiver": false, "parameter_count": 1},
+          "completeness": "complete",
+          "transfers": [{"input": {"kind": "parameter", "ordinal": 0}, "exit_kind": "normal", "output": {"kind": "normal_return"}}],
+          "rationale": "flow", "provenance": "hand", "confidence": "high", "citations": "rustdoc"
+        }]"#;
+        let conversion = convert_in(&[("run.json", module_function)], TOOLCHAIN_LESS_REALM);
+        let pack = &conversion.packs[0];
+        assert!(!pack.pinned, "a realm with no toolchain pin ships unpinned");
+        assert!(
+            !conversion.audit.packs[0].pinned,
+            "the audit report agrees the pack is unpinned"
+        );
+
+        let value: serde_json::Value = serde_json::from_str(&pack.source_json).unwrap();
+        assert_eq!(
+            value["compatibility"]["toolchains"],
+            serde_json::json!([]),
+            "a toolchain-less realm declares no compatible toolchains"
+        );
+        let selector = &value["shards"][0]["activation"][0];
+        assert!(
+            selector.get("toolchain").is_none(),
+            "the activation selector carries no toolchain coordinate: {selector:#}"
+        );
+
+        // The production compiler (which runs the validator) accepts the
+        // empty-coordinate selector as language-intrinsic activation.
+        compile_source(
+            SourceFormat::Json,
+            pack.source_json.as_bytes(),
+            &CompilerOptions::default(),
+        )
+        .expect("a toolchain-less golden pack compiles");
+    }
+
+    /// The Rust realm inverts the static-call receiver rule. A Rust scoped path
+    /// publishes owner and member with NO receiver (#2596), so the shipped
+    /// target must say `has_receiver: false` or it never matches the canonical
+    /// binding key. It also ships unpinned, because `cargo` discovery mints no
+    /// toolchain evidence.
+    #[test]
+    fn the_rust_realm_ships_receiverless_unpinned_targets() {
+        let from_utf8 = r#"[{
+          "target": {"path": "library/core/src/str/converts.rs", "symbol": "std.str.from_utf8", "has_receiver": false, "parameter_count": 1},
+          "completeness": "complete",
+          "transfers": [{"input": {"kind": "parameter", "ordinal": 0}, "exit_kind": "normal", "output": {"kind": "normal_return"}}],
+          "rationale": "flow", "provenance": "hand-authored", "confidence": "high", "citations": "std/str/fn.from_utf8.html"
+        }]"#;
+        let conversion = convert_in(&[("str.json", from_utf8)], RUST_REALM);
+        let pack = &conversion.packs[0];
+        assert_eq!(pack.pack_id, "bifrost.rust-std-golden-summaries");
+        assert!(!pack.pinned, "the Rust realm pins no toolchain");
+
+        let value: serde_json::Value = serde_json::from_str(&pack.source_json).unwrap();
+        assert_eq!(value["language"], "rust");
+        assert_eq!(value["ecosystem"], "cargo");
+        assert_eq!(
+            value["shards"][0]["payload"]["summaries"][0]["target"]["has_receiver"],
+            serde_json::Value::Bool(false),
+            "a Rust scoped path is not lowered as a call receiver"
+        );
+    }
+
+    /// The JS/TS pair is the case where one candidate directory feeds TWO
+    /// realms. The converter takes a directory and a realm, so running it twice
+    /// over the same directory is all that is required, and the two packs must
+    /// differ in exactly two places: the pack id and the declared language.
+    /// Everything the summaries claim -- targets, receivers, transfers, ids --
+    /// is identical, which is what makes one authored candidate set honest for
+    /// both languages.
+    #[test]
+    fn one_candidate_directory_ships_both_the_javascript_and_typescript_realms() {
+        let json_parse = r#"[{
+          "target": {"path": "ecma262/json.js", "symbol": "JSON.parse", "has_receiver": true, "parameter_count": 1},
+          "completeness": "complete",
+          "transfers": [{"input": {"kind": "parameter", "ordinal": 0}, "exit_kind": "normal", "output": {"kind": "normal_return"}}],
+          "rationale": "flow", "provenance": "hand-authored", "confidence": "high", "citations": "ECMA-262"
+        }]"#;
+        let dir = tempfile::tempdir().expect("temp candidates dir");
+        fs::write(dir.path().join("globals.json"), json_parse).expect("write candidate file");
+
+        let javascript = convert_golden_candidates(dir.path(), JAVASCRIPT_REALM)
+            .expect("JavaScript conversion over the shared candidates");
+        let typescript = convert_golden_candidates(dir.path(), TYPESCRIPT_REALM)
+            .expect("TypeScript conversion over the shared candidates");
+
+        assert_eq!(
+            javascript.packs[0].pack_id,
+            "bifrost.javascript-golden-summaries"
+        );
+        assert_eq!(
+            typescript.packs[0].pack_id,
+            "bifrost.typescript-golden-summaries"
+        );
+        assert!(
+            !javascript.packs[0].pinned && !typescript.packs[0].pinned,
+            "npm discovery mints no toolchain evidence, so neither pack is pinned"
+        );
+
+        let js: serde_json::Value = serde_json::from_str(&javascript.packs[0].source_json).unwrap();
+        let ts: serde_json::Value = serde_json::from_str(&typescript.packs[0].source_json).unwrap();
+        assert_eq!(js["language"], "javascript");
+        assert_eq!(ts["language"], "typescript");
+        assert_eq!(js["ecosystem"], "npm");
+        assert_eq!(ts["ecosystem"], "npm");
+        assert_eq!(
+            js["shards"][0]["payload"], ts["shards"][0]["payload"],
+            "one candidate directory must yield the identical claims in both realms"
+        );
+        assert_eq!(
+            js["shards"][0]["payload"]["summaries"][0]["target"]["has_receiver"],
+            serde_json::Value::Bool(true),
+            "a JS/TS member call is lowered with a receiver, unlike a Rust scoped path"
         );
     }
 }

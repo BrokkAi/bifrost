@@ -3416,7 +3416,7 @@ mod tests {
         SourceSliceHash, VulnerabilityIdentity, WitnessId, WitnessStep, WitnessStepKind,
     };
     use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
-    use brokk_bifrost_analysis::analyzer::structural::CodeQueryDiagnosticCode;
+    use brokk_bifrost_rql::structural::CodeQueryDiagnosticCode;
 
     #[test]
     fn terminal_escape_is_visible_and_cannot_create_lines_or_ansi_sequences() {

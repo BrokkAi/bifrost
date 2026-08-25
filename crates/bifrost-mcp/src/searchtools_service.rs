@@ -38,7 +38,7 @@ use crate::{
         PolicyFindingId, PolicyId, PolicyNearMissRanking, PolicyReportDocument, PolicyScopeOptions,
         PolicyScopeSource, PolicySuppressionOptions, PolicySuppressionSource,
         built_in_policy_catalog, explain_policy_inputs, rank_policy_near_misses,
-        workspace_snapshot_deadline_outcome,
+        workspace_snapshot_deadline_outcome_with_preflight,
     },
     profiling,
     searchtools::{
@@ -72,6 +72,16 @@ use std::time::{Duration, Instant};
 const SEMANTIC_PACK_CATALOG_ENV: &str = "BIFROST_SEMANTIC_PACK_CATALOG";
 const SEMANTIC_PACK_EVIDENCE_ENV: &str = "BIFROST_SEMANTIC_PACK_EVIDENCE";
 const WORKSPACE_SEMANTIC_MODELS_ENV: &str = "BIFROST_WORKSPACE_SEMANTIC_MODELS";
+
+/// Transport-side request delays measured by the MCP host and carried into
+/// profiled tool responses. The aggregate queue wait remains distinct from
+/// its readiness and analyzer-admission components for attribution.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TransportTimings {
+    pub(crate) transport_queue_wait: Duration,
+    pub(crate) workspace_readiness_wait: Duration,
+    pub(crate) analyzer_admission_wait: Duration,
+}
 
 /// Facade-owned registration hook for reviewed shipped semantic packs.
 pub type SemanticModelCatalogBootstrap = fn(&SemanticPackCatalog) -> Result<(), String>;
@@ -757,6 +767,23 @@ pub(crate) struct RunPolicyToolResult {
     report: PolicyReportDocument,
 }
 
+pub(crate) enum RunPolicyPreflight {
+    Valid(PreparedRunPolicyPreflight),
+    Invalid(ToolOutput),
+}
+
+pub(crate) struct PreparedRunPolicyPreflight {
+    suppression_preflight: crate::policy::PolicySuppressionPreflight,
+    selection_elapsed: Duration,
+    suppression_preflight_elapsed: Duration,
+}
+
+struct DecodedRunPolicy {
+    policy_inputs: Vec<PolicyEvaluationInput>,
+    selected_policy_ids: Vec<PolicyId>,
+    options: PolicyEvaluationOptions,
+}
+
 /// `explain_policy` arguments.
 ///
 /// The policy selection is `run_policy`'s, narrowed to exactly one resolved
@@ -828,6 +855,7 @@ pub(crate) enum ExplainPolicyToolResult {
 pub struct SearchToolsServiceError {
     pub code: SearchToolsServiceErrorCode,
     pub message: String,
+    pub(crate) retryable_stale_generation: bool,
 }
 
 impl SearchToolsServiceError {
@@ -835,6 +863,7 @@ impl SearchToolsServiceError {
         Self {
             code: SearchToolsServiceErrorCode::InvalidParams,
             message: message.into(),
+            retryable_stale_generation: false,
         }
     }
 
@@ -842,6 +871,7 @@ impl SearchToolsServiceError {
         Self {
             code: SearchToolsServiceErrorCode::UnknownTool,
             message: message.into(),
+            retryable_stale_generation: false,
         }
     }
 
@@ -849,6 +879,7 @@ impl SearchToolsServiceError {
         Self {
             code: SearchToolsServiceErrorCode::Internal,
             message: message.into(),
+            retryable_stale_generation: false,
         }
     }
 
@@ -856,7 +887,20 @@ impl SearchToolsServiceError {
         Self {
             code: SearchToolsServiceErrorCode::DeadlineExceeded,
             message: message.into(),
+            retryable_stale_generation: false,
         }
+    }
+
+    fn stale_analyzer_generation(message: impl Into<String>) -> Self {
+        Self {
+            code: SearchToolsServiceErrorCode::Internal,
+            message: message.into(),
+            retryable_stale_generation: true,
+        }
+    }
+
+    fn is_stale_analyzer_generation(&self) -> bool {
+        self.retryable_stale_generation
     }
 }
 
@@ -935,11 +979,10 @@ pub struct SearchToolsService {
     root: RwLock<Option<PathBuf>>,
     session: RwLock<Option<WorkspaceSession>>,
     workspace_generation: AtomicU64,
-    query_protocols: RwLock<crate::analyzer::structural::ProtocolRegistrationSet>,
-    query_value_flows: RwLock<crate::analyzer::structural::ValueFlowPlanRegistrationSet>,
-    query_taint_results: RwLock<crate::analyzer::structural::TaintResultRegistrationSet>,
-    typestate_summaries:
-        RwLock<Arc<crate::analyzer::typestate::ProductionTypestateSummaryRepository>>,
+    flow_state: crate::flow::FlowWorkspaceState,
+    query_protocols: RwLock<crate::rql::ProtocolRegistrationSet>,
+    query_value_flows: RwLock<crate::rql::ValueFlowPlanRegistrationSet>,
+    query_taint_results: RwLock<crate::rql::TaintResultRegistrationSet>,
     /// A deferred workspace build (file discovery + parse) runs on a background
     /// thread and lands here. The result carries the binding generation and root
     /// so a superseded client workspace can never be published later.
@@ -1019,10 +1062,9 @@ pub(crate) struct PreparedQueryCode {
     arguments: Value,
     request_timing: PreparedQueryCodeTiming,
     workspace_generation: u64,
-    query_protocols: crate::analyzer::structural::ProtocolRegistrationSet,
-    query_value_flows: crate::analyzer::structural::ValueFlowPlanRegistrationSet,
-    query_taint_results: crate::analyzer::structural::TaintResultRegistrationSet,
-    typestate_summary_lease: crate::analyzer::typestate::ProductionTypestateSummaryLease,
+    query_protocols: crate::rql::ProtocolRegistrationSet,
+    query_value_flows: crate::rql::ValueFlowPlanRegistrationSet,
+    query_taint_results: crate::rql::TaintResultRegistrationSet,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1669,11 +1711,24 @@ pub(crate) struct PreparedRunPolicy {
     policy_inputs: Vec<PolicyEvaluationInput>,
     options: PolicyEvaluationOptions,
     selection_elapsed: Duration,
+    suppression_preflight: Option<crate::policy::PolicySuppressionPreflight>,
+    suppression_preflight_elapsed: Duration,
     snapshot_elapsed: Duration,
 }
 
+struct RunPolicySnapshotPreparation {
+    policy_inputs: Vec<PolicyEvaluationInput>,
+    selected_policy_ids: Vec<PolicyId>,
+    options: PolicyEvaluationOptions,
+    suppression_preflight: crate::policy::PolicySuppressionPreflight,
+    selection_elapsed: Duration,
+    suppression_preflight_elapsed: Duration,
+    snapshot_started: Instant,
+}
+
 pub(crate) enum RunPolicyPreparation {
-    Ready(PreparedRunPolicy),
+    Ready(Box<PreparedRunPolicy>),
+    PreflightFailure(Box<RunPolicyToolResult>),
     // Boxed: the ready payload is a slim handle while the deadline payload
     // carries a whole report document.
     Deadline(Box<RunPolicyToolResult>),
@@ -1724,9 +1779,15 @@ impl WorkspaceQueryScope {
         match result {
             Err(error) => Err(error),
             Ok(value) => match self.context.store_error() {
-                Some(error) => Err(SearchToolsServiceError::internal(format!(
-                    "Analyzer store failure while running `{operation}`: {error}"
-                ))),
+                Some(error) => {
+                    let message =
+                        format!("Analyzer store failure while running `{operation}`: {error}");
+                    if error.is_stale_generation() {
+                        Err(SearchToolsServiceError::stale_analyzer_generation(message))
+                    } else {
+                        Err(SearchToolsServiceError::internal(message))
+                    }
+                }
                 None => Ok(value),
             },
         }
@@ -1906,6 +1967,176 @@ fn maybe_start_semantic_checked(
     Some(SemanticIndexer::start(root, snapshot.clone()))
 }
 
+fn decode_run_policy_arguments(
+    arguments: Value,
+) -> Result<DecodedRunPolicy, SearchToolsServiceError> {
+    let params = serde_json::from_value::<RunPolicyParams>(arguments).map_err(|error| {
+        SearchToolsServiceError::invalid_params(format!("Invalid run_policy arguments: {error}"))
+    })?;
+    let max_policy_files = crate::policy::PolicyBatchBudget::default().max_policies();
+    if params.policy_files.len() > max_policy_files {
+        return Err(SearchToolsServiceError::invalid_params(format!(
+            "run_policy accepts at most {max_policy_files} policy_files entries"
+        )));
+    }
+    for (label, values) in [
+        ("policy_packs", &params.policy_packs),
+        ("policy_categories", &params.policy_categories),
+        ("policy_ids", &params.policy_ids),
+    ] {
+        if values.len() > max_policy_files {
+            return Err(SearchToolsServiceError::invalid_params(format!(
+                "run_policy accepts at most {max_policy_files} {label} entries"
+            )));
+        }
+        let mut unique = BTreeSet::new();
+        for value in values {
+            if value.is_empty() || value.len() > crate::mcp_extended::MAX_RUN_POLICY_SELECTOR_BYTES
+            {
+                return Err(SearchToolsServiceError::invalid_params(format!(
+                    "run_policy {label} entries must contain between 1 and {} bytes",
+                    crate::mcp_extended::MAX_RUN_POLICY_SELECTOR_BYTES
+                )));
+            }
+            if !unique.insert(value.as_str()) {
+                return Err(SearchToolsServiceError::invalid_params(format!(
+                    "run_policy {label} entry `{value}` is duplicated"
+                )));
+            }
+        }
+    }
+    if params.policy_files.is_empty()
+        && params.policy_packs.is_empty()
+        && params.policy_categories.is_empty()
+        && params.policy_ids.is_empty()
+    {
+        return Err(SearchToolsServiceError::invalid_params(
+            "run_policy requires at least one policy file or built-in selector".to_string(),
+        ));
+    }
+
+    let mut unique_paths = BTreeSet::new();
+    let mut policy_inputs = Vec::with_capacity(params.policy_files.len());
+    for raw_path in params.policy_files {
+        if raw_path.len() > crate::mcp_extended::MAX_RUN_POLICY_PATH_BYTES {
+            return Err(SearchToolsServiceError::invalid_params(format!(
+                "run_policy policy path exceeds {} bytes",
+                crate::mcp_extended::MAX_RUN_POLICY_PATH_BYTES
+            )));
+        }
+        let path = WorkspaceRelativePath::new(&raw_path).map_err(|error| {
+            SearchToolsServiceError::invalid_params(format!(
+                "invalid run_policy policy path `{raw_path}`: {error}"
+            ))
+        })?;
+        if Path::new(path.as_str())
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("rqlp")
+        {
+            return Err(SearchToolsServiceError::invalid_params(format!(
+                "run_policy policy path `{}` must use the .rqlp extension",
+                path.as_str()
+            )));
+        }
+        if !unique_paths.insert(path.as_str().to_owned()) {
+            return Err(SearchToolsServiceError::invalid_params(format!(
+                "run_policy policy path `{}` is duplicated",
+                path.as_str()
+            )));
+        }
+        policy_inputs.push(PolicyEvaluationInput::workspace_file(path.as_str()));
+    }
+
+    let selection = BuiltInPolicySelection {
+        packs: params.policy_packs,
+        categories: params.policy_categories,
+        policy_ids: params.policy_ids,
+    };
+    let selected = built_in_policy_catalog()
+        .map_err(|error| {
+            SearchToolsServiceError::internal(format!(
+                "failed to load built-in policy catalog: {error}"
+            ))
+        })?
+        .select(&selection)
+        .map_err(|error| SearchToolsServiceError::invalid_params(error.to_string()))?;
+    let selected_policy_ids = selected
+        .iter()
+        .map(|policy| {
+            PolicyId::new(&policy.manifest().id).expect("built-in policy IDs are validated")
+        })
+        .collect::<Vec<_>>();
+    let mut built_in_inputs = selected
+        .into_iter()
+        .map(|policy| PolicyEvaluationInput::embedded(policy.source_identity(), policy.source()))
+        .collect::<Vec<_>>();
+    built_in_inputs.append(&mut policy_inputs);
+    let policy_inputs = built_in_inputs;
+    if policy_inputs.len() > max_policy_files {
+        return Err(SearchToolsServiceError::invalid_params(format!(
+            "run_policy resolves to {} policies but accepts at most {max_policy_files}",
+            policy_inputs.len()
+        )));
+    }
+
+    let suppressions = params
+        .suppression_file
+        .map(PolicySuppressionSource::explicit_portable)
+        .transpose()
+        .map_err(|error| {
+            SearchToolsServiceError::invalid_params(format!(
+                "invalid run_policy suppression_file: {error}"
+            ))
+        })?
+        .map_or_else(
+            PolicySuppressionOptions::default,
+            PolicySuppressionOptions::new,
+        );
+    let scope = params
+        .scope_file
+        .map(PolicyScopeSource::explicit_portable)
+        .transpose()
+        .map_err(|error| {
+            SearchToolsServiceError::invalid_params(format!(
+                "invalid run_policy scope_file: {error}"
+            ))
+        })?
+        .map_or_else(PolicyScopeOptions::default, PolicyScopeOptions::new);
+    let baseline = params
+        .baseline_file
+        .map(PolicyBaselineSource::explicit_portable)
+        .transpose()
+        .map_err(|error| {
+            SearchToolsServiceError::invalid_params(format!(
+                "invalid run_policy baseline_file: {error}"
+            ))
+        })?
+        .map_or_else(PolicyBaselineOptions::default, PolicyBaselineOptions::new);
+    let fail_on = PolicyFailOn::from(params.fail_on);
+    let mut options =
+        PolicyEvaluationOptions::with_suppressions(params.evaluation_date, suppressions)
+            .with_scope(scope)
+            .with_baseline(baseline)
+            .with_fail_on(fail_on);
+    if let Some(revision) = params.diff_base {
+        if revision.is_empty()
+            || revision.len() > crate::mcp_extended::MAX_RUN_POLICY_DIFF_BASE_BYTES
+        {
+            return Err(SearchToolsServiceError::invalid_params(format!(
+                "run_policy diff_base must contain between 1 and {} bytes",
+                crate::mcp_extended::MAX_RUN_POLICY_DIFF_BASE_BYTES
+            )));
+        }
+        options = options.with_diff_base(revision);
+    }
+    Ok(DecodedRunPolicy {
+        policy_inputs,
+        selected_policy_ids,
+        options,
+    })
+}
+
 impl SearchToolsService {
     /// Configure trusted Git objects that immutable `analyze_diff` endpoints
     /// may resolve. This is host configuration, never a tool argument.
@@ -1993,8 +2224,9 @@ impl SearchToolsService {
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
     ) -> Result<Self, String> {
-        let workspace = WorkspaceAnalyzer::build_persisted(Arc::clone(&project), config)
-            .map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
+        let workspace =
+            WorkspaceAnalyzer::build_persisted_without_automatic_gc(Arc::clone(&project), config)
+                .map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
         Self::new_manual_from_workspace(project, workspace)
     }
 
@@ -2016,12 +2248,10 @@ impl SearchToolsService {
             root: RwLock::new(Some(root)),
             session: RwLock::new(Some(session)),
             workspace_generation: AtomicU64::new(1),
+            flow_state: crate::flow::FlowWorkspaceState::new(),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
             query_taint_results: RwLock::new(Default::default()),
-            typestate_summaries: RwLock::new(Arc::new(
-                crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
-            )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             file_listing: RwLock::new(None),
@@ -2053,17 +2283,16 @@ impl SearchToolsService {
     /// never accepted by an MCP/LSP wire request.
     pub fn register_query_protocol(
         &self,
-        protocol_ref: crate::analyzer::structural::ProtocolRef,
+        protocol_ref: crate::rql::ProtocolRef,
         expected_root: crate::analyzer::semantic::ProcedureHandle,
-        protocol: Arc<crate::analyzer::typestate::CompiledProtocol>,
-        bindings: Arc<crate::analyzer::typestate::TypestateBindingPlan>,
-    ) -> Result<crate::analyzer::structural::ProtocolRegistrationOutcome, SearchToolsServiceError>
-    {
+        protocol: Arc<crate::flow::typestate::CompiledProtocol>,
+        bindings: Arc<crate::flow::typestate::TypestateBindingPlan>,
+    ) -> Result<crate::rql::ProtocolRegistrationOutcome, SearchToolsServiceError> {
         let session = self.read_session()?;
         session.as_ref().ok_or_else(Self::closed_error)?;
         let workspace_generation = self.workspace_generation();
 
-        let registration = crate::analyzer::structural::ProtocolRegistration::new(
+        let registration = crate::rql::ProtocolRegistration::new(
             workspace_generation,
             expected_root,
             protocol,
@@ -2084,7 +2313,7 @@ impl SearchToolsService {
     /// immutable snapshot, while later requests observe the removal.
     pub fn unregister_query_protocol(
         &self,
-        protocol_ref: &crate::analyzer::structural::ProtocolRef,
+        protocol_ref: &crate::rql::ProtocolRef,
     ) -> Result<bool, SearchToolsServiceError> {
         Ok(self
             .query_protocols
@@ -2096,19 +2325,15 @@ impl SearchToolsService {
     /// Register one already-compiled value-flow plan for in-process CodeQuery callers.
     pub fn register_query_value_flow_plan(
         &self,
-        plan_ref: crate::analyzer::structural::ValueFlowPlanRef,
-        plan: Arc<crate::analyzer::value_flow::ValueFlowPlan>,
-    ) -> Result<
-        crate::analyzer::structural::ValueFlowPlanRegistrationOutcome,
-        SearchToolsServiceError,
-    > {
+        plan_ref: crate::rql::ValueFlowPlanRef,
+        plan: Arc<crate::flow::value_flow::ValueFlowPlan>,
+    ) -> Result<crate::rql::ValueFlowPlanRegistrationOutcome, SearchToolsServiceError> {
         let workspace_generation = {
             let session = self.read_session()?;
             session.as_ref().ok_or_else(Self::closed_error)?;
             self.workspace_generation()
         };
-        let registration =
-            crate::analyzer::structural::ValueFlowPlanRegistration::new(workspace_generation, plan);
+        let registration = crate::rql::ValueFlowPlanRegistration::new(workspace_generation, plan);
         let session = self.read_session()?;
         session.as_ref().ok_or_else(Self::closed_error)?;
         if self.workspace_generation() != workspace_generation {
@@ -2129,7 +2354,7 @@ impl SearchToolsService {
     /// Remove one host-defined value-flow plan alias.
     pub fn unregister_query_value_flow_plan(
         &self,
-        plan_ref: &crate::analyzer::structural::ValueFlowPlanRef,
+        plan_ref: &crate::rql::ValueFlowPlanRef,
     ) -> Result<bool, SearchToolsServiceError> {
         Ok(self
             .query_value_flows
@@ -2141,20 +2366,16 @@ impl SearchToolsService {
     /// Register retained production taint results for in-process CodeQuery callers.
     pub fn register_query_taint_results(
         &self,
-        taint_ref: crate::analyzer::structural::TaintResultRef,
+        taint_ref: crate::rql::TaintResultRef,
         results: Vec<Arc<crate::policy::ProductionTaintAnalysisResult>>,
-    ) -> Result<crate::analyzer::structural::TaintResultRegistrationOutcome, SearchToolsServiceError>
-    {
+    ) -> Result<crate::rql::TaintResultRegistrationOutcome, SearchToolsServiceError> {
         let workspace_generation = {
             let session = self.read_session()?;
             session.as_ref().ok_or_else(Self::closed_error)?;
             self.workspace_generation()
         };
-        let registration = crate::analyzer::structural::TaintResultRegistration::new(
-            workspace_generation,
-            results,
-        )
-        .map_err(|error| SearchToolsServiceError::invalid_params(error.to_string()))?;
+        let registration = crate::rql::TaintResultRegistration::new(workspace_generation, results)
+            .map_err(|error| SearchToolsServiceError::invalid_params(error.to_string()))?;
         let session = self.read_session()?;
         session.as_ref().ok_or_else(Self::closed_error)?;
         if self.workspace_generation() != workspace_generation {
@@ -2175,7 +2396,7 @@ impl SearchToolsService {
     /// Remove one host-defined retained taint-result alias.
     pub fn unregister_query_taint_results(
         &self,
-        taint_ref: &crate::analyzer::structural::TaintResultRef,
+        taint_ref: &crate::rql::TaintResultRef,
     ) -> Result<bool, SearchToolsServiceError> {
         Ok(self
             .query_taint_results
@@ -2262,13 +2483,108 @@ impl SearchToolsService {
         cancellation: Option<&CancellationToken>,
         transport_queue_wait: Duration,
     ) -> Result<ToolOutput, SearchToolsServiceError> {
+        self.call_tool_output_with_transport_timings(
+            name,
+            arguments,
+            render_options,
+            cancellation,
+            TransportTimings {
+                transport_queue_wait,
+                ..TransportTimings::default()
+            },
+        )
+    }
+
+    /// Execute a tool after an MCP host measured the transport queue and its
+    /// two request-admission components.
+    ///
+    /// `transport_queue_wait` remains the historical accepted-to-admitted
+    /// aggregate. The component durations are additive diagnostics for
+    /// profiled `query_code` responses; callers that do not have the split can
+    /// use [`Self::call_tool_output_with_transport_queue_wait`].
+    pub(crate) fn call_tool_output_with_transport_timings(
+        &self,
+        name: &str,
+        arguments: Value,
+        render_options: RenderOptions,
+        cancellation: Option<&CancellationToken>,
+        transport_timings: TransportTimings,
+    ) -> Result<ToolOutput, SearchToolsServiceError> {
+        let retry_arguments = arguments.clone();
+        let workspace_generation = self.workspace_generation();
         let result = self.call_tool_output_with_transport_queue_wait_inner(
             name,
             arguments,
             render_options,
             cancellation,
-            transport_queue_wait,
+            transport_timings,
+            None,
         );
+        let result = match result {
+            Err(error)
+                if error.is_stale_analyzer_generation()
+                    && !cancellation.is_some_and(CancellationToken::is_cancelled) =>
+            {
+                self.reload_stale_workspace_snapshot(workspace_generation)?;
+                self.call_tool_output_with_transport_queue_wait_inner(
+                    name,
+                    retry_arguments,
+                    render_options,
+                    cancellation,
+                    transport_timings,
+                    None,
+                )
+            }
+            result => result,
+        };
+        self.schedule_initial_index_warm();
+        result
+    }
+
+    pub(crate) fn call_tool_output_with_transport_timings_and_preflight(
+        &self,
+        name: &str,
+        arguments: Value,
+        render_options: RenderOptions,
+        cancellation: Option<&CancellationToken>,
+        transport_timings: TransportTimings,
+        suppression_preflight: Option<PreparedRunPolicyPreflight>,
+    ) -> Result<ToolOutput, SearchToolsServiceError> {
+        let retry_arguments = arguments.clone();
+        let workspace_generation = self.workspace_generation();
+        let result = self.call_tool_output_with_transport_queue_wait_inner(
+            name,
+            arguments,
+            render_options,
+            cancellation,
+            transport_timings,
+            suppression_preflight,
+        );
+        let result = match result {
+            Err(error)
+                if error.is_stale_analyzer_generation()
+                    && !cancellation.is_some_and(CancellationToken::is_cancelled) =>
+            {
+                self.reload_stale_workspace_snapshot(workspace_generation)?;
+                let retry_preflight = if name == "run_policy" {
+                    match self.preflight_run_policy(&retry_arguments)? {
+                        RunPolicyPreflight::Valid(preflight) => Some(preflight),
+                        RunPolicyPreflight::Invalid(output) => return Ok(output),
+                    }
+                } else {
+                    None
+                };
+                self.call_tool_output_with_transport_queue_wait_inner(
+                    name,
+                    retry_arguments,
+                    render_options,
+                    cancellation,
+                    transport_timings,
+                    retry_preflight,
+                )
+            }
+            result => result,
+        };
         self.schedule_initial_index_warm();
         result
     }
@@ -2279,7 +2595,8 @@ impl SearchToolsService {
         arguments: Value,
         render_options: RenderOptions,
         cancellation: Option<&CancellationToken>,
-        transport_queue_wait: Duration,
+        transport_timings: TransportTimings,
+        suppression_preflight: Option<PreparedRunPolicyPreflight>,
     ) -> Result<ToolOutput, SearchToolsServiceError> {
         // Lifecycle tools bypass watcher delta application: refresh rebuilds
         // explicitly, activate replaces the whole workspace, and get is cheap.
@@ -2315,10 +2632,10 @@ impl SearchToolsService {
         }
         if name == "query_code" {
             let prepared = self.prepare_query_code(arguments, cancellation)?;
-            return self.execute_prepared_query_code_with_transport_queue_wait(
+            return self.execute_prepared_query_code_with_transport_timings(
                 prepared,
                 cancellation,
-                transport_queue_wait,
+                transport_timings,
             );
         }
         if name == "list_policies" {
@@ -2330,11 +2647,16 @@ impl SearchToolsService {
             return Self::structured_only(catalog.manifest());
         }
         if name == "run_policy" {
-            return match self.prepare_run_policy_with_cancellation(arguments, cancellation)? {
+            return match self.prepare_run_policy_with_cancellation_and_preflight(
+                arguments,
+                cancellation,
+                suppression_preflight,
+            )? {
                 RunPolicyPreparation::Ready(prepared) => {
-                    self.execute_prepared_run_policy(prepared, cancellation)
+                    self.execute_prepared_run_policy(*prepared, cancellation)
                 }
                 RunPolicyPreparation::Deadline(result) => Self::structured_only(result),
+                RunPolicyPreparation::PreflightFailure(result) => Self::structured_only(result),
             };
         }
         if name == "explain_policy" {
@@ -2605,7 +2927,7 @@ impl SearchToolsService {
     pub fn query_code_result(
         &self,
         arguments: Value,
-    ) -> Result<crate::analyzer::structural::CodeQueryResponse, SearchToolsServiceError> {
+    ) -> Result<crate::rql::CodeQueryResponse, SearchToolsServiceError> {
         let PreparedQueryCode {
             snapshot,
             arguments,
@@ -2614,7 +2936,6 @@ impl SearchToolsService {
             query_protocols,
             query_value_flows,
             query_taint_results,
-            typestate_summary_lease,
         } = self.prepare_query_code(arguments, None)?;
         let result = self
             .query_code_result_for_snapshot(
@@ -2625,7 +2946,6 @@ impl SearchToolsService {
                 &query_protocols,
                 &query_value_flows,
                 &query_taint_results,
-                typestate_summary_lease,
             )
             .map(|(mut response, execution_timing)| {
                 Self::attach_query_code_request_timing(
@@ -2633,7 +2953,7 @@ impl SearchToolsService {
                     request_timing,
                     execution_timing,
                     0,
-                    Duration::ZERO,
+                    TransportTimings::default(),
                 );
                 response
             });
@@ -2648,16 +2968,7 @@ impl SearchToolsService {
         let started = Instant::now();
         let mut workspace_ready = Duration::ZERO;
         loop {
-            let (generation, typestate_summaries) = {
-                let typestate_summaries = self
-                    .typestate_summaries
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                (
-                    self.workspace_generation(),
-                    Arc::clone(&typestate_summaries),
-                )
-            };
+            let generation = self.workspace_generation();
             let snapshot_started = Instant::now();
             let snapshot = self.snapshot_for_query_with_cancellation(cancellation)?;
             workspace_ready = workspace_ready.saturating_add(snapshot_started.elapsed());
@@ -2667,9 +2978,6 @@ impl SearchToolsService {
             if generation != self.workspace_generation() {
                 continue;
             }
-            let typestate_summary_lease = typestate_summaries
-                .lease(generation)
-                .map_err(|error| SearchToolsServiceError::internal(error.to_string()))?;
             let root = snapshot.analyzer().project().root();
             let arguments =
                 crate::tool_arguments::normalize_tool_arguments("query_code", arguments, root)
@@ -2686,7 +2994,6 @@ impl SearchToolsService {
                 query_protocols,
                 query_value_flows,
                 query_taint_results,
-                typestate_summary_lease,
             });
         }
     }
@@ -2704,11 +3011,28 @@ impl SearchToolsService {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn execute_prepared_query_code_with_transport_queue_wait(
         &self,
         prepared: PreparedQueryCode,
         cancellation: Option<&CancellationToken>,
         transport_queue_wait: Duration,
+    ) -> Result<ToolOutput, SearchToolsServiceError> {
+        self.execute_prepared_query_code_with_transport_timings(
+            prepared,
+            cancellation,
+            TransportTimings {
+                transport_queue_wait,
+                ..TransportTimings::default()
+            },
+        )
+    }
+
+    pub(crate) fn execute_prepared_query_code_with_transport_timings(
+        &self,
+        prepared: PreparedQueryCode,
+        cancellation: Option<&CancellationToken>,
+        transport_timings: TransportTimings,
     ) -> Result<ToolOutput, SearchToolsServiceError> {
         let PreparedQueryCode {
             snapshot,
@@ -2718,7 +3042,6 @@ impl SearchToolsService {
             query_protocols,
             query_value_flows,
             query_taint_results,
-            typestate_summary_lease,
         } = prepared;
         let result = (|| {
             let (mut output, execution_timing) = self.query_code_result_for_snapshot(
@@ -2729,15 +3052,11 @@ impl SearchToolsService {
                 &query_protocols,
                 &query_value_flows,
                 &query_taint_results,
-                typestate_summary_lease,
             )?;
             let rendering_started = Instant::now();
             let rendered_text = output.render_text();
             let rendering_ns = duration_ns(rendering_started.elapsed());
-            let serialization_ns = if matches!(
-                &output,
-                crate::analyzer::structural::CodeQueryResponse::Profile(_)
-            ) {
+            let serialization_ns = if matches!(&output, crate::rql::CodeQueryResponse::Profile(_)) {
                 let serialization_started = Instant::now();
                 serde_json::to_value(&output).map_err(|err| {
                     SearchToolsServiceError::internal(format!(
@@ -2753,7 +3072,7 @@ impl SearchToolsService {
                 request_timing,
                 execution_timing,
                 rendering_ns.saturating_add(serialization_ns),
-                transport_queue_wait,
+                transport_timings,
             );
             let structured = serde_json::to_value(&output).map_err(|err| {
                 SearchToolsServiceError::internal(format!("Failed to serialize tool result: {err}"))
@@ -2773,30 +3092,23 @@ impl SearchToolsService {
         arguments: Value,
         cancellation: Option<&CancellationToken>,
         workspace_generation: u64,
-        query_protocols: &crate::analyzer::structural::ProtocolRegistrationSet,
-        query_value_flows: &crate::analyzer::structural::ValueFlowPlanRegistrationSet,
-        query_taint_results: &crate::analyzer::structural::TaintResultRegistrationSet,
-        typestate_summary_lease: crate::analyzer::typestate::ProductionTypestateSummaryLease,
-    ) -> Result<
-        (
-            crate::analyzer::structural::CodeQueryResponse,
-            QueryCodeExecutionTiming,
-        ),
-        SearchToolsServiceError,
-    > {
+        query_protocols: &crate::rql::ProtocolRegistrationSet,
+        query_value_flows: &crate::rql::ValueFlowPlanRegistrationSet,
+        query_taint_results: &crate::rql::TaintResultRegistrationSet,
+    ) -> Result<(crate::rql::CodeQueryResponse, QueryCodeExecutionTiming), SearchToolsServiceError>
+    {
         let input_decode_started = Instant::now();
         let query = Self::decode_query_code_input(snapshot, arguments)?;
         let input_decode_ns = duration_ns(input_decode_started.elapsed());
         let query_execution_started = Instant::now();
-        let response = CodeIntelligenceRuntime::new(snapshot, cancellation)
-            .execute_query_with_all_analysis_registration_lease(
+        let response = CodeIntelligenceRuntime::new(snapshot, &self.flow_state, cancellation)
+            .execute_query_with_all_analysis_registrations(
                 workspace_generation,
                 query_protocols,
                 query_value_flows,
                 query_taint_results,
                 &query,
-                crate::analyzer::structural::CodeQueryExecutionLimits::default(),
-                typestate_summary_lease,
+                crate::rql::CodeQueryExecutionLimits::default(),
             );
         Ok((
             response,
@@ -2808,33 +3120,35 @@ impl SearchToolsService {
     }
 
     fn attach_query_code_request_timing(
-        response: &mut crate::analyzer::structural::CodeQueryResponse,
+        response: &mut crate::rql::CodeQueryResponse,
         prepared: PreparedQueryCodeTiming,
         execution: QueryCodeExecutionTiming,
         rendering_serialization_ns: u64,
-        transport_queue_wait: Duration,
+        transport_timings: TransportTimings,
     ) {
-        let crate::analyzer::structural::CodeQueryResponse::Profile(profile) = response else {
+        let crate::rql::CodeQueryResponse::Profile(profile) = response else {
             return;
         };
-        profile.request_timings_ns = crate::analyzer::structural::CodeQueryProfileRequestTimings {
-            transport_queue_wait: duration_ns(transport_queue_wait),
+        profile.request_timings_ns = crate::rql::CodeQueryProfileRequestTimings {
+            transport_queue_wait: duration_ns(transport_timings.transport_queue_wait),
+            workspace_readiness_wait: duration_ns(transport_timings.workspace_readiness_wait),
+            analyzer_admission_wait: duration_ns(transport_timings.analyzer_admission_wait),
             workspace_ready: prepared.workspace_ready_ns,
             preparation: prepared.preparation_ns,
             input_decode: execution.input_decode_ns,
             query_execution: execution.query_execution_ns,
             rendering_serialization: rendering_serialization_ns,
             total: duration_ns(prepared.started.elapsed())
-                .saturating_add(duration_ns(transport_queue_wait)),
+                .saturating_add(duration_ns(transport_timings.transport_queue_wait)),
         };
     }
 
     fn decode_query_code_input(
         snapshot: &WorkspaceQueryScope,
         arguments: Value,
-    ) -> Result<crate::analyzer::structural::CodeQuery, SearchToolsServiceError> {
+    ) -> Result<crate::rql::CodeQuery, SearchToolsServiceError> {
         let Some(query_file) = arguments.get("query_file") else {
-            return crate::analyzer::structural::CodeQuery::from_json(&arguments)
+            return crate::rql::CodeQuery::from_json(&arguments)
                 .map_err(|error| SearchToolsServiceError::invalid_params(error.to_string()));
         };
 
@@ -2888,7 +3202,7 @@ impl SearchToolsService {
         }?;
         let value = crate::tool_arguments::normalize_tool_arguments("query_code", value, root)
             .map_err(SearchToolsServiceError::invalid_params)?;
-        crate::analyzer::structural::CodeQuery::from_json(&value).map_err(|error| {
+        crate::rql::CodeQuery::from_json(&value).map_err(|error| {
             SearchToolsServiceError::invalid_params(format!(
                 "invalid CodeQuery in `{query_file}`: {error}"
             ))
@@ -2938,7 +3252,7 @@ impl SearchToolsService {
 
     fn query_protocol_snapshot(
         &self,
-    ) -> Result<crate::analyzer::structural::ProtocolRegistrationSet, SearchToolsServiceError> {
+    ) -> Result<crate::rql::ProtocolRegistrationSet, SearchToolsServiceError> {
         self.query_protocols
             .read()
             .map(|registrations| registrations.clone())
@@ -2947,8 +3261,7 @@ impl SearchToolsService {
 
     fn query_value_flow_snapshot(
         &self,
-    ) -> Result<crate::analyzer::structural::ValueFlowPlanRegistrationSet, SearchToolsServiceError>
-    {
+    ) -> Result<crate::rql::ValueFlowPlanRegistrationSet, SearchToolsServiceError> {
         self.query_value_flows
             .read()
             .map(|registrations| registrations.clone())
@@ -2957,19 +3270,22 @@ impl SearchToolsService {
 
     fn query_taint_result_snapshot(
         &self,
-    ) -> Result<crate::analyzer::structural::TaintResultRegistrationSet, SearchToolsServiceError>
-    {
+    ) -> Result<crate::rql::TaintResultRegistrationSet, SearchToolsServiceError> {
         self.query_taint_results
             .read()
             .map(|registrations| registrations.clone())
             .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))
     }
 
+    /// Retire every live registration and move to the next generation.
+    ///
+    /// The typestate summary repository is deliberately not rotated here. Its
+    /// entries are keyed by `ProcedureSummaryKey`, which names the procedure's
+    /// exact artifact content, so an update cannot make a retained entry wrong;
+    /// rotating would only throw away every unchanged procedure's summary. The
+    /// registrations below are different: they are caller-minted handles into
+    /// one immutable workspace snapshot, and they do not survive it.
     fn advance_workspace_generation(&self) {
-        let mut summaries = self
-            .typestate_summaries
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.query_protocols
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2982,10 +3298,7 @@ impl SearchToolsService {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
-        let previous = self.workspace_generation.fetch_add(1, Ordering::AcqRel);
-        let generation = previous.wrapping_add(1);
-        let successor = summaries.successor_generation(generation);
-        *summaries = Arc::new(successor);
+        self.workspace_generation.fetch_add(1, Ordering::AcqRel);
     }
 
     // Note: `--root` and `new_for_python` take the path as-given (canonicalized
@@ -3076,7 +3389,8 @@ impl SearchToolsService {
         semantic_indexing: bool,
         watcher_starter: WatcherStarter,
     ) -> Result<Self, String> {
-        let (project, workspace) = build_persisted_workspace(canonical, file_listing.clone())?;
+        let (project, workspace) =
+            build_persisted_workspace(canonical, file_listing.clone(), update_strategy)?;
         let root = project.root().to_path_buf();
         let session = assemble_session(
             project,
@@ -3090,12 +3404,10 @@ impl SearchToolsService {
             root: RwLock::new(Some(root)),
             session: RwLock::new(Some(session)),
             workspace_generation: AtomicU64::new(1),
+            flow_state: crate::flow::FlowWorkspaceState::new(),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
             query_taint_results: RwLock::new(Default::default()),
-            typestate_summaries: RwLock::new(Arc::new(
-                crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
-            )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             file_listing: RwLock::new(file_listing),
@@ -3142,12 +3454,10 @@ impl SearchToolsService {
             root: RwLock::new(Some(root)),
             session: RwLock::new(Some(session)),
             workspace_generation: AtomicU64::new(1),
+            flow_state: crate::flow::FlowWorkspaceState::new(),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
             query_taint_results: RwLock::new(Default::default()),
-            typestate_summaries: RwLock::new(Arc::new(
-                crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
-            )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             file_listing: RwLock::new(file_listing),
@@ -3184,12 +3494,10 @@ impl SearchToolsService {
             root: RwLock::new(Some(canonical)),
             session: RwLock::new(None),
             workspace_generation: AtomicU64::new(1),
+            flow_state: crate::flow::FlowWorkspaceState::new(),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
             query_taint_results: RwLock::new(Default::default()),
-            typestate_summaries: RwLock::new(Arc::new(
-                crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
-            )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             file_listing: RwLock::new(file_listing),
@@ -3249,12 +3557,10 @@ impl SearchToolsService {
             root: RwLock::new(None),
             session: RwLock::new(None),
             workspace_generation: AtomicU64::new(0),
+            flow_state: crate::flow::FlowWorkspaceState::new(),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
             query_taint_results: RwLock::new(Default::default()),
-            typestate_summaries: RwLock::new(Arc::new(
-                crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
-            )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             file_listing: RwLock::new(None),
@@ -3316,8 +3622,11 @@ impl SearchToolsService {
                     // uses (`gitblob::cache_db_path`): a linked worktree shares
                     // the primary checkout's oid-keyed database, so a client
                     // bind neither copies nor forks it (issue #1544).
-                    let (project, workspace) =
-                        build_persisted_workspace(build_root.clone(), build_file_listing)?;
+                    let (project, workspace) = build_persisted_workspace(
+                        build_root.clone(),
+                        build_file_listing,
+                        update_strategy,
+                    )?;
                     let session = assemble_session(
                         project,
                         workspace,
@@ -3453,9 +3762,10 @@ impl SearchToolsService {
                 move || -> Result<(u64, PathBuf, WorkspaceSession), String> {
                     let _scope = profiling::scope("mcp_cold.analyzer_construction");
                     let project = build_project(canonical.clone(), file_listing)?;
-                    let workspace = WorkspaceAnalyzer::build_persisted(
+                    let workspace = build_persisted_analyzer(
                         Arc::clone(&project),
                         AnalyzerConfig::default(),
+                        update_strategy,
                     )
                     .map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
                     prewarm_configured_semantic_models(project.root(), &workspace)?;
@@ -3475,12 +3785,10 @@ impl SearchToolsService {
             root: RwLock::new(Some(canonical)),
             session: RwLock::new(None),
             workspace_generation: AtomicU64::new(1),
+            flow_state: crate::flow::FlowWorkspaceState::new(),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
             query_taint_results: RwLock::new(Default::default()),
-            typestate_summaries: RwLock::new(Arc::new(
-                crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
-            )),
             pending_build: Mutex::new(Some(handle)),
             build_error: Mutex::new(None),
             file_listing: RwLock::new(file_listing),
@@ -3548,8 +3856,8 @@ impl SearchToolsService {
                 .read()
                 .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?
                 .clone();
-            let built =
-                build_persisted_workspace(root, file_listing).and_then(|(project, workspace)| {
+            let built = build_persisted_workspace(root, file_listing, self.update_strategy)
+                .and_then(|(project, workspace)| {
                     assemble_session(
                         project,
                         workspace,
@@ -3687,37 +3995,109 @@ impl SearchToolsService {
         Ok(())
     }
 
-    /// Run a forced git-reachability GC on the semantic index and block until it
-    /// completes. Off the retrieval path (does not affect `wait_ready`), intended
-    /// for occasional maintenance. The session lock is released before blocking.
-    pub fn request_semantic_gc(&self) -> Result<(), SearchToolsServiceError> {
-        #[cfg(not(feature = "nlp"))]
-        {
-            Err(SearchToolsServiceError::internal(
-                "semantic index requires the nlp feature",
-            ))
+    /// Replace a session whose persisted language generations were advanced
+    /// by another analyzer process (for example, while a client switched
+    /// branches). Incremental updates retain the snapshot's captured
+    /// generations, so they cannot repair this condition; a fresh persisted
+    /// build must capture the store's current immutable generation map.
+    fn reload_stale_workspace_snapshot(
+        &self,
+        expected_workspace_generation: u64,
+    ) -> Result<(), SearchToolsServiceError> {
+        let root = self.service_root()?;
+        let file_listing = self
+            .file_listing
+            .read()
+            .map_err(|_| SearchToolsServiceError::internal("SearchToolsService lock poisoned"))?
+            .clone();
+        if let Some(file_listing) = &file_listing {
+            file_listing.invalidate();
         }
+        let mut session_guard = self.write_session()?;
+        if self.workspace_generation() != expected_workspace_generation {
+            return Ok(());
+        }
+        let semantic_indexing = {
+            let session = session_guard.as_ref().ok_or_else(Self::closed_error)?;
+            #[cfg(feature = "nlp")]
+            {
+                session.semantic.is_some()
+            }
+            #[cfg(not(feature = "nlp"))]
+            {
+                let _ = session;
+                false
+            }
+        };
+        let (project, workspace) =
+            build_persisted_workspace(root, file_listing, self.update_strategy).map_err(
+                |error| {
+                    SearchToolsServiceError::internal(format!(
+                        "Failed to reload workspace after stale analyzer generation: {error}"
+                    ))
+                },
+            )?;
+        let new_session = assemble_session(
+            project,
+            workspace,
+            self.update_strategy,
+            semantic_indexing,
+            self.startup_index_warm,
+            &self.watcher_starter,
+        )
+        .map_err(|error| {
+            SearchToolsServiceError::internal(format!(
+                "Failed to assemble workspace after stale analyzer generation: {error}"
+            ))
+        })?;
+        self.advance_workspace_generation();
+        let old_session = session_guard
+            .replace(new_session)
+            .ok_or_else(Self::closed_error)?;
+        drop(session_guard);
+        old_session.close_semantic();
+        Ok(())
+    }
+
+    /// Run a forced git-reachability GC on the unified analyzer/semantic cache
+    /// and block until it completes. The session lock is released before blocking.
+    pub fn request_cache_gc(&self) -> Result<(), SearchToolsServiceError> {
+        self.ensure_ready()?;
         #[cfg(feature = "nlp")]
         {
-            self.ensure_ready()?;
             let indexer = {
                 let guard = self.session.read().map_err(|_| {
                     SearchToolsServiceError::internal("workspace session lock poisoned")
                 })?;
                 let session = guard.as_ref().ok_or_else(Self::closed_error)?;
-                match &session.semantic {
-                    Some(indexer) => indexer.clone(),
-                    None => {
-                        return Err(SearchToolsServiceError::invalid_params(
-                            "semantic index is disabled for this session",
-                        ));
-                    }
-                }
+                session.semantic.clone()
             };
-            indexer
-                .run_gc_blocking()
-                .map_err(SearchToolsServiceError::internal)
+            if let Some(indexer) = indexer {
+                return indexer
+                    .run_gc_blocking()
+                    .map_err(SearchToolsServiceError::internal);
+            }
         }
+
+        let (root, db_path) = {
+            let guard = self.session.read().map_err(|_| {
+                SearchToolsServiceError::internal("workspace session lock poisoned")
+            })?;
+            let session = guard.as_ref().ok_or_else(Self::closed_error)?;
+            let db_path = session.snapshot.persisted_store_path().ok_or_else(|| {
+                SearchToolsServiceError::invalid_params("cache GC requires a persisted workspace")
+            })?;
+            (
+                session.snapshot.analyzer().project().root().to_path_buf(),
+                db_path,
+            )
+        };
+        let repo = crate::gitblob::discover(&root).ok_or_else(|| {
+            SearchToolsServiceError::invalid_params("cache GC requires a Git repository")
+        })?;
+        crate::cache_gc::force_gc_for_path(&db_path, &repo, &root)
+            .map(|_| ())
+            .map_err(SearchToolsServiceError::internal)
     }
 
     fn handle_refresh(&self, arguments: Value) -> Result<ToolOutput, SearchToolsServiceError> {
@@ -3820,15 +4200,17 @@ impl SearchToolsService {
         // Fully assemble the replacement before mutating either active field so
         // analyzer-store or watcher startup failure leaves the old session usable.
         let new_file_listing = listing_cache_for(self.update_strategy, &resolved);
-        let (new_project, new_workspace) =
-            build_persisted_workspace(resolved.clone(), new_file_listing.clone()).map_err(
-                |err| {
-                    SearchToolsServiceError::internal(format!(
-                        "Failed to activate workspace {}: {err}",
-                        resolved.display()
-                    ))
-                },
-            )?;
+        let (new_project, new_workspace) = build_persisted_workspace(
+            resolved.clone(),
+            new_file_listing.clone(),
+            self.update_strategy,
+        )
+        .map_err(|err| {
+            SearchToolsServiceError::internal(format!(
+                "Failed to activate workspace {}: {err}",
+                resolved.display()
+            ))
+        })?;
         #[cfg(feature = "nlp")]
         let semantic_indexing = session.semantic.is_some();
         #[cfg(not(feature = "nlp"))]
@@ -4413,180 +4795,143 @@ impl SearchToolsService {
         ))
     }
 
+    pub(crate) fn preflight_run_policy(
+        &self,
+        arguments: &Value,
+    ) -> Result<RunPolicyPreflight, SearchToolsServiceError> {
+        let selection_started = Instant::now();
+        let decoded = decode_run_policy_arguments(arguments.clone())?;
+        let selection_elapsed = selection_started.elapsed();
+        let preflight_started = Instant::now();
+        let root = self.service_root()?;
+        let preflight = crate::policy::preflight_policy_suppressions(&root, &decoded.options)
+            .map_err(|error| {
+                SearchToolsServiceError::internal(format!(
+                    "run_policy suppression preflight failed: {error}"
+                ))
+            })?;
+        let preflight_elapsed = preflight_started.elapsed();
+        if preflight.is_valid() {
+            return Ok(RunPolicyPreflight::Valid(PreparedRunPolicyPreflight {
+                suppression_preflight: preflight,
+                selection_elapsed,
+                suppression_preflight_elapsed: preflight_elapsed,
+            }));
+        }
+        let outcome = crate::policy::suppression_preflight_failure_outcome(
+            &decoded.options,
+            preflight,
+            selection_elapsed,
+            preflight_elapsed,
+        )
+        .map_err(|error| {
+            SearchToolsServiceError::internal(format!(
+                "failed to construct suppression preflight policy report: {error}"
+            ))
+        })?;
+        Ok(RunPolicyPreflight::Invalid(Self::structured_only(
+            RunPolicyToolResult {
+                status: "unreliable",
+                exit_status: outcome.exit_status(),
+                report: outcome.into_report(),
+            },
+        )?))
+    }
+
+    #[cfg(test)]
     pub(crate) fn prepare_run_policy_with_cancellation(
         &self,
         arguments: Value,
         cancellation: Option<&CancellationToken>,
     ) -> Result<RunPolicyPreparation, SearchToolsServiceError> {
+        self.prepare_run_policy_with_cancellation_and_preflight(arguments, cancellation, None)
+    }
+
+    pub(crate) fn prepare_run_policy_with_cancellation_and_preflight(
+        &self,
+        arguments: Value,
+        cancellation: Option<&CancellationToken>,
+        supplied_preflight: Option<PreparedRunPolicyPreflight>,
+    ) -> Result<RunPolicyPreparation, SearchToolsServiceError> {
         let preparation_started = Instant::now();
-        let params = serde_json::from_value::<RunPolicyParams>(arguments).map_err(|error| {
-            SearchToolsServiceError::invalid_params(format!(
-                "Invalid run_policy arguments: {error}"
+        let decoded = decode_run_policy_arguments(arguments)?;
+        let decode_selection_elapsed = preparation_started.elapsed();
+        let DecodedRunPolicy {
+            policy_inputs,
+            selected_policy_ids,
+            options,
+        } = decoded;
+        let (suppression_preflight, selection_elapsed, suppression_preflight_elapsed) =
+            match supplied_preflight {
+                Some(preflight) => (
+                    preflight.suppression_preflight,
+                    preflight
+                        .selection_elapsed
+                        .saturating_add(decode_selection_elapsed),
+                    preflight.suppression_preflight_elapsed,
+                ),
+                None => {
+                    let preflight_started = Instant::now();
+                    let root = self.service_root()?;
+                    let preflight = crate::policy::preflight_policy_suppressions(&root, &options)
+                        .map_err(|error| {
+                        SearchToolsServiceError::internal(format!(
+                            "run_policy suppression preflight failed: {error}"
+                        ))
+                    })?;
+                    (
+                        preflight,
+                        decode_selection_elapsed,
+                        preflight_started.elapsed(),
+                    )
+                }
+            };
+        if suppression_preflight.is_valid() {
+            let preparation = RunPolicySnapshotPreparation {
+                policy_inputs,
+                selected_policy_ids,
+                options,
+                suppression_preflight,
+                selection_elapsed,
+                suppression_preflight_elapsed,
+                snapshot_started: Instant::now(),
+            };
+            return self.prepare_run_policy_after_preflight(preparation, cancellation);
+        }
+        let outcome = crate::policy::suppression_preflight_failure_outcome(
+            &options,
+            suppression_preflight,
+            selection_elapsed,
+            suppression_preflight_elapsed,
+        )
+        .map_err(|error| {
+            SearchToolsServiceError::internal(format!(
+                "failed to construct suppression preflight policy report: {error}"
             ))
         })?;
-        let max_policy_files = crate::policy::PolicyBatchBudget::default().max_policies();
-        if params.policy_files.len() > max_policy_files {
-            return Err(SearchToolsServiceError::invalid_params(format!(
-                "run_policy accepts at most {max_policy_files} policy_files entries"
-            )));
-        }
-        for (label, values) in [
-            ("policy_packs", &params.policy_packs),
-            ("policy_categories", &params.policy_categories),
-            ("policy_ids", &params.policy_ids),
-        ] {
-            if values.len() > max_policy_files {
-                return Err(SearchToolsServiceError::invalid_params(format!(
-                    "run_policy accepts at most {max_policy_files} {label} entries"
-                )));
-            }
-            let mut unique = BTreeSet::new();
-            for value in values {
-                if value.is_empty()
-                    || value.len() > crate::mcp_extended::MAX_RUN_POLICY_SELECTOR_BYTES
-                {
-                    return Err(SearchToolsServiceError::invalid_params(format!(
-                        "run_policy {label} entries must contain between 1 and {} bytes",
-                        crate::mcp_extended::MAX_RUN_POLICY_SELECTOR_BYTES
-                    )));
-                }
-                if !unique.insert(value.as_str()) {
-                    return Err(SearchToolsServiceError::invalid_params(format!(
-                        "run_policy {label} entry `{value}` is duplicated"
-                    )));
-                }
-            }
-        }
-        if params.policy_files.is_empty()
-            && params.policy_packs.is_empty()
-            && params.policy_categories.is_empty()
-            && params.policy_ids.is_empty()
-        {
-            return Err(SearchToolsServiceError::invalid_params(
-                "run_policy requires at least one policy file or built-in selector".to_string(),
-            ));
-        }
+        Ok(RunPolicyPreparation::PreflightFailure(Box::new(
+            RunPolicyToolResult {
+                status: "unreliable",
+                exit_status: outcome.exit_status(),
+                report: outcome.into_report(),
+            },
+        )))
+    }
 
-        let mut unique_paths = BTreeSet::new();
-        let mut policy_inputs = Vec::with_capacity(params.policy_files.len());
-        for raw_path in params.policy_files {
-            if raw_path.len() > crate::mcp_extended::MAX_RUN_POLICY_PATH_BYTES {
-                return Err(SearchToolsServiceError::invalid_params(format!(
-                    "run_policy policy path exceeds {} bytes",
-                    crate::mcp_extended::MAX_RUN_POLICY_PATH_BYTES
-                )));
-            }
-            let path = WorkspaceRelativePath::new(&raw_path).map_err(|error| {
-                SearchToolsServiceError::invalid_params(format!(
-                    "invalid run_policy policy path `{raw_path}`: {error}"
-                ))
-            })?;
-            if Path::new(path.as_str())
-                .extension()
-                .and_then(|extension| extension.to_str())
-                != Some("rqlp")
-            {
-                return Err(SearchToolsServiceError::invalid_params(format!(
-                    "run_policy policy path `{}` must use the .rqlp extension",
-                    path.as_str()
-                )));
-            }
-            if !unique_paths.insert(path.as_str().to_owned()) {
-                return Err(SearchToolsServiceError::invalid_params(format!(
-                    "run_policy policy path `{}` is duplicated",
-                    path.as_str()
-                )));
-            }
-            policy_inputs.push(PolicyEvaluationInput::workspace_file(path.as_str()));
-        }
-
-        let selection = BuiltInPolicySelection {
-            packs: params.policy_packs,
-            categories: params.policy_categories,
-            policy_ids: params.policy_ids,
-        };
-        let selected = built_in_policy_catalog()
-            .map_err(|error| {
-                SearchToolsServiceError::internal(format!(
-                    "failed to load built-in policy catalog: {error}"
-                ))
-            })?
-            .select(&selection)
-            .map_err(|error| SearchToolsServiceError::invalid_params(error.to_string()))?;
-        let selected_policy_ids = selected
-            .iter()
-            .map(|policy| {
-                PolicyId::new(&policy.manifest().id).expect("built-in policy IDs are validated")
-            })
-            .collect::<Vec<_>>();
-        let mut built_in_inputs = selected
-            .into_iter()
-            .map(|policy| {
-                PolicyEvaluationInput::embedded(policy.source_identity(), policy.source())
-            })
-            .collect::<Vec<_>>();
-        built_in_inputs.append(&mut policy_inputs);
-        let policy_inputs = built_in_inputs;
-        if policy_inputs.len() > max_policy_files {
-            return Err(SearchToolsServiceError::invalid_params(format!(
-                "run_policy resolves to {} policies but accepts at most {max_policy_files}",
-                policy_inputs.len()
-            )));
-        }
-
-        let suppressions = params
-            .suppression_file
-            .map(PolicySuppressionSource::explicit_portable)
-            .transpose()
-            .map_err(|error| {
-                SearchToolsServiceError::invalid_params(format!(
-                    "invalid run_policy suppression_file: {error}"
-                ))
-            })?
-            .map_or_else(
-                PolicySuppressionOptions::default,
-                PolicySuppressionOptions::new,
-            );
-        let scope = params
-            .scope_file
-            .map(PolicyScopeSource::explicit_portable)
-            .transpose()
-            .map_err(|error| {
-                SearchToolsServiceError::invalid_params(format!(
-                    "invalid run_policy scope_file: {error}"
-                ))
-            })?
-            .map_or_else(PolicyScopeOptions::default, PolicyScopeOptions::new);
-        let baseline = params
-            .baseline_file
-            .map(PolicyBaselineSource::explicit_portable)
-            .transpose()
-            .map_err(|error| {
-                SearchToolsServiceError::invalid_params(format!(
-                    "invalid run_policy baseline_file: {error}"
-                ))
-            })?
-            .map_or_else(PolicyBaselineOptions::default, PolicyBaselineOptions::new);
-        let fail_on = PolicyFailOn::from(params.fail_on);
-        let mut options =
-            PolicyEvaluationOptions::with_suppressions(params.evaluation_date, suppressions)
-                .with_scope(scope)
-                .with_baseline(baseline)
-                .with_fail_on(fail_on);
-        if let Some(revision) = params.diff_base {
-            if revision.is_empty()
-                || revision.len() > crate::mcp_extended::MAX_RUN_POLICY_DIFF_BASE_BYTES
-            {
-                return Err(SearchToolsServiceError::invalid_params(format!(
-                    "run_policy diff_base must contain between 1 and {} bytes",
-                    crate::mcp_extended::MAX_RUN_POLICY_DIFF_BASE_BYTES
-                )));
-            }
-            options = options.with_diff_base(revision);
-        }
-        let selection_elapsed = preparation_started.elapsed();
-        let snapshot_started = Instant::now();
-
+    fn prepare_run_policy_after_preflight(
+        &self,
+        preparation: RunPolicySnapshotPreparation,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<RunPolicyPreparation, SearchToolsServiceError> {
+        let RunPolicySnapshotPreparation {
+            policy_inputs,
+            selected_policy_ids,
+            options,
+            suppression_preflight,
+            selection_elapsed,
+            suppression_preflight_elapsed,
+            snapshot_started,
+        } = preparation;
         loop {
             let workspace_generation = self.workspace_generation();
             let snapshot_result = {
@@ -4599,10 +4944,12 @@ impl SearchToolsService {
                     if error.code == SearchToolsServiceErrorCode::DeadlineExceeded
                         && cancellation.is_some_and(CancellationToken::is_timed_out) =>
                 {
-                    let outcome = workspace_snapshot_deadline_outcome(
+                    let outcome = workspace_snapshot_deadline_outcome_with_preflight(
                         &options,
                         selected_policy_ids,
                         selection_elapsed,
+                        &suppression_preflight,
+                        suppression_preflight_elapsed,
                         snapshot_started.elapsed(),
                     )
                     .map_err(|error| {
@@ -4623,14 +4970,16 @@ impl SearchToolsService {
                 continue;
             }
             let root = snapshot.analyzer().project().root().to_path_buf();
-            return Ok(RunPolicyPreparation::Ready(PreparedRunPolicy {
+            return Ok(RunPolicyPreparation::Ready(Box::new(PreparedRunPolicy {
                 snapshot,
                 root,
                 policy_inputs,
                 options,
                 selection_elapsed,
+                suppression_preflight: Some(suppression_preflight),
+                suppression_preflight_elapsed,
                 snapshot_elapsed: snapshot_started.elapsed(),
-            }));
+            })));
         }
     }
 
@@ -4674,6 +5023,7 @@ impl SearchToolsService {
                                     &policy_inputs,
                                     target,
                                     Some(&snapshot),
+                                    Some(&self.flow_state),
                                     cancellation,
                                     &ExplanationLimits::default(),
                                 )
@@ -4689,6 +5039,7 @@ impl SearchToolsService {
                                     &policy_inputs,
                                     candidates,
                                     Some(&snapshot),
+                                    Some(&self.flow_state),
                                     cancellation,
                                     limits,
                                 )
@@ -4714,19 +5065,33 @@ impl SearchToolsService {
             policy_inputs,
             options,
             selection_elapsed,
+            suppression_preflight,
+            suppression_preflight_elapsed,
             snapshot_elapsed,
-            ..
         } = prepared;
         let result = (|| {
             let _scope = profiling::scope("run_policy.evaluate_policy_inputs");
-            let mut outcome = CodeIntelligenceRuntime::new(&snapshot, cancellation)
-                .evaluate_policy_inputs(&root, &policy_inputs, &options)
-                .map_err(|error| {
-                    SearchToolsServiceError::internal(format!(
-                        "run_policy evaluation failed: {error}"
-                    ))
-                })?;
-            outcome.record_preparation_timings(selection_elapsed, snapshot_elapsed);
+            let mut outcome = match suppression_preflight {
+                Some(preflight) => {
+                    CodeIntelligenceRuntime::new(&snapshot, &self.flow_state, cancellation)
+                        .evaluate_policy_inputs_with_suppression_preflight(
+                            &root,
+                            &policy_inputs,
+                            &options,
+                            preflight,
+                        )
+                }
+                None => CodeIntelligenceRuntime::new(&snapshot, &self.flow_state, cancellation)
+                    .evaluate_policy_inputs(&root, &policy_inputs, &options),
+            }
+            .map_err(|error| {
+                SearchToolsServiceError::internal(format!("run_policy evaluation failed: {error}"))
+            })?;
+            outcome.record_preparation_timings(
+                selection_elapsed,
+                suppression_preflight_elapsed,
+                snapshot_elapsed,
+            );
             let exit_status = outcome.exit_status();
             let status = match exit_status {
                 POLICY_EXIT_CLEAN => "clean",
@@ -4905,14 +5270,34 @@ fn build_project(
 fn build_persisted_workspace(
     root: PathBuf,
     listing: Option<Arc<WorkspaceFileListingCache>>,
+    update_strategy: UpdateStrategy,
 ) -> Result<(Arc<dyn Project>, WorkspaceAnalyzer), String> {
     let _scope = profiling::scope("mcp_cold.analyzer_construction");
+    let cache_path = crate::gitblob::cache_db_path(&root);
+    crate::cache_db::validate_writable_cache_filesystem(&cache_path)
+        .map_err(|error| format!("Failed to initialize persistent cache: {error}"))?;
     let project = build_project(root, listing)?;
-    let workspace =
-        WorkspaceAnalyzer::build_persisted(Arc::clone(&project), AnalyzerConfig::default())
-            .map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
+    let workspace = build_persisted_analyzer(
+        Arc::clone(&project),
+        AnalyzerConfig::default(),
+        update_strategy,
+    )
+    .map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
     prewarm_configured_semantic_models(project.root(), &workspace)?;
     Ok((project, workspace))
+}
+
+fn build_persisted_analyzer(
+    project: Arc<dyn Project>,
+    config: AnalyzerConfig,
+    update_strategy: UpdateStrategy,
+) -> Result<WorkspaceAnalyzer, crate::analyzer::store::StoreError> {
+    match update_strategy {
+        UpdateStrategy::WatchFiles => WorkspaceAnalyzer::build_persisted(project, config),
+        UpdateStrategy::Manual => {
+            WorkspaceAnalyzer::build_persisted_without_automatic_gc(project, config)
+        }
+    }
 }
 
 fn build_ephemeral_workspace(
@@ -5083,12 +5468,10 @@ mod watcher_startup_tests {
             root: RwLock::new(None),
             session: RwLock::new(None),
             workspace_generation: AtomicU64::new(0),
+            flow_state: crate::flow::FlowWorkspaceState::new(),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
             query_taint_results: RwLock::new(Default::default()),
-            typestate_summaries: RwLock::new(Arc::new(
-                crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
-            )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             file_listing: RwLock::new(None),
@@ -5421,6 +5804,46 @@ mod watcher_startup_tests {
     }
 
     #[test]
+    fn profiled_query_reports_transport_wait_components() {
+        let (_temp, root) = workspace("SplitQueued.java", "class SplitQueued {}\n");
+        let service =
+            SearchToolsService::new_manual_ephemeral(root).expect("manual service should start");
+        let output = service
+            .call_tool_output_with_transport_timings(
+                "query_code",
+                json!({
+                    "schema_version": 1,
+                    "match": {"kind": "class", "name": "SplitQueued"},
+                    "execution_mode": "profile",
+                }),
+                RenderOptions::default(),
+                None,
+                TransportTimings {
+                    transport_queue_wait: Duration::from_millis(11),
+                    workspace_readiness_wait: Duration::from_millis(7),
+                    analyzer_admission_wait: Duration::from_millis(3),
+                },
+            )
+            .expect("profiled query should succeed");
+        let ToolOutput::Structured { structured, .. } = output else {
+            panic!("query_code should return structured output");
+        };
+        let timings = &structured["request_timings_ns"];
+        assert_eq!(timings["transport_queue_wait"].as_u64(), Some(11_000_000));
+        assert_eq!(
+            timings["workspace_readiness_wait"].as_u64(),
+            Some(7_000_000)
+        );
+        assert_eq!(timings["analyzer_admission_wait"].as_u64(), Some(3_000_000));
+        assert!(
+            timings["total"]
+                .as_u64()
+                .is_some_and(|total| total >= 11_000_000),
+            "request total should include the host queue aggregate: {timings}"
+        );
+    }
+
+    #[test]
     fn issue_1296_run_policy_snapshot_deadline_returns_canonical_report() {
         let (_temp, root) = workspace("DeferredPolicy.java", "class DeferredPolicy {}\n");
         let (startup_started_tx, startup_started_rx) = mpsc::channel();
@@ -5455,6 +5878,9 @@ mod watcher_startup_tests {
             Some(&cancellation),
         ) {
             Ok(RunPolicyPreparation::Deadline(result)) => result,
+            Ok(RunPolicyPreparation::PreflightFailure(_)) => {
+                panic!("expired request unexpectedly failed suppression preflight")
+            }
             Ok(RunPolicyPreparation::Ready(_)) => {
                 panic!("expired request should not join the deferred build")
             }
@@ -5474,6 +5900,23 @@ mod watcher_startup_tests {
             result.report.execution().terminal_stage(),
             Some(PolicyExecutionStage::WorkspaceSnapshot)
         );
+        let stages = result
+            .report
+            .execution()
+            .stage_timings()
+            .iter()
+            .map(|timing| timing.stage())
+            .collect::<Vec<_>>();
+        for expected in [
+            PolicyExecutionStage::PolicySelection,
+            PolicyExecutionStage::SuppressionPreflight,
+            PolicyExecutionStage::WorkspaceSnapshot,
+        ] {
+            assert!(
+                stages.contains(&expected),
+                "missing stage {expected:?}: {stages:?}"
+            );
+        }
         assert_eq!(
             result.report.execution().pending_policy_ids(),
             &[PolicyId::new("bifrost.correctness.dynamic-evaluation").unwrap()]
@@ -5488,12 +5931,139 @@ mod watcher_startup_tests {
                 .evaluation()
                 .suppression_sources()
                 .iter()
-                .all(|source| source.state() == PolicySuppressionDocumentState::NotEvaluated),
-            "a run that ended before loading consults no source"
+                .all(|source| source.state() == PolicySuppressionDocumentState::NotFound),
+            "suppression preflight completes before the snapshot wait"
         );
         release_startup_tx
             .send(())
             .expect("release deferred watcher startup");
+    }
+
+    #[test]
+    fn malformed_suppressions_fail_before_deferred_snapshot_readiness() {
+        let (_temp, root) = workspace("MalformedPolicy.java", "class MalformedPolicy {}\n");
+        let suppression_path = root.join(".bifrost/suppressions.json");
+        std::fs::create_dir_all(suppression_path.parent().expect("suppression parent"))
+            .expect("create suppression directory");
+        std::fs::write(&suppression_path, "{ not json").expect("write malformed suppressions");
+        let (startup_started_tx, startup_started_rx) = mpsc::channel();
+        let (release_startup_tx, release_startup_rx) = mpsc::sync_channel(1);
+        let release_startup_rx = Arc::new(Mutex::new(release_startup_rx));
+        let starter: WatcherStarter = Arc::new(move |project| {
+            startup_started_tx
+                .send(())
+                .expect("test should observe watcher startup");
+            release_startup_rx
+                .lock()
+                .expect("release lock")
+                .recv_timeout(Duration::from_secs(5))
+                .expect("test should release watcher startup");
+            ProjectChangeWatcher::start_polling_for_tests(project)
+        });
+        let service = unbound_watching_service(starter);
+        service
+            .bind_client_workspace(root)
+            .expect("client binding should start a deferred build");
+        startup_started_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("deferred build should reach watcher startup");
+
+        let result = service
+            .prepare_run_policy_with_cancellation(
+                json!({
+                    "policy_ids": ["bifrost.correctness.dynamic-evaluation"],
+                    "evaluation_date": "2026-07-29",
+                    "fail_on": "warning"
+                }),
+                None,
+            )
+            .expect("malformed suppressions should be a canonical result");
+        let RunPolicyPreparation::PreflightFailure(result) = result else {
+            panic!("malformed suppressions must fail before snapshot acquisition");
+        };
+        assert_eq!(result.status, "unreliable");
+        assert_eq!(result.exit_status, POLICY_EXIT_UNRELIABLE);
+        assert_eq!(result.report.schema_version(), 5);
+        assert!(result.report.rules().is_empty());
+        assert!(result.report.runs().is_empty());
+        assert_eq!(result.report.diagnostics().len(), 1);
+        assert_eq!(
+            result.report.diagnostics()[0].code(),
+            PolicyReportDiagnosticCode::SuppressionLoadFailed
+        );
+        assert_eq!(
+            result.report.execution().completed_policy_ids(),
+            &[] as &[PolicyId]
+        );
+        assert_eq!(
+            result.report.execution().pending_policy_ids(),
+            &[] as &[PolicyId]
+        );
+        let stages = result
+            .report
+            .execution()
+            .stage_timings()
+            .iter()
+            .map(|timing| timing.stage())
+            .collect::<Vec<_>>();
+        assert!(stages.contains(&PolicyExecutionStage::PolicySelection));
+        assert!(stages.contains(&PolicyExecutionStage::SuppressionPreflight));
+        assert!(stages.contains(&PolicyExecutionStage::ReportConstruction));
+        assert!(!stages.contains(&PolicyExecutionStage::WorkspaceSnapshot));
+        assert!(!stages.contains(&PolicyExecutionStage::PolicyEvaluation));
+        assert_eq!(
+            result.report.evaluation().suppression_sources()[0].state(),
+            PolicySuppressionDocumentState::Invalid
+        );
+        release_startup_tx
+            .send(())
+            .expect("release deferred watcher startup");
+    }
+
+    #[test]
+    fn valid_suppression_preflight_is_carried_into_policy_execution() {
+        let (_temp, root) = workspace("Policy.java", "class Policy {}");
+        let service = SearchToolsService::new_manual_ephemeral(root.clone())
+            .expect("manual service should start");
+        let suppression_path = root.join(".bifrost/suppressions.json");
+        std::fs::create_dir_all(suppression_path.parent().expect("suppression parent"))
+            .expect("create suppression directory");
+        std::fs::write(
+            &suppression_path,
+            r#"{"schema_version":1,"suppressions":[]}"#,
+        )
+        .expect("write valid suppressions");
+        let arguments = json!({
+            "policy_ids": ["bifrost.correctness.dynamic-evaluation"],
+            "evaluation_date": "2026-07-29",
+            "fail_on": "warning"
+        });
+        let RunPolicyPreflight::Valid(preflight) = service
+            .preflight_run_policy(&arguments)
+            .expect("suppression preflight should succeed")
+        else {
+            panic!("valid suppressions must produce a carried preflight");
+        };
+
+        // A host-level preflight is intentionally a snapshot of configuration.
+        // If execution loaded the file again, this mutation would turn the
+        // otherwise valid run into an unreliable suppression-load failure.
+        std::fs::write(&suppression_path, "{ malformed").expect("invalidate suppressions");
+        let ToolOutput::Structured { structured, .. } = service
+            .call_tool_output_with_transport_timings_and_preflight(
+                "run_policy",
+                arguments,
+                RenderOptions::default(),
+                None,
+                TransportTimings::default(),
+                Some(preflight),
+            )
+            .expect("carried preflight should permit execution")
+        else {
+            panic!("run_policy must return structured output");
+        };
+        assert_ne!(structured["status"], "unreliable", "{structured:#}");
+        assert_eq!(structured["report"]["diagnostics"], json!([]));
     }
 
     /// #1199: a request whose budget expires while the deferred initial build
@@ -5676,6 +6246,7 @@ mod watcher_startup_tests {
             .expect("stage timings");
         for expected in [
             "policy_selection",
+            "suppression_preflight",
             "workspace_snapshot",
             "policy_registration",
         ] {
@@ -6068,17 +6639,10 @@ mod watcher_startup_tests {
         assert_eq!(symbols["files"][0]["path"], "Old.java");
     }
 
-    /// Issues #1848 and #1847, coupled: the loop's by-product was
-    /// `.git/index.lock` recorded as a changed project file, and draining that
-    /// delta ran `snapshot.update`, which allocates a fresh
-    /// `global_usage_definition_index` `OnceLock` (pinned by
-    /// `shared_usage_indices_reuse_generation_allocations_and_reset_on_update`
-    /// in `tree_sitter_analyzer.rs`; a snapshot *clone*, as every query takes,
-    /// keeps it). So Git's own bookkeeping rebuilt the resident workspace
-    /// index over and over. It must now leave the session snapshot -- and with
-    /// it the published index -- exactly where it was.
+    /// Git bookkeeping is outside the analyzed source set and must not replace
+    /// the session snapshot used by subsequent queries.
     #[test]
-    fn git_bookkeeping_in_a_watched_session_keeps_the_definition_index() {
+    fn git_bookkeeping_in_a_watched_session_keeps_the_source_snapshot() {
         let (_temp, root) = workspace("Model.java", "class Model { void run() {} }\n");
         let repository = git2::Repository::init(&root).unwrap();
         let mut index = repository.index().unwrap();
@@ -6092,17 +6656,8 @@ mod watcher_startup_tests {
 
         let service = SearchToolsService::new_without_semantic_index(root.clone()).unwrap();
         let warm = service.snapshot_for_query().unwrap();
-        warm.analyzer().global_usage_definition_index();
-        let builds = warm
-            .analyzer()
-            .test_hooks()
-            .global_usage_definition_index_build_count_for_test();
-        assert!(
-            builds >= 1,
-            "the definition index must be published before the pin means anything"
-        );
         let published = Arc::clone(&warm.source_snapshot);
-        warm.finish("warm_definition_index", Ok(())).unwrap();
+        warm.finish("capture_source_snapshot", Ok(())).unwrap();
 
         for arguments in [
             ["status", "--porcelain"].as_slice(),
@@ -6124,18 +6679,9 @@ mod watcher_startup_tests {
         let after = service.snapshot_for_query().unwrap();
         assert!(
             Arc::ptr_eq(&published, &after.source_snapshot),
-            "Git bookkeeping must not replace the session snapshot: replacing it drops the resident definition index"
+            "Git bookkeeping must not replace the session snapshot"
         );
-        after.analyzer().global_usage_definition_index();
-        assert_eq!(
-            after
-                .analyzer()
-                .test_hooks()
-                .global_usage_definition_index_build_count_for_test(),
-            builds,
-            "the published definition index must be reused, not rebuilt"
-        );
-        after.finish("definition_index_pin", Ok(())).unwrap();
+        after.finish("source_snapshot_pin", Ok(())).unwrap();
     }
 }
 
@@ -6165,21 +6711,25 @@ mod analyzer_failure_boundary_tests {
         (temp, root, service)
     }
 
-    fn make_java_store_stale(root: &Path) {
+    fn make_store_stale(root: &Path, lang: &str) {
         let connection = rusqlite::Connection::open(analyzer_db_path(root)).unwrap();
         assert_eq!(
             connection
                 .execute(
-                    "UPDATE analysis_epochs SET generation = generation + 1 WHERE lang = 'java'",
-                    [],
+                    "UPDATE analysis_epochs SET generation = generation + 1 WHERE lang = ?1",
+                    [lang],
                 )
                 .unwrap(),
             1
         );
     }
 
+    fn make_java_store_stale(root: &Path) {
+        make_store_stale(root, "java");
+    }
+
     #[test]
-    fn multi_language_store_failure_replaces_false_empty_tool_success() {
+    fn stale_generation_reloads_the_service_snapshot_before_retrying() {
         let (_temp, root, service) = multi_language_service();
 
         let healthy = service
@@ -6189,24 +6739,81 @@ mod analyzer_failure_boundary_tests {
 
         make_java_store_stale(&root);
 
-        let error = service
+        let recovered = service
             .call_tool_value("get_symbol_locations", json!({"symbols": ["Model"]}))
-            .unwrap_err();
-        assert_eq!(error.code, SearchToolsServiceErrorCode::Internal);
-        assert!(error.message.contains("get_symbol_locations"));
-        assert!(error.message.contains("querying definition candidates"));
-        assert!(error.message.contains("stale analyzer generation"));
+            .unwrap();
+        assert_eq!(recovered["locations"][0]["symbol"], "Model");
 
-        let error = service
+        let recovered = service
             .call_tool_value(
                 "search_symbols",
                 json!({"patterns": ["Model"], "include_tests": true, "limit": 5}),
             )
-            .unwrap_err();
-        assert_eq!(error.code, SearchToolsServiceErrorCode::Internal);
-        assert!(error.message.contains("search_symbols"));
-        assert!(error.message.contains("searching symbol candidates"));
-        assert!(error.message.contains("stale analyzer generation"));
+            .unwrap();
+        assert_eq!(recovered["total_files"], 1);
+    }
+
+    #[test]
+    fn rust_search_symbols_recovers_after_an_external_generation_cutover() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("Model.rs"), "struct Before {}").unwrap();
+        git2::Repository::init(&root).unwrap();
+        let project: Arc<dyn Project> = Arc::new(TestProject::with_languages(
+            root.clone(),
+            BTreeSet::from([Language::Rust]),
+        ));
+        let service = SearchToolsService::new_manual_persisted_for_project(
+            project,
+            AnalyzerConfig::default(),
+        )
+        .unwrap();
+
+        let initial = service
+            .call_tool_output_with_transport_timings_and_preflight(
+                "search_symbols",
+                json!({"patterns": ["Before"], "include_tests": true, "limit": 5}),
+                RenderOptions::default(),
+                None,
+                TransportTimings::default(),
+                None,
+            )
+            .unwrap()
+            .into_value();
+        assert_eq!(initial["total_files"], 1);
+
+        // A checkout performed by another process changes the source and
+        // advances the shared analyzer generation before this service sees it.
+        std::fs::write(root.join("Model.rs"), "struct After {}").unwrap();
+        make_store_stale(&root, "rust");
+
+        let recovered = service
+            .call_tool_output_with_transport_timings_and_preflight(
+                "search_symbols",
+                json!({"patterns": ["After"], "include_tests": true, "limit": 5}),
+                RenderOptions::default(),
+                None,
+                TransportTimings::default(),
+                None,
+            )
+            .unwrap()
+            .into_value();
+        assert_eq!(recovered["total_files"], 1, "{recovered:#}");
+
+        // The rebuilt snapshot is retained, so repeated calls do not replay
+        // the stale-generation failure.
+        let repeated = service
+            .call_tool_output_with_transport_timings_and_preflight(
+                "search_symbols",
+                json!({"patterns": ["After"], "include_tests": true, "limit": 5}),
+                RenderOptions::default(),
+                None,
+                TransportTimings::default(),
+                None,
+            )
+            .unwrap()
+            .into_value();
+        assert_eq!(repeated["total_files"], 1, "{repeated:#}");
     }
 
     #[test]
@@ -6233,46 +6840,6 @@ mod analyzer_failure_boundary_tests {
         assert_eq!(error.code, SearchToolsServiceErrorCode::Internal);
         assert!(error.message.contains("failing_request"));
         assert!(error.message.contains("stale analyzer generation"));
-    }
-
-    #[test]
-    fn failed_shard_index_build_is_not_published_to_other_requests() {
-        let (_temp, root, service) = multi_language_service();
-        make_java_store_stale(&root);
-
-        // The workspace definition view is a view over the two delegates' own
-        // indexes, so one query attempts two shard builds: Python's succeeds
-        // and is published, Java's fails against the stale store.
-        let first_scope = service.snapshot_for_query().unwrap();
-        first_scope.analyzer().global_usage_definition_index();
-        assert!(first_scope.context.store_error().is_some());
-        assert_eq!(
-            first_scope
-                .analyzer()
-                .test_hooks()
-                .global_usage_definition_index_build_count_for_test(),
-            2
-        );
-        assert!(
-            first_scope
-                .finish("first_failed_index_build", Ok(()))
-                .is_err()
-        );
-
-        let retry_scope = service.snapshot_for_query().unwrap();
-        retry_scope.analyzer().global_usage_definition_index();
-        assert!(
-            retry_scope.context.store_error().is_some(),
-            "a failed shard build must not be published to later requests"
-        );
-        assert_eq!(
-            retry_scope
-                .analyzer()
-                .test_hooks()
-                .global_usage_definition_index_build_count_for_test(),
-            3,
-            "the failing Java shard rebuilds while the healthy Python shard stays published"
-        );
     }
 
     #[test]
@@ -6371,12 +6938,10 @@ public partial class MudDialogContainer
                 semantic: None,
             })),
             workspace_generation: AtomicU64::new(1),
+            flow_state: crate::flow::FlowWorkspaceState::new(),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
             query_taint_results: RwLock::new(Default::default()),
-            typestate_summaries: RwLock::new(Arc::new(
-                crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
-            )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             file_listing: RwLock::new(None),
@@ -6607,12 +7172,10 @@ mod client_roots_tests {
             root: RwLock::new(None),
             session: RwLock::new(None),
             workspace_generation: AtomicU64::new(0),
+            flow_state: crate::flow::FlowWorkspaceState::new(),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
             query_taint_results: RwLock::new(Default::default()),
-            typestate_summaries: RwLock::new(Arc::new(
-                crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
-            )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             file_listing: RwLock::new(None),
@@ -6628,6 +7191,101 @@ mod client_roots_tests {
         root.join(crate::gitblob::PROJECT_DIR_NAME)
             .join(crate::gitblob::CACHE_SUBDIR_NAME)
             .join(crate::cache_db::cache_db_file_name())
+    }
+
+    fn committed_workspace(file: &str, source: &str) -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let repo = Repository::init(&root).unwrap();
+        std::fs::write(root.join(file), source).unwrap();
+        commit_all(&repo);
+        (temp, root)
+    }
+
+    fn make_cache_gc_due(root: &Path) -> PathBuf {
+        let store = crate::analyzer::store::AnalyzerStore::open_for_workspace(root).unwrap();
+        let db_path = store.db_path().unwrap().to_path_buf();
+        drop(store);
+        crate::cache_gc::set_accounting_for_test(&db_path, 0, 0).unwrap();
+        db_path
+    }
+
+    fn gc_accounting(db_path: &Path) -> (i64, i64) {
+        let connection = rusqlite::Connection::open(db_path).unwrap();
+        connection
+            .query_row(
+                "SELECT last_gc_at, blobs_at_last_gc FROM cache_state WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn manual_persisted_sessions_leave_gc_for_explicit_maintenance() {
+        let (_source_temp, source_root) = committed_workspace("Source.java", "class Source {}\n");
+        let source_db = make_cache_gc_due(&source_root);
+        let service = SearchToolsService::new_manual_persisted(source_root.clone()).unwrap();
+        assert_eq!(gc_accounting(&source_db), (0, 0));
+
+        std::fs::write(
+            source_root.join("Source.java"),
+            "class Source { int value; }\n",
+        )
+        .unwrap();
+        service.call_tool_value("refresh", json!({})).unwrap();
+        assert_eq!(gc_accounting(&source_db), (0, 0));
+
+        let (_target_temp, target_root) = committed_workspace("Target.java", "class Target {}\n");
+        let target_db = make_cache_gc_due(&target_root);
+        service
+            .call_tool_value(
+                "activate_workspace",
+                json!({"workspace_path": target_root.display().to_string()}),
+            )
+            .unwrap();
+        service.close().unwrap();
+
+        assert_eq!(gc_accounting(&source_db), (0, 0));
+        assert_eq!(gc_accounting(&target_db), (0, 0));
+    }
+
+    #[test]
+    fn watched_persisted_sessions_still_run_automatic_gc() {
+        let (_temp, root) = committed_workspace("Watched.java", "class Watched {}\n");
+        let db_path = make_cache_gc_due(&root);
+
+        let service = SearchToolsService::new_without_semantic_index(root).unwrap();
+        service.close().unwrap();
+
+        let (last_gc_at, blobs_at_last_gc) = gc_accounting(&db_path);
+        assert!(last_gc_at > 0);
+        assert!(blobs_at_last_gc > 0);
+    }
+
+    #[test]
+    fn explicit_gc_collects_a_manual_nonsemantic_cache() {
+        let (_temp, root) = committed_workspace("Manual.java", "class Manual {}\n");
+        let db_path = make_cache_gc_due(&root);
+        let service = SearchToolsService::new_manual_persisted(root).unwrap();
+
+        service.request_cache_gc().unwrap();
+        service.close().unwrap();
+
+        let (last_gc_at, blobs_at_last_gc) = gc_accounting(&db_path);
+        assert!(last_gc_at > 0);
+        assert!(blobs_at_last_gc > 0);
+    }
+
+    #[test]
+    fn explicit_gc_rejects_ephemeral_sessions() {
+        let (_temp, root) = committed_workspace("Ephemeral.java", "class Ephemeral {}\n");
+        let service = SearchToolsService::new_manual_ephemeral(root).unwrap();
+
+        let error = service.request_cache_gc().unwrap_err();
+
+        assert_eq!(error.code, SearchToolsServiceErrorCode::InvalidParams);
+        assert!(error.message.contains("persisted workspace"));
     }
 
     #[test]
@@ -6782,7 +7440,8 @@ mod client_roots_tests {
         commit_all(&repo);
         let canonical_primary = primary_root.canonicalize().unwrap();
         let (_primary_project, primary_workspace) =
-            build_persisted_workspace(canonical_primary.clone(), None).unwrap();
+            build_persisted_workspace(canonical_primary.clone(), None, UpdateStrategy::Manual)
+                .unwrap();
 
         let linked_root = temp.path().join("linked");
         let worktree = repo.worktree("linked", &linked_root, None).unwrap();
@@ -7050,9 +7709,9 @@ mod search_symbols_cancellation_tests {
 mod query_protocol_tests {
     use super::*;
     use crate::analyzer::semantic::{ProcedureKind, SemanticBudget, SemanticRequest};
-    use crate::analyzer::structural::{CodeQueryDiagnosticCode, ProtocolRef};
-    use crate::analyzer::typestate::{ProtocolSpec, TypestateBindingPlan};
     use crate::cancellation::CancellationToken;
+    use crate::flow::typestate::{ProtocolSpec, TypestateBindingPlan};
+    use crate::rql::{CodeQueryDiagnosticCode, ProtocolRef};
     use serde_json::json;
 
     const RESOURCE_LIFECYCLE: &[u8] = include_bytes!(concat!(
@@ -7146,17 +7805,8 @@ mod query_protocol_tests {
         let prepared = service
             .prepare_query_code(query(&protocol_ref), None)
             .unwrap();
-        let prepared_summaries = prepared.typestate_summary_lease.clone();
 
         service.advance_workspace_generation();
-        let current_summaries = Arc::clone(
-            &service
-                .typestate_summaries
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
-        assert_eq!(prepared_summaries.generation(), 1);
-        assert_eq!(current_summaries.generation(), Some(2));
 
         let live = service.query_protocol_snapshot().unwrap();
         assert_eq!(live.reference_count(), 0);
@@ -7171,8 +7821,6 @@ mod query_protocol_tests {
             prepared_value.get("diagnostics").is_none(),
             "prepared requests own their generation-consistent registration snapshot"
         );
-        assert_eq!(prepared_summaries.generation(), 1);
-        assert_eq!(current_summaries.generation(), Some(2));
 
         let current = service.query_code_result(query(&protocol_ref)).unwrap();
         assert_eq!(
@@ -7233,15 +7881,31 @@ mod query_protocol_tests {
             Some(&json!(1))
         );
 
+        let prepared = service
+            .prepare_query_code(json!({"query_file": "lifecycle.rql"}), None)
+            .unwrap();
+
+        // A generation advance no longer rotates the summary repository, so
+        // the exact result computed under the previous generation is still a
+        // hit. The prepared request retains its protocol registration while a
+        // new live request would correctly become unresolved.
         service.advance_workspace_generation();
-        let summaries = Arc::clone(
-            &service
-                .typestate_summaries
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        let after_advance = serde_json::to_value(
+            service
+                .execute_prepared_query_code(prepared, None)
+                .unwrap()
+                .into_value(),
+        )
+        .unwrap();
+        assert_eq!(after_advance.pointer("/results"), first.pointer("/results"));
+        assert_eq!(
+            after_advance.pointer("/work/semantic/typestate/summary_hits"),
+            Some(&json!(1))
         );
-        let counters = summaries.counters();
-        assert!(counters.evictions > 0);
+        assert_eq!(
+            after_advance.pointer("/work/semantic/typestate/summary_recomputations"),
+            Some(&json!(0))
+        );
     }
 }
 
@@ -7261,7 +7925,8 @@ mod tests {
         )
         .unwrap();
         let (_project, workspace) =
-            build_persisted_workspace(dir.path().to_path_buf(), None).unwrap();
+            build_persisted_workspace(dir.path().to_path_buf(), None, UpdateStrategy::WatchFiles)
+                .unwrap();
         let snapshot = Arc::new(workspace);
         let indexer = SemanticIndexer::start_with_provider(
             dir.path().to_path_buf(),
@@ -7282,12 +7947,10 @@ mod tests {
                 semantic: Some(indexer.clone()),
             })),
             workspace_generation: AtomicU64::new(1),
+            flow_state: crate::flow::FlowWorkspaceState::new(),
             query_protocols: RwLock::new(Default::default()),
             query_value_flows: RwLock::new(Default::default()),
             query_taint_results: RwLock::new(Default::default()),
-            typestate_summaries: RwLock::new(Arc::new(
-                crate::analyzer::typestate::ProductionTypestateSummaryRepository::new(),
-            )),
             pending_build: Mutex::new(None),
             build_error: Mutex::new(None),
             file_listing: RwLock::new(None),
@@ -7315,7 +7978,8 @@ mod tests {
         )
         .unwrap();
         let (_project, workspace) =
-            build_persisted_workspace(dir.path().to_path_buf(), None).unwrap();
+            build_persisted_workspace(dir.path().to_path_buf(), None, UpdateStrategy::WatchFiles)
+                .unwrap();
         let snapshot = Arc::new(workspace);
 
         // No CUDA/Metal and no --force-semantic-cpu: the indexer must not start.

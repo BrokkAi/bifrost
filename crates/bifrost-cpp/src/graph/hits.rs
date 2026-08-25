@@ -20,6 +20,22 @@ pub fn push_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
+pub fn push_type_hit_range(anchor: Node<'_>, start: usize, end: usize, ctx: &mut ScanCtx<'_>) {
+    if ctx.has_physically_visible_type_target {
+        push_hit_range_with_options(
+            anchor,
+            start,
+            end,
+            ctx,
+            false,
+            UsageHitKind::Reference,
+            true,
+        );
+    } else {
+        push_unproven_hit_range(anchor, start, end, ctx, UsageHitKind::Reference);
+    }
+}
+
 pub fn push_self_receiver_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     push_hit_with_options(node, ctx, false, UsageHitKind::SelfReceiver, false);
 }
@@ -52,6 +68,24 @@ pub fn push_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     push_hit_with_options(node, ctx, true, UsageHitKind::Definition, false);
 }
 
+/// Record a declaration-only spelling that is linked to the target's physical
+/// definition. It is an external reference to that definition even when the
+/// analyzer reconciles both occurrences into one logical CodeUnit, so the
+/// ordinary own-declaration suppression does not apply.
+pub fn push_declaration_reference_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if *ctx.limit_exceeded {
+        return;
+    }
+    let line_idx = find_line_index_for_offset(ctx.line_starts, node.start_byte());
+    insert_hit(
+        node,
+        ctx,
+        ctx.spec.target.clone(),
+        line_idx,
+        UsageHitKind::Reference,
+    );
+}
+
 pub fn push_unproven_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     push_unproven_hit_with_kind(node, ctx, UsageHitKind::Reference);
 }
@@ -61,13 +95,21 @@ pub fn push_unproven_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn push_unproven_hit_with_kind(node: Node<'_>, ctx: &mut ScanCtx<'_>, kind: UsageHitKind) {
-    if is_inside_target_declaration(node, ctx) || is_member_field_own_declarator(node, ctx) {
+    push_unproven_hit_range(node, node.start_byte(), node.end_byte(), ctx, kind);
+}
+
+fn push_unproven_hit_range(
+    anchor: Node<'_>,
+    start: usize,
+    end: usize,
+    ctx: &mut ScanCtx<'_>,
+    kind: UsageHitKind,
+) {
+    if is_inside_target_declaration(anchor, ctx) || is_member_field_own_declarator(anchor, ctx) {
         return;
     }
-    let start = node.start_byte();
-    let end = node.end_byte();
     let line_idx = find_line_index_for_offset(ctx.line_starts, start);
-    let Some(enclosing) = enclosing_context(node, ctx).enclosing.clone() else {
+    let Some(enclosing) = enclosing_context(anchor, ctx).enclosing.clone() else {
         return;
     };
     if ctx.target_group.contains(&enclosing) {
@@ -104,17 +146,37 @@ fn push_hit_with_options(
     kind: UsageHitKind,
     allow_inside_target_declaration: bool,
 ) {
+    push_hit_range_with_options(
+        node,
+        node.start_byte(),
+        node.end_byte(),
+        ctx,
+        allow_logical_target_enclosing,
+        kind,
+        allow_inside_target_declaration,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_hit_range_with_options(
+    anchor: Node<'_>,
+    start: usize,
+    end: usize,
+    ctx: &mut ScanCtx<'_>,
+    allow_logical_target_enclosing: bool,
+    kind: UsageHitKind,
+    allow_inside_target_declaration: bool,
+) {
     if *ctx.limit_exceeded {
         return;
     }
-    let start = node.start_byte();
-    if is_member_field_own_declarator(node, ctx) {
+    if is_member_field_own_declarator(anchor, ctx) {
         return;
     }
     let inside_target_declaration =
-        !allow_inside_target_declaration && is_inside_target_declaration(node, ctx);
+        !allow_inside_target_declaration && is_inside_target_declaration(anchor, ctx);
     let line_idx = find_line_index_for_offset(ctx.line_starts, start);
-    let Some(enclosing) = enclosing_context(node, ctx).enclosing.clone() else {
+    let Some(enclosing) = enclosing_context(anchor, ctx).enclosing.clone() else {
         return;
     };
     // A reference whose enclosing declaration is the target itself is a
@@ -128,9 +190,16 @@ fn push_hit_with_options(
     if matches!(kind, UsageHitKind::Reference | UsageHitKind::SelfReceiver)
         && ctx.spec.target.is_function()
         && enclosing == ctx.spec.target
-        && !is_target_declaration_name(node, ctx)
+        && !is_target_declaration_name(anchor, ctx)
     {
-        insert_hit(node, ctx, enclosing, line_idx, UsageHitKind::SelfReceiver);
+        insert_hit_range(
+            start,
+            end,
+            ctx,
+            enclosing,
+            line_idx,
+            UsageHitKind::SelfReceiver,
+        );
         return;
     }
     if inside_target_declaration {
@@ -144,7 +213,7 @@ fn push_hit_with_options(
     {
         return;
     }
-    insert_hit(node, ctx, enclosing, line_idx, kind);
+    insert_hit_range(start, end, ctx, enclosing, line_idx, kind);
 }
 
 fn insert_hit(
@@ -154,11 +223,29 @@ fn insert_hit(
     line_idx: usize,
     kind: UsageHitKind,
 ) {
+    insert_hit_range(
+        node.start_byte(),
+        node.end_byte(),
+        ctx,
+        enclosing,
+        line_idx,
+        kind,
+    );
+}
+
+fn insert_hit_range(
+    start: usize,
+    end: usize,
+    ctx: &mut ScanCtx<'_>,
+    enclosing: CodeUnit,
+    line_idx: usize,
+    kind: UsageHitKind,
+) {
     let hit = usage_hit(
         ctx.file,
         line_idx,
-        node.start_byte(),
-        node.end_byte(),
+        start,
+        end,
         enclosing,
         snippet_around_line(ctx.source, ctx.line_starts, line_idx, SNIPPET_CONTEXT_LINES),
     );

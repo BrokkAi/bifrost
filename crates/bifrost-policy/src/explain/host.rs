@@ -76,6 +76,7 @@ pub fn explain_policy_inputs(
     policy_inputs: &[PolicyEvaluationInput],
     target: &ExplanationTarget,
     workspace: Option<&WorkspaceAnalyzer>,
+    flow_state: Option<&brokk_bifrost_flow::FlowWorkspaceState>,
     cancellation: Option<&CancellationToken>,
     limits: &ExplanationLimits,
 ) -> Result<PolicyExplanation, ExplainError> {
@@ -83,6 +84,7 @@ pub fn explain_policy_inputs(
         root,
         policy_inputs,
         workspace,
+        flow_state,
         cancellation,
         |policy, context, budget| explain_loaded_policy(policy, context, target, budget, limits),
     )
@@ -106,6 +108,7 @@ pub fn rank_policy_near_misses(
     policy_inputs: &[PolicyEvaluationInput],
     candidates: &NearMissCandidates,
     workspace: Option<&WorkspaceAnalyzer>,
+    flow_state: Option<&brokk_bifrost_flow::FlowWorkspaceState>,
     cancellation: Option<&CancellationToken>,
     limits: &ExplanationLimits,
 ) -> Result<PolicyNearMissRanking, ExplainError> {
@@ -113,6 +116,7 @@ pub fn rank_policy_near_misses(
         root,
         policy_inputs,
         workspace,
+        flow_state,
         cancellation,
         |policy, context, budget| rank_near_misses(policy, context, candidates, budget, limits),
     )
@@ -127,6 +131,7 @@ fn with_one_policy<T>(
     root: &Path,
     policy_inputs: &[PolicyEvaluationInput],
     workspace: Option<&WorkspaceAnalyzer>,
+    flow_state: Option<&brokk_bifrost_flow::FlowWorkspaceState>,
     cancellation: Option<&CancellationToken>,
     answer: impl FnOnce(
         &LoadedPolicy,
@@ -170,9 +175,16 @@ fn with_one_policy<T>(
     let workspace = workspace
         .or(owned.as_ref())
         .expect("either the caller supplied a workspace or one was built");
+    let owned_flow_state = flow_state
+        .is_none()
+        .then(brokk_bifrost_flow::FlowWorkspaceState::new);
+    let flow_state = flow_state
+        .or(owned_flow_state.as_ref())
+        .expect("every explanation owns reusable flow state");
     let context = PolicyEvaluationContext {
         analyzer: workspace.analyzer(),
         workspace: Some(workspace),
+        flow_state,
         cancellation,
         cvss_overlays: &[],
         organizational_risk: &[],

@@ -26,6 +26,7 @@ use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
 use brokk_bifrost_core::analyzer::structural::materialization::{
     ExportForm, MaterializationRecord,
 };
+use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 use brokk_bifrost_core::analyzer::tree_walk::{WalkControl, walk_named_tree_preorder};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
@@ -1201,8 +1202,12 @@ fn js_signature_metadata(
     source: &str,
     parameter_text: &str,
 ) -> SignatureMetadata {
+    let (is_static, is_constructor) = js_callable_modifiers(function, source);
+    let with_modifiers = |metadata: SignatureMetadata| {
+        metadata.with_callable_modifiers(is_static, is_constructor, DeclaredVisibility::Unknown)
+    };
     let Some(parameters_start) = signature.find(parameter_text) else {
-        return SignatureMetadata::new(signature, Vec::new());
+        return with_modifiers(SignatureMetadata::new(signature, Vec::new()));
     };
     let parameters_end = parameters_start + parameter_text.len();
     let mut search_start = parameters_start;
@@ -1221,7 +1226,41 @@ fn js_signature_metadata(
             Some(ParameterMetadata::new(label, start_byte, end_byte))
         })
         .collect();
-    SignatureMetadata::new(signature, parameters)
+    with_modifiers(SignatureMetadata::new(signature, parameters))
+}
+
+/// The `(is_static, is_constructor)` pair this callable declares, read from its
+/// own syntax nodes (#2597).
+///
+/// Recording the pair is what makes a JavaScript declaration keyable for
+/// procedure-summary binding: `receiver_contract_of` refuses to answer for a
+/// callable whose adapter never inspected modifiers, so before this every
+/// JavaScript summary matched nothing.
+///
+/// Only a `method_definition` can bind a class receiver. Every other node this
+/// walk hands over -- `function_declaration`, `function_expression`,
+/// `arrow_function`, `generator_function` -- is reached through its own binding
+/// rather than through an instance, so it is static in the sense the receiver
+/// contract asks about: nothing has to be bound in receiver position.
+///
+/// `static` and the `static get` compound are anonymous tokens of
+/// `method_definition`, so the check reads the node's children rather than its
+/// rendered header. `constructor` is a static-free member name: a member named
+/// `constructor` under `static` is an ordinary static method, and the language
+/// only reserves the name for the instance-construction path.
+fn js_callable_modifiers(function: Node<'_>, source: &str) -> (bool, bool) {
+    if function.kind() != "method_definition" {
+        return (true, false);
+    }
+    let mut cursor = function.walk();
+    let is_static = function
+        .children(&mut cursor)
+        .any(|child| matches!(child.kind(), "static" | "static get"));
+    let is_constructor = !is_static
+        && function
+            .child_by_field_name("name")
+            .is_some_and(|name| node_text(name, source).trim_matches('"').trim() == "constructor");
+    (is_static, is_constructor)
 }
 
 fn js_rendered_parameter_text(function: Node<'_>, source: &str) -> String {
@@ -2152,4 +2191,67 @@ fn is_component_like_name(name: &str) -> bool {
         .next()
         .map(|ch| ch.is_ascii_uppercase())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod callable_modifier_tests {
+    use super::*;
+
+    /// #2597: every JavaScript callable this walk records carries modifier
+    /// facts, because `receiver_contract_of` reports no contract at all for a
+    /// callable whose adapter never inspected modifiers -- and without a
+    /// contract no procedure summary can bind the declaration.
+    ///
+    /// The four shapes are the ones that decide differently: a free function
+    /// and a `static` method bind nothing in receiver position, an instance
+    /// method binds one, and a constructor is neither.
+    #[test]
+    fn callable_metadata_records_javascript_static_and_constructor_structurally() {
+        let source = "export function free(value) { return value; }\n\nexport class Widget {\n    constructor(spec) { this.spec = spec; }\n    static build(spec) { return new Widget(spec); }\n    render(target) { return target; }\n}\n\nexport const arrow = (value) => value;\n";
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = ProjectFile::new(
+            temp.path().canonicalize().expect("canonical root"),
+            "widget.js",
+        );
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_javascript::LANGUAGE.into())
+            .expect("JavaScript parser language");
+        let tree = parser
+            .parse(source, None)
+            .expect("parse JavaScript fixture");
+        let parsed = parse_javascript_file(&file, source, &tree);
+
+        let modifiers = |name: &str| {
+            let metadata = parsed
+                .signature_metadata
+                .iter()
+                .find(|(unit, _)| unit.identifier() == name)
+                .and_then(|(_, metadata)| metadata.first())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing JavaScript callable {name}; recorded {:?}",
+                        parsed
+                            .signature_metadata
+                            .keys()
+                            .map(|unit| unit.identifier().to_owned())
+                            .collect::<Vec<_>>()
+                    )
+                });
+            assert!(
+                metadata.callable_modifiers_recorded(),
+                "{name} must record that the walk read its modifiers"
+            );
+            (
+                metadata.callable_is_static(),
+                metadata.callable_is_constructor(),
+            )
+        };
+
+        assert_eq!(modifiers("free"), (true, false));
+        assert_eq!(modifiers("arrow"), (true, false));
+        assert_eq!(modifiers("build"), (true, false));
+        assert_eq!(modifiers("render"), (false, false));
+        assert_eq!(modifiers("constructor"), (false, true));
+    }
 }

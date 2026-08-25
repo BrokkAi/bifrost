@@ -14,7 +14,7 @@ pub mod resolver;
 
 use brokk_bifrost_core::analyzer::capabilities::{ImportAnalysisProvider, TypeHierarchyProvider};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
-use brokk_bifrost_core::analyzer::{CodeUnitIndex, DefinitionLookupAccess};
+use brokk_bifrost_core::analyzer::{CodeUnitIndex, RelationalDefinitionFrontier};
 
 /// The *dispatching* analyzer's side of a Python usage-graph scan.
 ///
@@ -25,16 +25,14 @@ use brokk_bifrost_core::analyzer::{CodeUnitIndex, DefinitionLookupAccess};
 /// [`PythonUsageSource`](crate::graph_support::PythonUsageSource) that answers
 /// the Python-only questions.
 ///
-/// `definitions` is a callback rather than a handle because the analyzer's
-/// global definition index is built lazily on first access and only
-/// [`resolver::resolve_receiver_type`]'s last fallback reaches it; returning a
-/// handle would force the build at every scan.
 #[derive(Clone, Copy)]
 pub struct PythonGraphSource<'a> {
     pub index: &'a dyn CodeUnitIndex,
     pub hierarchy: Option<&'a dyn TypeHierarchyProvider>,
     pub imports: Option<&'a dyn ImportAnalysisProvider>,
-    pub definitions: &'a DefinitionLookupAccess<'a>,
+    /// Request-local relational answers. Missing questions record themselves
+    /// in the owning replay frontier and return the query shape's empty value.
+    pub definitions: &'a dyn RelationalDefinitionFrontier,
     /// Proof that the request scope this per-query bundle serves is open
     /// (issue #2414 step 3).
     pub token: QueryToken<'a>,

@@ -519,7 +519,7 @@ fn is_variadic_parameter(language: Language, parameter: Node<'_>) -> Option<Form
 /// written, and TypeScript's `this` parameter is optional in the same way. A
 /// caller that needs the answer for one of those languages must read the
 /// declaration's published receiver contract instead.
-pub(crate) fn receiver_is_declared_parameter(language: Language) -> bool {
+pub fn receiver_is_declared_parameter(language: Language) -> bool {
     match language {
         Language::Rust | Language::Go | Language::Python => true,
         Language::Java

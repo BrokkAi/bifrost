@@ -1,6 +1,6 @@
 use super::JavaGraphSource;
-use super::resolver::java_callable_arity;
-use crate::java::graph_support::{JavaSource, resolve_java_usage_type_name};
+use crate::java::graph_support::{JavaSource, resolve_java_usage_type_components_in};
+use brokk_bifrost_core::analyzer::RelationalDefinitionFrontier;
 use brokk_bifrost_core::analyzer::model::{CodeUnit, ProjectFile, Range};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::usages::common::node_text;
@@ -45,6 +45,8 @@ pub struct JavaFileReturnFacts {
 
 pub trait JavaReturnTypeContext {
     fn java(&self) -> &dyn JavaSource;
+    fn relational_definitions(&self) -> &dyn RelationalDefinitionFrontier;
+    fn call_answering_units(&self, owner: &str, name: &str, arity: usize) -> Vec<CodeUnit>;
     fn file(&self) -> &ProjectFile;
     fn source(&self) -> &str;
     fn root(&self) -> Node<'_>;
@@ -79,7 +81,7 @@ where
 /// level the walk skips can never be a level whose return type is then read.
 pub fn java_call_answering_units<C>(
     owner: &str,
-    token: QueryToken<'_>,
+    _token: QueryToken<'_>,
     name: &str,
     arity: usize,
     ctx: &C,
@@ -87,13 +89,7 @@ pub fn java_call_answering_units<C>(
 where
     C: JavaReturnTypeContext + ?Sized,
 {
-    ctx.java()
-        .usage_definitions(token)
-        .fqn(&format!("{owner}.{name}"))
-        .iter()
-        .filter(|unit| unit.is_function() && java_callable_arity(ctx.java(), unit).accepts(arity))
-        .cloned()
-        .collect()
+    ctx.call_answering_units(owner, name, arity)
 }
 
 pub fn method_return_type_for_owner_fqn<C>(
@@ -164,6 +160,7 @@ where
                 java_declared_type_fqn(
                     ctx.java(),
                     token,
+                    ctx.relational_definitions(),
                     ctx.file(),
                     ctx.source(),
                     type_node,
@@ -250,6 +247,7 @@ where
                 method_declaration_anonymous_return_type(
                     ctx.java(),
                     token,
+                    ctx.relational_definitions(),
                     ctx.file(),
                     ctx.source(),
                     declaration,
@@ -335,7 +333,15 @@ where
         let declared_type = declaration
             .and_then(|method| method.child_by_field_name("type"))
             .and_then(|type_node| {
-                java_declared_type_fqn(ctx.java(), token, file, &source, type_node, &unit)
+                java_declared_type_fqn(
+                    ctx.java(),
+                    token,
+                    ctx.relational_definitions(),
+                    file,
+                    &source,
+                    type_node,
+                    &unit,
+                )
             })
             .map(|fqn| ReceiverAnalysisOutcome::Precise(vec![fqn]))
             .unwrap_or(ReceiverAnalysisOutcome::Unknown);
@@ -344,6 +350,7 @@ where
                 method_declaration_anonymous_return_type(
                     ctx.java(),
                     token,
+                    ctx.relational_definitions(),
                     file,
                     &source,
                     method,
@@ -362,6 +369,7 @@ where
 fn java_declared_type_fqn(
     java: &dyn JavaSource,
     token: QueryToken<'_>,
+    definitions: &dyn RelationalDefinitionFrontier,
     file: &ProjectFile,
     source: &str,
     type_node: Node<'_>,
@@ -372,7 +380,7 @@ fn java_declared_type_fqn(
         LexicalTypeResolution::Resolved(unit) => Some(unit.fq_name()),
         LexicalTypeResolution::Blocked => None,
         LexicalTypeResolution::NotFound => {
-            resolve_java_usage_type_name(java, token, file, &components.join("."))
+            resolve_java_usage_type_components_in(java, token, definitions, file, &components)
                 .map(|unit| unit.fq_name())
         }
     }
@@ -382,7 +390,7 @@ pub fn java_type_name_from_node(type_node: Node<'_>, source: &str) -> Option<Str
     java_type_name_components(type_node, source).map(|components| components.join("."))
 }
 
-fn java_type_name_components(type_node: Node<'_>, source: &str) -> Option<Vec<String>> {
+pub fn java_type_name_components(type_node: Node<'_>, source: &str) -> Option<Vec<String>> {
     let mut components = Vec::new();
     let mut stack = vec![type_node];
     while let Some(node) = stack.pop() {
@@ -632,14 +640,14 @@ pub fn java_lexical_type_from_declaration(
 
 fn unique_java_class_by_fqn_in_file(
     java: &dyn JavaSource,
-    token: QueryToken<'_>,
+    _token: QueryToken<'_>,
     fqn: &str,
     file: &ProjectFile,
 ) -> Result<Option<CodeUnit>, ()> {
-    let units = java.usage_definitions(token).fqn(fqn);
+    let units = java.declarations(file);
     let mut candidates = units
         .iter()
-        .filter(|unit| unit.is_class() && unit.source() == file);
+        .filter(|unit| unit.is_class() && unit.fq_name() == fqn);
     let Some(first) = candidates.next() else {
         return Ok(None);
     };
@@ -691,6 +699,7 @@ fn method_declaration_covering<'tree>(root: Node<'tree>, range: &Range) -> Optio
 fn method_declaration_anonymous_return_type(
     java: &dyn JavaSource,
     token: QueryToken<'_>,
+    definitions: &dyn RelationalDefinitionFrontier,
     file: &ProjectFile,
     source: &str,
     method: Node<'_>,
@@ -715,9 +724,15 @@ fn method_declaration_anonymous_return_type(
             let Some(type_node) = value.child_by_field_name("type") else {
                 return ReceiverAnalysisOutcome::Unknown;
             };
-            let Some(fqn) =
-                java_declared_type_fqn(java, token, file, source, type_node, declaration)
-            else {
+            let Some(fqn) = java_declared_type_fqn(
+                java,
+                token,
+                definitions,
+                file,
+                source,
+                type_node,
+                declaration,
+            ) else {
                 return ReceiverAnalysisOutcome::Unknown;
             };
             return_types.push(fqn);

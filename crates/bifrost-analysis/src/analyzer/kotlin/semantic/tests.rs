@@ -50,5 +50,5 @@ fn capability_table_is_total_and_partitioned() {
         });
 
     assert_eq!(counts.iter().sum::<usize>(), SemanticCapability::COUNT);
-    assert_eq!(counts, [9, 18, 4]);
+    assert_eq!(counts, [9, 18, 5]);
 }

@@ -15,7 +15,7 @@ use crate::analyzer::semantic_model::{
     DependencyPackAdapter, DependencyPackDiagnostic, DependencyPackDiagnosticSeverity,
     DependencyPackLimits, DependencyPackProduction, DependencyProvenance, ExactDependencyArtifact,
     ExternalArtifactKind, ExternalArtifactPackProducer, HierarchyFact, Locator, MemberFact,
-    NameSelector, Producer, ProducerDiagnostic, ProducerDiagnosticSeverity, Provenance,
+    MemberKind, NameSelector, Producer, ProducerDiagnostic, ProducerDiagnosticSeverity, Provenance,
     ResolvedDependency, ResolvedDependencyArtifact, Safety, SemanticModelActivationEvidence,
     TypeFact, TypeKind, TypeRef, Visibility, normalize_artifact_locator_paths,
     read_exact_artifact_while,
@@ -41,6 +41,7 @@ use tree_sitter::Parser;
 use zip::ZipArchive;
 
 use crate::CancellationToken;
+use crate::analyzer::topology::DependencyScope;
 
 const MAX_ARCHIVE_ENTRIES: usize = 10_000;
 const MAX_INDEX_ARTIFACTS: usize = 128;
@@ -169,6 +170,8 @@ impl JavaArtifactFacts {
             if !budget.take() {
                 break;
             }
+            let is_static = fact.is_static;
+            let is_constant = fact.member_kind == MemberKind::Constant;
             members
                 .entry(fact.name.clone())
                 .or_insert_with(|| JvmExternalMember {
@@ -176,6 +179,8 @@ impl JavaArtifactFacts {
                     declaring_package: owner_package.to_owned(),
                     visibility: semantic_visibility(fact.visibility),
                     returns: fact.signature.and_then(|signature| signature.returns),
+                    is_static,
+                    is_constant,
                 });
         }
         JvmIndexedOwnerSurface {
@@ -310,8 +315,14 @@ pub fn resolve_jvm_semantic_pack_dependencies(
         return cancelled_discovery("JVM dependency discovery was cancelled");
     }
     let mut dependencies = config.external_dependencies.clone();
+    // What the build files *declare*, kept beside the coordinates themselves:
+    // scope and declaring target are properties of the declaration, and the
+    // merged coordinate list has already lost which file each came from.
+    let mut declarations = crate::hash::HashMap::default();
     if config.dependency_discovery.mode != JvmDependencyDiscoveryMode::Disabled {
-        discover_metadata(project).merge_into(&mut dependencies);
+        let discovered = discover_metadata(project);
+        declarations.clone_from(&discovered.declarations);
+        discovered.merge_into(&mut dependencies);
     }
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
         return cancelled_discovery("JVM dependency discovery was cancelled");
@@ -357,7 +368,18 @@ pub fn resolve_jvm_semantic_pack_dependencies(
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return cancelled_discovery("JVM dependency discovery was cancelled");
         }
-        let dependency = resolved_semantic_pack_dependency_while(artifact, cancellation);
+        let declaration = artifact
+            .coordinate
+            .as_ref()
+            .and_then(|coordinate| declarations.get(coordinate).cloned());
+        let mut dependency = resolved_semantic_pack_dependency_while(artifact, cancellation);
+        // A jar resolved out of a local repository proves the artifact; only a
+        // build file proves the scope, so a dependency with no declaration
+        // keeps `Unknown` rather than inheriting a neighbour's scope.
+        if let Some(declaration) = declaration {
+            dependency.scope = declaration.scope;
+            dependency.declared_by = declaration.declared_by;
+        }
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return cancelled_discovery("JVM dependency discovery was cancelled");
         }
@@ -605,6 +627,8 @@ fn resolved_jdk_dependency(
             })
             .into_iter()
             .collect(),
+        scope: DependencyScope::Unknown,
+        declared_by: None,
     }
 }
 
@@ -914,6 +938,8 @@ fn resolved_semantic_pack_dependency_while(
         },
         provenance,
         artifacts,
+        scope: DependencyScope::Unknown,
+        declared_by: None,
     }
 }
 
@@ -1544,6 +1570,8 @@ impl JvmExternalDeclarationIndex {
                 if !member_budget.take() {
                     break;
                 }
+                let is_static = member.is_static;
+                let is_constant = member.member_kind == MemberKind::Constant;
                 members
                     .entry(member.name.clone())
                     .or_insert_with(|| JvmExternalMember {
@@ -1558,6 +1586,15 @@ impl JvmExternalDeclarationIndex {
                         // not on the other, which measurably retired the whole
                         // chained-receiver census on the OWASP corpus.
                         returns: member.returns,
+                        // The class file's access flags are what prove a
+                        // `static final` field is a compile-time constant
+                        // (#2538); dropping them here would make the same
+                        // class file answer a `Cipher.ENCRYPT_MODE`-shaped
+                        // read on the pack-production path and not on this
+                        // one, the same asymmetry #2454's comment above
+                        // describes for return types.
+                        is_static,
+                        is_constant,
                     });
             }
             self.attach_member_surface(
@@ -1764,6 +1801,42 @@ impl JvmExternalDeclarationIndex {
     }
 }
 
+/// Feeds [`JvmExternalDeclarationIndex::build_from_artifacts`]: raw
+/// class-file/`-sources.jar` byte scanning (`index_class_jar`,
+/// `index_source_jar`) over an ordinary Maven/Gradle dependency's resolved
+/// jar(s).
+///
+/// A JDK dependency's own artifact is a `src.zip`
+/// (`ExternalArtifactKind::JdkSourceZip`, built by [`resolved_jdk_dependency`]
+/// from `JAVA_HOME`/`jdk_homes`), and this function excludes it
+/// unconditionally. This is deliberate, not an oversight, for two independent
+/// reasons:
+///
+/// 1. Structurally, this index could not read it correctly even if let
+///    through: `is_source_jar` only recognizes a `-sources.jar` filename
+///    suffix (false for `src.zip`), and `index_class_jar` expects `.class`
+///    entries (none exist in a source archive), so the raw-byte path silently
+///    produces zero facts for it either way.
+/// 2. Architecturally, a JDK source archive already has its own producer,
+///    `JdkSourceArchivePackProducer` (dispatched from
+///    `JvmDependencyPackAdapter::produce`, above), which turns the same
+///    `src.zip` into a proper declaration-fact semantic pack. That pack
+///    reaches resolution through the pack-activation pipeline
+///    (`prepare_dependency_semantic_packs` / `activate_workspace_packs`, or a
+///    caller's own hand-curated `SemanticModelActivationRequest`, as
+///    `owasp_benchmark.rs` uses), never through this artifact index. Routing
+///    the same `src.zip` through both would double-produce and diverge from
+///    that pack's own completeness/gap accounting (#2401).
+///
+/// Confirmed twice independently: #2538's investigation (see that issue's
+/// ExecPlan, `.agents/plans/issue-2538-external-constants.md`, "Surprises &
+/// Discoveries") found this exclusion by tracing why `java.util.Locale`/
+/// `javax.crypto.Cipher` never resolved through this index, and #2401's own
+/// session (this repository, 2026-08-21) re-confirmed it while evaluating
+/// whether to lift it. Do not lift this exclusion; if a JDK dependency ever
+/// needs to resolve here too, give it a real conversion from the pack's own
+/// `TypeFact`/`MemberFact` shards (`apply_java_type_fact` already exists for
+/// half of that), not a change to this filter.
 fn jvm_artifact_from_dependency(dependency: &ResolvedDependency) -> Option<ResolvedJvmArtifact> {
     if dependency
         .artifacts
@@ -2108,6 +2181,18 @@ impl<'a> JvmExternalDeclarations<'a> {
                     .structured_signature
                     .as_ref()
                     .and_then(|signature| signature.returns.clone()),
+                // Carried for parity with the artifact-derived member surface
+                // (#2538). The doc comment above already warns that a Scala
+                // `object` or Kotlin companion member is published without
+                // the static flag a Java `static` carries, so a caller that
+                // needs a *proof* of compile-time-constant-ness (not merely
+                // "declared const-shaped") must not rely on this half alone
+                // for those languages; [`JvmExternalMember::is_compile_time_constant`]
+                // requires both flags together and fails closed if either is
+                // under-reported.
+                is_static: member.is_static,
+                is_constant: member.kind
+                    == crate::analyzer::semantic_model::SemanticModelSymbolKind::Constant,
             })
         })
     }
@@ -2145,6 +2230,19 @@ pub(crate) struct JvmExternalMember {
     /// the same "overloads are one name, not ambiguity" rule
     /// [`JvmIndexedOwnerSurface`] already applies to the member itself.
     returns: Option<TypeRef>,
+    /// Whether the declaring half marked this member `static` (#2538).
+    is_static: bool,
+    /// Whether the declaring half classified this member as a compile-time
+    /// constant: for the JVM class-file half, exactly a field whose access
+    /// flags carry both `ACC_STATIC` and `ACC_FINAL`
+    /// (`MemberKind::Constant`, set by `class_field_member`); for an
+    /// activated pack, `SemanticModelSymbolKind::Constant` (#2538).
+    ///
+    /// This is a separate signal from [`Self::is_static`] rather than the
+    /// whole story on its own: a caller that needs "provably a compile-time
+    /// constant" should require both, so a producer that ever set one flag
+    /// without the other fails closed instead of over-claiming.
+    is_constant: bool,
 }
 
 impl JvmExternalMember {
@@ -2176,6 +2274,27 @@ impl JvmExternalMember {
 
     fn is_accessible_from_package(&self, package_name: &str) -> bool {
         is_visible_from_package(self.visibility, &self.declaring_package, package_name)
+    }
+
+    /// Whether the declaring half marked this member `static` (#2538).
+    pub(crate) fn is_static(&self) -> bool {
+        self.is_static
+    }
+
+    /// Whether this member is provably a compile-time constant: `static`
+    /// *and* classified `MemberKind::Constant`/`SemanticModelSymbolKind::Constant`
+    /// by whichever half declared it (#2538).
+    ///
+    /// A field the class-file half classifies `MemberKind::Constant` is,
+    /// by construction, a field whose access flags carry both `ACC_STATIC`
+    /// and `ACC_FINAL` -- read straight off the real class file, not
+    /// inferred -- so a caller may treat a read of such a field as carrying
+    /// no attacker-influenced value flow (Java Language Specification
+    /// compile-time-constant semantics for a `static final` field). Requiring
+    /// both flags here, rather than trusting `is_constant` alone, means a
+    /// producer that only ever set one of the two still fails closed.
+    pub(crate) fn is_compile_time_constant(&self) -> bool {
+        self.is_static && self.is_constant
     }
 }
 

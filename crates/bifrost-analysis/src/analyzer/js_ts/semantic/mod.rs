@@ -18,8 +18,8 @@ use brokk_bifrost_js_ts::syntax::{
     JsTsImportBinder, JsTsLexicalBindingIndex, compute_import_binder,
 };
 
-const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-value-semantics-v12";
-const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v13";
+const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-value-semantics-v13";
+const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v14";
 
 #[derive(Debug, Clone, Copy)]
 enum JsTsSemanticFlavor {
@@ -262,6 +262,10 @@ fn js_ts_capabilities() -> SemanticCapabilities {
     ] {
         builder = builder.partial(capability);
     }
+    // Explicitly unsupported: this adapter normalizes no branch conditions, so
+    // an empty `guard_facts` table means "this language publishes no guard
+    // facts" rather than "this procedure has no decision" (#2443).
+    builder = builder.unsupported(SemanticCapability::GuardFacts);
     builder.build()
 }
 
@@ -371,9 +375,10 @@ struct LocalBinding {
 /// A local whose value is a proven allocation for the binding's whole extent:
 /// the initializer is a supported literal or built-in allocation, and every
 /// use of the name in the procedure is a non-`__proto__` member-access base
-/// outside call-callee position, so no alias, capture, rebind, or prototype
-/// mutation exists that could install an accessor or a proxy behind a later
-/// property access.
+/// outside call-callee position, a whole-value call argument, or another
+/// recognized structured use, so no alias, capture, rebind, or prototype
+/// mutation exists that could install an accessor or a proxy behind a
+/// property access this local's `escapes_after` bound admits.
 #[derive(Clone, Copy)]
 struct PlainObjectLocal {
     /// The local value assigned by the proven allocation declaration. Aliases
@@ -386,6 +391,11 @@ struct PlainObjectLocal {
     /// End byte of the declarator; accesses before it may observe the
     /// binding uninitialized.
     available_after: usize,
+    /// Start byte of the first whole-value consumption of this allocation
+    /// root, when the procedure has one. A callee that receives the object can
+    /// install an accessor or a proxy on it, so only an access that ends
+    /// before this byte is still proven.
+    escapes_after: Option<usize>,
 }
 
 /// A local binding whose value is a non-escaping array literal allocation.
@@ -395,4 +405,7 @@ struct PlainObjectLocal {
 struct ArrayLocal {
     declaration_parent: usize,
     available_after: usize,
+    /// Start byte of the first whole-value consumption of this allocation
+    /// root. See [`PlainObjectLocal::escapes_after`].
+    escapes_after: Option<usize>,
 }

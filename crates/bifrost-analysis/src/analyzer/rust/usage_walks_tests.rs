@@ -502,6 +502,11 @@ mod tests {
              not one per path through the cycle: {} for {MODULES} modules",
             walks.recursion_computations()
         );
+        assert!(
+            walks.import_binding_computations() <= (MODULES + 1) as u64,
+            "cyclic fixed-point rounds must decode each import-bearing file once: {} for {MODULES} modules",
+            walks.import_binding_computations()
+        );
     }
 
     /// A walk whose budget expired must stop doing work, and must publish
@@ -561,12 +566,12 @@ mod tests {
         );
     }
 
-    /// A deep re-export chain must not exhaust the stack. The walk recurses
-    /// once per link, so this pins the depth the implementation is known to
-    /// survive rather than asserting an unbounded guarantee.
+    /// A deep re-export chain must not exhaust the stack. This is deliberately
+    /// far deeper than a normal module tree: the explicit work queue must
+    /// carry the ladder instead of consuming one Rust stack frame per link.
     #[test]
     fn an_export_chain_survives_a_deep_re_export_ladder() {
-        const LINKS: usize = 250;
+        const LINKS: usize = 512;
         let mut files: Vec<(String, String)> = Vec::new();
         let mut lib = String::new();
         for index in 0..LINKS {
@@ -600,6 +605,27 @@ mod tests {
         assert_eq!(
             value.origin.file, tail,
             "the whole ladder resolves to the one real declaration"
+        );
+        assert!(
+            walks.recursion_computations() <= 8 * LINKS + 1,
+            "the explicit worklist must visit each ladder key a bounded number of times: {} for {LINKS} links",
+            walks.recursion_computations()
+        );
+        assert!(
+            walks.import_binding_computations() <= (LINKS + 1) as u64,
+            "the ladder must decode each import-bearing file at most once: {} for {LINKS} links",
+            walks.import_binding_computations()
+        );
+        let classified = walks.queries().path_identity_computations();
+        let _ = walks.bindings_at(&head, &head_module);
+        assert_eq!(
+            walks.queries().path_identity_computations(),
+            classified,
+            "repeating the fixed-point answer must not reclassify path identities"
+        );
+        assert!(
+            classified <= (LINKS + 1) as u64,
+            "the ladder must classify each file at most once: {classified} for {LINKS} links"
         );
     }
 

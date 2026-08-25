@@ -1426,6 +1426,71 @@ pub(super) fn rename_symbol_failure(
     }
 }
 
+/// Re-attach the semantic-model evidence for a generated member that the
+/// analyzer resolved to its own physical declaration.
+///
+/// Navigation for a generated member used to run through the overlay, which
+/// carried the provenance with it. Once an analyzer resolves the member
+/// itself -- Scala case-class `copy` maps to the case class since f54dd1f04 --
+/// the physical candidate is the better navigation target, but it arrives
+/// with no record of the rule that generated the member, so a consumer can no
+/// longer tell that `copy` is generated or which rule produced it.
+///
+/// The match is deliberately narrow, because attributing a resolution to a
+/// rule that did not produce it is worse than carrying no evidence.
+///
+/// Only records carrying a `rule_id` are considered, because those are the
+/// generated ones; a pack declaration describing an existing symbol says
+/// nothing about this resolution. The record must anchor to the very
+/// declaration that was resolved, and be the only such record, so an overload
+/// set or an ambiguous model leaves the candidate alone.
+///
+/// Crucially the candidate must not itself be a member of that name. That is
+/// what separates this case from an authored member that legitimately wins:
+/// when a user writes their own `getValue`, navigation lands on that method
+/// and carries no generated provenance, because the resolved declaration *is*
+/// the member. Re-attachment applies only where the analyzer redirected a
+/// generated member to its owning declaration, as case-class `copy` resolves
+/// to the case class itself.
+fn attach_generated_member_provenance(
+    overlay: &crate::analyzer::semantic_model::SemanticModelOverlay,
+    target: &str,
+    definitions: &mut [DefinitionCandidate],
+) {
+    let member = target
+        .rsplit(['.', '#', ':'])
+        .find(|part| !part.is_empty())
+        .unwrap_or(target);
+    let named = overlay.symbols_named(member);
+    if named.records.is_empty() {
+        return;
+    }
+    for candidate in definitions
+        .iter_mut()
+        .filter(|candidate| candidate.semantic_model.is_none())
+    {
+        let Some(fqn) = candidate.fqn.as_deref() else {
+            continue;
+        };
+        if fqn == member || fqn.ends_with(&format!(".{member}")) {
+            continue;
+        }
+        let mut anchored = named.records.iter().filter(|record| {
+            record.provenance.rule_id.is_some()
+                && matches!(
+                    &record.location,
+                    crate::analyzer::semantic_model::SemanticModelLocation::Authored(anchor)
+                        if anchor.symbol == fqn
+                )
+        });
+        if let Some(record) = anchored.next()
+            && anchored.next().is_none()
+        {
+            candidate.semantic_model = Some(record.provenance.clone());
+        }
+    }
+}
+
 pub(super) fn render_definition_lookup(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
@@ -1467,6 +1532,11 @@ pub(super) fn render_definition_lookup(
         })
         .collect();
     if let Some(overlay) = analyzer.semantic_model_overlay() {
+        if !definitions.is_empty()
+            && let Some(target) = reference_target.as_deref()
+        {
+            attach_generated_member_provenance(&overlay, target, &mut definitions);
+        }
         if definitions.is_empty() {
             if let Some(target) = reference_target.as_deref() {
                 let member_name = target
@@ -1723,7 +1793,7 @@ fn structured_receiver_owner(
 ) -> Option<String> {
     let focus = reference.focus_start_byte;
     let receiver = analyzer
-        .structural_search_providers()
+        .structural_fact_providers()
         .into_iter()
         .find_map(|provider| {
             let facts = provider.structural_facts(file)?;
@@ -1806,7 +1876,7 @@ fn structured_reference_call_arity(
 ) -> Option<usize> {
     let reference_range = &reference.range;
     analyzer
-        .structural_search_providers()
+        .structural_fact_providers()
         .into_iter()
         .find_map(|provider| {
             let facts = provider.structural_facts(file)?;
@@ -1848,7 +1918,7 @@ fn structured_reference_kind(
     let reference = reference?;
     let reference_range = &reference.range;
     analyzer
-        .structural_search_providers()
+        .structural_fact_providers()
         .into_iter()
         .find_map(|provider| {
             let facts = provider.structural_facts(file)?;

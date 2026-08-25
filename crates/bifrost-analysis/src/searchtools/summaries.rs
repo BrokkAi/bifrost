@@ -1,8 +1,14 @@
 use super::navigation::deserialize_symbol_lookup_names;
 use super::selectors::*;
 use super::*;
+use crate::analyzer::languages::package_fq_name;
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
+use brokk_bifrost_core::analyzer::{
+    DefinitionLanguageScope, PackageRelationKind, PackageRelationValue, RelationalBatchOutcome,
+    RelationalDefinitionQuery, RelationalDefinitionRequest, RelationalDefinitionValue,
+    RelationalName,
+};
 use std::cell::OnceCell;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -430,14 +436,76 @@ pub(super) fn package_listing(analyzer: &dyn IAnalyzer, target: &str) -> Option<
     {
         return None;
     }
-    let index = analyzer.global_usage_definition_index();
-    if !index.package_container_exists(package) {
+    let mut languages = analyzer.languages().into_iter().collect::<Vec<_>>();
+    languages.sort();
+    let mut requests = Vec::with_capacity(languages.len() * 3);
+    for language in &languages {
+        let name = RelationalName::stable(package_fq_name(*language, package));
+        for relation in [
+            PackageRelationKind::Exists,
+            PackageRelationKind::Files,
+            PackageRelationKind::Children,
+        ] {
+            requests.push(RelationalDefinitionRequest {
+                ordinal: requests.len(),
+                language_scope: DefinitionLanguageScope::Language(*language),
+                name: name.clone(),
+                query: RelationalDefinitionQuery::PackageRelation(relation),
+            });
+        }
+    }
+    let RelationalBatchOutcome::Complete(results) =
+        analyzer.relational_definition_batch(&requests, &crate::CancellationToken::new())
+    else {
+        return None;
+    };
+    assert_eq!(results.len(), requests.len());
+    let mut results = results
+        .into_iter()
+        .map(|result| (result.ordinal, result.value))
+        .collect::<HashMap<_, _>>();
+
+    let mut package_languages = Vec::new();
+    let mut package_files = Vec::new();
+    let mut child_languages: HashMap<String, Vec<Language>> = HashMap::default();
+    for (language_index, language) in languages.iter().enumerate() {
+        let base = language_index * 3;
+        let exists = match results.remove(&base) {
+            Some(RelationalDefinitionValue::PackageRelation(PackageRelationValue::Exists(
+                exists,
+            ))) => exists,
+            _ => panic!("package existence request returned the wrong result shape"),
+        };
+        let files = match results.remove(&(base + 1)) {
+            Some(RelationalDefinitionValue::PackageRelation(PackageRelationValue::Files(
+                files,
+            ))) => files,
+            _ => panic!("package files request returned the wrong result shape"),
+        };
+        let children = match results.remove(&(base + 2)) {
+            Some(RelationalDefinitionValue::PackageRelation(PackageRelationValue::Packages(
+                packages,
+            ))) => packages,
+            _ => panic!("package children request returned the wrong result shape"),
+        };
+        if exists || !children.is_empty() {
+            package_languages.push(*language);
+        }
+        package_files.extend(files);
+        for child in children {
+            child_languages.entry(child).or_default().push(*language);
+        }
+    }
+    assert!(results.is_empty());
+    if package_languages.is_empty() {
         return None;
     }
+    package_files.sort();
+    package_files.dedup();
 
     let mut entries = Vec::new();
-    for child in index.child_packages(package) {
-        let languages = package_language_labels(index.package_languages(&child));
+    for (child, languages) in child_languages {
+        let languages = package_language_labels(languages);
         entries.push(ContainerListingEntry::Package {
             name: package_leaf_name(&child).to_string(),
             qualified_name: child,
@@ -446,7 +514,7 @@ pub(super) fn package_listing(analyzer: &dyn IAnalyzer, target: &str) -> Option<
     }
 
     let mut seen_types = HashSet::default();
-    for file in index.package_files(package) {
+    for file in package_files {
         for unit in analyzer.top_level_declarations(&file) {
             if !unit.is_class() || unit.package_name() != package {
                 continue;
@@ -480,7 +548,7 @@ pub(super) fn package_listing(analyzer: &dyn IAnalyzer, target: &str) -> Option<
     Some(ContainerListing {
         target: package.to_string(),
         kind: ContainerKind::Package,
-        languages: package_language_labels(index.package_languages(package)),
+        languages: package_language_labels(package_languages),
         total_entries: entries.len(),
         entries,
         truncated: false,

@@ -470,7 +470,8 @@ impl<K> FileDeclarations<K> {
 }
 
 /// Everything one file's edge scan reads: the parsed tree and its source text,
-/// the node domain the build is keyed on, and this file's declaration index.
+/// the caller frontier, the optional closed callee domain, and this file's
+/// declaration index.
 ///
 /// The driver constructs one of these per file and hands it to the language
 /// scan, which returns [`PerFileEdges`]. Nothing here borrows an analyzer, so a
@@ -480,8 +481,16 @@ pub struct FileEdgeScanInput<'a, K = String> {
     pub tree: &'a Tree,
     pub source: &'a str,
     pub line_starts: &'a [usize],
-    /// The caller/callee domain: only keys in here become edge endpoints.
-    pub nodes: &'a HashSet<K>,
+    /// Only keys in this set may become callers. A rooted graph supplies its
+    /// current breadth-first frontier; a whole-workspace graph supplies every
+    /// eligible node. `None` admits any indexed enclosing declaration, which
+    /// is the inbound graph shape used when the callee catalog is bounded but
+    /// callers are not.
+    callers: Option<&'a HashSet<K>>,
+    /// `Some` retains the legacy closed-world rule that callees must already be
+    /// catalogued. `None` lets a rooted scan stage exact resolved callees for
+    /// endpoint hydration by its analysis-owned caller.
+    callees: Option<&'a HashSet<K>>,
     pub declarations: &'a FileDeclarations<K>,
     nodes_by_terminal: HashMap<String, Vec<K>>,
 }
@@ -494,8 +503,58 @@ impl<'a, K: NodeKey> FileEdgeScanInput<'a, K> {
         nodes: &'a HashSet<K>,
         declarations: &'a FileDeclarations<K>,
     ) -> Self {
+        Self::with_callees(
+            tree,
+            source,
+            line_starts,
+            Some(nodes),
+            Some(nodes),
+            declarations,
+        )
+    }
+
+    /// Construct an open-callee scan rooted at `callers`.
+    ///
+    /// Language resolvers may record an exact callee without first enumerating
+    /// the workspace. The analysis layer must hydrate and validate those
+    /// endpoints before exposing them as graph nodes.
+    pub fn new_rooted(
+        tree: &'a Tree,
+        source: &'a str,
+        line_starts: &'a [usize],
+        callers: &'a HashSet<K>,
+        declarations: &'a FileDeclarations<K>,
+    ) -> Self {
+        Self::with_callees(tree, source, line_starts, Some(callers), None, declarations)
+    }
+
+    /// Construct an inbound scan over every indexed caller in the workspace
+    /// while admitting only the requested callee set.
+    ///
+    /// This is the efficient shape for a report that needs to prove a bounded
+    /// candidate list from all possible callers. The caller set is deliberately
+    /// not materialized: the declaration index already contains the exact
+    /// enclosing caller for each structured reference.
+    pub fn new_inbound(
+        tree: &'a Tree,
+        source: &'a str,
+        line_starts: &'a [usize],
+        callees: &'a HashSet<K>,
+        declarations: &'a FileDeclarations<K>,
+    ) -> Self {
+        Self::with_callees(tree, source, line_starts, None, Some(callees), declarations)
+    }
+
+    fn with_callees(
+        tree: &'a Tree,
+        source: &'a str,
+        line_starts: &'a [usize],
+        callers: Option<&'a HashSet<K>>,
+        callees: Option<&'a HashSet<K>>,
+        declarations: &'a FileDeclarations<K>,
+    ) -> Self {
         let mut nodes_by_terminal: HashMap<String, Vec<K>> = HashMap::default();
-        for node in nodes {
+        for node in callees.into_iter().flatten() {
             nodes_by_terminal
                 .entry(node_terminal(node))
                 .or_default()
@@ -505,7 +564,8 @@ impl<'a, K: NodeKey> FileEdgeScanInput<'a, K> {
             tree,
             source,
             line_starts,
-            nodes,
+            callers,
+            callees,
             declarations,
             nodes_by_terminal,
         }
@@ -516,7 +576,23 @@ impl<'a, K: NodeKey> FileEdgeScanInput<'a, K> {
     }
 
     pub fn is_node(&self, key: &K) -> bool {
-        self.nodes.contains(key)
+        self.accepts_callee(key)
+    }
+
+    /// Whether a structurally extracted terminal name can belong to a requested
+    /// callee. Rooted scans leave the callee domain open, so every terminal is a
+    /// possible match; closed and inbound scans can reject names before a
+    /// language resolver performs its more expensive work.
+    pub fn may_match_terminal(&self, name: &str) -> bool {
+        self.callees.is_none() || self.nodes_by_terminal.contains_key(name)
+    }
+
+    pub fn is_caller(&self, key: &K) -> bool {
+        self.callers.is_none_or(|callers| callers.contains(key))
+    }
+
+    fn accepts_callee(&self, key: &K) -> bool {
+        self.callees.is_none_or(|callees| callees.contains(key))
     }
 
     /// The key of the smallest declaration whose byte span contains `[start, end)`
@@ -587,7 +663,7 @@ impl<K: NodeKey> PerFileEdges<K> {
         start: usize,
         end: usize,
     ) {
-        if !input.nodes.contains(&callee) {
+        if !input.accepts_callee(&callee) {
             return;
         }
         let caller = match input.enclosing(start, end) {
@@ -606,7 +682,7 @@ impl<K: NodeKey> PerFileEdges<K> {
         start: usize,
         end: usize,
     ) {
-        if !input.nodes.contains(&callee) {
+        if !input.accepts_callee(&callee) {
             return;
         }
         // A recursive call's enclosing definition is the callee itself; the
@@ -625,7 +701,7 @@ impl<K: NodeKey> PerFileEdges<K> {
         if input.overlaps_definition(&callee, start, end) {
             return;
         }
-        if !input.nodes.contains(&caller) {
+        if !input.is_caller(&caller) {
             return;
         }
         // 1-based, matching `scan_usages` hit lines and node `start_line`.
@@ -664,7 +740,7 @@ impl<K: NodeKey> PerFileEdges<K> {
         start: usize,
         end: usize,
     ) {
-        if !input.nodes.contains(&callee) {
+        if !input.accepts_callee(&callee) {
             return;
         }
         let Some(caller) = input.enclosing(start, end).cloned() else {

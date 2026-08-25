@@ -4,10 +4,9 @@
 //! is left here but the trait impl itself.
 
 use crate::analyzer::cognitive_complexity;
-use crate::analyzer::{Language, LanguageAdapter, ProjectFile, SignatureMetadata};
+use crate::analyzer::{Language, LanguageAdapter, ProjectFile};
 use brokk_bifrost_jvm::kotlin::adapter::{
     KOTLIN_COGNITIVE_CONFIG, KOTLIN_FILE_EXTENSION, kotlin_extract_call_receiver,
-    kotlin_signature_arity, kotlin_signature_return_type,
 };
 use brokk_bifrost_jvm::kotlin::declarations::parse_kotlin_file;
 use brokk_bifrost_jvm::kotlin::test_detection::kotlin_contains_tests;
@@ -30,21 +29,6 @@ impl LanguageAdapter for KotlinAdapter {
 
     fn file_extension(&self) -> &'static str {
         KOTLIN_FILE_EXTENSION
-    }
-
-    fn callable_arity(
-        &self,
-        signature: &str,
-        metadata: Option<&SignatureMetadata>,
-    ) -> Option<usize> {
-        metadata
-            .and_then(SignatureMetadata::callable_arity)
-            .map(|arity| arity.total())
-            .or_else(|| kotlin_signature_arity(signature))
-    }
-
-    fn callable_return_type_text<'a>(&self, signature: &'a str) -> Option<&'a str> {
-        kotlin_signature_return_type(signature)
     }
 
     fn extract_call_receiver(&self, reference: &str) -> Option<String> {

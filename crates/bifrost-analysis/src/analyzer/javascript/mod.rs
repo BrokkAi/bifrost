@@ -10,6 +10,7 @@ use crate::analyzer::js_ts::{
     contains_tests as js_ts_contains_tests, path_contains_tests as js_ts_path_contains_tests,
     source_contains_tests as js_ts_source_contains_tests,
     synthesize_hydrated_module as synthesize_js_ts_hydrated_module_unit,
+    synthesize_summary_module as synthesize_js_ts_summary_module_unit,
 };
 use crate::analyzer::tree_sitter_analyzer::lookup_suffix_candidates;
 use crate::analyzer::usages::js_ts_graph::JsTsUsageIndex;
@@ -81,6 +82,16 @@ impl LanguageAdapter for JavascriptAdapter {
         state: &mut crate::analyzer::tree_sitter_analyzer::FileState,
     ) {
         synthesize_js_ts_hydrated_module_unit(file, source, state);
+    }
+
+    fn synthesize_summary_projection(
+        &self,
+        file: &ProjectFile,
+        source: &str,
+        has_structured_imports: bool,
+        projection: &mut crate::analyzer::SummaryFileProjection,
+    ) {
+        synthesize_js_ts_summary_module_unit(file, source, has_structured_imports, projection);
     }
 
     fn path_synthetic_module_unit(&self, file: &ProjectFile) -> Option<CodeUnit> {
@@ -172,11 +183,13 @@ impl JsTsSource for JavascriptAnalyzer {
         self.inner.signatures_vec_of(code_unit)
     }
 
-    fn usage_definitions(
+    fn with_usage_definitions(
         &self,
-        token: QueryToken<'_>,
-    ) -> &dyn brokk_bifrost_core::analyzer::BoundedDefinitionLookup {
-        self.inner.global_usage_definition_index_ref(token)
+        _token: QueryToken<'_>,
+        read: &mut dyn FnMut(&dyn brokk_bifrost_core::analyzer::BoundedDefinitionLookup),
+    ) {
+        let lookup = crate::analyzer::AnalyzerDefinitionLookup::new(self, Language::JavaScript);
+        read(&lookup);
     }
 
     fn usage_index(
@@ -546,6 +559,8 @@ impl CodeUnitIndex for JavascriptAnalyzer {
 }
 
 impl IAnalyzer for JavascriptAnalyzer {
+    crate::analyzer::i_analyzer::forward_relational_definition_batch!();
+
     fn invalidate_cached_file_identities(&self) {
         self.inner.invalidate_cached_file_identities();
     }
@@ -585,13 +600,6 @@ impl IAnalyzer for JavascriptAnalyzer {
 
     fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
         self.inner.workspace_file_index_cell()
-    }
-
-    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
-        // Trait signature is fixed, so this boundary opens the scope the
-        // usage-graph funnel now demands proof of (issue #2423 milestone B).
-        let scope = crate::analyzer::AnalyzerQueryScope::new(self);
-        self.inner.global_usage_definition_index(scope.token())
     }
 
     fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
@@ -676,14 +684,20 @@ impl IAnalyzer for JavascriptAnalyzer {
         Some(self)
     }
 
-    fn structural_search_providers(
+    fn structural_fact_providers(
         &self,
-    ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
-        self.inner.structural_search_providers()
+    ) -> Vec<&dyn crate::analyzer::structural::StructuralFactProvider> {
+        self.inner.structural_fact_providers()
     }
 
     fn snapshot_caches(&self) -> Option<&crate::analyzer::AnalyzerSnapshotCaches> {
         Some(self.inner.snapshot_caches())
+    }
+
+    fn workspace_content_identities(
+        &self,
+    ) -> Option<crate::analyzer::content_identity::WorkspaceContentIdentities> {
+        self.inner.workspace_content_identities()
     }
 
     fn contains_tests(&self, file: &ProjectFile) -> bool {
@@ -767,18 +781,6 @@ impl IAnalyzer for JavascriptAnalyzer {
 
 #[cfg(any(test, feature = "test-support"))]
 impl crate::analyzer::AnalyzerTestHooks for JavascriptAnalyzer {
-    fn reset_global_usage_definition_index_build_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_global_usage_definition_index_build_count_for_test();
-    }
-
-    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .global_usage_definition_index_build_count_for_test()
-    }
-
     fn reset_full_declaration_scan_count_for_test(&self) {
         self.inner
             .test_hooks()

@@ -32,27 +32,32 @@ use crate::analyzer::cognitive_complexity;
 use crate::analyzer::common::language_for_target;
 use crate::analyzer::languages::{
     DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof, DeadCodeRouting, DeadCodeSupport,
-    EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx, LanguageEdgePass, LanguageEdgeSites,
-    LanguageEdgeWeights, LanguageSupport, LocalDeclarationBindingScope, LocalDeclarationVisibility,
-    ReceiverFactsFactory, analyzable_file_count,
+    EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx, ExternalCalleeSite, LanguageEdgePass,
+    LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport, LocalDeclarationBindingScope,
+    LocalDeclarationVisibility, ReceiverFactsFactory, analyzable_file_count,
 };
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::inverted_edges::{NodeKey, UsageNodeKey};
 use crate::analyzer::usages::js_ts_graph::{
     JsTsExportUsageGraphStrategy, JsTsReceiverFacts, build_jsts_scoped_usage_edges,
-    build_jsts_usage_edges,
+    build_rooted_jsts_usage_edges,
 };
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::{
     AnalyzerQueryScope, ForwardQueryProvider, IAnalyzer, JavascriptAnalyzer, ParserFlavor,
     ProjectFile, QueryScope, Range, TypescriptAnalyzer, resolve_analyzer,
 };
-use crate::analyzer::{CodeUnit, Language};
+use crate::analyzer::{CodeUnit, Language, SummaryFileProjection};
 use crate::hash::HashSet;
 use crate::text_utils::compute_line_starts;
+use brokk_bifrost_core::analyzer::usages::model::ImportKind;
+use brokk_bifrost_js_ts::imports::npm_package_of_module_specifier;
 use brokk_bifrost_js_ts::model::module_code_unit;
-use brokk_bifrost_js_ts::syntax::js_ts_variable_declarator_binding_scope;
+use brokk_bifrost_js_ts::syntax::{
+    JsTsLexicalBindingIndex, compute_import_binder as compute_js_ts_import_binder,
+    js_ts_variable_declarator_binding_scope,
+};
 use std::sync::LazyLock;
 
 fn js_ts_local_declaration_binding_scope<'tree>(
@@ -130,7 +135,81 @@ pub(crate) fn synthesize_hydrated_module(file: &ProjectFile, source: &str, state
     });
 }
 
+pub(crate) fn synthesize_summary_module(
+    file: &ProjectFile,
+    source: &str,
+    has_structured_imports: bool,
+    projection: &mut SummaryFileProjection,
+) {
+    if !has_structured_imports {
+        return;
+    }
+    let module = module_code_unit(file);
+    projection.top_level_declarations.push(module.clone());
+    projection.ranges.entry(module).or_default().push(Range {
+        start_byte: 0,
+        end_byte: source.len(),
+        start_line: 1,
+        end_line: compute_line_starts(source).len(),
+    });
+}
+
 static JS_TS_USAGE_STRATEGY: JsTsExportUsageGraphStrategy = JsTsExportUsageGraphStrategy::new();
+
+/// The canonical owner a single-segment JS/TS external callee publishes, or
+/// `None` when the owner names no external identity at all (#2598).
+///
+/// One rule for both dialects, because the binding structure it reads is the
+/// same one. The callee has already failed to resolve by the time this runs, so
+/// the only question left is what the file itself says about the owner name:
+///
+///   * bound by an import or `require` that names a package or runtime builtin
+///     -- the owner is that module's identity. A default, namespace or
+///     CommonJS module-object binding *is* the module, so the specifier is the
+///     owner and `import p from 'path'` keys identically to
+///     `import path from 'path'`. A named import binds a member *of* the
+///     module, and that member is itself the owner: `import { Buffer } from
+///     'buffer'` makes `Buffer.from` owner `Buffer`, never `buffer`;
+///   * bound by an import whose specifier is relative or absolute -- refused.
+///     That specifier addresses a workspace file, so a call through it that did
+///     not resolve is a resolution gap to fix, not an external surface to
+///     model;
+///   * bound by anything else in scope at the call -- a parameter, a local, a
+///     class, a function, a catch binder -- refused. `opts.parse(x)` where
+///     `opts` is a parameter names the parameter's runtime value, and no
+///     authored summary can claim it;
+///   * bound by nothing -- admitted as itself. `JSON`, `Buffer` and `crypto`
+///     reach a call site with no binding anywhere in the file precisely because
+///     they are the runtime's own globals.
+///
+/// The last arm is a definition check, not a reviewed table of global names. A
+/// table would have to be kept current with several runtimes and would still
+/// answer wrongly for a file that shadows one of its entries; the binding
+/// question answers both cases from the file in hand.
+fn js_ts_single_segment_external_owner(
+    owner: &str,
+    site: &ExternalCalleeSite<'_>,
+) -> Option<String> {
+    let binder = compute_js_ts_import_binder(site.source, site.tree);
+    let Some(binding) = binder.binding(owner) else {
+        // Nothing in the file binds the name at this point, so it is the
+        // runtime's own global and is its own owner.
+        let lexical = JsTsLexicalBindingIndex::build(site.tree.root_node(), site.source);
+        return (!lexical.is_bound_at(owner, site.callee_start_byte)).then(|| owner.to_owned());
+    };
+    // A relative or absolute specifier addresses a workspace file rather than a
+    // package, which is what `npm_package_of_module_specifier` answers `None`
+    // for.
+    npm_package_of_module_specifier(&binding.module_specifier)?;
+    match binding.kind {
+        ImportKind::Default | ImportKind::Namespace | ImportKind::CommonJsRequire => {
+            Some(binding.module_specifier.clone())
+        }
+        ImportKind::Named => Some(owner.to_owned()),
+        // A glob binds no single name, so it cannot be what bound this owner.
+        ImportKind::Glob => None,
+    }
+}
 
 pub(crate) struct JavascriptSupport;
 
@@ -202,6 +281,18 @@ impl LanguageSupport for JavascriptSupport {
 
     fn parser_language(&self, _flavor: ParserFlavor) -> tree_sitter::Language {
         tree_sitter_javascript::LANGUAGE.into()
+    }
+
+    fn publishes_single_segment_external_owners(&self) -> bool {
+        true
+    }
+
+    fn single_segment_external_owner(
+        &self,
+        owner: &str,
+        site: &ExternalCalleeSite<'_>,
+    ) -> Option<String> {
+        js_ts_single_segment_external_owner(owner, site)
     }
 
     fn structural_spec(&self) -> &'static dyn crate::analyzer::structural::StructuralSpec {
@@ -300,6 +391,18 @@ impl LanguageSupport for TypescriptSupport {
         }
     }
 
+    fn publishes_single_segment_external_owners(&self) -> bool {
+        true
+    }
+
+    fn single_segment_external_owner(
+        &self,
+        owner: &str,
+        site: &ExternalCalleeSite<'_>,
+    ) -> Option<String> {
+        js_ts_single_segment_external_owner(owner, site)
+    }
+
     fn structural_spec(&self) -> &'static dyn crate::analyzer::structural::StructuralSpec {
         &brokk_bifrost_js_ts::structural::TYPESCRIPT_STRUCTURAL_SPEC
     }
@@ -323,7 +426,7 @@ impl LanguageEdgePass for JsTsEdgePass {
 
     fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
         let scope = AnalyzerQueryScope::new(ctx.analyzer);
-        build_jsts_usage_edges(ctx.analyzer, scope.token(), ctx.fqns, ctx.keep_file)
+        build_rooted_jsts_usage_edges(ctx.analyzer, scope.token(), ctx.fqns, ctx.keep_file)
             .map(LanguageEdgeSites)
     }
 

@@ -12,7 +12,7 @@
 
 use std::collections::HashSet;
 
-use brokk_bifrost_analysis::analyzer::structural::search::DetailedCodeQueryDomain;
+use brokk_bifrost_rql::structural::search::DetailedCodeQueryDomain;
 
 use crate::definition::{
     PolicySelector, RelationalAssertionPlan, RowAggregate, RowAggregateOp, RowBindingSource,

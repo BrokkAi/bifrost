@@ -15,13 +15,15 @@ pub mod resolver;
 pub mod syntax;
 
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
-use brokk_bifrost_core::analyzer::{CodeUnitIndex, DefinitionLookupAccess};
+use brokk_bifrost_core::analyzer::{
+    BoundedDefinitionLookup, CodeUnitIndex, DefinitionLookupAccess,
+};
 
 /// The *dispatching* analyzer's side of a Ruby usage-graph scan.
 ///
 /// Deliberately not the Ruby analyzer, for the reason recorded on
 /// `PythonGraphSource`: in a mixed workspace the query is issued against a
-/// `MultiAnalyzer`, whose `definitions` merges every language's shards and whose
+/// `MultiAnalyzer`, whose `definitions` can query every language's store and whose
 /// enclosing-unit lookup crosses language boundaries. The walks depend on that
 /// reach, so this stays separate from the
 /// [`RubySource`](crate::graph_support::RubySource) that answers the Ruby-only
@@ -39,4 +41,17 @@ pub struct RubyGraphSource<'a> {
     pub token: QueryToken<'a>,
     pub index: &'a dyn CodeUnitIndex,
     pub definitions: &'a DefinitionLookupAccess<'a>,
+}
+
+impl RubyGraphSource<'_> {
+    pub fn with_definitions<R>(&self, read: impl FnOnce(&dyn BoundedDefinitionLookup) -> R) -> R {
+        let mut read = Some(read);
+        let mut resolved = None;
+        (self.definitions)(&mut |lookup| {
+            if let Some(read) = read.take() {
+                resolved = Some(read(lookup));
+            }
+        });
+        resolved.expect("definition lookup access must invoke its consumer exactly once")
+    }
 }

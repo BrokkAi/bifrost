@@ -39,6 +39,9 @@ tempfile = "3.23.0"
 tree-sitter = "0.25.10"
 walkdir = "2.5.0"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [features]
 default = []
 # CI-only mode that exposes accidental dependence on hash iteration order.

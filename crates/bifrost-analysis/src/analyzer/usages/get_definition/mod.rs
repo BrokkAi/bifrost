@@ -75,11 +75,11 @@ use crate::analyzer::usages::scala_graph::{
 };
 use crate::analyzer::{
     AliasResolver, AnalyzerDefinitionLookup, AnalyzerQueryScope, BoundedDefinitionLookup,
-    CSharpAnalyzer, CodeUnit, CppAnalyzer, GoAnalyzer, IAnalyzer, ImportAnalysisProvider,
-    ImportInfo, JavaAnalyzer, Language, ModuleBindingEventKind, ModuleBindingTimeline, PhpAnalyzer,
-    ProjectFile, PythonAnalyzer, Range, RubyAnalyzer, RustAnalyzer, ScalaAnalyzer,
-    cpp_include_paths, cpp_node_text, csharp_callable_arity, resolve_analyzer,
-    resolve_include_targets,
+    CSharpAnalyzer, CodeUnit, CppAnalyzer, DeclarationKind, GoAnalyzer, IAnalyzer,
+    ImportAnalysisProvider, ImportInfo, JavaAnalyzer, Language, ModuleBindingEventKind,
+    ModuleBindingTimeline, PhpAnalyzer, ProjectFile, PythonAnalyzer, Range, RubyAnalyzer,
+    RustAnalyzer, ScalaAnalyzer, cpp_include_paths, cpp_node_text, csharp_callable_arity,
+    resolve_analyzer, resolve_include_targets,
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
@@ -107,11 +107,11 @@ use brokk_bifrost_ruby::graph::syntax::{
     symbol_or_string_value as ruby_symbol_or_string_value,
 };
 pub(crate) use rust::{
-    AnalyzerRustDefinitionProvider, RustTypeLookupCache, ingest_file_macro_matcher_roles,
-    resolve_rust_bounded, rust_associated_call_applicable_candidates,
-    rust_expression_type_definition_candidates_cached, rust_expression_type_definition_fqn_cached,
-    rust_field_definition_type_candidates_cached, rust_is_type_definition,
-    rust_resolve_type_node_fqn,
+    AnalyzerRustDefinitionProvider, RustMacroMatcherCandidateGate, RustTypeLookupCache,
+    ingest_file_macro_matcher_roles, resolve_rust_bounded,
+    rust_associated_call_applicable_candidates, rust_expression_type_definition_candidates_cached,
+    rust_expression_type_definition_fqn_cached, rust_field_definition_type_candidates_cached,
+    rust_is_type_definition, rust_resolve_type_node_fqn,
 };
 use std::sync::{Arc, OnceLock};
 use tree_sitter::{Node, Parser, Tree};
@@ -138,12 +138,12 @@ mod scala;
 pub mod trace;
 
 pub(crate) use brokk_bifrost_core::analyzer::usages::resolution_session;
+pub use call_sites::CallSyntaxKind;
 pub use call_sites::call_signature_context;
 pub(crate) use call_sites::{
-    CallSiteSyntax, CallSyntaxKind, ExactCallReference, ExactCallReferenceGap,
-    call_reference_ranges_in_tree, call_reference_requires_point_lookup,
-    call_site_syntax_for_reference, exact_call_reference_for_call, is_call_reference_range_in_tree,
-    range_is_call_keyword_label,
+    CallSiteSyntax, ExactCallReference, ExactCallReferenceGap, call_reference_ranges_in_tree,
+    call_reference_requires_point_lookup, call_site_syntax_for_reference,
+    exact_call_reference_for_call, is_call_reference_range_in_tree, range_is_call_keyword_label,
 };
 pub(crate) use cpp::{cpp_type_lookup_resolution_in_session, resolve_cpp_bounded};
 pub(crate) use csharp::{
@@ -433,7 +433,7 @@ impl NavigationLookupOutcome {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct CallTargetLookupOutcome {
+pub struct CallTargetLookupOutcome {
     pub outcome: DefinitionLookupOutcome,
     pub structure_unavailable: bool,
     pub unproven_link_unit: bool,
@@ -813,7 +813,7 @@ pub fn resolve_definition_batch_with_source_and_cancellation(
     )
 }
 
-pub(crate) fn resolve_call_target_batch_with_source(
+pub fn resolve_call_target_batch_with_source(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
     requests: Vec<DefinitionLookupRequest>,
@@ -1509,6 +1509,7 @@ fn resolve_one<'a>(
                     &source,
                     tree.as_ref(),
                     &site,
+                    operation.is_some(),
                 )
             },
         ),
@@ -1521,6 +1522,7 @@ fn resolve_one<'a>(
             tree.as_ref(),
             &site,
             context.exact_token_focus,
+            operation,
         ),
         Language::Scala => scala::resolve_scala(
             analyzer,
@@ -2088,9 +2090,6 @@ mod tests {
         let analyzer = fixture.analyzer.analyzer();
         analyzer
             .test_hooks()
-            .reset_global_usage_definition_index_build_count_for_test();
-        analyzer
-            .test_hooks()
             .reset_full_declaration_scan_count_for_test();
         let scope = AnalyzerQueryScope::new(analyzer);
         let mut context = DefinitionBatchContext::new(analyzer, scope.token(), true);
@@ -2120,12 +2119,6 @@ mod tests {
                     .starts_with("service.Service.")
         }));
         assert_eq!(context.python_build_counts(), (1, 1, 1, 0));
-        assert_eq!(
-            analyzer
-                .test_hooks()
-                .global_usage_definition_index_build_count_for_test(),
-            0
-        );
         assert_eq!(
             analyzer.test_hooks().full_declaration_scan_count_for_test(),
             0

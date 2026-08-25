@@ -62,8 +62,9 @@ cargo test -p brokk-bifrost-lsp --all-features
 ```
 
 Changes in `brokk-bifrost-core`, `brokk-bifrost-analysis`,
-`brokk-bifrost-policy`, or `brokk-bifrost-runtime` affect both hosts and should
-use the full workspace gate. MCP and LSP are versioned
+`brokk-bifrost-flow`, `brokk-bifrost-rql`, `brokk-bifrost-policy`, or
+`brokk-bifrost-runtime` affect both hosts and should use the full workspace
+gate. MCP and LSP are versioned
 implementation dependencies of the stable `brokk-bifrost` facade, not
 separate public API commitments.
 
@@ -365,10 +366,9 @@ the dependency graph: `brokk-bifrost-core`, then the language crates
 `brokk-bifrost-cpp`, `brokk-bifrost-csharp`, `brokk-bifrost-go`,
 `brokk-bifrost-js-ts`, `brokk-bifrost-jvm`, `brokk-bifrost-php`,
 `brokk-bifrost-python`, `brokk-bifrost-ruby` and `brokk-bifrost-rust` (which may
-run in parallel), and `brokk-bifrost-rql` in parallel, then
-`brokk-bifrost-analysis`, then
-its direct dependents `brokk-bifrost-policy`, `brokk-bifrost-nlp`, and
-`brokk-bifrost-semantic-packs` (which may run in parallel), then
+run in parallel), then `brokk-bifrost-analysis`, then `brokk-bifrost-flow` and
+`brokk-bifrost-nlp` in parallel, then `brokk-bifrost-rql` and
+`brokk-bifrost-semantic-packs` in parallel, then `brokk-bifrost-policy`, then
 `brokk-bifrost-runtime`, then MCP and LSP (which may run in parallel), and the
 stable `brokk-bifrost` facade last. Each publication waits for crates.io to
 expose the exact version and archive checksum before its dependents proceed.
@@ -389,15 +389,16 @@ This table is the expected crates.io publication set for the workspace.
 | `brokk-bifrost-python` | `crates/bifrost-python/Cargo.toml` | 2 |
 | `brokk-bifrost-ruby` | `crates/bifrost-ruby/Cargo.toml` | 2 |
 | `brokk-bifrost-rust` | `crates/bifrost-rust/Cargo.toml` | 2 |
-| `brokk-bifrost-rql` | `crates/bifrost-rql/Cargo.toml` | 2 |
 | `brokk-bifrost-analysis` | `crates/bifrost-analysis/Cargo.toml` | 3 |
+| `brokk-bifrost-flow` | `crates/bifrost-flow/Cargo.toml` | 4 |
 | `brokk-bifrost-nlp` | `crates/bifrost-nlp/Cargo.toml` | 4 |
-| `brokk-bifrost-policy` | `crates/bifrost-policy/Cargo.toml` | 4 |
-| `brokk-bifrost-semantic-packs` | `crates/bifrost-semantic-packs/Cargo.toml` | 4 |
-| `brokk-bifrost-runtime` | `crates/bifrost-runtime/Cargo.toml` | 5 |
-| `brokk-bifrost-mcp` | `crates/bifrost-mcp/Cargo.toml` | 6 |
-| `brokk-bifrost-lsp` | `crates/bifrost-lsp/Cargo.toml` | 6 |
-| `brokk-bifrost` | `Cargo.toml` | 7 |
+| `brokk-bifrost-rql` | `crates/bifrost-rql/Cargo.toml` | 5 |
+| `brokk-bifrost-semantic-packs` | `crates/bifrost-semantic-packs/Cargo.toml` | 5 |
+| `brokk-bifrost-policy` | `crates/bifrost-policy/Cargo.toml` | 6 |
+| `brokk-bifrost-runtime` | `crates/bifrost-runtime/Cargo.toml` | 7 |
+| `brokk-bifrost-mcp` | `crates/bifrost-mcp/Cargo.toml` | 8 |
+| `brokk-bifrost-lsp` | `crates/bifrost-lsp/Cargo.toml` | 8 |
+| `brokk-bifrost` | `Cargo.toml` | 9 |
 
 Before each release, compare this table with the root workspace members and
 package names. Confirm these items for each package:
@@ -418,15 +419,17 @@ workflow in the same change. Publish the crate through a separate bootstrap
 change before the next version release. Configure its trusted publisher during
 that bootstrap.
 
-All 19 packages in this inventory have now been bootstrapped on crates.io. The
-language crates and `brokk-bifrost-rql` are published through `0.10.2`, and the
-latest publication entry for each inventory package carries
+The 19 packages that preceded `brokk-bifrost-flow` have been bootstrapped on
+crates.io. The language crates and `brokk-bifrost-rql` are published through
+`0.10.2`, and the latest publication entry for each existing package carries
 `trustpub_data.repository` set to `BrokkAi/bifrost`. For any future package,
 retain the bootstrap policy above: trusted publishing cannot create a new
 crate, so the first version must be uploaded with a scoped crates.io API token
 from a clean, reviewed commit. Then set the crate owners and configure the
 trusted publisher per the checklist above, and verify that configuration
-before you tag.
+before you tag. `brokk-bifrost-flow` must be bootstrapped and have its trusted
+publisher configured before the next release; adding it to this inventory does
+not authorize that publication.
 
 Use the **Release** workflow's unqualified `vX.Y.Z` `tag` input for a manual
 release. Dispatch it from `master`. The workflow definition comes from

@@ -1,3 +1,4 @@
+use crate::analyzer::topology::DependencyScope;
 use crate::analyzer::{
     JvmDependencyDiscoveryConfig, JvmExternalArtifact, JvmExternalDependencies, JvmMavenCoordinate,
     Project, ProjectFile,
@@ -11,7 +12,9 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::path::{Component, Path, PathBuf};
 
-const MAX_BUILD_METADATA_BYTES: usize = 2 * 1024 * 1024;
+/// The per-file cap on build metadata reads, published through
+/// `DependencyResolver::bounds` so a host can see what JVM discovery spends.
+pub(crate) const MAX_BUILD_METADATA_BYTES: usize = 2 * 1024 * 1024;
 const MAX_TOOL_REPORT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TOOL_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_MAVEN_XML_DEPTH: usize = 128;
@@ -54,10 +57,30 @@ gradle.projectsEvaluated {
 }
 "#;
 
+/// What a build file said about one coordinate, beyond that it is depended on
+/// (#2442).
+///
+/// Only a declaration carries this. A jar found in a local repository proves
+/// the artifact exists, not the scope anything wants it in, so a coordinate
+/// reached that way has no entry here and keeps
+/// [`DependencyScope::Unknown`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct JvmDependencyDeclaration {
+    pub(crate) scope: DependencyScope,
+    /// The topology target whose build file declares it, where the build file
+    /// names one. A Gradle lockfile does not name the project it belongs to in
+    /// its own contents, so it declares a scope and no target.
+    pub(crate) declared_by: Option<String>,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct DiscoveredJvmDependencies {
     pub(super) artifact_paths: Vec<JvmExternalArtifact>,
     pub(super) coordinates: Vec<JvmMavenCoordinate>,
+    /// Declarations keyed by coordinate. A coordinate declared twice with
+    /// different scopes keeps the widest one, because that is the scope the
+    /// build actually resolves it in.
+    pub(crate) declarations: HashMap<JvmMavenCoordinate, JvmDependencyDeclaration>,
 }
 
 impl DiscoveredJvmDependencies {
@@ -65,6 +88,53 @@ impl DiscoveredJvmDependencies {
         dependencies.artifact_paths.extend(self.artifact_paths);
         dependencies.coordinates.extend(self.coordinates);
         deduplicate_dependencies(dependencies);
+    }
+
+    fn declare(
+        &mut self,
+        coordinate: JvmMavenCoordinate,
+        scope: DependencyScope,
+        declared_by: Option<String>,
+    ) {
+        match self.declarations.entry(coordinate) {
+            std::collections::hash_map::Entry::Occupied(mut existing) => {
+                let existing = existing.get_mut();
+                if widest_scope(existing.scope, scope) != existing.scope {
+                    existing.scope = scope;
+                    existing.declared_by = declared_by;
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(JvmDependencyDeclaration { scope, declared_by });
+            }
+        }
+    }
+}
+
+/// The scope a build resolves a coordinate in when two declarations disagree:
+/// a dependency on both the compile and the test classpath is compile-scoped.
+/// Unknown loses to everything, because it is the absence of an answer rather
+/// than a narrow one.
+fn widest_scope(left: DependencyScope, right: DependencyScope) -> DependencyScope {
+    const ORDER: [DependencyScope; 7] = [
+        DependencyScope::Unknown,
+        DependencyScope::Optional,
+        DependencyScope::FeatureGated,
+        DependencyScope::Test,
+        DependencyScope::Provided,
+        DependencyScope::Runtime,
+        DependencyScope::Compile,
+    ];
+    let rank = |scope: DependencyScope| {
+        ORDER
+            .iter()
+            .position(|candidate| *candidate == scope)
+            .expect("every scope is ranked")
+    };
+    if rank(right) > rank(left) {
+        right
+    } else {
+        left
     }
 }
 
@@ -274,6 +344,11 @@ fn discover_maven_pom(
     }
 
     let properties = maven_project_properties(&project_node);
+    // The pom's own artifact is the topology target that declares everything
+    // below, which is what lets a dependency name the entity that wanted it.
+    let declaring_target = project_node
+        .child_text("artifactId")
+        .and_then(|value| expand_maven_value(value, &properties));
 
     let Some(dependencies) = project_node.child("dependencies") else {
         return;
@@ -314,13 +389,17 @@ fn discover_maven_pom(
         {
             continue;
         }
-        discovered
-            .coordinates
-            .push(JvmMavenCoordinate::new(group_id, artifact_id, version));
+        let coordinate = JvmMavenCoordinate::new(group_id, artifact_id, version);
+        discovered.declare(
+            coordinate.clone(),
+            super::topology::maven_scope_edge_kind(Some(scope)),
+            declaring_target.clone(),
+        );
+        discovered.coordinates.push(coordinate);
     }
 }
 
-fn maven_project_properties(project_node: &XmlNode) -> HashMap<String, String> {
+pub(crate) fn maven_project_properties(project_node: &XmlNode) -> HashMap<String, String> {
     let mut properties = HashMap::default();
     if let Some(property_node) = project_node.child("properties") {
         for child in &property_node.children {
@@ -361,12 +440,25 @@ fn discover_gradle_lockfile(
     let Some(source) = read_bounded_source(project, file) else {
         return;
     };
-    discovered
-        .coordinates
-        .extend(parse_gradle_lockfile(&source));
+    for (coordinate, configurations) in parse_gradle_lockfile(&source) {
+        // A lockfile states the configurations the coordinate resolves in and
+        // nothing about which project declared it, so the declaring entity
+        // stays unnamed rather than guessed from the lockfile's directory.
+        discovered.declare(
+            coordinate.clone(),
+            gradle_configuration_scope(&configurations),
+            None,
+        );
+        discovered.coordinates.push(coordinate);
+    }
 }
 
-fn parse_gradle_lockfile(source: &str) -> Vec<JvmMavenCoordinate> {
+/// Each locked coordinate with the configurations Gradle locked it for.
+///
+/// The lockfile line is `group:artifact:version=configuration[,configuration]`,
+/// a format Gradle writes for machines; splitting it is reading a declared
+/// record, not parsing a program.
+fn parse_gradle_lockfile(source: &str) -> Vec<(JvmMavenCoordinate, String)> {
     source
         .lines()
         .filter_map(|line| {
@@ -374,7 +466,7 @@ fn parse_gradle_lockfile(source: &str) -> Vec<JvmMavenCoordinate> {
             if line.is_empty() || line.starts_with('#') || line.starts_with("empty=") {
                 return None;
             }
-            let (coordinate, _) = line.split_once('=')?;
+            let (coordinate, configurations) = line.split_once('=')?;
             let mut parts = coordinate.split(':');
             let group_id = parts.next()?.trim();
             let artifact_id = parts.next()?.trim();
@@ -386,9 +478,36 @@ fn parse_gradle_lockfile(source: &str) -> Vec<JvmMavenCoordinate> {
             {
                 return None;
             }
-            Some(JvmMavenCoordinate::new(group_id, artifact_id, version))
+            Some((
+                JvmMavenCoordinate::new(group_id, artifact_id, version),
+                configurations.trim().to_owned(),
+            ))
         })
         .collect()
+}
+
+/// The scope a set of locked Gradle configurations resolves to.
+///
+/// Gradle's configuration names are conventions of the Java plugin, not a
+/// closed vocabulary, so this reads the two roles the names actually encode --
+/// a `test` prefix and a `runtime`/`compile` role -- and answers `Unknown` for
+/// a name that carries neither. A coordinate locked for several configurations
+/// takes the widest, because that is the one the build resolves it in.
+fn gradle_configuration_scope(configurations: &str) -> DependencyScope {
+    configurations
+        .split(',')
+        .map(|configuration| {
+            let configuration = configuration.trim();
+            let test = configuration.starts_with("test");
+            let role = configuration.to_ascii_lowercase();
+            match (test, role.contains("compile"), role.contains("runtime")) {
+                (true, _, _) => DependencyScope::Test,
+                (false, true, _) => DependencyScope::Compile,
+                (false, false, true) => DependencyScope::Runtime,
+                (false, false, false) => DependencyScope::Unknown,
+            }
+        })
+        .fold(DependencyScope::Unknown, widest_scope)
 }
 
 fn maven_dependency_list_args(report_path: &Path) -> Vec<String> {
@@ -579,7 +698,10 @@ fn stable_path(path: impl AsRef<Path>) -> PathBuf {
         .unwrap_or_else(|_| path.as_ref().to_path_buf())
 }
 
-fn expand_maven_value(value: &str, properties: &HashMap<String, String>) -> Option<String> {
+pub(crate) fn expand_maven_value(
+    value: &str,
+    properties: &HashMap<String, String>,
+) -> Option<String> {
     enum Work {
         Value(String),
         Text(String),
@@ -666,14 +788,14 @@ fn maven_value_tokens(value: &str) -> Option<Vec<MavenValueToken>> {
     Some(tokens)
 }
 
-fn read_bounded_source(project: &dyn Project, file: &ProjectFile) -> Option<String> {
+pub(crate) fn read_bounded_source(project: &dyn Project, file: &ProjectFile) -> Option<String> {
     project
         .read_source_limited(file, MAX_BUILD_METADATA_BYTES)
         .ok()
         .flatten()
 }
 
-fn is_maven_pom(file: &ProjectFile) -> bool {
+pub(crate) fn is_maven_pom(file: &ProjectFile) -> bool {
     file.rel_path()
         .file_name()
         .is_some_and(|name| name == "pom.xml")
@@ -740,6 +862,7 @@ fn deduplicate_dependencies(dependencies: &mut JvmExternalDependencies) {
     let mut discovered = DiscoveredJvmDependencies {
         artifact_paths: std::mem::take(&mut dependencies.artifact_paths),
         coordinates: std::mem::take(&mut dependencies.coordinates),
+        declarations: HashMap::default(),
     };
     deduplicate_discovered(&mut discovered);
     dependencies.artifact_paths = discovered.artifact_paths;
@@ -747,29 +870,29 @@ fn deduplicate_dependencies(dependencies: &mut JvmExternalDependencies) {
 }
 
 #[derive(Debug, Default)]
-struct XmlNode {
-    name: String,
-    text: String,
-    children: Vec<XmlNode>,
+pub(crate) struct XmlNode {
+    pub(crate) name: String,
+    pub(crate) text: String,
+    pub(crate) children: Vec<XmlNode>,
 }
 
 impl XmlNode {
-    fn child(&self, name: &str) -> Option<&XmlNode> {
+    pub(crate) fn child(&self, name: &str) -> Option<&XmlNode> {
         self.children.iter().find(|child| child.name == name)
     }
 
-    fn child_text(&self, name: &str) -> Option<&str> {
+    pub(crate) fn child_text(&self, name: &str) -> Option<&str> {
         self.child(name)
             .map(|child| child.text.trim())
             .filter(|text| !text.is_empty())
     }
 
-    fn children_named<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a XmlNode> {
+    pub(crate) fn children_named<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a XmlNode> {
         self.children.iter().filter(move |child| child.name == name)
     }
 }
 
-fn parse_xml(source: &str) -> Option<XmlNode> {
+pub(crate) fn parse_xml(source: &str) -> Option<XmlNode> {
     let mut reader = Reader::from_str(source);
     reader.config_mut().trim_text(true);
     let mut stack = Vec::<XmlNode>::new();
@@ -973,6 +1096,92 @@ mod tests {
                 JvmMavenCoordinate::new("org.example", "beta", "2.0"),
             ],
             discovered.coordinates
+        );
+    }
+
+    /// A pom declares the scope and the target that wants each dependency, and
+    /// both reach the discovery record. A Gradle lockfile declares
+    /// configurations and no project, so it answers a scope and no declaring
+    /// target.
+    #[test]
+    fn java_dependency_discovery_records_declared_scope_and_declaring_target() {
+        let project = project(&[
+            (
+                "domain/pom.xml",
+                r#"<project>
+                     <groupId>com.example</groupId><artifactId>domain</artifactId><version>1.0</version>
+                     <dependencies>
+                       <dependency><groupId>org.example</groupId><artifactId>library</artifactId><version>1</version></dependency>
+                       <dependency><groupId>org.example</groupId><artifactId>harness</artifactId><version>1</version><scope>test</scope></dependency>
+                     </dependencies>
+                   </project>"#,
+            ),
+            (
+                "gradle.lockfile",
+                "org.example:locked:2.0=compileClasspath,testRuntimeClasspath\norg.example:tested:2.0=testCompileClasspath\norg.example:opaque:2.0=bifrostCustom\n",
+            ),
+            ("src/App.java", "class App {}"),
+        ]);
+        let discovered = discover_metadata(&project);
+
+        let declaration = |group: &str, name: &str, version: &str| {
+            discovered
+                .declarations
+                .get(&JvmMavenCoordinate::new(group, name, version))
+                .cloned()
+                .unwrap_or_else(|| panic!("{group}:{name} must carry a declaration"))
+        };
+        assert_eq!(
+            declaration("org.example", "library", "1"),
+            JvmDependencyDeclaration {
+                scope: DependencyScope::Compile,
+                declared_by: Some("domain".to_owned()),
+            }
+        );
+        assert_eq!(
+            declaration("org.example", "harness", "1"),
+            JvmDependencyDeclaration {
+                scope: DependencyScope::Test,
+                declared_by: Some("domain".to_owned()),
+            }
+        );
+        // Locked for both a compile and a test configuration: the build
+        // resolves it on the compile classpath, and no lockfile names a
+        // declaring project.
+        assert_eq!(
+            declaration("org.example", "locked", "2.0"),
+            JvmDependencyDeclaration {
+                scope: DependencyScope::Compile,
+                declared_by: None,
+            }
+        );
+        assert_eq!(
+            declaration("org.example", "tested", "2.0").scope,
+            DependencyScope::Test
+        );
+        // A configuration name carrying neither role is not forced into one.
+        assert_eq!(
+            declaration("org.example", "opaque", "2.0").scope,
+            DependencyScope::Unknown
+        );
+    }
+
+    /// A coordinate reached only through a resolved artifact path carries no
+    /// declaration, so its scope stays unknown instead of inheriting one.
+    #[test]
+    fn java_dependency_discovery_leaves_undeclared_coordinates_without_a_scope() {
+        let project = project(&[
+            (
+                "gradle.lockfile",
+                "org.example:alpha:1.0=compileClasspath\n",
+            ),
+            ("src/App.java", "class App {}"),
+        ]);
+        let discovered = discover_metadata(&project);
+        assert!(
+            !discovered
+                .declarations
+                .contains_key(&JvmMavenCoordinate::new("org.example", "beta", "1.0"))
         );
     }
 

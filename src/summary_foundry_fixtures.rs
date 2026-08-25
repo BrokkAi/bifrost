@@ -25,6 +25,7 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{
     SessionPackSource, SessionPackSourceKind, SourceFormat, compile_source,
 };
 use brokk_bifrost_analysis::analyzer::{AnalyzerConfig, FilesystemProject, Project};
+use brokk_bifrost_flow::FlowWorkspaceState;
 use brokk_bifrost_policy::{
     PolicyEvaluationDate, PolicyEvaluationInput, PolicyEvaluationOptions, PolicyRunCompletion,
     PolicySemanticModelContext, PolicySourceIdentity,
@@ -222,10 +223,12 @@ fn run_case(
         PolicyEvaluationDate::from_ymd(year, month, day).expect("a fixed evaluation date"),
     );
     let request = activation_request(language);
+    let flow_state = FlowWorkspaceState::default();
     let outcome = evaluate_policy_inputs_with_analyzer_and_semantic_models(
         root,
         &inputs,
         &workspace,
+        &flow_state,
         &options,
         PolicySemanticModelContext {
             catalog: &catalog,

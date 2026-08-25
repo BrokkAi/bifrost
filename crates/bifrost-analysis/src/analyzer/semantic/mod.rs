@@ -61,7 +61,7 @@ pub(crate) mod lowering;
 pub mod oracle;
 pub mod provider;
 pub mod render;
-pub(crate) mod service;
+pub mod service;
 pub mod workspace_oracle;
 
 pub use crate::cancellation::CancellationToken;
@@ -74,4 +74,5 @@ pub(crate) use lowering::*;
 pub use oracle::*;
 pub use provider::*;
 pub use render::*;
+pub use service::semantic_artifact_retained_bytes;
 pub use workspace_oracle::*;

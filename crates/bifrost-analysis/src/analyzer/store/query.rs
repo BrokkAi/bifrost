@@ -6,7 +6,8 @@ use git2::Oid;
 use crate::CancellationToken;
 use crate::analyzer::store::liveness::{LiveSnapshot, Liveness};
 use crate::analyzer::store::{
-    CandidateRow, LimitedQueryRows, Result, SearchCandidateKey, SearchCandidateNameRow, StoreError,
+    HydratedCandidateRow, LimitedQueryRows, Result, SearchCandidateKey, SearchCandidateNameRow,
+    StoreError,
 };
 use crate::analyzer::tree_sitter_analyzer::LanguageAdapter;
 use crate::analyzer::{CodeUnit, ProjectFile};
@@ -40,7 +41,10 @@ impl<'a, A: LanguageAdapter> QueryResolver<'a, A> {
         Ok(Self::from_snapshot(adapter, project_root, snapshot))
     }
 
-    pub fn resolve_rows(&self, rows: impl IntoIterator<Item = CandidateRow>) -> Vec<CodeUnit> {
+    pub fn resolve_rows(
+        &self,
+        rows: impl IntoIterator<Item = HydratedCandidateRow>,
+    ) -> Vec<CodeUnit> {
         self.resolve_rows_with_payload(rows.into_iter().map(|row| (row, ())))
             .into_iter()
             .map(|(unit, ())| unit)
@@ -49,7 +53,7 @@ impl<'a, A: LanguageAdapter> QueryResolver<'a, A> {
 
     pub fn resolve_rows_with_payload<T>(
         &self,
-        rows: impl IntoIterator<Item = (CandidateRow, T)>,
+        rows: impl IntoIterator<Item = (HydratedCandidateRow, T)>,
     ) -> Vec<(CodeUnit, T)>
     where
         T: Clone,
@@ -59,7 +63,7 @@ impl<'a, A: LanguageAdapter> QueryResolver<'a, A> {
 
     pub(crate) fn resolve_rows_with_payload_cancellable<T>(
         &self,
-        rows: impl IntoIterator<Item = (CandidateRow, T)>,
+        rows: impl IntoIterator<Item = (HydratedCandidateRow, T)>,
         cancellation: Option<&CancellationToken>,
     ) -> LimitedQueryRows<(CodeUnit, T)>
     where
@@ -75,7 +79,7 @@ impl<'a, A: LanguageAdapter> QueryResolver<'a, A> {
 
     fn resolve_rows_with_payload_while<T>(
         &self,
-        rows: impl IntoIterator<Item = (CandidateRow, T)>,
+        rows: impl IntoIterator<Item = (HydratedCandidateRow, T)>,
         mut continue_query: impl FnMut() -> bool,
     ) -> LimitedQueryRows<(CodeUnit, T)>
     where
@@ -172,7 +176,13 @@ impl<'a, A: LanguageAdapter> QueryResolver<'a, A> {
                 .or_insert_with(|| {
                     self.paths_for_oid(row.blob_oid)
                         .into_iter()
-                        .filter(|file| self.adapter.storage_language_key_for_file(file) == *lang)
+                        .filter(|file| {
+                            self.snapshot.is_mounted_under(
+                                file,
+                                self.adapter.storage_language_key_for_file(file),
+                                lang,
+                            )
+                        })
                         .collect()
                 });
             if files.is_empty() {
@@ -212,17 +222,23 @@ impl<'a, A: LanguageAdapter> QueryResolver<'a, A> {
             .collect()
     }
 
-    fn paths_for_row(&self, row: &CandidateRow) -> Vec<ProjectFile> {
+    fn paths_for_row(&self, row: &HydratedCandidateRow) -> Vec<ProjectFile> {
         self.paths_for_oid(row.blob_oid)
             .into_iter()
-            .filter(|file| self.adapter.storage_language_key_for_file(file) == row.lang)
+            .filter(|file| {
+                self.snapshot.is_mounted_under(
+                    file,
+                    self.adapter.storage_language_key_for_file(file),
+                    &row.lang,
+                )
+            })
             .collect()
     }
 
     /// [`Self::paths_for_row`] answered once per `(blob, storage language)`.
     fn paths_for_row_memoized<'r, 'm>(
         &self,
-        row: &'r CandidateRow,
+        row: &'r HydratedCandidateRow,
         memo: &'m mut HashMap<(Oid, &'r str), Vec<ProjectFile>>,
     ) -> &'m [ProjectFile] {
         memo.entry((row.blob_oid, row.lang.as_str()))
@@ -233,10 +249,10 @@ impl<'a, A: LanguageAdapter> QueryResolver<'a, A> {
         crate::analyzer::common::rebase_project_file_to_root(file, self.project_root)
     }
 
-    fn code_unit_for_row(&self, row: &CandidateRow, file: &ProjectFile) -> CodeUnit {
+    fn code_unit_for_row(&self, row: &HydratedCandidateRow, file: &ProjectFile) -> CodeUnit {
         let (fq, package_segment_count) = crate::analyzer::store::hydrate_unit_fq(
             self.adapter,
-            row.fq_segments.as_deref(),
+            row.fq.as_ref(),
             &row.content_qualifier,
             file,
         )

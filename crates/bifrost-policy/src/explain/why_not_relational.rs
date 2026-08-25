@@ -191,7 +191,7 @@ fn walk_bindings(
 fn binding_query<'a>(
     policy: &'a LoadedPolicy,
     binding: &RowBinding,
-) -> Result<&'a brokk_bifrost_analysis::analyzer::structural::CodeQuery, ExplainError> {
+) -> Result<&'a brokk_bifrost_rql::structural::CodeQuery, ExplainError> {
     let path = relational_binding_selector_path(&binding.name);
     policy
         .resolved_selectors()

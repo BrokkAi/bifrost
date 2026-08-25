@@ -322,7 +322,7 @@ const MAX_TYPE_WRAPPER_DEPTH: usize = 32;
 ///
 /// The walk is iterative and depth-capped rather than recursive, per the
 /// repository's stack-safety rule for analyzer tree walks.
-pub fn kotlin_type_spelling(node: Node<'_>, source: &str) -> Option<String> {
+pub fn kotlin_type_name_components(node: Node<'_>, source: &str) -> Option<Vec<String>> {
     let mut frontier = vec![node];
     for _ in 0..MAX_TYPE_WRAPPER_DEPTH {
         let mut next = Vec::new();
@@ -333,9 +333,10 @@ pub fn kotlin_type_spelling(node: Node<'_>, source: &str) -> Option<String> {
                         .into_iter()
                         .map(|segment| segment.utf8_text(source.as_bytes()).unwrap_or_default())
                         .filter(|segment| !segment.is_empty())
+                        .map(str::to_string)
                         .collect::<Vec<_>>();
                     if !segments.is_empty() {
-                        return Some(segments.join("."));
+                        return Some(segments);
                     }
                 }
                 // Wrappers that hold the nominal type one level down. A
@@ -354,6 +355,36 @@ pub fn kotlin_type_spelling(node: Node<'_>, source: &str) -> Option<String> {
     None
 }
 
+pub fn kotlin_type_spelling(node: Node<'_>, source: &str) -> Option<String> {
+    kotlin_type_name_components(node, source).map(|components| components.join("."))
+}
+
+pub fn kotlin_declared_return_type_components(
+    function: Node<'_>,
+    source: &str,
+) -> Option<Vec<String>> {
+    let receiver = function
+        .child_by_field_name("receiver")
+        .map(|node| node.id());
+    named_children(function)
+        .into_iter()
+        .filter(|child| Some(child.id()) != receiver)
+        .find_map(|child| kotlin_type_name_components(child, source))
+}
+
+pub fn kotlin_binding_type_components(binding: Node<'_>, source: &str) -> Option<Vec<String>> {
+    named_children(binding)
+        .into_iter()
+        .find_map(|child| kotlin_type_name_components(child, source))
+}
+
+pub fn kotlin_extension_receiver_components(
+    declaration: Node<'_>,
+    source: &str,
+) -> Option<Vec<String>> {
+    kotlin_type_name_components(declaration.child_by_field_name("receiver")?, source)
+}
+
 /// The return type a `function_declaration` writes, or `None` when it writes
 /// none.
 ///
@@ -365,13 +396,7 @@ pub fn kotlin_type_spelling(node: Node<'_>, source: &str) -> Option<String> {
 /// type and is reported absent — inferring what the source did not write is
 /// semantic work this does not do.
 pub fn kotlin_declared_return_type_text(function: Node<'_>, source: &str) -> Option<String> {
-    let receiver = function
-        .child_by_field_name("receiver")
-        .map(|node| node.id());
-    named_children(function)
-        .into_iter()
-        .filter(|child| Some(child.id()) != receiver)
-        .find_map(|child| kotlin_type_spelling(child, source))
+    kotlin_declared_return_type_components(function, source).map(|components| components.join("."))
 }
 
 /// The type a binding writes, or `None` when it writes none.
@@ -380,9 +405,7 @@ pub fn kotlin_declared_return_type_text(function: Node<'_>, source: &str) -> Opt
 /// (`class D(val base: Base)`) holds its name and then its type node, so the
 /// type is the first child that spells one.
 pub fn kotlin_binding_type_text(binding: Node<'_>, source: &str) -> Option<String> {
-    named_children(binding)
-        .into_iter()
-        .find_map(|child| kotlin_type_spelling(child, source))
+    kotlin_binding_type_components(binding, source).map(|components| components.join("."))
 }
 
 /// The type an extension declaration extends, or `None` when the declaration is
@@ -392,7 +415,7 @@ pub fn kotlin_binding_type_text(binding: Node<'_>, source: &str) -> Option<Strin
 /// grammar, carried by both `function_declaration` and `property_declaration`,
 /// so extension-ness is a structured check and never a name heuristic.
 pub fn kotlin_extension_receiver_text(declaration: Node<'_>, source: &str) -> Option<String> {
-    kotlin_type_spelling(declaration.child_by_field_name("receiver")?, source)
+    kotlin_extension_receiver_components(declaration, source).map(|components| components.join("."))
 }
 
 /// The declaration node covering `range`.

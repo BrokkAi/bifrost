@@ -379,7 +379,7 @@ pub fn environment_for_file(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Env
         return unavailable(file, EnvironmentIncompleteReason::NoStructuralAdapter);
     };
     let facts = analyzer
-        .structural_search_providers()
+        .structural_fact_providers()
         .into_iter()
         .find(|provider| provider.structural_language() == language)
         .and_then(|provider| provider.structural_facts(file));

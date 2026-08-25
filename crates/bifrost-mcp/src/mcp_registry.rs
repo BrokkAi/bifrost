@@ -393,6 +393,19 @@ mod tests {
                 description.chars().count() <= MCP_DISCOVERY_TEXT_MAX_CHARS,
                 "tool descriptor `{name}` exceeds the discovery metadata limit"
             );
+            // `query_code` stays under the cap because it describes the tool
+            // and leaves the step vocabulary to the generated `steps` schema.
+            // A description that names a step is a description that grows with
+            // the registry, which is how it reached the cap before.
+            if name == "query_code" {
+                for op in brokk_bifrost_rql::schema::ALL_QUERY_STEP_OPS {
+                    assert!(
+                        !description.contains(op.label()),
+                        "query_code description enumerates step `{}`; the step reference belongs to the steps parameter schema",
+                        op.label()
+                    );
+                }
+            }
         }
     }
 }

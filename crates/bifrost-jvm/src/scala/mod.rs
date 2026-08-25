@@ -14,11 +14,47 @@ pub mod supertypes;
 pub mod test_detection;
 pub mod wildcard_imports;
 
+use brokk_bifrost_core::analyzer::fq_name::{
+    FqName, SegmentKind, joined_segments, segment_interner,
+};
 use brokk_bifrost_core::analyzer::{CodeUnit, Language};
 
 /// Strip the `$` companion-object spelling out of a Scala fully qualified name.
 pub fn scala_normalize_full_name(fq_name: &str) -> String {
     fq_name.replace("$.", ".").trim_end_matches('$').to_string()
+}
+
+/// Remove companion-object spelling from a structured Scala identity.
+/// `Companion` is the source of the rendered trailing `$`; changing only that
+/// kind preserves every segment boundary and produces the normalized dot join.
+pub fn scala_normalize_fq_name(fq_name: &FqName) -> FqName {
+    let interner = segment_interner();
+    let mut normalized = FqName::new();
+    for &segment_id in fq_name.segments() {
+        let (text, kind) = interner.resolve(segment_id);
+        let kind = if kind == SegmentKind::Companion {
+            SegmentKind::Type
+        } else {
+            kind
+        };
+        normalized.push(interner.intern(text, kind));
+    }
+    normalized
+}
+
+/// Build the structured identity for a dotted Scala package spelling.
+///
+/// Package declarations and imports carry an explicit component separator, so
+/// this is the shared legacy-string bridge for callers that have not retained
+/// the parser's component vector. It uses the same empty-component policy as
+/// the declaration extractor's FQ-name round trip.
+pub fn scala_package_fq_name(package_name: &str) -> FqName {
+    let interner = segment_interner();
+    let mut package = FqName::new();
+    for component in joined_segments(package_name, ".") {
+        package.push(interner.intern(component, SegmentKind::Package));
+    }
+    package
 }
 
 /// Candidate spellings of `segments` rooted at `prefix`, plus the "$"
@@ -238,4 +274,21 @@ pub fn scala_standard_arity_type_name(name: &str) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod relational_name_tests {
+    use super::*;
+
+    #[test]
+    fn structured_lookup_canonicalization_matches_the_legacy_spelling() {
+        let interner = segment_interner();
+        let mut name = FqName::new();
+        name.push(interner.intern("chess", SegmentKind::Package));
+        name.push(interner.intern("Tournament", SegmentKind::Companion));
+        let exact = name.display_native(Language::Scala, interner);
+        let structured = scala_normalize_fq_name(&name).display_native(Language::Scala, interner);
+        assert_eq!(structured, scala_normalize_full_name(&exact));
+        assert_eq!(structured, "chess.Tournament");
+    }
 }

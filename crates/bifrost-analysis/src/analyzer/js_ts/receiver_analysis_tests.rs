@@ -1,13 +1,13 @@
 //! JS/TS receiver-facts coverage, kept beside the analyzers it exercises.
 //!
 //! The provider itself is [`brokk_bifrost_js_ts::graph::receiver_analysis`].
-//! These tests build a concrete `TypescriptAnalyzer` and read its workspace
-//! definition index, so they stay on this side of the crate line.
+//! These tests build a concrete `TypescriptAnalyzer` and a request-local
+//! definition lookup, so they stay on this side of the crate line.
 
 #[cfg(test)]
 mod tests {
     use crate::analyzer::{
-        AnalyzerDefinitionLookup, IAnalyzer, Language, ProjectFile, TestProject, TypescriptAnalyzer,
+        AnalyzerDefinitionLookup, Language, ProjectFile, TestProject, TypescriptAnalyzer,
     };
     use brokk_bifrost_core::analyzer::usages::receiver_analysis::DEFAULT_RECEIVER_MAX_TARGETS;
     use brokk_bifrost_core::analyzer::usages::receiver_analysis::{
@@ -65,7 +65,7 @@ export function caller() {
 "#;
         let (_temp, file, analyzer) = test_project(source);
         let tree = parse(source);
-        let definitions = analyzer.global_usage_definition_index();
+        let definitions = AnalyzerDefinitionLookup::new(&analyzer, Language::TypeScript);
         let provider = JsTsReceiverFactProvider::new(
             &analyzer,
             &definitions,
@@ -117,7 +117,7 @@ export function second() {
 "#;
         let (_temp, file, analyzer) = test_project(source);
         let tree = parse(source);
-        let definitions = analyzer.global_usage_definition_index();
+        let definitions = AnalyzerDefinitionLookup::new(&analyzer, Language::TypeScript);
         let provider = JsTsReceiverFactProvider::new(
             &analyzer,
             &definitions,
@@ -166,7 +166,7 @@ export function caller(which: number) {
 "#;
         let (_temp, file, analyzer) = test_project(source);
         let tree = parse(source);
-        let definitions = analyzer.global_usage_definition_index();
+        let definitions = AnalyzerDefinitionLookup::new(&analyzer, Language::TypeScript);
         let provider = JsTsReceiverFactProvider::new(
             &analyzer,
             &definitions,

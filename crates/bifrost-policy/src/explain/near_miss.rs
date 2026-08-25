@@ -93,12 +93,10 @@ use std::ops::Range;
 use serde::Serialize;
 
 use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
-use brokk_bifrost_analysis::analyzer::structural::search::{
+use brokk_bifrost_rql::structural::search::{
     execute_code_query_detailed_eager_index, execute_code_query_detailed_eager_index_workspace,
 };
-use brokk_bifrost_analysis::analyzer::structural::{
-    CodeQuery, CodeQueryCompletion, CodeQueryResultDetail,
-};
+use brokk_bifrost_rql::structural::{CodeQuery, CodeQueryCompletion, CodeQueryResultDetail};
 use brokk_bifrost_rql::{CodeQueryPlanSource, CodeQuerySeed, Pattern};
 
 use crate::budget::PolicyBudget;
@@ -1018,12 +1016,7 @@ fn execute_rung(
     let mut rows: HashMap<String, Vec<Option<Range<usize>>>> = HashMap::new();
     let mut ordered = Vec::new();
     for evidence in &executed.evidence {
-        let Some(path) = evidence
-            .file
-            .rel_path()
-            .to_str()
-            .and_then(|path| WorkspaceRelativePath::new(path).ok())
-        else {
+        let Ok(path) = WorkspaceRelativePath::try_from_path(evidence.file.rel_path()) else {
             continue;
         };
         rows.entry(path.as_str().to_string())

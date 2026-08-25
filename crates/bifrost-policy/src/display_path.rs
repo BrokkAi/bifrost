@@ -4,8 +4,8 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use brokk_bifrost_analysis::analyzer::WorkspaceAnalyzer;
-use brokk_bifrost_analysis::analyzer::dataflow::{SummaryWitness, SummaryWitnessStepKind};
 use brokk_bifrost_analysis::analyzer::semantic::{IcfgEdgeKind, SemanticLocator};
+use brokk_bifrost_flow::dataflow::{SummaryWitness, SummaryWitnessStepKind};
 use serde::Serialize;
 
 use crate::finding::PolicySourceLocation;

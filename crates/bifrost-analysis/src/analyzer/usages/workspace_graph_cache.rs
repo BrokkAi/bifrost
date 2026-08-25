@@ -4,7 +4,14 @@ use super::workspace_graph::{UsageEcosystem, WorkspaceUsageRankingGraph};
 use crate::analyzer::complete_value_cache::{
     CompleteValueAcquisition, CompleteValueCache, CompleteValueWait,
 };
+use crate::analyzer::content_identity::WorkspaceContentIdentity;
+use crate::analyzer::invalidation::{
+    ArtifactVerdict, ArtifactVerdictLog, DerivedArtifactId, DerivedArtifactKind,
+    InvalidationReason, RetentionReason,
+};
+use crate::analyzer::semantic::ids::StableDigest;
 use crate::cancellation::CancellationToken;
+use brokk_bifrost_core::analyzer::canonical_hash::CanonicalHasher;
 use std::sync::Arc;
 
 const USAGE_GRAPH_REPRESENTATION_VERSION: u32 = 1;
@@ -16,40 +23,66 @@ pub(crate) enum WorkspaceUsageGraphKind {
     Exact,
 }
 
+/// The identity of one complete usage-ranking graph.
+///
+/// `ecosystems` names what the graph spans and `workspace_content` is the
+/// content identity of exactly the languages in those ecosystems (#2449). The
+/// pairing is the point: a JVM graph is keyed by JVM content, so editing a
+/// Python file cannot retire it. Before this the last field was the process's
+/// whole source-generation vector, which moved for every language at once.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct WorkspaceUsageGraphCacheKey {
     representation_version: u32,
     kind: WorkspaceUsageGraphKind,
     ecosystems: Box<[UsageEcosystem]>,
-    source_generations: Box<[u64]>,
+    workspace_content: WorkspaceContentIdentity,
 }
 
 impl WorkspaceUsageGraphCacheKey {
+    const ARTIFACT_DOMAIN: &[u8] = b"bifrost-workspace-usage-graph-key:v1";
+
     pub(crate) fn new(
         kind: WorkspaceUsageGraphKind,
         ecosystems: impl IntoIterator<Item = UsageEcosystem>,
-        source_generations: Box<[u64]>,
+        workspace_content: WorkspaceContentIdentity,
     ) -> Self {
         Self {
             representation_version: USAGE_GRAPH_REPRESENTATION_VERSION,
             kind,
             ecosystems: ecosystems.into_iter().collect(),
-            source_generations,
+            workspace_content,
         }
     }
 
+    fn artifact(&self) -> DerivedArtifactId {
+        let mut hasher = CanonicalHasher::new(Self::ARTIFACT_DOMAIN);
+        hasher.field(
+            "representation_version",
+            &self.representation_version.to_be_bytes(),
+        );
+        hasher.field(
+            "kind",
+            match self.kind {
+                WorkspaceUsageGraphKind::File => b"file".as_slice(),
+                WorkspaceUsageGraphKind::Exact => b"exact".as_slice(),
+            },
+        );
+        hasher.sequence("ecosystems", &self.ecosystems, |hasher, ecosystem| {
+            hasher.value(ecosystem.as_str().as_bytes());
+        });
+        hasher.field("content", self.workspace_content.digest().as_bytes());
+        DerivedArtifactId::new(
+            DerivedArtifactKind::WorkspaceUsageGraph,
+            StableDigest::from_array(hasher.finish()),
+        )
+    }
+
     fn retained_bytes(&self) -> usize {
-        std::mem::size_of::<Self>()
-            .saturating_add(
-                self.ecosystems
-                    .len()
-                    .saturating_mul(std::mem::size_of::<UsageEcosystem>()),
-            )
-            .saturating_add(
-                self.source_generations
-                    .len()
-                    .saturating_mul(std::mem::size_of::<u64>()),
-            )
+        std::mem::size_of::<Self>().saturating_add(
+            self.ecosystems
+                .len()
+                .saturating_mul(std::mem::size_of::<UsageEcosystem>()),
+        )
     }
 }
 
@@ -75,9 +108,15 @@ pub(crate) enum WorkspaceUsageGraphCacheAcquisition {
     Stale,
 }
 
+/// Snapshot-owned complete usage graphs, keyed by the content they were built
+/// from.
+///
+/// The cache survives an analyzer update: an update carries it forward and an
+/// ecosystem whose content did not move still answers from it.
 pub(crate) struct SnapshotWorkspaceUsageGraphCache {
     max_retained_bytes: u64,
     values: CompleteValueCache<WorkspaceUsageGraphCacheKey, WorkspaceUsageRankingGraph>,
+    verdicts: ArtifactVerdictLog,
 }
 
 impl SnapshotWorkspaceUsageGraphCache {
@@ -92,7 +131,31 @@ impl SnapshotWorkspaceUsageGraphCache {
                         .min(u32::MAX as usize) as u32
                 },
             ),
+            verdicts: ArtifactVerdictLog::default(),
         }
+    }
+
+    pub(crate) fn verdicts(&self) -> &ArtifactVerdictLog {
+        &self.verdicts
+    }
+
+    /// Record that a caller could not state a content identity for the
+    /// ecosystems it needs, so this cache was not consulted at all.
+    pub(crate) fn record_missing_content_identity(
+        &self,
+        kind: WorkspaceUsageGraphKind,
+        ecosystems: impl IntoIterator<Item = UsageEcosystem>,
+    ) {
+        let key = WorkspaceUsageGraphCacheKey::new(
+            kind,
+            ecosystems,
+            WorkspaceContentIdentity::unattested(),
+        );
+        self.verdicts.record(ArtifactVerdict::Invalidated(
+            InvalidationReason::ContentIdentityEvidenceMissing {
+                artifact: key.artifact(),
+            },
+        ));
     }
 
     pub(crate) fn acquire(
@@ -100,12 +163,17 @@ impl SnapshotWorkspaceUsageGraphCache {
         key: WorkspaceUsageGraphCacheKey,
         cancellation: &CancellationToken,
         build: impl FnOnce() -> WorkspaceUsageGraphCacheBuildOutcome,
-        generation_is_current: impl Fn() -> bool,
+        content_is_current: impl Fn() -> bool,
     ) -> WorkspaceUsageGraphCacheAcquisition {
         let (acquisition, wait) = self.values.acquire(&key, cancellation);
         match acquisition {
             CompleteValueAcquisition::Cached { value } => {
-                if generation_is_current() {
+                if content_is_current() {
+                    self.verdicts.record(ArtifactVerdict::Retained(
+                        RetentionReason::InputsUnchanged {
+                            artifact: key.artifact(),
+                        },
+                    ));
                     WorkspaceUsageGraphCacheAcquisition::Ready {
                         graph: value,
                         lifecycle: WorkspaceUsageGraphCacheLifecycle::Hit,
@@ -115,38 +183,45 @@ impl SnapshotWorkspaceUsageGraphCache {
                     WorkspaceUsageGraphCacheAcquisition::Stale
                 }
             }
-            CompleteValueAcquisition::Leader { permit } => match build() {
-                WorkspaceUsageGraphCacheBuildOutcome::Complete(graph) => {
-                    if cancellation.is_cancelled() {
-                        return WorkspaceUsageGraphCacheAcquisition::Cancelled;
-                    }
-                    if !generation_is_current() {
-                        return WorkspaceUsageGraphCacheAcquisition::Stale;
-                    }
-                    let retained_bytes =
-                        key.retained_bytes().saturating_add(graph.retained_bytes());
-                    let graph = Arc::new(graph);
-                    if retained_bytes as u64 > self.max_retained_bytes {
-                        return WorkspaceUsageGraphCacheAcquisition::Ready {
+            CompleteValueAcquisition::Leader { permit } => {
+                self.verdicts.record(ArtifactVerdict::Invalidated(
+                    InvalidationReason::NoRetainedArtifact {
+                        artifact: key.artifact(),
+                    },
+                ));
+                match build() {
+                    WorkspaceUsageGraphCacheBuildOutcome::Complete(graph) => {
+                        if cancellation.is_cancelled() {
+                            return WorkspaceUsageGraphCacheAcquisition::Cancelled;
+                        }
+                        if !content_is_current() {
+                            return WorkspaceUsageGraphCacheAcquisition::Stale;
+                        }
+                        let retained_bytes =
+                            key.retained_bytes().saturating_add(graph.retained_bytes());
+                        let graph = Arc::new(graph);
+                        if retained_bytes as u64 > self.max_retained_bytes {
+                            return WorkspaceUsageGraphCacheAcquisition::Ready {
+                                graph,
+                                lifecycle: WorkspaceUsageGraphCacheLifecycle::UncachedOverBudget,
+                                wait,
+                            };
+                        }
+                        permit.publish_complete(Arc::clone(&graph));
+                        if !content_is_current() {
+                            return WorkspaceUsageGraphCacheAcquisition::Stale;
+                        }
+                        WorkspaceUsageGraphCacheAcquisition::Ready {
                             graph,
-                            lifecycle: WorkspaceUsageGraphCacheLifecycle::UncachedOverBudget,
+                            lifecycle: WorkspaceUsageGraphCacheLifecycle::Built,
                             wait,
-                        };
+                        }
                     }
-                    permit.publish_complete(Arc::clone(&graph));
-                    if !generation_is_current() {
-                        return WorkspaceUsageGraphCacheAcquisition::Stale;
-                    }
-                    WorkspaceUsageGraphCacheAcquisition::Ready {
-                        graph,
-                        lifecycle: WorkspaceUsageGraphCacheLifecycle::Built,
-                        wait,
+                    WorkspaceUsageGraphCacheBuildOutcome::Cancelled => {
+                        WorkspaceUsageGraphCacheAcquisition::Cancelled
                     }
                 }
-                WorkspaceUsageGraphCacheBuildOutcome::Cancelled => {
-                    WorkspaceUsageGraphCacheAcquisition::Cancelled
-                }
-            },
+            }
             CompleteValueAcquisition::Cancelled => WorkspaceUsageGraphCacheAcquisition::Cancelled,
             CompleteValueAcquisition::Rejected => WorkspaceUsageGraphCacheAcquisition::Stale,
         }
@@ -180,14 +255,18 @@ mod tests {
     use std::time::Duration;
 
     fn key_with_kind(
-        generation: u64,
+        content_seed: u64,
         kind: WorkspaceUsageGraphKind,
     ) -> WorkspaceUsageGraphCacheKey {
-        WorkspaceUsageGraphCacheKey::new(kind, [UsageEcosystem::Rust], Box::new([generation]))
+        WorkspaceUsageGraphCacheKey::new(
+            kind,
+            [UsageEcosystem::Rust],
+            WorkspaceContentIdentity::for_test(content_seed),
+        )
     }
 
-    fn key(generation: u64) -> WorkspaceUsageGraphCacheKey {
-        key_with_kind(generation, WorkspaceUsageGraphKind::Exact)
+    fn key(content_seed: u64) -> WorkspaceUsageGraphCacheKey {
+        key_with_kind(content_seed, WorkspaceUsageGraphKind::Exact)
     }
 
     fn empty_graph() -> WorkspaceUsageRankingGraph {
@@ -270,14 +349,14 @@ mod tests {
     }
 
     #[test]
-    fn issue_1304_source_generation_is_part_of_usage_graph_identity() {
+    fn issue_1304_workspace_content_is_part_of_usage_graph_identity() {
         let cache = SnapshotWorkspaceUsageGraphCache::default();
         let cancellation = CancellationToken::default();
         let builds = AtomicUsize::new(0);
 
-        for generation in [1, 2] {
+        for content_seed in [1, 2] {
             let (_, lifecycle) = ready_graph(cache.acquire(
-                key(generation),
+                key(content_seed),
                 &cancellation,
                 || {
                     builds.fetch_add(1, Ordering::SeqCst);
@@ -314,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn issue_1304_generation_change_during_build_prevents_publication() {
+    fn issue_1304_content_change_during_build_prevents_publication() {
         let cache = SnapshotWorkspaceUsageGraphCache::default();
         let cancellation = CancellationToken::default();
 

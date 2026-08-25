@@ -13,7 +13,8 @@ use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 
 use crate::analyzer::usages::common::{classify_recursive_hits, language_for_target};
 use crate::analyzer::usages::inverted_edges::{
-    UsageEdgeBuildOutput, UsageEdgeWeights, UsageEdges, build_edge_output, parse_and_collect,
+    EdgeNodeDomain, UsageEdgeBuildOutput, UsageEdgeWeights, UsageEdges, build_edge_output,
+    parse_and_collect_with_domain,
 };
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{
@@ -21,8 +22,7 @@ use crate::analyzer::usages::outcome::{
 };
 use crate::analyzer::usages::traits::{UsageAnalyzer, UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{
-    BoundedDefinitionLookup, CodeUnit, IAnalyzer, Language, ProjectFile, PythonAnalyzer,
-    resolve_analyzer,
+    CodeUnit, IAnalyzer, Language, ProjectFile, PythonAnalyzer, resolve_analyzer,
 };
 use crate::hash::HashSet;
 use brokk_bifrost_python::graph::PythonGraphSource;
@@ -41,25 +41,33 @@ pub(in crate::analyzer::usages) use brokk_bifrost_python::graph::resolver::resol
 /// Run `visit` with the [`PythonGraphSource`] built from the *dispatching*
 /// analyzer.
 ///
-/// A callback rather than a constructor because the definition-index accessor is
-/// itself a borrowed closure: `analyzer.global_usage_definition_index()` returns
-/// a handle that borrows the analyzer, and the Python side takes it lazily so a
-/// scan that never reaches the receiver-type fallback never pays for the build.
 pub(in crate::analyzer::usages) fn with_python_graph_source<R>(
     analyzer: &dyn IAnalyzer,
-    visit: impl FnOnce(PythonGraphSource<'_>) -> R,
+    mut visit: impl FnMut(PythonGraphSource<'_>) -> R,
 ) -> R {
-    let definitions = |consume: &mut dyn FnMut(&dyn BoundedDefinitionLookup)| {
-        consume(&analyzer.global_usage_definition_index());
-    };
     let scope = AnalyzerQueryScope::new(analyzer);
-    visit(PythonGraphSource {
-        token: scope.token(),
-        index: analyzer,
-        hierarchy: analyzer.type_hierarchy_provider(),
-        imports: analyzer.import_analysis_provider(),
-        definitions: &definitions,
-    })
+    let cancellation = crate::CancellationToken::new();
+    match crate::analyzer::relational_frontier::resolve_relational_frontier(
+        analyzer,
+        &cancellation,
+        |frontier| {
+            visit(PythonGraphSource {
+                token: scope.token(),
+                index: analyzer,
+                hierarchy: analyzer.type_hierarchy_provider(),
+                imports: analyzer.import_analysis_provider(),
+                definitions: frontier,
+            })
+        },
+    ) {
+        crate::analyzer::RelationalFrontierOutcome::Complete(result) => result,
+        crate::analyzer::RelationalFrontierOutcome::Cancelled => {
+            unreachable!("an uncancelled Python helper frontier cannot cancel")
+        }
+        crate::analyzer::RelationalFrontierOutcome::Failed(error) => {
+            panic!("Python relational helper frontier failed: {error:?}")
+        }
+    }
 }
 
 /// The whole-workspace inverted pass: the shared driver's parallel fan-out plus
@@ -71,8 +79,8 @@ pub(in crate::analyzer::usages) fn with_python_graph_source<R>(
 fn build_python_edges<Output, F>(
     analyzer: &dyn IAnalyzer,
     py: &PythonAnalyzer,
-    nodes: &HashSet<String>,
-    targets: &HashSet<String>,
+    domain: EdgeNodeDomain<'_>,
+    targets: Option<&HashSet<String>>,
     keep_file: F,
 ) -> Output
 where
@@ -81,26 +89,48 @@ where
 {
     let files: Vec<ProjectFile> = py.get_analyzed_files().into_iter().collect();
     let language = tree_sitter_python::LANGUAGE.into();
-    let scan = PythonEdgeScan::new(nodes, targets);
-    with_python_graph_source(analyzer, |graph| {
-        build_edge_output(&files, keep_file, |file| {
-            parse_and_collect(
-                analyzer,
-                file,
-                nodes,
-                ParseSpec::whole(&language),
-                |input| scan.scan_file(&graph, py, file, input),
-            )
-        })
+    let scan = targets.map_or_else(PythonEdgeScan::new_rooted, |targets| {
+        PythonEdgeScan::new(domain.callers(), targets)
+    });
+    let scope = AnalyzerQueryScope::new(analyzer);
+    build_edge_output(&files, keep_file, |file| {
+        parse_and_collect_with_domain(
+            analyzer,
+            file,
+            domain,
+            ParseSpec::whole(&language),
+            |input| {
+                let cancellation = crate::CancellationToken::new();
+                match crate::analyzer::relational_frontier::resolve_relational_frontier(
+                    analyzer,
+                    &cancellation,
+                    |frontier| {
+                        let graph = PythonGraphSource {
+                            token: scope.token(),
+                            index: analyzer,
+                            hierarchy: analyzer.type_hierarchy_provider(),
+                            imports: analyzer.import_analysis_provider(),
+                            definitions: frontier,
+                        };
+                        scan.scan_file(&graph, py, file, input)
+                    },
+                ) {
+                    crate::analyzer::RelationalFrontierOutcome::Complete(edges) => edges,
+                    crate::analyzer::RelationalFrontierOutcome::Cancelled => {
+                        unreachable!("an uncancelled Python edge frontier cannot cancel")
+                    }
+                    crate::analyzer::RelationalFrontierOutcome::Failed(error) => {
+                        panic!("Python relational edge frontier failed: {error:?}")
+                    }
+                }
+            },
+        )
     })
 }
 
-/// Build the whole Python `caller -> callee` edge set in a single inverted pass
-/// (see [`build_python_edges`]). Returns `None` when there are no Python
-/// files. `nodes`/`keep_file` mirror the Go builder.
-pub(crate) fn build_python_usage_edges<F>(
+pub(crate) fn build_rooted_python_usage_edges<F>(
     analyzer: &dyn IAnalyzer,
-    nodes: &HashSet<String>,
+    callers: &HashSet<String>,
     keep_file: F,
 ) -> Option<UsageEdges>
 where
@@ -110,8 +140,8 @@ where
     Some(build_python_edges(
         analyzer,
         resolver.py,
-        nodes,
-        nodes,
+        EdgeNodeDomain::Rooted(callers),
+        None,
         keep_file,
     ))
 }
@@ -131,7 +161,13 @@ pub(crate) fn build_cached_python_usage_edges_for_targets(
     let edges = py.usage_edges_for_targets(nodes, targets, || {
         let resolver = PythonEdgeResolver::try_new(analyzer)
             .expect("resolved Python analyzer must construct a Python edge resolver");
-        build_python_edges(analyzer, resolver.py, nodes, targets, |_| true)
+        build_python_edges(
+            analyzer,
+            resolver.py,
+            EdgeNodeDomain::Closed(nodes),
+            Some(targets),
+            |_| true,
+        )
     });
     Some(edges)
 }
@@ -186,6 +222,9 @@ impl<'a> UsageQueryResolver<'a> for PythonQueryResolver<'a> {
     ) -> GraphUsageOutcome {
         let py = self.py;
         let candidate_files = scan_scope.candidate_files();
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let uncancelled = crate::CancellationToken::new();
+        let cancellation = scan_scope.cancellation().unwrap_or(&uncancelled);
 
         // One reference can name several declarations -- two vendored copies of
         // a package give their modules the same import path, so every item in
@@ -217,17 +256,40 @@ impl<'a> UsageQueryResolver<'a> for PythonQueryResolver<'a> {
                 scan_files.retain(|file| scan_scope.allows(file));
             }
 
-            let scan_result = with_python_graph_source(analyzer, |source| {
-                scan_files_for_seeds(
-                    &source,
-                    py,
-                    &graph,
-                    &scan_files,
-                    target,
-                    &seeds,
-                    scan_scope.cancellation(),
-                )
-            });
+            let scan_result =
+                match crate::analyzer::relational_frontier::resolve_relational_frontier(
+                    analyzer,
+                    cancellation,
+                    |frontier| {
+                        let source = PythonGraphSource {
+                            token: scope.token(),
+                            index: analyzer,
+                            hierarchy: analyzer.type_hierarchy_provider(),
+                            imports: analyzer.import_analysis_provider(),
+                            definitions: frontier,
+                        };
+                        scan_files_for_seeds(
+                            &source,
+                            py,
+                            &graph,
+                            &scan_files,
+                            target,
+                            &seeds,
+                            scan_scope.cancellation(),
+                        )
+                    },
+                ) {
+                    crate::analyzer::RelationalFrontierOutcome::Complete(result) => result,
+                    crate::analyzer::RelationalFrontierOutcome::Cancelled => {
+                        return Ok(CandidateUsageHits::default());
+                    }
+                    crate::analyzer::RelationalFrontierOutcome::Failed(_) => {
+                        return Err(GraphFailureReason::UnsupportedTargetShape(
+                            "the relational Python scan frontier failed",
+                        )
+                        .diagnostic(target.fq_name(), PYTHON_STRATEGY));
+                    }
+                };
             // A proven hit inside the target itself is a recursive call (#1638):
             // kept, classified `SelfReceiver`. The unproven channel still drops
             // them -- an unproven recursive call is not evidence of anything.
@@ -270,7 +332,13 @@ impl<'a> PythonEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        build_python_edges(analyzer, self.py, nodes, nodes, keep_file)
+        build_python_edges(
+            analyzer,
+            self.py,
+            EdgeNodeDomain::Closed(nodes),
+            Some(nodes),
+            keep_file,
+        )
     }
 }
 

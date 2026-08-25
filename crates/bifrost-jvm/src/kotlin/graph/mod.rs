@@ -14,38 +14,82 @@ pub mod resolver;
 use brokk_bifrost_core::analyzer::capabilities::{
     ImportAnalysisProvider, TypeAliasProvider, TypeHierarchyProvider,
 };
+use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::{
-    BoundedDefinitionLookup, CodeUnitIndex, DefinitionLookupAccess,
+    CodeUnit, CodeUnitIndex, DefinitionLanguageScope, RelationalDefinitionFrontier,
+    RelationalDefinitionQuery, RelationalDefinitionQuestion, RelationalDefinitionValue,
+    RelationalName,
 };
 
 /// The *dispatching* analyzer's side of a Kotlin usage-graph scan.
 ///
 /// Deliberately not the Kotlin analyzer, for the reason recorded on
 /// `JavaGraphSource`: in a mixed workspace the query is issued against a
-/// `MultiAnalyzer`, whose definition index merges every language's shards and
+/// `MultiAnalyzer`, whose relational frontier spans every language delegate and
 /// whose hierarchy answers cross language boundaries. Kotlin depends on that
 /// reach as much as Java does -- the JVM realm is one candidate space (#1237),
 /// so a Kotlin file naming a Java or Scala class next door resolves only
-/// through the merged index.
+/// through the workspace frontier.
 #[derive(Clone, Copy)]
 pub struct KotlinGraphSource<'a> {
     pub index: &'a dyn CodeUnitIndex,
     pub hierarchy: Option<&'a dyn TypeHierarchyProvider>,
     pub type_alias: Option<&'a dyn TypeAliasProvider>,
     pub imports: Option<&'a dyn ImportAnalysisProvider>,
-    pub definitions: &'a DefinitionLookupAccess<'a>,
+    /// Request-local answers for questions whose owner is already structured.
+    pub relational_definitions: &'a dyn RelationalDefinitionFrontier,
 }
 
 impl KotlinGraphSource<'_> {
-    /// Run `read` against the dispatching analyzer's definition index.
-    pub fn with_definitions<R>(&self, read: impl FnOnce(&dyn BoundedDefinitionLookup) -> R) -> R {
-        let mut read = Some(read);
-        let mut resolved = None;
-        (self.definitions)(&mut |lookup| {
-            if let Some(read) = read.take() {
-                resolved = Some(read(lookup));
-            }
-        });
-        resolved.expect("definition lookup access must invoke its consumer exactly once")
+    pub fn definitions_by_components(&self, components: &[String]) -> Vec<CodeUnit> {
+        let Some(identifier) = components.last() else {
+            return Vec::new();
+        };
+        let mut identifier_name = FqName::new();
+        identifier_name.push(segment_interner().intern(identifier, SegmentKind::Unknown));
+        let question = RelationalDefinitionQuestion {
+            language_scope: DefinitionLanguageScope::Workspace,
+            name: RelationalName::stable(identifier_name),
+            query: RelationalDefinitionQuery::Identifier { file: None },
+        };
+        let RelationalDefinitionValue::Definitions(candidates) =
+            self.relational_definitions.ask(&question)
+        else {
+            panic!("a Kotlin identifier question returned the wrong shape")
+        };
+        let mut expected = FqName::new();
+        for component in components {
+            expected.push(segment_interner().intern(component, SegmentKind::Unknown));
+        }
+        candidates
+            .into_iter()
+            .filter(|unit| unit.fq().same_segment_texts(&expected))
+            .collect()
+    }
+
+    pub fn structural_members(&self, owner: &FqName, identifier: &str) -> Vec<CodeUnit> {
+        let question = RelationalDefinitionQuestion {
+            language_scope: DefinitionLanguageScope::Workspace,
+            name: RelationalName::stable(owner.clone()),
+            query: RelationalDefinitionQuery::StructuralMembers {
+                identifier: identifier.to_string(),
+            },
+        };
+        match self.relational_definitions.ask(&question) {
+            RelationalDefinitionValue::Definitions(units) => units,
+            _ => panic!("a structural-member question returned the wrong shape"),
+        }
+    }
+
+    pub fn structural_children(&self, owner: &FqName) -> Vec<CodeUnit> {
+        let question = RelationalDefinitionQuestion {
+            language_scope: DefinitionLanguageScope::Workspace,
+            name: RelationalName::stable(owner.clone()),
+            query: RelationalDefinitionQuery::StructuralChildren,
+        };
+        match self.relational_definitions.ask(&question) {
+            RelationalDefinitionValue::Definitions(units) => units,
+            _ => panic!("a structural-children question returned the wrong shape"),
+        }
     }
 }

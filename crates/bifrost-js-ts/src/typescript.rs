@@ -23,6 +23,7 @@ use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind};
 use brokk_bifrost_core::analyzer::model::{CodeUnit, SignatureMetadata};
 use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
+use brokk_bifrost_core::analyzer::structural::resolution::DeclaredVisibility;
 use brokk_bifrost_core::hash::HashSet;
 use tree_sitter::{Node, Tree};
 
@@ -387,9 +388,10 @@ fn visit_ts_default_export_function(
     );
     parsed.add_signature_with_metadata(
         code_unit.clone(),
-        SignatureMetadata::with_parameter_labels(
+        ts_callable_signature_metadata(
             ts_default_export_function_signature(function, source),
-            ts_parameter_labels(function, source),
+            function,
+            source,
         ),
     );
     visit_ts_return_surface_members(file, source, function, &code_unit, &code_unit, parsed);
@@ -597,13 +599,10 @@ fn visit_ts_function(
     let signature = ts_function_signature(node, source, exported);
     parsed.add_signature_with_metadata(
         code_unit.clone(),
-        SignatureMetadata::with_parameter_labels(
-            signature,
-            ts_parameter_labels(definition, source),
-        )
-        // An overload signature or ambient declaration has no body and must
-        // never be treated as runnable behavior (#1658, the da26602 shape).
-        .with_declaration_only(definition.kind() == "function_signature"),
+        ts_callable_signature_metadata(signature, definition, source)
+            // An overload signature or ambient declaration has no body and must
+            // never be treated as runnable behavior (#1658, the da26602 shape).
+            .with_declaration_only(definition.kind() == "function_signature"),
     );
     visit_ts_return_surface_members(file, source, definition, &code_unit, &top_level, parsed);
 }
@@ -760,10 +759,7 @@ fn visit_ts_value(
             if let Some(value) = value {
                 parsed.add_signature_with_metadata(
                     code_unit.clone(),
-                    SignatureMetadata::with_parameter_labels(
-                        signature.clone(),
-                        ts_parameter_labels(value, source),
-                    ),
+                    ts_callable_signature_metadata(signature.clone(), value, source),
                 );
                 visit_ts_return_surface_members(
                     file, source, value, &code_unit, &top_level, parsed,
@@ -1422,7 +1418,7 @@ fn visit_ts_method(
     let name = trim_statement(node_text(name_node, source))
         .trim_matches('"')
         .to_string();
-    let member_name = if is_static_ts_member(node, source) {
+    let member_name = if is_static_ts_member(node) {
         format!("{name}$static")
     } else {
         name
@@ -1467,7 +1463,7 @@ fn visit_ts_method(
             .is_some_and(|body| body.kind() == "class_body");
     parsed.add_signature_with_metadata(
         code_unit,
-        SignatureMetadata::with_parameter_labels(signature, ts_parameter_labels(node, source))
+        ts_callable_signature_metadata(signature, node, source)
             .with_declaration_only(declaration_only),
     );
     if member_name == "constructor" {
@@ -1551,7 +1547,7 @@ fn visit_ts_field(
     let name = trim_statement(node_text(name_node, source))
         .trim_matches('"')
         .to_string();
-    let member_name = if is_static_ts_member(node, source) {
+    let member_name = if is_static_ts_member(node) {
         format!("{name}$static")
     } else {
         name
@@ -1808,10 +1804,128 @@ fn is_simple_ts_initializer(node: Node<'_>) -> bool {
     )
 }
 
-fn is_static_ts_member(node: Node<'_>, source: &str) -> bool {
-    let head = node_text(node, source)
-        .split(['{', ';'])
-        .next()
-        .unwrap_or("");
-    head.split_whitespace().any(|token| token == "static")
+/// Whether this class member declares `static`, read from the member's own
+/// syntax nodes.
+///
+/// `static` is an anonymous token of `method_definition`, `method_signature`
+/// and `public_field_definition` in the TypeScript grammar, and the JavaScript
+/// grammar additionally aliases the `static get` compound to one token. Reading
+/// the children answers the question the header text only approximates: the
+/// previous rendered-header scan could see the keyword anywhere before the
+/// first `{` or `;`, including inside a decorator argument or a parameter
+/// default.
+fn is_static_ts_member(node: Node<'_>) -> bool {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .any(|child| matches!(child.kind(), "static" | "static get"))
+}
+
+/// The `(is_static, is_constructor)` pair this callable declares (#2597).
+///
+/// Recording it is what makes a TypeScript declaration keyable for
+/// procedure-summary binding: `receiver_contract_of` refuses to answer for a
+/// callable whose adapter never inspected modifiers.
+///
+/// Only a class-body member can bind a class receiver. A `function_declaration`,
+/// `function_signature`, `arrow_function` or `function_expression` is reached
+/// through its own binding, so nothing has to be bound in receiver position and
+/// it is static in the sense the receiver contract asks about.
+///
+/// An `abstract_method_signature` is never static -- the grammar admits no
+/// `static` token on it -- and is therefore an instance member, which is what
+/// [`is_static_ts_member`] already answers structurally.
+/// The one place TypeScript builds callable signature metadata, so no
+/// declaration path can record parameter labels and forget the modifier facts
+/// that make it keyable (#2597).
+///
+/// Visibility stays `Unknown`, matching the Rust adapter (#2589). The
+/// TypeScript grammar does publish `accessibility_modifier` as its own node,
+/// but nothing on the summary-binding path reads visibility, and recording it
+/// would change the RQL `visibility` property for every TypeScript callable.
+/// That is its own decision, not a side effect of this one.
+fn ts_callable_signature_metadata(
+    signature: String,
+    node: Node<'_>,
+    source: &str,
+) -> SignatureMetadata {
+    let (is_static, is_constructor) = ts_callable_modifiers(node, source);
+    SignatureMetadata::with_parameter_labels(signature, ts_parameter_labels(node, source))
+        .with_callable_modifiers(is_static, is_constructor, DeclaredVisibility::Unknown)
+}
+
+fn ts_callable_modifiers(node: Node<'_>, source: &str) -> (bool, bool) {
+    if !matches!(
+        node.kind(),
+        "method_definition" | "method_signature" | "abstract_method_signature"
+    ) {
+        return (true, false);
+    }
+    let is_static = is_static_ts_member(node);
+    let is_constructor = !is_static
+        && node
+            .child_by_field_name("name")
+            .is_some_and(|name| node_text(name, source).trim_matches('"').trim() == "constructor");
+    (is_static, is_constructor)
+}
+
+#[cfg(test)]
+mod callable_modifier_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    /// The TypeScript half of #2597. `abstract` members and bodiless overload
+    /// signatures are included because the grammar gives them their own node
+    /// kinds, and a walk that only handled `method_definition` would leave them
+    /// unkeyable.
+    #[test]
+    fn callable_metadata_records_typescript_static_and_constructor_structurally() {
+        let source = "export function free(value: string): string { return value; }\n\nexport abstract class Widget {\n    constructor(spec: string) { this.spec = spec; }\n    static build(spec: string): Widget { return null!; }\n    render(target: string): string { return target; }\n    abstract measure(target: string): number;\n}\n\nexport const arrow = (value: string): string => value;\n";
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = ProjectFile::new(
+            temp.path().canonicalize().expect("canonical root"),
+            "widget.ts",
+        );
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .expect("TypeScript parser language");
+        let tree = parser
+            .parse(source, None)
+            .expect("parse TypeScript fixture");
+        let parsed = parse_typescript_file(&file, source, &tree);
+
+        let modifiers = |name: &str| {
+            let metadata = parsed
+                .signature_metadata
+                .iter()
+                .find(|(unit, _)| unit.identifier() == name)
+                .and_then(|(_, metadata)| metadata.first())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing TypeScript callable {name}; recorded {:?}",
+                        parsed
+                            .signature_metadata
+                            .keys()
+                            .map(|unit| unit.identifier().to_owned())
+                            .collect::<Vec<_>>()
+                    )
+                });
+            assert!(
+                metadata.callable_modifiers_recorded(),
+                "{name} must record that the walk read its modifiers"
+            );
+            (
+                metadata.callable_is_static(),
+                metadata.callable_is_constructor(),
+            )
+        };
+
+        assert_eq!(modifiers("free"), (true, false));
+        assert_eq!(modifiers("arrow"), (true, false));
+        // A static member's identity already carries the `$static` suffix.
+        assert_eq!(modifiers("build$static"), (true, false));
+        assert_eq!(modifiers("render"), (false, false));
+        assert_eq!(modifiers("measure"), (false, false));
+        assert_eq!(modifiers("constructor"), (false, true));
+    }
 }

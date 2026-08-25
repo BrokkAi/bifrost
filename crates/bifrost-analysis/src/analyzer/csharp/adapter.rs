@@ -7,10 +7,10 @@
 
 use crate::analyzer::cognitive_complexity;
 use crate::analyzer::tree_sitter_analyzer::lookup_suffix_candidates;
-use crate::analyzer::{CodeUnit, Language, LanguageAdapter, ProjectFile, SignatureMetadata};
+use crate::analyzer::{CodeUnit, FqName, Language, LanguageAdapter, ProjectFile};
 use brokk_bifrost_csharp::adapter::{
-    CSHARP_COGNITIVE_CONFIG, CSHARP_FILE_EXTENSION, csharp_callable_return_type_text,
-    csharp_extract_call_receiver, csharp_nested_owner_short_name_candidates,
+    CSHARP_COGNITIVE_CONFIG, CSHARP_FILE_EXTENSION, csharp_extract_call_receiver,
+    csharp_nested_owner_short_name_candidates,
 };
 use brokk_bifrost_csharp::declarations::parse_csharp_file;
 use brokk_bifrost_csharp::preprocessor::csharp_included_ranges;
@@ -18,13 +18,10 @@ use brokk_bifrost_csharp::queries::CSHARP_QUERY_DIRECTORY;
 use brokk_bifrost_csharp::test_detection::csharp_contains_tests;
 use tree_sitter::Tree;
 
-use super::{
-    csharp_normalize_full_name, csharp_signature_arity, csharp_source_identifier,
-    strip_csharp_generic_arity,
-};
+use super::{csharp_normalize_full_name, csharp_source_identifier, strip_csharp_generic_arity};
 
 #[derive(Debug, Clone, Default)]
-pub(super) struct CSharpAdapter;
+pub(crate) struct CSharpAdapter;
 
 impl LanguageAdapter for CSharpAdapter {
     fn language(&self) -> Language {
@@ -56,6 +53,22 @@ impl LanguageAdapter for CSharpAdapter {
         csharp_normalize_full_name(fq_name)
     }
 
+    fn normalize_fq_name(&self, fq_name: &FqName) -> FqName {
+        brokk_bifrost_csharp::syntax::csharp_normalize_fq_name(fq_name)
+    }
+
+    fn visibility_containers(&self, unit: &CodeUnit) -> Vec<FqName> {
+        let Some(last) = unit.fq().last() else {
+            return Vec::new();
+        };
+        let (_, kind) = crate::analyzer::fq_name::segment_interner().resolve(last);
+        if unit.is_class() && kind == brokk_bifrost_core::analyzer::fq_name::SegmentKind::Nested {
+            vec![unit.package_fq()]
+        } else {
+            Vec::new()
+        }
+    }
+
     fn simple_type_name(&self, unit: &CodeUnit) -> String {
         csharp_source_identifier(unit).to_string()
     }
@@ -83,21 +96,6 @@ impl LanguageAdapter for CSharpAdapter {
         candidates.sort();
         candidates.dedup();
         candidates
-    }
-
-    fn callable_arity(
-        &self,
-        signature: &str,
-        metadata: Option<&SignatureMetadata>,
-    ) -> Option<usize> {
-        metadata
-            .and_then(SignatureMetadata::callable_arity)
-            .map(|arity| arity.total())
-            .or_else(|| Some(csharp_signature_arity(Some(signature))))
-    }
-
-    fn callable_return_type_text<'a>(&self, signature: &'a str) -> Option<&'a str> {
-        csharp_callable_return_type_text(signature)
     }
 
     fn contains_tests(

@@ -22,7 +22,7 @@ use brokk_bifrost_python::bindings::{
     python_direct_scope_bindings_bounded,
 };
 
-const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v8";
+const ADAPTER_VERSION: &[u8] = b"python-value-semantics-v9";
 
 impl_program_semantics_provider!(PythonAnalyzer, PythonSemanticLowerer);
 
@@ -145,6 +145,10 @@ fn python_capabilities() -> SemanticCapabilities {
     ] {
         builder = builder.partial(capability);
     }
+    // Explicitly unsupported: this adapter normalizes no branch conditions, so
+    // an empty `guard_facts` table means "this language publishes no guard
+    // facts" rather than "this procedure has no decision" (#2443).
+    builder = builder.unsupported(SemanticCapability::GuardFacts);
     builder.build()
 }
 
@@ -610,6 +614,11 @@ struct LoweringContext<'tree, 'targets> {
     known_instance_bindings: HashMap<Box<str>, Box<str>>,
     known_instance_fields: HashMap<Box<str>, HashSet<Box<str>>>,
     known_binding_available_after: HashMap<Box<str>, usize>,
+    /// Start byte of the first whole-value consumption of each proven
+    /// allocation root, projected onto every binding that names it. A callee
+    /// that receives the object can rebind its attributes or install a
+    /// descriptor, so only an access that ends before this byte is proven.
+    known_binding_escapes_after: HashMap<Box<str>, usize>,
     proven_instance_fields: HashMap<Box<str>, HashSet<Box<str>>>,
     catch_binders: HashMap<ProgramPointId, ValueId>,
     parameters: HashMap<Box<str>, ValueId>,
@@ -667,6 +676,7 @@ fn lower_procedure<'tree, 'targets>(
         known_instance_bindings: HashMap::default(),
         known_instance_fields: HashMap::default(),
         known_binding_available_after: HashMap::default(),
+        known_binding_escapes_after: HashMap::default(),
         proven_instance_fields: HashMap::default(),
         catch_binders: HashMap::default(),
         parameters: HashMap::default(),
@@ -685,6 +695,7 @@ fn lower_procedure<'tree, 'targets>(
         known_instances,
         known_fields,
         available_after,
+        escapes_after,
     } = heap_binding_proofs(
         spec.callable,
         prepared.source(),
@@ -695,6 +706,7 @@ fn lower_procedure<'tree, 'targets>(
     context.known_instance_bindings = known_instances;
     context.known_instance_fields = known_fields;
     context.known_binding_available_after = available_after;
+    context.known_binding_escapes_after = escapes_after;
     context.proven_instance_fields = proven_instance_fields;
     context.emit_procedure_inputs(&mut builder, spec)?;
     context.emit_local_bindings(&mut builder)?;
@@ -795,6 +807,22 @@ struct HeapBindingProofs {
     known_instances: HashMap<Box<str>, Box<str>>,
     known_fields: HashMap<Box<str>, HashSet<Box<str>>>,
     available_after: HashMap<Box<str>, usize>,
+    escapes_after: HashMap<Box<str>, usize>,
+}
+
+/// What one occurrence of a candidate allocation does to its proof.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HeapOccurrence {
+    /// A declaration, a direct alias, a matching attribute or index base, or a
+    /// direct raise: the allocation stays fully proven.
+    Structured,
+    /// A whole value handed to a call. It names no attribute and no element,
+    /// so the members that were already written keep their identity, but the
+    /// callee holds the object from here on and can rebind an attribute or
+    /// install a descriptor, so later accesses are no longer proven.
+    Escapes,
+    /// Anything else: the allocation root is not proven at all.
+    Unproven,
 }
 
 #[derive(Clone)]
@@ -900,9 +928,14 @@ fn heap_binding_proofs<'tree>(
 
     // A local allocation remains proof-safe only while every occurrence is a
     // declaration, a direct alias, or the matching field/index base. Any
-    // unknown use, rebind, escape, dynamic index, or nested capture invalidates
-    // the complete allocation root. This is intentionally conservative: a
-    // unique constructor/list assignment alone is not a type or alias proof.
+    // unknown use, rebind, dynamic index, or nested capture invalidates the
+    // complete allocation root. This is intentionally conservative: a unique
+    // constructor/list assignment alone is not a type or alias proof.
+    //
+    // A plain whole-value call argument is the exception, and it is not a
+    // weakening: it names no attribute and no element, so it cannot retract
+    // the identity of an access that already ran, and it records an escape
+    // byte that bounds the accesses that follow it instead.
     let candidate_names: HashSet<Box<str>> = candidates.keys().cloned().collect();
     let candidate_classes: HashMap<Box<str>, Option<Box<str>>> = candidates
         .iter()
@@ -919,6 +952,7 @@ fn heap_binding_proofs<'tree>(
         direct_field_ends: &direct_field_ends,
     };
     let mut invalid_roots: HashSet<Box<str>> = HashSet::default();
+    let mut root_escapes: HashMap<Box<str>, usize> = HashMap::default();
     let mut occurrences = vec![body];
     while let Some(node) = occurrences.pop() {
         if node != body && is_nested_execution_boundary(node) {
@@ -928,9 +962,19 @@ fn heap_binding_proofs<'tree>(
         if node.kind() == "identifier"
             && let Some(name) = node_text(source, node)
             && let Some(candidate) = candidates.get(name)
-            && !heap_occurrence_is_allowed(node, &occurrence_context)
         {
-            invalid_roots.insert(candidate.root.clone());
+            match classify_heap_occurrence(node, &occurrence_context) {
+                HeapOccurrence::Structured => {}
+                HeapOccurrence::Escapes => {
+                    let escape = root_escapes
+                        .entry(candidate.root.clone())
+                        .or_insert(node.start_byte());
+                    *escape = (*escape).min(node.start_byte());
+                }
+                HeapOccurrence::Unproven => {
+                    invalid_roots.insert(candidate.root.clone());
+                }
+            }
         }
         occurrences.extend(named_children(node));
     }
@@ -960,9 +1004,13 @@ fn heap_binding_proofs<'tree>(
     let mut known_instances = HashMap::default();
     let mut known_fields = HashMap::default();
     let mut available_after = HashMap::default();
+    let mut escapes_after = HashMap::default();
     for (name, candidate) in candidates {
         if invalid_roots.contains(&candidate.root) {
             continue;
+        }
+        if let Some(escape) = root_escapes.get(&candidate.root).copied() {
+            escapes_after.insert(name.clone(), escape);
         }
         if candidate.class_name.is_none() {
             known_lists.insert(name.clone());
@@ -986,6 +1034,7 @@ fn heap_binding_proofs<'tree>(
         known_instances,
         known_fields,
         available_after,
+        escapes_after,
     }
 }
 
@@ -1121,10 +1170,20 @@ fn is_nested_execution_boundary(node: Node<'_>) -> bool {
     )
 }
 
-fn heap_occurrence_is_allowed<'tree, 'source>(
+/// Classify one identifier occurrence of a candidate allocation.
+///
+/// A whole-value call argument is the one occurrence that is neither fully
+/// structured nor unproven. It reads the object as a whole and names no
+/// member, so it must not retract the member identity of the accesses that
+/// already ran; it does hand the object to a callee, so it bounds the accesses
+/// that come after it. Requiring it to be a top-level use of the body is what
+/// makes "after" mean execution order: every access this adapter proves is
+/// itself top-level or directly dominated, so no repetition construct can put
+/// a proven access between the argument and its own next run.
+fn classify_heap_occurrence<'tree, 'source>(
     node: Node<'tree>,
     context: &HeapOccurrenceContext<'tree, 'source>,
-) -> bool {
+) -> HeapOccurrence {
     let body = context.body;
     let source = context.source;
     let assignments = context.assignments;
@@ -1133,19 +1192,21 @@ fn heap_occurrence_is_allowed<'tree, 'source>(
     let proven_instance_fields = context.proven_instance_fields;
     let direct_field_ends = context.direct_field_ends;
     let Some(name) = node_text(source, node) else {
-        return false;
+        return HeapOccurrence::Unproven;
     };
     let Some(parent) = node.parent() else {
-        return false;
+        return HeapOccurrence::Unproven;
     };
     if parent.kind() == "assignment"
         && parent
             .child_by_field_name("left")
             .is_some_and(|left| left.id() == node.id())
     {
-        return assignments
-            .get(name)
-            .is_some_and(|values| values.len() == 1 && values[0].1 == parent.end_byte());
+        return structured_when(
+            assignments
+                .get(name)
+                .is_some_and(|values| values.len() == 1 && values[0].1 == parent.end_byte()),
+        );
     }
     if parent.kind() == "assignment"
         && parent
@@ -1153,18 +1214,20 @@ fn heap_occurrence_is_allowed<'tree, 'source>(
             .is_some_and(|right| right.id() == node.id())
     {
         let Some(target) = parent.child_by_field_name("left") else {
-            return false;
+            return HeapOccurrence::Unproven;
         };
         let Some(target_name) = (target.kind() == "identifier")
             .then(|| node_text(source, target))
             .flatten()
         else {
-            return false;
+            return HeapOccurrence::Unproven;
         };
-        return assignments
-            .get(target_name)
-            .is_some_and(|values| values.len() == 1 && values[0].1 == parent.end_byte())
-            && candidate_names.contains(target_name);
+        return structured_when(
+            assignments
+                .get(target_name)
+                .is_some_and(|values| values.len() == 1 && values[0].1 == parent.end_byte())
+                && candidate_names.contains(target_name),
+        );
     }
     if parent.kind() == "attribute"
         && parent
@@ -1172,13 +1235,13 @@ fn heap_occurrence_is_allowed<'tree, 'source>(
             .is_some_and(|object| object.id() == node.id())
     {
         let Some(Some(class_name)) = candidate_classes.get(name) else {
-            return false;
+            return HeapOccurrence::Unproven;
         };
         let Some(attribute) = parent.child_by_field_name("attribute") else {
-            return false;
+            return HeapOccurrence::Unproven;
         };
         let Some(attribute_name) = node_text(source, attribute) else {
-            return false;
+            return HeapOccurrence::Unproven;
         };
         let class_field_proven = proven_instance_fields
             .get(class_name)
@@ -1188,23 +1251,23 @@ fn heap_occurrence_is_allowed<'tree, 'source>(
             .and_then(|fields| fields.get(attribute_name))
             .copied();
         if !class_field_proven && direct_field_end.is_none() {
-            return false;
+            return HeapOccurrence::Unproven;
         }
         if direct_field_end.is_some() {
             if !is_direct_dominated_heap_assignment(parent.parent().unwrap_or(parent), body)
                 && !is_dominated_heap_use(node, body)
             {
-                return false;
+                return HeapOccurrence::Unproven;
             }
         } else if !is_top_level_heap_use(node, body) {
-            return false;
+            return HeapOccurrence::Unproven;
         }
-        return !parent.parent().is_some_and(|grandparent| {
+        return structured_when(!parent.parent().is_some_and(|grandparent| {
             grandparent.kind() == "call"
                 && grandparent
                     .child_by_field_name("function")
                     .is_some_and(|function| function.id() == parent.id())
-        });
+        }));
     }
     if parent.kind() == "raise_statement"
         && runtime_expression_children(parent)
@@ -1216,9 +1279,9 @@ fn heap_occurrence_is_allowed<'tree, 'source>(
             .get(name)
             .is_some_and(|fields| fields.values().any(|end| *end >= parent.start_byte()))
         {
-            return false;
+            return HeapOccurrence::Unproven;
         }
-        return is_dominated_heap_use(node, body);
+        return structured_when(is_dominated_heap_use(node, body));
     }
     if parent.kind() == "subscript"
         && parent
@@ -1228,13 +1291,36 @@ fn heap_occurrence_is_allowed<'tree, 'source>(
         if candidate_classes.get(name).is_none_or(Option::is_some)
             || !is_top_level_heap_use(node, body)
         {
-            return false;
+            return HeapOccurrence::Unproven;
         }
-        return parent
-            .child_by_field_name("subscript")
-            .is_some_and(|index| is_structural_constant_index(source, index).is_some());
+        return structured_when(
+            parent
+                .child_by_field_name("subscript")
+                .is_some_and(|index| is_structural_constant_index(source, index).is_some()),
+        );
     }
-    false
+    // A plain positional argument only. A keyword argument, a `*args` or
+    // `**kwargs` splat, and a comprehension or generator argument all parent
+    // the identifier under another node, so they never reach here and keep
+    // invalidating the root.
+    if parent.kind() == "argument_list"
+        && named_children(parent)
+            .into_iter()
+            .any(|argument| argument.id() == node.id())
+        && parent.parent().is_some_and(|call| call.kind() == "call")
+        && is_top_level_heap_use(node, body)
+    {
+        return HeapOccurrence::Escapes;
+    }
+    HeapOccurrence::Unproven
+}
+
+fn structured_when(structured: bool) -> HeapOccurrence {
+    if structured {
+        HeapOccurrence::Structured
+    } else {
+        HeapOccurrence::Unproven
+    }
 }
 
 fn is_top_level_heap_use(node: Node<'_>, body: Node<'_>) -> bool {
@@ -1761,7 +1847,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .get(object_name)
             .copied()
             .is_some_and(|end| access.start_byte() > end);
+        let before_escape = self
+            .known_binding_escapes_after
+            .get(object_name)
+            .copied()
+            .is_none_or(|escape| access.end_byte() <= escape);
         established_after
+            && before_escape
             && (self
                 .known_instance_fields
                 .get(object_name)
@@ -1787,6 +1879,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 .get(value_name)
                 .copied()
                 .is_some_and(|end| access.start_byte() > end)
+            && self
+                .known_binding_escapes_after
+                .get(value_name)
+                .copied()
+                .is_none_or(|escape| access.end_byte() <= escape)
             && is_structural_constant_index(self.prepared.source(), index).is_some()
     }
 

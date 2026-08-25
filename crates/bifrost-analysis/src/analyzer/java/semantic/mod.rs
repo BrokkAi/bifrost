@@ -164,6 +164,12 @@ fn java_capabilities() -> SemanticCapabilities {
         SemanticCapability::NonLocalControl,
         SemanticCapability::ResourceManagement,
         SemanticCapability::DeferredExecution,
+        // Java is the only adapter that publishes guard facts today (#2443).
+        // `Partial` rather than `Complete` states the exact limit: every
+        // decision the lowerer reaches gets a row, but only constant, null and
+        // constant-equality conditions are normalized and everything else is
+        // recorded `Opaque`.
+        SemanticCapability::GuardFacts,
     ] {
         builder = builder.partial(capability);
     }
@@ -300,13 +306,18 @@ struct LoweringContext<'tree, 'targets> {
     session: ProcedureLoweringSession<'targets>,
     expression_values: HashMap<usize, ValueId>,
     constant_index_values: HashMap<Box<str>, ValueId>,
-    field_declaration_anchors: HashMap<(Box<str>, Box<str>), Option<SourceAnchor>>,
+    field_declaration_anchors:
+        HashMap<(Box<str>, Box<str>), Option<values::FieldDeclarationAnchor>>,
     type_name_roots: HashSet<Box<str>>,
     local_types: HashMap<ValueId, Box<str>>,
     non_null_values: HashSet<ValueId>,
     catch_binders: HashMap<ProgramPointId, ValueId>,
     parameters: HashMap<Box<str>, ValueId>,
     locals: HashMap<Box<str>, Vec<LocalBinding>>,
+    /// The per-procedure, per-field-name "virtual local" carrier #2573's
+    /// implicit-field mechanism mints lazily; see the `values` submodule's
+    /// own `implicit_field_carrier` method for the full doc comment.
+    implicit_field_values: HashMap<Box<str>, ValueId>,
     receiver: Option<ValueId>,
     captured_receiver: Option<ValueId>,
     procedure_targets: &'targets HashMap<usize, NestedProcedureTarget>,

@@ -33,7 +33,6 @@ use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, Language, ProjectFil
 use brokk_bifrost_core::hash::HashMap;
 use brokk_bifrost_core::path_utils::rel_path_string;
 use brokk_bifrost_core::profiling;
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use tree_sitter::{Node, Parser, Tree};
 
@@ -696,30 +695,19 @@ impl CppReconcileCandidates {
     }
 }
 
-/// Read and bucket every callable declaration sharing `member_identifier`.
+/// Bucket an already-retrieved identifier cohort for reconciliation.
 ///
-/// `keep_going` is polled per candidate batch; `None` means the caller's
-/// deadline expired and nothing may be memoized, because a truncated candidate
-/// set is indistinguishable from an identifier with fewer namesakes and every
-/// later reconcile reading it would silently lose definitions (#1908 fix D,
-/// the same contract `visible_type_units_while` carries).
-pub fn cpp_reconcile_candidates(
-    cpp: &dyn CppSource,
-    member_identifier: &str,
+/// The analysis crate's relational executor obtains this cohort in the same
+/// batch as the caller's questions. Keeping retrieval outside this semantic
+/// function prevents the C++ crate from choosing a second, legacy data-access
+/// path while preserving one implementation of the structured owner bucketing.
+pub fn cpp_reconcile_candidates_from_units(
+    candidates: impl IntoIterator<Item = CodeUnit>,
     keep_going: &dyn Fn() -> bool,
 ) -> Option<CppReconcileCandidates> {
-    let candidates: BTreeSet<CodeUnit> = {
-        let _lookup =
-            profiling::scope_with(|| format!("cpp.reconcile.lookup[{member_identifier}]"));
-        cpp.lookup_candidates_by_identifier(member_identifier)
-    };
-    profiling::note_with(|| {
-        format!(
-            "cpp.reconcile.candidates[{member_identifier}] n={}",
-            candidates.len()
-        )
-    });
-
+    let mut candidates = candidates.into_iter().collect::<Vec<_>>();
+    candidates.sort();
+    candidates.dedup();
     let interner = segment_interner();
     let mut by_owner_terminal: HashMap<String, Vec<CodeUnit>> = HashMap::default();
     let mut all = Vec::new();
@@ -814,7 +802,7 @@ pub fn cpp_reconcile_group(
             profiling::scope_with(|| format!("cpp.reconcile.candidate[{}]", unit.fq_name()));
         let role = {
             let _role = profiling::scope("cpp.reconcile.role");
-            cpp_callable_unit_role(cpp, unit)
+            cpp.stored_callable_unit_role(unit)
         };
         if !matches!(
             role,

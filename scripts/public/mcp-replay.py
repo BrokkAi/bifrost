@@ -444,7 +444,7 @@ def scenario_i1504(c):
     """usage_graph most_relevant_files on self-repo taint seeds (issue 1504)."""
     calls = [("most_relevant_files", {
         "seed_file_paths": [
-            "crates/bifrost-analysis/src/analyzer/structural/search/witness_projection.rs",
+            "crates/bifrost-rql/src/structural/search/witness_projection.rs",
             "crates/bifrost-analysis/src/analyzer/policy/taint_policy.rs",
             "tests/suite_bench_policy/taint_policy_adapter.rs",
         ],

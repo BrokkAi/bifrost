@@ -48,27 +48,27 @@ use crate::resolved::{
 use crate::selector_compiler::parameter_names_match;
 use brokk_bifrost_analysis::CancellationToken;
 use brokk_bifrost_analysis::analyzer::common::language_for_file;
-use brokk_bifrost_analysis::analyzer::dataflow::{
-    DataflowRequest, SolverBudget, SolverTermination, SummaryWitnessStepKind,
-    WitnessReconstructionLimits,
-};
 use brokk_bifrost_analysis::analyzer::lexical_definitions::formal_parameter_slots;
 use brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::{
     ProcedureRangeLookupStatus, procedures_for_source_ranges,
 };
 use brokk_bifrost_analysis::analyzer::semantic::{
-    AbstractObject, CallBinding, CallSiteHandle, CallSiteId, CallTransferSet, CandidateCoverage,
-    DispatchOracle, DispatchResult, EvidenceCompleteness, HeapOracle, IcfgExitProfile,
-    IcfgProvider, IcfgSnapshot, IcfgSnapshotLimits, ObservationPhase, OracleCallContext,
-    ProcedureHandle, ProcedurePortHandle, ProcedurePortKind, ProgramPointHandle, ProofStatus,
-    SemanticBudget, SemanticBudgetDimension, SemanticExecutionBudget, SemanticExecutionWork,
-    SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticWork, ValueAtPoint,
-    ValueFlowOracle, ValueHandle, WorkspaceIcfgProvider,
+    AbstractObject, AccessPath, AccessPathAtPoint, AccessPathRoot, AliasQuery, AliasRelation,
+    CallBinding, CallSiteHandle, CallSiteId, CallTransferSet, CandidateCoverage, DispatchOracle,
+    DispatchResult, EvidenceCompleteness, HeapOracle, IcfgExitProfile, IcfgProvider, IcfgSnapshot,
+    IcfgSnapshotLimits, ObservationPhase, OracleCallContext, OracleLimits, ProcedureHandle,
+    ProcedurePortHandle, ProcedurePortKind, ProgramPointHandle, ProofStatus, SemanticBudget,
+    SemanticBudgetDimension, SemanticExecutionBudget, SemanticExecutionWork, SemanticOutcome,
+    SemanticProviderError, SemanticRequest, SemanticWork, ValueAtPoint, ValueFlowOracle,
+    ValueHandle, WorkspaceIcfgProvider,
 };
-use brokk_bifrost_analysis::analyzer::structural::{
-    CodeQueryCompletion, CodeQueryDiagnosticCode, CodeQueryExecutionLimits, CodeQueryExecutionWork,
+use brokk_bifrost_analysis::analyzer::usages::get_definition::parse_tree_for_language;
+use brokk_bifrost_analysis::analyzer::{ProjectFile, Range, WorkspaceAnalyzer};
+use brokk_bifrost_flow::dataflow::{
+    DataflowRequest, SolverBudget, SolverTermination, SummaryWitnessStepKind,
+    WitnessReconstructionLimits,
 };
-use brokk_bifrost_analysis::analyzer::typestate::{
+use brokk_bifrost_flow::typestate::{
     BoundTypestateSubjectSpec, CompiledProtocol, PROTOCOL_SCHEMA_VERSION,
     ProductionSummaryLifecycleCounters, ProductionTypestateExecutionContext,
     ProductionTypestateSummaryRepository, ProtocolAnalysisMode, ProtocolEventKey,
@@ -85,12 +85,13 @@ use brokk_bifrost_analysis::analyzer::typestate::{
     TypestateTerminalBindingId, TypestateTerminalBindingSpec, TypestateUncertainty,
     collect_summary_findings_with_limits, solve_typestate_with_production_summaries,
 };
-use brokk_bifrost_analysis::analyzer::usages::get_definition::parse_tree_for_language;
-use brokk_bifrost_analysis::analyzer::{ProjectFile, Range, WorkspaceAnalyzer};
+use brokk_bifrost_rql::structural::{
+    CodeQueryCompletion, CodeQueryDiagnosticCode, CodeQueryExecutionLimits, CodeQueryExecutionWork,
+};
 
 #[derive(Debug)]
 pub(crate) enum TypestatePolicyCompileError {
-    Protocol(brokk_bifrost_analysis::analyzer::typestate::ProtocolCompileError),
+    Protocol(brokk_bifrost_flow::typestate::ProtocolCompileError),
     MissingWorkspace,
     MissingSelector(String),
     QueryIncomplete {
@@ -102,7 +103,7 @@ pub(crate) enum TypestatePolicyCompileError {
     AmbiguousSemanticSite(String),
     EndpointDominanceUndecidable(String),
     UnsupportedBinding(String),
-    BindingPlan(brokk_bifrost_analysis::analyzer::typestate::TypestateBindingPlanError),
+    BindingPlan(brokk_bifrost_flow::typestate::TypestateBindingPlanError),
 }
 
 pub(crate) struct TypestatePolicyCompileFailure {
@@ -181,6 +182,10 @@ pub(crate) struct CompiledTypestateSubject {
     pub(crate) key: TypestateSubjectKey,
     pub(crate) endpoint: ResolvedEndpointIdentity,
     pub(crate) root: ProcedureHandle,
+    /// The abstract object the key projects, retained so an observation whose
+    /// own object set does not name this subject can still be related to it
+    /// through the heap oracle's alias relation.
+    object: AbstractObject,
 }
 
 #[derive(Debug)]
@@ -308,7 +313,6 @@ impl IcfgProvider for PolicyIcfgProvider<'_> {
 #[derive(Default)]
 pub(crate) struct ProductionTypestatePolicyEvaluator {
     prepared: RefCell<Option<CompiledTypestatePolicy>>,
-    summaries: Arc<ProductionTypestateSummaryRepository>,
 }
 
 impl super::projection::sealed::TypestateAdapter for ProductionTypestatePolicyEvaluator {}
@@ -361,10 +365,11 @@ impl TypestatePolicyEvaluator for ProductionTypestatePolicyEvaluator {
                 "typestate policy evaluation lost its workspace semantic snapshot",
             );
         };
-        let summary_lease = match self.summaries.lease(0) {
-            Ok(summary_lease) => summary_lease,
-            Err(error) => return failed_projection_payload(&error.to_string()),
-        };
+        // The workspace owns one content-keyed summary repository, so a
+        // procedure this evaluator solves is available to the MCP/search path
+        // and the other way around. This evaluator used to construct its own
+        // and lease a hardcoded generation, which shared nothing with anything.
+        let summaries = context.flow_state.typestate_summaries();
         match evaluate_compiled_typestate(
             authority,
             policy,
@@ -373,7 +378,7 @@ impl TypestatePolicyEvaluator for ProductionTypestatePolicyEvaluator {
             context.cancellation,
             budget,
             &compiled,
-            &summary_lease,
+            &summaries,
         ) {
             Ok(payload) => payload,
             Err(error) => failed_projection_payload(&error),
@@ -390,7 +395,7 @@ fn evaluate_compiled_typestate(
     cancellation: Option<&CancellationToken>,
     budget: &PolicyBudget,
     compiled: &CompiledTypestatePolicy,
-    summary_lease: &brokk_bifrost_analysis::analyzer::typestate::ProductionTypestateSummaryLease,
+    summaries: &ProductionTypestateSummaryRepository,
 ) -> Result<TypestateProjectionPayload, String> {
     let mut cache_work = ProductionSummaryLifecycleCounters::default();
     let uncancelled = CancellationToken::default();
@@ -418,7 +423,7 @@ fn evaluate_compiled_typestate(
     for root in &compiled.roots {
         let mut request = DataflowRequest::new(&mut solver_budget, cancellation);
         let production = solve_typestate_with_production_summaries(
-            summary_lease,
+            summaries,
             root,
             &[],
             &icfg_provider,
@@ -759,6 +764,28 @@ fn project_finding(
         .collect::<Vec<_>>();
     acquisitions.sort_unstable();
     acquisitions.dedup();
+    // Every spelling through which this subject was observed. A protocol
+    // subject follows the object, so a reader has to be able to see the other
+    // names the same object was reached under -- the alias a close was written
+    // on is not otherwise anywhere in the report. For a subject with one
+    // spelling this is exactly the acquisition set above and adds nothing.
+    let mut spellings = compiled
+        .bindings
+        .event_bindings()
+        .iter()
+        .filter(|binding| binding.subject() == finding.subject())
+        .map(|binding| binding.site().identity())
+        .chain(
+            compiled
+                .bindings
+                .terminal_bindings()
+                .iter()
+                .filter(|binding| binding.subject() == finding.subject())
+                .map(|binding| binding.site().identity()),
+        )
+        .collect::<Vec<_>>();
+    spellings.sort_unstable();
+    spellings.dedup();
     let subject_locator = acquisitions
         .first()
         .copied()
@@ -815,6 +842,7 @@ fn project_finding(
             workspace,
             finding,
             &acquisitions,
+            &spellings,
             &finding_key,
             &policy.definition().report,
             budget,
@@ -955,7 +983,7 @@ fn terminal_endpoint(
 
 fn policy_state(
     protocol: &CompiledProtocol,
-    state: brokk_bifrost_analysis::analyzer::typestate::ProtocolStateId,
+    state: brokk_bifrost_flow::typestate::ProtocolStateId,
 ) -> Result<PolicyTypestateStateId, String> {
     let key = protocol
         .state_key(state)
@@ -963,10 +991,12 @@ fn policy_state(
     PolicyTypestateStateId::new(key.as_str()).map_err(|error| error.to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn projected_report(
     workspace: &WorkspaceAnalyzer,
     finding: &TypestateFinding,
     acquisitions: &[&brokk_bifrost_analysis::analyzer::semantic::SemanticLocator],
+    spellings: &[&brokk_bifrost_analysis::analyzer::semantic::SemanticLocator],
     finding_key: &str,
     report_options: &PolicyReportOptions,
     budget: &PolicyBudget,
@@ -1059,27 +1089,28 @@ fn projected_report(
     let related_limit = budget
         .max_related_locations_per_finding()
         .min(report_options.origins_per_finding);
-    for acquisition in acquisitions {
-        let location = super::semantic_identity::policy_location(workspace, acquisition)?;
-        if location == primary
-            || related
-                .iter()
-                .any(|retained: &RelatedPolicyLocation| retained.location() == &location)
-        {
-            continue;
+    for (relationship, locators) in [
+        (PolicyLocationRelationship::Source, acquisitions),
+        (PolicyLocationRelationship::Subject, spellings),
+    ] {
+        for locator in locators {
+            let location = super::semantic_identity::policy_location(workspace, locator)?;
+            if location == primary
+                || related
+                    .iter()
+                    .any(|retained: &RelatedPolicyLocation| retained.location() == &location)
+            {
+                continue;
+            }
+            if related.len() >= related_limit {
+                omitted_related_locations = omitted_related_locations.saturating_add(1);
+                continue;
+            }
+            related.push(
+                RelatedPolicyLocation::try_new(relationship, location, Vec::new())
+                    .map_err(|error| error.to_string())?,
+            );
         }
-        if related.len() >= related_limit {
-            omitted_related_locations = omitted_related_locations.saturating_add(1);
-            continue;
-        }
-        related.push(
-            RelatedPolicyLocation::try_new(
-                PolicyLocationRelationship::Source,
-                location,
-                Vec::new(),
-            )
-            .map_err(|error| error.to_string())?,
-        );
     }
     Ok((
         ProjectedFindingReport {
@@ -1368,6 +1399,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
             .map_err(|error| TypestatePolicyCompileError::UnsupportedBinding(error.to_string()))?;
         for subject in reduce_subject_bindings(pending_subjects, &endpoint_precedence)? {
             let key = TypestateSubjectKey::for_object(subject.class.clone(), &subject.object);
+            let object = subject.object.clone();
             subject_specs.push(BoundTypestateSubjectSpec::new(
                 subject.class,
                 subject.object,
@@ -1385,6 +1417,7 @@ impl<'a> TypestatePolicyCompiler<'a> {
                 key,
                 endpoint: subject.endpoint,
                 root: subject.root,
+                object,
             });
         }
 
@@ -1469,6 +1502,23 @@ impl<'a> TypestatePolicyCompiler<'a> {
                         });
                     }
                 }
+                let unnamed = subjects_absent_from(&resolved, &subjects, |subject| {
+                    event.applies_to_subjects.contains(&subject.endpoint)
+                });
+                for aliased in self.alias_bound_subjects(&resolved, &unnamed)? {
+                    let (site, role) = event_site(&resolved, trigger.phase)?;
+                    events.push(PendingEventBinding {
+                        event: event_key.clone(),
+                        policy_event: event.id.clone(),
+                        subject: aliased,
+                        site,
+                        phase: EventObservationPhase::Endpoint(trigger.phase),
+                        order,
+                        role,
+                        quality: may_alias_quality(resolved.multiplicity),
+                        endpoint: endpoint.clone(),
+                    });
+                }
             }
         }
 
@@ -1551,6 +1601,22 @@ impl<'a> TypestatePolicyCompiler<'a> {
                                         endpoint: Some(endpoint.clone()),
                                     });
                                 }
+                            }
+                            let unnamed = subjects_absent_from(&resolved, &subjects, |subject| {
+                                expectation.applies_to_subjects.contains(&subject.endpoint)
+                            });
+                            for aliased in self.alias_bound_subjects(&resolved, &unnamed)? {
+                                let (site, role) = event_site(&resolved, *phase)?;
+                                terminals.push(PendingTerminalBinding {
+                                    expectation: expectation_key.clone(),
+                                    policy_expectation: expectation.id.clone(),
+                                    subject: aliased,
+                                    site,
+                                    phase: TerminalObservationPhase::Endpoint(*phase),
+                                    role,
+                                    quality: may_alias_quality(resolved.multiplicity),
+                                    endpoint: Some(endpoint.clone()),
+                                });
                             }
                         }
                     }
@@ -1908,6 +1974,9 @@ impl<'a> TypestatePolicyCompiler<'a> {
             observation_point,
             role,
             objects,
+            observation: at_point,
+            coverage: result.objects().coverage(),
+            multiplicity,
         })
     }
 
@@ -1971,7 +2040,79 @@ impl<'a> TypestatePolicyCompiler<'a> {
             observation_point: observation.query().point().clone(),
             role: TypestateObjectRole::MatchedValue,
             objects,
+            observation: observation.query().clone(),
+            coverage: observation.objects().coverage(),
+            multiplicity,
         })
+    }
+
+    /// Subjects this observation may act on that its own object set did not
+    /// name, in the order the caller supplied them.
+    ///
+    /// A protocol subject follows the object, not the spelling, so an event on
+    /// a proven alias of the subject has to reach the same subject state. The
+    /// object set `pointees` already produced answers that for every subject it
+    /// names. This answers it for the rest, and only when the object set is
+    /// open: a closed set that does not name the subject has proved the value
+    /// does not denote it, and no further question is worth asking. When the
+    /// set is open the heap oracle's [`AliasRelation`] is the only admissible
+    /// source of the answer -- there is no second alias engine here -- and a
+    /// `MayAlias` answer must bind, because dropping it silently would report
+    /// a clean protocol run for a program the analysis never excluded.
+    ///
+    /// The query is procedure-local by contract ([`AliasQuery`] rejects two
+    /// observations in different procedures), so a subject rooted outside the
+    /// observation's procedure keeps today's behaviour and is skipped.
+    fn alias_bound_subjects(
+        &mut self,
+        resolved: &ResolvedSelection,
+        subjects: &[&CompiledTypestateSubject],
+    ) -> Result<Vec<TypestateSubjectKey>, TypestatePolicyCompileError> {
+        if resolved.coverage.is_exhaustive() || subjects.is_empty() {
+            return Ok(Vec::new());
+        }
+        let limits = *self
+            .selectors
+            .workspace()
+            .semantic_oracle_provider()
+            .limits();
+        let observed = access_path_at_observation(
+            resolved,
+            AccessPathRoot::Value(resolved.observation.value().clone()),
+            limits,
+        )
+        .expect("the observed value is scoped to the observation point's procedure");
+        let mut bound = Vec::new();
+        for subject in subjects {
+            let Some(candidate) =
+                access_path_at_observation(resolved, subject.object.identity().clone(), limits)
+            else {
+                continue;
+            };
+            let query = AliasQuery::new(observed.clone(), candidate)
+                .expect("both alias operands were built at the same observation");
+            let oracle = self.selectors.workspace().semantic_oracle_provider();
+            let outcome = {
+                let mut request = self.selectors.semantic_request();
+                oracle
+                    .alias(&query, &mut request)
+                    .map_err(TypestatePolicyCompileError::SemanticProvider)?
+            };
+            require_uninterrupted_semantic_outcome(&outcome, "subject alias analysis")?;
+            self.selectors
+                .require_execution_budget("subject alias analysis")
+                .map_err(typestate_selector_error)?;
+            let Some(result) = outcome.available_value() else {
+                continue;
+            };
+            match result.answer().value() {
+                AliasRelation::MustAlias | AliasRelation::MayAlias => {
+                    bound.push(subject.key.clone());
+                }
+                AliasRelation::Disjoint => {}
+            }
+        }
+        Ok(bound)
     }
 
     fn resolve_named_argument_index(
@@ -2597,12 +2738,84 @@ struct ResolvedObject {
     quality: TypestateBindingQuality,
 }
 
+/// The applicable subjects this observation's own object set did not name.
+///
+/// These are exactly the subjects the identity match above skipped, so asking
+/// the heap oracle about them adds bindings rather than changing any.
+fn subjects_absent_from<'a>(
+    resolved: &ResolvedSelection,
+    subjects: &'a [CompiledTypestateSubject],
+    applies: impl Fn(&CompiledTypestateSubject) -> bool,
+) -> Vec<&'a CompiledTypestateSubject> {
+    subjects
+        .iter()
+        .filter(|subject| {
+            applies(subject)
+                && !resolved.objects.iter().any(|object| {
+                    subject.key.object()
+                        == TypestateSubjectKey::for_object(
+                            subject.key.class().clone(),
+                            &object.object,
+                        )
+                        .object()
+                })
+        })
+        .collect()
+}
+
+/// One object identity as a whole-object access path at this observation.
+///
+/// `None` means the root belongs to another procedure, or to an artifact this
+/// observation's materialization no longer holds. Neither is an error here: an
+/// alias query relates two paths at one point in one procedure, so a root from
+/// somewhere else is a question this oracle cannot be asked rather than a
+/// question it answered badly. The caller skips that subject, which is the
+/// behaviour it had before alias binding existed.
+fn access_path_at_observation(
+    resolved: &ResolvedSelection,
+    root: AccessPathRoot,
+    limits: OracleLimits,
+) -> Option<AccessPathAtPoint> {
+    let path = AccessPath::exact(root, Vec::new(), limits).ok()?;
+    AccessPathAtPoint::new(
+        path,
+        resolved.observation.point().clone(),
+        resolved.observation.phase(),
+        resolved.observation.context().clone(),
+    )
+    .ok()
+}
+
+/// The quality one may-alias subject binding carries.
+///
+/// A binding the heap oracle could not prove must never be definitive. This is
+/// the whole guard against a `MayAlias` answer being reported as a clean
+/// protocol run: the event still reaches the subject, and every finding it
+/// produces stays a possible one.
+fn may_alias_quality(multiplicity: TypestateBindingMultiplicity) -> TypestateBindingQuality {
+    const REASON: &str = "typestate subject binding rests on a heap-oracle may-alias";
+    TypestateBindingQuality::new(
+        ProofStatus::Unproven(REASON.into()),
+        EvidenceCompleteness::Partial(REASON.into()),
+        multiplicity,
+    )
+}
+
 struct ResolvedSelection {
     procedure: ProcedureHandle,
     call: Option<CallSiteHandle>,
     observation_point: ProgramPointHandle,
     role: TypestateObjectRole,
     objects: Vec<ResolvedObject>,
+    /// The exact value observation the object set above answers, retained so a
+    /// subject the object set did not name can still be asked about through
+    /// the heap oracle's alias relation.
+    observation: ValueAtPoint,
+    /// Whether that object set is closed. An open set means the value may
+    /// denote an object the oracle did not enumerate, so a subject missing
+    /// from the set is not thereby excluded.
+    coverage: CandidateCoverage,
+    multiplicity: TypestateBindingMultiplicity,
 }
 
 fn selector<'a>(
@@ -2940,7 +3153,7 @@ mod tests {
     use super::*;
     use crate::definition::{CallModelingSpec, InconclusivePolicy, TypestateUncertaintySpec};
     use crate::resolved::ResolvedTypestateAutomatonSpec;
-    use brokk_bifrost_analysis::analyzer::dataflow::UnmodeledCallBehavior;
+    use brokk_bifrost_flow::dataflow::UnmodeledCallBehavior;
 
     fn minimal_resolved_spec(behavior: UnmodeledCallBehavior) -> ResolvedTypestatePolicySpec {
         let open = PolicyTypestateStateId::new("open").unwrap();

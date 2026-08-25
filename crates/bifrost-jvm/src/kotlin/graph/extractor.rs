@@ -22,7 +22,7 @@ use crate::kotlin::graph::resolver::{
     receiver_type_fq_name,
 };
 use crate::kotlin::syntax::{
-    kotlin_binding_type_text, kotlin_call_arity, kotlin_call_with_callee, kotlin_callee,
+    kotlin_binding_type_components, kotlin_call_arity, kotlin_call_with_callee, kotlin_callee,
     kotlin_class_literal_type, kotlin_dotted_navigation_segments, kotlin_import_header_segments,
     kotlin_is_declaration_name, kotlin_is_expression_kind, kotlin_is_navigation_kind,
     kotlin_named_argument_label, kotlin_navigation_member, kotlin_navigation_receiver,
@@ -130,12 +130,12 @@ impl KotlinResolutionCtx for ScanCtx<'_> {
         &self.bindings
     }
 
-    fn resolve_type_fqn(&self, spelled: &str, byte: usize) -> Option<String> {
-        self.names.resolve_type_fqn(spelled, byte)
+    fn resolve_type_components(&self, components: &[String], byte: usize) -> Option<String> {
+        self.names.resolve_type_components(components, byte)
     }
 
-    fn resolve_callable_fqn(&self, spelled: &str, byte: usize) -> Option<String> {
-        self.names.resolve_callable_fqn(spelled, byte)
+    fn resolve_callable_components(&self, components: &[String], byte: usize) -> Option<String> {
+        self.names.resolve_callable_components(components, byte)
     }
 
     fn enclosing_owner_fq_names(&mut self, node: Node<'_>) -> Vec<String> {
@@ -344,8 +344,10 @@ fn binding_type_fq_name(
     token: QueryToken<'_>,
     ctx: &mut ScanCtx<'_>,
 ) -> Option<String> {
-    if let Some(spelled) = kotlin_binding_type_text(binding, ctx.source)
-        && let Some(fqn) = ctx.names.resolve_type_fqn(&spelled, binding.start_byte())
+    if let Some(components) = kotlin_binding_type_components(binding, ctx.source)
+        && let Some(fqn) = ctx
+            .names
+            .resolve_type_components(&components, binding.start_byte())
     {
         return Some(fqn);
     }
@@ -411,12 +413,12 @@ fn record_constructor_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     let Some(owner) = ctx.spec.owner.as_ref().map(CodeUnit::fq_name) else {
         return;
     };
-    let Some((token, spelled)) = constructed_type_spelling(callee, ctx) else {
+    let Some((token, components)) = constructed_type_components(callee, ctx) else {
         return;
     };
     if ctx
         .names
-        .resolve_type_fqn(&spelled, token.start_byte())
+        .resolve_type_components(&components, token.start_byte())
         .is_some_and(|resolved| resolved == owner)
     {
         hits::push_hit(token, ctx);
@@ -425,45 +427,47 @@ fn record_constructor_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 
 /// The token and spelled name of the type a callee constructs, for the shapes a
 /// constructor call can take.
-fn constructed_type_spelling<'tree>(
+fn constructed_type_components<'tree>(
     callee: Node<'tree>,
     ctx: &ScanCtx<'_>,
-) -> Option<(Node<'tree>, String)> {
+) -> Option<(Node<'tree>, Vec<String>)> {
     match callee.kind() {
         "simple_identifier" => {
             let name = node_text(callee, ctx.source);
             (!name.is_empty() && !ctx.bindings.is_shadowed(name))
-                .then(|| (callee, name.to_string()))
+                .then(|| (callee, vec![name.to_string()]))
         }
         // `: Base(1)` in a supertype list spells its callee as a `user_type`.
         "user_type" => {
             let segments = kotlin_user_type_segments(callee);
             let last = segments.last().copied()?;
-            let spelled = segments
+            let components = segments
                 .iter()
                 .map(|segment| node_text(*segment, ctx.source))
-                .collect::<Vec<_>>()
-                .join(".");
-            (!spelled.is_empty()).then_some((last, spelled))
+                .filter(|component| !component.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            (!components.is_empty()).then_some((last, components))
         }
         // `lib.Base(1)`.
         kind if kotlin_is_navigation_kind(kind) => {
             let member = kotlin_navigation_member(callee)?;
-            let spelled = dotted_navigation_spelling(callee, ctx)?;
-            Some((member, spelled))
+            let components = dotted_navigation_components(callee, ctx)?;
+            Some((member, components))
         }
         _ => None,
     }
 }
 
 /// The dotted name a navigation spells, when every link of it is a plain name.
-fn dotted_navigation_spelling(navigation: Node<'_>, ctx: &ScanCtx<'_>) -> Option<String> {
+fn dotted_navigation_components(navigation: Node<'_>, ctx: &ScanCtx<'_>) -> Option<Vec<String>> {
     let segments = kotlin_dotted_navigation_segments(navigation)?;
     let names: Vec<&str> = segments
         .iter()
         .map(|segment| node_text(*segment, ctx.source))
         .collect();
-    (!names.iter().any(|name| name.is_empty())).then(|| names.join("."))
+    (!names.iter().any(|name| name.is_empty()))
+        .then(|| names.into_iter().map(str::to_string).collect())
 }
 
 /// Record a reference to a function: a call, a callable reference, or a
@@ -550,7 +554,10 @@ fn record_bare_reference(token: Node<'_>, ctx: &mut ScanCtx<'_>, arity: Option<u
     if ctx.spec.owner.is_none() {
         if ctx
             .names
-            .resolve_callable_fqn(&ctx.spec.member_name, token.start_byte())
+            .resolve_callable_components(
+                std::slice::from_ref(&ctx.spec.member_name),
+                token.start_byte(),
+            )
             .is_some_and(|resolved| resolved == ctx.spec.fq_name)
         {
             hits::push_hit(token, ctx);
@@ -575,7 +582,10 @@ fn record_bare_reference(token: Node<'_>, ctx: &mut ScanCtx<'_>, arity: Option<u
     // Not reachable through any enclosing scope: an import may still bring it in.
     if ctx
         .names
-        .resolve_callable_fqn(&ctx.spec.member_name, token.start_byte())
+        .resolve_callable_components(
+            std::slice::from_ref(&ctx.spec.member_name),
+            token.start_byte(),
+        )
         .is_some_and(|resolved| resolved == ctx.spec.fq_name)
     {
         hits::push_hit(token, ctx);
@@ -798,7 +808,7 @@ fn record_constructed_type_reference(call: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
     if ctx
         .names
-        .resolve_type_fqn(name, callee.start_byte())
+        .resolve_type_components(&[name.to_string()], callee.start_byte())
         .is_some_and(|resolved| resolved == ctx.spec.fq_name)
     {
         hits::push_hit(callee, ctx);
@@ -866,7 +876,7 @@ fn record_type_name_segments(
     ctx: &mut ScanCtx<'_>,
     types: &TypeParameterScopes,
 ) {
-    let mut spelling = String::new();
+    let mut components = Vec::new();
     for (index, segment) in segments.iter().enumerate() {
         let name = node_text(*segment, ctx.source);
         if name.is_empty() {
@@ -880,13 +890,10 @@ fn record_type_name_segments(
         if index == 0 && type_parameter_in_scope(types, name) {
             return;
         }
-        if !spelling.is_empty() {
-            spelling.push('.');
-        }
-        spelling.push_str(name);
+        components.push(name.to_string());
         if ctx
             .names
-            .resolve_type_fqn(&spelling, segment.start_byte())
+            .resolve_type_components(&components, segment.start_byte())
             .is_some_and(|resolved| resolved == ctx.spec.fq_name)
         {
             hits::push_hit(*segment, ctx);
@@ -923,7 +930,7 @@ fn record_qualifier_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
     if ctx
         .names
-        .resolve_type_fqn(name, node.start_byte())
+        .resolve_type_components(&[name.to_string()], node.start_byte())
         .is_some_and(|resolved| resolved == ctx.spec.fq_name)
     {
         hits::push_hit(node, ctx);

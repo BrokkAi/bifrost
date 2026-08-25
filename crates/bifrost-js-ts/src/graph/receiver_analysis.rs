@@ -13,7 +13,7 @@ use crate::imports::{
 use crate::providers::{JsTsSource, compute_direct_ancestors};
 use crate::syntax::compute_import_binder as compute_jsts_import_binder;
 use crate::syntax::parse_js_ts_tree;
-use crate::syntax::{JsTsImportBinder, inline_object_type, slice};
+use crate::syntax::{JsTsImportBinder, inline_object_type, slice, static_member_property};
 use crate::ts_owners::{
     jsts_identifier_candidates, jsts_indexed_callable_node,
     ts_resolve_type_node_to_property_owner_outcome, ts_resolve_type_text_to_property_owners,
@@ -291,8 +291,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         budget: ReceiverAnalysisBudget,
     ) -> Option<ReceiverMemberTargetReport> {
         let member_expression = member_expression_at_site(site)?;
-        let property = member_expression.child_by_field_name("property")?;
-        let member_name = slice(property, self.source);
+        let (_, member_name) = static_member_property(member_expression, self.source)?;
         if member_name.is_empty() || expected_member.is_some_and(|expected| expected != member_name)
         {
             return None;
@@ -300,10 +299,10 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         let receiver = member_expression.child_by_field_name("object")?;
         Some(ReceiverMemberTargetReport {
             receiver_range: node_range(receiver),
-            member_name: member_name.to_string(),
+            member_name: member_name.clone(),
             analysis: self.resolve_member_targets_report(
                 receiver,
-                member_name,
+                &member_name,
                 before_byte,
                 budget,
             ),
@@ -1158,7 +1157,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
                 let name = slice(function, self.source);
                 self.summarize_named_function(name, call, depth, budget, tracker)
             }
-            "member_expression" => {
+            "member_expression" | "subscript_expression" => {
                 self.summarize_member_call(function, call_byte, depth, budget, tracker)
             }
             _ => ReceiverAnalysisOutcome::Unsupported {
@@ -1313,15 +1312,14 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         let Some(object) = member_expression.child_by_field_name("object") else {
             return ReceiverAnalysisOutcome::Unknown;
         };
-        let Some(property) = member_expression.child_by_field_name("property") else {
+        let Some((_, member)) = static_member_property(member_expression, self.source) else {
             return ReceiverAnalysisOutcome::Unknown;
         };
-        let member = slice(property, self.source);
         if member.is_empty() {
             return ReceiverAnalysisOutcome::Unknown;
         }
         if let Some(outcome) =
-            self.summarize_module_member_function(object, member, depth + 1, budget, tracker)
+            self.summarize_module_member_function(object, &member, depth + 1, budget, tracker)
         {
             return outcome;
         }
@@ -1331,7 +1329,7 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         };
         let mut methods = Vec::new();
         for value in values {
-            for factory in self.member_targets_for_value(&value, member) {
+            for factory in self.member_targets_for_value(&value, &member) {
                 methods.extend(
                     nodes_for_code_unit(self.host, &factory, self.root)
                         .into_iter()
@@ -2527,12 +2525,15 @@ fn wrap_factory_outcome(
 
 pub fn member_expression_at_site(mut node: Node<'_>) -> Option<Node<'_>> {
     for _ in 0..4 {
-        if node.kind() == "member_expression" {
+        if matches!(node.kind(), "member_expression" | "subscript_expression") {
             return Some(node);
         }
         if node.kind() == "call_expression"
             && let Some(function) = node.child_by_field_name("function")
-            && function.kind() == "member_expression"
+            && matches!(
+                function.kind(),
+                "member_expression" | "subscript_expression"
+            )
         {
             return Some(function);
         }

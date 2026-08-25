@@ -128,7 +128,7 @@ The Python method accepts the canonical query fields as typed arguments; it does
 ### Rust
 
 ```rust
-use brokk_bifrost::analyzer::structural::CodeQueryResult;
+use brokk_bifrost::rql::CodeQueryResult;
 use brokk_bifrost::SearchToolsService;
 use serde_json::json;
 use std::path::PathBuf;
@@ -162,7 +162,7 @@ Dispatch on `result_type` in JSON, the corresponding Python dataclass, or `CodeQ
 | `receiver_analysis` | `receiver_targets`, `points_to`, or `member_targets` | Explicit analysis outcome plus bounded receiver values or exact member declarations. |
 | `file` | `file_of`, `imports_of`, or `importers_of` | Exact project file reached by the pipeline. |
 
-In Python, the seven classes are `CodeQueryMatch`, `CodeQueryDeclaration`, `CodeQueryReferenceSite`, `CodeQueryCallSite`, `CodeQueryExpressionSite`, `CodeQueryReceiverAnalysis`, and `CodeQueryFile`. In Rust, match all variants of `brokk_bifrost::analyzer::structural::CodeQueryResultValue` without a wildcard so a future result type becomes a compile-time integration decision.
+In Python, the seven classes are `CodeQueryMatch`, `CodeQueryDeclaration`, `CodeQueryReferenceSite`, `CodeQueryCallSite`, `CodeQueryExpressionSite`, `CodeQueryReceiverAnalysis`, and `CodeQueryFile`. In Rust, match all variants of `brokk_bifrost::rql::CodeQueryResultValue` without a wildcard so a future result type becomes a compile-time integration decision.
 
 Request `result_detail: "full"` when a report needs stable IDs, byte/line/column ranges, capture ranges, or decorator ranges. Compact mode is designed for agent context, not durable finding identity.
 

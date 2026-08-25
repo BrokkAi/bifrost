@@ -27,6 +27,7 @@ use crate::analyzer::semantic_model::{
 use crate::analyzer::{PhpAnalyzerConfig, PhpDependencyApiEvidence, Project};
 use crate::hash::{HashMap, HashSet};
 
+use crate::analyzer::topology::DependencyScope;
 use brokk_bifrost_php::aliases::php_namespace_to_fq;
 
 /// The most autoload rules one Composer package may contribute. Each rule
@@ -229,6 +230,8 @@ fn resolve_evidence(
             },
             provenance: package_provenance(package, evidence, &install_dir),
             artifacts,
+            scope: DependencyScope::Unknown,
+            declared_by: None,
         });
     }
     Ok(resolved)

@@ -2072,7 +2072,7 @@ fn deferred_invocation_kind(properties: super::ProcedureProperties) -> DeferredI
     }
 }
 
-pub(crate) fn project_call_boundary(
+pub fn project_call_boundary(
     caller: &ProcedureHandle,
     semantic_call: &SemanticCallSite,
     boundary: &CallBoundary,
@@ -2384,7 +2384,7 @@ fn add_local_edge(
     Ok(())
 }
 
-pub(crate) fn invoked_call_at(
+pub fn invoked_call_at(
     point: &ProgramPointHandle,
 ) -> Result<Option<CallSiteId>, SemanticProviderError> {
     let semantic_point = point
@@ -2402,7 +2402,7 @@ pub(crate) fn invoked_call_at(
 }
 
 /// Validate provider-owned exit evidence before either ICFG backend caches it.
-pub(crate) fn validate_exit_profile(
+pub fn validate_exit_profile(
     callee_entry: &ProgramPointHandle,
     callee_exit: &ProgramPointHandle,
     profile: &IcfgExitProfile,
@@ -2422,7 +2422,7 @@ pub(crate) fn validate_exit_profile(
 
 /// Validate provider-owned call projections before either ICFG backend
 /// publishes them.
-pub(crate) fn validate_call_transfer_set(
+pub fn validate_call_transfer_set(
     caller: &ProcedureHandle,
     semantic_call: &SemanticCallSite,
     transfers: &CallTransferSet,
@@ -2480,10 +2480,7 @@ pub(crate) fn validate_call_transfer_set(
     Ok(())
 }
 
-pub(crate) fn is_call_scaffolding(
-    edge: &super::ControlEdge,
-    call: &super::SemanticCallSite,
-) -> bool {
+pub fn is_call_scaffolding(edge: &super::ControlEdge, call: &super::SemanticCallSite) -> bool {
     matches!(
         (edge.kind, call.normal_continuation),
         (ControlEdgeKind::Normal, ControlContinuation::Target(target)) if edge.target_point == target

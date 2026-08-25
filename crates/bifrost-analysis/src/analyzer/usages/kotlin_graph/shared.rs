@@ -9,10 +9,10 @@
 //! and dead code. Both drive the same receiver typing, member lookup, and name
 //! ladder through `super::resolver::KotlinResolutionCtx`.
 
-use super::with_kotlin_graph_source;
+use super::{kotlin_target_spec_replayable, scan_kotlin_file_replayable, with_kotlin_graph_source};
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::common::language_for_file;
-use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
+use crate::analyzer::usages::inverted_edges::{EdgeNodeDomain, UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::parsed_tree::ParseSpec;
@@ -24,9 +24,8 @@ use crate::analyzer::{
 };
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
-use brokk_bifrost_jvm::kotlin::graph::extractor::{ScanState, scan_file};
+use brokk_bifrost_jvm::kotlin::graph::extractor::ScanState;
 use brokk_bifrost_jvm::kotlin::graph::inverted::scan_file as scan_inverted_file;
-use brokk_bifrost_jvm::kotlin::graph::resolver::TargetSpec;
 use std::collections::BTreeSet;
 
 /// Resolves usages of one Kotlin target within a candidate file set.
@@ -56,9 +55,7 @@ impl<'a> UsageQueryResolver<'a> for KotlinQueryResolver {
             return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
         };
         let _spec_scope = crate::profiling::scope("kotlin_graph::target_spec");
-        let Some(spec) = with_kotlin_graph_source(analyzer, |graph| {
-            TargetSpec::from_targets(&graph, token, overloads)
-        }) else {
+        let Some(spec) = kotlin_target_spec_replayable(analyzer, token, overloads) else {
             return GraphUsageOutcome::fallback_safe(
                 target.fq_name(),
                 GraphFailureReason::UnsupportedTargetShape(
@@ -101,18 +98,16 @@ impl<'a> UsageQueryResolver<'a> for KotlinQueryResolver {
             raw_match_count: &mut raw_match_count,
             limit_exceeded: &mut limit_exceeded,
         };
-        with_kotlin_graph_source(analyzer, |graph| {
-            for file in ordered {
-                if scan_scope.is_cancelled() {
-                    break;
-                }
-                let _file_scope = crate::profiling::scope("kotlin_graph::scan_file");
-                scan_file(&graph, token, &file, &spec, &mut state);
-                if *state.limit_exceeded {
-                    break;
-                }
+        for file in ordered {
+            if scan_scope.is_cancelled() {
+                break;
             }
-        });
+            let _file_scope = crate::profiling::scope("kotlin_graph::scan_file");
+            scan_kotlin_file_replayable(analyzer, token, &file, &spec, &mut state);
+            if *state.limit_exceeded {
+                break;
+            }
+        }
 
         // A Kotlin class is equally nameable from Java and Scala source, and the
         // three languages share one candidate space, so find-references on a
@@ -186,9 +181,8 @@ pub(crate) fn scan_kotlin_files_for_jvm_type(
     if resolve_analyzer::<KotlinAnalyzer>(analyzer).is_none() {
         return;
     }
-    let Some(spec) = with_kotlin_graph_source(analyzer, |graph| {
-        TargetSpec::from_targets(&graph, token, std::slice::from_ref(target))
-    }) else {
+    let Some(spec) = kotlin_target_spec_replayable(analyzer, token, std::slice::from_ref(target))
+    else {
         return;
     };
     let mut ordered: Vec<ProjectFile> = candidate_files
@@ -204,14 +198,12 @@ pub(crate) fn scan_kotlin_files_for_jvm_type(
         raw_match_count,
         limit_exceeded,
     };
-    with_kotlin_graph_source(analyzer, |graph| {
-        for file in ordered {
-            scan_file(&graph, token, &file, &spec, &mut state);
-            if *state.limit_exceeded {
-                break;
-            }
+    for file in ordered {
+        scan_kotlin_file_replayable(analyzer, token, &file, &spec, &mut state);
+        if *state.limit_exceeded {
+            break;
         }
-    });
+    }
 }
 
 /// Builds the whole Kotlin `caller -> callee` edge set in one inverted pass.
@@ -223,8 +215,7 @@ pub(crate) fn scan_kotlin_files_for_jvm_type(
 /// every subsequent `scan_usages` cold.
 pub(crate) struct KotlinEdgeResolver<'a> {
     files: Vec<ProjectFile>,
-    file_states: HashMap<ProjectFile, FileState>,
-    _kotlin: &'a KotlinAnalyzer,
+    kotlin: &'a KotlinAnalyzer,
 }
 
 /// The whole-workspace `caller -> callee` scan behind this language's
@@ -240,14 +231,10 @@ impl<'a> KotlinEdgeResolver<'a> {
             .ok()?
             .into_iter()
             .collect();
-        let file_states = kotlin.bulk_file_states(files.clone(), BulkFileStateSource::Omit);
-        Some(Self {
-            files,
-            file_states,
-            _kotlin: kotlin,
-        })
+        Some(Self { files, kotlin })
     }
 
+    #[cfg(test)]
     pub(crate) fn build_edges<F>(
         &self,
         analyzer: &dyn IAnalyzer,
@@ -258,12 +245,79 @@ impl<'a> KotlinEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
+        let selected_files: Vec<_> = self
+            .files
+            .iter()
+            .filter(|file| keep_file(file))
+            .cloned()
+            .collect();
+        let file_states = self
+            .kotlin
+            .bulk_file_states(selected_files, BulkFileStateSource::Omit);
         build_kotlin_edges(
             analyzer,
             token,
             &self.files,
-            &self.file_states,
-            nodes,
+            &file_states,
+            EdgeNodeDomain::Closed(nodes),
+            keep_file,
+        )
+    }
+
+    pub(crate) fn build_rooted_edges<F>(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        token: QueryToken<'_>,
+        callers: &HashSet<String>,
+        keep_file: F,
+    ) -> UsageEdges
+    where
+        F: Fn(&ProjectFile) -> bool + Sync,
+    {
+        let selected_files: Vec<_> = self
+            .files
+            .iter()
+            .filter(|file| keep_file(file))
+            .cloned()
+            .collect();
+        let file_states = self
+            .kotlin
+            .bulk_file_states(selected_files, BulkFileStateSource::Omit);
+        build_kotlin_edges(
+            analyzer,
+            token,
+            &self.files,
+            &file_states,
+            EdgeNodeDomain::Rooted(callers),
+            keep_file,
+        )
+    }
+
+    pub(crate) fn build_inbound_edges<F>(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        token: QueryToken<'_>,
+        callees: &HashSet<String>,
+        keep_file: F,
+    ) -> UsageEdges
+    where
+        F: Fn(&ProjectFile) -> bool + Sync,
+    {
+        let selected_files: Vec<_> = self
+            .files
+            .iter()
+            .filter(|file| keep_file(file))
+            .cloned()
+            .collect();
+        let file_states = self
+            .kotlin
+            .bulk_file_states(selected_files, BulkFileStateSource::Omit);
+        build_kotlin_edges(
+            analyzer,
+            token,
+            &self.files,
+            &file_states,
+            EdgeNodeDomain::Inbound(callees),
             keep_file,
         )
     }
@@ -278,12 +332,21 @@ impl<'a> KotlinEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
+        let selected_files: Vec<_> = self
+            .files
+            .iter()
+            .filter(|file| keep_file(file))
+            .cloned()
+            .collect();
+        let file_states = self
+            .kotlin
+            .bulk_file_states(selected_files, BulkFileStateSource::Omit);
         build_kotlin_edges(
             analyzer,
             token,
             &self.files,
-            &self.file_states,
-            nodes,
+            &file_states,
+            EdgeNodeDomain::Closed(nodes),
             keep_file,
         )
     }
@@ -302,7 +365,7 @@ fn build_kotlin_edges<Output, F>(
     token: QueryToken<'_>,
     files: &[ProjectFile],
     file_states: &HashMap<ProjectFile, FileState>,
-    nodes: &HashSet<String>,
+    domain: EdgeNodeDomain<'_>,
     keep_file: F,
 ) -> Output
 where
@@ -312,12 +375,12 @@ where
     use crate::analyzer::usages::inverted_edges::{
         ClassRangeIndex, build_edge_output, build_file_declarations,
         build_file_declarations_from_state, class_range_index_from_state,
-        parse_and_collect_with_declarations,
+        parse_and_collect_with_declarations_and_domain,
     };
 
     let language = brokk_bifrost_jvm::kotlin::language::LANGUAGE.into();
-    with_kotlin_graph_source(analyzer, |graph| {
-        build_edge_output(files, keep_file, |file| {
+    build_edge_output(files, keep_file, |file| {
+        with_kotlin_graph_source(analyzer, |graph| {
             let state = file_states.get(file);
             let declarations = state
                 .map(build_file_declarations_from_state)
@@ -325,9 +388,9 @@ where
             let class_ranges = state
                 .map(class_range_index_from_state)
                 .unwrap_or_else(|| ClassRangeIndex::build(analyzer, file));
-            parse_and_collect_with_declarations(
+            parse_and_collect_with_declarations_and_domain(
                 file,
-                nodes,
+                domain,
                 ParseSpec::whole(&language),
                 declarations,
                 |input| scan_inverted_file(&graph, token, file, input, class_ranges),

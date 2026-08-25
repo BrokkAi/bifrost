@@ -14,6 +14,7 @@ use crate::analyzer::semantic_model::{
     Visibility, member_declaration_id, normalize_artifact_locator_paths, read_exact_artifact_while,
     type_declaration_id,
 };
+use crate::analyzer::topology::DependencyScope;
 use crate::analyzer::{CSharpAnalyzerConfig, Project};
 use crate::hash::{HashMap, HashSet};
 use goblin::pe::PE;
@@ -1523,6 +1524,8 @@ fn resolved_csharp_dependency(assembly: ResolvedCSharpAssembly) -> ResolvedDepen
             ExternalArtifactKind::DotNetAssembly,
             assembly.path,
         )],
+        scope: DependencyScope::Unknown,
+        declared_by: None,
     }
 }
 

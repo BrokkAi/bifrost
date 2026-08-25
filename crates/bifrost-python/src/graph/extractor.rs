@@ -10,10 +10,13 @@ use crate::graph::resolver::{
     annotation_class_qualifier_site, annotation_reference_candidates, member_name,
     normalized_receiver_type, receiver_annotation_matches_target,
     resolve_callable_parameter_default_types, resolve_constructor_types, resolve_receiver_type,
-    target_owner_code_unit, top_level_identifier,
+    resolved_member_declarations, target_owner_code_unit, top_level_identifier,
 };
 use crate::graph_support::{PythonSource, PythonUsageSource};
-use crate::imports::{PythonImportBinding, parse_python_import_bindings, resolve_fqn_candidates};
+use crate::imports::{
+    PythonImportBinding, imported_module_assignment_at, parse_python_import_bindings,
+    resolve_fqn_candidates, resolve_python_relative_module,
+};
 use crate::usage_index::{
     ModuleBindingEvent, ModuleBindingEventKind, ModuleBindingTimeline, PythonScopeFacts,
     usage_matching_edges, usage_module_binding_timeline, usage_resolve_module_files,
@@ -502,6 +505,71 @@ impl ScanCtx<'_> {
         self.receiver_type_matches_target(raw_type)
     }
 
+    fn importlib_assignment_targets_query(&self, receiver: Node<'_>, node: Node<'_>) -> bool {
+        if receiver.kind() != "identifier" {
+            return false;
+        }
+        let local = slice(receiver, self.source);
+        let Some(module) =
+            imported_module_assignment_at(node, local, self.source, |importlib_local| {
+                self.importlib_binding_visible(importlib_local, node)
+            })
+        else {
+            return false;
+        };
+        self.graph
+            .index
+            .parent_of(self.target)
+            .filter(CodeUnit::is_module)
+            .is_some_and(|owner| {
+                owner.fq_name() == module
+                    || resolve_fqn_candidates(self.python, &module, |name| {
+                        self.graph.index.definitions(name).collect()
+                    })
+                    .into_iter()
+                    .any(|candidate| candidate.is_module() && candidate == owner)
+            })
+            || module_contains_seed(self.python, self.file, &module, self.seeds)
+    }
+
+    fn importlib_binding_visible(&self, local: &str, node: Node<'_>) -> bool {
+        if let Some(binding) = self.scoped_import_bindings.iter().rev().find(|binding| {
+            binding.start_byte <= node.start_byte()
+                && binding.scope_start_byte <= node.start_byte()
+                && node.end_byte() <= binding.scope_end_byte
+                && binding.local_name == local
+        }) {
+            if binding.is_function_scoped() {
+                return binding.qualified_name == "importlib";
+            }
+            if self
+                .scope_facts_for_node(node)
+                .is_some_and(|facts| facts.is_shadowed(local))
+            {
+                return false;
+            }
+            return binding.qualified_name == "importlib";
+        }
+        if self
+            .scope_facts_for_node(node)
+            .is_some_and(|facts| facts.is_shadowed(local))
+        {
+            return false;
+        }
+        self.python
+            .import_binder_of(self.file)
+            .bindings
+            .get(local)
+            .is_some_and(|binding| {
+                binding.kind == ImportKind::Namespace
+                    && binding
+                        .namespace_imported_module
+                        .as_deref()
+                        .unwrap_or(&binding.module_specifier)
+                        == "importlib"
+            })
+    }
+
     /// Whether `node` is evaluated in the target member owner's class namespace.
     /// This includes class-level field initializers and the decorators,
     /// annotations, and defaults of a method declaration. The method body itself
@@ -596,7 +664,9 @@ impl ScanCtx<'_> {
                 && node.end_byte() <= binding.scope_end_byte
                 && binding.local_name == ident
         })?;
-        let candidates = resolve_fqn_candidates(self.python, &binding.qualified_name, |name| {
+        let qualified_name = resolve_python_relative_module(self.file, &binding.qualified_name)
+            .unwrap_or_else(|| binding.qualified_name.clone());
+        let candidates = resolve_fqn_candidates(self.python, &qualified_name, |name| {
             self.graph.index.definitions(name).collect()
         });
         let imported_target = self.target_owner.as_ref().unwrap_or(self.target);
@@ -660,15 +730,7 @@ impl ScanCtx<'_> {
                 None => return false,
             }
         };
-        if &enclosing_class == target_owner {
-            return true;
-        }
-        self.graph
-            .hierarchy
-            .map(|provider| provider.get_ancestors(&enclosing_class))
-            .unwrap_or_default()
-            .into_iter()
-            .any(|ancestor| ancestor == *target_owner)
+        self.receiver_unit_matches_target(&enclosing_class, target_owner)
     }
 
     fn receiver_type_matches_target(&self, raw_type: &str) -> bool {
@@ -682,16 +744,7 @@ impl ScanCtx<'_> {
             raw_type,
             self.target_self_file,
         ) {
-            if &receiver_type == target_owner {
-                return true;
-            }
-            return self
-                .graph
-                .hierarchy
-                .map(|provider| provider.get_ancestors(&receiver_type))
-                .unwrap_or_default()
-                .into_iter()
-                .any(|ancestor| ancestor == *target_owner);
+            return self.receiver_unit_matches_target(&receiver_type, target_owner);
         }
 
         // Preserve the annotation-edge/name fallback only when structured
@@ -704,6 +757,26 @@ impl ScanCtx<'_> {
             self.target_short,
             self.target_self_file,
         )
+    }
+
+    fn receiver_unit_matches_target(
+        &self,
+        receiver_type: &CodeUnit,
+        target_owner: &CodeUnit,
+    ) -> bool {
+        if let Some(member) = self.target_member {
+            return resolved_member_declarations(self.graph, receiver_type, member)
+                .iter()
+                .any(|candidate| candidate == self.target);
+        }
+        receiver_type == target_owner
+            || self
+                .graph
+                .hierarchy
+                .map(|provider| provider.get_ancestors(receiver_type))
+                .unwrap_or_default()
+                .into_iter()
+                .any(|ancestor| ancestor == *target_owner)
     }
 }
 
@@ -1058,6 +1131,13 @@ fn handle_attribute_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     };
     let object_text = slice(object, ctx.source);
     let attribute_text = slice(attribute, ctx.source);
+    if ctx.target_member.is_none()
+        && !ctx.target_is_module
+        && attribute_text == ctx.target_short
+        && ctx.importlib_assignment_targets_query(object, node)
+    {
+        record_hit(attribute, ctx);
+    }
     if let Some(member) = ctx.target_member
         && attribute_text == member
     {
@@ -1524,13 +1604,13 @@ fn imported_module_bindings(
             && reference.end_byte() <= binding.scope_end_byte
             && binding.local_name == root_text
     }) {
-        return if usage_resolve_module_files(ctx.python, ctx.file, &binding.qualified_name)
-            .is_empty()
-        {
+        let qualified_name = resolve_python_relative_module(ctx.file, &binding.qualified_name)
+            .unwrap_or_else(|| binding.qualified_name.clone());
+        return if usage_resolve_module_files(ctx.python, ctx.file, &qualified_name).is_empty() {
             Vec::new()
         } else {
             vec![ImportedModuleBinding {
-                module: binding.qualified_name.clone(),
+                module: qualified_name,
                 consumed_attributes: binding.consumed_attributes,
             }]
         };

@@ -1,9 +1,12 @@
+use brokk_bifrost_core::analyzer::capabilities::ImportReachability;
 use brokk_bifrost_core::analyzer::model::{ImportInfo, StructuredImportScope};
+use brokk_bifrost_core::analyzer::{CodeUnit, Language};
 use brokk_bifrost_core::hash::HashSet;
 use tree_sitter::Node;
 
-use crate::scala::scala_nested_type_candidates;
+use crate::scala::imports::is_scala_importable_direct_member;
 use crate::scala::supertypes::scala_type_lookup_segments;
+use crate::scala::{scala_nested_type_candidates, scala_normalize_full_name};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ScalaWildcardOwnerKind {
@@ -59,6 +62,107 @@ pub struct ScalaExplicitImportTier {
     pub candidate: String,
     pub declaration: bool,
     pub package: bool,
+}
+
+/// Decide whether one Scala file's structured imports can reach declarations
+/// from another file without materializing every imported declaration.
+///
+/// Candidate discovery needs a conservative file edge, not a resolved binder.
+/// It therefore considers every package-relative spelling the ordinary import
+/// resolver can select, including spellings shadowed by an earlier tier. That
+/// may admit an extra file, but it cannot lose one. Returning `DoesNotReach`
+/// is safe because the same candidate and chained-wildcard expansion is a
+/// superset of the resolver's paths; malformed legacy facts remain `Unknown`
+/// and retain the caller's declaration-expansion backstop.
+pub fn scala_import_reachability<'a>(
+    imports: &[ImportInfo],
+    source_package: &str,
+    target_package: &str,
+    target_declarations: impl IntoIterator<Item = &'a CodeUnit>,
+    mut explicit_candidate_facts: impl FnMut(&str) -> ScalaExplicitImportFacts,
+) -> ImportReachability {
+    if source_package == target_package {
+        return ImportReachability::Reaches;
+    }
+
+    let interner = brokk_bifrost_core::analyzer::fq_name::segment_interner();
+    let mut target_names = HashSet::default();
+    let mut target_owners = HashSet::default();
+    for declaration in target_declarations
+        .into_iter()
+        .filter(|declaration| is_scala_importable_direct_member(declaration))
+    {
+        target_names.insert(scala_normalize_full_name(&declaration.fq_name()));
+        if let Some(parent) = declaration.fq().parent() {
+            target_owners.insert(scala_normalize_full_name(
+                &parent.display_native(Language::Scala, interner),
+            ));
+        }
+    }
+    if target_names.is_empty() && target_owners.is_empty() {
+        return ImportReachability::Unknown;
+    }
+
+    let mut wildcard_roots: Vec<(usize, String)> = Vec::new();
+    for (import_index, import) in imports.iter().enumerate() {
+        let Some(path) = import.path.as_ref() else {
+            return ImportReachability::Unknown;
+        };
+        if path.segments.is_empty() {
+            return ImportReachability::Unknown;
+        }
+        let rendered_path = path.segments.join(".");
+        let fallback_prefixes = [source_package.to_string()];
+        let package_prefixes = if path.lexical_prefixes.is_empty() {
+            fallback_prefixes.as_slice()
+        } else {
+            path.lexical_prefixes.as_slice()
+        };
+        let mut candidates = scala_import_path_candidates(&rendered_path, package_prefixes);
+        if import.is_wildcard {
+            let chained = wildcard_roots
+                .iter()
+                .filter(|(root_index, _)| {
+                    same_lexical_import_context(imports, *root_index, import_index)
+                })
+                .map(|(_, root)| format!("{root}.{rendered_path}"))
+                .collect::<Vec<_>>();
+            candidates.extend(chained);
+            let mut seen = HashSet::default();
+            candidates.retain(|candidate| seen.insert(candidate.clone()));
+            if candidates.iter().any(|candidate| {
+                candidate == target_package
+                    || target_owners.contains(&scala_normalize_full_name(candidate))
+            }) {
+                return ImportReachability::Reaches;
+            }
+            wildcard_roots.extend(
+                candidates
+                    .into_iter()
+                    .map(|candidate| (import_index, candidate)),
+            );
+            continue;
+        }
+
+        let Some(tier) = resolve_scala_explicit_import_tier(
+            &rendered_path,
+            package_prefixes,
+            &mut explicit_candidate_facts,
+        ) else {
+            continue;
+        };
+        let candidate = &tier.candidate;
+        let normalized = scala_normalize_full_name(candidate);
+        let reaches_target = target_names.contains(&normalized)
+            || candidate == target_package
+            || target_package
+                .strip_prefix(candidate)
+                .is_some_and(|suffix| suffix.starts_with('.'));
+        if reaches_target {
+            return ImportReachability::Reaches;
+        }
+    }
+    ImportReachability::DoesNotReach
 }
 
 /// Select the first relative/global candidate tier that denotes either a

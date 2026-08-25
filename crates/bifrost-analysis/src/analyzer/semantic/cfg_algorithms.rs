@@ -12,7 +12,7 @@ use crate::analyzer::work_budget::{BudgetLedger, WorkBudgetExceeded, define_work
 /// Successor and predecessor iteration must be canonical and every returned edge
 /// must have the same endpoints as `edge_endpoints`. Implementations are views:
 /// algorithms never require a copied or normalized graph.
-pub(crate) trait DenseBidirectionalGraph {
+pub trait DenseBidirectionalGraph {
     type Node: Copy + Eq + Ord + std::fmt::Debug;
     type Edge: Copy + Eq + Ord + std::fmt::Debug;
 
@@ -73,10 +73,10 @@ define_work_dimensions! {
     /// Independently bounded kinds of CFG work.
     #[repr(u8)]
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub(crate) enum CfgAlgorithmLimit;
+    pub enum CfgAlgorithmLimit;
     /// Work completed by one or more algorithms sharing a request-local budget.
     #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
-    pub(crate) struct CfgAlgorithmWork;
+    pub struct CfgAlgorithmWork;
     all: [2];
     NodeVisits => node_visits = usize::MAX,
     EdgeVisits => edge_visits = usize::MAX,
@@ -84,38 +84,38 @@ define_work_dimensions! {
 
 /// Exact failed node- or edge-visit charge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct CfgAlgorithmBudgetExceeded {
-    pub(crate) limit_kind: CfgAlgorithmLimit,
-    pub(crate) limit: usize,
-    pub(crate) attempted: usize,
-    pub(crate) work: CfgAlgorithmWork,
+pub struct CfgAlgorithmBudgetExceeded {
+    pub limit_kind: CfgAlgorithmLimit,
+    pub limit: usize,
+    pub attempted: usize,
+    pub work: CfgAlgorithmWork,
 }
 
 /// Request-local two-dimensional CFG work budget.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CfgAlgorithmBudget {
+pub struct CfgAlgorithmBudget {
     ledger: BudgetLedger<CfgAlgorithmWork>,
 }
 
 impl CfgAlgorithmBudget {
-    pub(crate) const fn new(limits: CfgAlgorithmWork) -> Self {
+    pub const fn new(limits: CfgAlgorithmWork) -> Self {
         Self {
             ledger: BudgetLedger::new(limits, CfgAlgorithmWork::uniform(0)),
         }
     }
 
-    pub(crate) const fn uniform(limit: usize) -> Self {
+    pub const fn uniform(limit: usize) -> Self {
         Self::new(CfgAlgorithmWork {
             node_visits: limit,
             edge_visits: limit,
         })
     }
 
-    pub(crate) const fn limits(&self) -> CfgAlgorithmWork {
+    pub const fn limits(&self) -> CfgAlgorithmWork {
         self.ledger.limits()
     }
 
-    pub(crate) const fn used(&self) -> CfgAlgorithmWork {
+    pub const fn used(&self) -> CfgAlgorithmWork {
         self.ledger.used()
     }
 
@@ -146,7 +146,7 @@ fn budget_exceeded(
 
 /// Complete failure of a bounded algorithm. No variant contains a partial result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CfgAlgorithmError<Node> {
+pub enum CfgAlgorithmError<Node> {
     InvalidNode(Node),
     Cancelled { work: CfgAlgorithmWork },
     ExceededBudget(CfgAlgorithmBudgetExceeded),
@@ -154,13 +154,13 @@ pub(crate) enum CfgAlgorithmError<Node> {
 
 /// Borrowed controls shared by all CFG algorithms.
 #[derive(Debug)]
-pub(crate) struct CfgAlgorithmRequest<'request> {
-    pub(crate) budget: &'request mut CfgAlgorithmBudget,
-    pub(crate) cancellation: &'request CancellationToken,
+pub struct CfgAlgorithmRequest<'request> {
+    pub budget: &'request mut CfgAlgorithmBudget,
+    pub cancellation: &'request CancellationToken,
 }
 
 impl<'request> CfgAlgorithmRequest<'request> {
-    pub(crate) const fn new(
+    pub const fn new(
         budget: &'request mut CfgAlgorithmBudget,
         cancellation: &'request CancellationToken,
     ) -> Self {
@@ -190,6 +190,17 @@ impl<'request> CfgAlgorithmRequest<'request> {
             .map_err(CfgAlgorithmError::ExceededBudget)
     }
 
+    /// Charge one unit for considering one candidate node pair.
+    ///
+    /// A pairwise relation over a dense graph is quadratic in the node count,
+    /// and a caller that enumerates such a relation is doing graph work under
+    /// the same ledger the algorithms here charge against. Exposing the charge
+    /// keeps that work inside one budget instead of letting a consumer invent
+    /// a second, unrelated bound (issue #2443).
+    pub fn visit_pair<Node>(&mut self) -> Result<(), CfgAlgorithmError<Node>> {
+        self.visit_node()
+    }
+
     fn visit_edge<Node>(&mut self) -> Result<(), CfgAlgorithmError<Node>> {
         self.checkpoint()?;
         self.budget
@@ -203,21 +214,14 @@ impl<'request> CfgAlgorithmRequest<'request> {
 
 /// Complete reachability membership with dense-order iteration.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Reachability<Node> {
+pub struct Reachability<Node> {
     membership: Box<[bool]>,
     work: CfgAlgorithmWork,
     node: std::marker::PhantomData<Node>,
 }
 
 impl<Node: Copy> Reachability<Node> {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "dense membership is the current production consumer"
-        )
-    )]
-    pub(crate) fn contains<G>(&self, graph: &G, node: Node) -> bool
+    pub fn contains<G>(&self, graph: &G, node: Node) -> bool
     where
         G: DenseBidirectionalGraph<Node = Node>,
     {
@@ -228,17 +232,7 @@ impl<Node: Copy> Reachability<Node> {
             .unwrap_or(false)
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "dense membership is the current production consumer"
-        )
-    )]
-    pub(crate) fn iter<'graph, G>(
-        &'graph self,
-        graph: &'graph G,
-    ) -> impl Iterator<Item = Node> + 'graph
+    pub fn iter<'graph, G>(&'graph self, graph: &'graph G) -> impl Iterator<Item = Node> + 'graph
     where
         G: DenseBidirectionalGraph<Node = Node> + 'graph,
     {
@@ -249,18 +243,11 @@ impl<Node: Copy> Reachability<Node> {
             .map(|(index, _)| required_node(graph, index))
     }
 
-    pub(crate) fn membership(&self) -> &[bool] {
+    pub fn membership(&self) -> &[bool] {
         &self.membership
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "benchmark and future consumers inspect exact work"
-        )
-    )]
-    pub(crate) const fn work(&self) -> CfgAlgorithmWork {
+    pub const fn work(&self) -> CfgAlgorithmWork {
         self.work
     }
 }
@@ -271,7 +258,7 @@ enum Direction {
     Reverse,
 }
 
-pub(crate) fn forward_reachability<G>(
+pub fn forward_reachability<G>(
     graph: &G,
     start: G::Node,
     request: &mut CfgAlgorithmRequest<'_>,
@@ -282,7 +269,7 @@ where
     reachability(graph, start, Direction::Forward, request)
 }
 
-pub(crate) fn reverse_reachability<G>(
+pub fn reverse_reachability<G>(
     graph: &G,
     start: G::Node,
     request: &mut CfgAlgorithmRequest<'_>,
@@ -365,12 +352,12 @@ where
 
 /// Complete deterministic iterative DFS forest.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DepthFirstOrder<Node, Edge> {
-    pub(crate) preorder: Box<[Node]>,
-    pub(crate) postorder: Box<[Node]>,
-    pub(crate) reverse_postorder: Box<[Node]>,
-    pub(crate) back_edges: Box<[Edge]>,
-    pub(crate) work: CfgAlgorithmWork,
+pub struct DepthFirstOrder<Node, Edge> {
+    pub preorder: Box<[Node]>,
+    pub postorder: Box<[Node]>,
+    pub reverse_postorder: Box<[Node]>,
+    pub back_edges: Box<[Edge]>,
+    pub work: CfgAlgorithmWork,
 }
 
 type AlgorithmResult<T, Node> = Result<T, CfgAlgorithmError<Node>>;
@@ -386,7 +373,7 @@ enum DfsAction<Node, Edge> {
     Finish(Node),
 }
 
-pub(crate) fn depth_first_order<G>(
+pub fn depth_first_order<G>(
     graph: &G,
     request: &mut CfgAlgorithmRequest<'_>,
 ) -> AlgorithmResult<DepthFirstOrder<G::Node, G::Edge>, G::Node>
@@ -452,18 +439,14 @@ where
 
 /// Canonically ordered strongly connected components and dense membership.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StronglyConnectedComponents<Node> {
-    pub(crate) components: Box<[Box<[Node]>]>,
+pub struct StronglyConnectedComponents<Node> {
+    pub components: Box<[Box<[Node]>]>,
     component_by_node: Box<[usize]>,
-    pub(crate) work: CfgAlgorithmWork,
+    pub work: CfgAlgorithmWork,
 }
 
 impl<Node: Copy> StronglyConnectedComponents<Node> {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "SCC queries intentionally await a consumer")
-    )]
-    pub(crate) fn component_of<G>(&self, graph: &G, node: Node) -> Option<usize>
+    pub fn component_of<G>(&self, graph: &G, node: Node) -> Option<usize>
     where
         G: DenseBidirectionalGraph<Node = Node>,
     {
@@ -474,7 +457,7 @@ impl<Node: Copy> StronglyConnectedComponents<Node> {
     }
 }
 
-pub(crate) fn strongly_connected_components<G>(
+pub fn strongly_connected_components<G>(
     graph: &G,
     request: &mut CfgAlgorithmRequest<'_>,
 ) -> Result<StronglyConnectedComponents<G::Node>, CfgAlgorithmError<G::Node>>
@@ -564,7 +547,7 @@ where
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LoopEntryStructure {
+pub enum LoopEntryStructure {
     None,
     Single,
     Multiple,
@@ -572,25 +555,21 @@ pub(crate) enum LoopEntryStructure {
 
 /// One cyclic SCC described without an unsupported dominance claim.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LoopRegion<Node, Edge> {
-    pub(crate) members: Box<[Node]>,
-    pub(crate) entries: Box<[Node]>,
-    pub(crate) entry_structure: LoopEntryStructure,
-    pub(crate) back_edges: Box<[Edge]>,
-    pub(crate) has_self_loop: bool,
+pub struct LoopRegion<Node, Edge> {
+    pub members: Box<[Node]>,
+    pub entries: Box<[Node]>,
+    pub entry_structure: LoopEntryStructure,
+    pub back_edges: Box<[Edge]>,
+    pub has_self_loop: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LoopRegions<Node, Edge> {
-    pub(crate) regions: Box<[LoopRegion<Node, Edge>]>,
-    pub(crate) work: CfgAlgorithmWork,
+pub struct LoopRegions<Node, Edge> {
+    pub regions: Box<[LoopRegion<Node, Edge>]>,
+    pub work: CfgAlgorithmWork,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "issue 819 keeps loop regions available on demand")
-)]
-pub(crate) fn loop_regions<G>(
+pub fn loop_regions<G>(
     graph: &G,
     request: &mut CfgAlgorithmRequest<'_>,
 ) -> AlgorithmResult<LoopRegions<G::Node, G::Edge>, G::Node>
@@ -675,20 +654,13 @@ where
 
 /// One deterministic shortest path, including the exact selected rich edges.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ShortestPath<Node, Edge> {
-    pub(crate) nodes: Box<[Node]>,
-    pub(crate) edges: Box<[Edge]>,
-    pub(crate) work: CfgAlgorithmWork,
+pub struct ShortestPath<Node, Edge> {
+    pub nodes: Box<[Node]>,
+    pub edges: Box<[Edge]>,
+    pub work: CfgAlgorithmWork,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "issue 819 keeps shortest paths available on demand"
-    )
-)]
-pub(crate) fn shortest_path<G>(
+pub fn shortest_path<G>(
     graph: &G,
     start: G::Node,
     goal: G::Node,
@@ -776,21 +748,14 @@ where
 /// dominates them. The entry stores itself internally so the chain walk has a
 /// fixed point, and reports `None` externally because no node dominates it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Dominators<Node> {
+pub struct Dominators<Node> {
     immediate: Box<[Option<usize>]>,
     work: CfgAlgorithmWork,
     node: std::marker::PhantomData<Node>,
 }
 
 impl<Node: Copy> Dominators<Node> {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "issue 1480 milestone 2 flow-state derivation is the pending consumer"
-        )
-    )]
-    pub(crate) fn immediate_dominator<G>(&self, graph: &G, node: Node) -> Option<Node>
+    pub fn immediate_dominator<G>(&self, graph: &G, node: Node) -> Option<Node>
     where
         G: DenseBidirectionalGraph<Node = Node>,
     {
@@ -802,7 +767,7 @@ impl<Node: Copy> Dominators<Node> {
     /// Reflexive dominance: `a` dominates itself, and dominates `b` when every
     /// entry-to-`b` path passes through `a`. The idom chain is walked
     /// iteratively and strictly ascends, so the walk always terminates.
-    pub(crate) fn dominates<G>(&self, graph: &G, a: Node, b: Node) -> bool
+    pub fn dominates<G>(&self, graph: &G, a: Node, b: Node) -> bool
     where
         G: DenseBidirectionalGraph<Node = Node>,
     {
@@ -827,20 +792,13 @@ impl<Node: Copy> Dominators<Node> {
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "benchmark and future consumers inspect exact work"
-        )
-    )]
-    pub(crate) const fn work(&self) -> CfgAlgorithmWork {
+    pub const fn work(&self) -> CfgAlgorithmWork {
         self.work
     }
 }
 
 /// Cooper-Harvey-Kennedy iterative dominance over the nodes reachable from `entry`.
-pub(crate) fn dominators<G>(
+pub fn dominators<G>(
     graph: &G,
     entry: G::Node,
     request: &mut CfgAlgorithmRequest<'_>,
@@ -909,8 +867,8 @@ where
 /// Canonical live regions which are reachable from the procedure entry but
 /// have no structural path to either real exit.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct NonExitingRegion<Node> {
-    pub(crate) members: Box<[Node]>,
+pub struct NonExitingRegion<Node> {
+    pub members: Box<[Node]>,
 }
 
 /// Complete postdominator relation for the analyzable part of one procedure.
@@ -919,17 +877,16 @@ pub(crate) struct NonExitingRegion<Node> {
 /// never returned by the public queries. Live non-exiting points have no
 /// postdominator parent and are reported separately.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Postdominators<Node> {
+pub struct Postdominators<Node> {
     immediate: Box<[Option<usize>]>,
     synthetic_exit: usize,
-    pub(crate) non_exiting_regions: Box<[NonExitingRegion<Node>]>,
-    pub(crate) unreachable_points: usize,
-    pub(crate) work: CfgAlgorithmWork,
+    pub non_exiting_regions: Box<[NonExitingRegion<Node>]>,
+    pub unreachable_points: usize,
+    pub work: CfgAlgorithmWork,
 }
 
 impl<Node: Copy> Postdominators<Node> {
-    #[cfg_attr(not(test), expect(dead_code, reason = "algorithm contract query"))]
-    pub(crate) fn immediate_postdominator<G>(&self, graph: &G, node: Node) -> Option<Node>
+    pub fn immediate_postdominator<G>(&self, graph: &G, node: Node) -> Option<Node>
     where
         G: DenseBidirectionalGraph<Node = Node>,
     {
@@ -941,7 +898,7 @@ impl<Node: Copy> Postdominators<Node> {
         (parent != self.synthetic_exit).then(|| required_node(graph, parent))
     }
 
-    pub(crate) fn postdominates<G>(&self, graph: &G, a: Node, b: Node) -> bool
+    pub fn postdominates<G>(&self, graph: &G, a: Node, b: Node) -> bool
     where
         G: DenseBidirectionalGraph<Node = Node>,
     {
@@ -964,17 +921,17 @@ impl<Node: Copy> Postdominators<Node> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct ControlDependenceRow<Edge, Node> {
-    pub(crate) controlling_edge: Edge,
-    pub(crate) governed: Node,
+pub struct ControlDependenceRow<Edge, Node> {
+    pub controlling_edge: Edge,
+    pub governed: Node,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ControlDependenceResult<Edge, Node> {
-    pub(crate) rows: Box<[ControlDependenceRow<Edge, Node>]>,
-    pub(crate) non_exiting_regions: Box<[NonExitingRegion<Node>]>,
-    pub(crate) unreachable_points: usize,
-    pub(crate) work: CfgAlgorithmWork,
+pub struct ControlDependenceResult<Edge, Node> {
+    pub rows: Box<[ControlDependenceRow<Edge, Node>]>,
+    pub non_exiting_regions: Box<[NonExitingRegion<Node>]>,
+    pub unreachable_points: usize,
+    pub work: CfgAlgorithmWork,
 }
 
 /// Narrow cross-crate projection used by the extension runtime. The extension
@@ -1052,7 +1009,7 @@ pub fn derive_procedure_control_dependence(
     })
 }
 
-pub(crate) fn postdominators<G>(
+pub fn postdominators<G>(
     graph: &G,
     entry: G::Node,
     normal_exit: G::Node,
@@ -1216,7 +1173,7 @@ where
     Ok(postorder)
 }
 
-pub(crate) fn control_dependence<G>(
+pub fn control_dependence<G>(
     graph: &G,
     entry: G::Node,
     normal_exit: G::Node,
@@ -1342,7 +1299,7 @@ const DEFINITIONS_PER_WORD: usize = u64::BITS as usize;
 /// Definition identities are dense `usize` values minted by the caller. The
 /// node count must match the graph the facts are solved over.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct GenKillFacts {
+pub struct GenKillFacts {
     node_count: usize,
     definition_count: usize,
     words_per_node: usize,
@@ -1351,7 +1308,7 @@ pub(crate) struct GenKillFacts {
 }
 
 impl GenKillFacts {
-    pub(crate) fn new(node_count: usize, definition_count: usize) -> Self {
+    pub fn new(node_count: usize, definition_count: usize) -> Self {
         let words_per_node = definition_count.div_ceil(DEFINITIONS_PER_WORD);
         let words = node_count
             .checked_mul(words_per_node)
@@ -1365,12 +1322,12 @@ impl GenKillFacts {
         }
     }
 
-    pub(crate) fn record_generated(&mut self, node_index: usize, definition: usize) {
+    pub fn record_generated(&mut self, node_index: usize, definition: usize) {
         let (word, bit) = self.locate(node_index, definition);
         self.generated[word] |= bit;
     }
 
-    pub(crate) fn record_killed(&mut self, node_index: usize, definition: usize) {
+    pub fn record_killed(&mut self, node_index: usize, definition: usize) {
         let (word, bit) = self.locate(node_index, definition);
         self.killed[word] |= bit;
     }
@@ -1400,7 +1357,7 @@ impl GenKillFacts {
 /// transfer of IN through the node's gen/kill facts. Nodes unreachable from
 /// the entry carry the empty set.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ReachingSets {
+pub struct ReachingSets {
     node_count: usize,
     definition_count: usize,
     words_per_node: usize,
@@ -1409,14 +1366,7 @@ pub(crate) struct ReachingSets {
 }
 
 impl ReachingSets {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "issue 1480 milestone 2 flow-state derivation is the pending consumer"
-        )
-    )]
-    pub(crate) fn reaches_in(&self, node_index: usize, definition: usize) -> bool {
+    pub fn reaches_in(&self, node_index: usize, definition: usize) -> bool {
         assert!(
             node_index < self.node_count,
             "node index {node_index} outside {} nodes",
@@ -1432,7 +1382,7 @@ impl ReachingSets {
     }
 
     /// Ascending definition identities reaching the node's entry.
-    pub(crate) fn reaching_in(&self, node_index: usize) -> impl Iterator<Item = usize> + '_ {
+    pub fn reaching_in(&self, node_index: usize) -> impl Iterator<Item = usize> + '_ {
         assert!(
             node_index < self.node_count,
             "node index {node_index} outside {} nodes",
@@ -1450,14 +1400,7 @@ impl ReachingSets {
             })
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "benchmark and future consumers inspect exact work"
-        )
-    )]
-    pub(crate) const fn work(&self) -> CfgAlgorithmWork {
+    pub const fn work(&self) -> CfgAlgorithmWork {
         self.work
     }
 }
@@ -1466,7 +1409,7 @@ impl ReachingSets {
 ///
 /// The entry's IN set is the empty boundary set even when the entry has
 /// predecessors, so a definition never reaches the procedure's own start.
-pub(crate) fn reaching_definitions<G>(
+pub fn reaching_definitions<G>(
     graph: &G,
     entry: G::Node,
     facts: &GenKillFacts,
@@ -1569,7 +1512,7 @@ mod test_support {
     use super::DenseBidirectionalGraph;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-    pub(crate) struct SyntheticEdgeId(pub(crate) usize);
+    pub struct SyntheticEdgeId(pub usize);
 
     #[derive(Debug, Clone)]
     struct SyntheticEdge {
@@ -1579,7 +1522,7 @@ mod test_support {
     }
 
     #[derive(Debug)]
-    pub(crate) struct SyntheticGraph {
+    pub struct SyntheticGraph {
         nodes: usize,
         edges: Box<[SyntheticEdge]>,
         outgoing: Box<[Box<[SyntheticEdgeId]>]>,
@@ -1587,11 +1530,11 @@ mod test_support {
     }
 
     impl SyntheticGraph {
-        pub(crate) fn new(nodes: usize, edges: &[(usize, usize, u8)]) -> Self {
+        pub fn new(nodes: usize, edges: &[(usize, usize, u8)]) -> Self {
             Self::from_edges(nodes, edges.iter().copied())
         }
 
-        pub(crate) fn from_edges(
+        pub fn from_edges(
             nodes: usize,
             edges: impl IntoIterator<Item = (usize, usize, u8)>,
         ) -> Self {
@@ -1620,11 +1563,11 @@ mod test_support {
             }
         }
 
-        pub(crate) fn edge_count(&self) -> usize {
+        pub fn edge_count(&self) -> usize {
             self.edges.len()
         }
 
-        pub(crate) fn edge_label(&self, edge: SyntheticEdgeId) -> Option<u8> {
+        pub fn edge_label(&self, edge: SyntheticEdgeId) -> Option<u8> {
             self.edges.get(edge.0).map(|edge| edge.label)
         }
     }

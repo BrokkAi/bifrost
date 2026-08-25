@@ -6,6 +6,10 @@
 //! a value shape is therefore a macro error, and every handler must match the
 //! generated enum exhaustively.
 
+use brokk_bifrost_core::analyzer::structural::control_relation::{
+    ALL_CONTROL_EXIT_PARTITIONS, ALL_CONTROL_RELATION_KINDS, ControlExitPartition,
+    ControlRelationKind,
+};
 use brokk_bifrost_core::analyzer::structural::flow_state::{
     ALL_FLOW_CERTAINTIES, ALL_FLOW_RELATIONS, ALL_FLOW_SUBJECT_KINDS, ALL_STATE_EVENT_CLASSES,
     FlowCertainty, FlowRelation, FlowSubjectKind, StateEventClass,
@@ -129,6 +133,8 @@ pub enum ValueShape {
     FlowCertaintyList,
     RewriteDomainList,
     RewriteOutcomeList,
+    ControlRelationKindList,
+    ControlExitPartitionList,
 }
 
 impl ValueShape {
@@ -200,6 +206,8 @@ impl ValueShape {
             Self::FlowCertaintyList => "exact or may",
             Self::RewriteDomainList => "one or more rewrite domains",
             Self::RewriteOutcomeList => "converged, cycle, or exceeded-budget",
+            Self::ControlRelationKindList => "one or more control relations",
+            Self::ControlExitPartitionList => "one or more control exit partitions",
         }
     }
 
@@ -407,6 +415,10 @@ macro_rules! query_step_ops {
                 matches!(self, Self::RewritePathsOf)
             }
 
+            pub fn allows_control_relation_options(self) -> bool {
+                matches!(self, Self::ControlRelations)
+            }
+
             pub fn allows_binding_of_options(self) -> bool {
                 matches!(self, Self::BindingOf)
             }
@@ -495,6 +507,11 @@ query_step_ops! {
     FlowRelationsOf { label: "flow_relations_of", signature: "state_event|procedure -> flow_relation", description: "Derive the flow relations between the state events of each procedure: reaching-definition, dominance, and same-evaluation, each with exact or may certainty. Seeded from a state event, only the relations incident to that event are returned. Budget exhaustion emits no rows and an explicit incomplete diagnostic; it is never reported as an absent relation.", semantic: [Procedures, ProgramPoints, ControlEdges] }
     FlowSource { label: "flow_source", signature: "flow_relation -> state_event", description: "Project each flow relation to its source state event: the establishment or kill end." }
     FlowTarget { label: "flow_target", signature: "flow_relation -> state_event", description: "Project each flow relation to its target state event: the read end." }
+    ControlRelations { label: "control_relations", signature: "procedure -> control_relation", description: "Derive the control relations of each procedure from the shared control-flow algorithms over the production semantic IR: dominance, postdominance, control dependence, entry reachability, and loop membership between the procedure's own program points, joined by the same stable ids the program_point and control_edge rows publish. Every row states the exit partition its claim was computed against, so a backward claim can never be read as a claim about a partition that was not computed. Budget exhaustion or cancellation emits no row for the affected relation and an explicit incomplete diagnostic; it is never reported as an absent relation.", semantic: [Procedures, ProgramPoints, ControlEdges] }
+    GuardsOf { label: "guards_of", signature: "procedure -> guard", description: "Return the normalized branch conditions the language adapter recorded for each procedure: which decision point each guard sits on, what its condition was normalized to -- a compile-time constant, a null comparison, a comparison against a constant, or an explicitly opaque condition -- and the stable ids of the true and false successor edges. A constant condition is published even when lowering folded its dead arm away, which is the only place that evidence survives. An empty answer means the adapter records no guard facts for this language, which its own guard_facts capability states.", semantic: [Procedures, ProgramPoints, ControlEdges] }
+    TargetOf { label: "target_of", signature: "file -> build_target", description: "Return the build target each file compiles into, as the workspace's own build files declare it. Ownership comes from build evidence alone: a file no read build file claims produces no row, and a build model this workspace cannot read produces an explicit incomplete diagnostic rather than an empty answer that reads as \"no target\"." }
+    SourceSetOf { label: "source_set_of", signature: "file -> source_set", description: "Return the declared compilation input set each file belongs to, with the build file that fixes the layout. A file two declared source sets both claim is reported ambiguous rather than assigned to whichever was read first." }
+    TopologyEdgesOf { label: "topology_edges_of", signature: "build_target -> topology_edge", description: "Return the dependencies each build target declares on other targets of the same workspace, each carrying its build-declared scope and the build file that declares it. The absence of an edge is only publishable when the topology it was read from is complete, which the row's own completeness column states." }
     RewritePathsOf { label: "rewrite_paths_of", signature: "file -> rewrite_path", description: "Enumerate the bounded rewrite chases each file engages in a declared finite rewrite domain: the ordered steps a production analysis took, the bound the domain declared for itself, and the terminal outcome -- converged with its fixed point, cycle with the ordered repeated-state witness, or exceeded-budget with the work performed. Budget exhaustion is absence of evidence, never a proven cycle and never a clean convergence." }
     SegmentsOf { label: "segments_of", signature: "qualified_path -> path_segment", description: "Return each path's ordered segment rows with decoded text, spelled generic arity, and (with :resolved true) each segment's own prefix resolution." }
     SegmentTarget { label: "segment_target", signature: "path_segment -> declaration", description: "Project the workspace declarations each path segment's own position resolves to." }
@@ -504,6 +521,29 @@ query_step_ops! {
     ImplementationOf { label: "implementation_of", signature: "declaration_state|declaration -> declaration", description: "Return the runnable implementation a declaration-only signature links to." }
     StubsOf { label: "stubs_of", signature: "declaration -> declaration_state", description: "Return the declaration-only stub state rows whose implementation link resolves to each declaration; composed with except, this lists the stubs no implementation answers." }
     ExportTarget { label: "export_target", signature: "export -> declaration", description: "Project the declaration an export row materialized, where the analyzer models one." }
+}
+
+/// The generated step reference: one line per registry step, in
+/// [`ALL_QUERY_STEP_OPS`] order, spelled `label (input -> output): meaning`.
+///
+/// This is the only step reference Bifrost publishes to a caller. The MCP
+/// `query_code` `steps` parameter schema carries it, and `bifrost --help
+/// query_code` prints it out of that same schema, so a step added to the
+/// registry above documents itself on both surfaces and no help text anywhere
+/// repeats the vocabulary.
+pub fn query_step_reference() -> String {
+    let mut reference = String::new();
+    for op in ALL_QUERY_STEP_OPS {
+        if !reference.is_empty() {
+            reference.push('\n');
+        }
+        reference.push_str(op.label());
+        reference.push_str(" (");
+        reference.push_str(op.signature());
+        reference.push_str("): ");
+        reference.push_str(op.description());
+    }
+    reference
 }
 
 macro_rules! rql_form_description {
@@ -691,6 +731,11 @@ macro_rules! rql_forms {
                     | Self::FlowRelationsOf
                     | Self::FlowSource
                     | Self::FlowTarget
+                    | Self::ControlRelations
+                    | Self::TargetOf
+                    | Self::SourceSetOf
+                    | Self::TopologyEdgesOf
+                    | Self::GuardsOf
                     | Self::RewritePathsOf => None,
                     Self::Name => Some(RqlProperty::Name),
                     Self::NameRegex => Some(RqlProperty::NameRegex),
@@ -1420,6 +1465,46 @@ rql_forms! {
         description: (QueryStepOp::FlowTarget),
         step: FlowTarget,
     }
+    ControlRelations {
+        labels: ["control-relations", "control_relations"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(control-relations [:relation [dominates|postdominates|control-depends-on|reachable|in-loop ...]] [:exit-partition [normal-and-exceptional ...]] query)",
+        description: (QueryStepOp::ControlRelations),
+        step: ControlRelations,
+    }
+    GuardsOf {
+        labels: ["guards-of", "guards_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(guards-of query)",
+        description: (QueryStepOp::GuardsOf),
+        step: GuardsOf,
+    }
+    TargetOf {
+        labels: ["target-of", "target_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(target-of query)",
+        description: (QueryStepOp::TargetOf),
+        step: TargetOf,
+    }
+    SourceSetOf {
+        labels: ["source-set-of", "source_set_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(source-set-of query)",
+        description: (QueryStepOp::SourceSetOf),
+        step: SourceSetOf,
+    }
+    TopologyEdgesOf {
+        labels: ["topology-edges-of", "topology_edges_of"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(topology-edges-of query)",
+        description: (QueryStepOp::TopologyEdgesOf),
+        step: TopologyEdgesOf,
+    }
     RewritePathsOf {
         labels: ["rewrite-paths-of", "rewrite_paths_of"],
         class: Wrapper,
@@ -1751,6 +1836,8 @@ json_fields! {
     RewriteDomains { label: "domain", shape: RewriteDomainList, signature: "\"domain\": [\"rust_import_alias\"]", description: "Restrict rewrite-path rows to one or more declared rewrite domains." }
     RewriteOutcomes { label: "rewrite_outcome", shape: RewriteOutcomeList, signature: "\"rewrite_outcome\": [\"converged\", \"cycle\", \"exceeded_budget\"]", description: "Restrict rewrite-path rows to one or more terminal outcomes." }
     FlowCertainties { label: "certainty", shape: FlowCertaintyList, signature: "\"certainty\": [\"exact\", \"may\"]", description: "Restrict flow-relation rows to one or more certainties." }
+    ControlRelations { label: "control_relation", shape: ControlRelationKindList, signature: "\"control_relation\": [\"dominates\", ...]", description: "Restrict control-relation rows to one or more relations." }
+    ControlExitPartitions { label: "exit_partition", shape: ControlExitPartitionList, signature: "\"exit_partition\": [\"normal_and_exceptional\"]", description: "Restrict control-relation rows to one or more exit partitions the claim was computed against." }
 }
 
 // The scope filter has exactly one axis, and its JSON key is `kind` -- the same
@@ -1904,6 +1991,18 @@ pub fn flow_state_option_for_rql_label(op: QueryStepOp, label: &str) -> Option<Q
         .find(|option| option.accepts_rql_label(label))
 }
 
+/// Options of the `control-relations` step (#2443).
+pub const CONTROL_RELATION_STEP_OPTIONS: &[QueryStepOption] = &[
+    QueryStepOption::optional(
+        QueryStepField::ControlRelations,
+        &[":relation", ":relations"],
+    ),
+    QueryStepOption::optional(
+        QueryStepField::ControlExitPartitions,
+        &[":exit-partition", ":exit_partition", ":exit-partitions"],
+    ),
+];
+
 /// Options of the `rewrite-paths-of` step (#1480).
 pub const REWRITE_PATH_STEP_OPTIONS: &[QueryStepOption] = &[
     QueryStepOption::optional(QueryStepField::RewriteDomains, &[":domain", ":domains"]),
@@ -1987,6 +2086,7 @@ impl QueryStepOp {
             Self::DeclarationStateOf => DECLARATION_STATE_STEP_OPTIONS,
             Self::StateEventsOf => STATE_EVENT_STEP_OPTIONS,
             Self::FlowRelationsOf => FLOW_RELATION_STEP_OPTIONS,
+            Self::ControlRelations => CONTROL_RELATION_STEP_OPTIONS,
             Self::RewritePathsOf => REWRITE_PATH_STEP_OPTIONS,
             _ => &[],
         }
@@ -2138,7 +2238,36 @@ pub fn constrained_step_option_labels(field: QueryStepField) -> Vec<&'static str
     if !flow_state.is_empty() {
         return flow_state;
     }
-    rewrite_path_filter_labels(field)
+    let rewrite_path = rewrite_path_filter_labels(field);
+    if !rewrite_path.is_empty() {
+        return rewrite_path;
+    }
+    control_relation_filter_labels(field)
+}
+
+/// The constrained-value vocabulary each control-relation filter axis accepts,
+/// in canonical registry order, so parser, validator, hover and completion all
+/// read one table (#2443).
+pub fn control_relation_filter_labels(field: QueryStepField) -> Vec<&'static str> {
+    match field {
+        QueryStepField::ControlRelations => ALL_CONTROL_RELATION_KINDS
+            .iter()
+            .map(|relation| relation.label())
+            .collect(),
+        QueryStepField::ControlExitPartitions => ALL_CONTROL_EXIT_PARTITIONS
+            .iter()
+            .map(|partition| partition.label())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+pub fn control_relation_kind_from_label(label: &str) -> Option<ControlRelationKind> {
+    ControlRelationKind::from_label(label)
+}
+
+pub fn control_exit_partition_from_label(label: &str) -> Option<ControlExitPartition> {
+    ControlExitPartition::from_label(label)
 }
 
 /// The constrained-value vocabulary each rewrite-path filter axis accepts, in
@@ -2380,6 +2509,27 @@ mod tests {
             assert_eq!(
                 StringPredicateField::from_label(field.label()),
                 Some(*field)
+            );
+        }
+    }
+
+    #[test]
+    fn step_reference_is_exhaustive_over_the_registry() {
+        let reference = query_step_reference();
+        let lines: Vec<&str> = reference.lines().collect();
+        assert_eq!(
+            lines.len(),
+            ALL_QUERY_STEP_OPS.len(),
+            "the step reference must publish exactly one line per registry step"
+        );
+        // Registry order, so a caller reading the reference and a caller
+        // reading the step enum see the same sequence.
+        for (line, op) in lines.iter().zip(ALL_QUERY_STEP_OPS) {
+            assert_eq!(
+                *line,
+                format!("{} ({}): {}", op.label(), op.signature(), op.description()),
+                "step {} renders its own registry row",
+                op.label()
             );
         }
     }

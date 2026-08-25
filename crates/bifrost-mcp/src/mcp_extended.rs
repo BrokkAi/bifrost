@@ -1,15 +1,15 @@
-use crate::analyzer::structural::{
+use crate::mcp_common::{McpRenderOptions, run_stdio_server, tool_descriptor};
+use crate::rql::{
     ALL_KINDS, ALL_OWNER_RELATIONS, ALL_SITE_CLASSES, DEFAULT_LIMIT, MAX_BINDING_NAME_LENGTH,
     MAX_CAPTURE_LENGTH, MAX_GLOB_LENGTH, MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS,
     MAX_LIMIT, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES, MAX_QUERY_BRANCHES, MAX_QUERY_STEPS,
     MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, SCHEMA_VERSION,
 };
-use crate::mcp_common::{McpRenderOptions, run_stdio_server, tool_descriptor};
 use brokk_bifrost_rql::schema::{
     ALL_CODE_QUERY_EXECUTION_MODES, ALL_QUERY_STEP_OPS, ALL_REFERENCE_KINDS, ALL_USAGE_KINDS,
-    QueryField, QueryStepField, environment_filter_labels, flow_state_filter_labels,
-    occurrence_filter_labels, reference_kind_label, rewrite_path_filter_labels,
-    supported_query_schema_versions,
+    QueryField, QueryStepField, control_relation_filter_labels, environment_filter_labels,
+    flow_state_filter_labels, occurrence_filter_labels, reference_kind_label,
+    rewrite_path_filter_labels, supported_query_schema_versions,
 };
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -120,6 +120,7 @@ fn query_step_input_variants() -> Vec<Value> {
                 && !op.allows_edge_options()
                 && !op.allows_state_event_options()
                 && !op.allows_flow_relation_options()
+                && !op.allows_control_relation_options()
                 && !op.allows_rewrite_path_options()
                 && !op.allows_segment_options()
                 && op.label() != "call_input"
@@ -226,6 +227,12 @@ fn query_step_input_variants() -> Vec<Value> {
         .iter()
         .copied()
         .filter(|op| op.allows_rewrite_path_options())
+        .map(|op| op.label())
+        .collect::<Vec<_>>();
+    let control_relation_steps = ALL_QUERY_STEP_OPS
+        .iter()
+        .copied()
+        .filter(|op| op.allows_control_relation_options())
         .map(|op| op.label())
         .collect::<Vec<_>>();
     let segment_steps = ALL_QUERY_STEP_OPS
@@ -527,6 +534,17 @@ fn query_step_input_variants() -> Vec<Value> {
         json!({
             "type": "object",
             "properties": {
+                "op": { "type": "string", "enum": control_relation_steps },
+                "control_relation": control_relation_label_array(QueryStepField::ControlRelations),
+                "exit_partition":
+                    control_relation_label_array(QueryStepField::ControlExitPartitions)
+            },
+            "required": ["op"],
+            "additionalProperties": false
+        }),
+        json!({
+            "type": "object",
+            "properties": {
                 "op": { "type": "string", "enum": rewrite_path_steps },
                 "domain": rewrite_path_label_array(QueryStepField::RewriteDomains),
                 "rewrite_outcome": rewrite_path_label_array(QueryStepField::RewriteOutcomes)
@@ -627,6 +645,12 @@ fn flow_state_label_array(field: QueryStepField) -> Value {
 /// so the MCP surface cannot drift from the parser's vocabulary (#1480).
 fn rewrite_path_label_array(field: QueryStepField) -> Value {
     constrained_label_array(rewrite_path_filter_labels(field), field.description())
+}
+
+/// One control-relation constrained-value axis, read from the schema registry
+/// so the MCP surface cannot drift from the parser's vocabulary (#2443).
+fn control_relation_label_array(field: QueryStepField) -> Value {
+    constrained_label_array(control_relation_filter_labels(field), field.description())
 }
 
 fn edge_usage_kind_array() -> Value {
@@ -734,6 +758,23 @@ fn occurrence_filter_schema() -> Value {
     })
 }
 
+/// The `query_code` discovery description. Stable prose against the
+/// `MCP_DISCOVERY_TEXT_MAX_CHARS` budget: it names no step, so adding a step
+/// family cannot grow it. A test asserts that no registry step label appears
+/// here.
+const QUERY_CODE_DESCRIPTION: &str = "Query normalized code structure with CodeQuery or RQL. Match declarations and syntax, compose compatible typed branches with union, intersect, or except, then apply typed semantic steps. The steps parameter schema documents every available step: its name, its typed signature, and what it returns. Set branches must produce the same terminal domain, and a common steps suffix can continue from that domain. Steps that run a registered analysis take a host-registered reference and project retained production evidence; they do not compile selectors, run propagation, or imply policy classification. Example: {\"schema_version\":1,\"match\":{\"kind\":\"method\",\"name\":\"run\"}}. Guide: https://bifrost.brokk.ai/code-querying/";
+
+/// What a nested set branch says about its own `steps`. A branch accepts the
+/// same step vocabulary as the root, so the generated reference is attached
+/// once, to the top-level `steps` parameter, rather than repeating several
+/// thousand characters into `$defs/queryPlan` in the same payload.
+const BRANCH_QUERY_STEPS_DESCRIPTION: &str = "Ordered typed transformations for this branch. Same step vocabulary as the top-level steps parameter, whose description carries the step reference.";
+
+/// The prose that introduces the generated step reference on the top-level
+/// `steps` parameter. It states how to read a reference line and nothing that
+/// the registry itself already states.
+const QUERY_STEPS_DESCRIPTION_PREFACE: &str = "Ordered typed transformations applied in order. Each step consumes one typed domain and produces another, so a pipeline is valid when adjacent step signatures compose, and the last step fixes the result domain. Every step this build accepts is listed below as `name (input -> output): meaning`.";
+
 fn query_plan_properties(
     pattern_schema_description: &str,
     query_step_variants: &[Value],
@@ -796,7 +837,7 @@ fn query_plan_properties(
             "type": "array",
             "maxItems": MAX_QUERY_STEPS,
             "items": { "oneOf": query_step_variants },
-            "description": "Ordered typed transformations. Hierarchy/member/owner steps consume and produce exact indexed declarations; import steps consume files; schema-v3 CFG steps consume and produce source-backed procedures, program points, and control edges; schema-v4 typestate consumes a host registration and witness projects retained evidence."
+            "description": BRANCH_QUERY_STEPS_DESCRIPTION
         }
     })
     .as_object()
@@ -862,7 +903,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
         .map(|kind| kind.label())
         .collect::<Vec<_>>()
         .join(", ");
-    let role_vocabulary = crate::analyzer::structural::kinds::ALL_ROLES
+    let role_vocabulary = crate::rql::kinds::ALL_ROLES
         .iter()
         .map(|role| role.label())
         .collect::<Vec<_>>()
@@ -870,18 +911,23 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
     let pattern_schema_description = format!(
         "A structural pattern object. Fields are optional: kind (one normalized kind or an array forming a subtype-aware union; vocabulary: {kind_vocabulary}), not_kind (kind or array to exclude), name (string for exact match or {{\"regex\": ...}}, max {MAX_STRING_PREDICATE_LENGTH} bytes), text ({{\"regex\": ...}}, max {MAX_STRING_PREDICATE_LENGTH} bytes), capture (max {MAX_CAPTURE_LENGTH} bytes), has / not_has (descendant patterns), and role sub-patterns valid for the declared kind: {role_vocabulary}. Query budget: max {MAX_PATTERN_NODES} pattern nodes, max depth {MAX_PATTERN_DEPTH}, max {MAX_ROLE_LIST_ENTRIES} role-list entries per list, max {MAX_KWARGS} kwargs, max keyword length {MAX_KWARG_NAME_LENGTH} bytes."
     );
-    let step_vocabulary = ALL_QUERY_STEP_OPS
-        .iter()
-        .map(|op| op.label())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let query_code_description = format!(
-        "Query normalized code structure with CodeQuery or RQL. Match declarations and syntax, compose compatible typed branches with union, intersect, or except, and apply typed semantic steps. Schema version 1 supports {step_vocabulary}. Set branches must produce the same terminal domain. A common steps suffix can continue from that domain. Use execution_mode explain to plan without workspace execution. Use profile for ordinary results with operator measurements. Procedure-local CFG steps return procedures, program points, and control edges. Typestate, value-flow, and taint steps use host-registered references and return retained production evidence. The taint step projects existing findings; it does not compile selectors or run propagation. It does not imply policy classification. Example: {{\"schema_version\":1,\"match\":{{\"kind\":\"method\",\"name\":\"run\"}}}}. Guide: https://bifrost.brokk.ai/code-querying/"
-    );
     let query_step_variants = query_step_input_variants();
     let query_plan_schema = query_plan_schema(&pattern_schema_description, &query_step_variants);
     let mut query_code_properties =
         query_plan_properties(&pattern_schema_description, &query_step_variants);
+    // The step vocabulary is published here, generated from the RQL registry,
+    // and nowhere else: an MCP client reads this parameter description, and
+    // `bifrost --help query_code` prints it. Spelling the vocabulary in the
+    // tool description instead spent roughly fifteen characters of the
+    // `MCP_DISCOVERY_TEXT_MAX_CHARS` budget per added step and forced a prose
+    // trim every time a step family landed.
+    let steps_description = format!(
+        "{QUERY_STEPS_DESCRIPTION_PREFACE}\n{}",
+        brokk_bifrost_rql::schema::query_step_reference()
+    );
+    query_code_properties
+        .get_mut("steps")
+        .expect("query plan properties declare steps")["description"] = json!(steps_description);
     let execution_modes = ALL_CODE_QUERY_EXECUTION_MODES
         .iter()
         .map(|mode| mode.label())
@@ -942,7 +988,7 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
     vec![
         tool_descriptor(
             "query_code",
-            &query_code_description,
+            QUERY_CODE_DESCRIPTION,
             json!({
                 "type": "object",
                 "properties": query_code_properties,
@@ -1273,6 +1319,31 @@ pub(crate) fn extended_tool_descriptors() -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn steps_parameter_schema_documents_every_registry_step() {
+        let query_code = extended_tool_descriptors()
+            .into_iter()
+            .find(|descriptor| descriptor["name"] == "query_code")
+            .expect("query_code descriptor");
+        let steps_description = query_code["inputSchema"]["properties"]["steps"]["description"]
+            .as_str()
+            .expect("steps parameter description")
+            .to_string();
+        assert!(steps_description.starts_with(QUERY_STEPS_DESCRIPTION_PREFACE));
+        // The reference is what an MCP client reads instead of the tool
+        // description, so every step the build accepts has to be in it with
+        // the signature and meaning the registry states.
+        for op in ALL_QUERY_STEP_OPS {
+            let line = format!("{} ({}): {}", op.label(), op.signature(), op.description());
+            assert!(
+                steps_description.lines().any(|rendered| rendered == line),
+                "steps parameter schema is missing step `{}`",
+                op.label()
+            );
+        }
+    }
 
     #[test]
     fn query_code_schema_exposes_typed_pipeline_steps() {
@@ -1282,56 +1353,44 @@ mod tests {
             .expect("query_code descriptor");
         let steps = &query_code["inputSchema"]["properties"]["steps"];
         assert_eq!(steps["maxItems"], MAX_QUERY_STEPS);
-        assert_eq!(
-            steps["items"]["oneOf"][0]["properties"]["op"]["enum"],
-            json!([
-                "enclosing_decl",
-                "procedure_of",
-                "cfg_entry",
-                "cfg_exits",
-                "cfg_successor_edges",
-                "cfg_predecessor_edges",
-                "cfg_edge_source",
-                "cfg_edge_target",
-                "file_of",
-                "imports_of",
-                "importers_of",
-                "members",
-                "owner",
-                "receiver_outcome",
-                "receiver_evidence",
-                "call_shape",
-                "call_argument_groups",
-                "call_arguments",
-                "call_effects",
-                "procedure_effects",
-                "call_bindings",
-                "callable_signature",
-                "signature_parameters",
-                "callable_applicability",
-                "overload_selection",
-                "member_selection",
-                "dispatch_outcome",
-                "dispatch_targets",
-                "member_family",
-                "family_edges",
-                "occurrence_target",
-                "scope_of",
-                "scope_ancestors",
-                "binding_occurrence",
-                "candidate_hierarchy",
-                "candidate_target",
-                "edge_target",
-                "flow_source",
-                "flow_target",
-                "segment_target",
-                "generates",
-                "generated_by",
-                "declaration_state_of",
-                "implementation_of",
-                "stubs_of",
-                "export_target"
-            ])
+        // The accepted ops and the registry are the same set. A step may appear
+        // in several variants because its option shapes are separate variants,
+        // so this is set coverage and not a per-variant count. The expectation
+        // is derived from the registry rather than transcribed, because a
+        // transcribed list silently stops covering the step a later slice adds
+        // -- `060129ca8` added three topology steps and this assertion carried
+        // the pre-topology list forward.
+        let mut accepted: HashSet<&str> = HashSet::new();
+        for variant in steps["items"]["oneOf"]
+            .as_array()
+            .expect("step variants are an array")
+        {
+            let op = &variant["properties"]["op"];
+            match op["enum"].as_array() {
+                Some(labels) => accepted.extend(
+                    labels
+                        .iter()
+                        .map(|label| label.as_str().expect("step op labels are strings")),
+                ),
+                None => {
+                    accepted.insert(
+                        op["const"]
+                            .as_str()
+                            .expect("each step variant constrains op by enum or const"),
+                    );
+                }
+            }
+        }
+        for op in ALL_QUERY_STEP_OPS {
+            assert!(
+                accepted.remove(op.label()),
+                "step `{}` is not accepted by any step variant",
+                op.label()
+            );
+        }
+        assert!(
+            accepted.is_empty(),
+            "step schema accepts ops that are not in the registry: {accepted:?}"
         );
         assert_eq!(
             steps["items"]["oneOf"][2]["properties"]["depth"]["minimum"],
@@ -1399,24 +1458,104 @@ mod tests {
             MAX_CAPTURE_LENGTH
         );
         assert_eq!(receiver_variant["required"], json!(["op"]));
-        let advertised = steps["items"]["oneOf"]
+        let variants = steps["items"]["oneOf"]
             .as_array()
-            .unwrap()
-            .iter()
-            .flat_map(|variant| {
-                variant["properties"]["op"]["enum"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
-                    .chain(variant["properties"]["op"]["const"].as_str())
-            })
+            .expect("typed query-step variants");
+        let variant_ops = |variant: &Value| {
+            variant["properties"]["op"]["enum"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .chain(
+                    variant["properties"]["op"]["const"]
+                        .as_str()
+                        .map(str::to_owned),
+                )
+                .collect::<Vec<_>>()
+        };
+        let mut advertised_counts = std::collections::BTreeMap::new();
+        for variant in variants {
+            for label in variant_ops(variant)
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+            {
+                *advertised_counts.entry(label).or_insert(0) += 1;
+            }
+        }
+        let advertised = advertised_counts
+            .keys()
+            .map(String::as_str)
             .collect::<std::collections::BTreeSet<_>>();
         let registered = ALL_QUERY_STEP_OPS
             .iter()
             .map(|op| op.label())
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(advertised, registered);
+
+        // The first variant is the option-free form. Operators with a
+        // constrained option axis must appear only in their matching variant;
+        // hierarchy and call-input operators intentionally have multiple
+        // forms for their required options.
+        let plain_ops = variant_ops(&variants[0])
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        for op in ALL_QUERY_STEP_OPS {
+            let option_bearing = [
+                op.allows_hierarchy_options(),
+                op.allows_reference_options(),
+                op.allows_call_options(),
+                op.allows_call_site_options(),
+                op.allows_receiver_options(),
+                op.allows_typestate_options(),
+                op.allows_value_flow_options(),
+                op.allows_taint_options(),
+                op.allows_witness_options(),
+                op.allows_occurrence_options(),
+                op.allows_binding_options(),
+                op.allows_candidate_options(),
+                op.allows_binding_of_options(),
+                op.allows_edge_options(),
+                op.allows_state_event_options(),
+                op.allows_flow_relation_options(),
+                op.allows_control_relation_options(),
+                op.allows_rewrite_path_options(),
+                op.allows_segment_options(),
+            ]
+            .into_iter()
+            .any(std::convert::identity);
+            let expected_variants = if op.label() == "call_input" || op.allows_hierarchy_options() {
+                3
+            } else {
+                1
+            };
+            assert_eq!(
+                advertised_counts.get(op.label()),
+                Some(&expected_variants),
+                "operator {} appears in the wrong number of schema variants",
+                op.label()
+            );
+            if option_bearing {
+                assert!(
+                    !plain_ops.contains(op.label()),
+                    "option-bearing {} leaked into plain",
+                    op.label()
+                );
+            } else if op.label() != "call_input" {
+                assert!(
+                    plain_ops.contains(op.label()),
+                    "plain {} is not accepted",
+                    op.label()
+                );
+            }
+        }
+        for op in ["target_of", "source_set_of", "topology_edges_of"] {
+            assert!(
+                plain_ops.contains(op),
+                "topology operator {op} must be plain"
+            );
+        }
         let occurrence_variant = steps["items"]["oneOf"]
             .as_array()
             .unwrap()
@@ -1567,13 +1706,25 @@ mod tests {
             "union",
             "intersect",
             "except",
-            "steps",
         ] {
             assert_eq!(
                 query_code["inputSchema"]["properties"][field], nested_plan["properties"][field],
                 "root and nested plan schemas drifted for {field}"
             );
         }
+        // A branch accepts exactly the steps the root accepts. Only the prose
+        // differs: the generated step reference is attached once, to the root
+        // parameter, and the branch points at it rather than repeating several
+        // thousand characters into the same payload.
+        let root_steps = &query_code["inputSchema"]["properties"]["steps"];
+        let nested_steps = &nested_plan["properties"]["steps"];
+        for field in ["type", "maxItems", "items"] {
+            assert_eq!(
+                root_steps[field], nested_steps[field],
+                "root and nested step schemas drifted for {field}"
+            );
+        }
+        assert_eq!(nested_steps["description"], BRANCH_QUERY_STEPS_DESCRIPTION);
         for op in ["union", "intersect", "except"] {
             let variant = nested_plan["oneOf"]
                 .as_array()

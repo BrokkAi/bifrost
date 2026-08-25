@@ -5,10 +5,25 @@ analysis behavior, integrations, and release artifacts. It is curated from the
 complete private release range because the public open-core repository is a
 projection and its commit history does not contain every source commit.
 
-## [0.10.6] - Unreleased
+## [0.10.6] - 2026-08-25
 
 ### Added
 
+- Shipped standard-library procedure-summary packs for three new languages:
+  Rust (`bifrost.rust-std-golden-summaries`), JavaScript, and TypeScript
+  (`bifrost.javascript-golden-summaries`, `bifrost.typescript-golden-summaries`),
+  joining the existing JDK and CPython golden packs so every policy-pack
+  language carries stdlib taint-flow summaries.
+- Rust, JavaScript, and TypeScript call sites now publish bindable external
+  identities: Rust `::`-qualified and `use`-imported callees, JS/TS
+  module-bound callees (`path.join` after an import or `require`), and JS/TS
+  runtime globals (`JSON.parse`, `Buffer.from`) can all bind authored
+  procedure summaries under `require-model` taint policies.
+- Golden summary packs can activate language-intrinsically for ecosystems
+  without toolchain version evidence (cargo, npm).
+- Added configurable forward, backward, and automatic direction planning for
+  value-flow, taint, and typestate analyses, with selection reasons and work
+  estimates.
 - Added bounded near-miss ranking to policy explanations in the CLI and MCP,
   helping authors understand why an expected policy match was not produced.
 - Made the standalone `bifrost-policy-scan` action publishable through the
@@ -16,12 +31,45 @@ projection and its commit history does not contain every source commit.
 
 ### Changed
 
+- Split flow solvers and RQL execution into dedicated public crates, reducing
+  analyzer coupling while preserving the facade query API and wire formats.
+- Made reusable flow caches explicitly owned by each logical workspace so MCP,
+  LSP, runtime, and policy evaluation retain them across analyzer replacement.
+- Accelerated definition navigation and path-scoped Java caller scans with
+  targeted, bounded relational queries.
 - GitHub Releases now use this curated version entry as their release notes
   instead of generating an incomplete list from projected pull requests.
+- Rust `Self` is no longer reported as a textual type reference to its nominal
+  owner. It still resolves associated members, return types, and constructors
+  inside an `impl`, but rename and reference results list only explicit
+  nominal-type tokens.
+- Scala find-usages of a base method no longer reports statically concrete
+  calls made through a subtype receiver; the overriding declaration is still
+  reported, so the family stays reachable in one hop. Case-class `copy` now
+  navigates to the case class itself while still carrying the generated-member
+  provenance that names the rule which produced it.
+- C# references to a `using` alias navigate to the written alias binder,
+  matching Roslyn go-to-definition. An alias whose target the workspace does
+  not index still reports the unresolvable import boundary rather than
+  resolving to a dead end.
 
 ### Fixed
 
+- Recovered MCP tool calls from stale analyzer snapshots after workspace
+  changes instead of returning a persistent store error.
+- Restored bounded Kotlin constructor usage scans by avoiding unnecessary
+  polymorphic candidate expansion.
+- Fixed `analyze_diff` context expansion so changed symbols retain the
+  workspace-qualified names and newly referenced declarations are reported.
+- Reduced repeated `go.mod` discovery in large multi-module Go workspaces by
+  memoizing nearest-module resolution for sibling files.
+- Made every symbol spelling emitted by file summaries resolve back to its
+  declaration, including dollar-prefixed JavaScript names, Scala companions,
+  and basename-qualified C/C++ selectors.
 - Included the sigil in static PHP property usage ranges.
+- Rejected a malformed `run_policy` suppression document during request
+  preparation, returning one bounded unreliable report instead of spending
+  workspace readiness and analyzer admission before failing.
 
 ## [0.10.5] - 2026-08-21
 

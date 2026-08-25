@@ -1,15 +1,11 @@
 //! The `LanguageAdapter` forwarding shell for Java.
 //!
-//! Every answer below comes from [`brokk_bifrost_jvm`] except
-//! `callable_arity`, which reads only core `SignatureMetadata` and names no
-//! Java syntax.
+//! Every answer below comes from [`brokk_bifrost_jvm`].
 
 use super::*;
 use crate::analyzer::cognitive_complexity;
-use crate::analyzer::{LanguageAdapter, SignatureMetadata};
-use brokk_bifrost_jvm::java::adapter::{
-    JAVA_COGNITIVE_CONFIG, JAVA_FILE_EXTENSION, java_callable_return_type_text,
-};
+use crate::analyzer::{FqName, LanguageAdapter};
+use brokk_bifrost_jvm::java::adapter::{JAVA_COGNITIVE_CONFIG, JAVA_FILE_EXTENSION};
 use brokk_bifrost_jvm::java::declarations::{
     extract_java_call_receiver, is_java_anonymous_structure, normalize_java_full_name,
     parse_java_file,
@@ -40,21 +36,8 @@ impl LanguageAdapter for JavaAdapter {
         normalize_java_full_name(fq_name)
     }
 
-    fn callable_arity(
-        &self,
-        _signature: &str,
-        metadata: Option<&SignatureMetadata>,
-    ) -> Option<usize> {
-        metadata.map(|metadata| {
-            metadata
-                .callable_arity()
-                .map(|arity| arity.total())
-                .unwrap_or_else(|| metadata.parameters().len())
-        })
-    }
-
-    fn callable_return_type_text<'a>(&self, signature: &'a str) -> Option<&'a str> {
-        java_callable_return_type_text(signature)
+    fn normalize_fq_name(&self, fq_name: &FqName) -> FqName {
+        brokk_bifrost_jvm::java::declarations::normalize_java_fq_name(fq_name)
     }
 
     fn is_anonymous_structure(&self, fq_name: &str) -> bool {

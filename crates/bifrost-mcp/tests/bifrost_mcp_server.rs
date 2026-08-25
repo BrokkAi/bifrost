@@ -7,11 +7,12 @@ use brokk_bifrost_analysis::Language;
 use brokk_bifrost_policy::{PolicyEvaluationOptions, PolicyFailOn, evaluate_policy_files};
 use common::InlineTestProject;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Cursor, Read, Write};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{ChildStderr, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -1227,6 +1228,59 @@ fn bifrost_mcp_run_policy_uses_the_active_snapshot_and_durable_suppressions() {
     drop(stdin);
     let status = child.wait().expect("wait bifrost");
     assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
+/// Malformed suppressions are configuration input, not analyzer input. The
+/// RMCP host must return their canonical report before it waits for the cold
+/// watcher/snapshot, while retaining the wire correlation contract.
+#[test]
+fn rmcp_run_policy_malformed_suppressions_fail_before_readiness() {
+    let workspace = InlineTestProject::with_language(Language::Python)
+        .file("src/app.py", "def harmless(value):\n    return value\n")
+        .file(".bifrost/suppressions.json", "{ malformed")
+        .build();
+    let mut child = spawn_server(workspace.root(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+
+    let response = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        malformed_run_policy_request(1),
+    );
+    assert_compact_malformed_run_policy_reply(&response, false);
+
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
+}
+
+/// Task-capable clients must still receive the immediate canonical report;
+/// malformed configuration cannot be parked behind a task handle.
+#[test]
+fn task_capable_rmcp_run_policy_malformed_suppressions_is_not_a_task() {
+    let workspace = InlineTestProject::with_language(Language::Python)
+        .file("src/app.py", "def harmless(value):\n    return value\n")
+        .file(".bifrost/suppressions.json", "{ malformed")
+        .build();
+    let mut child = spawn_server(workspace.root(), "searchtools", &[]);
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+    initialize_tasks_session(&mut stdin, &mut reader, &mut stderr, "2026-07-28");
+
+    let response = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        malformed_run_policy_request(1),
+    );
+    assert_compact_malformed_run_policy_reply(&response, true);
+
+    drop(stdin);
+    assert!(child.wait().expect("wait bifrost").success());
 }
 
 #[test]
@@ -4183,6 +4237,90 @@ fn run_policy_request(id: i64) -> Value {
     })
 }
 
+fn malformed_run_policy_request(id: i64) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": {
+            "name": "run_policy",
+            "arguments": {
+                "policy_ids": ["bifrost.correctness.dynamic-evaluation"],
+                "evaluation_date": "2026-07-27",
+                "fail_on": "warning"
+            }
+        }
+    })
+}
+
+fn assert_compact_malformed_run_policy_reply(response: &Value, task_capable: bool) {
+    assert!(response["error"].is_null(), "{response}");
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    if task_capable {
+        assert_ne!(response["result"]["resultType"], "task", "{response}");
+    }
+    let structured = &response["result"]["structuredContent"];
+    assert_eq!(structured["status"], "unreliable", "{response}");
+    assert_eq!(structured["exit_status"], 2, "{response}");
+    assert!(
+        structured["request_correlation_id"]
+            .as_str()
+            .is_some_and(|correlation| correlation.starts_with("sha256:")),
+        "early run_policy replies retain correlation: {response}"
+    );
+    let report = &structured["report"];
+    assert_eq!(report["schema_version"], 5, "{response}");
+    assert_eq!(report["rules"], json!([]), "{response}");
+    assert_eq!(report["runs"], json!([]), "{response}");
+    assert_eq!(report["diagnostics"].as_array().map(Vec::len), Some(1));
+    assert_eq!(report["diagnostics"][0]["code"], "suppression-load-failed");
+    assert_eq!(
+        report["execution"]["completed_policy_ids"],
+        json!([]),
+        "{response}"
+    );
+    assert_eq!(
+        report["execution"]["pending_policy_ids"],
+        json!([]),
+        "{response}"
+    );
+    let stages = report["execution"]["stage_timings"]
+        .as_array()
+        .expect("stage timings");
+    assert!(
+        stages
+            .iter()
+            .any(|timing| timing["stage"] == "policy_selection")
+    );
+    assert!(
+        stages
+            .iter()
+            .any(|timing| timing["stage"] == "suppression_preflight")
+    );
+    assert!(
+        stages
+            .iter()
+            .any(|timing| timing["stage"] == "report_construction")
+    );
+    assert!(
+        stages
+            .iter()
+            .all(|timing| timing["stage"] != "workspace_snapshot")
+    );
+    assert!(
+        stages
+            .iter()
+            .all(|timing| timing["stage"] != "policy_evaluation")
+    );
+    assert!(
+        serde_json::to_vec(structured)
+            .expect("serialize compact report")
+            .len()
+            < 24_000,
+        "malformed suppression report grew unexpectedly: {structured}"
+    );
+}
+
 /// Poll `tasks/get` until the task reaches a terminal status, returning the
 /// terminal response. Polls faster than the advertised interval because this
 /// is a test, not a considerate client.
@@ -4715,6 +4853,170 @@ fn spawn_server(root: &std::path::Path, mode: &str, extra_args: &[&str]) -> std:
         .expect("spawn bifrost")
 }
 
+const PROFILED_STDERR_TAIL_BYTES: usize = 64 * 1024;
+const PROFILED_PHASES: [&str; 4] = [
+    "queue_wait",
+    "execution",
+    "response_queue_wait",
+    "writer_delivery",
+];
+const PROFILED_PHASE_MARKERS: [&[u8]; 4] = [
+    b"mcp_request.queue_wait[search_symbols]",
+    b"mcp_request.execution[search_symbols]",
+    b"mcp_request.response_queue_wait[search_symbols]",
+    b"mcp_request.writer_delivery[search_symbols]",
+];
+
+#[derive(Clone, Default)]
+struct ProfiledStderrState {
+    tail: VecDeque<u8>,
+    tail_truncated: bool,
+    observed_phases: [bool; PROFILED_PHASES.len()],
+    read_error: Option<String>,
+}
+
+impl ProfiledStderrState {
+    fn push(&mut self, bytes: &[u8]) {
+        if bytes.len() >= PROFILED_STDERR_TAIL_BYTES {
+            self.tail.clear();
+            self.tail.extend(
+                bytes[bytes.len() - PROFILED_STDERR_TAIL_BYTES..]
+                    .iter()
+                    .copied(),
+            );
+            self.tail_truncated = true;
+        } else {
+            let overflow = self
+                .tail
+                .len()
+                .saturating_add(bytes.len())
+                .saturating_sub(PROFILED_STDERR_TAIL_BYTES);
+            if overflow > 0 {
+                self.tail.drain(..overflow);
+                self.tail_truncated = true;
+            }
+            self.tail.extend(bytes.iter().copied());
+        }
+
+        for (observed, marker) in self.observed_phases.iter_mut().zip(PROFILED_PHASE_MARKERS) {
+            *observed |= bytes.windows(marker.len()).any(|window| window == marker);
+        }
+    }
+
+    fn observed_phase(&self, phase: &str) -> bool {
+        PROFILED_PHASES
+            .iter()
+            .position(|candidate| *candidate == phase)
+            .is_some_and(|index| self.observed_phases[index])
+    }
+
+    fn diagnostics(&self) -> String {
+        let observed = PROFILED_PHASES
+            .into_iter()
+            .zip(self.observed_phases)
+            .filter_map(|(phase, observed)| observed.then_some(phase))
+            .collect::<Vec<_>>();
+        let tail = self.tail.iter().copied().collect::<Vec<_>>();
+        format!(
+            "stderr tail (prefix truncated: {}, observed phases: {:?}, read error: {:?}):\n{}",
+            self.tail_truncated,
+            observed,
+            self.read_error,
+            String::from_utf8_lossy(&tail)
+        )
+    }
+}
+
+struct ProfiledStderrDrain {
+    state: Arc<Mutex<ProfiledStderrState>>,
+    reader: Option<thread::JoinHandle<()>>,
+    diagnostic_snapshot: Cursor<Vec<u8>>,
+    diagnostic_snapshot_loaded: bool,
+}
+
+impl ProfiledStderrDrain {
+    fn spawn(stderr: ChildStderr) -> Self {
+        let state = Arc::new(Mutex::new(ProfiledStderrState::default()));
+        let reader_state = Arc::clone(&state);
+        let reader = thread::Builder::new()
+            .name("profiled-mcp-stderr".to_string())
+            .spawn(move || {
+                let mut stderr = BufReader::new(stderr);
+                let mut line = Vec::new();
+                loop {
+                    line.clear();
+                    match stderr.read_until(b'\n', &mut line) {
+                        Ok(0) => break,
+                        Ok(_) => reader_state
+                            .lock()
+                            .expect("profiled stderr state mutex poisoned")
+                            .push(&line),
+                        Err(error) => {
+                            reader_state
+                                .lock()
+                                .expect("profiled stderr state mutex poisoned")
+                                .read_error = Some(error.to_string());
+                            break;
+                        }
+                    }
+                }
+            })
+            .expect("spawn profiled MCP stderr drain");
+        Self {
+            state,
+            reader: Some(reader),
+            diagnostic_snapshot: Cursor::new(Vec::new()),
+            diagnostic_snapshot_loaded: false,
+        }
+    }
+
+    fn capture(&self) -> ProfiledStderrState {
+        self.state
+            .lock()
+            .expect("profiled stderr state mutex poisoned")
+            .clone()
+    }
+
+    fn finish(mut self) -> ProfiledStderrState {
+        self.reader
+            .take()
+            .expect("profiled stderr reader exists")
+            .join()
+            .expect("profiled stderr reader panicked");
+        self.capture()
+    }
+}
+
+impl Read for ProfiledStderrDrain {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if !self.diagnostic_snapshot_loaded {
+            self.diagnostic_snapshot =
+                Cursor::new(self.capture().tail.into_iter().collect::<Vec<_>>());
+            self.diagnostic_snapshot_loaded = true;
+        }
+        self.diagnostic_snapshot.read(buffer)
+    }
+}
+
+#[test]
+fn profiled_stderr_capture_bounds_tail_and_transport_evidence() {
+    let mut state = ProfiledStderrState::default();
+    state.push(&vec![b'x'; PROFILED_STDERR_TAIL_BYTES + 1]);
+    assert_eq!(state.tail.len(), PROFILED_STDERR_TAIL_BYTES);
+    assert!(state.tail_truncated);
+
+    for phase in PROFILED_PHASES {
+        state.push(
+            format!("[bifrost-timing] mcp_request.{phase}[search_symbols] (1 ms)\n").as_bytes(),
+        );
+    }
+    assert!(
+        PROFILED_PHASES
+            .into_iter()
+            .all(|phase| state.observed_phase(phase))
+    );
+}
+
 fn mcp_server_command(root: &std::path::Path, mode: &str, extra_args: &[&str]) -> Command {
     let mut command = Command::new(mcp_server_binary());
     command.env("BIFROST_SEMANTIC_INDEX", "off");
@@ -4749,7 +5051,7 @@ fn profiled_tool_calls_emit_all_transport_phases() {
         .expect("spawn profiled bifrost");
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
-    let mut stderr = child.stderr.take().expect("stderr");
+    let mut stderr = ProfiledStderrDrain::spawn(child.stderr.take().expect("stderr"));
     initialize_session(&mut stdin, &mut reader, &mut stderr);
 
     let response = round_trip(
@@ -4779,18 +5081,15 @@ fn profiled_tool_calls_emit_all_transport_phases() {
     assert!(list["result"]["tools"].is_array(), "{list}");
 
     drop(stdin);
-    child.wait().expect("bifrost exits after stdin closes");
-    let mut trace = String::new();
-    stderr.read_to_string(&mut trace).expect("read stderr");
-    for phase in [
-        "queue_wait",
-        "execution",
-        "response_queue_wait",
-        "writer_delivery",
-    ] {
+    let status = child.wait().expect("bifrost exits after stdin closes");
+    let capture = stderr.finish();
+    assert!(status.success(), "{}", capture.diagnostics());
+    assert!(capture.read_error.is_none(), "{}", capture.diagnostics());
+    for phase in PROFILED_PHASES {
         assert!(
-            trace.contains(&format!("mcp_request.{phase}[search_symbols]")),
-            "stderr trace omitted transport phase `{phase}`:\n{trace}"
+            capture.observed_phase(phase),
+            "stderr trace omitted transport phase `{phase}`:\n{}",
+            capture.diagnostics()
         );
     }
 }

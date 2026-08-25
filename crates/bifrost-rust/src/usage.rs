@@ -57,6 +57,10 @@ pub struct RustImportEdge {
     pub importer: ProjectFile,
     pub importer_module: ModuleKey,
     pub extent: RustImportExtent,
+    /// The exact structured path of the `use` leaf that produced this edge.
+    /// Seed consumers use it to identify an import binder without rebuilding
+    /// the import graph from every other binding in the file.
+    pub source_path: Vec<String>,
     pub local_name: String,
     pub target_file: ProjectFile,
     pub target_module: ModuleKey,
@@ -190,11 +194,18 @@ pub struct ModuleKey {
 impl ModuleKey {
     pub fn new(file: &ProjectFile, module: &str) -> Self {
         let crate_root = rust_crate_root_package(file);
+        Self::with_crate_root(&crate_root, module)
+    }
+
+    /// Construct a module key when the file's Cargo-root package is already
+    /// known. Query-scoped usage walks derive that identity once and should
+    /// not rediscover it while composing aliases and import edges.
+    pub fn with_crate_root(crate_root: &str, module: &str) -> Self {
         let relative = if module == crate_root {
             ""
         } else {
             module
-                .strip_prefix(&crate_root)
+                .strip_prefix(crate_root)
                 .and_then(|suffix| suffix.strip_prefix('.'))
                 .unwrap_or(module)
         };
@@ -204,7 +215,7 @@ impl ModuleKey {
             .map(str::to_string)
             .collect();
         Self {
-            crate_root,
+            crate_root: crate_root.to_string(),
             components,
         }
     }
@@ -393,6 +404,62 @@ impl RustBindingSeeds {
     pub fn has_import_edges(&self) -> bool {
         !self.edges_by_importer.is_empty()
     }
+
+    /// Visibility domains carried by the prepared seed closure.
+    pub fn candidate_domains(&self) -> impl Iterator<Item = &Domain> {
+        self.identity_domains.values().flatten()
+    }
+}
+
+/// Keep coarse candidate-provider files whose owned modules can see a
+/// prepared binding seed.
+///
+/// Structured importers and seed files are retained explicitly. Other files
+/// are admitted through the same Cargo-aware `Domain` containment used by
+/// reference resolution, including inline and file-backed descendant modules.
+pub fn usage_candidate_files_visible_to_binding_seeds_with_walks(
+    analyzer: &dyn RustFactSource,
+    walks: &RustUsageWalks<'_>,
+    candidates: &HashSet<ProjectFile>,
+    target_source: &ProjectFile,
+    seeds: &RustBindingSeeds,
+) -> Option<HashSet<ProjectFile>> {
+    let verified_importers: HashSet<_> = seeds.verified_importer_files().cloned().collect();
+    let mut visible = HashSet::default();
+    for file in candidates {
+        if walks.cancelled() {
+            return None;
+        }
+        if !walks.is_analyzed(file) {
+            continue;
+        }
+        if file == target_source
+            || verified_importers.contains(file)
+            || seeds.identities_in_file(file).next().is_some()
+        {
+            visible.insert(file.clone());
+            continue;
+        }
+        let modules = walks
+            .physical_root_of(file)
+            .into_iter()
+            .chain(
+                walks
+                    .queries()
+                    .module_extents_of(file)
+                    .into_iter()
+                    .map(|(module, _, _)| module),
+            )
+            .collect::<HashSet<_>>();
+        if seeds.candidate_domains().any(|domain| {
+            modules
+                .iter()
+                .any(|module| domain_contains_module_for_file(domain, analyzer, file, module))
+        }) {
+            visible.insert(file.clone());
+        }
+    }
+    Some(visible)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -942,6 +1009,24 @@ impl RustUsageWalks<'_> {
     }
 }
 
+/// Package names derived from one Rust file's path and nearest Cargo target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RustPathIdentity {
+    /// The package path of the file itself.
+    pub package: String,
+    /// The package path that `crate::` resolves to from this file.
+    pub crate_root_package: String,
+}
+
+impl RustPathIdentity {
+    pub fn of(file: &ProjectFile) -> Self {
+        Self {
+            package: rust_package_name(file),
+            crate_root_package: rust_crate_root_package(file),
+        }
+    }
+}
+
 /// The visibility domain a declared `visibility` gives an item owned by
 /// `package` in `file`.
 ///
@@ -955,28 +1040,52 @@ pub fn direct_import_scope_for_module(
     visibility: RustVisibility,
     is_actual_crate_root: bool,
 ) -> Option<Domain> {
-    let crate_package = rust_crate_root_package(file);
-    let package = if is_actual_crate_root && package == rust_package_name(file) {
-        crate_package.clone()
+    let identity = RustPathIdentity::of(file);
+    direct_import_scope_for_module_with_identity(
+        package,
+        visibility,
+        is_actual_crate_root,
+        &identity,
+    )
+}
+
+/// The same visibility calculation when the caller already memoized the
+/// path-derived identity for `file` within its query.
+pub fn direct_import_scope_for_module_with_identity(
+    package: &str,
+    visibility: RustVisibility,
+    is_actual_crate_root: bool,
+    identity: &RustPathIdentity,
+) -> Option<Domain> {
+    let package = if is_actual_crate_root && package == identity.package {
+        identity.crate_root_package.clone()
     } else {
         package.to_string()
     };
     match visibility {
-        RustVisibility::Private | RustVisibility::SelfModule => {
-            Some(Domain::Module(ModuleKey::new(file, &package)))
-        }
+        RustVisibility::Private | RustVisibility::SelfModule => Some(Domain::Module(
+            ModuleKey::with_crate_root(&identity.crate_root_package, &package),
+        )),
         RustVisibility::Public => Some(Domain::Public),
-        RustVisibility::Crate => Some(Domain::Crate(crate_package)),
+        RustVisibility::Crate => Some(Domain::Crate(identity.crate_root_package.clone())),
         RustVisibility::SuperModule => {
             let parent = package
                 .rsplit_once('.')
                 .map(|(parent, _)| parent.to_string())
-                .unwrap_or_else(|| crate_package.clone());
-            Some(Domain::Module(ModuleKey::new(file, &parent)))
+                .unwrap_or_else(|| identity.crate_root_package.clone());
+            Some(Domain::Module(ModuleKey::with_crate_root(
+                &identity.crate_root_package,
+                &parent,
+            )))
         }
         RustVisibility::InPath(path) => {
-            resolve_rust_module_segments_with_crate(&package, &crate_package, &path)
-                .map(|module| Domain::Module(ModuleKey::new(file, &module)))
+            resolve_rust_module_segments_with_crate(&package, &identity.crate_root_package, &path)
+                .map(|module| {
+                    Domain::Module(ModuleKey::with_crate_root(
+                        &identity.crate_root_package,
+                        &module,
+                    ))
+                })
         }
     }
 }
@@ -1121,8 +1230,7 @@ pub fn usage_binding_names(
 ) -> (HashSet<String>, HashSet<String>) {
     let mut direct = HashSet::default();
     let mut qualified = HashSet::default();
-    let walks = RustUsageWalks::new(analyzer, token);
-    for edge in walks.matching_edges_for_importer(file, seeds) {
+    for edge in seeds.edges_by_importer.get(file).into_iter().flatten() {
         match &edge.kind {
             RustImportEdgeKind::Namespace => {
                 qualified.extend(
@@ -1142,12 +1250,18 @@ pub fn usage_binding_names(
             }
         }
     }
+    let walks = seeds
+        .roots
+        .iter()
+        .any(CodeUnit::is_macro)
+        .then(|| RustUsageWalks::new(analyzer, token));
     for root in seeds.roots.iter().filter(|root| root.is_macro()) {
-        if walks
-            .macro_visible_ranges_of(root)
-            .keys()
-            .any(|scope| &scope.file == file)
-        {
+        if walks.as_ref().is_some_and(|walks| {
+            walks
+                .macro_visible_ranges_of(root)
+                .keys()
+                .any(|scope| &scope.file == file)
+        }) {
             direct.insert(root.identifier().to_string());
         }
     }
@@ -1188,6 +1302,36 @@ pub fn usage_has_exact_scoped_binding(
                 )
                 .is_some()
             })
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn usage_import_path_matches_seed(
+    analyzer: &dyn RustFactSource,
+    _token: QueryToken<'_>,
+    file: &ProjectFile,
+    seeds: &RustBindingSeeds,
+    path: &[String],
+    local_name: &str,
+    byte: usize,
+    namespace: RustReferenceNamespace,
+    cfg_condition: &RustCfgCondition,
+) -> bool {
+    let Some(importer_module) = RustUsageQueries::new(analyzer).module_at_byte(file, byte) else {
+        return false;
+    };
+    let edges = seeds
+        .edges_by_importer
+        .get(file)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    edges.iter().any(|edge| {
+        edge.importer_module == importer_module
+            && edge.extent.contains(byte)
+            && edge.source_path == path
+            && edge.local_name == local_name
+            && edge.cfg_condition == *cfg_condition
+            && edge.namespace.is_some_and(|bound| bound.accepts(namespace))
     })
 }
 
@@ -1264,7 +1408,16 @@ pub fn usage_exact_root_for_resolution(
     resolution: &RustReferenceResolution,
     seeds: &RustBindingSeeds,
 ) -> Option<CodeUnit> {
-    RustUsageWalks::new(analyzer, token).exact_root_for_resolution(resolution, seeds)
+    let walks = RustUsageWalks::new(analyzer, token);
+    usage_exact_root_for_resolution_with_walks(&walks, resolution, seeds)
+}
+
+pub fn usage_exact_root_for_resolution_with_walks(
+    walks: &RustUsageWalks<'_>,
+    resolution: &RustReferenceResolution,
+    seeds: &RustBindingSeeds,
+) -> Option<CodeUnit> {
+    walks.exact_root_for_resolution(resolution, seeds)
 }
 
 pub fn usage_local_module_prefix_visible_at(
@@ -1276,7 +1429,7 @@ pub fn usage_local_module_prefix_visible_at(
     byte: usize,
 ) -> bool {
     let walks = RustUsageWalks::new(analyzer, token);
-    let queries = RustUsageQueries::new(analyzer);
+    let queries = walks.queries();
     let Some(module) = queries.module_at_byte(file, byte) else {
         return false;
     };
@@ -1299,7 +1452,7 @@ pub fn usage_local_module_prefix_visible_at(
             analyzer,
             token,
             &walks,
-            &queries,
+            queries,
             file,
             module,
             byte,
@@ -1618,17 +1771,70 @@ pub fn usage_reference_at(
     root_shadowed: bool,
     leading_absolute: bool,
 ) -> RustReferenceResolution {
+    let walks = RustUsageWalks::new(analyzer, token);
+    usage_reference_at_with_walks(
+        analyzer,
+        &walks,
+        file,
+        seeds,
+        segments,
+        byte,
+        namespace,
+        root_shadowed,
+        leading_absolute,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn usage_reference_at_with_walks(
+    analyzer: &dyn RustFactSource,
+    walks: &RustUsageWalks<'_>,
+    file: &ProjectFile,
+    seeds: &RustBindingSeeds,
+    segments: &[&str],
+    byte: usize,
+    namespace: RustReferenceNamespace,
+    root_shadowed: bool,
+    leading_absolute: bool,
+) -> RustReferenceResolution {
     if segments.is_empty() || (root_shadowed && !leading_absolute) {
         return RustReferenceResolution::Unresolved;
     }
-    let walks = RustUsageWalks::new(analyzer, token);
-    let queries = RustUsageQueries::new(analyzer);
+    let token = walks.token();
+    let queries = walks.queries();
     let Some(module) = queries.module_at_byte(file, byte) else {
         return RustReferenceResolution::Unresolved;
     };
     let module = &module;
     let leading_absolute_local =
         leading_absolute && walks.cargo_routes().file_uses_rust_2015_edition(file);
+    if segments.len() == 1
+        && namespace != RustReferenceNamespace::Macro
+        && !root_shadowed
+        && !leading_absolute
+    {
+        let local_seed_identities = seeds
+            .identities_in_file(file)
+            .filter(|identity| {
+                identity.name == segments[0]
+                    && identity.module == *module
+                    && identity.namespace.accepts(namespace)
+                    && seeds
+                        .identity_domains
+                        .get(*identity)
+                        .is_some_and(|domains| {
+                            domains.iter().any(|domain| domain.contains_module(module))
+                        })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if let [identity] = local_seed_identities.as_slice()
+            && seeds.root_origins.contains(identity)
+            && scoped_explicit_import(analyzer, token, file, byte, segments[0]).is_none()
+        {
+            return RustReferenceResolution::Exact(identity.clone());
+        }
+    }
     let absolute_route_admitted = |provenance| {
         !leading_absolute
             || matches!(
@@ -1879,8 +2085,8 @@ pub fn usage_reference_at(
         let local_namespace_routes = visible_namespace_module_routes(
             analyzer,
             token,
-            &walks,
-            &queries,
+            walks,
+            queries,
             file,
             module,
             byte,
@@ -1892,7 +2098,7 @@ pub fn usage_reference_at(
             // local namespace must not fall through to a relative module path.
             for resolved in routes {
                 matches.extend(seed_identities_for_resolved_module_route(
-                    analyzer, &walks, &queries, seeds, file, module, &resolved, terminal, namespace,
+                    analyzer, walks, queries, seeds, file, module, &resolved, terminal, namespace,
                 ));
             }
             return resolution_of(matches, seeds);
@@ -1902,7 +2108,7 @@ pub fn usage_reference_at(
                 continue;
             }
             matches.extend(seed_identities_for_resolved_module_route(
-                analyzer, &walks, &queries, seeds, file, module, &resolved, terminal, namespace,
+                analyzer, walks, queries, seeds, file, module, &resolved, terminal, namespace,
             ));
         }
         let resolved_modules = if leading_absolute && !leading_absolute_local {
@@ -2387,6 +2593,7 @@ pub fn imported_identity_domain(
     target_domain.intersect(&edge.domain)
 }
 
-pub fn edge_target_matches_exact_module(edge: &RustImportEdge) -> bool {
-    ModuleKey::new(&edge.target_file, &rust_package_name(&edge.target_file)) == edge.target_module
+pub fn edge_target_matches_exact_module(edge: &RustImportEdge, crate_root_package: &str) -> bool {
+    ModuleKey::with_crate_root(crate_root_package, &rust_package_name(&edge.target_file))
+        == edge.target_module
 }

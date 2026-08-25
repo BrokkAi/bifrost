@@ -12,8 +12,8 @@
 use crate::java::graph::resolver::{self as java_resolver, java_callable_arity};
 use crate::java::graph_support::JavaSource;
 use crate::scala::graph::inverted::{
-    ScalaLogicalOwnerMember, ScalaLogicalReceiver, ScalaReferenceRole, ScalaReferenceSink,
-    ScalaResolvedReference, callable_alternative_contradicts_literal_arguments,
+    ProjectTypes, ScalaLogicalOwnerMember, ScalaLogicalReceiver, ScalaReferenceRole,
+    ScalaReferenceSink, ScalaResolvedReference, callable_alternative_contradicts_literal_arguments,
     callable_alternative_is_candidate, callable_alternative_matches, single_replica_family,
 };
 use crate::scala::graph::resolver::{
@@ -139,6 +139,7 @@ impl ScalaQueryTargetCatalog {
     pub fn build(
         scala: &dyn ScalaSource,
         token: QueryToken<'_>,
+        types: &ProjectTypes,
         targets: &[CodeUnit],
         cancellation: Option<&CancellationToken>,
     ) -> Result<Self, ScalaCatalogBuildError> {
@@ -149,7 +150,7 @@ impl ScalaQueryTargetCatalog {
         let mut explicit_imports: HashMap<String, Vec<usize>> = HashMap::default();
         let mut owner_imports: HashMap<String, Vec<usize>> = HashMap::default();
         let mut direct_descendants: HashMap<CodeUnit, Vec<CodeUnit>> = HashMap::default();
-        if let Some(ancestors_by_unit) = scala.project_types().exact_direct_ancestors_snapshot() {
+        if let Some(ancestors_by_unit) = types.exact_direct_ancestors_snapshot() {
             for (unit, ancestors) in ancestors_by_unit {
                 ensure_catalog_active(cancellation)?;
                 for ancestor in ancestors {
@@ -164,7 +165,7 @@ impl ScalaQueryTargetCatalog {
         let mut specs = Vec::with_capacity(targets.len());
         for (target_id, target) in targets.iter().enumerate() {
             ensure_catalog_active(cancellation)?;
-            let spec = TargetSpec::from_target(scala, token, target)
+            let spec = TargetSpec::from_target(scala, token, types, target)
                 .ok_or_else(|| ScalaCatalogBuildError::UnsupportedTarget(target.clone()))?;
             if matches!(spec.kind, TargetKind::Method | TargetKind::Field) {
                 let role = if spec.kind == TargetKind::Field {
@@ -211,11 +212,9 @@ impl ScalaQueryTargetCatalog {
                     .entry((target.clone(), ScalaReferenceRole::CompanionValue))
                     .or_default()
                     .push(target_id);
-                for constructor in scala.project_types().exact_member_declarations(
-                    scala,
-                    target,
-                    target.identifier(),
-                ) {
+                for constructor in
+                    types.exact_member_declarations(scala, target, target.identifier())
+                {
                     ensure_catalog_active(cancellation)?;
                     if constructor.is_function() {
                         for role in [
@@ -230,16 +229,12 @@ impl ScalaQueryTargetCatalog {
                     }
                 }
                 let normalized_target = scala_normalized_fq_name(&target.fq_name());
-                for companion in scala.project_types().exact_companion_objects(scala, target) {
+                for companion in types.exact_companion_objects(scala, target) {
                     ensure_catalog_active(cancellation)?;
-                    for apply in scala
-                        .project_types()
-                        .exact_member_declarations(scala, &companion, "apply")
-                    {
+                    for apply in types.exact_member_declarations(scala, &companion, "apply") {
                         ensure_catalog_active(cancellation)?;
                         if !apply.is_function()
-                            || !scala
-                                .project_types()
+                            || !types
                                 .callable_alternatives_for(scala, token, &apply)
                                 .iter()
                                 .any(|alternative| {
@@ -267,16 +262,14 @@ impl ScalaQueryTargetCatalog {
                 }
             }
             if spec.kind == TargetKind::Type && spec.is_object_type {
-                for class in scala.project_types().exact_companion_classes(scala, target) {
+                for class in types.exact_companion_classes(scala, target) {
                     ensure_catalog_active(cancellation)?;
-                    if !scala.project_types().is_case_class(scala, &class) {
+                    if !types.is_case_class(scala, &class) {
                         continue;
                     }
-                    for constructor in scala.project_types().exact_member_declarations(
-                        scala,
-                        &class,
-                        class.identifier(),
-                    ) {
+                    for constructor in
+                        types.exact_member_declarations(scala, &class, class.identifier())
+                    {
                         ensure_catalog_active(cancellation)?;
                         if constructor.is_function() && constructor.is_synthetic() {
                             for role in [
@@ -293,11 +286,7 @@ impl ScalaQueryTargetCatalog {
                 }
                 for member_name in ["apply", "unapply", "unapplySeq"] {
                     ensure_catalog_active(cancellation)?;
-                    for member in
-                        scala
-                            .project_types()
-                            .exact_member_declarations(scala, target, member_name)
-                    {
+                    for member in types.exact_member_declarations(scala, target, member_name) {
                         ensure_catalog_active(cancellation)?;
                         if member.is_function() {
                             exact
@@ -321,7 +310,7 @@ impl ScalaQueryTargetCatalog {
                     }
                 }
             }
-            if spec.kind == TargetKind::Type && scala.project_types().is_enum(scala, target) {
+            if spec.kind == TargetKind::Type && types.is_enum(scala, target) {
                 for candidate in scala.get_declarations(target.source()) {
                     ensure_catalog_active(cancellation)?;
                     if candidate.is_field()
@@ -346,7 +335,7 @@ impl ScalaQueryTargetCatalog {
                     for owner in &spec.family_owners {
                         ensure_catalog_active(cancellation)?;
                         for candidate in
-                            scala.definitions(&format!("{}.{}", owner.fq_name(), spec.member_name))
+                            types.exact_member_declarations(scala, owner, &spec.member_name)
                         {
                             ensure_catalog_active(cancellation)?;
                             if scala.structural_parent_of(&candidate).as_ref() != Some(owner) {
@@ -357,10 +346,13 @@ impl ScalaQueryTargetCatalog {
                             );
                             if compatible {
                                 let roles: &[ScalaReferenceRole] = match spec.kind {
-                                    TargetKind::Method => &[
-                                        ScalaReferenceRole::Callable,
-                                        ScalaReferenceRole::Override,
-                                    ],
+                                    // Override-family declarations belong to the
+                                    // queried method family, but a call through a
+                                    // statically concrete receiver selects the
+                                    // concrete override only. Mapping family peers
+                                    // as ordinary callables widened those calls into
+                                    // every ancestor contract.
+                                    TargetKind::Method => &[ScalaReferenceRole::Override],
                                     TargetKind::Field => &[ScalaReferenceRole::Field],
                                     TargetKind::Type | TargetKind::Constructor => unreachable!(),
                                 };
@@ -382,7 +374,7 @@ impl ScalaQueryTargetCatalog {
                             cancellation,
                         )? {
                             ensure_catalog_active(cancellation)?;
-                            let candidates = scala.project_types().exact_member_declarations(
+                            let candidates = types.exact_member_declarations(
                                 scala,
                                 &descendant,
                                 &spec.member_name,
@@ -502,7 +494,7 @@ impl ScalaQueryTargetCatalog {
         let mut logical: HashMap<(String, ScalaReferenceRole), Vec<usize>> = HashMap::default();
         for ((unit, role), target_ids) in &exact {
             ensure_catalog_active(cancellation)?;
-            let declarations = scala.definitions(&unit.fq_name()).collect::<Vec<_>>();
+            let declarations = types.definitions_by_fqn(&unit.fq_name());
             if declarations.contains(unit) && single_replica_family(declarations.iter()) {
                 logical
                     .entry((unit.fq_name(), *role))

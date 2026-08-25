@@ -15,7 +15,8 @@ use brokk_bifrost_js_ts::syntax::{
     MAX_STATIC_IMPORT_BINDINGS_PER_NAME, destructured_property_key_source,
     direct_property_definitions, is_declaration_identifier, is_explicit_object_literal_key,
     is_export_alias_identifier, is_known_js_ts_global, js_program_is_external_module,
-    pattern_binder_identifiers, slice, typescript_enclosing_enum_initializer,
+    pattern_binder_identifiers, slice, static_member_property,
+    typescript_enclosing_enum_initializer,
 };
 /// The receiver-owner / type-text cluster this route drives now lives beside the
 /// rest of the JS/TS language logic, so the usage graph can call it without
@@ -339,13 +340,17 @@ pub(super) fn resolve_js_ts(
     };
     let batch = context.js_ts_context(host, file, language, source, tree);
     let support = context.bounded_support();
-    let reference = site.text.as_str();
     let value_position = jsts_reference_is_value_position(tree, site);
     let imports = &batch.imports;
     let aliases = batch.aliases.as_ref();
     let lexical_bindings = JsTsLexicalBindingIndex::build(tree.root_node(), source);
     let focused =
         smallest_named_node_covering(tree.root_node(), site.focus_start_byte, site.focus_end_byte);
+    let structured_reference =
+        focused.and_then(|node| jsts_static_member_reference_at_focus(node, source, language));
+    let reference = structured_reference
+        .as_deref()
+        .unwrap_or(site.text.as_str());
 
     if focused.is_some_and(|node| {
         jsts_is_commonjs_host_export_assignment_object(node, source)
@@ -464,7 +469,7 @@ pub(super) fn resolve_js_ts(
     // AST path for an inline construction receiver `new Foo().member` — the
     // text-split path below cannot express `new Foo()` as a qualifier.
     if let Some(members) = jsts_construction_receiver_members(
-        analyzer, host, support, file, language, source, tree, site,
+        analyzer, host, support, file, language, source, tree, site, imports, aliases,
     ) {
         return js_ts_candidates_outcome(analyzer, members);
     }
@@ -1785,14 +1790,24 @@ fn jsts_focused_reference_receiver_property<'tree>(
     Node<'tree>,
 )> {
     let member_expression = match focused.kind() {
-        "member_expression" => focused,
-        "property_identifier" => focused
+        "member_expression" | "subscript_expression" => focused,
+        "property_identifier" | "string_fragment" => focused
             .parent()
-            .filter(|parent| parent.kind() == "member_expression")?,
+            .filter(|parent| matches!(parent.kind(), "member_expression" | "string"))
+            .and_then(|parent| {
+                if parent.kind() == "string" {
+                    parent.parent()
+                } else {
+                    Some(parent)
+                }
+            })
+            .filter(|parent| {
+                matches!(parent.kind(), "member_expression" | "subscript_expression")
+            })?,
         _ => return None,
     };
     let object = member_expression.child_by_field_name("object")?;
-    let property = member_expression.child_by_field_name("property")?;
+    let (property, _) = static_member_property(member_expression, source)?;
     let receiver = brokk_bifrost_js_ts::syntax::static_member_receiver(object, source)?;
     Some((receiver, property))
 }
@@ -2214,6 +2229,10 @@ fn jsts_dotted_access_parts<'tree>(node: Node<'tree>) -> Option<(Node<'tree>, No
             node.child_by_field_name("object")?,
             node.child_by_field_name("property")?,
         )),
+        "subscript_expression" => Some((
+            node.child_by_field_name("object")?,
+            node.child_by_field_name("index")?,
+        )),
         "nested_type_identifier" => Some((
             node.child_by_field_name("module")?,
             node.child_by_field_name("name")?,
@@ -2227,13 +2246,48 @@ fn jsts_dotted_access_parts<'tree>(node: Node<'tree>) -> Option<(Node<'tree>, No
 fn jsts_dotted_chain_text(node: Node<'_>, source: &str, language: Language) -> Option<String> {
     let mut names = Vec::new();
     let mut current = node;
-    while let Some((receiver, member)) = jsts_dotted_access_parts(current) {
-        names.push(simple_reference_name(member, source, language)?);
-        current = receiver;
+    loop {
+        match current.kind() {
+            "member_expression" | "subscript_expression" => {
+                let receiver = current.child_by_field_name("object")?;
+                let (_, member) = static_member_property(current, source)?;
+                names.push(member);
+                current = receiver;
+            }
+            "nested_type_identifier" => {
+                let (receiver, member) = jsts_dotted_access_parts(current)?;
+                names.push(simple_reference_name(member, source, language)?.to_string());
+                current = receiver;
+            }
+            _ => break,
+        }
     }
-    names.push(simple_reference_name(current, source, language)?);
+    names.push(simple_reference_name(current, source, language)?.to_string());
     names.reverse();
     Some(names.join("."))
+}
+
+fn jsts_static_member_reference_at_focus(
+    focus: Node<'_>,
+    source: &str,
+    language: Language,
+) -> Option<String> {
+    let mut current = Some(focus);
+    for _ in 0..4 {
+        let node = current?;
+        if matches!(node.kind(), "member_expression" | "subscript_expression") {
+            let object = node.child_by_field_name("object")?;
+            let (name_node, name) = static_member_property(node, source)?;
+            if name_node.start_byte() <= focus.start_byte()
+                && focus.end_byte() <= name_node.end_byte()
+            {
+                let receiver = jsts_dotted_chain_text(object, source, language)?;
+                return Some(format!("{receiver}.{name}"));
+            }
+        }
+        current = node.parent();
+    }
+    None
 }
 
 /// Resolve `new Foo().member` by typing the receiver as the constructed class.
@@ -2249,16 +2303,18 @@ fn jsts_construction_receiver_members(
     source: &str,
     tree: &Tree,
     site: &ResolvedReferenceSite,
+    imports: &JsTsImportBinder,
+    aliases: &AliasResolver,
 ) -> Option<Vec<CodeUnit>> {
     let node =
         smallest_named_node_covering(tree.root_node(), site.range.start_byte, site.range.end_byte)?;
     // The site may resolve to the property identifier or to the whole
     // member-expression (`new Foo().bar`).
-    let member_expr = if node.kind() == "member_expression" {
+    let member_expr = if matches!(node.kind(), "member_expression" | "subscript_expression") {
         node
     } else if node
         .parent()
-        .is_some_and(|p| p.kind() == "member_expression")
+        .is_some_and(|p| matches!(p.kind(), "member_expression" | "subscript_expression"))
     {
         node.parent()?
     } else {
@@ -2272,11 +2328,23 @@ fn jsts_construction_receiver_members(
     if constructor.kind() != "identifier" {
         return None;
     }
-    let property = member_expr.child_by_field_name("property")?;
+    let (_, member) = static_member_property(member_expr, source)?;
     let class_name = &source[constructor.start_byte()..constructor.end_byte()];
-    let member = &source[property.start_byte()..property.end_byte()];
-    let receiver_candidates =
-        jsts_value_space_candidates(host, support.file_identifier(file, class_name));
+    let mut receiver_candidates = support.file_identifier(file, class_name);
+    receiver_candidates.extend(
+        resolve_js_ts_direct_import_candidates(
+            host,
+            support,
+            language,
+            file,
+            imports,
+            class_name,
+            Some(aliases),
+            true,
+        )
+        .unwrap_or_default(),
+    );
+    let receiver_candidates = jsts_value_space_candidates(host, receiver_candidates);
     let mut finds = JsTsMemberFinds::default();
     let members = if language == Language::TypeScript {
         ts_member_candidates(
@@ -2284,12 +2352,12 @@ fn jsts_construction_receiver_members(
             host,
             support,
             receiver_candidates,
-            member,
+            &member,
             true,
             &mut finds,
         )
     } else {
-        jsts_member_candidates(host, support, receiver_candidates, member, true)
+        jsts_member_candidates(host, support, receiver_candidates, &member, true)
     };
     if members.is_empty() {
         return None;

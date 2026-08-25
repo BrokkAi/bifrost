@@ -35,7 +35,7 @@ const JAVA_PACKAGE_SEPARATOR: &str = ".";
 /// `.`, but a declaration can still be written with a doubled or dangling one
 /// -- intellij-community's inspection fixtures carry `package com..foo;` -- and
 /// the two spellings must not disagree about it (#2375).
-fn java_package_fq(package_name: &str) -> FqName {
+pub(crate) fn java_package_fq(package_name: &str) -> FqName {
     let mut fq = FqName::new();
     for component in joined_segments(package_name, JAVA_PACKAGE_SEPARATOR) {
         fq.push(java_segment(component, SegmentKind::Package));
@@ -112,6 +112,33 @@ pub fn normalize_java_full_name(fq_name: &str) -> String {
     normalized = strip_trailing_numeric_suffix(&normalized);
     normalized = strip_location_suffix(&normalized);
     normalized.replace('$', ".")
+}
+
+/// Canonicalize an extracted Java identity one semantic segment at a time.
+/// Nested-owner joins are represented by `SegmentKind`, so the canonical form
+/// changes the join kind instead of replacing `$` in a rendered full name.
+/// Bytecode-only suffixes can still occur inside one segment; the existing
+/// segment-text normalizer handles exactly that local vocabulary.
+pub fn normalize_java_fq_name(fq_name: &FqName) -> FqName {
+    let interner = segment_interner();
+    let mut normalized = FqName::new();
+    for &segment_id in fq_name.segments() {
+        let (text, kind) = interner.resolve(segment_id);
+        let text = normalize_java_full_name(text);
+        if text.is_empty() {
+            continue;
+        }
+        let kind = match kind {
+            SegmentKind::Nested | SegmentKind::Companion => SegmentKind::Type,
+            other => other,
+        };
+        normalized.push(interner.intern(&text, kind));
+    }
+    if normalized.is_empty() {
+        fq_name.clone()
+    } else {
+        normalized
+    }
 }
 
 fn strip_trailing_numeric_suffix(input: &str) -> String {
@@ -1787,4 +1814,23 @@ pub fn parse_java_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedF
     }
 
     parsed
+}
+
+#[cfg(test)]
+mod relational_name_tests {
+    use super::*;
+    use brokk_bifrost_core::analyzer::Language;
+
+    #[test]
+    fn structured_lookup_canonicalization_matches_the_legacy_spelling() {
+        let interner = segment_interner();
+        let mut name = FqName::new();
+        name.push(interner.intern("com", SegmentKind::Package));
+        name.push(interner.intern("Outer", SegmentKind::Type));
+        name.push(interner.intern("Inner<T>", SegmentKind::Nested));
+        let exact = name.display_native(Language::Java, interner);
+        let structured = normalize_java_fq_name(&name).display_native(Language::Java, interner);
+        assert_eq!(structured, normalize_java_full_name(&exact));
+        assert_eq!(structured, "com.Outer.Inner");
+    }
 }

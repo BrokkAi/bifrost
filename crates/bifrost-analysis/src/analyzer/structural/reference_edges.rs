@@ -22,7 +22,8 @@
 //! from two different snapshots.
 
 use super::edges::{EdgeAxis, EdgeProvenance, OwnerRelation, SiteClass};
-use super::kinds::NormalizedKind;
+use super::facts::Span;
+use super::kinds::{NormalizedKind, Role};
 use super::lexical_environment::environment_for_file;
 use super::occurrence_rows::{
     OccurrenceCompleteness, OccurrenceRow, OccurrenceTarget, OccurrencesCancelled, ast_id,
@@ -30,10 +31,9 @@ use super::occurrence_rows::{
 };
 use super::occurrences::{ALL_OCCURRENCE_ROLES, OccurrenceClass, OccurrenceRole};
 use super::resolution::EnvironmentAxis;
-use super::search::expansions::{classify_reference_kind, reference_hits_for_target};
 use crate::analyzer::usages::{
-    ReferenceHit, ReferenceKind, UsageFinder, UsageHitKind, UsageHitSurface, UsageProof,
-    UsageQueryCompletion,
+    FuzzyResult, ReferenceHit, ReferenceKind, UsageFinder, UsageHit, UsageHitKind, UsageHitSurface,
+    UsageProof, UsageQueryCompletion,
 };
 use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
@@ -43,6 +43,202 @@ use crate::hash::{HashMap, HashSet};
 /// traversal's scan bound; the hit bound is per seed declaration.
 pub const MAX_INVERSE_EDGE_FILES: usize = 20_000;
 pub const MAX_INVERSE_EDGE_HITS: usize = 5_000;
+
+pub fn reference_hit_for_target(
+    analyzer: &dyn IAnalyzer,
+    hit: UsageHit,
+    target: CodeUnit,
+    proof: UsageProof,
+) -> ReferenceHit {
+    let kind = hit.reference_kind.or_else(|| {
+        classify_reference_kind(
+            analyzer,
+            &hit.file,
+            hit.start_offset,
+            hit.end_offset,
+            &target,
+        )
+    });
+    ReferenceHit {
+        file: hit.file,
+        range: Range {
+            start_byte: hit.start_offset,
+            end_byte: hit.end_offset,
+            start_line: hit.line,
+            end_line: hit.line,
+        },
+        enclosing_unit: hit.enclosing,
+        kind,
+        resolved: target,
+        confidence: (hit.confidence.clamp(0.0, 1.0) * 1_000_000.0) as u32,
+        usage_kind: hit.kind,
+        proof,
+    }
+}
+
+pub fn reference_hits_from_bounded_sample(
+    analyzer: &dyn IAnalyzer,
+    sample_hits: impl IntoIterator<Item = UsageHit>,
+    target: CodeUnit,
+    limit: usize,
+) -> Vec<ReferenceHit> {
+    sample_hits
+        .into_iter()
+        .take(limit)
+        .map(|hit| reference_hit_for_target(analyzer, hit, target.clone(), UsageProof::Proven))
+        .collect()
+}
+
+pub fn reference_hits_for_target(
+    analyzer: &dyn IAnalyzer,
+    result: FuzzyResult,
+    target: &CodeUnit,
+) -> (Vec<ReferenceHit>, bool) {
+    match result {
+        FuzzyResult::Success {
+            hits_by_overload,
+            unproven_by_overload,
+            ..
+        } => (
+            hits_by_overload
+                .into_values()
+                .flatten()
+                .map(|hit| {
+                    reference_hit_for_target(analyzer, hit, target.clone(), UsageProof::Proven)
+                })
+                .chain(unproven_by_overload.into_values().flatten().map(|hit| {
+                    reference_hit_for_target(analyzer, hit, target.clone(), UsageProof::Unproven)
+                }))
+                .collect(),
+            false,
+        ),
+        FuzzyResult::Ambiguous {
+            hits_by_overload, ..
+        } => (
+            hits_by_overload
+                .into_values()
+                .flatten()
+                .map(|hit| {
+                    reference_hit_for_target(analyzer, hit, target.clone(), UsageProof::Unproven)
+                })
+                .collect(),
+            false,
+        ),
+        FuzzyResult::TooManyCallsites {
+            sample_hits, limit, ..
+        } => (
+            reference_hits_from_bounded_sample(analyzer, sample_hits, target.clone(), limit),
+            true,
+        ),
+        FuzzyResult::Failure { .. } => (Vec::new(), false),
+    }
+}
+
+pub fn classify_reference_kind(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    start_byte: usize,
+    end_byte: usize,
+    target: &CodeUnit,
+) -> Option<ReferenceKind> {
+    let language = crate::analyzer::common::language_for_file(file);
+    let facts = analyzer
+        .structural_fact_providers()
+        .into_iter()
+        .find(|provider| provider.structural_language() == language)?
+        .structural_facts(file)?;
+    let covers = |span: Span| span.start_byte <= start_byte && end_byte <= span.end_byte;
+    let mut candidates = facts
+        .nodes()
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| {
+            node.name.is_some_and(covers)
+                && matches!(
+                    node.kind,
+                    NormalizedKind::Call | NormalizedKind::FieldAccess
+                )
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|(_, node)| {
+        (
+            usize::from(node.kind != NormalizedKind::Call),
+            node.range.end_byte - node.range.start_byte,
+        )
+    });
+    if let Some((id, node)) = candidates.first().copied() {
+        let receiver_role = if node.kind == NormalizedKind::FieldAccess {
+            Role::Object
+        } else {
+            Role::Receiver
+        };
+        let receiver = facts
+            .role_targets(id as u32, receiver_role)
+            .next()
+            .map(|role| role.span.text(facts.source()).trim());
+        if receiver.is_some_and(|text| matches!(text, "super" | "base")) {
+            return Some(ReferenceKind::SuperCall);
+        }
+        let static_receiver = analyzer
+            .parent_of(target)
+            .filter(|owner| owner.is_class())
+            .is_some_and(|owner| receiver == Some(owner.short_name()));
+        if static_receiver {
+            return Some(ReferenceKind::StaticReference);
+        }
+        if node.kind == NormalizedKind::Call {
+            return Some(
+                if target.is_class() || target.kind().display_lowercase() == "constructor" {
+                    ReferenceKind::ConstructorCall
+                } else {
+                    ReferenceKind::MethodCall
+                },
+            );
+        }
+        let mut parent = Some(id as u32);
+        while let Some(current) = parent {
+            let fact = facts.node(current);
+            if fact.kind == NormalizedKind::Assignment {
+                return Some(
+                    if facts
+                        .role_targets(current, Role::Left)
+                        .any(|role| covers(role.span))
+                    {
+                        ReferenceKind::FieldWrite
+                    } else {
+                        ReferenceKind::FieldRead
+                    },
+                );
+            }
+            parent = fact.parent;
+        }
+        return Some(ReferenceKind::FieldRead);
+    }
+    if target.is_class() {
+        let nearest = facts
+            .nodes()
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| {
+                node.range.start_byte <= start_byte && end_byte <= node.range.end_byte
+            })
+            .min_by_key(|(_, node)| node.range.end_byte - node.range.start_byte)
+            .map(|(id, _)| id as u32);
+        let mut current = nearest;
+        while let Some(id) = current {
+            let node = facts.node(id);
+            if node.kind.satisfies(NormalizedKind::Declaration) {
+                if node.kind == NormalizedKind::Class && node.name.is_none_or(|name| !covers(name))
+                {
+                    return Some(ReferenceKind::Inheritance);
+                }
+                break;
+            }
+            current = node.parent;
+        }
+    }
+    target.is_class().then_some(ReferenceKind::TypeReference)
+}
 
 /// The site end of an edge: where in the workspace the reference is spelled.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,7 +429,7 @@ fn supports_edge_axis(
 ) -> Option<bool> {
     let language = crate::analyzer::common::language_for_file(file);
     analyzer
-        .structural_search_providers()
+        .structural_fact_providers()
         .into_iter()
         .find(|provider| provider.structural_language() == language)
         .map(|provider| provider.structural_supports_edge_axis(axis))
@@ -326,7 +522,7 @@ fn import_target_nodes_for_file(
         return None;
     }
     let facts = analyzer
-        .structural_search_providers()
+        .structural_fact_providers()
         .into_iter()
         .find(|provider| {
             provider.structural_language() == crate::analyzer::common::language_for_file(file)
@@ -382,7 +578,7 @@ impl SiteIdentityIndex {
     fn build(analyzer: &dyn IAnalyzer, file: &ProjectFile) -> Self {
         let language = crate::analyzer::common::language_for_file(file);
         let facts = analyzer
-            .structural_search_providers()
+            .structural_fact_providers()
             .into_iter()
             .find(|provider| provider.structural_language() == language)
             .and_then(|provider| provider.structural_facts(file));

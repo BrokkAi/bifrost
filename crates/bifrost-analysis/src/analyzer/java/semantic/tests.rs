@@ -1,6 +1,6 @@
 use super::syntax::{
-    body_contains_free_this, java_field_access_is_type_qualifier, java_field_access_segments,
-    java_type_name_prefix_len,
+    body_contains_free_this, is_sole_initializer_fragment, java_field_access_is_type_qualifier,
+    java_field_access_segments, java_type_name_prefix_len,
 };
 use super::*;
 
@@ -136,4 +136,110 @@ fn inherited_field_chain_is_not_a_type_qualifier() {
         !java_field_access_is_type_qualifier(access, source, |_| false, |_| false),
         "an inherited field chain must keep Field lowering"
     );
+}
+
+/// The `variable_declarator` node that declares `name`, found anywhere in
+/// the tree. Distinguishes sibling field declarations by their declared
+/// name, since `first_kind` alone cannot pick a specific one among several.
+fn declarator_named<'a>(
+    root: tree_sitter::Node<'a>,
+    source: &str,
+    name: &str,
+) -> tree_sitter::Node<'a> {
+    let mut found = None;
+    crate::analyzer::tree_sitter_analyzer::walk_named_tree_preorder(root, true, |node| {
+        if node.kind() == "variable_declarator"
+            && node
+                .child_by_field_name("name")
+                .is_some_and(|id| &source[id.byte_range()] == name)
+        {
+            found = Some(node);
+            WalkControl::Break
+        } else {
+            WalkControl::Continue
+        }
+    });
+    found.unwrap_or_else(|| panic!("missing variable_declarator named {name}"))
+}
+
+// #2553: `is_sole_initializer_fragment` is the structural predicate that
+// decides whether the whole-procedure `DeferredExecution` gap still applies
+// to one initializer fragment. These cases pin its documented contract
+// directly, independent of the gap-emission wiring in `control.rs`.
+
+#[test]
+fn a_lone_static_field_initializer_is_the_sole_fragment_in_its_group() {
+    // The corpus's own dominant shape (#2545's census): boilerplate
+    // `serialVersionUID`, nothing else in the static group.
+    let source = "class App {\n  private static final long serialVersionUID = 1L;\n}\n";
+    let tree = parse_java(source);
+    let declarator = declarator_named(tree.root_node(), source, "serialVersionUID");
+    assert!(is_sole_initializer_fragment(declarator, true));
+}
+
+#[test]
+fn two_static_field_initializers_are_not_sole_in_their_shared_group() {
+    // A genuine source-order-composition case: `b`'s value can depend on
+    // `a` having already run. Both fragments must keep the gap.
+    let source = "class App {\n  private static int a = 1;\n  private static int b = a + 1;\n}\n";
+    let tree = parse_java(source);
+    let a = declarator_named(tree.root_node(), source, "a");
+    let b = declarator_named(tree.root_node(), source, "b");
+    assert!(!is_sole_initializer_fragment(a, true));
+    assert!(!is_sole_initializer_fragment(b, true));
+}
+
+#[test]
+fn a_static_field_and_a_static_initializer_block_share_one_group() {
+    let source = "class App {\n  private static int a = 1;\n  static { a = a + 1; }\n}\n";
+    let tree = parse_java(source);
+    let a = declarator_named(tree.root_node(), source, "a");
+    let block = first_kind(tree.root_node(), "static_initializer");
+    assert!(!is_sole_initializer_fragment(a, true));
+    assert!(!is_sole_initializer_fragment(block, true));
+}
+
+#[test]
+fn static_and_instance_groups_are_independent() {
+    // One member in each group: neither fragment has a sibling to compose
+    // with, even though the class has two initializer fragments overall.
+    let source = "class App {\n  private static final long serialVersionUID = 1L;\n  private int count = 0;\n}\n";
+    let tree = parse_java(source);
+    let statik = declarator_named(tree.root_node(), source, "serialVersionUID");
+    let instance = declarator_named(tree.root_node(), source, "count");
+    assert!(is_sole_initializer_fragment(statik, true));
+    assert!(is_sole_initializer_fragment(instance, false));
+}
+
+#[test]
+fn two_instance_field_initializers_are_not_sole_in_their_shared_group() {
+    let source = "class App {\n  private int a = 1;\n  private int b = a + 1;\n}\n";
+    let tree = parse_java(source);
+    let a = declarator_named(tree.root_node(), source, "a");
+    let b = declarator_named(tree.root_node(), source, "b");
+    assert!(!is_sole_initializer_fragment(a, false));
+    assert!(!is_sole_initializer_fragment(b, false));
+}
+
+#[test]
+fn an_uninitialized_sibling_field_does_not_count_as_a_fragment() {
+    // `plain` has no `value`, so `callable_shape` never lowers it as an
+    // Initializer procedure at all; it must not inflate the group count
+    // either.
+    let source = "class App {\n  private static final long serialVersionUID = 1L;\n  private static String plain;\n}\n";
+    let tree = parse_java(source);
+    let declarator = declarator_named(tree.root_node(), source, "serialVersionUID");
+    assert!(is_sole_initializer_fragment(declarator, true));
+}
+
+#[test]
+fn multiple_declarators_in_one_field_declaration_each_count() {
+    // `private static int a = 1, b = 2;` is two composed fragments in JLS
+    // source order, even though they share one `field_declaration`.
+    let source = "class App {\n  private static int a = 1, b = 2;\n}\n";
+    let tree = parse_java(source);
+    let a = declarator_named(tree.root_node(), source, "a");
+    let b = declarator_named(tree.root_node(), source, "b");
+    assert!(!is_sole_initializer_fragment(a, true));
+    assert!(!is_sole_initializer_fragment(b, true));
 }

@@ -7,14 +7,14 @@ use super::super::ir::{
 use super::error::{OracleContractError, require_same_procedure};
 use super::limits::OracleLimits;
 use super::model::{
-    AbstractLocation, AbstractObjectIdentity, OracleCallContext, ProcedurePortHandle,
-    ProcedurePortKind,
+    AbstractLocation, AbstractObjectIdentity, ExecutionTiming, ExecutionTimingClaim,
+    OracleCallContext, ProcedurePortHandle, ProcedurePortKind,
 };
 use super::relation::{
     CandidateCoverage, OracleRelationHandle, OracleRelationKind, OracleRelationOwner,
     validate_retained_relation_arenas,
 };
-use crate::analyzer::semantic::ValueId;
+use crate::analyzer::semantic::{SemanticGapId, ValueId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ValueFlowRelationKind {
@@ -27,7 +27,63 @@ pub enum ValueFlowRelationKind {
     MemoryLoad,
     MemoryStore,
     Capture,
+    /// The runtime binds a thrown value to a handler's own binding when it
+    /// selects that handler (#2446). The source is the thrown value at the
+    /// throw site and the target is the procedure-local value the handler
+    /// binds it to; the relation rides the `Throw` event that publishes the
+    /// value, because that is the exact event whose evidence justifies it.
+    HandlerBinding,
+    /// Reading a container as a whole reads everything inside it (#2444
+    /// slice 2 / #2453). The source is a member or element location of the
+    /// object the read is rooted at, and the target is the value that read
+    /// produces.
+    ///
+    /// The direction is strictly element-to-whole and the relation is only
+    /// ever published at a *consumption* of the whole value -- an argument, a
+    /// receiver, a returned value, or a value stored as a whole. Publishing it
+    /// at the read rather than at the member store is what keeps a strong
+    /// update (#2444 slice 1) meaningful: the kill has already replaced what
+    /// the member location holds by the time this relation reads it, so a
+    /// member that was overwritten with a clean value does not resurrect the
+    /// value it used to hold. Element-to-element separation, field separation
+    /// and every existing kill are unchanged, because nothing here flows out
+    /// of the whole value back into a member.
+    ContainerCollapse,
     LanguageDefined,
+}
+
+impl ValueFlowRelationKind {
+    /// When the target of a relation of this kind is evaluated, relative to
+    /// its source (#2446).
+    ///
+    /// Every point-local transfer publishes both endpoints from one event, so
+    /// the two are evaluated by one step. The three that leave the event --
+    /// a handler binding, a capture, and a port -- state their own timing
+    /// instead of inheriting that assumption.
+    pub const fn timing(self) -> ExecutionTiming {
+        match self {
+            Self::Assignment
+            | Self::Allocation
+            | Self::MemoryLoad
+            | Self::MemoryStore
+            // A container collapse rides the event that reads the whole
+            // value, so the member it names and the value the read produces
+            // are observed by that one evaluation.
+            | Self::ContainerCollapse
+            | Self::LanguageDefined
+            | Self::Parameter
+            | Self::Receiver => ExecutionTiming::SameEvaluation,
+            // The handler runs while this activation is still unwinding, so
+            // the binding is later in the same synchronous invocation.
+            Self::HandlerBinding => ExecutionTiming::SameInvocation,
+            // A return port is written as this activation completes.
+            Self::NormalReturn | Self::ExceptionalReturn => ExecutionTiming::SameInvocation,
+            // A captured value is read whenever the capturing callable runs,
+            // which nothing in this layer establishes. Lexical nesting is not
+            // evidence that it runs now.
+            Self::Capture => ExecutionTiming::Unknown,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -86,6 +142,22 @@ fn memory_access_is_indexed(
         })
 }
 
+/// Whether a relation is the container collapse a whole-value read publishes
+/// (#2444 slice 2).
+///
+/// The read's own event decides which value the whole container arrives in;
+/// the collapse names a location inside the object that value denotes. The
+/// oracle proves the containment relationship when it derives the relation,
+/// which this layer cannot re-derive from one event, so what is checked here
+/// is the shape: a location on the source side and the exact value the event
+/// defines on the target side.
+fn is_container_collapse(relation: &ValueFlowRelation, defined: ValueId) -> bool {
+    relation.kind == ValueFlowRelationKind::ContainerCollapse
+        && matches!(&relation.source, ValueFlowEndpoint::Location(location)
+            if !location.path().selectors().is_empty())
+        && value_endpoint(&relation.target, defined)
+}
+
 fn relation_matches_event(
     procedure: &ProcedureHandle,
     relation: &ValueFlowRelation,
@@ -93,18 +165,20 @@ fn relation_matches_event(
 ) -> bool {
     match effect {
         SemanticEffect::Assignment { target, value } => {
-            relation.kind == ValueFlowRelationKind::Assignment
+            (relation.kind == ValueFlowRelationKind::Assignment
                 && value_endpoint(&relation.source, *value)
-                && value_endpoint(&relation.target, *target)
+                && value_endpoint(&relation.target, *target))
+                || is_container_collapse(relation, *target)
         }
         SemanticEffect::ValueFlow {
             kind: ValueFlowKind::Local,
             source,
             target,
         } => {
-            relation.kind == ValueFlowRelationKind::Assignment
+            (relation.kind == ValueFlowRelationKind::Assignment
                 && value_endpoint(&relation.source, *source)
-                && value_endpoint(&relation.target, *target)
+                && value_endpoint(&relation.target, *target))
+                || is_container_collapse(relation, *target)
         }
         SemanticEffect::ValueFlow {
             kind: ValueFlowKind::Parameter,
@@ -179,10 +253,11 @@ fn relation_matches_event(
         SemanticEffect::MemoryLoad {
             location, result, ..
         } => {
-            relation.kind == ValueFlowRelationKind::MemoryLoad
+            (relation.kind == ValueFlowRelationKind::MemoryLoad
                 && (matches!(&relation.source, ValueFlowEndpoint::Location(_))
                     || memory_access_is_indexed(procedure, *location))
-                && value_endpoint(&relation.target, *result)
+                && value_endpoint(&relation.target, *result))
+                || is_container_collapse(relation, *result)
         }
         SemanticEffect::MemoryStore {
             location, value, ..
@@ -218,11 +293,22 @@ fn relation_matches_event(
                     )
             })
         }
-        SemanticEffect::Throw { value: Some(value) } => {
-            relation.kind == ValueFlowRelationKind::ExceptionalReturn
-                && value_endpoint(&relation.source, *value)
-                && port_endpoint(&relation.target, ProcedurePortKind::ExceptionalReturn)
-        }
+        // A thrown value publishes two relation families from one event: it
+        // leaves the procedure through the exceptional-return port, and, when
+        // a handler in this procedure can select the throw, the runtime binds
+        // it to that handler's own binding (#2446). Both are justified by this
+        // event's evidence, so both ride it.
+        SemanticEffect::Throw { value: Some(value) } => match relation.kind {
+            ValueFlowRelationKind::ExceptionalReturn => {
+                value_endpoint(&relation.source, *value)
+                    && port_endpoint(&relation.target, ProcedurePortKind::ExceptionalReturn)
+            }
+            ValueFlowRelationKind::HandlerBinding => {
+                value_endpoint(&relation.source, *value)
+                    && matches!(&relation.target, ValueFlowEndpoint::Value(_))
+            }
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -282,6 +368,18 @@ pub struct ValueFlowRelation {
     pub target: ValueFlowEndpoint,
     pub proof: ProofStatus,
     pub completeness: EvidenceCompleteness,
+    /// Whether this store holds a [`StrongUpdateCertificate`] at its own site
+    /// (#2444).
+    ///
+    /// Only a `MemoryStore` relation can set this. A flow client that carries
+    /// the overwritten location may replace, rather than join, the facts at
+    /// that carrier; every other relation joins as before. The flag is the
+    /// certificate's verdict and not the certificate itself, because the
+    /// certificate retains a relation arena scoped to the query that issued it
+    /// and a snapshot outlives that query.
+    ///
+    /// [`StrongUpdateCertificate`]: super::heap::StrongUpdateCertificate
+    pub strong_update: bool,
 }
 
 impl ValueFlowRelation {
@@ -297,6 +395,22 @@ impl ValueFlowRelation {
         matches!(self.proof, ProofStatus::Proven)
             && matches!(self.completeness, EvidenceCompleteness::Complete)
     }
+
+    /// When this relation's target is evaluated relative to its source, at the
+    /// quality this relation's own evidence supports (#2446).
+    ///
+    /// The timing comes from the relation family and the carriers come from
+    /// the relation, so a consumer never has to decide separately whether the
+    /// timing is trustworthy: an unproven relation carries an unproven timing.
+    pub fn timing_claim(&self) -> ExecutionTimingClaim {
+        let timing = self.kind.timing();
+        if matches!(timing, ExecutionTiming::Unknown) {
+            return ExecutionTimingClaim::unknown(
+                "this relation family does not establish when its target is evaluated",
+            );
+        }
+        ExecutionTimingClaim::new(timing, self.proof.clone(), self.completeness.clone())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -305,15 +419,51 @@ pub struct ValueFlowSnapshot {
     context: OracleCallContext,
     relations: Box<[ValueFlowRelation]>,
     coverage: CandidateCoverage,
+    /// Gaps on this snapshot's procedure that a query-time discharge
+    /// predicate proved do not apply, computed once while this snapshot was
+    /// materialized (#2545).
+    ///
+    /// A gap's presence in the procedure's own IR never changes once
+    /// lowering runs; whether it actually blocks anything is a query-time
+    /// judgment ([`super::super::workspace_oracle::gap_impacts_value_flow`]
+    /// composed with each discharge predicate). Before this field existed, a
+    /// downstream consumer that needed to re-examine this snapshot's raw
+    /// gaps (`ValueFlowPlan`'s own-procedure "refinable" residual check) had
+    /// no way to see that judgment and had to either duplicate every
+    /// discharge predicate or treat every non-refinement-shaped gap as
+    /// permanently blocking, even one this snapshot's own construction had
+    /// already proven discharged. Carrying the discharged set as data lets a
+    /// consumer trust this snapshot's own judgment without re-deriving it
+    /// and without needing the query-time analyzer access that judgment
+    /// required.
+    discharged_gaps: Box<[SemanticGapId]>,
 }
 
 impl ValueFlowSnapshot {
+    /// Build a snapshot whose materialization discharged no gap. Equivalent
+    /// to [`Self::with_discharged_gaps`] with an empty discharge set.
     pub fn new(
         procedure: ProcedureHandle,
         context: OracleCallContext,
         relations: Vec<ValueFlowRelation>,
         coverage: CandidateCoverage,
         limits: OracleLimits,
+    ) -> Result<Self, OracleContractError> {
+        Self::with_discharged_gaps(procedure, context, relations, coverage, limits, Vec::new())
+    }
+
+    /// Build a snapshot, recording which of its procedure's gaps a
+    /// query-time discharge predicate proved do not apply while this
+    /// snapshot was materialized (#2545). `discharged_gaps` need not be
+    /// sorted or deduplicated; order does not matter to
+    /// [`Self::gap_is_discharged`].
+    pub fn with_discharged_gaps(
+        procedure: ProcedureHandle,
+        context: OracleCallContext,
+        relations: Vec<ValueFlowRelation>,
+        coverage: CandidateCoverage,
+        limits: OracleLimits,
+        discharged_gaps: Vec<SemanticGapId>,
     ) -> Result<Self, OracleContractError> {
         let owner = OracleRelationOwner::ProcedureValueFlow {
             procedure: procedure.clone(),
@@ -355,6 +505,20 @@ impl ValueFlowSnapshot {
             {
                 return Err(OracleContractError::InvalidRelationQuality);
             }
+            // A strong update is only ever a claim about one exact overwritten
+            // location, backed by proven and complete evidence. Rejecting the
+            // other shapes here means a client can act on the flag without
+            // re-deriving the preconditions the certificate already required.
+            if relation.strong_update
+                && (relation.kind != ValueFlowRelationKind::MemoryStore
+                    || !relation.is_proven_complete()
+                    || !matches!(
+                        &relation.target,
+                        ValueFlowEndpoint::Location(location) if location.path().is_exact()
+                    ))
+            {
+                return Err(OracleContractError::InvalidRelationIdentity);
+            }
         }
         validate_retained_relation_arenas(relations.iter().map(|relation| &relation.id), limits)?;
         Ok(Self {
@@ -362,6 +526,7 @@ impl ValueFlowSnapshot {
             context,
             relations: relations.into_boxed_slice(),
             coverage,
+            discharged_gaps: discharged_gaps.into_boxed_slice(),
         })
     }
 
@@ -379,5 +544,15 @@ impl ValueFlowSnapshot {
 
     pub const fn coverage(&self) -> CandidateCoverage {
         self.coverage
+    }
+
+    /// Whether a query-time discharge predicate proved, while this snapshot
+    /// was materialized, that `gap` does not apply (#2545). `false` for a
+    /// gap this snapshot never examined (a stale or foreign ID) as well as
+    /// for one it examined and left standing -- both keep whatever the gap
+    /// would otherwise mean to a caller that re-examines this snapshot's
+    /// procedure's raw gap list.
+    pub fn gap_is_discharged(&self, gap: SemanticGapId) -> bool {
+        self.discharged_gaps.contains(&gap)
     }
 }

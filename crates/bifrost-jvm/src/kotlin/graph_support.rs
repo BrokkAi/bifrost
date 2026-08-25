@@ -48,8 +48,14 @@ pub trait KotlinSource: CodeUnitIndex + ImportAnalysisProvider {
     /// The file's `package` declaration.
     fn package_name_of(&self, file: &ProjectFile) -> Option<String>;
 
-    /// The workspace's usage-definition index, as the bounded lookup contract.
-    fn usage_definitions(&self, token: QueryToken<'_>) -> &dyn BoundedDefinitionLookup;
+    /// Run one synchronous resolution step against a step-local bounded
+    /// definition lookup. The callback keeps the lookup owned by the analysis
+    /// implementation instead of publishing it as analyzer-generation state.
+    fn with_usage_definitions(
+        &self,
+        token: QueryToken<'_>,
+        read: &mut dyn FnMut(&dyn BoundedDefinitionLookup),
+    );
 
     /// The type identifiers a file spells, from the analyzer's persisted parse.
     fn type_identifiers_of(&self, file: &ProjectFile) -> Option<HashSet<String>>;

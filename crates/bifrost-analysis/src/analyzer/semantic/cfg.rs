@@ -4,10 +4,10 @@ use crate::hash::{HashMap, HashSet};
 
 use super::{
     AllocationId, AllocationKind, AllocationSite, BasicBlock, BlockId, CaptureBinding, CaptureId,
-    CaptureMode, ControlEdge, ControlEdgeKind, Evidence, EvidenceId, MemoryLocation,
-    MemoryLocationId, MemoryLocationKind, ProcedureSemanticsParts, ProgramPoint, ProgramPointId,
-    SemanticBudget, SemanticBudgetExceeded, SemanticCallSite, SemanticEvent, SemanticGap,
-    SemanticLocator, SemanticValue, SemanticWork, SourceMapping, SourceMappingId,
+    CaptureMode, ControlEdge, ControlEdgeKind, Evidence, EvidenceId, GuardFactParts, GuardId,
+    MemoryLocation, MemoryLocationId, MemoryLocationKind, ProcedureSemanticsParts, ProgramPoint,
+    ProgramPointId, SemanticBudget, SemanticBudgetExceeded, SemanticCallSite, SemanticEvent,
+    SemanticGap, SemanticLocator, SemanticValue, SemanticWork, SourceMapping, SourceMappingId,
 };
 
 #[derive(Debug, Clone)]
@@ -38,7 +38,10 @@ impl ProcedureCfgBuilder {
         budget: &SemanticBudget,
     ) -> Result<Self, SemanticBudgetExceeded> {
         assert!(
-            parts.points.is_empty() && parts.blocks.is_empty() && parts.control_edges.is_empty(),
+            parts.points.is_empty()
+                && parts.blocks.is_empty()
+                && parts.control_edges.is_empty()
+                && parts.guard_facts.is_empty(),
             "CFG builder requires construction parts without prebuilt topology"
         );
         assert!(
@@ -301,6 +304,32 @@ impl ProcedureCfgBuilder {
         })?;
         self.points[point.index()].events.push(event);
         Ok(())
+    }
+
+    /// Retain one normalized decision-point condition.
+    ///
+    /// The arms are named by destination and edge kind because control-edge IDs
+    /// only exist once the canonical table is sorted at freeze time. The caller
+    /// must have already added the arm edges: [`Self::seal_unreachable_regions`]
+    /// drops an arm whose edge it removes, and the IR validator rejects an arm
+    /// that names an edge the guard's point does not have.
+    pub(crate) fn add_guard_fact(
+        &mut self,
+        guard: GuardFactParts,
+    ) -> Result<GuardId, SemanticBudgetExceeded> {
+        let id = GuardId::try_from_index(self.parts.guard_facts.len())
+            .expect("guard count is bounded by the u32 semantic budget");
+        assert_eq!(guard.id, id, "guard facts must use dense builder IDs");
+        assert!(
+            guard.point.index() < self.points.len(),
+            "guard point must exist"
+        );
+        self.reserve(SemanticWork {
+            nested_entries: 1,
+            ..SemanticWork::default()
+        })?;
+        self.parts.guard_facts.push(guard);
+        Ok(id)
     }
 
     pub(crate) fn add_edge(&mut self, edge: ControlEdge) -> Result<(), SemanticBudgetExceeded> {
@@ -604,6 +633,31 @@ impl ProcedureCfgBuilder {
                 index += 1;
                 retain
             });
+            // A guard arm names an edge, so an arm whose edge just went away is
+            // no longer a claim this procedure can make. Clearing it keeps the
+            // predicate -- the fact that a constant condition was here survives
+            // the seal -- while the arm honestly reports that the frozen CFG
+            // has no such successor.
+            if !self.parts.guard_facts.is_empty() {
+                let surviving = self
+                    .parts
+                    .control_edges
+                    .iter()
+                    .map(|edge| (edge.source_point, edge.target_point, edge.kind))
+                    .collect::<HashSet<_>>();
+                for guard in &mut self.parts.guard_facts {
+                    let point = guard.point;
+                    let retain_arm = |arm: &mut Option<super::GuardArm>| {
+                        if arm.is_some_and(|arm| {
+                            !surviving.contains(&(point, arm.target_point, arm.kind))
+                        }) {
+                            *arm = None;
+                        }
+                    };
+                    retain_arm(&mut guard.true_arm);
+                    retain_arm(&mut guard.false_arm);
+                }
+            }
             self.prospective_work.control_edges = self
                 .prospective_work
                 .control_edges

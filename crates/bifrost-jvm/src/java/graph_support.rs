@@ -29,17 +29,22 @@
 use brokk_bifrost_core::analyzer::capabilities::{
     ImportAnalysisProvider, TypeHierarchyProvider, build_reverse_file_index,
 };
+use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::model::{CallableArity, ImportInfo};
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::structural::resolution::PrecedenceTier;
-use brokk_bifrost_core::analyzer::{BoundedDefinitionLookup, CodeUnit, CodeUnitIndex, ProjectFile};
+use brokk_bifrost_core::analyzer::{
+    BoundedDefinitionLookup, CodeUnit, CodeUnitIndex, DefinitionLanguageScope, ProjectFile,
+    RelationalDefinitionFrontier, RelationalDefinitionQuery, RelationalDefinitionQuestion,
+    RelationalDefinitionValue, RelationalName,
+};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use tree_sitter::Node;
 
-use crate::java::declarations::{collect_type_identifiers, parse_tree};
+use crate::java::declarations::{collect_type_identifiers, java_package_fq, parse_tree};
 use crate::java::imports::{import_package, non_static_import_path, static_import_path};
 use crate::proof::JvmRetainedExternalIndex;
 
@@ -72,13 +77,23 @@ pub trait JavaSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyProv
     /// answered forward without building the workspace usage index.
     fn forward_definition_fqn(&self, fqn: &str) -> Vec<CodeUnit>;
 
-    /// The workspace's usage-definition index, as the bounded lookup contract.
-    fn usage_definitions(&self, token: QueryToken<'_>) -> &dyn BoundedDefinitionLookup;
+    /// Run one synchronous resolution step against a step-local bounded
+    /// definition lookup. The callback keeps the lookup owned by the analysis
+    /// implementation instead of publishing it as analyzer-generation state.
+    fn with_usage_definitions(
+        &self,
+        token: QueryToken<'_>,
+        read: &mut dyn FnMut(&dyn BoundedDefinitionLookup),
+    );
 
-    /// Every type the usage-definition index holds in `package_name`, sorted and
-    /// deduplicated. The index's package projection has no bounded spelling, so
-    /// this is the one lookup below that names its own accessor.
-    fn source_types_in_package(&self, token: QueryToken<'_>, package_name: &str) -> Vec<CodeUnit>;
+    /// Every type in each requested package, sorted and deduplicated per
+    /// package. The implementation executes the whole slice as one relational
+    /// batch; one package is the same operation at arity one.
+    fn source_types_in_packages(
+        &self,
+        token: QueryToken<'_>,
+        package_names: &[String],
+    ) -> HashMap<String, Vec<CodeUnit>>;
 
     /// The type identifiers a file spells, from the analyzer's persisted parse.
     fn type_identifiers_of(&self, file: &ProjectFile) -> Option<HashSet<String>>;
@@ -418,13 +433,11 @@ pub fn resolve_java_usage_type_name(
     file: &ProjectFile,
     raw_name: &str,
 ) -> Option<CodeUnit> {
-    resolve_java_usage_type_name_in(
-        source,
-        token,
-        source.usage_definitions(token),
-        file,
-        raw_name,
-    )
+    let mut result = None;
+    source.with_usage_definitions(token, &mut |definitions| {
+        result = resolve_java_usage_type_name_in(source, token, definitions, file, raw_name);
+    });
+    result
 }
 
 /// Resolve a source type against a *supplied* declaration index, applying
@@ -460,6 +473,111 @@ pub fn resolve_java_usage_type_name_in(
                 .cloned()
         },
     ))
+}
+
+/// Resolve parser-derived Java type components through the workspace
+/// relational frontier.
+///
+/// Every visibility tier yields a component vector, not a rendered FQN. All
+/// candidates for one written name share a terminal identifier, so the
+/// frontier deduplicates them into one indexed identifier seek. Candidate
+/// selection then compares semantic segment text and never guesses where a
+/// package path becomes a nested type path.
+pub fn resolve_java_usage_type_components_in(
+    source: &dyn JavaSource,
+    token: QueryToken<'_>,
+    definitions: &dyn RelationalDefinitionFrontier,
+    file: &ProjectFile,
+    components: &[String],
+) -> Option<CodeUnit> {
+    let terminal = components.last()?;
+    let mut identifier_name = FqName::new();
+    identifier_name.push(segment_interner().intern(terminal, SegmentKind::Type));
+    let question = RelationalDefinitionQuestion {
+        language_scope: DefinitionLanguageScope::Workspace,
+        name: RelationalName::stable(identifier_name),
+        query: RelationalDefinitionQuery::Identifier { file: None },
+    };
+    let RelationalDefinitionValue::Definitions(identifier_candidates) = definitions.ask(&question)
+    else {
+        panic!("a Java identifier question returned the wrong shape")
+    };
+
+    let candidate = |segments: &[String]| {
+        let mut expected = FqName::new();
+        for segment in segments {
+            expected.push(segment_interner().intern(segment, SegmentKind::Type));
+        }
+        identifier_candidates
+            .iter()
+            .find(|unit| unit.is_class() && unit.fq().same_segment_texts(&expected))
+            .cloned()
+    };
+
+    if components.len() > 1
+        && let Some(unit) = candidate(components)
+    {
+        return Some(unit);
+    }
+
+    let imports = source.import_info_of(token, file);
+    for import in &imports {
+        let Some(import_path) = non_static_import_path(import) else {
+            continue;
+        };
+        if import.is_wildcard
+            || import.identifier.as_deref() != components.first().map(String::as_str)
+        {
+            continue;
+        }
+        let mut imported = import_path.segments.clone();
+        imported.extend_from_slice(&components[1..]);
+        // A matching explicit import is terminal even when the workspace does
+        // not contain its target.
+        return candidate(&imported);
+    }
+
+    let mut wildcard_candidates = Vec::new();
+    for import in &imports {
+        let Some(import_path) = non_static_import_path(import) else {
+            continue;
+        };
+        if !import.is_wildcard {
+            continue;
+        }
+        let mut imported = import_path.segments.clone();
+        imported.extend_from_slice(components);
+        if let Some(unit) = candidate(&imported)
+            && !wildcard_candidates.contains(&unit)
+        {
+            wildcard_candidates.push(unit);
+        }
+    }
+    if wildcard_candidates.len() == 1 {
+        return wildcard_candidates.pop();
+    }
+    if !wildcard_candidates.is_empty() {
+        return None;
+    }
+
+    let package_name = source
+        .cached_package_name(file)
+        .unwrap_or_else(|| Arc::from(""));
+    let package = java_package_fq(&package_name);
+    let interner = segment_interner();
+    let mut same_package = package;
+    for (ordinal, component) in components.iter().enumerate() {
+        let kind = if ordinal == 0 {
+            SegmentKind::Type
+        } else {
+            SegmentKind::Nested
+        };
+        same_package.push(interner.intern(component, kind));
+    }
+    identifier_candidates
+        .iter()
+        .find(|unit| unit.is_class() && unit.fq().same_segment_texts(&same_package))
+        .cloned()
 }
 
 /// Every candidate the deciding type-name tier produced for `raw_name`,
@@ -759,8 +877,18 @@ fn usage_source_type_by_fqn(
     token: QueryToken<'_>,
     fqn: &str,
 ) -> Option<CodeUnit> {
-    source
-        .usage_definitions(token)
+    let mut result = None;
+    source.with_usage_definitions(token, &mut |definitions| {
+        result = usage_source_type_by_fqn_in(definitions, fqn);
+    });
+    result
+}
+
+fn usage_source_type_by_fqn_in(
+    definitions: &dyn BoundedDefinitionLookup,
+    fqn: &str,
+) -> Option<CodeUnit> {
+    definitions
         .fqn(fqn)
         .iter()
         .find(|code_unit| code_unit.is_class())
@@ -781,22 +909,45 @@ pub fn resolve_java_import_infos(
     let mut resolved = HashMap::default();
     let mut wildcard_resolved = HashMap::<String, CodeUnit>::default();
 
+    source.with_usage_definitions(token, &mut |definitions| {
+        for import in imports {
+            let Some(import_path) = non_static_import_path(import) else {
+                continue;
+            };
+            if import.is_wildcard {
+                continue;
+            }
+            if let Some(code_unit) =
+                usage_source_type_by_fqn_in(definitions, &import_path.render_segments("."))
+            {
+                resolved.insert(code_unit.identifier().to_string(), code_unit);
+            }
+        }
+    });
+
+    let wildcard_packages = imports
+        .iter()
+        .filter_map(|import| {
+            import
+                .is_wildcard
+                .then(|| non_static_import_path(import))
+                .flatten()
+                .map(|path| path.render_segments("."))
+        })
+        .collect::<Vec<_>>();
+    let types_by_package = source.source_types_in_packages(token, &wildcard_packages);
+
     for import in imports {
         let Some(import_path) = non_static_import_path(import) else {
             continue;
         };
 
         if !import.is_wildcard {
-            if let Some(code_unit) =
-                usage_source_type_by_fqn(source, token, &import_path.render_segments("."))
-            {
-                resolved.insert(code_unit.identifier().to_string(), code_unit);
-            }
             continue;
         }
 
         let package_name = import_path.render_segments(".");
-        for code_unit in source.source_types_in_package(token, &package_name) {
+        for code_unit in types_by_package.get(&package_name).into_iter().flatten() {
             let identifier = code_unit.identifier().to_string();
             if resolved.contains_key(&identifier) && !wildcard_resolved.contains_key(&identifier) {
                 continue;

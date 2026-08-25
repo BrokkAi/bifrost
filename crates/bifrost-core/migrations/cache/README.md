@@ -2,8 +2,9 @@
 
 `0018-current-baseline.sql` is the schema every store starts from. It is the
 fold of the former migrations 0001..0018 and is named for the version it
-produces, not for its position. The six files beside it carry a store from
-version 18 to version 24, one version each.
+produces, not for its position. The numbered files beside it carry a store
+forward through the current version; version numbers remain explicit because
+this chain can deliberately skip an unpublished number.
 
 `BASELINE_MIGRATION_VERSION` and `CURRENT_MIGRATION_VERSION` in
 `src/cache_db.rs` name the two ends, and `CACHE_MIGRATIONS` writes the version
@@ -42,3 +43,20 @@ Migration `0024-live-definition-views.sql` makes completed-parse and
 active-generation membership reusable schema interfaces for definition
 queries. It adds views only: it does not persist a second path, package, or
 declaration projection.
+
+Migration `0027-relational-definition-set-views.sql` keeps stable and anchored
+name access paths separate for set-oriented joins. It adds views only. The
+split prevents SQLite from materializing the compound point-query views when a
+bounded request relation drives a batch.
+
+Migration `0028-retire-fq2.sql` removes the opaque `code_units.fq_segments`
+identity envelope. Migration 0026 already populated the authoritative
+`code_unit_fq_segments` relation; 0028 backfills parent-declared segment row and
+byte counts for complete-read validation and bounded header admission, then
+drops the redundant binary copy without invalidating analyzer rows.
+
+Migration `0029-reverse-import-lookups.sql` adds reverse access paths for
+structured import segments and type identifiers. Seed-directed relevance
+queries intersect these indexes with their connection-local live blob set, so
+they do not hydrate every file in a large workspace or admit historical blobs
+from the shared content cache.

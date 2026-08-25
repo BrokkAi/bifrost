@@ -103,7 +103,7 @@ impl PolicySourceHash {
 impl ResolvedSelectorSemanticHash {
     pub(crate) fn from_query(
         schema_version: u32,
-        query: &brokk_bifrost_analysis::analyzer::structural::CodeQuery,
+        query: &brokk_bifrost_rql::structural::CodeQuery,
     ) -> Self {
         let value = json!({
             "schema_version": schema_version,

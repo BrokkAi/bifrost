@@ -3,8 +3,8 @@ use crate::analyzer::cpp::cpp_sentinel_recovered_classes;
 use crate::analyzer::usages::common::{analyzed_files_for_language, language_for_file};
 use crate::analyzer::usages::cpp_graph::CppDispatch;
 use crate::analyzer::usages::inverted_edges::{
-    ClassRangeIndex, UsageEdgeBuildOutput, UsageEdgeWeights, UsageEdges, build_edge_output,
-    parse_and_collect,
+    ClassRangeIndex, EdgeNodeDomain, UsageEdgeBuildOutput, UsageEdgeWeights, UsageEdges,
+    build_edge_output, parse_and_collect_with_domain,
 };
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit, UsageHitSurface};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
@@ -32,6 +32,7 @@ struct PreparedCppFile {
     class_ranges: OnceLock<Arc<ClassRangeIndex>>,
 }
 
+#[cfg(test)]
 fn scan_file_major<F, S, P, I, C, Prepare, Scan>(
     files: I,
     specs: &[S],
@@ -250,22 +251,63 @@ impl CppQueryResolver<'_> {
         let Some(target) = overloads.first() else {
             return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
         };
-        let dispatch = CppDispatch::new(analyzer, token);
-        let source = dispatch.source();
-        let mut specs = Vec::with_capacity(overloads.len());
-        let mut seen_type_specs = HashSet::default();
-        for overload in overloads {
-            let Some(spec) = TargetSpec::from_target(&source, overload) else {
+        // A target group is one resolution frontier. Build every TargetSpec
+        // provisionally, batch the structured owner questions that pass
+        // discovers, and replay until no new owner or alias hop is asked.
+        // Only the final owned specs escape; no scan side effect is published
+        // by a provisional pass.
+        let site_equivalents = self.site_equivalent_overloads(token, overloads);
+        let uncancelled = crate::CancellationToken::new();
+        let cancellation = scan_scope.cancellation().unwrap_or(&uncancelled);
+        let specs = match crate::analyzer::relational_frontier::resolve_relational_frontier(
+            analyzer,
+            cancellation,
+            |frontier| {
+                let dispatch = CppDispatch::with_frontier(analyzer, token, frontier);
+                let source = dispatch.source();
+                let mut specs = Vec::with_capacity(overloads.len() + site_equivalents.len());
+                let mut seen_type_specs = HashSet::default();
+                for overload in overloads {
+                    let Some(spec) = TargetSpec::from_target(&source, overload) else {
+                        return Err(overload.clone());
+                    };
+                    if retain_scan_spec(&mut seen_type_specs, &spec) {
+                        specs.push(spec);
+                    }
+                }
+                for equivalent in &site_equivalents {
+                    if let Some(spec) = TargetSpec::from_target(&source, equivalent)
+                        && retain_scan_spec(&mut seen_type_specs, &spec)
+                    {
+                        specs.push(spec);
+                    }
+                }
+                Ok(specs)
+            },
+        ) {
+            crate::analyzer::RelationalFrontierOutcome::Complete(Ok(specs)) => specs,
+            crate::analyzer::RelationalFrontierOutcome::Complete(Err(overload)) => {
                 return GraphUsageOutcome::fallback_safe(
                     overload.fq_name(),
                     GraphFailureReason::UnsupportedTargetShape("target shape is unsupported"),
                     "CppUsageGraphStrategy",
                 );
-            };
-            if retain_scan_spec(&mut seen_type_specs, &spec) {
-                specs.push(spec);
             }
-        }
+            crate::analyzer::RelationalFrontierOutcome::Cancelled => {
+                return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
+            }
+            crate::analyzer::RelationalFrontierOutcome::Failed(_) => {
+                return GraphUsageOutcome::fallback_safe(
+                    target.fq_name(),
+                    GraphFailureReason::UnsupportedTargetShape(
+                        "the relational target frontier failed",
+                    ),
+                    "CppUsageGraphStrategy",
+                );
+            }
+        };
+        let dispatch = CppDispatch::new(analyzer, token);
+        let source = dispatch.source();
         // #1970: the C and C++ readings of a header give one declaration site
         // two identities. A query against either must report every reference
         // found under both, so the site's other identity is scanned alongside
@@ -276,14 +318,6 @@ impl CppQueryResolver<'_> {
         // Leniently: an equivalent whose shape yields no `TargetSpec` is
         // dropped rather than failing the whole query, because the caller
         // asked about the requested overloads, not about it.
-        let site_equivalents = self.site_equivalent_overloads(token, overloads);
-        for equivalent in &site_equivalents {
-            if let Some(spec) = TargetSpec::from_target(&source, equivalent)
-                && retain_scan_spec(&mut seen_type_specs, &spec)
-            {
-                specs.push(spec);
-            }
-        }
         let target_group: HashSet<CodeUnit> = overloads
             .iter()
             .chain(site_equivalents.iter())
@@ -303,40 +337,67 @@ impl CppQueryResolver<'_> {
             limit_exceeded: &mut limit_exceeded,
         };
 
-        scan_file_major(
-            files,
-            &specs,
-            || scan_scope.is_cancelled(),
-            |file| {
-                prepare_file(self.cpp, token, file).map(|prepared| {
-                    let recovered_sentinel_classes = cpp_sentinel_recovered_classes(
-                        prepared.tree().root_node(),
-                        prepared.source(),
-                    );
-                    let class_range_cell = OnceLock::new();
-                    if let Some(class_ranges) = self.class_ranges.get(file).cloned() {
-                        assert!(
-                            class_range_cell.set(class_ranges).is_ok(),
-                            "class range cache is initialized once"
+        'files: for file in files {
+            if scan_scope.is_cancelled() || *state.limit_exceeded {
+                break;
+            }
+            let Some(prepared) = prepare_file(self.cpp, token, &file) else {
+                continue;
+            };
+            let recovered_sentinel_classes =
+                cpp_sentinel_recovered_classes(prepared.tree().root_node(), prepared.source());
+            let class_range_cell = OnceLock::new();
+            if let Some(class_ranges) = self.class_ranges.get(&file).cloned() {
+                assert!(
+                    class_range_cell.set(class_ranges).is_ok(),
+                    "class range cache is initialized once"
+                );
+            }
+            let prepared_file = PreparedCppFile {
+                prepared,
+                recovered_sentinel_classes,
+                class_ranges: class_range_cell,
+            };
+            let effective_specs =
+                match crate::analyzer::relational_frontier::resolve_relational_frontier(
+                    analyzer,
+                    cancellation,
+                    |frontier| {
+                        let dispatch = CppDispatch::with_frontier(analyzer, token, frontier);
+                        let frontier_source = dispatch.source();
+                        specs
+                            .iter()
+                            .map(|spec| {
+                                spec.with_visible_callable_arities(
+                                    &frontier_source,
+                                    self.cpp,
+                                    visibility,
+                                    &file,
+                                    prepared_file.prepared.as_ref(),
+                                )
+                                .into_owned()
+                            })
+                            .collect::<Vec<_>>()
+                    },
+                ) {
+                    crate::analyzer::RelationalFrontierOutcome::Complete(specs) => specs,
+                    crate::analyzer::RelationalFrontierOutcome::Cancelled => break,
+                    crate::analyzer::RelationalFrontierOutcome::Failed(_) => {
+                        return GraphUsageOutcome::fallback_safe(
+                            target.fq_name(),
+                            GraphFailureReason::UnsupportedTargetShape(
+                                "the relational file frontier failed",
+                            ),
+                            "CppUsageGraphStrategy",
                         );
                     }
-                    PreparedCppFile {
-                        prepared,
-                        recovered_sentinel_classes,
-                        class_ranges: class_range_cell,
-                    }
-                })
-            },
-            |file, prepared_file, spec| {
+                };
+            for spec in &effective_specs {
+                if scan_scope.is_cancelled() {
+                    break 'files;
+                }
                 #[cfg(any(test, feature = "test-support"))]
                 self.cpp.record_target_spec_scan_for_test();
-                let spec = spec.with_visible_callable_arities(
-                    &source,
-                    self.cpp,
-                    visibility,
-                    file,
-                    prepared_file.prepared.as_ref(),
-                );
                 let class_ranges = spec.type_scan_key().and_then(|_| {
                     // The authoritative batch already built this index. Use it
                     // for every type scan, including malformed class bodies
@@ -350,24 +411,26 @@ impl CppQueryResolver<'_> {
                     Some(
                         prepared_file
                             .class_ranges
-                            .get_or_init(|| Arc::new(ClassRangeIndex::build(analyzer, file)))
+                            .get_or_init(|| Arc::new(ClassRangeIndex::build(analyzer, &file)))
                             .as_ref(),
                     )
                 });
                 scan_prepared_file(
                     &source,
                     visibility,
-                    file,
+                    &file,
                     prepared_file.prepared.as_ref(),
                     &prepared_file.recovered_sentinel_classes,
                     class_ranges,
-                    spec.as_ref(),
+                    spec,
                     &target_group,
                     &mut state,
                 );
-                *state.limit_exceeded
-            },
-        );
+                if *state.limit_exceeded {
+                    break 'files;
+                }
+            }
+        }
 
         let external_hit_count = hits
             .iter()
@@ -420,7 +483,7 @@ pub(super) fn build_cpp_edges<Output, F>(
     token: QueryToken<'_>,
     files: &[ProjectFile],
     visibility: &VisibilityIndex<'_>,
-    nodes: &HashSet<String>,
+    domain: EdgeNodeDomain<'_>,
     keep_file: F,
 ) -> Output
 where
@@ -431,10 +494,10 @@ where
     let dispatch = CppDispatch::new(analyzer, token);
     prewarm_project_using_index(visibility);
     build_edge_output(files, keep_file, |file| {
-        parse_and_collect(
+        parse_and_collect_with_domain(
             analyzer,
             file,
-            nodes,
+            domain,
             ParseSpec::whole(&language),
             |input| {
                 brokk_bifrost_cpp::graph::inverted::scan_file(
@@ -488,7 +551,43 @@ impl<'a> CppEdgeResolver<'a> {
             .collect();
         let dispatch = CppDispatch::new(analyzer, token);
         let visibility = VisibilityIndex::build(self.cpp, token, &dispatch.source(), &roots);
-        build_cpp_edges(analyzer, token, &self.files, &visibility, nodes, keep_file)
+        build_cpp_edges(
+            analyzer,
+            token,
+            &self.files,
+            &visibility,
+            EdgeNodeDomain::Closed(nodes),
+            keep_file,
+        )
+    }
+
+    pub(crate) fn build_rooted_edges<F>(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        callers: &HashSet<String>,
+        keep_file: F,
+    ) -> UsageEdges
+    where
+        F: Fn(&ProjectFile) -> bool + Sync,
+    {
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let token = scope.token();
+        let roots: HashSet<ProjectFile> = self
+            .files
+            .iter()
+            .filter(|file| keep_file(file))
+            .cloned()
+            .collect();
+        let dispatch = CppDispatch::new(analyzer, token);
+        let visibility = VisibilityIndex::build(self.cpp, token, &dispatch.source(), &roots);
+        build_cpp_edges(
+            analyzer,
+            token,
+            &self.files,
+            &visibility,
+            EdgeNodeDomain::Rooted(callers),
+            keep_file,
+        )
     }
 
     pub(crate) fn build_edge_weights<F>(
@@ -511,7 +610,14 @@ impl<'a> CppEdgeResolver<'a> {
             .collect();
         let dispatch = CppDispatch::new(analyzer, token);
         let visibility = VisibilityIndex::build(self.cpp, token, &dispatch.source(), &roots);
-        build_cpp_edges(analyzer, token, &self.files, &visibility, nodes, keep_file)
+        build_cpp_edges(
+            analyzer,
+            token,
+            &self.files,
+            &visibility,
+            EdgeNodeDomain::Closed(nodes),
+            keep_file,
+        )
     }
 }
 

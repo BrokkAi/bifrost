@@ -23,30 +23,32 @@ use sha2::{Digest, Sha256};
 use brokk_bifrost_analysis::CancellationToken;
 use brokk_bifrost_analysis::analyzer::Range as AnalyzerRange;
 use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
-use brokk_bifrost_analysis::analyzer::structural::OwnerRelation;
-use brokk_bifrost_analysis::analyzer::structural::edges::EdgeAxis;
-use brokk_bifrost_analysis::analyzer::structural::flow_state::{
+use brokk_bifrost_analysis::analyzer::usages::{UsageHitSurface, UsageProof};
+use brokk_bifrost_analysis::analyzer::{CodeUnit, IAnalyzer, ProjectFile, WorkspaceAnalyzer};
+use brokk_bifrost_flow::flow_state::{
     FileFlowState, FlowRelation, FlowStateAxis, FlowStateDerivation, FlowStateRequest, FlowSubject,
     StateEventClass, StateEventRow, flow_state_for_file,
 };
-use brokk_bifrost_analysis::analyzer::structural::materialization::MaterializationAxis;
-use brokk_bifrost_analysis::analyzer::structural::materialization_rows::{
+use brokk_bifrost_rql::structural::OwnerRelation;
+use brokk_bifrost_rql::structural::edges::EdgeAxis;
+use brokk_bifrost_rql::structural::materialization::MaterializationAxis;
+use brokk_bifrost_rql::structural::materialization_rows::{
     DeclarationStateRow, MaterializationFileResult, materialization_for_file,
 };
-use brokk_bifrost_analysis::analyzer::structural::occurrences::OccurrenceClass as InternalOccurrenceClass;
-use brokk_bifrost_analysis::analyzer::structural::occurrences::OccurrenceRole;
-use brokk_bifrost_analysis::analyzer::structural::reference_edges::{
+use brokk_bifrost_rql::structural::occurrences::OccurrenceClass as InternalOccurrenceClass;
+use brokk_bifrost_rql::structural::occurrences::OccurrenceRole;
+use brokk_bifrost_rql::structural::reference_edges::{
     EdgeDerivationResult, ReferenceEdgeRow, forward_edges_for_file, inverse_edges_for_declaration,
 };
-use brokk_bifrost_analysis::analyzer::structural::rewrite_path::RewriteOutcome;
-use brokk_bifrost_analysis::analyzer::structural::rewrite_paths::{
+use brokk_bifrost_rql::structural::rewrite_path::RewriteOutcome;
+use brokk_bifrost_rql::structural::rewrite_paths::{
     FileRewritePaths, RewritePathIncompleteReason, RewritePathRequest, rewrite_paths_for_file,
 };
-use brokk_bifrost_analysis::analyzer::structural::search::{
+use brokk_bifrost_rql::structural::search::{
     CodeQueryBinding, CodeQueryCandidateRef, CodeQueryGenerationSite, CodeQueryLexicalScope,
     CodeQueryOccurrence, CodeQueryOccurrenceTarget, CodeQueryResolutionCandidate,
 };
-use brokk_bifrost_analysis::analyzer::structural::search::{
+use brokk_bifrost_rql::structural::search::{
     CodeQueryStableOwnerDerivation, DetailedCodeQueryDomain, DetailedCodeQueryEvidence,
     DetailedCodeQueryIdentityCandidate, DetailedCodeQueryKey, DetailedCodeQueryProvenanceEvidence,
     DetailedCodeQueryProvenanceIdentities, DetailedCodeQueryProvenanceRefEvidence,
@@ -54,24 +56,22 @@ use brokk_bifrost_analysis::analyzer::structural::search::{
     execute_code_query_detailed_eager_index_without_targets,
     execute_code_query_detailed_eager_index_workspace,
 };
-use brokk_bifrost_analysis::analyzer::structural::{BoundaryStatus, PrecedenceTier};
-use brokk_bifrost_analysis::analyzer::structural::{
+use brokk_bifrost_rql::structural::{BoundaryStatus, PrecedenceTier};
+use brokk_bifrost_rql::structural::{
     CanonicalIdentity, IDENTITY_PRESERVING_HOPS, OccurrenceFileResult, RoundTripOutcome,
     RouteEndpoint, RouteHopKind, RouteTermination, file_supplies_route_relations,
     identity_routes_from, occurrences_for_file, round_trip_from_site,
 };
-use brokk_bifrost_analysis::analyzer::structural::{
+use brokk_bifrost_rql::structural::{
     CodeQuery, CodeQueryCompletion, CodeQueryDiagnostic, CodeQueryDiagnosticCode,
     CodeQueryDiagnosticImpact, CodeQueryExecutionWork, CodeQueryProvenance, CodeQueryRange,
     CodeQueryResultDetail, CodeQueryResultItem, CodeQueryResultRef, CodeQueryResultValue,
     QueryValueKind,
 };
-use brokk_bifrost_analysis::analyzer::structural::{
+use brokk_bifrost_rql::structural::{
     NormalizedKind, OccurrenceRow as InternalOccurrenceRow,
     OccurrenceTarget as InternalOccurrenceTarget, canonical_identity_of,
 };
-use brokk_bifrost_analysis::analyzer::usages::{UsageHitSurface, UsageProof};
-use brokk_bifrost_analysis::analyzer::{CodeUnit, IAnalyzer, ProjectFile, WorkspaceAnalyzer};
 use brokk_bifrost_rql::{
     BindingOfOptions, CandidateFilter, CodeQueryPlan, CodeQueryPlanSource, CodeQuerySeed,
     GenerationSiteSeed, OccurrenceSeed, Pattern, QueryStep, SCHEMA_VERSION, ScopeSeed,
@@ -135,6 +135,7 @@ pub struct PolicyEvaluationContext<'a> {
     /// Full workspace semantics for analyses that lower structural matches
     /// into procedure, value, call-site, and heap identities.
     pub workspace: Option<&'a WorkspaceAnalyzer>,
+    pub flow_state: &'a brokk_bifrost_flow::FlowWorkspaceState,
     pub cancellation: Option<&'a CancellationToken>,
     pub cvss_overlays: &'a [CvssEvaluationOverlay],
     pub organizational_risk: &'a [OrganizationalRiskOverlay],
@@ -2244,7 +2245,7 @@ pub(crate) fn evaluate_match_policy_candidates(
 fn evaluate_match_query_candidates(
     policy_id: &PolicyId,
     analyzer: &dyn IAnalyzer,
-    query: &brokk_bifrost_analysis::analyzer::structural::CodeQuery,
+    query: &brokk_bifrost_rql::structural::CodeQuery,
     budget: &PolicyBudget,
     cancellation: Option<&CancellationToken>,
 ) -> EvaluatedMatchPolicy {
@@ -2271,6 +2272,11 @@ fn evaluate_match_query_candidates(
             | QueryValueKind::MemberFamilyEdge
             | QueryValueKind::StateEvent
             | QueryValueKind::FlowRelation
+            | QueryValueKind::ControlRelation
+            | QueryValueKind::Guard
+            | QueryValueKind::SourceSet
+            | QueryValueKind::BuildTarget
+            | QueryValueKind::TopologyEdge
             | QueryValueKind::RewritePath
             | QueryValueKind::Procedure
             | QueryValueKind::ProgramPoint
@@ -2910,6 +2916,60 @@ fn terminal_presentation(
             ProofState::Proven,
             ProofReason::DirectStructuralMatch,
         ),
+        // A control-relation row is an exact record of what a shared
+        // control-flow algorithm answered over one procedure; whether that
+        // answer is the whole truth is the row's own `completeness` and the
+        // response's diagnostics, not a proof tier of a source site (#2443).
+        CodeQueryResultValue::ControlRelation { value } => (
+            DetailedCodeQueryDomain::ControlRelation,
+            value.path.as_str(),
+            Some(value.range),
+            Vec::new(),
+            ProofState::Proven,
+            ProofReason::DirectStructuralMatch,
+        ),
+        // A guard row is an exact record of what the lowerer normalized the
+        // condition to. Its own `proof` and `completeness` columns carry the
+        // IR evidence; the row's presence is not itself in doubt (#2443).
+        CodeQueryResultValue::Guard { value } => (
+            DetailedCodeQueryDomain::Guard,
+            value.path.as_str(),
+            Some(value.range),
+            Vec::new(),
+            ProofState::Proven,
+            ProofReason::DirectStructuralMatch,
+        ),
+        // A topology row is an exact record of what a build file declares. Its
+        // location is that build file, anchored at the file's own first line
+        // because the topology vocabulary records no position inside it; the
+        // row publishes its display anchor and this reads it rather than
+        // restating it. Whether the whole set was readable is the row's own
+        // `completeness` and the response's diagnostics, not a proof tier of a
+        // source site (#2448).
+        CodeQueryResultValue::SourceSet { value: row } => (
+            DetailedCodeQueryDomain::SourceSet,
+            row.build_file.as_str(),
+            value.display_range(),
+            Vec::new(),
+            ProofState::Proven,
+            ProofReason::DirectStructuralMatch,
+        ),
+        CodeQueryResultValue::BuildTarget { value: row } => (
+            DetailedCodeQueryDomain::BuildTarget,
+            row.build_file.as_str(),
+            value.display_range(),
+            Vec::new(),
+            ProofState::Proven,
+            ProofReason::DirectStructuralMatch,
+        ),
+        CodeQueryResultValue::TopologyEdge { value: row } => (
+            DetailedCodeQueryDomain::TopologyEdge,
+            row.build_file.as_str(),
+            value.display_range(),
+            Vec::new(),
+            ProofState::Proven,
+            ProofReason::DirectStructuralMatch,
+        ),
         CodeQueryResultValue::ReferenceEdge { value } => (
             DetailedCodeQueryDomain::ReferenceEdge,
             value.path.as_str(),
@@ -3541,6 +3601,11 @@ fn public_provenance_kind(value: &CodeQueryResultRef) -> &'static str {
         CodeQueryResultRef::ReferenceEdge { .. } => "reference_edge",
         CodeQueryResultRef::StateEvent { .. } => "state_event",
         CodeQueryResultRef::FlowRelation { .. } => "flow_relation",
+        CodeQueryResultRef::ControlRelation { .. } => "control_relation",
+        CodeQueryResultRef::Guard { .. } => "guard",
+        CodeQueryResultRef::SourceSet { .. } => "source_set",
+        CodeQueryResultRef::BuildTarget { .. } => "build_target",
+        CodeQueryResultRef::TopologyEdge { .. } => "topology_edge",
         CodeQueryResultRef::RewritePath { .. } => "rewrite_path",
         CodeQueryResultRef::QualifiedPath { .. } => "qualified_path",
         CodeQueryResultRef::PathSegment { .. } => "path_segment",
@@ -3592,6 +3657,11 @@ fn public_provenance_path(value: &CodeQueryResultRef) -> &str {
         | CodeQueryResultRef::ReferenceEdge { path, .. }
         | CodeQueryResultRef::StateEvent { path, .. }
         | CodeQueryResultRef::FlowRelation { path, .. }
+        | CodeQueryResultRef::ControlRelation { path, .. }
+        | CodeQueryResultRef::Guard { path, .. }
+        | CodeQueryResultRef::SourceSet { path, .. }
+        | CodeQueryResultRef::BuildTarget { path, .. }
+        | CodeQueryResultRef::TopologyEdge { path, .. }
         | CodeQueryResultRef::RewritePath { path, .. } => path,
         CodeQueryResultRef::QualifiedPath { path, .. }
         | CodeQueryResultRef::PathSegment { path, .. } => path,
@@ -3635,6 +3705,11 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         DetailedCodeQueryDomain::PathSegment => Some(MatchResultDomain::PathSegment),
         DetailedCodeQueryDomain::StateEvent
         | DetailedCodeQueryDomain::FlowRelation
+        | DetailedCodeQueryDomain::ControlRelation
+        | DetailedCodeQueryDomain::Guard
+        | DetailedCodeQueryDomain::SourceSet
+        | DetailedCodeQueryDomain::BuildTarget
+        | DetailedCodeQueryDomain::TopologyEdge
         | DetailedCodeQueryDomain::RewritePath
         | DetailedCodeQueryDomain::Procedure
         | DetailedCodeQueryDomain::ProgramPoint
@@ -3800,6 +3875,44 @@ fn weak_finding_key(evidence: &DetailedCodeQueryEvidence) -> OpaqueFindingKey {
             update_hash(&mut hasher, procedure_id.as_bytes());
             update_hash(&mut hasher, relation.as_bytes());
             update_hash(&mut hasher, certainty.as_bytes());
+        }
+        DetailedCodeQueryKey::ControlRelation {
+            id,
+            procedure_id,
+            relation,
+            certainty,
+        } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, procedure_id.as_bytes());
+            update_hash(&mut hasher, relation.as_bytes());
+            update_hash(&mut hasher, certainty.as_bytes());
+        }
+        DetailedCodeQueryKey::Guard {
+            id,
+            procedure_id,
+            point_id,
+            predicate,
+        } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, procedure_id.as_bytes());
+            update_hash(&mut hasher, point_id.as_bytes());
+            update_hash(&mut hasher, predicate.as_bytes());
+        }
+        DetailedCodeQueryKey::SourceSet { id, name }
+        | DetailedCodeQueryKey::BuildTarget { id, name } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, name.as_bytes());
+        }
+        DetailedCodeQueryKey::TopologyEdge {
+            id,
+            from_name,
+            to_name,
+            scope,
+        } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, from_name.as_bytes());
+            update_hash(&mut hasher, to_name.as_bytes());
+            update_hash(&mut hasher, scope.as_bytes());
         }
         DetailedCodeQueryKey::RewritePath {
             id,
@@ -4048,6 +4161,13 @@ pub(super) fn incomplete_reason_for_code(code: &CodeQueryDiagnosticCode) -> Poli
         | CodeQueryDiagnosticCode::FlowStateDerivationIncomplete
         | CodeQueryDiagnosticCode::RewriteDomainUnsupported
         | CodeQueryDiagnosticCode::RewritePathDerivationIncomplete
+        | CodeQueryDiagnosticCode::ControlRelationDerivationIncomplete
+        | CodeQueryDiagnosticCode::ControlRelationExitPartitionPartial
+        // The build model behind a topology row could not be read in full, or
+        // no provider answers the axis at all. Either way the absence of a row
+        // is not evidence of an absent declaration (#2448).
+        | CodeQueryDiagnosticCode::TopologyDerivationIncomplete
+        | CodeQueryDiagnosticCode::TopologyOwnershipAmbiguous
         | CodeQueryDiagnosticCode::IdentityAxisUnsupported
         | CodeQueryDiagnosticCode::PathDerivationIncomplete
         // An effect derivation that could not establish every callee is a

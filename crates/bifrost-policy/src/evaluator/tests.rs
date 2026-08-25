@@ -22,13 +22,11 @@ use crate::registry::{PolicyRegistry, PolicyRegistryLimits};
 use crate::source::PolicySourceIdentity;
 use crate::{CvssMetricValueToken, EvidenceRef};
 use brokk_bifrost_analysis::analyzer::Language;
-use brokk_bifrost_analysis::analyzer::structural::search::{
+use brokk_bifrost_analysis::analyzer::{ProjectFile, TestProject, TypescriptAnalyzer};
+use brokk_bifrost_rql::structural::search::{
     CodeQueryStableOwnerCandidate, execute_code_query_detailed,
 };
-use brokk_bifrost_analysis::analyzer::structural::{
-    CodeQuery, CodeQueryCallSite, CodeQueryDeclaration,
-};
-use brokk_bifrost_analysis::analyzer::{ProjectFile, TestProject, TypescriptAnalyzer};
+use brokk_bifrost_rql::structural::{CodeQuery, CodeQueryCallSite, CodeQueryDeclaration};
 use serde_json::json;
 
 fn risk(rating: &str, refs: &[&str]) -> OrganizationalRiskAssessment {
@@ -70,6 +68,7 @@ fn classified_match_run(source: &str, budget: PolicyBudget) -> PolicyRun {
     let context = PolicyEvaluationContext {
         analyzer: &analyzer,
         workspace: None,
+        flow_state: &brokk_bifrost_flow::FlowWorkspaceState::new(),
         cancellation: None,
         cvss_overlays: &[],
         organizational_risk: &[],
@@ -238,6 +237,7 @@ fn raw_taint_projection(
     .unwrap();
     let anchor = TaintFindingAnchor::strong(
         sink_identity,
+        0,
         source.analysis_projection_hash,
         sink.analysis_projection_hash,
         scenario_hash,
@@ -485,6 +485,7 @@ fn typestate_compilation_incompleteness_remains_typed_and_non_clean() {
             &PolicyEvaluationContext {
                 analyzer: &analyzer,
                 workspace: None,
+                flow_state: &brokk_bifrost_flow::FlowWorkspaceState::new(),
                 cancellation: None,
                 cvss_overlays: &[],
                 organizational_risk: &[],
@@ -520,6 +521,7 @@ fn default_evaluator_dispatches_valid_taint_and_typestate_adapters() {
     let context = PolicyEvaluationContext {
         analyzer: &analyzer,
         workspace: None,
+        flow_state: &brokk_bifrost_flow::FlowWorkspaceState::new(),
         cancellation: None,
         cvss_overlays: &[],
         organizational_risk: &[],
@@ -612,6 +614,7 @@ fn duplicate_taint_projection_fails_but_preserves_unrelated_strong_positive() {
         &PolicyEvaluationContext {
             analyzer: &analyzer,
             workspace: None,
+            flow_state: &brokk_bifrost_flow::FlowWorkspaceState::new(),
             cancellation: None,
             cvss_overlays: &[],
             organizational_risk: &[],
@@ -645,6 +648,7 @@ fn taint_assembly_keeps_cvss_scenario_display_joined_after_byte_truncation() {
     let context = PolicyEvaluationContext {
         analyzer: &analyzer,
         workspace: None,
+        flow_state: &brokk_bifrost_flow::FlowWorkspaceState::new(),
         cancellation: None,
         cvss_overlays: &[],
         organizational_risk: &[],
@@ -728,6 +732,7 @@ fn terminal_adapter_completion_survives_secondary_overlay_budget() {
         &PolicyEvaluationContext {
             analyzer: &analyzer,
             workspace: None,
+            flow_state: &brokk_bifrost_flow::FlowWorkspaceState::new(),
             cancellation: None,
             cvss_overlays: &[],
             organizational_risk: &overlays,
@@ -1492,7 +1497,7 @@ fn proven_call_without_a_stable_caller_identity_is_name_based_but_keeps_strong_a
     let mut detailed = execute_code_query_detailed(
         &analyzer,
         &query,
-        brokk_bifrost_analysis::analyzer::structural::CodeQueryExecutionLimits::default(),
+        brokk_bifrost_rql::structural::CodeQueryExecutionLimits::default(),
         None,
     );
     assert_eq!(detailed.result.results.len(), 1);
@@ -1586,7 +1591,7 @@ fn invalid_owner_candidate_forces_weak_anchor() {
         byte_span: Some(0..4),
         identities: DetailedCodeQueryProvenanceIdentities::Primary(None),
         stable_owner_candidate: Some(
-            brokk_bifrost_analysis::analyzer::structural::search::CodeQueryStableOwnerCandidate {
+            brokk_bifrost_rql::structural::search::CodeQueryStableOwnerCandidate {
                 namespace: "INVALID".to_string(),
                 derivation: CodeQueryStableOwnerDerivation::CanonicalAstIdentity,
                 semantic_key: "call:sink".to_string(),
@@ -1663,7 +1668,7 @@ fn file_anchor_never_uses_a_span() {
 #[test]
 fn budget_exhaustion_is_inconclusive_and_only_a_cycle_is_a_counterexample() {
     use super::assertion::{TerminationVerdict, termination_verdict};
-    use brokk_bifrost_analysis::analyzer::structural::rewrite_path::RewriteOutcome;
+    use brokk_bifrost_rql::structural::rewrite_path::RewriteOutcome;
 
     assert_eq!(
         termination_verdict(&RewriteOutcome::Converged {

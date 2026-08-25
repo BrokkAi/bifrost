@@ -964,6 +964,7 @@ fn run_policy_explain_mode(
         target,
         None,
         None,
+        None,
         &ExplanationLimits::default(),
     ) {
         Ok(explanation) => explanation,
@@ -1005,6 +1006,7 @@ fn run_policy_near_miss_mode(
         root,
         policy_inputs,
         &NearMissCandidates::PolicySeedSearch,
+        None,
         None,
         None,
         &ExplanationLimits::default().with_max_near_miss_candidates(max_candidates),
@@ -1647,7 +1649,13 @@ fn print_tool_help(name: &str) -> Result<(), String> {
                 let summary = param_summary(param_schema, required.contains(param.as_str()));
                 println!("    {param}  ({summary})");
                 if let Some(description) = param_schema.get("description").and_then(Value::as_str) {
-                    println!("        {description}");
+                    // A parameter whose schema documents a generated vocabulary
+                    // -- `query_code`'s `steps` carries the RQL step reference,
+                    // one line per step -- keeps that shape here instead of
+                    // collapsing onto one unreadable line.
+                    for line in description.lines() {
+                        println!("        {line}");
+                    }
                 }
             }
         }

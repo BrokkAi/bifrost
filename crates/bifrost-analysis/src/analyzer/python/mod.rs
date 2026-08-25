@@ -44,7 +44,7 @@ use crate::analyzer::usages::get_definition::{
 use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_python_type_bounded};
 use crate::analyzer::usages::python_graph::{
     PythonExportUsageGraphStrategy, build_cached_python_usage_edges_for_targets,
-    build_python_usage_edge_weights, build_python_usage_edges, python_usage_candidate_files,
+    build_python_usage_edge_weights, python_usage_candidate_files,
 };
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::usages::{ExportIndex, ImportBinder};
@@ -178,19 +178,21 @@ impl PythonAnalyzer {
 
     pub(crate) fn member_candidates_for_owner_limited(
         &self,
-        owner_fqn: &str,
+        owner: &CodeUnit,
         name: &str,
         limit: usize,
         continue_query: impl FnMut() -> bool,
     ) -> LimitedQueryRows<CodeUnit> {
-        let exact_fqn = format!("{owner_fqn}.{name}");
         let mut candidates = self
             .inner
             .lookup_non_module_declarations_by_identifier_limited(name, limit, continue_query);
         if candidates.complete {
-            candidates
-                .rows
-                .retain(|candidate| candidate.fq_name() == exact_fqn);
+            candidates.rows.retain(|candidate| {
+                candidate
+                    .fq()
+                    .parent()
+                    .is_some_and(|parent| parent == *owner.fq())
+            });
         }
         candidates
     }
@@ -656,6 +658,8 @@ impl CodeUnitIndex for PythonAnalyzer {
 }
 
 impl IAnalyzer for PythonAnalyzer {
+    crate::analyzer::i_analyzer::forward_relational_definition_batch!();
+
     #[cfg(any(test, feature = "test-support"))]
     fn test_hooks(&self) -> &dyn crate::analyzer::AnalyzerTestHooks {
         self
@@ -695,13 +699,6 @@ impl IAnalyzer for PythonAnalyzer {
 
     fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
         self.inner.workspace_file_index_cell()
-    }
-
-    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
-        // Trait signature is fixed, so this boundary opens the scope the
-        // usage-graph funnel now demands proof of (issue #2423 milestone B).
-        let scope = crate::analyzer::AnalyzerQueryScope::new(self);
-        self.inner.global_usage_definition_index(scope.token())
     }
 
     fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
@@ -806,14 +803,20 @@ impl IAnalyzer for PythonAnalyzer {
         Some(self)
     }
 
-    fn structural_search_providers(
+    fn structural_fact_providers(
         &self,
-    ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
-        self.inner.structural_search_providers()
+    ) -> Vec<&dyn crate::analyzer::structural::StructuralFactProvider> {
+        self.inner.structural_fact_providers()
     }
 
     fn snapshot_caches(&self) -> Option<&crate::analyzer::AnalyzerSnapshotCaches> {
         Some(self.inner.snapshot_caches())
+    }
+
+    fn workspace_content_identities(
+        &self,
+    ) -> Option<crate::analyzer::content_identity::WorkspaceContentIdentities> {
+        self.inner.workspace_content_identities()
     }
 
     fn contains_tests(&self, file: &ProjectFile) -> bool {
@@ -884,18 +887,6 @@ impl IAnalyzer for PythonAnalyzer {
 
 #[cfg(any(test, feature = "test-support"))]
 impl crate::analyzer::AnalyzerTestHooks for PythonAnalyzer {
-    fn reset_global_usage_definition_index_build_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_global_usage_definition_index_build_count_for_test();
-    }
-
-    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .global_usage_definition_index_build_count_for_test()
-    }
-
     fn reset_full_declaration_scan_count_for_test(&self) {
         self.inner
             .test_hooks()
@@ -1029,7 +1020,12 @@ impl LanguageEdgePass for PythonEdgePass {
     }
 
     fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
-        build_python_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file).map(LanguageEdgeSites)
+        crate::analyzer::usages::python_graph::build_rooted_python_usage_edges(
+            ctx.analyzer,
+            ctx.fqns,
+            ctx.keep_file,
+        )
+        .map(LanguageEdgeSites)
     }
 
     fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {

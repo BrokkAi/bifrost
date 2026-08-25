@@ -7,7 +7,8 @@
 use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::common::language_for_file as file_language;
 use crate::analyzer::{
-    CodeUnit, ImportAnalysisProvider, ImportInfo, Language, ProjectFile, build_reverse_file_index,
+    CodeUnit, ImportAnalysisProvider, ImportInfo, ImportReachability, Language, ProjectFile,
+    build_reverse_file_index,
 };
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
@@ -21,7 +22,7 @@ use brokk_bifrost_jvm::scala::wildcard_imports::{
     ScalaExplicitImportFacts, ScalaExplicitImportTier, ScalaWildcardImportEnvironment,
     ScalaWildcardImportOwner, ScalaWildcardOwnerFacts, ScalaWildcardOwnerKind,
     resolve_scala_explicit_import_tier, resolve_scala_wildcard_import_environment,
-    scala_import_path,
+    scala_import_path, scala_import_reachability,
 };
 
 use super::{ScalaAnalyzer, scala_enclosing_template_owner_fq_names};
@@ -308,6 +309,19 @@ impl ImportAnalysisProvider for ScalaAnalyzer {
         result
     }
 
+    fn import_infos_for_files(
+        &self,
+        files: &[ProjectFile],
+    ) -> Option<HashMap<ProjectFile, Vec<ImportInfo>>> {
+        Some(
+            self.inner
+                .bulk_import_facts(files.iter().cloned())
+                .into_iter()
+                .map(|(file, facts)| (file, facts.imports))
+                .collect(),
+        )
+    }
+
     fn import_info_of(&self, token: QueryToken<'_>, file: &ProjectFile) -> Vec<ImportInfo> {
         self.inner.import_info_of(token, file)
     }
@@ -318,64 +332,42 @@ impl ImportAnalysisProvider for ScalaAnalyzer {
         imports: &[ImportInfo],
         target: &ProjectFile,
     ) -> bool {
-        let scope = AnalyzerQueryScope::new(self);
-        let token = scope.token();
+        matches!(
+            self.import_reachability(source_file, imports, target),
+            ImportReachability::Reaches
+        )
+    }
+
+    fn import_reachability(
+        &self,
+        source_file: &ProjectFile,
+        imports: &[ImportInfo],
+        target: &ProjectFile,
+    ) -> ImportReachability {
         if source_file == target {
-            return false;
+            return ImportReachability::DoesNotReach;
         }
         if file_language(source_file) != Language::Scala || file_language(target) != Language::Scala
         {
-            return false;
+            return ImportReachability::Unknown;
         }
 
         let Some(source_package) = self.inner.package_name_of(source_file) else {
-            return false;
+            return ImportReachability::Unknown;
         };
         let Some(target_package) = self.inner.package_name_of(target) else {
-            return false;
+            return ImportReachability::Unknown;
         };
-        if source_package == target_package {
-            return true;
-        }
-
-        let wildcard_environment = self.wildcard_import_environment(source_file, imports);
-        if wildcard_environment
-            .owners
-            .iter()
-            .any(|owner| match owner.kind {
-                ScalaWildcardOwnerKind::Package => owner.fqn == target_package,
-                ScalaWildcardOwnerKind::StableSingleton => self
-                    .resolve_wildcard_owner(token, owner)
-                    .iter()
-                    .any(|declaration| declaration.source() == target),
-            })
-        {
-            return true;
-        }
-
-        imports.iter().any(|info| {
-            let Some(path) = scala_import_path(info) else {
-                return false;
-            };
-            if info.is_wildcard {
-                return false;
-            }
-            let Some(tier) =
-                self.explicit_import_tier(info, &path, std::slice::from_ref(&source_package))
-            else {
-                return false;
-            };
-            let declaration_reaches = tier.declaration
-                && self
-                    .inner
-                    .definitions(&tier.candidate)
-                    .any(|declaration| declaration.source() == target);
-            let package_reaches = tier.package
-                && (target_package == tier.candidate
-                    || target_package
-                        .strip_prefix(&tier.candidate)
-                        .is_some_and(|suffix| suffix.starts_with('.')));
-            declaration_reaches || package_reaches
-        })
+        let declarations = self.declarations(target);
+        scala_import_reachability(
+            imports,
+            &source_package,
+            &target_package,
+            &declarations,
+            |candidate| ScalaExplicitImportFacts {
+                declaration: self.inner.definitions(candidate).next().is_some(),
+                package: self.package_namespace_exists(candidate),
+            },
+        )
     }
 }

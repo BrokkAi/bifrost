@@ -1,5 +1,5 @@
-use brokk_bifrost::analyzer::structural::kinds::{ALL_KINDS, ALL_ROLES, Role};
-use brokk_bifrost::analyzer::structural::{
+use brokk_bifrost::rql::kinds::{ALL_KINDS, ALL_ROLES, Role};
+use brokk_bifrost::rql::{
     CodeQuery, CodeQueryExecutionMode, CodeQueryMatch, CodeQueryPlan, CodeQueryPlanSource,
     CodeQueryResult, CodeQueryResultValue, Pattern, RuneIrLanguage, RuneIrLimits, RuneIrSelection,
     StringPredicate, render_source_rune_ir,
@@ -1869,6 +1869,79 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         ));
                     }
                 }
+                CodeQueryResultValue::SourceSet { value } => {
+                    let path = sanitize_terminal_text(&value.build_file);
+                    let name = sanitize_terminal_text(&value.name);
+                    out.push_str(&format!(
+                        "{}\n  {} {} ({})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        paint(Style::new().fg(Color::Blue), "source set:", use_color),
+                        paint(Style::new().bold(), &name, use_color),
+                        value.completeness,
+                    ));
+                }
+                CodeQueryResultValue::BuildTarget { value } => {
+                    let path = sanitize_terminal_text(&value.build_file);
+                    let name = sanitize_terminal_text(&value.name);
+                    out.push_str(&format!(
+                        "{}\n  {} {} ({})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        paint(Style::new().fg(Color::Blue), "build target:", use_color),
+                        paint(Style::new().bold(), &name, use_color),
+                        value.completeness,
+                    ));
+                }
+                CodeQueryResultValue::TopologyEdge { value } => {
+                    let path = sanitize_terminal_text(&value.build_file);
+                    let from = sanitize_terminal_text(&value.from_name);
+                    let to = sanitize_terminal_text(&value.to_name);
+                    out.push_str(&format!(
+                        "{}\n  {} {} -> {} ({}, {})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        paint(Style::new().fg(Color::Blue), "topology edge:", use_color),
+                        paint(Style::new().bold(), &from, use_color),
+                        paint(Style::new().bold(), &to, use_color),
+                        value.scope,
+                        value.completeness,
+                    ));
+                }
+                CodeQueryResultValue::ControlRelation { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} ({}, {})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "control relation:", use_color),
+                        paint(Style::new().bold(), value.relation, use_color),
+                        value.certainty,
+                        value.exit_partition,
+                    ));
+                    out.push_str(&format!(
+                        "  point {} -> point {}, {}\n",
+                        value.source.range.start_line,
+                        value.target.range.start_line,
+                        value.completeness
+                    ));
+                }
+                CodeQueryResultValue::Guard { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {}\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "guard:", use_color),
+                        paint(Style::new().bold(), value.predicate, use_color),
+                    ));
+                    out.push_str(&format!(
+                        "  true edge {}, false edge {} ({}, {})\n",
+                        value.true_edge_id.as_deref().unwrap_or("none"),
+                        value.false_edge_id.as_deref().unwrap_or("none"),
+                        value.proof,
+                        value.completeness,
+                    ));
+                }
                 CodeQueryResultValue::FlowRelation { value } => {
                     let path = sanitize_terminal_text(&value.path);
                     out.push_str(&format!(
@@ -2283,7 +2356,7 @@ fn balanced_delimiters(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brokk_bifrost::analyzer::structural::{CodeQueryCapture, CodeQueryResultItem};
+    use brokk_bifrost::rql::{CodeQueryCapture, CodeQueryResultItem};
 
     #[test]
     fn code_query_repl_loads_sexp_with_human_summary() {

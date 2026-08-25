@@ -14,7 +14,7 @@ pub struct CallSignatureContext {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum CallSyntaxKind {
+pub enum CallSyntaxKind {
     Function,
     Method,
     Constructor,

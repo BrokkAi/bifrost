@@ -17,7 +17,9 @@ use crate::analyzer::usages::get_definition::{
     SCALA_UNSUPPORTED_CALL_TARGET_SHAPE, SCALA_UNSUPPORTED_RECEIVER,
 };
 use crate::analyzer::usages::reference_site::reference_target_match_offsets;
-use crate::analyzer::usages::workspace_graph::{UsageEcosystem, WorkspaceUsageCatalog};
+use crate::analyzer::usages::workspace_graph::{
+    UsageEcosystem, WorkspaceUsageCatalog, WorkspaceUsageNodeKey, is_graph_declaration,
+};
 use crate::analyzer::usages::{
     CONFIDENCE_THRESHOLD, CandidateFileProvider, DEFAULT_MAX_FILES, DEFAULT_MAX_USAGES,
     ExplicitCandidateProvider, FuzzyResult, UsageFinder, UsageHit, UsageHitKind, UsageHitSurface,

@@ -1,6 +1,6 @@
 use super::{build_csharp_edges, csharp_graph_source};
 use crate::analyzer::usages::common::{analyzed_files_for_language, language_for_file};
-use crate::analyzer::usages::inverted_edges::{UsageEdgeWeights, UsageEdges};
+use crate::analyzer::usages::inverted_edges::{EdgeNodeDomain, UsageEdgeWeights, UsageEdges};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
@@ -128,17 +128,44 @@ impl<'a> CSharpEdgeResolver<'a> {
         Some(Self { csharp, files })
     }
 
-    pub(crate) fn build_edges<F>(
+    pub(crate) fn build_rooted_edges<F>(
         &self,
         analyzer: &dyn IAnalyzer,
         token: QueryToken<'_>,
-        nodes: &HashSet<String>,
+        callers: &HashSet<String>,
         keep_file: F,
     ) -> UsageEdges
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        build_csharp_edges(analyzer, token, self.csharp, &self.files, nodes, keep_file)
+        build_csharp_edges(
+            analyzer,
+            token,
+            self.csharp,
+            &self.files,
+            EdgeNodeDomain::Rooted(callers),
+            keep_file,
+        )
+    }
+
+    pub(crate) fn build_inbound_edges<F>(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        token: QueryToken<'_>,
+        callees: &HashSet<String>,
+        keep_file: F,
+    ) -> UsageEdges
+    where
+        F: Fn(&ProjectFile) -> bool + Sync,
+    {
+        build_csharp_edges(
+            analyzer,
+            token,
+            self.csharp,
+            &self.files,
+            EdgeNodeDomain::Inbound(callees),
+            keep_file,
+        )
     }
 
     pub(crate) fn build_edge_weights<F>(
@@ -151,6 +178,13 @@ impl<'a> CSharpEdgeResolver<'a> {
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        build_csharp_edges(analyzer, token, self.csharp, &self.files, nodes, keep_file)
+        build_csharp_edges(
+            analyzer,
+            token,
+            self.csharp,
+            &self.files,
+            EdgeNodeDomain::Closed(nodes),
+            keep_file,
+        )
     }
 }

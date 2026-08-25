@@ -20,6 +20,7 @@ use crate::analyzer::usages::rust_graph::{
 use crate::analyzer::{RustReferenceContext, SignatureMetadata, StructuredTypeIdentity};
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
+use brokk_bifrost_core::analyzer::symbol_path::strip_raw_identifier_prefix;
 use brokk_bifrost_rust::declarations::rust_macro_invocation_arguments;
 use brokk_bifrost_rust::field_roles::{
     RustFieldNameRole, RustStructFieldContainer, classify_rust_field_name,
@@ -182,24 +183,18 @@ impl RustDefinitionProvider for AnalyzerRustDefinitionProvider<'_> {
             }
         }
         let mut units: Vec<_> = match self.session {
-            Some(session) => session
-                .query_limited_rows(|limit| {
-                    self.rust.declaration_candidates_by_identifier_limited(
+            Some(session) => session.query_limited_rows(|limit| {
+                self.rust
+                    .declaration_candidates_by_identifier_in_file_limited(
+                        file,
                         identifier,
                         limit,
                         || session.observe_cancellation(),
                     )
-                })
-                .into_iter()
-                .filter(|unit| unit.source() == file)
-                .collect(),
+            }),
             None => self
                 .rust
-                .declaration_candidates_by_identifier(identifier)
-                .into_iter()
-                .filter(|unit| unit.source() == file)
-                .filter(|unit| unit.identifier() == identifier)
-                .collect(),
+                .declaration_candidates_by_identifier_in_file(file, identifier),
         };
         sort_units(&mut units);
         units.dedup();
@@ -1804,6 +1799,45 @@ enum MacroUnitResolution {
     NotAMacroName,
 }
 
+/// Necessary-name gate for the expensive matcher replay performed during a
+/// forward usage scan. Macro arguments are raw token trees, but their named
+/// identifier nodes still provide a structured spelling check. A module
+/// target must use [`All`] because an alias or a glob can reach it without ever
+/// spelling the module name in the invocation arguments.
+pub(crate) enum RustMacroMatcherCandidateGate<'a> {
+    All,
+    Names(&'a HashSet<String>),
+}
+
+impl RustMacroMatcherCandidateGate<'_> {
+    fn admits_arguments(&self, arguments: Node<'_>, source: &str) -> bool {
+        let Self::Names(candidate_names) = self else {
+            return true;
+        };
+        let mut stack = vec![arguments];
+        while let Some(node) = stack.pop() {
+            if matches!(
+                node.kind(),
+                "identifier"
+                    | "type_identifier"
+                    | "field_identifier"
+                    | "shorthand_field_identifier"
+            ) && node
+                .utf8_text(source.as_bytes())
+                .ok()
+                .map(str::trim)
+                .map(strip_raw_identifier_prefix)
+                .is_some_and(|name| candidate_names.contains(name))
+            {
+                return true;
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        false
+    }
+}
+
 fn rust_macro_invocation_name<'a>(invocation: Node<'_>, source: &'a str) -> Option<&'a str> {
     let macro_name = invocation.child_by_field_name("macro")?;
     let name_node = macro_name.child_by_field_name("name").unwrap_or(macro_name);
@@ -1863,16 +1897,12 @@ fn rust_collect_macro_units(
             RustVisibleImportResolution::Resolved(candidates)
             | RustVisibleImportResolution::GlobResolved(candidates) => candidates,
             RustVisibleImportResolution::BoundButUnindexed => {
-                if let Some(unit) = resolve_in_enclosing_scopes(
-                    analyzer,
-                    file,
-                    name,
-                    lookup_start,
-                    CodeUnit::is_macro,
-                ) {
+                if let Some(unit) =
+                    resolve_in_enclosing_scopes(rust, file, name, lookup_start, CodeUnit::is_macro)
+                {
                     vec![unit]
                 } else {
-                    let same_package = rust_same_package_macros(analyzer, rust, file, name);
+                    let same_package = rust_same_package_macros(rust, file, name);
                     if same_package.is_empty() {
                         return MacroUnitResolution::Boundary(Box::new(boundary_unchecked(
                             format!(
@@ -1903,49 +1933,34 @@ fn rust_collect_macro_units(
     };
     if candidates.is_empty()
         && let Some(unit) =
-            resolve_in_enclosing_scopes(analyzer, file, name, lookup_start, CodeUnit::is_macro)
+            resolve_in_enclosing_scopes(rust, file, name, lookup_start, CodeUnit::is_macro)
     {
         candidates = vec![unit];
     }
     if candidates.is_empty() {
-        candidates = rust_same_package_macros(analyzer, rust, file, name);
+        candidates = rust_same_package_macros(rust, file, name);
     }
     MacroUnitResolution::Found(candidates)
 }
 
-fn rust_same_crate_types(
-    analyzer: &dyn IAnalyzer,
-    rust: &RustAnalyzer,
-    file: &ProjectFile,
-    name: &str,
-) -> Vec<CodeUnit> {
+fn rust_same_crate_types(rust: &RustAnalyzer, file: &ProjectFile, name: &str) -> Vec<CodeUnit> {
     let crate_root = rust_crate_root_package(file);
-    rust.get_analyzed_files()
+    rust.declaration_candidates_by_identifier(name)
         .into_iter()
-        .filter(|candidate| rust_crate_root_package(candidate) == crate_root)
-        .flat_map(|candidate| analyzer.declarations(&candidate))
-        .filter(|unit| {
-            unit.identifier() == name
-                && (unit.is_class() || rust_declaration_is_module_type_alias(rust, unit))
-        })
+        .filter(|unit| rust_crate_root_package(unit.source()) == crate_root)
+        .filter(|unit| unit.is_class() || rust_declaration_is_module_type_alias(rust, unit))
         .collect()
 }
 
-fn rust_same_package_macros(
-    analyzer: &dyn IAnalyzer,
-    rust: &RustAnalyzer,
-    file: &ProjectFile,
-    name: &str,
-) -> Vec<CodeUnit> {
+fn rust_same_package_macros(rust: &RustAnalyzer, file: &ProjectFile, name: &str) -> Vec<CodeUnit> {
     let crate_root = rust_crate_root_package(file);
-    rust.get_analyzed_files()
+    rust.declaration_candidates_by_identifier(name)
         .into_iter()
-        .filter(|candidate| rust_crate_root_package(candidate) == crate_root)
-        .flat_map(|candidate| analyzer.declarations(&candidate))
-        .filter(|unit| unit.is_macro() && unit.identifier() == name)
+        .filter(|unit| unit.is_macro() && rust_crate_root_package(unit.source()) == crate_root)
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn ingest_file_macro_matcher_roles(
     cache: &mut RustTokenTreeRoleCache,
     token: QueryToken<'_>,
@@ -1954,10 +1969,18 @@ pub(crate) fn ingest_file_macro_matcher_roles(
     file: &ProjectFile,
     source: &str,
     tree: &Tree,
+    candidate_gate: RustMacroMatcherCandidateGate<'_>,
+    cancellation: Option<&CancellationToken>,
 ) {
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
-        if node.kind() == "macro_invocation" {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return;
+        }
+        if node.kind() == "macro_invocation"
+            && rust_macro_invocation_arguments(node)
+                .is_some_and(|arguments| candidate_gate.admits_arguments(arguments, source))
+        {
             ingest_invocation_matcher_roles(
                 cache, token, analyzer, support, file, source, tree, node,
             );
@@ -2568,7 +2591,7 @@ fn rust_resolve_matcher_bare_name(
                         return candidates_outcome(types);
                     }
                 }
-                let crate_types = rust_same_crate_types(analyzer, rust, file, reference);
+                let crate_types = rust_same_crate_types(rust, file, reference);
                 if !crate_types.is_empty() {
                     return candidates_outcome(crate_types);
                 }
@@ -8527,6 +8550,95 @@ mod bounded_tests {
         }
     }
 
+    #[test]
+    fn file_identifier_lookup_keeps_same_named_rust_declarations_file_scoped() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Rust,
+            &[
+                ("src/lib.rs", "pub mod left;\npub mod right;\n"),
+                ("src/left.rs", "pub struct Target;\n"),
+                ("src/right.rs", "pub struct Target;\n"),
+            ],
+        );
+        let rust =
+            resolve_analyzer::<RustAnalyzer>(fixture.analyzer.analyzer()).expect("Rust analyzer");
+        let file = ProjectFile::new(fixture.project_root(), "src/left.rs");
+
+        let full = AnalyzerRustDefinitionProvider::new(rust, false);
+        let full_matches = full.file_identifier(&file, "Target");
+        assert_eq!(
+            full_matches
+                .iter()
+                .map(|unit| unit.fq_name())
+                .collect::<Vec<_>>(),
+            vec!["left.Target".to_string()]
+        );
+
+        let session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
+        let bounded = AnalyzerRustDefinitionProvider::bounded(rust, &session);
+        let bounded_matches = bounded.file_identifier(&file, "Target");
+        assert_eq!(
+            bounded_matches
+                .iter()
+                .map(|unit| unit.fq_name())
+                .collect::<Vec<_>>(),
+            vec!["left.Target".to_string()]
+        );
+    }
+
+    #[test]
+    fn same_crate_type_candidates_use_identifier_index_and_keep_aliases_local() {
+        let fixture = AnalyzerFixture::new(&[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"engine\", \"facade\"]\nresolver = \"2\"\n",
+            ),
+            (
+                "engine/Cargo.toml",
+                "[package]\nname = \"engine\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            (
+                "engine/src/lib.rs",
+                "pub struct Target;\npub type Alias = Target;\n",
+            ),
+            (
+                "facade/Cargo.toml",
+                "[package]\nname = \"facade\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            (
+                "facade/src/lib.rs",
+                "pub struct Target;\npub type Alias = Target;\n",
+            ),
+        ]);
+        let rust =
+            resolve_analyzer::<RustAnalyzer>(fixture.analyzer.analyzer()).expect("Rust analyzer");
+        let file = ProjectFile::new(fixture.project_root(), "facade/src/lib.rs");
+
+        let target_candidates = rust_same_crate_types(rust, &file, "Target");
+        assert_eq!(
+            target_candidates
+                .iter()
+                .map(|unit| (
+                    unit.identifier().to_string(),
+                    rel_path_string(unit.source())
+                ))
+                .collect::<Vec<_>>(),
+            vec![("Target".to_string(), "facade/src/lib.rs".to_string())]
+        );
+
+        let alias_candidates = rust_same_crate_types(rust, &file, "Alias");
+        assert_eq!(
+            alias_candidates
+                .iter()
+                .map(|unit| (
+                    unit.identifier().to_string(),
+                    rel_path_string(unit.source())
+                ))
+                .collect::<Vec<_>>(),
+            vec![("Alias".to_string(), "facade/src/lib.rs".to_string())]
+        );
+    }
+
     fn assert_opaque_macro_reference_resolves(
         source: &str,
         expression: &str,
@@ -8611,6 +8723,146 @@ mod bounded_tests {
             "Ready",
             "Ready",
             "State.Ready",
+        );
+    }
+
+    fn macro_invocations<'tree>(tree: &'tree Tree) -> Vec<tree_sitter::Node<'tree>> {
+        let mut stack = vec![tree.root_node()];
+        let mut invocations = Vec::new();
+        while let Some(node) = stack.pop() {
+            if node.kind() == "macro_invocation" {
+                invocations.push(node);
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        invocations.sort_by_key(|node| node.start_byte());
+        invocations
+    }
+
+    fn node_with_text<'tree>(
+        root: tree_sitter::Node<'tree>,
+        source: &str,
+        wanted: &str,
+    ) -> tree_sitter::Node<'tree> {
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if matches!(
+                node.kind(),
+                "identifier" | "type_identifier" | "field_identifier"
+            ) && node.utf8_text(source.as_bytes()).ok() == Some(wanted)
+            {
+                return node;
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        panic!("identifier {wanted:?} not found")
+    }
+
+    #[test]
+    fn macro_matcher_candidate_gate_skips_irrelevant_arguments_and_normalizes_raw_names() {
+        let source = "macro_rules! render { ($value:expr) => {}; }\nrender!(irrelevant);\nrender!(r#Target);\n";
+        let tree = lexical_scope::parse_rust_tree(source).expect("Rust tree");
+        let invocations = macro_invocations(&tree);
+        assert_eq!(invocations.len(), 2);
+        let names = ["Target".to_string()].into_iter().collect::<HashSet<_>>();
+        let gate = RustMacroMatcherCandidateGate::Names(&names);
+        let irrelevant = rust_macro_invocation_arguments(invocations[0]).expect("arguments");
+        let relevant = rust_macro_invocation_arguments(invocations[1]).expect("arguments");
+        assert!(!gate.admits_arguments(irrelevant, source));
+        assert!(gate.admits_arguments(relevant, source));
+    }
+
+    #[test]
+    fn relevant_macro_argument_keeps_matcher_type_role_projection() {
+        let source = "macro_rules! typed { ($value:ty) => {}; }\ntyped!(r#Target);\n";
+        let tree = lexical_scope::parse_rust_tree(source).expect("Rust tree");
+        let invocation = macro_invocations(&tree).pop().expect("macro invocation");
+        let arguments = rust_macro_invocation_arguments(invocation).expect("arguments");
+        let target = node_with_text(arguments, source, "r#Target");
+        let names = ["Target".to_string()].into_iter().collect::<HashSet<_>>();
+        let gate = RustMacroMatcherCandidateGate::Names(&names);
+        assert!(gate.admits_arguments(arguments, source));
+
+        let definition = {
+            let mut stack = vec![tree.root_node()];
+            let mut found = None;
+            while let Some(node) = stack.pop() {
+                if node.kind() == "macro_definition" {
+                    found = Some(node);
+                    break;
+                }
+                let mut cursor = node.walk();
+                stack.extend(node.named_children(&mut cursor));
+            }
+            found.expect("macro definition")
+        };
+        let matched = match_macro_rules(definition, source, arguments, source).expect("match");
+        let binding = matched
+            .bindings
+            .iter()
+            .find(|binding| binding.start_byte <= target.start_byte())
+            .expect("type binding");
+        let namespace = token_namespace_evidence(
+            &matched,
+            definition,
+            source,
+            binding.start_byte,
+            binding.end_byte,
+        )
+        .expect("matcher namespace");
+        assert_eq!(
+            matcher_namespace_to_role(namespace),
+            Some(RustBareTokenTreeRole::TypeReference)
+        );
+    }
+
+    #[test]
+    fn matcher_ingestion_skips_irrelevant_invocations_but_projects_relevant_roles() {
+        let source =
+            "macro_rules! typed { ($value:ty) => {}; }\ntyped!(Irrelevant);\ntyped!(Target);\n";
+        let fixture = AnalyzerFixture::new_for_language(Language::Rust, &[("src/lib.rs", source)]);
+        let analyzer = fixture.analyzer.analyzer();
+        let scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
+        let rust = resolve_analyzer::<RustAnalyzer>(analyzer).expect("Rust analyzer");
+        let support = AnalyzerRustDefinitionProvider::new(rust, false);
+        let file = ProjectFile::new(fixture.project_root(), "src/lib.rs");
+        let tree = lexical_scope::parse_rust_tree(source).expect("Rust tree");
+        let invocations = macro_invocations(&tree);
+        assert_eq!(invocations.len(), 2);
+        let irrelevant = node_with_text(
+            rust_macro_invocation_arguments(invocations[0]).expect("arguments"),
+            source,
+            "Irrelevant",
+        );
+        let relevant = node_with_text(
+            rust_macro_invocation_arguments(invocations[1]).expect("arguments"),
+            source,
+            "Target",
+        );
+        let names = ["Target".to_string()].into_iter().collect::<HashSet<_>>();
+        let mut cache = RustTokenTreeRoleCache::default();
+        ingest_file_macro_matcher_roles(
+            &mut cache,
+            scope.token(),
+            analyzer,
+            &support,
+            &file,
+            source,
+            &tree,
+            RustMacroMatcherCandidateGate::Names(&names),
+            None,
+        );
+        assert_eq!(
+            cache.role(irrelevant, source),
+            RustBareTokenTreeRole::Reference,
+            "irrelevant macro arguments must not trigger matcher replay"
+        );
+        assert_eq!(
+            cache.role(relevant, source),
+            RustBareTokenTreeRole::TypeReference,
+            "relevant macro arguments still receive matcher namespace roles"
         );
     }
 

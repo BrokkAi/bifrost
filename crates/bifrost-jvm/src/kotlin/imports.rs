@@ -53,17 +53,52 @@ use crate::realm::JvmSourceRealm;
 /// Kotlin/JVM only — a name that would resolve solely through a Kotlin/JS or
 /// Kotlin/Native default import stays unresolved rather than being guessed at,
 /// because guessing would claim a resolution the target platform may not have.
-pub const KOTLIN_DEFAULT_IMPORT_PACKAGES: &[&str] = &[
-    "kotlin",
-    "kotlin.annotation",
-    "kotlin.collections",
-    "kotlin.comparisons",
-    "kotlin.io",
-    "kotlin.ranges",
-    "kotlin.sequences",
-    "kotlin.text",
-    "java.lang",
-    "kotlin.jvm",
+pub struct KotlinDefaultImportPackage {
+    pub rendered: &'static str,
+    pub components: &'static [&'static str],
+}
+
+pub const KOTLIN_DEFAULT_IMPORT_PACKAGES: &[KotlinDefaultImportPackage] = &[
+    KotlinDefaultImportPackage {
+        rendered: "kotlin",
+        components: &["kotlin"],
+    },
+    KotlinDefaultImportPackage {
+        rendered: "kotlin.annotation",
+        components: &["kotlin", "annotation"],
+    },
+    KotlinDefaultImportPackage {
+        rendered: "kotlin.collections",
+        components: &["kotlin", "collections"],
+    },
+    KotlinDefaultImportPackage {
+        rendered: "kotlin.comparisons",
+        components: &["kotlin", "comparisons"],
+    },
+    KotlinDefaultImportPackage {
+        rendered: "kotlin.io",
+        components: &["kotlin", "io"],
+    },
+    KotlinDefaultImportPackage {
+        rendered: "kotlin.ranges",
+        components: &["kotlin", "ranges"],
+    },
+    KotlinDefaultImportPackage {
+        rendered: "kotlin.sequences",
+        components: &["kotlin", "sequences"],
+    },
+    KotlinDefaultImportPackage {
+        rendered: "kotlin.text",
+        components: &["kotlin", "text"],
+    },
+    KotlinDefaultImportPackage {
+        rendered: "java.lang",
+        components: &["java", "lang"],
+    },
+    KotlinDefaultImportPackage {
+        rendered: "kotlin.jvm",
+        components: &["kotlin", "jvm"],
+    },
 ];
 
 /// Read one `import_header` node into a structured [`ImportInfo`], or `None`
@@ -186,12 +221,14 @@ pub fn kotlin_declarations_named(
     fqn: &str,
     realm: Option<&JvmSourceRealm<'_>>,
 ) -> Vec<CodeUnit> {
-    let mut units: Vec<CodeUnit> = source
-        .usage_definitions(token)
-        .fqn(fqn)
-        .into_iter()
-        .filter(|unit| unit.fq_name() == fqn && !unit.is_synthetic())
-        .collect();
+    let mut units = Vec::new();
+    source.with_usage_definitions(token, &mut |definitions| {
+        units = definitions
+            .fqn(fqn)
+            .into_iter()
+            .filter(|unit| unit.fq_name() == fqn && !unit.is_synthetic())
+            .collect();
+    });
     // A Kotlin file can import a Java or Scala declaration from the same
     // workspace, so the realm's other members answer for the names Kotlin's
     // own index does not hold.

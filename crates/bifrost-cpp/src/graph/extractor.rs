@@ -9,13 +9,14 @@ use crate::declarations::{
 };
 use crate::graph::CppGraphSource;
 use crate::graph::callable_definitions_share_identity_evidence as cpp_callable_definitions_share_identity_evidence;
+use crate::graph::callable_definitions_share_identity_evidence_with_visibility as cpp_callable_definitions_share_identity_evidence_with_visibility;
 use crate::graph::hits::{
-    enclosing_context, is_member_field_own_declarator, push_definition_hit, push_hit,
-    push_recursive_reference_hit, push_self_receiver_hit, push_type_hit,
-    push_unproven_definition_hit, push_unproven_hit,
+    enclosing_context, is_member_field_own_declarator, push_declaration_reference_hit,
+    push_definition_hit, push_hit, push_recursive_reference_hit, push_self_receiver_hit,
+    push_type_hit, push_type_hit_range, push_unproven_definition_hit, push_unproven_hit,
 };
 use crate::graph::resolver::*;
-use crate::graph::syntax::qualified_callable_value;
+use crate::graph::syntax::{object_macro_replacement_type_references, qualified_callable_value};
 use crate::graph_support::CppSource;
 use brokk_bifrost_core::analyzer::fq_name::segment_interner;
 use brokk_bifrost_core::analyzer::prepared_syntax::PreparedSyntaxTree;
@@ -771,6 +772,10 @@ fn maybe_record_macro_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
 }
 
 fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if node.kind() == "preproc_arg" {
+        maybe_record_object_macro_replacement_type_hits(node, ctx);
+        return;
+    }
     let recovered_exported_class_base =
         is_recovered_exported_class_base_type_node(node, ctx.source);
     if let Some(return_type) = recovered_macro_return_type_node(node, ctx.source) {
@@ -962,8 +967,6 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             node,
         )
     {
-        let terminal_destructor = out_of_line_destructor_type_reference(node);
-        let innermost = owners.innermost().map(|(_, owner)| owner.clone());
         *ctx.raw_match_count += 1;
         let mut matched_owner = false;
         for (owner_node, owner) in owners.owners {
@@ -981,13 +984,6 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         {
             push_unproven_hit(scope, ctx);
         }
-        if let Some(terminal_destructor) = terminal_destructor
-            && innermost
-                .as_ref()
-                .is_some_and(|owner| same_visible_symbol(owner, &ctx.spec.target))
-        {
-            push_hit(terminal_destructor, ctx);
-        }
         return;
     }
     if !recovered_type
@@ -998,9 +994,6 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     {
         *ctx.raw_match_count += 1;
         push_type_hit(owner, ctx);
-        if let Some(destructor) = out_of_line_destructor_type_reference(node) {
-            push_type_hit(destructor, ctx);
-        }
         return;
     }
     // A qualified template-id is represented as a qualified_identifier whose
@@ -1524,6 +1517,50 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             push_unproven_hit(scope, ctx);
         } else {
             push_unproven_hit(hit_node, ctx);
+        }
+    }
+}
+
+fn maybe_record_object_macro_replacement_type_hits(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    for reference in object_macro_replacement_type_references(node, ctx.source) {
+        for component_count in 1..=reference.components.len() {
+            let resolution = resolve_type_components_lexically_at_for_target_with_scope_cache(
+                node,
+                &reference.components[..component_count],
+                reference.global,
+                &ctx.analyzer,
+                ctx.visibility,
+                &ctx.ordinary_type_imports,
+                ctx.file,
+                ctx.source,
+                &ctx.spec.target,
+                false,
+                Some(&ctx.lexical_scope_cache),
+            );
+            let matches_target = match resolution {
+                LexicalTypeResolution::Resolved {
+                    unit, candidates, ..
+                } => {
+                    same_visible_symbol(&unit, &ctx.spec.target)
+                        || candidates
+                            .iter()
+                            .any(|candidate| same_visible_symbol(candidate, &ctx.spec.target))
+                }
+                LexicalTypeResolution::Missing => unique_macro_replacement_type_candidate(
+                    &ctx.analyzer,
+                    ctx.visibility,
+                    ctx.file,
+                    &reference.components[..component_count],
+                )
+                .is_some_and(|candidate| same_visible_symbol(&candidate, &ctx.spec.target)),
+                LexicalTypeResolution::Ambiguous => false,
+            };
+            if !matches_target {
+                continue;
+            }
+            let range = &reference.component_ranges[component_count - 1];
+            *ctx.raw_match_count += 1;
+            push_type_hit_range(node, range.start, range.end, ctx);
         }
     }
 }
@@ -5683,6 +5720,10 @@ fn maybe_record_free_function_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         maybe_record_free_function_definition_hit(node, ctx);
         return;
     }
+    if node.kind() == "function_declarator" {
+        maybe_record_recovered_error_free_function_call(node, ctx);
+        return;
+    }
     if node.kind() == "identifier" {
         maybe_record_free_function_value_reference(node, ctx);
         return;
@@ -5809,6 +5850,80 @@ fn maybe_record_free_function_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
 }
 
+/// Recover a bare call whose adjacent object-like macro arguments made
+/// tree-sitter place a `function_declarator` directly under an `ERROR` node.
+///
+/// For example, `check(mount(A, PREFIX SUFFIX, 0))` loses the inner
+/// `call_expression`, but retains `mount(...)` as a structured declarator. A
+/// real block-scope function declaration remains under a `declaration`, so the
+/// direct `ERROR` parent and compound-statement ancestry keep this recovery
+/// out of declaration syntax. The malformed parameter list cannot establish
+/// arity; publish a proven hit only when ordinary visibility leaves one
+/// callable identity for the bare name.
+fn maybe_record_recovered_error_free_function_call(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if node.parent().is_none_or(|parent| parent.kind() != "ERROR")
+        || !has_ancestor_kind(node, "compound_statement")
+    {
+        return;
+    }
+    let mut recovered_functions = Vec::new();
+    if let Some(function) = node
+        .child_by_field_name("declarator")
+        .filter(|function| function.kind() == "identifier")
+    {
+        recovered_functions.push(function);
+    }
+    if let Some(parameters) = node.child_by_field_name("parameters") {
+        let mut cursor = parameters.walk();
+        for parameter in parameters
+            .named_children(&mut cursor)
+            .filter(|child| child.kind() == "parameter_declaration")
+        {
+            if parameter
+                .child_by_field_name("declarator")
+                .is_some_and(|declarator| declarator.kind() == "abstract_function_declarator")
+                && let Some(function) = parameter
+                    .child_by_field_name("type")
+                    .filter(|function| function.kind() == "type_identifier")
+            {
+                recovered_functions.push(function);
+            }
+        }
+    }
+
+    for function in recovered_functions {
+        let name = node_text(function, ctx.source);
+        if !name_matches_callable(name, &ctx.spec.member_name)
+            || ctx.local_shadows.is_shadowed(name)
+        {
+            continue;
+        }
+        *ctx.raw_match_count += 1;
+        if bare_name_at_binds_only_target(function.start_byte(), name, ctx) {
+            push_hit(function, ctx);
+            continue;
+        }
+        let mut candidates =
+            ctx.visibility
+                .named_candidates(ctx.file, name, TargetKind::FreeFunction);
+        candidates.retain(|candidate| {
+            ctx.visibility.declaration_visible_at(
+                &ctx.analyzer,
+                ctx.file,
+                candidate,
+                function.start_byte(),
+            )
+        });
+        dedupe_callable_candidates(&mut candidates, &ctx.analyzer, ctx.visibility);
+        if candidates
+            .iter()
+            .any(|candidate| same_visible_symbol(candidate, &ctx.spec.target))
+        {
+            push_unproven_hit(function, ctx);
+        }
+    }
+}
+
 /// Whether the bare name at `call` binds to exactly one visible callable, and
 /// that callable is the scan target.
 ///
@@ -5826,12 +5941,16 @@ fn bare_name_binds_only_target(
     if !matches!(function.kind(), "identifier" | "template_function") {
         return false;
     }
+    bare_name_at_binds_only_target(call.start_byte(), text, ctx)
+}
+
+fn bare_name_at_binds_only_target(reference_byte: usize, text: &str, ctx: &ScanCtx<'_>) -> bool {
     let mut candidates = ctx
         .visibility
         .named_candidates(ctx.file, text, TargetKind::FreeFunction);
     candidates.retain(|candidate| {
         ctx.visibility
-            .declaration_visible_at(&ctx.analyzer, ctx.file, candidate, call.start_byte())
+            .declaration_visible_at(&ctx.analyzer, ctx.file, candidate, reference_byte)
     });
     dedupe_callable_candidates(&mut candidates, &ctx.analyzer, ctx.visibility);
     matches!(candidates.as_slice(), [only] if same_visible_symbol(only, &ctx.spec.target))
@@ -5931,7 +6050,11 @@ fn maybe_record_free_function_value_reference(node: Node<'_>, ctx: &mut ScanCtx<
     if !name_matches_callable(text, &ctx.spec.member_name) {
         return;
     }
-    if is_declaration_name(node) || is_call_callee_node(node) {
+    if is_declaration_name(node) {
+        maybe_record_free_function_declaration_reference(node, ctx);
+        return;
+    }
+    if is_call_callee_node(node) {
         return;
     }
     *ctx.raw_match_count += 1;
@@ -5952,6 +6075,62 @@ fn maybe_record_free_function_value_reference(node: Node<'_>, ctx: &mut ScanCtx<
     } else {
         push_unproven_hit(node, ctx);
     }
+}
+
+fn maybe_record_free_function_declaration_reference(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    if !ctx.spec.callable_has_definition_body {
+        return;
+    }
+    let text = node_text(node, ctx.source);
+    if !name_matches_callable(text, &ctx.spec.member_name) {
+        return;
+    }
+    let mut declaration = node.parent();
+    while let Some(candidate) = declaration {
+        if candidate.kind() == "function_definition" {
+            return;
+        }
+        if candidate.kind() == "declaration" {
+            break;
+        }
+        declaration = candidate.parent();
+    }
+    let Some(declaration) = declaration else {
+        return;
+    };
+    let signature = node_text(declaration, ctx.source);
+    if let Some(expected) = ctx.spec.callable_arity_at(node.start_byte())
+        && !expected.accepts(signature_arity(Some(signature)))
+    {
+        return;
+    }
+    let linked_declaration = ctx
+        .visibility
+        .named_candidates(ctx.file, text, TargetKind::FreeFunction)
+        .into_iter()
+        .find(|candidate| {
+            candidate.source() == ctx.file
+                && candidate.is_function()
+                && (!ctx.target_group.contains(candidate)
+                    || candidate.source() == ctx.spec.target.source())
+                && ctx.analyzer.ranges(candidate).iter().any(|range| {
+                    range.start_byte <= node.start_byte() && node.end_byte() <= range.end_byte
+                })
+                && (candidate.source() == ctx.spec.target.source()
+                    && candidate.fq_name() == ctx.spec.target.fq_name()
+                    && candidate.signature() == ctx.spec.target.signature()
+                    || cpp_callable_definitions_share_identity_evidence_with_visibility(
+                        &ctx.analyzer,
+                        ctx.visibility,
+                        candidate,
+                        &ctx.spec.target,
+                    ))
+        });
+    if linked_declaration.is_none() {
+        return;
+    }
+    *ctx.raw_match_count += 1;
+    push_declaration_reference_hit(node, ctx);
 }
 
 fn maybe_record_free_function_definition_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {

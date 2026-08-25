@@ -134,6 +134,14 @@ class SearchToolsClient:
         except Exception as exc:
             raise SearchToolsError(f"Failed to close the bifrost native session: {exc}") from exc
 
+    def gc(self) -> None:
+        """Force a Git-reachability collection of the persisted Bifrost cache."""
+        runtime = self._ensure_started()
+        try:
+            runtime.native.gc()
+        except Exception as exc:
+            raise SearchToolsError(f"Failed to garbage-collect the bifrost cache: {exc}") from exc
+
     def refresh(self) -> RefreshResult:
         return RefreshResult.from_dict(self._call_tool("refresh", {}))
 
@@ -609,23 +617,27 @@ class SearchToolsClient:
         *,
         include_tests: bool = False,
         paths: list[str] | None = None,
+        depth: int = 1,
     ) -> UsageGraphResult:
-        """Build the whole-workspace caller -> callee reference graph.
+        """Build a rooted caller -> callee reference graph.
 
-        Returns classes and functions as nodes and resolved references as
-        weighted edges, ready to feed into a graph library for ranking (e.g.
-        PageRank for a code map). Each edge carries its reference locations in
-        ``UsageGraphEdge.sites`` (``{path, line}``, with ``len(edge.sites) ==
-        edge.weight``), so a consumer can map call sites without re-scanning.
-        This is the bulk counterpart to a per-symbol usage scan; expect to
-        cache the result and rebuild on change.
+        With ``paths``, declarations in those files are roots and ``depth``
+        bounds outbound expansion. Without ``paths``, every workspace
+        declaration is a root and depth one is the complete workspace graph.
+        Each edge carries its reference locations in ``UsageGraphEdge.sites``
+        (``{path, line}``, with ``len(edge.sites) == edge.weight``).
 
         Args:
             include_tests: Include references that live in detected test files.
-            paths: Optional project-relative paths or globs bounding the search.
-                Omit to graph the whole workspace.
+            paths: Optional project-relative root paths or globs.
+            depth: Maximum outbound caller-to-callee hops. Must be positive.
         """
-        arguments: dict[str, Any] = {"include_tests": include_tests}
+        if depth < 1:
+            raise ValueError("usage_graph depth must be at least 1")
+        arguments: dict[str, Any] = {
+            "include_tests": include_tests,
+            "depth": depth,
+        }
         if paths is not None:
             arguments["paths"] = paths
         payload = self._call_tool_payload("usage_graph", arguments)

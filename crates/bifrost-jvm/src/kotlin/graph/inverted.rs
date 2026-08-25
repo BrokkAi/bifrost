@@ -46,7 +46,7 @@ use super::resolver::{
     member_unit, receiver_is_same_owner, receiver_type_fq_name, type_unit, visible_extension_unit,
 };
 use crate::kotlin::syntax::{
-    kotlin_binding_type_text, kotlin_call_arity, kotlin_call_with_callee, kotlin_callee,
+    kotlin_binding_type_components, kotlin_call_arity, kotlin_call_with_callee, kotlin_callee,
     kotlin_class_literal_type, kotlin_dotted_navigation_segments, kotlin_import_header_segments,
     kotlin_is_declaration_name, kotlin_is_expression_kind, kotlin_is_navigation_kind,
     kotlin_named_argument_label, kotlin_navigation_member, kotlin_navigation_receiver,
@@ -101,6 +101,26 @@ pub fn scan_file(
     class_ranges: ClassRangeIndex,
 ) -> PerFileEdges {
     let names = KotlinNameResolver::new(graph, token, file, input.root(), input.source);
+    let mut alias_terminals: HashMap<String, Option<String>> = HashMap::default();
+    if let Some(imports) = graph.imports {
+        for import in imports.import_info_of(token, file) {
+            let Some(alias) = import.alias.as_deref() else {
+                continue;
+            };
+            let terminal = import
+                .path
+                .as_ref()
+                .and_then(|path| path.segments.last())
+                .cloned();
+            if let Some(previous) = alias_terminals.get_mut(alias) {
+                if previous.as_ref() != terminal.as_ref() {
+                    *previous = None;
+                }
+            } else {
+                alias_terminals.insert(alias.to_string(), terminal);
+            }
+        }
+    }
     let mut scan = KotlinEdgeScan {
         graph,
         source: input.source,
@@ -109,6 +129,7 @@ pub fn scan_file(
         bindings: LocalInferenceEngine::new(LocalInferenceConfig::default()),
         declared_type_cache: HashMap::default(),
         owner_chain_cache: HashMap::default(),
+        alias_terminals,
         input,
         edges: PerFileEdges::default(),
     };
@@ -126,6 +147,10 @@ struct KotlinEdgeScan<'a> {
     /// Owner chains by the fqn of the innermost enclosing class, so the walk
     /// pays for `parent_of` once per class rather than once per reference.
     owner_chain_cache: HashMap<String, Vec<String>>,
+    /// Import aliases by their visible spelling. `None` means that more than
+    /// one structured import binds the spelling, or that its path was not
+    /// published; such shapes stay admitted conservatively.
+    alias_terminals: HashMap<String, Option<String>>,
     input: &'a FileEdgeScanInput<'a>,
     edges: PerFileEdges,
 }
@@ -143,12 +168,12 @@ impl KotlinResolutionCtx for KotlinEdgeScan<'_> {
         &self.bindings
     }
 
-    fn resolve_type_fqn(&self, spelled: &str, byte: usize) -> Option<String> {
-        self.names.resolve_type_fqn(spelled, byte)
+    fn resolve_type_components(&self, components: &[String], byte: usize) -> Option<String> {
+        self.names.resolve_type_components(components, byte)
     }
 
-    fn resolve_callable_fqn(&self, spelled: &str, byte: usize) -> Option<String> {
-        self.names.resolve_callable_fqn(spelled, byte)
+    fn resolve_callable_components(&self, components: &[String], byte: usize) -> Option<String> {
+        self.names.resolve_callable_components(components, byte)
     }
 
     /// Answered from the per-file class-span index rather than from
@@ -181,6 +206,32 @@ impl KotlinResolutionCtx for KotlinEdgeScan<'_> {
 }
 
 impl KotlinEdgeScan<'_> {
+    /// Reject a terminal that cannot name a requested callee before entering
+    /// receiver, type, or member resolution. Rooted scans intentionally leave
+    /// this open through `FileEdgeScanInput`.
+    fn may_match_terminal(&self, name: &str) -> bool {
+        self.input.may_match_terminal(name)
+    }
+
+    /// An imported alias spells a different terminal from the declaration it
+    /// binds. Use the structured import path when it is available; an
+    /// unpublished or conflicting alias remains admitted rather than risking a
+    /// false negative.
+    fn may_match_spelled_name(&self, name: &str) -> bool {
+        self.may_match_terminal(name)
+            || match self.alias_terminals.get(name) {
+                Some(Some(terminal)) => self.may_match_terminal(terminal),
+                Some(None) => true,
+                None => false,
+            }
+    }
+
+    fn may_match_type_segments(&self, segments: &[Node<'_>]) -> bool {
+        segments
+            .iter()
+            .any(|segment| self.may_match_spelled_name(node_text(*segment, self.source)))
+    }
+
     fn record(&mut self, callee: String, node: Node<'_>) {
         self.edges.record_kind(
             self.input,
@@ -246,8 +297,10 @@ fn binding_type_fq_name(
     token: QueryToken<'_>,
     scan: &mut KotlinEdgeScan<'_>,
 ) -> Option<String> {
-    if let Some(spelled) = kotlin_binding_type_text(binding, scan.source)
-        && let Some(fqn) = scan.names.resolve_type_fqn(&spelled, binding.start_byte())
+    if let Some(components) = kotlin_binding_type_components(binding, scan.source)
+        && let Some(fqn) = scan
+            .names
+            .resolve_type_components(&components, binding.start_byte())
     {
         return Some(fqn);
     }
@@ -343,7 +396,10 @@ fn record_import(header: Node<'_>, scan: &mut KotlinEdgeScan<'_>) {
         .map(|segment| node_text(*segment, scan.source))
         .collect::<Vec<_>>()
         .join(".");
-    if path.is_empty() || !scan.input.is_node(&path) {
+    if path.is_empty()
+        || !scan.may_match_terminal(node_text(last, scan.source))
+        || !scan.input.is_node(&path)
+    {
         return;
     }
     scan.record(path, last);
@@ -371,17 +427,20 @@ fn record_user_type(user_type: Node<'_>, scan: &mut KotlinEdgeScan<'_>) {
 /// Record one edge per resolving prefix of a dotted type name, so an outer type's
 /// usage count includes the nested references that named it.
 fn record_type_name_segments(segments: &[Node<'_>], scan: &mut KotlinEdgeScan<'_>) {
-    let mut spelling = String::new();
+    if !scan.may_match_type_segments(segments) {
+        return;
+    }
+    let mut components = Vec::new();
     for segment in segments {
         let name = node_text(*segment, scan.source);
         if name.is_empty() {
             return;
         }
-        if !spelling.is_empty() {
-            spelling.push('.');
-        }
-        spelling.push_str(name);
-        if let Some(resolved) = scan.names.resolve_type_fqn(&spelling, segment.start_byte()) {
+        components.push(name.to_string());
+        if let Some(resolved) = scan
+            .names
+            .resolve_type_components(&components, segment.start_byte())
+        {
             scan.record(resolved, *segment);
         }
     }
@@ -406,25 +465,43 @@ fn resolve_constructed_type(callee: Node<'_>, scan: &mut KotlinEdgeScan<'_>) -> 
     match callee.kind() {
         "simple_identifier" => {
             let name = node_text(callee, scan.source).to_string();
-            if name.is_empty() || scan.bindings.is_shadowed(&name) {
+            if name.is_empty()
+                || !scan.may_match_spelled_name(&name)
+                || scan.bindings.is_shadowed(&name)
+            {
                 return None;
             }
-            scan.names.resolve_type_fqn(&name, callee.start_byte())
+            scan.names
+                .resolve_type_components(std::slice::from_ref(&name), callee.start_byte())
         }
         "user_type" => {
             let segments = kotlin_user_type_segments(callee);
-            let spelled = segments
+            if !scan.may_match_type_segments(&segments) {
+                return None;
+            }
+            let components = segments
                 .iter()
                 .map(|segment| node_text(*segment, scan.source))
-                .collect::<Vec<_>>()
-                .join(".");
-            (!spelled.is_empty())
-                .then(|| scan.names.resolve_type_fqn(&spelled, callee.start_byte()))
+                .filter(|component| !component.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            (!components.is_empty())
+                .then(|| {
+                    scan.names
+                        .resolve_type_components(&components, callee.start_byte())
+                })
                 .flatten()
         }
         kind if kotlin_is_navigation_kind(kind) => {
-            let spelled = dotted_navigation_spelling(callee, scan)?;
-            scan.names.resolve_type_fqn(&spelled, callee.start_byte())
+            let components = dotted_navigation_components(callee, scan)?;
+            if !components
+                .iter()
+                .any(|component| scan.may_match_spelled_name(component))
+            {
+                return None;
+            }
+            scan.names
+                .resolve_type_components(&components, callee.start_byte())
         }
         _ => None,
     }
@@ -446,33 +523,36 @@ fn record_constructor_of(
     scan: &mut KotlinEdgeScan<'_>,
 ) {
     scan.record(owner_fqn.to_string(), type_node);
-    let Some(identifier) = owner_fqn.rsplit('.').next() else {
+    let Some(owner) = type_unit(scan.graph, owner_fqn) else {
         return;
     };
-    let constructor_fqn = format!("{owner_fqn}.{identifier}");
-    let declared = scan
+    let constructor = scan
         .graph
-        .with_definitions(|definitions| definitions.fqn(&constructor_fqn))
-        .iter()
-        .any(|candidate| {
+        .structural_members(owner.fq(), owner.identifier())
+        .into_iter()
+        .find(|candidate| {
             candidate.is_function()
                 && kotlin_callable_arities(scan.graph, candidate)
                     .iter()
                     .any(|recorded| recorded.accepts(arity))
         });
-    if declared {
-        scan.record(constructor_fqn, reference);
+    if let Some(constructor) = constructor {
+        scan.record(constructor.fq_name(), reference);
     }
 }
 
 /// The dotted name a navigation spells, when every link of it is a plain name.
-fn dotted_navigation_spelling(navigation: Node<'_>, scan: &KotlinEdgeScan<'_>) -> Option<String> {
+fn dotted_navigation_components(
+    navigation: Node<'_>,
+    scan: &KotlinEdgeScan<'_>,
+) -> Option<Vec<String>> {
     let segments = kotlin_dotted_navigation_segments(navigation)?;
     let names: Vec<&str> = segments
         .iter()
         .map(|segment| node_text(*segment, scan.source))
         .collect();
-    (!names.iter().any(|name| name.is_empty())).then(|| names.join("."))
+    (!names.iter().any(|name| name.is_empty()))
+        .then(|| names.into_iter().map(str::to_string).collect())
 }
 
 /// Record a bare `simple_identifier` that names a *type* used as a qualifier:
@@ -487,7 +567,7 @@ fn record_bare_identifier(node: Node<'_>, scan: &mut KotlinEdgeScan<'_>) {
         return;
     }
     let name = node_text(node, scan.source).to_string();
-    if name.is_empty() || scan.bindings.is_shadowed(&name) {
+    if name.is_empty() || !scan.may_match_spelled_name(&name) || scan.bindings.is_shadowed(&name) {
         return;
     }
     let Some(navigation) = node
@@ -499,7 +579,10 @@ fn record_bare_identifier(node: Node<'_>, scan: &mut KotlinEdgeScan<'_>) {
     if kotlin_navigation_receiver(navigation).is_none_or(|receiver| receiver.id() != node.id()) {
         return;
     }
-    if let Some(resolved) = scan.names.resolve_type_fqn(&name, node.start_byte()) {
+    if let Some(resolved) = scan
+        .names
+        .resolve_type_components(std::slice::from_ref(&name), node.start_byte())
+    {
         scan.record(resolved, node);
     }
 }
@@ -516,8 +599,17 @@ fn record_call(call: Node<'_>, token: QueryToken<'_>, scan: &mut KotlinEdgeScan<
     match callee.kind() {
         kind if kotlin_is_navigation_kind(kind) => {
             // `lib.Base(1)` is a fully-qualified construction, not a member call.
-            if let Some(owner_fqn) = dotted_navigation_spelling(callee, scan)
-                .and_then(|spelled| scan.names.resolve_type_fqn(&spelled, callee.start_byte()))
+            let Some(member) = kotlin_navigation_member(callee) else {
+                return;
+            };
+            if !scan.may_match_terminal(node_text(member, scan.source)) {
+                return;
+            }
+            if let Some(owner_fqn) = dotted_navigation_components(callee, scan)
+                .and_then(|components| {
+                    scan.names
+                        .resolve_type_components(&components, callee.start_byte())
+                })
                 .filter(|fqn| type_unit(scan.graph, fqn).is_some())
             {
                 let type_node = kotlin_navigation_member(callee).unwrap_or(callee);
@@ -531,13 +623,15 @@ fn record_call(call: Node<'_>, token: QueryToken<'_>, scan: &mut KotlinEdgeScan<
                 return;
             }
             let name = node_text(callee, scan.source).to_string();
-            if name.is_empty() {
+            if name.is_empty() || !scan.may_match_spelled_name(&name) {
                 return;
             }
             // `Base(1)` constructs a `Base`; a constructor call and a function
             // call are spelled identically, so the type reading is tried first.
             if !scan.bindings.is_shadowed(&name)
-                && let Some(owner_fqn) = scan.names.resolve_type_fqn(&name, callee.start_byte())
+                && let Some(owner_fqn) = scan
+                    .names
+                    .resolve_type_components(std::slice::from_ref(&name), callee.start_byte())
                 && type_unit(scan.graph, &owner_fqn).is_some()
             {
                 record_constructor_of(&owner_fqn, callee, call, arity, scan);
@@ -559,7 +653,7 @@ fn record_callable_reference(reference: Node<'_>, scan: &mut KotlinEdgeScan<'_>)
         return;
     };
     let name = node_text(name_node, scan.source).to_string();
-    if name.is_empty() {
+    if name.is_empty() || !scan.may_match_spelled_name(&name) {
         return;
     }
     record_bare_callable(name_node, &name, None, scan);
@@ -600,13 +694,15 @@ fn record_bare_callable(
     let unit = match arity {
         Some(arity) => bare_callable_unit(name, arity, token, scan),
         None => scan
-            .resolve_callable_fqn(name, token.start_byte())
+            .resolve_callable_components(
+                std::slice::from_ref(&name.to_string()),
+                token.start_byte(),
+            )
             .and_then(|fqn| {
                 scan.graph
-                    .with_definitions(|definitions| definitions.fqn(&fqn))
-                    .iter()
+                    .index
+                    .definitions(&fqn)
                     .find(|unit| !unit.is_synthetic() && (unit.is_function() || unit.is_field()))
-                    .cloned()
             }),
     };
     match unit {
@@ -631,7 +727,7 @@ fn record_member_access(
         return;
     };
     let name = node_text(member, scan.source).to_string();
-    if name.is_empty() {
+    if name.is_empty() || !scan.may_match_terminal(&name) {
         return;
     }
     // A named argument's label names a parameter, not a member.

@@ -1387,6 +1387,7 @@ fixed_report_type_retained_size!(
 #[serde(rename_all = "snake_case")]
 pub enum PolicyExecutionStage {
     PolicySelection,
+    SuppressionPreflight,
     WorkspaceSnapshot,
     PolicyRegistration,
     PolicyPreparation,
@@ -1749,6 +1750,9 @@ impl RetainedSize for PolicyDiffReview {
 /// The truncation flag stays exact; only the entry list truncates, mirroring
 /// the report's other bounded collections.
 pub(crate) const MAX_PACK_ACTIVATION_DECISIONS: usize = 128;
+/// Upper bound on per-pack procedure-summary evidence retained in one
+/// activation decision. The count remains exact when this list truncates.
+pub(crate) const MAX_PACK_PROCEDURE_SUMMARY_EVIDENCE: usize = 128;
 
 /// How one pack or discovered dependency fared at activation (#1868, #1884).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -1769,6 +1773,48 @@ pub enum PolicyPackDecisionStatus {
     Rejected,
 }
 
+/// One activated procedure summary's reachability evidence.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct PolicyPackProcedureSummaryEvidence {
+    summary_id: String,
+    symbol: String,
+    match_count: u64,
+}
+
+impl PolicyPackProcedureSummaryEvidence {
+    pub(crate) fn new(summary_id: String, symbol: String, match_count: u64) -> Self {
+        Self {
+            summary_id,
+            symbol,
+            match_count,
+        }
+    }
+
+    pub fn summary_id(&self) -> &str {
+        &self.summary_id
+    }
+
+    pub fn symbol(&self) -> &str {
+        &self.symbol
+    }
+
+    pub const fn match_count(&self) -> u64 {
+        self.match_count
+    }
+}
+
+impl RetainedSize for PolicyPackProcedureSummaryEvidence {
+    fn retained_size(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(self.summary_id.capacity())
+            .saturating_add(self.symbol.capacity())
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// One pack-activation decision retained for attribution.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct PolicyPackDecision {
@@ -1776,6 +1822,10 @@ pub struct PolicyPackDecision {
     status: PolicyPackDecisionStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    summary_matches: Vec<PolicyPackProcedureSummaryEvidence>,
+    #[serde(skip_serializing_if = "is_false")]
+    summary_matches_truncated: bool,
 }
 
 impl PolicyPackDecision {
@@ -1788,7 +1838,23 @@ impl PolicyPackDecision {
             pack,
             status,
             reason,
+            summary_matches: Vec::new(),
+            summary_matches_truncated: false,
         }
+    }
+
+    pub(crate) fn with_summary_matches(
+        mut self,
+        mut summary_matches: Vec<PolicyPackProcedureSummaryEvidence>,
+    ) -> Self {
+        summary_matches.sort();
+        summary_matches.dedup();
+        self.summary_matches_truncated =
+            summary_matches.len() > MAX_PACK_PROCEDURE_SUMMARY_EVIDENCE;
+        summary_matches.truncate(MAX_PACK_PROCEDURE_SUMMARY_EVIDENCE);
+        tighten_vec(&mut summary_matches);
+        self.summary_matches = summary_matches;
+        self
     }
 
     pub fn pack(&self) -> &str {
@@ -1802,6 +1868,14 @@ impl PolicyPackDecision {
     pub fn reason(&self) -> Option<&str> {
         self.reason.as_deref()
     }
+
+    pub fn summary_matches(&self) -> &[PolicyPackProcedureSummaryEvidence] {
+        &self.summary_matches
+    }
+
+    pub const fn summary_matches_truncated(&self) -> bool {
+        self.summary_matches_truncated
+    }
 }
 
 impl RetainedSize for PolicyPackDecision {
@@ -1809,6 +1883,7 @@ impl RetainedSize for PolicyPackDecision {
         size_of::<Self>()
             .saturating_add(self.pack.capacity())
             .saturating_add(self.reason.as_ref().map_or(0, String::capacity))
+            .saturating_add(retained_extra(&self.summary_matches))
     }
 }
 

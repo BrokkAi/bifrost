@@ -104,8 +104,10 @@ pub(crate) use brokk_bifrost_rust::usage::{
     RustBindingSeeds, usage_binding_local_names, usage_binding_names, usage_binding_seeds,
     usage_binding_seeds_while, usage_candidate_files_from_binding_seeds_while,
     usage_crate_export_targets, usage_declaration_visible_at, usage_exact_root_for_resolution,
-    usage_has_exact_scoped_binding, usage_identity_visible_at, usage_importers,
-    usage_local_module_prefix_visible_at, usage_reference_at, usage_root_declaration_matches_at,
+    usage_exact_root_for_resolution_with_walks, usage_has_exact_scoped_binding,
+    usage_identity_visible_at, usage_import_path_matches_seed, usage_importers,
+    usage_local_module_prefix_visible_at, usage_reference_at, usage_reference_at_with_walks,
+    usage_root_declaration_matches_at,
 };
 
 pub fn rust_declaration_matches_reference_namespace(
@@ -227,21 +229,38 @@ impl RustAnalyzer {
         facts
     }
 
-    pub(crate) fn declaration_candidates_by_identifier_limited(
-        &self,
-        identifier: &str,
-        limit: usize,
-        continue_query: impl FnMut() -> bool,
-    ) -> LimitedQueryRows<CodeUnit> {
-        self.inner
-            .lookup_declarations_by_identifier_limited(identifier, limit, continue_query)
-    }
-
     pub(crate) fn declaration_candidates_by_identifier(&self, identifier: &str) -> Vec<CodeUnit> {
         self.inner
             .lookup_declarations_by_identifier(identifier)
             .into_iter()
             .collect()
+    }
+
+    pub(crate) fn declaration_candidates_by_identifier_in_file(
+        &self,
+        file: &ProjectFile,
+        identifier: &str,
+    ) -> Vec<CodeUnit> {
+        self.inner
+            .lookup_declarations_by_identifier_in_file(file, identifier)
+            .into_iter()
+            .collect()
+    }
+
+    pub(crate) fn declaration_candidates_by_identifier_in_file_limited(
+        &self,
+        file: &ProjectFile,
+        identifier: &str,
+        limit: usize,
+        continue_query: impl FnMut() -> bool,
+    ) -> LimitedQueryRows<CodeUnit> {
+        self.inner
+            .lookup_declarations_by_identifier_in_file_limited(
+                file,
+                identifier,
+                limit,
+                continue_query,
+            )
     }
 
     pub(crate) fn declaration_candidates_by_fqn(&self, fqn: &str) -> Vec<CodeUnit> {
@@ -1049,6 +1068,8 @@ impl CodeUnitIndex for RustAnalyzer {
 }
 
 impl IAnalyzer for RustAnalyzer {
+    crate::analyzer::i_analyzer::forward_relational_definition_batch!();
+
     #[cfg(any(test, feature = "test-support"))]
     fn test_hooks(&self) -> &dyn crate::analyzer::AnalyzerTestHooks {
         self
@@ -1092,13 +1113,6 @@ impl IAnalyzer for RustAnalyzer {
 
     fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
         self.inner.workspace_file_index_cell()
-    }
-
-    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
-        // Trait signature is fixed, so this boundary opens the scope the
-        // usage-graph funnel now demands proof of (issue #2423 milestone B).
-        let scope = crate::analyzer::AnalyzerQueryScope::new(self);
-        self.inner.global_usage_definition_index(scope.token())
     }
 
     fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
@@ -1230,14 +1244,20 @@ impl IAnalyzer for RustAnalyzer {
         Some(self)
     }
 
-    fn structural_search_providers(
+    fn structural_fact_providers(
         &self,
-    ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
-        self.inner.structural_search_providers()
+    ) -> Vec<&dyn crate::analyzer::structural::StructuralFactProvider> {
+        self.inner.structural_fact_providers()
     }
 
     fn snapshot_caches(&self) -> Option<&crate::analyzer::AnalyzerSnapshotCaches> {
         Some(self.inner.snapshot_caches())
+    }
+
+    fn workspace_content_identities(
+        &self,
+    ) -> Option<crate::analyzer::content_identity::WorkspaceContentIdentities> {
+        self.inner.workspace_content_identities()
     }
 
     fn test_detection_provider(&self) -> Option<&dyn TestDetectionProvider> {
@@ -1330,18 +1350,6 @@ impl crate::analyzer::AnalyzerTestHooks for RustAnalyzer {
             .definition_candidates_query_count_for_test()
     }
 
-    fn reset_global_usage_definition_index_build_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_global_usage_definition_index_build_count_for_test();
-    }
-
-    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .global_usage_definition_index_build_count_for_test()
-    }
-
     fn reset_full_declaration_scan_count_for_test(&self) {
         self.inner
             .test_hooks()
@@ -1386,6 +1394,55 @@ impl crate::analyzer::AnalyzerTestHooks for RustAnalyzer {
 static RUST_USAGE_STRATEGY: RustExportUsageGraphStrategy = RustExportUsageGraphStrategy::new();
 
 pub(crate) struct RustSupport;
+
+/// Expand `Path::new` to `std::path::Path::new` when the file's `use`
+/// declarations bind `Path` (#2596, the Rust analog of Java's #2364).
+///
+/// The expansion reads the parser-derived import binders the store already
+/// holds: a binder's `local_name` is the name written at the call site
+/// (`alias ?? identifier`), and its structured segments are the path it binds
+/// to. Nothing here parses source text or reconstructs a path from the raw
+/// `use` snippet.
+///
+/// A callee whose owner is already multi-segment carries its own qualification
+/// and is left alone. A single-segment import (`use foo;`, `extern crate foo;`)
+/// adds no qualification and is skipped. Two binders that disagree on the same
+/// local name answer nothing rather than picking one; in Rust that only happens
+/// across mutually exclusive `#[cfg]` alternatives, where no single expansion
+/// is provable.
+fn expand_rust_imported_external_callee(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    callee_text: &str,
+) -> Option<String> {
+    let (owner, member) = callee_text.rsplit_once("::")?;
+    let owner = owner.trim();
+    let member = member.trim();
+    if owner.is_empty() || member.is_empty() || owner.contains("::") {
+        return None;
+    }
+    let provider = analyzer.import_analysis_provider_for_file(file)?;
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let mut expanded: Option<String> = None;
+    for import in provider.import_info_of(scope.token(), file) {
+        if import.is_wildcard || import.local_name() != Some(owner) {
+            continue;
+        }
+        let Some(path) = import.path.as_ref() else {
+            continue;
+        };
+        if path.segments.len() < 2 {
+            continue;
+        }
+        let rendered = path.render_segments("::");
+        match expanded.as_deref() {
+            Some(existing) if existing == rendered => {}
+            Some(_) => return None,
+            None => expanded = Some(rendered),
+        }
+    }
+    expanded.map(|owner| format!("{owner}::{member}"))
+}
 
 impl LanguageSupport for RustSupport {
     fn language(&self) -> Language {
@@ -1442,6 +1499,19 @@ impl LanguageSupport for RustSupport {
         &RUST_USAGE_STRATEGY
     }
 
+    fn qualified_call_separator(&self) -> &'static str {
+        "::"
+    }
+
+    fn expand_imported_external_callee(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        callee_text: &str,
+    ) -> Option<String> {
+        expand_rust_imported_external_callee(analyzer, file, callee_text)
+    }
+
     fn edge_pass(&self) -> Option<&'static dyn LanguageEdgePass> {
         Some(&RustEdgePass)
     }
@@ -1494,7 +1564,12 @@ impl LanguageEdgePass for RustEdgePass {
     }
 
     fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
-        build_rust_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file).map(LanguageEdgeSites)
+        crate::analyzer::usages::rust_graph::build_rooted_rust_usage_edges(
+            ctx.analyzer,
+            ctx.fqns,
+            ctx.keep_file,
+        )
+        .map(LanguageEdgeSites)
     }
 
     fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {

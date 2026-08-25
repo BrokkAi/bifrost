@@ -13,14 +13,60 @@ use crate::syntax::{
     python_node_is_in_annotation,
 };
 use crate::usage_index::usage_seeds;
+use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
 use brokk_bifrost_core::analyzer::usages::model::{ExportEntry, ImportBinder, ImportKind};
 use brokk_bifrost_core::analyzer::usages::{ImportEdge, ImportEdgeKind};
 use brokk_bifrost_core::analyzer::{
-    BoundedDefinitionLookup, CodeUnit, CodeUnitIndex, Language, ProjectFile, Range,
+    CodeUnit, CodeUnitIndex, DefinitionLanguageScope, Language, ProjectFile, Range,
+    RelationalDefinitionQuery, RelationalDefinitionQuestion, RelationalDefinitionValue,
+    RelationalName,
 };
+use brokk_bifrost_core::hash::HashSet;
 use std::collections::BTreeSet;
 use tree_sitter::Node;
+
+const MAX_MEMBER_OWNER_FRONTIER: usize = 512;
+
+/// Resolve the declarations selected by Python member lookup for one concrete
+/// receiver type. A declaration on the receiver (or on a nearer base layer)
+/// overrides every same-named declaration farther up the hierarchy.
+pub(crate) fn resolved_member_declarations(
+    graph: &PythonGraphSource<'_>,
+    receiver: &CodeUnit,
+    member: &str,
+) -> Vec<CodeUnit> {
+    let mut visited = HashSet::default();
+    let mut frontier = vec![receiver.clone()];
+    while !frontier.is_empty() && visited.len() < MAX_MEMBER_OWNER_FRONTIER {
+        let mut declarations = Vec::new();
+        let mut next = Vec::new();
+        for owner in frontier {
+            if !visited.insert(owner.clone()) {
+                continue;
+            }
+            let fqn = format!("{}.{member}", owner.fq_name());
+            declarations.extend(
+                graph
+                    .index
+                    .definitions(&fqn)
+                    .filter(|candidate| graph.index.parent_of(candidate).as_ref() == Some(&owner)),
+            );
+            if let Some(hierarchy) = graph.hierarchy {
+                next.extend(hierarchy.get_direct_ancestors(&owner));
+            }
+        }
+        declarations.sort();
+        declarations.dedup();
+        if !declarations.is_empty() {
+            return declarations;
+        }
+        next.sort();
+        next.dedup();
+        frontier = next;
+    }
+    Vec::new()
+}
 
 pub fn infer_export_names(python: &dyn PythonUsageSource, target: &CodeUnit) -> BTreeSet<String> {
     if target_owner_code_unit(python, target).is_some() {
@@ -155,15 +201,7 @@ pub fn resolve_receiver_type(
             if !target_self_file {
                 return None;
             }
-            // The only reader of the analyzer's global definition index in this
-            // crate, and the reason `PythonGraphSource::definitions` is a
-            // callback: the index builds on first access, so resolving it
-            // eagerly per scan would pay for a build this branch usually skips.
-            let mut resolved = None;
-            (graph.definitions)(&mut |support| {
-                resolved = resolve_indexed_receiver_type(graph.index, support, file, raw_type);
-            });
-            resolved
+            resolve_indexed_receiver_type(graph, file, raw_type)
         })
 }
 
@@ -815,31 +853,66 @@ fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
 }
 
 fn resolve_indexed_receiver_type(
-    index: &dyn CodeUnitIndex,
-    lookup: &dyn BoundedDefinitionLookup,
+    graph: &PythonGraphSource<'_>,
     file: &ProjectFile,
     raw_type: &str,
 ) -> Option<CodeUnit> {
-    module_fqn_for_file(index, file)
+    let package_matches = module_fq_for_file(graph.index, file).map_or_else(Vec::new, |module| {
+        relational_definitions(
+            graph,
+            RelationalName::stable(module),
+            RelationalDefinitionQuery::PackageTypes {
+                simple_name: raw_type.to_string(),
+            },
+        )
+    });
+    let mut root_name = FqName::new();
+    root_name.push(segment_interner().intern(raw_type, SegmentKind::Type));
+    let exact_matches = relational_definitions(
+        graph,
+        RelationalName::stable(root_name.clone()),
+        RelationalDefinitionQuery::ExactName,
+    );
+    let normalized_matches = relational_definitions(
+        graph,
+        RelationalName::stable(root_name),
+        RelationalDefinitionQuery::NormalizedName,
+    );
+    package_matches
         .into_iter()
-        .flat_map(|module| lookup.types_in_package(&module, raw_type))
-        .chain(lookup.fqn(raw_type))
-        .chain(lookup.by_normalized_fqn(raw_type))
+        .chain(exact_matches)
+        .chain(normalized_matches)
         .find(|code_unit| code_unit.identifier() == raw_type && code_unit.is_class())
 }
 
-fn module_fqn_for_file(index: &dyn CodeUnitIndex, file: &ProjectFile) -> Option<String> {
+fn relational_definitions(
+    graph: &PythonGraphSource<'_>,
+    name: RelationalName,
+    query: RelationalDefinitionQuery,
+) -> Vec<CodeUnit> {
+    let question = RelationalDefinitionQuestion {
+        language_scope: DefinitionLanguageScope::Workspace,
+        name,
+        query,
+    };
+    match graph.definitions.ask(&question) {
+        RelationalDefinitionValue::Definitions(units) => units,
+        _ => panic!("definition question returned the wrong result shape"),
+    }
+}
+
+fn module_fq_for_file(index: &dyn CodeUnitIndex, file: &ProjectFile) -> Option<FqName> {
     index
         .declarations(file)
         .into_iter()
         .find(|code_unit| code_unit.is_module())
-        .map(|code_unit| code_unit.fq_name())
+        .map(|code_unit| code_unit.fq().clone())
         .or_else(|| {
             index
                 .declarations(file)
                 .into_iter()
                 .find(|code_unit| !code_unit.package_name().is_empty())
-                .map(|code_unit| code_unit.package_name().to_string())
+                .map(|code_unit| code_unit.package_fq())
         })
 }
 

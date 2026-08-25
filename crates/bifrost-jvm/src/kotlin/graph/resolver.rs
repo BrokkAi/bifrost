@@ -7,23 +7,24 @@
 //! Kotlin source into the fully-qualified name it denotes at a given position,
 //! through Kotlin's real precedence ladder.
 //!
-//! The ladder itself is not reimplemented here. `crate::kotlin::types`
-//! owns it as `resolve_kotlin_type_name`, parameterised over a "does this
-//! fully-qualified name exist" predicate. This module supplies a predicate backed
-//! by `IAnalyzer::global_usage_definition_index`, which under `MultiAnalyzer`
-//! merges the declarations of every language in the workspace. That is what lets
-//! a Kotlin file resolve a Java type declared next door, and it is why the
-//! predicate is not `KotlinAnalyzer::source_type_exists`: the Kotlin-only lookup
-//! would silently drop every cross-language answer.
+//! The graph ladder consumes parser-derived component vectors from type nodes,
+//! package headers, and structured imports. Every visibility alternative for a
+//! written name shares one terminal identifier, so a request-local relational
+//! frontier deduplicates them into one indexed seek and the resolver compares
+//! complete `FqName` segment text. Published return and extension-receiver facts
+//! carry the same components as `StructuredTypeIdentity`; graph code never
+//! reconstructs or reparses a rendered qualified name.
 
 use super::KotlinGraphSource;
 use super::extractor::ScanCtx;
-use crate::kotlin::declarations::kotlin_package_name;
+use crate::kotlin::declarations::kotlin_package_components;
+use crate::kotlin::imports::KOTLIN_DEFAULT_IMPORT_PACKAGES;
 use crate::kotlin::syntax::{
     kotlin_call_arity, kotlin_callee, kotlin_is_navigation_kind, kotlin_navigation_member,
-    kotlin_navigation_receiver, kotlin_type_spelling, kotlin_unwrap_receiver,
+    kotlin_navigation_receiver, kotlin_type_name_components, kotlin_unwrap_receiver,
 };
-use crate::kotlin::types::{KotlinNameScope, KotlinTypeName, resolve_kotlin_type_name};
+use crate::kotlin::types::KotlinTypeName;
+use brokk_bifrost_core::analyzer::fq_name::{SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::model::{CallableArity, ImportInfo, SignatureMetadata};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::tree_walk::named_children;
@@ -286,13 +287,19 @@ pub fn extension_receiver_fq_name(
     token: QueryToken<'_>,
     unit: &CodeUnit,
 ) -> Option<String> {
-    let spelled = graph
+    let components = graph
         .index
         .signature_metadata(unit)
         .into_iter()
-        .find_map(|entry| entry.extension_receiver_type().map(str::to_string))?;
+        .find_map(|entry| {
+            entry
+                .extension_receiver_type_identity()?
+                .nominal_name()
+                .map(|name| name.path().to_vec())
+        })?;
     let byte = graph.index.ranges(unit).into_iter().min()?.start_byte;
-    KotlinNameResolver::for_declaration(graph, token, unit).resolve_type_fqn(&spelled, byte)
+    KotlinNameResolver::for_declaration(graph, token, unit)
+        .resolve_type_components(&components, byte)
 }
 
 // ---------------------------------------------------------------------------
@@ -335,11 +342,11 @@ pub trait KotlinResolutionCtx {
     fn bindings(&self) -> &LocalInferenceEngine<String>;
 
     /// The fully-qualified name the *type* `spelled` denotes at `byte`.
-    fn resolve_type_fqn(&self, spelled: &str, byte: usize) -> Option<String>;
+    fn resolve_type_components(&self, components: &[String], byte: usize) -> Option<String>;
 
     /// The fully-qualified name the receiver-less *callable or property*
     /// `spelled` denotes at `byte`.
-    fn resolve_callable_fqn(&self, spelled: &str, byte: usize) -> Option<String>;
+    fn resolve_callable_components(&self, components: &[String], byte: usize) -> Option<String>;
 
     /// Fully-qualified names of the class-like declarations lexically enclosing
     /// `node`, innermost first.
@@ -485,7 +492,9 @@ pub fn receiver_is_same_owner(receiver: Node<'_>, ctx: &mut impl KotlinResolutio
             if name.is_empty() || ctx.bindings().is_shadowed(&name) {
                 return false;
             }
-            let Some(fqn) = ctx.resolve_type_fqn(&name, receiver.start_byte()) else {
+            let Some(fqn) =
+                ctx.resolve_type_components(std::slice::from_ref(&name), receiver.start_byte())
+            else {
                 return false;
             };
             ctx.enclosing_owner_fq_names(receiver).contains(&fqn)
@@ -535,7 +544,7 @@ pub fn receiver_type_fq_name(
                 // class it shadows.
                 return None;
             }
-            ctx.resolve_type_fqn(&name, node.start_byte())
+            ctx.resolve_type_components(std::slice::from_ref(&name), node.start_byte())
         }
         "call_expression" => call_result_type_fq_name(node, token, ctx, depth),
         kind if kotlin_is_navigation_kind(kind) => {
@@ -552,8 +561,8 @@ pub fn receiver_type_fq_name(
         }
         "as_expression" => named_children(node)
             .into_iter()
-            .find_map(|child| kotlin_type_spelling(child, ctx.source()))
-            .and_then(|spelled| ctx.resolve_type_fqn(&spelled, node.start_byte())),
+            .find_map(|child| kotlin_type_name_components(child, ctx.source()))
+            .and_then(|components| ctx.resolve_type_components(&components, node.start_byte())),
         _ => None,
     }
 }
@@ -602,7 +611,7 @@ fn navigation_type_fq_name(
     if segments.iter().any(String::is_empty) {
         return None;
     }
-    ctx.resolve_type_fqn(&segments.join("."), navigation.start_byte())
+    ctx.resolve_type_components(&segments, navigation.start_byte())
 }
 
 /// The type a call evaluates to: the constructed type for a constructor call,
@@ -624,7 +633,8 @@ fn call_result_type_fq_name(
             // `Base()` constructs a `Base`. Tried first because a constructor
             // call and a function call are spelled identically.
             if !ctx.bindings().is_shadowed(&name)
-                && let Some(fqn) = ctx.resolve_type_fqn(&name, callee.start_byte())
+                && let Some(fqn) =
+                    ctx.resolve_type_components(std::slice::from_ref(&name), callee.start_byte())
             {
                 return Some(fqn);
             }
@@ -660,14 +670,12 @@ pub fn bare_callable_unit(
             return Some(unit);
         }
     }
-    let fqn = ctx.resolve_callable_fqn(name, node.start_byte())?;
-    ctx.graph().with_definitions(|definitions| {
-        definitions
-            .fqn(&fqn)
-            .iter()
-            .find(|unit| !unit.is_synthetic() && (unit.is_function() || unit.is_field()))
-            .cloned()
-    })
+    let fqn = ctx
+        .resolve_callable_components(std::slice::from_ref(&name.to_string()), node.start_byte())?;
+    ctx.graph()
+        .index
+        .definitions(&fqn)
+        .find(|unit| !unit.is_synthetic() && (unit.is_function() || unit.is_field()))
 }
 
 /// The member declaration `member_name` names on a receiver of type
@@ -684,7 +692,7 @@ pub fn member_unit(
     }
     let owner_unit = type_unit(graph, owner_fqn)?;
     // A companion's members answer to the enclosing class's name.
-    for child in graph.with_definitions(|definitions| definitions.fqn_direct_children(owner_fqn)) {
+    for child in graph.structural_children(owner_unit.fq()) {
         if child.is_class()
             && is_companion_object(graph, &child)
             && let Some(unit) = declared_member_unit(graph, &child.fq_name(), member_name, arity)
@@ -724,9 +732,10 @@ fn declared_member_unit(
     member_name: &str,
     arity: Option<usize>,
 ) -> Option<CodeUnit> {
+    let owner = type_unit(graph, owner_fqn)?;
     graph
-        .with_definitions(|definitions| definitions.fqn(&format!("{owner_fqn}.{member_name}")))
-        .iter()
+        .structural_members(owner.fq(), member_name)
+        .into_iter()
         .find(|unit| {
             !unit.is_synthetic()
                 && (unit.is_function() || unit.is_field())
@@ -738,7 +747,6 @@ fn declared_member_unit(
                     arities.is_empty() || arities.iter().any(|recorded| recorded.accepts(arity))
                 })
         })
-        .cloned()
 }
 
 /// The extension declaration `member_name` names on a receiver of type
@@ -763,13 +771,13 @@ pub fn visible_extension_unit(
     byte: usize,
     ctx: &mut impl KotlinResolutionCtx,
 ) -> Option<CodeUnit> {
-    let fqn = ctx.resolve_callable_fqn(member_name, byte)?;
+    let fqn =
+        ctx.resolve_callable_components(std::slice::from_ref(&member_name.to_string()), byte)?;
     let graph = ctx.graph();
     let unit = graph
-        .with_definitions(|definitions| definitions.fqn(&fqn))
-        .iter()
-        .find(|unit| !unit.is_synthetic() && (unit.is_function() || unit.is_field()))
-        .cloned()?;
+        .index
+        .definitions(&fqn)
+        .find(|unit| !unit.is_synthetic() && (unit.is_function() || unit.is_field()))?;
     (extension_receiver_fq_name(graph, token, &unit)? == owner_fqn).then_some(unit)
 }
 
@@ -784,9 +792,14 @@ fn member_declared_type(
 ) -> Option<String> {
     // A nested type reached through its owner's name (`Outer.Inner`) is a type,
     // not a member with a type.
-    let nested = format!("{owner_fqn}.{member_name}");
-    if type_unit(ctx.graph(), &nested).is_some() {
-        return Some(nested);
+    if let Some(owner) = type_unit(ctx.graph(), owner_fqn)
+        && let Some(nested) = ctx
+            .graph()
+            .structural_members(owner.fq(), member_name)
+            .into_iter()
+            .find(|unit| unit.is_class())
+    {
+        return Some(nested.fq_name());
     }
     let unit = member_unit(owner_fqn, member_name, arity, ctx)?;
     declared_type_of(&unit, token, ctx)
@@ -824,22 +837,27 @@ fn declared_type_of_uncached(
     {
         return Some(parent.fq_name());
     }
-    let spelled = graph
+    let components = graph
         .index
         .signature_metadata(unit)
         .into_iter()
-        .find_map(|entry| entry.return_type_text().map(str::to_string))?;
+        .find_map(|entry| {
+            entry
+                .return_type_identity()?
+                .nominal_name()
+                .map(|name| name.path().to_vec())
+        })?;
     let byte = graph.index.ranges(unit).into_iter().min()?.start_byte;
-    KotlinNameResolver::for_declaration(graph, token, unit).resolve_type_fqn(&spelled, byte)
+    KotlinNameResolver::for_declaration(graph, token, unit)
+        .resolve_type_components(&components, byte)
 }
 
 /// The workspace type declaration named `fqn`, if there is one.
 pub fn type_unit(graph: &KotlinGraphSource<'_>, fqn: &str) -> Option<CodeUnit> {
     graph
-        .with_definitions(|definitions| definitions.fqn(fqn))
-        .iter()
+        .index
+        .definitions(fqn)
         .find(|unit| !unit.is_synthetic() && unit.fq_name() == fqn && unit.is_class())
-        .cloned()
 }
 
 /// Whether `owner_fqn` declares a member spelled `member_name`, optionally one
@@ -850,9 +868,12 @@ pub fn owner_declares_member(
     member_name: &str,
     arity: Option<usize>,
 ) -> bool {
+    let Some(owner) = type_unit(graph, owner_fqn) else {
+        return false;
+    };
     graph
-        .with_definitions(|definitions| definitions.fqn(&format!("{owner_fqn}.{member_name}")))
-        .iter()
+        .structural_members(owner.fq(), member_name)
+        .into_iter()
         .any(|unit| {
             !unit.is_synthetic()
                 && (unit.is_function() || unit.is_field())
@@ -860,7 +881,7 @@ pub fn owner_declares_member(
                     if !unit.is_function() {
                         return true;
                     }
-                    let arities = kotlin_callable_arities(graph, unit);
+                    let arities = kotlin_callable_arities(graph, &unit);
                     arities.is_empty() || arities.iter().any(|recorded| recorded.accepts(arity))
                 })
         })
@@ -885,7 +906,7 @@ fn is_kotlin_type_alias(graph: &KotlinGraphSource<'_>, unit: &CodeUnit) -> bool 
 /// The file-level half of a Kotlin name scope: what the file declares itself to
 /// be in, and what it imported.
 struct KotlinFileFacts {
-    package_name: String,
+    package_components: Vec<String>,
     imports: Vec<ImportInfo>,
 }
 
@@ -901,10 +922,140 @@ pub struct KotlinNameResolver<'a> {
     /// per reference and the answer only changes when the enclosing declaration
     /// changes, so without the cache a large file re-walks the owner chain
     /// hundreds of times.
-    owners_at: RefCell<Vec<(usize, Vec<String>)>>,
+    owners_at: RefCell<Vec<(usize, Vec<CodeUnit>)>>,
 }
 
 impl<'a> KotlinNameResolver<'a> {
+    fn unit_components(unit: &CodeUnit) -> Vec<String> {
+        unit.fq()
+            .segments()
+            .iter()
+            .map(|segment| segment_interner().resolve(*segment).0.to_string())
+            .collect()
+    }
+
+    fn resolve_components(
+        &self,
+        components: &[String],
+        byte: usize,
+        accepts: impl Fn(&CodeUnit) -> bool,
+    ) -> KotlinTypeName {
+        let Some(head) = components.first() else {
+            return KotlinTypeName::Unresolved;
+        };
+        let lookup = |candidate: &[String]| {
+            self.graph
+                .definitions_by_components(candidate)
+                .into_iter()
+                .find(&accepts)
+        };
+
+        let mut resolved_head = None;
+        for owner in self.scope_owner_units_at(byte) {
+            let mut candidate = Self::unit_components(&owner);
+            candidate.push(head.clone());
+            if let Some(unit) = lookup(&candidate) {
+                resolved_head = Some(unit);
+                break;
+            }
+        }
+
+        if resolved_head.is_none() {
+            for import in &self.facts.imports {
+                if import.is_wildcard || import.local_name() != Some(head.as_str()) {
+                    continue;
+                }
+                let Some(path) = import.path.as_ref() else {
+                    return KotlinTypeName::Unresolved;
+                };
+                let Some(unit) = lookup(&path.segments) else {
+                    return KotlinTypeName::Unresolved;
+                };
+                resolved_head = Some(unit);
+                break;
+            }
+        }
+
+        if resolved_head.is_none() {
+            let mut candidate = self.facts.package_components.clone();
+            candidate.push(head.clone());
+            resolved_head = lookup(&candidate);
+        }
+
+        if resolved_head.is_none() {
+            let mut star_match: Option<CodeUnit> = None;
+            for import in &self.facts.imports {
+                if !import.is_wildcard {
+                    continue;
+                }
+                let Some(path) = import.path.as_ref() else {
+                    continue;
+                };
+                let mut candidate = path.segments.clone();
+                candidate.push(head.clone());
+                let Some(found) = lookup(&candidate) else {
+                    continue;
+                };
+                if star_match
+                    .as_ref()
+                    .is_some_and(|existing| existing.fq() != found.fq())
+                {
+                    return KotlinTypeName::Ambiguous;
+                }
+                star_match = Some(found);
+            }
+            resolved_head = star_match;
+        }
+
+        if resolved_head.is_none() {
+            for package in KOTLIN_DEFAULT_IMPORT_PACKAGES {
+                let mut candidate = package
+                    .components
+                    .iter()
+                    .map(|component| (*component).to_string())
+                    .collect::<Vec<_>>();
+                candidate.push(head.clone());
+                if let Some(unit) = lookup(&candidate) {
+                    resolved_head = Some(unit);
+                    break;
+                }
+            }
+        }
+
+        if let Some(head_unit) = resolved_head {
+            if components.len() == 1 {
+                return KotlinTypeName::Resolved(head_unit.fq_name());
+            }
+            let mut candidate = Self::unit_components(&head_unit);
+            candidate.extend_from_slice(&components[1..]);
+            if let Some(unit) = lookup(&candidate) {
+                return KotlinTypeName::Resolved(unit.fq_name());
+            }
+        }
+
+        lookup(components).map_or(KotlinTypeName::Unresolved, |unit| {
+            KotlinTypeName::Resolved(unit.fq_name())
+        })
+    }
+
+    pub fn resolve_type_components(&self, components: &[String], byte: usize) -> Option<String> {
+        self.resolve_components(components, byte, |unit| {
+            !unit.is_synthetic() && (unit.is_class() || is_kotlin_type_alias(self.graph, unit))
+        })
+        .resolved()
+    }
+
+    pub fn resolve_callable_components(
+        &self,
+        components: &[String],
+        byte: usize,
+    ) -> Option<String> {
+        self.resolve_components(components, byte, |unit| {
+            !unit.is_synthetic() && (unit.is_function() || unit.is_field())
+        })
+        .resolved()
+    }
+
     pub fn new(
         graph: &'a KotlinGraphSource<'a>,
         token: QueryToken<'_>,
@@ -920,7 +1071,7 @@ impl<'a> KotlinNameResolver<'a> {
                 // declaration: a file whose declarations were dropped by parse
                 // recovery still has a package header, and the same-package tier
                 // of the ladder needs it.
-                package_name: kotlin_package_name(root, source),
+                package_components: kotlin_package_components(root, source),
                 imports: graph
                     .imports
                     .map(|provider| provider.import_info_of(token, file))
@@ -946,7 +1097,14 @@ impl<'a> KotlinNameResolver<'a> {
             graph,
             file: unit.source(),
             facts: KotlinFileFacts {
-                package_name: unit.package_name().to_string(),
+                package_components: unit
+                    .fq()
+                    .segments()
+                    .iter()
+                    .map(|segment| segment_interner().resolve(*segment))
+                    .take_while(|(_, kind)| *kind == SegmentKind::Package)
+                    .map(|(text, _)| text.to_string())
+                    .collect(),
                 imports: graph
                     .imports
                     .map(|provider| provider.import_info_of(token, unit.source()))
@@ -966,10 +1124,6 @@ impl<'a> KotlinNameResolver<'a> {
     /// pick one arbitrarily or fail closed, and failing closed would report zero
     /// usages for every duplicated type in a monorepo. Java's usage graph reports
     /// both copies for exactly this reason.
-    pub fn resolve_type_fqn(&self, spelled: &str, byte: usize) -> Option<String> {
-        self.resolve_type_name(spelled, byte).resolved()
-    }
-
     /// The fully-qualified name the *callable or property* `spelled` at `byte`
     /// denotes when it is named without a receiver.
     ///
@@ -980,64 +1134,7 @@ impl<'a> KotlinNameResolver<'a> {
     /// value question with the type predicate would resolve a bare call to a
     /// class. The *ladder* is the same — Kotlin's precedence rules do not change
     /// between namespaces — so only the predicate differs.
-    pub fn resolve_callable_fqn(&self, spelled: &str, byte: usize) -> Option<String> {
-        let owners = self.scope_owners_at(byte);
-        let scope = KotlinNameScope {
-            package_name: &self.facts.package_name,
-            imports: &self.facts.imports,
-            scope_owners: owners,
-        };
-        resolve_kotlin_type_name(spelled, &scope, |candidate| self.callable_exists(candidate))
-            .resolved()
-    }
-
-    /// Whether any language in the workspace indexes a callable or property
-    /// named `fqn`.
-    ///
-    /// Synthetic units are excluded: Kotlin's primary constructors are synthetic
-    /// `Owner.Owner` callables, and a bare name never reaches one — a
-    /// constructor is named through its type.
-    fn callable_exists(&self, fqn: &str) -> bool {
-        self.graph
-            .with_definitions(|definitions| definitions.fqn(fqn))
-            .iter()
-            .any(|unit| {
-                !unit.is_synthetic()
-                    && unit.fq_name() == fqn
-                    && (unit.is_function() || unit.is_field())
-            })
-    }
-
-    pub fn resolve_type_name(&self, spelled: &str, byte: usize) -> KotlinTypeName {
-        let owners = self.scope_owners_at(byte);
-        let scope = KotlinNameScope {
-            package_name: &self.facts.package_name,
-            imports: &self.facts.imports,
-            scope_owners: owners,
-        };
-        resolve_kotlin_type_name(spelled, &scope, |candidate| self.type_exists(candidate))
-    }
-
-    /// Whether any language in the workspace indexes a type named `fqn`.
-    ///
-    /// Kotlin type aliases count: a spelled name can resolve to one, and a
-    /// reference through an alias is a reference to the alias. Synthetic units do
-    /// not: Kotlin's primary constructors are synthetic `Owner.Owner` callables,
-    /// and no type reference names one.
-    fn type_exists(&self, fqn: &str) -> bool {
-        self.graph
-            .with_definitions(|definitions| definitions.fqn(fqn))
-            .iter()
-            .any(|unit| {
-                !unit.is_synthetic()
-                    && unit.fq_name() == fqn
-                    && (unit.is_class() || is_kotlin_type_alias(self.graph, unit))
-            })
-    }
-
-    /// Fully-qualified names of the declarations enclosing `byte`, innermost
-    /// first, plus the scopes they inherit.
-    fn scope_owners_at(&self, byte: usize) -> Vec<String> {
+    fn scope_owner_units_at(&self, byte: usize) -> Vec<CodeUnit> {
         if let Some((_, owners)) = self
             .owners_at
             .borrow()
@@ -1046,12 +1143,12 @@ impl<'a> KotlinNameResolver<'a> {
         {
             return owners.clone();
         }
-        let owners = self.compute_scope_owners_at(byte);
+        let owners = self.compute_scope_owner_units_at(byte);
         self.owners_at.borrow_mut().push((byte, owners.clone()));
         owners
     }
 
-    fn compute_scope_owners_at(&self, byte: usize) -> Vec<String> {
+    fn compute_scope_owner_units_at(&self, byte: usize) -> Vec<CodeUnit> {
         let Some(enclosing) = self.graph.index.enclosing_code_unit(
             self.file,
             &Range {
@@ -1067,9 +1164,11 @@ impl<'a> KotlinNameResolver<'a> {
         let mut lexical = Vec::new();
         let mut current = Some(enclosing);
         while let Some(unit) = current {
-            let fqn = unit.fq_name();
-            if !owners.contains(&fqn) {
-                owners.push(fqn.clone());
+            if !owners
+                .iter()
+                .any(|owner: &CodeUnit| owner.fq() == unit.fq())
+            {
+                owners.push(unit.clone());
                 lexical.push(unit.clone());
             }
             current = self.graph.index.parent_of(&unit);
@@ -1086,9 +1185,11 @@ impl<'a> KotlinNameResolver<'a> {
             let mut next = Vec::new();
             for unit in &frontier {
                 for ancestor in provider.get_direct_ancestors(unit) {
-                    let fqn = ancestor.fq_name();
-                    if !owners.contains(&fqn) {
-                        owners.push(fqn);
+                    if !owners
+                        .iter()
+                        .any(|owner: &CodeUnit| owner.fq() == ancestor.fq())
+                    {
+                        owners.push(ancestor.clone());
                         next.push(ancestor);
                     }
                 }

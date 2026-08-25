@@ -22,6 +22,7 @@ use brokk_bifrost_jvm::java::graph_support::{
     resolve_java_import_infos, resolve_java_type_name,
 };
 use brokk_bifrost_jvm::java::imports::non_static_import_path;
+use rayon::prelude::*;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +78,185 @@ impl ImportAnalysisProvider for JavaAnalyzer {
         self.memo_caches
             .referencing_files
             .insert(file.clone(), Arc::new(result.clone()));
+        result
+    }
+
+    fn referencing_files_of_targets(
+        &self,
+        targets: &HashSet<ProjectFile>,
+        candidates: &[ProjectFile],
+        cancellation: &crate::CancellationToken,
+    ) -> HashSet<ProjectFile> {
+        let _scope = crate::profiling::scope("JavaAnalyzer::referencing_files_of_targets");
+        if targets.is_empty() || candidates.is_empty() || cancellation.is_cancelled() {
+            return HashSet::default();
+        }
+
+        let candidate_set = candidates.iter().cloned().collect::<HashSet<_>>();
+        let mut result = HashSet::default();
+        let mut uncached_targets = HashSet::default();
+        for target in targets {
+            if let Some(cached) = self.memo_caches.referencing_files.get(target) {
+                result.extend(
+                    cached
+                        .iter()
+                        .filter(|candidate| candidate_set.contains(*candidate))
+                        .cloned(),
+                );
+            } else {
+                uncached_targets.insert(target.clone());
+            }
+        }
+        if uncached_targets.is_empty() {
+            return result;
+        }
+
+        // The cheap half of Java reverse-import resolution is exact and fully
+        // structured: an explicit import path must equal a class FQN, while a
+        // wildcard path must equal its package. Only candidates that pass one
+        // of those tests pay the existing resolver to settle shadowing and
+        // duplicate-name precedence. This is the seed-directed distinction:
+        // unrelated workspace files never perform definition lookup.
+        let mut exact_targets = HashSet::default();
+        let mut wildcard_targets = HashSet::default();
+        let mut explicit_import_segments = HashSet::default();
+        let mut wildcard_import_segments = HashSet::default();
+        let mut same_package_targets: HashMap<String, HashMap<String, HashSet<ProjectFile>>> =
+            HashMap::default();
+        for target in &uncached_targets {
+            for declaration in self.get_declarations(target) {
+                if !declaration.is_class() {
+                    continue;
+                }
+                exact_targets.insert(declaration.fq_name());
+                wildcard_targets.insert(declaration.package_name().to_string());
+                explicit_import_segments.insert(declaration.terminal_name().to_string());
+                if let Some(segment) = declaration.package_terminal_name() {
+                    wildcard_import_segments.insert(segment.to_string());
+                }
+            }
+            let package = java_package_name_of(self, target).unwrap_or_default();
+            for declaration in self.top_level_declarations(target) {
+                if declaration.is_class() || declaration.is_module() {
+                    same_package_targets
+                        .entry(package.clone())
+                        .or_default()
+                        .entry(declaration.terminal_name().to_string())
+                        .or_default()
+                        .insert(target.clone());
+                }
+            }
+        }
+
+        let same_package_identifiers = same_package_targets
+            .values()
+            .flat_map(HashMap::keys)
+            .cloned()
+            .collect::<HashSet<_>>();
+        let plausible = self.inner.reverse_reference_candidates(
+            candidates.iter().cloned(),
+            &explicit_import_segments,
+            &wildcard_import_segments,
+            &same_package_identifiers,
+            cancellation,
+        );
+        if cancellation.is_cancelled() {
+            return HashSet::default();
+        }
+        let plausible = plausible.into_iter().collect::<Vec<_>>();
+
+        // The indexed lookup above is only a superset filter. Hydrate the
+        // surviving files and retain the complete structured-path and Java
+        // precedence checks below for the exact result.
+        let Some(imports_by_file) = self.import_infos_for_files(&plausible) else {
+            return result;
+        };
+        if cancellation.is_cancelled() {
+            return HashSet::default();
+        }
+        let same_packages: HashSet<String> = same_package_targets.keys().cloned().collect();
+        let identifiers_by_file = self.inner.bulk_type_identifiers(
+            plausible
+                .iter()
+                .filter(|candidate| {
+                    java_package_name_of(self, candidate)
+                        .is_some_and(|package| same_packages.contains(&package))
+                })
+                .cloned(),
+        );
+        let target_set = &uncached_targets;
+
+        let matches = plausible
+            .par_iter()
+            .filter_map(|candidate| {
+                if cancellation.is_cancelled() {
+                    return None;
+                }
+                let imports = imports_by_file.get(candidate)?;
+                let package = java_package_name_of(self, candidate).unwrap_or_default();
+                let mut matched = HashSet::default();
+
+                if let Some(identifiers) = identifiers_by_file.get(candidate) {
+                    let targets_by_identifier = same_package_targets
+                        .get(&package)
+                        .expect("bulk type identifiers were restricted to seed packages");
+                    for identifier in identifiers {
+                        if let Some(matching_targets) = targets_by_identifier.get(identifier) {
+                            matched.extend(matching_targets.iter().cloned());
+                        }
+                    }
+                }
+
+                let could_resolve_to_target = imports.iter().any(|import| {
+                    let Some(path) = non_static_import_path(import) else {
+                        return false;
+                    };
+                    let path = path.render_segments(".");
+                    if import.is_wildcard {
+                        wildcard_targets.contains(&path)
+                    } else {
+                        exact_targets.contains(&path)
+                    }
+                });
+                if could_resolve_to_target {
+                    let resolved = self
+                        .imported_code_units_from_infos(candidate, imports)
+                        .expect("Java resolves already-loaded import facts");
+                    matched.extend(
+                        resolved
+                            .iter()
+                            .map(CodeUnit::source)
+                            .filter(|source| target_set.contains(*source))
+                            .cloned(),
+                    );
+                }
+
+                (!matched.is_empty()).then_some((candidate.clone(), matched))
+            })
+            .collect::<Vec<_>>();
+
+        if cancellation.is_cancelled() {
+            return HashSet::default();
+        }
+        let mut computed: HashMap<ProjectFile, HashSet<ProjectFile>> = uncached_targets
+            .iter()
+            .cloned()
+            .map(|target| (target, HashSet::default()))
+            .collect();
+        for (candidate, matched_targets) in matches {
+            for target in matched_targets {
+                computed
+                    .get_mut(&target)
+                    .expect("matched Java target came from the requested set")
+                    .insert(candidate.clone());
+            }
+        }
+        for (target, referencing) in computed {
+            result.extend(referencing.iter().cloned());
+            self.memo_caches
+                .referencing_files
+                .insert(target, Arc::new(referencing));
+        }
         result
     }
 

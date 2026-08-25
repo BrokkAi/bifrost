@@ -30,13 +30,36 @@ use crate::analyzer::{
 };
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_core::analyzer::fq_name::{
+    FqName, SegmentKind, joined_segments, segment_interner,
+};
 use std::any::Any;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LocalDeclarationVisibility {
     Lexical,
     Hoisted,
+}
+
+/// Interpret one already-extracted package spelling through the registered
+/// language separator and preserve path packages as path segments.
+pub(crate) fn package_fq_name(language: Language, package: &str) -> FqName {
+    let separator = language_support(language)
+        .expect("every indexed language has registered support")
+        .package_separator();
+    let kind = if language == Language::Go {
+        SegmentKind::Path
+    } else {
+        SegmentKind::Package
+    };
+    let interner = segment_interner();
+    let mut name = FqName::new();
+    for segment in joined_segments(package, separator) {
+        name.push(interner.intern(segment, kind));
+    }
+    name
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -56,6 +79,18 @@ pub(crate) trait LanguageSupport: Send + Sync {
     /// own it rather than asking the pass. A pass shared by several languages (JS/TS)
     /// requires those languages to agree here, which [`edge_passes`] asserts.
     fn ecosystem(&self) -> UsageEcosystem;
+
+    /// Return a language-owned transitive reverse-import answer for candidate
+    /// discovery. `None` leaves the framework's generic importer walk in
+    /// charge; `Some` is complete for this language and replaces that walk.
+    fn transitive_referencing_files(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+        _seed_files: &BTreeSet<ProjectFile>,
+        _cancellation: Option<&CancellationToken>,
+    ) -> Option<HashSet<ProjectFile>> {
+        None
+    }
 
     /// Graph-backed usage strategy driving the `UsageFinder` query path.
     fn usage_strategy(&self) -> &'static dyn GraphUsageAnalyzer;
@@ -91,6 +126,26 @@ pub(crate) trait LanguageSupport: Send + Sync {
         None
     }
 
+    /// Whether `spelling`, read in `file`, resolves through this language's
+    /// external declaration surface to a member proven both static and a
+    /// compile-time constant (#2538).
+    ///
+    /// The workspace oracle uses this to discharge a `FieldMemory` gap for a
+    /// read of an external constant: such a read cannot observe or produce a
+    /// heap effect the gap would otherwise have to keep open. The default is
+    /// `false` -- a language without a modeled external declaration surface,
+    /// or whose analyzer is absent from this workspace, leaves the gap
+    /// standing. An implementation must answer `true` only from proven
+    /// declaration evidence, never from the spelling's shape.
+    fn external_compile_time_constant_member(
+        &self,
+        _analyzer: &dyn IAnalyzer,
+        _file: &ProjectFile,
+        _spelling: &str,
+    ) -> bool {
+        false
+    }
+
     /// Rendered signatures this language's analyzer holds for `unit`, visiting at most
     /// `limit` rows. `None` means the workspace does not analyze this language, or the
     /// language keeps no direct signature projection.
@@ -116,6 +171,19 @@ pub(crate) trait LanguageSupport: Send + Sync {
     /// Separator between a package name and its parent. Only Go and C++ differ from the
     /// dotted default.
     fn package_separator(&self) -> &'static str {
+        "."
+    }
+
+    /// The separator this language writes between the segments of a qualified callee
+    /// path *in source*: `java.net.URLDecoder.decode` against `std::str::from_utf8`.
+    /// Only Rust differs from the dotted default so far (#2596); C++ writes `::` too,
+    /// but its external-callee identity has not been reviewed for this route.
+    ///
+    /// This decides only how the spelling is cut. The canonical owner published from
+    /// it is always dot-joined, because that is how authored procedure-summary symbols
+    /// are indexed; see
+    /// [`crate::analyzer::semantic::split_canonical_qualified_callee`].
+    fn qualified_call_separator(&self) -> &'static str {
         "."
     }
 
@@ -165,6 +233,46 @@ pub(crate) trait LanguageSupport: Send + Sync {
         _analyzer: &dyn IAnalyzer,
         _file: &ProjectFile,
         _callee_text: &str,
+    ) -> Option<String> {
+        None
+    }
+
+    /// Whether this language's external surface is reached through owners that
+    /// carry only one segment (#2598).
+    ///
+    /// The dot in `java.net.URLDecoder.decode` is the proxy the unmaterialized
+    /// external route was born with: an owner that already spells its own
+    /// qualification needs no import or type resolution to name an identity.
+    /// That proxy holds for Java and Rust and fails outright for JavaScript and
+    /// TypeScript, whose entire standard surface is `JSON.parse`,
+    /// `Buffer.from`, `crypto.randomUUID` and `path.join` -- every one of them
+    /// a single segment.
+    ///
+    /// Saying `true` here does not admit every single-segment owner. It states
+    /// that such an owner *can* be an identity in this language, so the
+    /// classification stage consults
+    /// [`Self::single_segment_external_owner`] to decide each one.
+    fn publishes_single_segment_external_owners(&self) -> bool {
+        false
+    }
+
+    /// The canonical owner a single-segment external callee publishes, or
+    /// `None` when this owner names no external identity at all (#2598).
+    ///
+    /// Called only when [`Self::publishes_single_segment_external_owners`] is
+    /// true and only after the callee has already failed to resolve, so the
+    /// question is never "what does this name mean" but "does anything in this
+    /// file already answer that". A language answers it from its own binding
+    /// structure; there is no shared rule, because what may legally shadow a
+    /// runtime global differs by language.
+    ///
+    /// Returning a *different* owner than `owner` is how a module binding
+    /// publishes its module's identity rather than the local name a file
+    /// happened to give it.
+    fn single_segment_external_owner(
+        &self,
+        _owner: &str,
+        _site: &ExternalCalleeSite<'_>,
     ) -> Option<String> {
         None
     }
@@ -447,8 +555,7 @@ pub(crate) fn edge_passes() -> Vec<EdgePassEntry> {
 /// precise per-symbol scan; `bulk` is a whole-workspace edge build a bucket of candidates
 /// is proven against at once. Absence is not "unimplemented" and is deliberately silent:
 /// Python and C++ have no per-symbol strategy because their candidates are always proven
-/// in bulk, Kotlin has no bulk proof because every Kotlin candidate takes the per-symbol
-/// path, and a candidate that reaches a path its language does not serve is skipped as
+/// in bulk, and a candidate that reaches a path its language does not serve is skipped as
 /// inconclusive.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct DeadCodeSupport {
@@ -472,6 +579,15 @@ pub(crate) trait DeadCodeBulkProof: Send + Sync {
 
     /// Whether `candidate` must take the per-symbol precise path instead of this proof.
     fn needs_precise_scan(&self, routing: DeadCodeRouting<'_>) -> bool;
+
+    /// Whether a precise candidate may take the conservative report-local inbound
+    /// preflight. This is restricted to a language whose precise overload scan
+    /// cannot complete within the report budget and whose inbound graph is used
+    /// only to establish inconclusive evidence. Other precise-path reasons and
+    /// languages stay on their precise route.
+    fn supports_precise_inbound_preflight(&self, _routing: DeadCodeRouting<'_>) -> bool {
+        false
+    }
 
     /// Whole-workspace facts this proof memoizes across the candidates of one report.
     /// The default serves proofs whose routing decision needs none.
@@ -563,6 +679,30 @@ pub(crate) fn overloaded_function_fqns(
         .collect()
 }
 
+/// Whether one exact FQN has multiple non-synthetic function definitions in `language`.
+///
+/// Unlike [`overloaded_function_fqns`], this is candidate-local: the definition index is
+/// queried for the requested name instead of scanning every declaration in the workspace.
+/// That distinction matters when an FQN-keyed bulk graph is used to decide whether a
+/// precise overload scan is required.
+pub(crate) fn fqn_has_multiple_function_definitions(
+    analyzer: &dyn IAnalyzer,
+    language: Language,
+    fqn: &str,
+) -> bool {
+    analyzer
+        .get_definitions(fqn)
+        .into_iter()
+        .filter(|definition| {
+            language_for_target(definition) == language
+                && !definition.is_synthetic()
+                && definition.is_function()
+        })
+        .take(2)
+        .count()
+        > 1
+}
+
 /// The pair of bounded resolvers a structural receiver query needs. One trait rather than
 /// two independent capabilities: a language that can answer one and not the other would
 /// leave the receiver query with half an implementation part-way through a report.
@@ -625,6 +765,21 @@ pub(crate) struct CandidateCtx<'a> {
     pub(crate) analyzer: &'a dyn IAnalyzer,
     pub(crate) target: &'a CodeUnit,
     pub(crate) cancellation: &'a CancellationToken,
+}
+
+/// The file-scoped evidence [`LanguageSupport::single_segment_external_owner`]
+/// may consult about one call site (#2598).
+///
+/// The classification stage already parsed the file to find the call, so the
+/// tree and the exact source it was parsed from are handed over rather than
+/// re-derived. `callee_start_byte` is the offset of the callee reference
+/// itself, which is what a lexically scoped binding question has to be asked
+/// at: the same name can be a parameter in one body and a free global three
+/// lines later.
+pub(crate) struct ExternalCalleeSite<'a> {
+    pub(crate) source: &'a str,
+    pub(crate) tree: &'a tree_sitter::Tree,
+    pub(crate) callee_start_byte: usize,
 }
 
 /// Extra candidate files for one query target, split by how the query's budgets treat them.
@@ -722,6 +877,22 @@ pub(crate) fn language_support(language: Language) -> Option<&'static dyn Langua
     support
 }
 
+/// Every build ecosystem that can derive project topology (#2448), in a stable
+/// order.
+///
+/// Assembly, like `language_support` above: a provider knows one build model
+/// and nothing outside its own module dispatches over build ecosystems. The
+/// registry is keyed by ecosystem rather than by [`Language`] because one
+/// build model serves several languages -- Java, Kotlin, and Scala share the
+/// Maven reactor -- and because a workspace can carry build metadata for a
+/// language it has no sources in yet.
+pub(crate) fn build_model_providers()
+-> &'static [&'static dyn crate::analyzer::topology::BuildModelProvider] {
+    const PROVIDERS: &[&dyn crate::analyzer::topology::BuildModelProvider] =
+        &[&crate::analyzer::jvm::topology::JVM_BUILD_MODEL];
+    PROVIDERS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -770,8 +941,9 @@ mod tests {
     ///
     /// Absences the table records rather than merely permits, each a real user-visible
     /// behavior: C++ and Python have no per-symbol dead-code strategy because their
-    /// candidates are always proven in bulk, and Kotlin has no bulk proof because every
-    /// Kotlin candidate takes the per-symbol path; Java and JS/TS answer no structural
+    /// candidates are always proven in bulk; Kotlin now uses a bulk proof for classes and
+    /// callable declarations while fields and duplicate-FQN functions stay precise; Java and
+    /// JS/TS answer no structural
     /// receiver because their receiver analysis runs another route entirely (a resolution
     /// session, and the JS/TS syntax index reached through `facts`).
     ///
@@ -802,7 +974,7 @@ Php        | Php                  | Php    | .   | yes      | Php    | yes  | - 
 Scala      | Jvm                  | Scala  | .   | yes      | Scala  | yes  | -     | yes
 CSharp     | CSharp               | CSharp | .   | yes      | CSharp | yes  | -     | yes
 Ruby       | Ruby                 | Ruby   | .   | yes      | Ruby   | yes  | -     | yes
-Kotlin     | Jvm                  | Kotlin | .   | yes      | -      | yes  | -     | yes
+Kotlin     | Jvm                  | Kotlin | .   | yes      | Kotlin | yes  | -     | yes
 ";
 
     fn mark(present: bool) -> &'static str {

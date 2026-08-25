@@ -8,9 +8,9 @@ use crate::hash::{HashMap, HashSet};
 
 use super::super::capabilities::SemanticCapabilities;
 use super::super::ids::{
-    AllocationId, BlockId, CallSiteId, CaptureId, ControlEdgeId, EvidenceId, MemoryLocationId,
-    ProcedureId, ProgramPointId, SemanticArtifactKey, SemanticGapId, SemanticLocator,
-    SourceMappingId, ValueId,
+    AllocationId, BlockId, CallSiteId, CaptureId, ControlEdgeId, EvidenceId, GuardId,
+    MemoryLocationId, ProcedureId, ProgramPointId, SemanticArtifactKey, SemanticGapId,
+    SemanticLocator, SourceMappingId, ValueId,
 };
 use super::super::provider::{SemanticBudget, SemanticBudgetExceeded, SemanticWork};
 use super::model::*;
@@ -439,6 +439,42 @@ fn control_edge_sort_key(
         edge.evidence,
     )
 }
+/// One normalized decision-point condition, frozen against its own procedure.
+///
+/// This is [`GuardFactParts`] after the canonical control-edge table exists:
+/// each declared arm is resolved to the [`ControlEdgeId`] a `control_edge` row
+/// publishes, so a consumer joins a guard to its successors by id equality. An
+/// arm stays `None` when the lowerer emitted no edge for it, which is the
+/// ordinary shape of a folded constant condition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GuardFact {
+    pub id: GuardId,
+    pub point: ProgramPointId,
+    pub subject: Option<ValueId>,
+    pub predicate: GuardPredicate,
+    pub true_edge: Option<ControlEdgeId>,
+    pub false_edge: Option<ControlEdgeId>,
+    pub source: SourceMappingId,
+    pub evidence: EvidenceId,
+}
+
+impl GuardFact {
+    /// The arm the predicate proves cannot execute, when it proves one.
+    ///
+    /// A constant-true condition never takes its false arm and a constant-false
+    /// one never takes its true arm. The answer is `None` both when the
+    /// predicate proves no constant and when the infeasible arm carries no edge
+    /// because lowering already folded it away -- in the second case there is
+    /// nothing left to exclude.
+    pub const fn infeasible_edge(&self) -> Option<ControlEdgeId> {
+        match self.predicate.constant_value() {
+            Some(true) => self.false_edge,
+            Some(false) => self.true_edge,
+            None => None,
+        }
+    }
+}
+
 /// One validated executable body.
 #[derive(Debug, Clone)]
 pub struct ProcedureSemantics {
@@ -465,6 +501,7 @@ pub struct ProcedureSemantics {
     gaps: Box<[SemanticGap]>,
     blocks: Box<[BasicBlock]>,
     points: Box<[ProgramPoint]>,
+    guard_facts: Box<[GuardFact]>,
     cfg: ControlFlowGraph,
     entry_point: ProgramPointId,
     normal_exit_point: ProgramPointId,
@@ -480,6 +517,7 @@ impl ProcedureSemantics {
     ) -> Result<Self, SemanticIrError> {
         let cfg =
             ControlFlowGraph::try_from_edges(parts.id, parts.points.len(), parts.control_edges)?;
+        let guard_facts = freeze_guard_facts(&cfg, &parts.guard_facts);
         let (call_phase_points, call_result_sites) = index_call_phases(&parts.call_sites);
         let value_identity_ordinals =
             duplicate_value_ordinals(&parts.values, &parts.source_mappings);
@@ -504,6 +542,7 @@ impl ProcedureSemantics {
             gaps: parts.gaps.into_boxed_slice(),
             blocks: parts.blocks.into_boxed_slice(),
             points: parts.points.into_boxed_slice(),
+            guard_facts,
             cfg,
             entry_point,
             normal_exit_point,
@@ -628,6 +667,22 @@ impl ProcedureSemantics {
         &self.points
     }
 
+    /// Every normalized decision-point condition this procedure's lowerer could
+    /// state, in dense id order (issue #2443).
+    ///
+    /// An empty table means one of two different things, and the adapter's
+    /// [`crate::analyzer::semantic::capabilities::SemanticCapability::GuardFacts`]
+    /// entry is what distinguishes them: `Unsupported` means the language
+    /// publishes no guard facts at all, while an available capability means
+    /// this procedure genuinely has no normalizable decision.
+    pub fn guard_facts(&self) -> &[GuardFact] {
+        &self.guard_facts
+    }
+
+    pub fn guard_fact(&self, id: GuardId) -> Option<&GuardFact> {
+        self.guard_facts.get(id.index())
+    }
+
     pub fn cfg(&self) -> &ControlFlowGraph {
         &self.cfg
     }
@@ -722,6 +777,36 @@ impl ProcedureSemantics {
     pub fn point(&self, id: ProgramPointId) -> Option<&ProgramPoint> {
         self.points.get(id.index())
     }
+}
+
+/// Resolve every declared guard arm against the canonical control-edge table.
+///
+/// The lowerer names an arm by destination and edge kind because edge IDs only
+/// exist once the table is sorted. Validation has already proved that a
+/// declared arm names an edge leaving the guard's own point, so the lookup is a
+/// scan of that point's outgoing row -- at most a handful of edges -- and never
+/// fails for a declared arm.
+fn freeze_guard_facts(cfg: &ControlFlowGraph, parts: &[GuardFactParts]) -> Box<[GuardFact]> {
+    let resolve = |point: ProgramPointId, arm: Option<GuardArm>| {
+        let arm = arm?;
+        cfg.successor_edges(point)
+            .find(|(_, edge)| edge.target_point == arm.target_point && edge.kind == arm.kind)
+            .map(|(id, _)| id)
+    };
+    parts
+        .iter()
+        .map(|guard| GuardFact {
+            id: guard.id,
+            point: guard.point,
+            subject: guard.subject,
+            predicate: guard.predicate,
+            true_edge: resolve(guard.point, guard.true_arm),
+            false_edge: resolve(guard.point, guard.false_arm),
+            source: guard.source,
+            evidence: guard.evidence,
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
 }
 
 fn duplicate_value_ordinals(

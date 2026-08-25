@@ -1584,7 +1584,7 @@ fn evaluate_explanation_at_site(
 ) {
     let path = Path::new(&site.path);
     let provider_file = analyzer
-        .structural_search_providers()
+        .structural_fact_providers()
         .into_iter()
         .filter(|provider| provider.structural_language().config_label() == shard.manifest.language)
         .find_map(|provider| {
@@ -1843,7 +1843,7 @@ pub fn scan_unmapped_semantic_model_sites(
     };
     let active_rules = unique_active_rules(active);
     let provider_files = analyzer
-        .structural_search_providers()
+        .structural_fact_providers()
         .into_iter()
         .map(|provider| {
             let mut files = provider.structural_files();
@@ -2204,7 +2204,7 @@ fn generated_overlay_facts(
     let active_rules = unique_active_rules(active);
 
     let provider_files = analyzer
-        .structural_search_providers()
+        .structural_fact_providers()
         .into_iter()
         .map(|provider| {
             let mut files = provider.structural_files();

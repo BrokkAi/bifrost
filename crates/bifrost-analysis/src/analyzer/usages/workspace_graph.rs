@@ -73,7 +73,7 @@ pub(crate) struct WorkspaceUsageNodeKey {
 }
 
 impl WorkspaceUsageNodeKey {
-    fn for_declaration(unit: &CodeUnit) -> Self {
+    pub(crate) fn for_declaration(unit: &CodeUnit) -> Self {
         let ecosystem = UsageEcosystem::of(language_for_target(unit));
         Self {
             ecosystem,
@@ -145,24 +145,14 @@ impl WorkspaceUsageCatalog {
         analyzer: &dyn IAnalyzer,
         cancellation: &CancellationToken,
     ) -> Option<Self> {
-        let mut declarations: BTreeMap<WorkspaceUsageNodeKey, Vec<(CodeUnit, Option<Range>)>> =
-            BTreeMap::new();
+        let mut declarations = Vec::new();
         for (unit, range) in analyzer.all_declarations_with_primary_ranges() {
             if cancellation.is_cancelled() {
                 return None;
             }
-            let is_java_module_descriptor_scope = unit.is_file_scope()
-                && language_for_target(&unit) == Language::Java
-                && unit.source().rel_path().file_name() == Some(OsStr::new("module-info.java"));
-            if (unit.is_synthetic() && !is_java_module_descriptor_scope)
-                || !(unit.is_class() || unit.is_callable() || is_java_module_descriptor_scope)
-            {
-                continue;
+            if is_graph_declaration(&unit) {
+                declarations.push((unit, range));
             }
-            declarations
-                .entry(WorkspaceUsageNodeKey::for_declaration(&unit))
-                .or_default()
-                .push((unit, range));
         }
 
         // The public declaration inventory intentionally excludes synthetic
@@ -183,16 +173,82 @@ impl WorkspaceUsageCatalog {
                 .ranges(&file_scope)
                 .into_iter()
                 .min_by_key(|range| (range.start_line, range.start_byte));
-            declarations
-                .entry(WorkspaceUsageNodeKey::for_declaration(&file_scope))
-                .or_default()
-                .push((file_scope, range));
+            declarations.push((file_scope, range));
         }
 
-        let mut nodes = Vec::with_capacity(declarations.len());
+        Self::from_declarations(declarations, cancellation)
+    }
+
+    /// Build a graph-node catalog from only `files`, using one persisted summary
+    /// projection per file. This is the rooted `usage_graph` path: it must not
+    /// enumerate every declaration in a long-lived workspace cache before it can
+    /// answer a handful of changed-file roots.
+    pub(crate) fn build_for_files(analyzer: &dyn IAnalyzer, files: &[ProjectFile]) -> Self {
+        let mut declarations = Vec::new();
+        for file in files {
+            if let Some(projection) = analyzer.summary_file_projection(file) {
+                let mut stack = projection.top_level_declarations.clone();
+                let mut seen = HashSet::default();
+                while let Some(unit) = stack.pop() {
+                    if !seen.insert(unit.clone()) {
+                        continue;
+                    }
+                    if let Some(children) = projection.children.get(&unit) {
+                        stack.extend(children.iter().cloned());
+                    }
+                    if is_graph_declaration(&unit) {
+                        declarations.push((
+                            unit.clone(),
+                            projection
+                                .ranges
+                                .get(&unit)
+                                .and_then(|ranges| primary_range(ranges)),
+                        ));
+                    }
+                }
+            } else {
+                for unit in analyzer.declarations(file) {
+                    if is_graph_declaration(&unit) {
+                        let range = analyzer.ranges(&unit).into_iter().min_by_key(range_key);
+                        declarations.push((unit, range));
+                    }
+                }
+            }
+            if is_java_module_descriptor_file(file) {
+                let file_scope = CodeUnit::file_scope(file.clone());
+                let range = analyzer
+                    .ranges(&file_scope)
+                    .into_iter()
+                    .min_by_key(range_key);
+                declarations.push((file_scope, range));
+            }
+        }
+        Self::from_declarations(declarations, &CancellationToken::default())
+            .expect("uncancelled rooted workspace usage catalog construction")
+    }
+
+    pub(crate) fn from_declarations(
+        declarations: Vec<(CodeUnit, Option<Range>)>,
+        cancellation: &CancellationToken,
+    ) -> Option<Self> {
+        let mut grouped: BTreeMap<WorkspaceUsageNodeKey, Vec<(CodeUnit, Option<Range>)>> =
+            BTreeMap::new();
+        for (unit, range) in declarations {
+            if cancellation.is_cancelled() {
+                return None;
+            }
+            if is_graph_declaration(&unit) {
+                grouped
+                    .entry(WorkspaceUsageNodeKey::for_declaration(&unit))
+                    .or_default()
+                    .push((unit, range));
+            }
+        }
+
+        let mut nodes = Vec::with_capacity(grouped.len());
         let mut indices = HashMap::default();
         let mut fqns_by_ecosystem: HashMap<UsageEcosystem, HashSet<String>> = HashMap::default();
-        for (key, mut declarations) in declarations {
+        for (key, mut declarations) in grouped {
             if cancellation.is_cancelled() {
                 return None;
             }
@@ -288,6 +344,22 @@ impl WorkspaceUsageCatalog {
     fn index_of(&self, key: &WorkspaceUsageNodeKey) -> Option<usize> {
         self.indices.get(key).copied()
     }
+}
+
+fn primary_range(ranges: &[Range]) -> Option<Range> {
+    ranges.iter().copied().min_by_key(range_key)
+}
+
+fn range_key(range: &Range) -> (usize, usize) {
+    (range.start_line, range.start_byte)
+}
+
+pub(crate) fn is_graph_declaration(unit: &CodeUnit) -> bool {
+    let is_java_module_descriptor_scope = unit.is_file_scope()
+        && language_for_target(unit) == Language::Java
+        && unit.source().rel_path().file_name() == Some(OsStr::new("module-info.java"));
+    (!unit.is_synthetic() || is_java_module_descriptor_scope)
+        && (unit.is_class() || unit.is_callable() || is_java_module_descriptor_scope)
 }
 
 fn is_java_module_descriptor_file(file: &ProjectFile) -> bool {

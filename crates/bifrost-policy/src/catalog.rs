@@ -25,12 +25,12 @@ use super::definition::{
 use brokk_bifrost_analysis::analyzer::semantic::{
     WorkspaceRelativePath, WorkspaceRelativePathError,
 };
-use brokk_bifrost_analysis::analyzer::structural::{
+use brokk_bifrost_analysis::schema_version::SchemaVersionOrigin;
+use brokk_bifrost_analysis::workspace_document::{WorkspaceRoot, read_workspace_document};
+use brokk_bifrost_rql::structural::{
     CodeQuery, CodeQueryExecutionMode, CodeQueryResultDetail, DEFAULT_LIMIT,
     SCHEMA_VERSION as RQL_SCHEMA_VERSION,
 };
-use brokk_bifrost_analysis::schema_version::SchemaVersionOrigin;
-use brokk_bifrost_analysis::workspace_document::{WorkspaceRoot, read_workspace_document};
 
 pub const MAX_CATALOG_JSON_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_CATALOG_JSON_DEPTH: usize = 128;
@@ -1999,8 +1999,8 @@ pub(crate) fn phase_accepts_port(phase: EndpointObservationPhase, port: &PolicyP
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brokk_bifrost_analysis::analyzer::structural::CodeQuery;
     use brokk_bifrost_analysis::schema_version::{SchemaVersionOrigin, SchemaVersionResolution};
+    use brokk_bifrost_rql::structural::CodeQuery;
 
     fn selector(name: &str) -> PolicySelector {
         PolicySelector::Inline {

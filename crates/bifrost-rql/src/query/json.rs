@@ -1,10 +1,10 @@
 use super::ir::{
     ArityConstraint, BindingFilter, BindingSeed, CallInputSelector, CandidateFilter, CodeQuery,
-    CodeQueryPlan, CodeQueryPlanSource, CodeQuerySeed, DeclarationStateFilter, EdgeFilter,
-    ExportFilter, ExportSeed, FlowRelationFilter, GenerationSiteFilter, GenerationSiteSeed,
-    HierarchyTraversal, OccurrenceFilter, OccurrenceSeed, PathSeed, Pattern, QueryStep,
-    RewritePathFilter, ScopeFilter, ScopeSeed, StateEventFilter, StringPredicate,
-    UNATTRIBUTED_TIER_LABEL,
+    CodeQueryPlan, CodeQueryPlanSource, CodeQuerySeed, ControlRelationFilter,
+    DeclarationStateFilter, EdgeFilter, ExportFilter, ExportSeed, FlowRelationFilter,
+    GenerationSiteFilter, GenerationSiteSeed, HierarchyTraversal, OccurrenceFilter, OccurrenceSeed,
+    PathSeed, Pattern, QueryStep, RewritePathFilter, ScopeFilter, ScopeSeed, StateEventFilter,
+    StringPredicate, UNATTRIBUTED_TIER_LABEL,
 };
 use super::schema::{
     CallTraversalCompleteness, QueryStepField, reference_kind_label, usage_proof_label,
@@ -300,6 +300,37 @@ pub(super) fn flow_relation_filter_to_json(filter: &FlowRelationFilter) -> Map<S
                     .certainties
                     .iter()
                     .map(|certainty| json!(certainty.label()))
+                    .collect(),
+            ),
+        );
+    }
+    object
+}
+
+pub(super) fn control_relation_filter_to_json(
+    filter: &ControlRelationFilter,
+) -> Map<String, Value> {
+    let mut object = Map::new();
+    if !filter.relations.is_empty() {
+        object.insert(
+            QueryStepField::ControlRelations.label().to_string(),
+            Value::Array(
+                filter
+                    .relations
+                    .iter()
+                    .map(|relation| json!(relation.label()))
+                    .collect(),
+            ),
+        );
+    }
+    if !filter.exit_partitions.is_empty() {
+        object.insert(
+            QueryStepField::ControlExitPartitions.label().to_string(),
+            Value::Array(
+                filter
+                    .exit_partitions
+                    .iter()
+                    .map(|partition| json!(partition.label()))
                     .collect(),
             ),
         );
@@ -700,6 +731,10 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         | QueryStep::EdgeTarget
         | QueryStep::FlowSource
         | QueryStep::FlowTarget
+        | QueryStep::TargetOf
+        | QueryStep::SourceSetOf
+        | QueryStep::TopologyEdgesOf
+        | QueryStep::GuardsOf
         | QueryStep::SegmentTarget
         | QueryStep::ReceiverOutcome
         | QueryStep::ReceiverEvidence
@@ -730,6 +765,9 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         }
         QueryStep::FlowRelationsOf(filter) => {
             object.extend(flow_relation_filter_to_json(filter));
+        }
+        QueryStep::ControlRelations(filter) => {
+            object.extend(control_relation_filter_to_json(filter));
         }
         QueryStep::RewritePathsOf(filter) => {
             object.extend(rewrite_path_filter_to_json(filter));

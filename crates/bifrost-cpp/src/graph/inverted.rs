@@ -46,14 +46,14 @@ use crate::graph::resolver::{
     initialized_type_declaration_with_cast, is_cpp_template_argument_type_leaf,
     is_declaration_name, is_declarator_node, is_globally_qualified_cpp_name, is_nested_type_node,
     is_recovered_qualified_friend_class_type_reference, normalize_type_text,
-    out_of_line_destructor_type_reference, out_of_line_member_definition_owner,
-    parameter_belongs_to_callable_scope, qualified_alias_reference_preserves_target,
-    qualified_alias_reference_requires_terminal, qualified_owner_components,
-    recovered_macro_decorated_type_node, recovered_relational_template_member_call,
-    resolve_declaring_callable_owner, resolve_declaring_member_owner, same_logical_symbol,
-    same_visible_symbol, type_reference_hit_node,
+    out_of_line_member_definition_owner, parameter_belongs_to_callable_scope,
+    qualified_alias_reference_preserves_target, qualified_alias_reference_requires_terminal,
+    qualified_owner_components, recovered_macro_decorated_type_node,
+    recovered_relational_template_member_call, resolve_declaring_callable_owner,
+    resolve_declaring_member_owner, same_logical_symbol, same_visible_symbol,
+    type_reference_hit_node, unique_macro_replacement_type_candidate,
 };
-use crate::graph::syntax::qualified_callable_value;
+use crate::graph::syntax::{object_macro_replacement_type_references, qualified_callable_value};
 use brokk_bifrost_core::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
 use brokk_bifrost_core::analyzer::usages::common::same_node;
 use brokk_bifrost_core::analyzer::usages::inverted_edges::{
@@ -151,6 +151,16 @@ impl CppScan<'_> {
         );
     }
 
+    fn record_range(&mut self, callee: String, anchor: Node<'_>, start: usize, end: usize) {
+        self.edges.record_kind(
+            self.input,
+            callee,
+            classify_reference_node(anchor),
+            start,
+            end,
+        );
+    }
+
     fn record_unproven(&mut self, name: &str, node: Node<'_>) {
         self.edges
             .record_unproven_name(self.input, name, node.start_byte(), node.end_byte());
@@ -203,6 +213,15 @@ fn record_reference(
     ctx: &mut CppScan<'_>,
     bindings: &LocalInferenceEngine<CodeUnit>,
 ) {
+    if node.kind() == "preproc_arg" {
+        record_object_macro_replacement_type_references(node, ctx);
+    }
+    if node
+        .parent()
+        .is_some_and(|parent| parent.kind() == "destructor_name")
+    {
+        return;
+    }
     match ctx
         .visibility
         .resolve_ordinary_macro_reference(&ctx.analyzer, ctx.file, node, ctx.source)
@@ -275,13 +294,8 @@ fn record_reference(
             node,
         )
     {
-        let terminal_destructor = out_of_line_destructor_type_reference(node);
-        let innermost = owners.innermost().map(|(_, owner)| owner.clone());
         for (owner_node, owner) in owners.owners {
             ctx.record(owner.fq_name(), owner_node);
-        }
-        if let (Some(terminal), Some(owner)) = (terminal_destructor, innermost) {
-            ctx.record(owner.fq_name(), terminal);
         }
         return;
     }
@@ -335,13 +349,8 @@ fn record_reference(
                     ctx.source,
                     node,
                 ) {
-                    let terminal_destructor = out_of_line_destructor_type_reference(node);
-                    let innermost = owners.innermost().map(|(_, owner)| owner.clone());
                     for (owner_node, owner) in owners.owners {
                         ctx.record(owner.fq_name(), owner_node);
-                    }
-                    if let (Some(terminal), Some(owner)) = (terminal_destructor, innermost) {
-                        ctx.record(owner.fq_name(), terminal);
                     }
                 }
                 return;
@@ -399,6 +408,40 @@ fn record_reference(
         }
         "call_expression" => record_call(node, ctx, bindings),
         _ => {}
+    }
+}
+
+fn record_object_macro_replacement_type_references(node: Node<'_>, ctx: &mut CppScan<'_>) {
+    for reference in object_macro_replacement_type_references(node, ctx.source) {
+        for component_count in 1..=reference.components.len() {
+            let resolution = resolve_type_components_lexically_at(
+                node,
+                &reference.components[..component_count],
+                reference.global,
+                &ctx.analyzer,
+                ctx.visibility,
+                &ctx.ordinary_type_imports,
+                ctx.file,
+                ctx.source,
+            );
+            let unit = match resolution {
+                LexicalTypeResolution::Resolved { unit, .. } => unit,
+                LexicalTypeResolution::Missing => {
+                    let Some(unit) = unique_macro_replacement_type_candidate(
+                        &ctx.analyzer,
+                        ctx.visibility,
+                        ctx.file,
+                        &reference.components[..component_count],
+                    ) else {
+                        continue;
+                    };
+                    unit
+                }
+                LexicalTypeResolution::Ambiguous => continue,
+            };
+            let range = &reference.component_ranges[component_count - 1];
+            ctx.record_range(unit.fq_name(), node, range.start, range.end);
+        }
     }
 }
 

@@ -62,32 +62,87 @@ use crate::analyzer::usages::kotlin_graph::shared::{KotlinEdgeResolver, KotlinQu
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::{UsageAnalyzer, UsageQueryResolver, UsageScanScope};
-use crate::analyzer::{BoundedDefinitionLookup, CodeUnit, IAnalyzer, Language, ProjectFile};
+use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile};
 use crate::hash::HashSet;
 use brokk_bifrost_jvm::kotlin::graph::KotlinGraphSource;
+use brokk_bifrost_jvm::kotlin::graph::extractor::{ScanState, scan_file};
+use brokk_bifrost_jvm::kotlin::graph::resolver::TargetSpec;
 
 /// Run `visit` with the [`KotlinGraphSource`] built from the *dispatching*
 /// analyzer.
 ///
-/// A callback rather than a constructor because the definition-index accessor is
-/// itself a borrowed closure: `analyzer.global_usage_definition_index()` returns
-/// a handle that borrows the analyzer and merges one shard per delegate, and the
-/// Kotlin side takes it lazily so a scan that never reaches a realm-wide lookup
-/// never pays for the merge.
+/// A callback rather than a constructor because the request-local relational
+/// frontier is valid only while its owned graph computation is being evaluated.
 fn with_kotlin_graph_source<R>(
     analyzer: &dyn IAnalyzer,
-    visit: impl FnOnce(KotlinGraphSource<'_>) -> R,
+    mut visit: impl FnMut(KotlinGraphSource<'_>) -> R,
 ) -> R {
-    let definitions = |consume: &mut dyn FnMut(&dyn BoundedDefinitionLookup)| {
-        consume(&analyzer.global_usage_definition_index());
-    };
-    visit(KotlinGraphSource {
-        index: analyzer,
-        hierarchy: analyzer.type_hierarchy_provider(),
-        type_alias: analyzer.type_alias_provider(),
-        imports: analyzer.import_analysis_provider(),
-        definitions: &definitions,
+    let cancellation = crate::CancellationToken::new();
+    match crate::analyzer::relational_frontier::resolve_relational_frontier(
+        analyzer,
+        &cancellation,
+        |frontier| {
+            visit(KotlinGraphSource {
+                index: analyzer,
+                hierarchy: analyzer.type_hierarchy_provider(),
+                type_alias: analyzer.type_alias_provider(),
+                imports: analyzer.import_analysis_provider(),
+                relational_definitions: frontier,
+            })
+        },
+    ) {
+        crate::analyzer::RelationalFrontierOutcome::Complete(result) => result,
+        crate::analyzer::RelationalFrontierOutcome::Cancelled => {
+            unreachable!("an uncancelled Kotlin helper frontier cannot cancel")
+        }
+        crate::analyzer::RelationalFrontierOutcome::Failed(error) => {
+            panic!("Kotlin relational helper frontier failed: {error:?}")
+        }
+    }
+}
+
+pub(super) fn kotlin_target_spec_replayable(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    targets: &[CodeUnit],
+) -> Option<brokk_bifrost_jvm::kotlin::graph::resolver::TargetSpec> {
+    with_kotlin_graph_source(analyzer, |graph| {
+        brokk_bifrost_jvm::kotlin::graph::resolver::TargetSpec::from_targets(&graph, token, targets)
     })
+}
+
+pub(super) fn scan_kotlin_file_replayable(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+    spec: &TargetSpec,
+    state: &mut ScanState<'_>,
+) {
+    let initial_hits = state.hits.clone();
+    let initial_unproven_hits = state.unproven_hits.clone();
+    let initial_raw_match_count = *state.raw_match_count;
+    let initial_limit_exceeded = *state.limit_exceeded;
+    let max_usages = state.max_usages;
+    let (hits, unproven_hits, raw_match_count, limit_exceeded) =
+        with_kotlin_graph_source(analyzer, |graph| {
+            let mut hits = initial_hits.clone();
+            let mut unproven_hits = initial_unproven_hits.clone();
+            let mut raw_match_count = initial_raw_match_count;
+            let mut limit_exceeded = initial_limit_exceeded;
+            let mut provisional = ScanState {
+                max_usages,
+                hits: &mut hits,
+                unproven_hits: &mut unproven_hits,
+                raw_match_count: &mut raw_match_count,
+                limit_exceeded: &mut limit_exceeded,
+            };
+            scan_file(&graph, token, file, spec, &mut provisional);
+            (hits, unproven_hits, raw_match_count, limit_exceeded)
+        });
+    *state.hits = hits;
+    *state.unproven_hits = unproven_hits;
+    *state.raw_match_count = raw_match_count;
+    *state.limit_exceeded = limit_exceeded;
 }
 
 /// Whether `unit` is a Kotlin `companion object`.
@@ -103,6 +158,7 @@ pub(crate) fn is_companion_object(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> 
 }
 
 /// Every Kotlin `caller -> callee` edge whose callee is one of `nodes`.
+#[cfg(test)]
 pub(crate) fn build_kotlin_usage_edges<F>(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
@@ -114,6 +170,28 @@ where
 {
     let resolver = KotlinEdgeResolver::try_new(analyzer)?;
     Some(resolver.build_edges(analyzer, token, nodes, keep_file))
+}
+
+pub(crate) fn build_rooted_kotlin_usage_edges<F>(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    callers: &HashSet<String>,
+    keep_file: F,
+) -> Option<UsageEdges>
+where
+    F: Fn(&ProjectFile) -> bool + Sync,
+{
+    let resolver = KotlinEdgeResolver::try_new(analyzer)?;
+    Some(resolver.build_rooted_edges(analyzer, token, callers, keep_file))
+}
+
+pub(crate) fn build_inbound_kotlin_usage_edges(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    callees: &HashSet<String>,
+) -> Option<UsageEdges> {
+    let resolver = KotlinEdgeResolver::try_new(analyzer)?;
+    Some(resolver.build_inbound_edges(analyzer, token, callees, |_| true))
 }
 
 /// The same edge set as [`build_kotlin_usage_edges`], weighted by call site.
@@ -201,6 +279,69 @@ mod tests {
     use crate::analyzer::{AnalyzerQueryScope, QueryScope};
     use crate::analyzer::{KotlinAnalyzer, Project, TestProject};
     use std::sync::Arc;
+
+    #[test]
+    fn kotlin_forward_type_and_member_resolution_builds_no_global_definition_shard() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        ProjectFile::new(root.clone(), "Service.kt")
+            .write("package api\n\nclass Service { fun run() {} }\n")
+            .expect("write Kotlin service");
+        let consumer = ProjectFile::new(root.clone(), "Consumer.kt");
+        consumer
+            .write(
+                "package app\n\nimport api.*\n\n\
+                 class Consumer { fun call(service: Service) { service.run() } }\n",
+            )
+            .expect("write Kotlin fixture");
+        let analyzer = KotlinAnalyzer::new(Arc::new(TestProject::new(root, Language::Kotlin)));
+        let target = analyzer
+            .get_all_declarations()
+            .into_iter()
+            .find(|unit| unit.fq_name() == "api.Service.run")
+            .expect("fixture declares Service.run");
+        let candidates = HashSet::from_iter([consumer]);
+        let scan_scope = UsageScanScope::new(&candidates, true);
+
+        let outcome = KotlinUsageGraphStrategy::new()
+            .find_graph_usages(&analyzer, std::slice::from_ref(&target), &scan_scope, 100)
+            .into_fuzzy_result();
+
+        assert_eq!(outcome.all_hits_including_imports().len(), 1, "{outcome:?}");
+    }
+
+    #[test]
+    fn kotlin_inverted_type_and_member_resolution_uses_relational_lookup() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        ProjectFile::new(root.clone(), "Service.kt")
+            .write("package api\n\nclass Service { fun run() {} }\n")
+            .expect("write Kotlin service");
+        ProjectFile::new(root.clone(), "Consumer.kt")
+            .write(
+                "package app\n\nimport api.*\n\n\
+                 class Consumer { fun call(service: Service) { service.run() } }\n",
+            )
+            .expect("write Kotlin consumer");
+        let analyzer = KotlinAnalyzer::new(Arc::new(TestProject::new(root, Language::Kotlin)));
+        let nodes = analyzer
+            .get_all_declarations()
+            .into_iter()
+            .map(|unit| unit.fq_name())
+            .collect::<HashSet<_>>();
+        let scope = AnalyzerQueryScope::new(&analyzer);
+
+        let edges = build_kotlin_usage_edges(&analyzer, scope.token(), &nodes, |_| true)
+            .expect("Kotlin edge resolver should be available");
+
+        assert!(
+            edges.edges.keys().any(|(caller, callee)| {
+                caller == "app.Consumer.call" && callee == "api.Service.run"
+            }),
+            "typed receiver call must resolve through relational name and member questions: {:?}",
+            edges.edges.keys().collect::<Vec<_>>()
+        );
+    }
 
     /// A whole-workspace edge build reads every file's declarations in *bulk*,
     /// and never pulls a file through the per-file LRU more than once.

@@ -24,7 +24,6 @@ pub mod process;
 pub mod relevance;
 pub mod searchtools;
 pub mod searchtools_render;
-pub use brokk_bifrost_rql::sexp;
 pub mod summary;
 pub mod symbol_rename;
 #[cfg(test)]
@@ -36,28 +35,23 @@ pub use brokk_bifrost_core::{
     path_normalization, profiling, schema_version, text_utils, util,
 };
 
-pub use analyzer::structural::{
-    CodeQuery, CodeQueryExecutionLimits, CodeQueryExecutionMode, CodeQueryExplain,
-    CodeQueryProfile, CodeQueryResponse, execute_request, execute_request_with_cancellation,
-    execute_request_with_limits,
-};
 pub use analyzer::usages;
 pub use analyzer::{
-    AnalyzerConfig, AnalyzerDelegate, BIFROST_IGNORE_FILE_NAME, CSharpAnalyzer, CapabilityProvider,
-    CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit, CodeUnitIndex, CodeUnitType,
-    CppAnalyzer, DeclarationInfo, DeclarationKind, DependencyPackActivationOutcome,
-    DependencyPackEcosystem, DependencyPackEcosystemOutcome, DependencyPackWorkspaceContext,
-    DispatchHierarchyExpansion, EmptyAnalyzer, ExceptionHandlingAnalysis, ExceptionHandlingSmell,
-    ExceptionSmellWeights, FileSetProject, FilesystemProject, GoAnalyzer, IAnalyzer,
-    ImportAnalysisProvider, ImportInfo, ImportReachability, IngestedSource, JavaAnalyzer,
-    JavascriptAnalyzer, JvmAnalyzerConfig, JvmDependencyDiscoveryConfig,
-    JvmDependencyDiscoveryMode, JvmExternalArtifact, JvmExternalDependencies, JvmMavenCoordinate,
-    JvmStandardLibraryDiscoveryConfig, KotlinAnalyzer, Language, MultiAnalyzer, MultiRootProject,
-    OverlayProject, ParseError, ParseErrorKind, PhpAnalyzer, PhpAnalyzerConfig,
-    PhpDependencyApiEvidence, PhpDependencyPackAdapter, Project, ProjectFile, PythonAnalyzer,
-    PythonSemanticModelWorkspaceContext, Range, RubyAnalyzer, RubyAnalyzerConfig,
-    RubyDependencyApiEvidence, RubyDependencyPackAdapter, RubyGemApiArtifact, RustAnalyzer,
-    RustAnalyzerConfig, RustDependencyApiEvidence, RustDependencyPackAdapter,
+    AnalyzerConfig, AnalyzerDefinitionLookup, AnalyzerDelegate, BIFROST_IGNORE_FILE_NAME,
+    CSharpAnalyzer, CapabilityProvider, CloneSmell, CloneSmellWeights, CodeBaseMetrics, CodeUnit,
+    CodeUnitIndex, CodeUnitType, CppAnalyzer, DeclarationInfo, DeclarationKind,
+    DependencyPackActivationOutcome, DependencyPackEcosystem, DependencyPackEcosystemOutcome,
+    DependencyPackWorkspaceContext, DispatchHierarchyExpansion, EmptyAnalyzer,
+    ExceptionHandlingAnalysis, ExceptionHandlingSmell, ExceptionSmellWeights, FileSetProject,
+    FilesystemProject, GoAnalyzer, IAnalyzer, ImportAnalysisProvider, ImportInfo,
+    ImportReachability, IngestedSource, JavaAnalyzer, JavascriptAnalyzer, JvmAnalyzerConfig,
+    JvmDependencyDiscoveryConfig, JvmDependencyDiscoveryMode, JvmExternalArtifact,
+    JvmExternalDependencies, JvmMavenCoordinate, JvmStandardLibraryDiscoveryConfig, KotlinAnalyzer,
+    Language, MultiAnalyzer, MultiRootProject, OverlayProject, ParseError, ParseErrorKind,
+    PhpAnalyzer, PhpAnalyzerConfig, PhpDependencyApiEvidence, PhpDependencyPackAdapter, Project,
+    ProjectFile, PythonAnalyzer, PythonSemanticModelWorkspaceContext, Range, RubyAnalyzer,
+    RubyAnalyzerConfig, RubyDependencyApiEvidence, RubyDependencyPackAdapter, RubyGemApiArtifact,
+    RustAnalyzer, RustAnalyzerConfig, RustDependencyApiEvidence, RustDependencyPackAdapter,
     RustPackageApiArtifact, RustSelectedTarget, RustdocJsonPackProducer, ScalaAnalyzer,
     SourceContent, SourceIngestionError, SourceIngestionKind, TestAssertionAnalysis,
     TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TestProject,

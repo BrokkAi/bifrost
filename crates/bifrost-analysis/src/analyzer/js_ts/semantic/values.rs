@@ -84,9 +84,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     /// literal or a proven unshadowed built-in `Error` allocation.
     /// Allocation-rooted aliases are retained when their only uses are
     /// further aliases, direct throws, or non-`__proto__` member accesses
-    /// outside call-callee position. Any escape, rebind, subscript base,
-    /// shorthand property, or nested capture invalidates the whole allocation
-    /// root.
+    /// outside call-callee position. A rebind, subscript base, shorthand
+    /// property, nested capture, or any other unrecognized use invalidates the
+    /// whole allocation root.
+    ///
+    /// A plain whole-value call argument is the one use that neither proves
+    /// nor invalidates: it names no member, so it cannot retract the identity
+    /// of an access that already ran, and it hands the object to a callee, so
+    /// it records an `escapes_after` bound for the accesses that follow it.
     pub(super) fn collect_plain_object_locals(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -220,6 +225,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         // Occurrence scan over the full body, nested procedures included: a
         // capture invalidates the candidate exactly like a local escape does.
         let mut invalid_roots = HashSet::default();
+        let mut escapes: HashMap<ValueId, usize> = HashMap::default();
         let mut boundary_ends: Vec<usize> = Vec::new();
         try_walk_named_tree_preorder(body, true, |node| {
             if self.session.cancellation().is_cancelled() {
@@ -271,6 +277,20 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     })
                     .is_some()
             });
+            // A whole-value argument names no member of the allocation, so it
+            // leaves the object's member identity intact and must not open a
+            // member-resolution gap on the stores that already ran. It is
+            // still an escape: the callee holds the object and may install an
+            // accessor or a proxy on it, so it bounds every later access
+            // through `escapes_after` instead of invalidating the root.
+            let whole_value_argument = !inside_nested
+                && is_whole_value_call_argument(node)
+                && executes_once_within(node, candidate.declaration_parent);
+            if whole_value_argument {
+                let escape = escapes.entry(candidate.root).or_insert(node.start_byte());
+                *escape = (*escape).min(node.start_byte());
+                return Ok(WalkControl::Continue);
+            }
             let survives = !inside_nested
                 && (is_variable_binding_name(node)
                     || plain_member_base_use(source, node)
@@ -292,6 +312,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         root: candidate.root,
                         declaration_parent: candidate.declaration_parent,
                         available_after: candidate.available_after,
+                        escapes_after: escapes.get(&candidate.root).copied(),
                     },
                 )
             })
@@ -302,9 +323,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
 
     /// Identify local array-literal allocations whose indexed identity can be
     /// proved from this procedure alone. Only declaration aliases and
-    /// nonnegative decimal constant subscripts are retained. Every other
-    /// occurrence invalidates the allocation root, so a later constant access
-    /// cannot accidentally turn an incomplete heap path into a clean one.
+    /// nonnegative decimal constant subscripts are retained, plus the
+    /// whole-value call argument the plain-object scan admits on the same
+    /// terms. Every other occurrence invalidates the allocation root, so a
+    /// later constant access cannot accidentally turn an incomplete heap path
+    /// into a clean one.
     pub(super) fn collect_array_locals(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -414,6 +437,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         }
 
         let mut invalid_roots = HashSet::default();
+        let mut escapes: HashMap<ValueId, usize> = HashMap::default();
         let mut boundary_ends = Vec::new();
         try_walk_named_tree_preorder(body, true, |node| {
             if self.session.cancellation().is_cancelled() {
@@ -466,6 +490,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     })
                     .is_some()
             });
+            // The same whole-value rule the plain-object scan applies: an
+            // argument that names no element bounds later accesses instead of
+            // invalidating the allocation root.
+            let whole_value_argument = !inside_nested
+                && is_whole_value_call_argument(node)
+                && executes_once_within(node, candidate.declaration_parent);
+            if whole_value_argument {
+                let escape = escapes.entry(candidate.root).or_insert(node.start_byte());
+                *escape = (*escape).min(node.start_byte());
+                return Ok(WalkControl::Continue);
+            }
             let survives =
                 !inside_nested && (is_variable_binding_name(node) || supported_index || alias_use);
             if !survives {
@@ -482,6 +517,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     ArrayLocal {
                         declaration_parent: candidate.declaration_parent,
                         available_after: candidate.available_after,
+                        escapes_after: escapes.get(&candidate.root).copied(),
                     },
                 )
             })
@@ -490,10 +526,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     }
 
     /// Whether `access` is a field access whose base identifier resolves to a
-    /// plain object local and executes only after the declarator has run:
-    /// the declaration statement's parent must be an ancestor of the access,
-    /// and the access must start after the declarator ends, so no path
-    /// reaches the access without establishing the binding first.
+    /// plain object local and executes only after the declarator has run and
+    /// before any whole-value consumption of the allocation: the declaration
+    /// statement's parent must be an ancestor of the access, the access must
+    /// start after the declarator ends, so no path reaches the access without
+    /// establishing the binding first, and it must end before the first byte
+    /// at which a callee could hold the object.
     pub(super) fn established_plain_object_base(
         &self,
         access: Node<'tree>,
@@ -512,6 +550,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             return false;
         };
         if access.start_byte() < plain.available_after {
+            return false;
+        }
+        if plain
+            .escapes_after
+            .is_some_and(|escape| access.end_byte() > escape)
+        {
             return false;
         }
         let mut current = access.parent();
@@ -578,6 +622,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             return false;
         };
         if access.start_byte() < array.available_after {
+            return false;
+        }
+        if array
+            .escapes_after
+            .is_some_and(|escape| access.end_byte() > escape)
+        {
             return false;
         }
         let mut current = access.parent();
@@ -926,6 +976,56 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .add_gap(builder, point, subject, capability, kind, detail)?;
         Ok(())
     }
+}
+
+/// Whether this identifier occurrence is a whole value handed to a call: a
+/// direct element of a call's or a `new` expression's argument list.
+///
+/// Such an occurrence reads the allocation as a whole and names no member of
+/// it, so it needs no member identity and must not open a member-resolution
+/// gap on the accesses that already ran. A spread element (`f(...values)`), a
+/// callee position, and every other shape are deliberately absent: they are
+/// not plain whole-value reads, so they keep invalidating the root.
+fn is_whole_value_call_argument(node: Node<'_>) -> bool {
+    let Some(arguments) = node.parent() else {
+        return false;
+    };
+    if arguments.kind() != "arguments" {
+        return false;
+    }
+    if !named_children(arguments)
+        .into_iter()
+        .any(|argument| argument.id() == node.id())
+    {
+        return false;
+    }
+    arguments
+        .parent()
+        .is_some_and(|call| matches!(call.kind(), "call_expression" | "new_expression"))
+}
+
+/// Whether `node` executes at most once for each execution of the declarator
+/// that established `declaration_parent`'s allocation, so byte order between
+/// this node and an access under the same declaration is execution order.
+///
+/// A repetition construct between the two is what breaks that: a consumption
+/// inside a loop the declarator sits outside of can run before a textually
+/// earlier access on the loop's next iteration.
+fn executes_once_within(node: Node<'_>, declaration_parent: usize) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.id() == declaration_parent {
+            return true;
+        }
+        if matches!(
+            parent.kind(),
+            "for_statement" | "for_in_statement" | "while_statement" | "do_statement"
+        ) {
+            return false;
+        }
+        current = parent;
+    }
+    false
 }
 
 /// Whether this identifier occurrence is the object of a member access that

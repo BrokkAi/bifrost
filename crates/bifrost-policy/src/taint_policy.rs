@@ -43,12 +43,6 @@ use crate::selector_compiler::{parameter_name_matches, parameter_names_match};
 use crate::{ProductionTaintAnalysisResult, ProductionTaintPhaseMetrics};
 use brokk_bifrost_analysis::CancellationToken;
 use brokk_bifrost_analysis::analyzer::common::language_for_file;
-use brokk_bifrost_analysis::analyzer::dataflow::{
-    DataflowRequest, ExternalSemanticSummarySet, ExternalSummaryCompatibilityKey,
-    SemanticInputStatus, SolverBudget, SummaryBehaviorKey, SummaryContextKey, SummarySchemaVersion,
-    SummarySemanticsVersion, SummaryWitness, SummaryWitnessStepKind, WitnessReconstructionLimits,
-    WitnessRetentionLimits,
-};
 use brokk_bifrost_analysis::analyzer::lexical_definitions::formal_parameter_slots;
 use brokk_bifrost_analysis::analyzer::semantic::{
     CallArgumentMapping, CallArgumentMember, CallBinding, CallSiteHandle, CandidateCoverage,
@@ -59,27 +53,36 @@ use brokk_bifrost_analysis::analyzer::semantic::{
 };
 use brokk_bifrost_analysis::analyzer::semantic::{DispatchOracle, ValueFlowOracle};
 use brokk_bifrost_analysis::analyzer::semantic_model::{
-    CompiledProcedureSummary, CompiledSummaryEffect, ExactProcedureSummaryBoundary,
-    ExactProcedureSummaryParameter, ExactProcedureSummaryReceiver,
-    ExactProcedureSummaryTargetBinding, ProcedureSummaryMemberKey, ProcedureSummaryTargetKey,
-    ResolvedActiveSemanticModels, SemanticModelMatchDisposition, bind_compiled_procedure_summaries,
-};
-use brokk_bifrost_analysis::analyzer::structural::{
-    CodeQueryCompletion, CodeQueryDiagnosticCode, CodeQueryExecutionLimits,
-};
-use brokk_bifrost_analysis::analyzer::taint::{
-    SourceClassId, SourceEventKey, TaintAnalysisPlan, TaintBatch, TaintBatchCompatibilityKey,
-    TaintBatchPlanner, TaintClassSet, TaintFindingCollectionLimits, TaintFindingReport,
-    TaintOriginFindingEvidence, TaintPolicyPlan, TaintSanitizerBinding, TaintSinkBinding,
-    TaintSourceBinding, TaintUniverse, collect_taint_findings_with_limits,
+    CompiledProcedureSummary, CompiledSummaryEffect, ProcedureSummaryMemberKey,
+    ProcedureSummaryTargetKey, ResolvedActiveSemanticModels, SemanticModelMatchDisposition,
 };
 use brokk_bifrost_analysis::analyzer::usages::get_definition::parse_tree_for_language;
-use brokk_bifrost_analysis::analyzer::value_flow::{
+use brokk_bifrost_analysis::analyzer::{ProjectFile, Range, WorkspaceAnalyzer};
+use brokk_bifrost_flow::dataflow::{
+    DataflowRequest, ExternalSemanticSummarySet, ExternalSummaryCompatibilityKey,
+    SemanticInputStatus, SolverBudget, SummaryBehaviorKey, SummaryContextKey, SummarySchemaVersion,
+    SummarySemanticsVersion, SummaryWitness, SummaryWitnessStepKind, WitnessReconstructionLimits,
+    WitnessRetentionLimits,
+};
+use brokk_bifrost_flow::taint::{
+    SourceClassId, SourceEventKey, TaintAnalysisPlan, TaintBatch, TaintBatchCompatibilityKey,
+    TaintBatchPlanner, TaintClassSet, TaintFindingCollectionLimits, TaintFindingReport,
+    TaintOriginFindingEvidence, TaintPolicyPlan, TaintPropagationSemanticsId,
+    TaintSanitizerBinding, TaintSinkBinding, TaintSourceBinding, TaintUniverse,
+    collect_taint_findings_with_limits,
+};
+use brokk_bifrost_flow::value_flow::{
     ValueFlowCarrier, ValueFlowCarrierId, ValueFlowEventKey, ValueFlowEventKind,
     ValueFlowIncompleteCause, ValueFlowInput, ValueFlowObservationPhase, ValueFlowPlan,
     ValueFlowSinkSpec, ValueFlowSourceSpec,
 };
-use brokk_bifrost_analysis::analyzer::{ProjectFile, Range, WorkspaceAnalyzer};
+use brokk_bifrost_flow::{
+    ExactProcedureSummaryBoundary, ExactProcedureSummaryParameter, ExactProcedureSummaryReceiver,
+    ExactProcedureSummaryTargetBinding, bind_compiled_procedure_summaries,
+};
+use brokk_bifrost_rql::structural::{
+    CodeQueryCompletion, CodeQueryDiagnosticCode, CodeQueryExecutionLimits,
+};
 
 #[derive(Debug)]
 pub(crate) enum TaintPolicyCompileError {
@@ -287,8 +290,7 @@ fn refusal_messages(refused: &[RefusedCallSite]) -> Vec<String> {
 #[derive(Default)]
 pub(crate) struct ProductionTaintPolicyEvaluator {
     prepared: RefCell<HashMap<PolicyId, TaintProjectionPayload>>,
-    public_findings:
-        RefCell<Vec<brokk_bifrost_analysis::analyzer::structural::CodeQueryTaintFinding>>,
+    public_findings: RefCell<Vec<brokk_bifrost_rql::structural::CodeQueryTaintFinding>>,
     retained_analyses: RefCell<Vec<Arc<ProductionTaintAnalysisResult>>>,
 }
 
@@ -577,7 +579,7 @@ impl ProductionTaintPolicyEvaluator {
 
     pub(crate) fn take_public_findings(
         &self,
-    ) -> Vec<brokk_bifrost_analysis::analyzer::structural::CodeQueryTaintFinding> {
+    ) -> Vec<brokk_bifrost_rql::structural::CodeQueryTaintFinding> {
         std::mem::take(&mut *self.public_findings.borrow_mut())
     }
 
@@ -1233,22 +1235,21 @@ impl<'a> TaintPolicyCompiler<'a> {
                 policy.definition().metadata.id.as_str()
             );
             let compatibility = TaintBatchCompatibilityKey::with_call_behavior(
-                root.artifact().key().fingerprint().to_string(),
                 // The value-flow propagation hash deliberately excludes
                 // endpoint observations so compatible demand can share a solve,
                 // but it also excludes sanitizers, which DO change propagation.
                 // Folding them in is what keeps two policies with different
                 // kills in different batches instead of colliding on one key
                 // and failing the planner's own equality check.
-                format!(
-                    "bifrost.production-taint.v1:{:?}:{:016x}:{sanitizer_hash:016x}",
+                TaintPropagationSemanticsId::new(
+                    &root.artifact().key().fingerprint(),
                     root.semantics().locator(),
                     value_flow_compatibility_hash(analysis.value_flow()),
+                    sanitizer_hash,
                 ),
                 spec.call_modeling.unmodeled,
                 universe.hash(),
-            )
-            .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))?;
+            );
             let plan = TaintPolicyPlan::new(internal_policy_id.clone(), compatibility, analysis)
                 .map_err(|error| TaintPolicyCompileError::Plan(error.to_string()))?;
             let source_metadata = value_flow_sources(&plan, &sources)?;
@@ -2152,7 +2153,7 @@ impl<'a> TaintPolicyCompiler<'a> {
         discovery: DiscoveredValueFlow,
         source_specs: Vec<ValueFlowSourceSpec>,
         sink_specs: Vec<ValueFlowSinkSpec>,
-        call_behavior: brokk_bifrost_analysis::analyzer::dataflow::UnmodeledCallBehavior,
+        call_behavior: brokk_bifrost_flow::dataflow::UnmodeledCallBehavior,
     ) -> Result<ValueFlowPlan, TaintPolicyCompileError> {
         let external_summaries = self.bind_external_summaries(
             &discovery.external_targets,
@@ -2182,7 +2183,7 @@ impl<'a> TaintPolicyCompiler<'a> {
         targets: &[ExactExternalProcedureTarget],
         unmaterialized: &[UnmaterializedExternalTarget],
         root_artifact: &SemanticArtifactKey,
-        call_behavior: brokk_bifrost_analysis::analyzer::dataflow::UnmodeledCallBehavior,
+        call_behavior: brokk_bifrost_flow::dataflow::UnmodeledCallBehavior,
     ) -> Result<Option<ExternalSemanticSummarySet>, TaintPolicyCompileError> {
         let Some(active) = &self.active_semantic_models else {
             return Ok(None);
@@ -2515,7 +2516,7 @@ fn solve_and_project_batch(
     cancellation: &CancellationToken,
     budget: &PolicyBudget,
     execution_budget: &mut TaintExecutionBudget,
-    public_findings: &mut Vec<brokk_bifrost_analysis::analyzer::structural::CodeQueryTaintFinding>,
+    public_findings: &mut Vec<brokk_bifrost_rql::structural::CodeQueryTaintFinding>,
     retained_analyses: &mut Vec<Arc<ProductionTaintAnalysisResult>>,
     batch_planning_elapsed: Duration,
 ) -> Result<(), TaintBatchError> {
@@ -2538,7 +2539,7 @@ fn solve_and_project_batch(
     let mut request = DataflowRequest::new(&mut execution_budget.solver, cancellation);
     let provider = WorkspaceIcfgProvider::new(workspace);
     let propagation_started = Instant::now();
-    let result = brokk_bifrost_analysis::analyzer::taint::solve_taint_batch_with_witnesses(
+    let result = brokk_bifrost_flow::taint::solve_taint_batch_with_witnesses(
         batch.analysis().value_flow().root(),
         &provider,
         batch.analysis(),
@@ -2614,24 +2615,33 @@ fn solve_and_project_batch(
     execution_budget.remaining_witness_bytes = execution_budget
         .remaining_witness_bytes
         .saturating_sub(report.retained_witness_bytes());
-    let projection_limits =
-        brokk_bifrost_analysis::analyzer::structural::CodeQueryTaintProjectionLimits::new(
+    let projection_limits = brokk_bifrost_rql::structural::CodeQueryTaintProjectionLimits::new(
+        budget.max_origins_per_finding(),
+        budget.max_witnesses_per_finding(),
+        budget.max_witness_steps(),
+        budget.max_witness_bytes(),
+    );
+    let mut retained = ProductionTaintAnalysisResult::new(
+        Arc::new(batch.analysis().clone()),
+        Arc::new(report),
+        *batch.compatibility(),
+        brokk_bifrost_flow::taint::TaintProjectionLimits::new(
             budget.max_origins_per_finding(),
             budget.max_witnesses_per_finding(),
             budget.max_witness_steps(),
             budget.max_witness_bytes(),
-        );
-    let mut retained = ProductionTaintAnalysisResult::new(
-        Arc::new(batch.analysis().clone()),
-        Arc::new(report),
-        batch.compatibility().clone(),
-        projection_limits,
+        ),
     );
     debug_assert!(retained.plan_report_match());
     let standalone_projection_started = Instant::now();
-    let projected_findings = retained
-        .project_findings(workspace, projection_limits)
-        .map_err(|error| error.to_string())?;
+    let projected_findings = brokk_bifrost_rql::structural::project_taint_finding_report(
+        workspace,
+        retained.plan(),
+        retained.report(),
+        retained.projection_scope(),
+        projection_limits,
+    )
+    .map_err(|error| error.to_string())?;
     let standalone_projection_elapsed = standalone_projection_started.elapsed();
     retained
         .set_registration_digest(&projected_findings)
@@ -2845,7 +2855,7 @@ fn value_flow_compatibility_hash(plan: &ValueFlowPlan) -> u64 {
 struct ProjectedSourceGroup<'a> {
     source: &'a ResolvedTaintEndpoint<ResolvedTaintSourceDefinition>,
     origins: Vec<&'a TaintOriginFindingEvidence>,
-    findings: Vec<&'a brokk_bifrost_analysis::analyzer::taint::TaintFinding>,
+    findings: Vec<&'a brokk_bifrost_flow::taint::TaintFinding>,
     labels: Vec<TaintLabel>,
 }
 
@@ -2856,12 +2866,18 @@ struct ProjectedSourceGroup<'a> {
 /// anchor's byte span. It deliberately excludes the anchor's *occurrence*
 /// counter, which is what distinguishes several lowerings of one written call
 /// from one another (#2308).
-type ReportedSinkSite = (
-    ResolvedEndpointIdentity,
-    WorkspaceRelativePath,
-    String,
-    ByteRange<u32>,
-);
+///
+/// The field order is the sort order, and it matters: sorting groups the sites
+/// that share one endpoint, file, and enclosing declaration into one run,
+/// ordered by source position. That run is what `site_ordinals` numbers.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ReportedSinkSite {
+    endpoint: ResolvedEndpointIdentity,
+    path: WorkspaceRelativePath,
+    declaration: String,
+    span_start: u32,
+    span_end: u32,
+}
 
 /// Where one value-flow sink event is reported, or `None` when the event
 /// belongs to another policy in the shared batch.
@@ -2872,14 +2888,35 @@ fn reported_sink_site(
     let compiled = plan.sinks.iter().find(|sink| &sink.event == event)?;
     let locator = event.site();
     let span = locator.anchor().span();
-    Some(canonical_locator_identity(locator).map(|declaration| {
-        (
-            compiled.endpoint.clone(),
-            locator.path().clone(),
+    Some(
+        canonical_locator_identity(locator).map(|declaration| ReportedSinkSite {
+            endpoint: compiled.endpoint.clone(),
+            path: locator.path().clone(),
             declaration,
-            span.start_byte()..span.end_byte(),
-        )
-    }))
+            span_start: span.start_byte(),
+            span_end: span.end_byte(),
+        }),
+    )
+}
+
+/// Number each reported sink site within the run of sites that share its
+/// endpoint, file, and enclosing declaration, in source order.
+///
+/// `sites` must already be sorted, which is what puts each such run together.
+fn site_ordinals(sites: &[ReportedSinkSite]) -> Vec<u32> {
+    let mut ordinals = Vec::with_capacity(sites.len());
+    let mut ordinal = 0;
+    for (index, site) in sites.iter().enumerate() {
+        if index > 0 {
+            let previous = &sites[index - 1];
+            let same_declaration = previous.endpoint == site.endpoint
+                && previous.path == site.path
+                && previous.declaration == site.declaration;
+            ordinal = if same_declaration { ordinal + 1 } else { 0 };
+        }
+        ordinals.push(ordinal);
+    }
+    ordinals
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2931,25 +2968,30 @@ fn project_policy_findings(
     // route's origins and witnesses. It groups no more than that: two calls
     // written at different places keep their own findings and their own reported
     // locations.
-    let mut projected_sinks = Vec::<ReportedSinkSite>::new();
+    let mut reported_sinks = Vec::<ReportedSinkSite>::new();
     for candidate in report.findings() {
         let Some(reported_sink) = reported_sink_site(plan, candidate.key().sink()) else {
             continue;
         };
         let reported_sink = reported_sink?;
-        if projected_sinks.contains(&reported_sink) {
-            continue;
+        if !reported_sinks.contains(&reported_sink) {
+            reported_sinks.push(reported_sink);
         }
+    }
+    // Sorting is what makes the site ordinals below a property of the source
+    // rather than of the order the solver happened to retain its findings in.
+    reported_sinks.sort();
+    let sink_site_ordinals = site_ordinals(&reported_sinks);
+    for (reported_sink, sink_site_ordinal) in reported_sinks.iter().zip(sink_site_ordinals) {
         let sink_findings = report
             .findings()
             .iter()
             .filter(|finding| {
                 reported_sink_site(plan, finding.key().sink())
                     .and_then(Result::ok)
-                    .is_some_and(|site| site == reported_sink)
+                    .is_some_and(|site| &site == reported_sink)
             })
             .collect::<Vec<_>>();
-        projected_sinks.push(reported_sink);
         let finding = sink_findings
             .iter()
             .copied()
@@ -2960,7 +3002,7 @@ fn project_policy_findings(
                     finding.origins().is_complete(),
                 )
             })
-            .expect("the candidate row belongs to its own sink group");
+            .expect("every reported sink site came from a finding of its own group");
         let Some(compiled_sink) = plan
             .sinks
             .iter()
@@ -3078,6 +3120,7 @@ fn project_policy_findings(
             }
             let anchor = TaintFindingAnchor::strong(
                 sink_identity.clone(),
+                sink_site_ordinal,
                 group.source.analysis_projection_hash,
                 sink.analysis_projection_hash,
                 scenario_hash,
@@ -3163,6 +3206,13 @@ fn project_policy_findings(
     Ok(projected)
 }
 
+/// The declaration path and role a locator sits in.
+///
+/// This names the *enclosing declaration*, so every sink call written inside
+/// one procedure shares it. What separates those calls from one another is the
+/// site ordinal that `TaintFindingAnchor::strong` carries; a positional handle
+/// cannot live in a semantic key, which `validate_semantic_key` rejects as a
+/// dense handle.
 fn canonical_locator_identity(
     locator: &brokk_bifrost_analysis::analyzer::semantic::SemanticLocator,
 ) -> Result<String, String> {
@@ -3278,7 +3328,7 @@ fn policy_authored_arm_closures(report: &TaintFindingReport) -> Vec<AuthoredArmC
 }
 
 fn policy_authored_arm_closures_from(
-    closures: &[brokk_bifrost_analysis::analyzer::value_flow::AuthoredArmClosure],
+    closures: &[brokk_bifrost_flow::value_flow::AuthoredArmClosure],
 ) -> Vec<AuthoredArmClosureEvidence> {
     let mut evidence = closures
         .iter()
@@ -3309,7 +3359,7 @@ fn project_taint_report(
     witness_limit: usize,
     witness_limits: EffectiveWitnessLimits,
     budget: &PolicyBudget,
-    authored_arm_closures: &[brokk_bifrost_analysis::analyzer::value_flow::AuthoredArmClosure],
+    authored_arm_closures: &[brokk_bifrost_flow::value_flow::AuthoredArmClosure],
 ) -> Result<(ProjectedFindingReport, Vec<WitnessId>), String> {
     let certainty = if proven {
         FindingCertainty::Definite
@@ -4189,16 +4239,14 @@ mod tests {
     use crate::source::PolicySourceIdentity;
     use crate::suppression::PolicyEvaluationDate;
     use brokk_bifrost_analysis::CancellationToken;
-    use brokk_bifrost_analysis::analyzer::dataflow::SolverWork;
     use brokk_bifrost_analysis::analyzer::semantic::{
         ProcedureHandle, SemanticArtifact, SemanticBudget, SemanticRequest, SemanticWork,
-    };
-    use brokk_bifrost_analysis::analyzer::structural::{
-        CodeQueryExecutionLimits, CodeQuerySemanticLimits,
     };
     use brokk_bifrost_analysis::analyzer::{
         AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer,
     };
+    use brokk_bifrost_flow::dataflow::SolverWork;
+    use brokk_bifrost_rql::structural::{CodeQueryExecutionLimits, CodeQuerySemanticLimits};
 
     /// One taint flow: `source_one` returns attacker input and `sink_one`
     /// consumes it through a nested call, which is a witness of several steps.
@@ -4372,6 +4420,7 @@ def run_two():
             PolicySourceIdentity::new("test:issue-2356.rqlp"),
             &source,
             &analyzer,
+            &brokk_bifrost_flow::FlowWorkspaceState::new(),
             &options,
             None,
         )

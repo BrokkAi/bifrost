@@ -16,14 +16,15 @@ use super::{
     AllocationId, AllocationKind, AllocationSite, ArgumentDomain, AsyncResumeKind,
     CallContinuationKind, CallSiteId, CallableTargetResolution, CancellationToken, CaptureBinding,
     CaptureId, CaptureMode, CaptureSource, ControlContinuation, ControlEdge, ControlEdgeKind,
-    Evidence, EvidenceCompleteness, EvidenceId, FormalMultiplicity, MemoryAccessKind,
-    MemoryLocation, MemoryLocationId, MemoryLocationKind, ProcedureId, ProcedureSemanticsParts,
-    ProgramPointId, ProofStatus, SemanticBudget, SemanticBudgetExceeded, SemanticCallArgument,
-    SemanticCallSite, SemanticCapability, SemanticEffect, SemanticEvent, SemanticGap,
-    SemanticGapDischarge, SemanticGapId, SemanticGapImpacts, SemanticGapKind, SemanticGapSubject,
-    SemanticLocator, SemanticOutcome, SemanticProviderError, SemanticRole, SemanticValue,
-    SemanticValueKind, SemanticWork, SourceAnchor, SourceMapping, SourceMappingId,
-    SourceMappingKind, SourcePosition, SourceSpan, ValueFlowKind, ValueId,
+    Evidence, EvidenceCompleteness, EvidenceId, FormalMultiplicity, GuardArm, GuardFactParts,
+    GuardId, GuardPredicate, MemoryAccessKind, MemoryLocation, MemoryLocationId,
+    MemoryLocationKind, ProcedureId, ProcedureSemanticsParts, ProgramPointId, ProofStatus,
+    SemanticBudget, SemanticBudgetExceeded, SemanticCallArgument, SemanticCallSite,
+    SemanticCapability, SemanticEffect, SemanticEvent, SemanticGap, SemanticGapDischarge,
+    SemanticGapId, SemanticGapImpacts, SemanticGapKind, SemanticGapSubject, SemanticLocator,
+    SemanticOutcome, SemanticProviderError, SemanticRole, SemanticValue, SemanticValueKind,
+    SemanticWork, SourceAnchor, SourceMapping, SourceMappingId, SourceMappingKind, SourcePosition,
+    SourceSpan, ValueFlowKind, ValueId,
 };
 
 /// Common operational failures produced while lowering one procedure.
@@ -654,6 +655,7 @@ pub(crate) struct ProcedureLoweringSession<'a> {
     next_capture: usize,
     next_call_site: usize,
     next_gap: usize,
+    next_guard: usize,
     source_occurrences: HashMap<(usize, usize), u32>,
     cancellation: &'a CancellationToken,
 }
@@ -755,6 +757,7 @@ impl<'a> ProcedureLoweringSession<'a> {
             next_capture: 0,
             next_call_site: 0,
             next_gap: 0,
+            next_guard: 0,
             source_occurrences: HashMap::default(),
             cancellation,
         };
@@ -1290,6 +1293,38 @@ impl<'a> ProcedureLoweringSession<'a> {
             evidence: metadata.evidence,
         })?;
         Ok(())
+    }
+
+    /// Record one normalized decision-point condition (issue #2443).
+    ///
+    /// The guard's provenance is the decision point's own, which is what makes
+    /// a guard row anchor at the condition an author wrote. Arms must already
+    /// have been added as edges; the IR validator enforces that.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn add_guard_fact(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        predicate: GuardPredicate,
+        subject: Option<ValueId>,
+        true_arm: Option<GuardArm>,
+        false_arm: Option<GuardArm>,
+    ) -> Result<GuardId, ProcedureLoweringError> {
+        let metadata = self.metadata(point)?;
+        let id = GuardId::try_from_index(self.next_guard)
+            .map_err(|_| ProcedureLoweringError::Invalid("too many guard facts".into()))?;
+        builder.add_guard_fact(GuardFactParts {
+            id,
+            point,
+            subject,
+            predicate,
+            true_arm,
+            false_arm,
+            source: metadata.source,
+            evidence: metadata.evidence,
+        })?;
+        self.next_guard += 1;
+        Ok(id)
     }
 
     pub(crate) fn add_call_site(

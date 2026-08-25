@@ -1406,7 +1406,7 @@ fn qualified_type_name(
     }
     let mut default_candidates = KOTLIN_DEFAULT_IMPORT_PACKAGES
         .iter()
-        .map(|package| format!("{package}.{name}"))
+        .map(|package| format!("{}.{name}", package.rendered))
         .filter(|candidate| candidate.len() <= MAX_QUALIFIED_NAME_BYTES)
         .filter(|candidate| known_types.contains(candidate));
     if let Some(first) = default_candidates.next() {

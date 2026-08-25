@@ -117,10 +117,15 @@ pub trait CSharpSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyPr
     /// same way.
     fn workspace_namespace_exists(&self, namespace: &str) -> bool;
 
-    /// The workspace's usage-definition index, as the bounded lookup contract.
-    /// Every `usage_*` spelling below answers from here rather than from the
-    /// persisted store.
-    fn usage_definitions(&self, token: QueryToken<'_>) -> &dyn BoundedDefinitionLookup;
+    /// Run one synchronous usage-resolution step against a request-local
+    /// bounded definition lookup. The callback boundary lets the analysis
+    /// implementation borrow its analyzer without publishing lookup state as
+    /// analyzer-generation state.
+    fn with_usage_definitions(
+        &self,
+        token: QueryToken<'_>,
+        read: &mut dyn FnMut(&dyn BoundedDefinitionLookup),
+    );
 
     // --- indexed file facts ---
 
@@ -308,12 +313,27 @@ pub trait CSharpSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyPr
 // Declaration lookups
 // ---------------------------------------------------------------------------
 
+fn with_usage_definitions<R>(
+    source: &dyn CSharpSource,
+    token: QueryToken<'_>,
+    read: impl FnOnce(&dyn BoundedDefinitionLookup) -> R,
+) -> R {
+    let mut read = Some(read);
+    let mut result = None;
+    source.with_usage_definitions(token, &mut |lookup| {
+        if let Some(read) = read.take() {
+            result = Some(read(lookup));
+        }
+    });
+    result.expect("C# definition lookup access must invoke its consumer exactly once")
+}
+
 pub fn usage_declaration_candidates_by_identifier(
     source: &dyn CSharpSource,
     token: QueryToken<'_>,
     identifier: &str,
 ) -> Vec<CodeUnit> {
-    source.usage_definitions(token).identifier(identifier)
+    with_usage_definitions(source, token, |lookup| lookup.identifier(identifier))
 }
 
 pub fn declaration_candidates_by_fqn(
@@ -361,9 +381,9 @@ pub fn usage_member_candidates_for_owner(
     name: &str,
 ) -> Vec<CodeUnit> {
     let normalized = csharp_normalize_full_name(owner_fqn);
-    source
-        .usage_definitions(token)
-        .members_for_owner_name(owner_fqn, &normalized, name)
+    with_usage_definitions(source, token, |lookup| {
+        lookup.members_for_owner_name(owner_fqn, &normalized, name)
+    })
 }
 
 pub fn usage_workspace_namespace_exists(
@@ -371,15 +391,13 @@ pub fn usage_workspace_namespace_exists(
     token: QueryToken<'_>,
     namespace: &str,
 ) -> bool {
-    source.usage_definitions(token).package_exists(namespace)
+    with_usage_definitions(source, token, |lookup| lookup.package_exists(namespace))
 }
 
-pub fn usage_type_candidates_by_fqn(
-    source: &dyn CSharpSource,
-    token: QueryToken<'_>,
+fn usage_type_candidates_by_fqn_in(
+    lookup: &dyn BoundedDefinitionLookup,
     fqn: &str,
 ) -> Vec<CodeUnit> {
-    let lookup = source.usage_definitions(token);
     let exact = lookup
         .fqn(fqn)
         .iter()
@@ -400,15 +418,23 @@ pub fn usage_type_candidates_by_fqn(
         .collect()
 }
 
-pub fn usage_definition_candidates_by_fqn(
+pub fn usage_type_candidates_by_fqn(
     source: &dyn CSharpSource,
     token: QueryToken<'_>,
     fqn: &str,
 ) -> Vec<CodeUnit> {
-    let lookup = source.usage_definitions(token);
+    with_usage_definitions(source, token, |lookup| {
+        usage_type_candidates_by_fqn_in(lookup, fqn)
+    })
+}
+
+fn usage_definition_candidates_by_fqn_in(
+    lookup: &dyn BoundedDefinitionLookup,
+    fqn: &str,
+) -> Vec<CodeUnit> {
     let exact = lookup.fqn(fqn);
     if !exact.is_empty() {
-        return exact.to_vec();
+        return exact;
     }
     let arity_key = csharp_arity_preserving_full_name(fqn);
     lookup
@@ -417,6 +443,16 @@ pub fn usage_definition_candidates_by_fqn(
         .filter(|unit| csharp_arity_preserving_full_name(&unit.fq_name()) == arity_key)
         .cloned()
         .collect()
+}
+
+pub fn usage_definition_candidates_by_fqn(
+    source: &dyn CSharpSource,
+    token: QueryToken<'_>,
+    fqn: &str,
+) -> Vec<CodeUnit> {
+    with_usage_definitions(source, token, |lookup| {
+        usage_definition_candidates_by_fqn_in(lookup, fqn)
+    })
 }
 
 pub fn type_candidates_by_fqn(
@@ -449,7 +485,15 @@ pub fn usage_arity_free_type_candidates_by_fqn(
     token: QueryToken<'_>,
     fqn: &str,
 ) -> Vec<CodeUnit> {
-    let lookup = source.usage_definitions(token);
+    with_usage_definitions(source, token, |lookup| {
+        usage_arity_free_type_candidates_by_fqn_in(lookup, fqn)
+    })
+}
+
+fn usage_arity_free_type_candidates_by_fqn_in(
+    lookup: &dyn BoundedDefinitionLookup,
+    fqn: &str,
+) -> Vec<CodeUnit> {
     let exact = lookup
         .fqn(fqn)
         .iter()

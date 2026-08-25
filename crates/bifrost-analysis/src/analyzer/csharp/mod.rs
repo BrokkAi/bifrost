@@ -35,8 +35,7 @@ pub(crate) use brokk_bifrost_csharp::{graph_support, hierarchy};
 pub(crate) use brokk_bifrost_csharp::syntax::{
     csharp_attribute_name_node, csharp_attribute_type_names, csharp_callable_arity,
     csharp_conditional_member_access, csharp_member_name, csharp_method_generic_arity,
-    csharp_normalize_full_name, csharp_signature_arity, csharp_source_identifier,
-    csharp_type_node_identity,
+    csharp_normalize_full_name, csharp_source_identifier, csharp_type_node_identity,
 };
 pub use brokk_bifrost_csharp::syntax::{csharp_source_name_segment, strip_csharp_generic_arity};
 
@@ -48,12 +47,14 @@ use crate::analyzer::languages::{
     BoundedReceiverQuery, DeadCodeBulkEdges, DeadCodeBulkPreflight, DeadCodeBulkProof,
     DeadCodeRouting, DeadCodeSupport, EdgePassId, EdgeSiteScanCtx, EdgeWeightScanCtx,
     LanguageEdgePass, LanguageEdgeSites, LanguageEdgeWeights, LanguageSupport,
-    StructuralReceiverResolver, analyzable_file_count, fqn_bulk_nodes, overloaded_function_fqns,
+    StructuralReceiverResolver, analyzable_file_count, candidate_fqns,
+    fqn_has_multiple_function_definitions,
 };
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::usages::GraphUsageAnalyzer;
 use crate::analyzer::usages::csharp_graph::{
-    CSharpUsageGraphStrategy, build_csharp_usage_edge_weights, build_csharp_usage_edges,
+    CSharpUsageGraphStrategy, build_csharp_usage_edge_weights, build_inbound_csharp_usage_edges,
+    build_rooted_csharp_usage_edges,
 };
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_csharp_bounded,
@@ -61,10 +62,10 @@ use crate::analyzer::usages::get_definition::{
 use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_csharp_type_bounded};
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::{
-    AnalyzerConfig, AnalyzerStoreContext, BoundedDefinitionLookup, BuildProgress,
-    CSharpAnalyzerConfig, CodeUnit, ForwardQueryProvider, IAnalyzer, ImportAnalysisProvider,
-    Language, Project, ProjectFile, SignatureMetadata, TestAssertionSmell, TestAssertionWeights,
-    TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider, UsageFactsIndex,
+    AnalyzerConfig, AnalyzerDefinitionLookup, AnalyzerStoreContext, BoundedDefinitionLookup,
+    BuildProgress, CSharpAnalyzerConfig, CodeUnit, ForwardQueryProvider, IAnalyzer,
+    ImportAnalysisProvider, Language, Project, ProjectFile, SignatureMetadata, TestAssertionSmell,
+    TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer, TypeHierarchyProvider,
     resolve_analyzer,
 };
 use crate::hash::{HashMap, HashSet};
@@ -73,7 +74,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
-use adapter::CSharpAdapter;
+pub(crate) use adapter::CSharpAdapter;
 use brokk_bifrost_csharp::dead_code::{
     csharp_constructor_candidate, csharp_unsafe_using_member_forms_present,
 };
@@ -583,8 +584,13 @@ impl CSharpSource for CSharpAnalyzer {
         CSharpAnalyzer::workspace_namespace_exists(self, namespace)
     }
 
-    fn usage_definitions(&self, token: QueryToken<'_>) -> &dyn BoundedDefinitionLookup {
-        self.inner.global_usage_definition_index_ref(token)
+    fn with_usage_definitions(
+        &self,
+        _token: QueryToken<'_>,
+        read: &mut dyn FnMut(&dyn BoundedDefinitionLookup),
+    ) {
+        let lookup = AnalyzerDefinitionLookup::new(self, Language::CSharp);
+        read(&lookup);
     }
 
     fn all_files(&self) -> Vec<ProjectFile> {
@@ -950,6 +956,8 @@ impl CodeUnitIndex for CSharpAnalyzer {
 }
 
 impl IAnalyzer for CSharpAnalyzer {
+    crate::analyzer::i_analyzer::forward_relational_definition_batch!();
+
     fn invalidate_cached_file_identities(&self) {
         self.inner.invalidate_cached_file_identities();
     }
@@ -1024,25 +1032,20 @@ impl IAnalyzer for CSharpAnalyzer {
         Some(graph_support::partial_type_parts(self, code_unit))
     }
 
-    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
-        // Trait signature is fixed, so this boundary opens the scope the
-        // usage-graph funnel now demands proof of (issue #2423 milestone B).
-        let scope = crate::analyzer::AnalyzerQueryScope::new(self);
-        self.inner.global_usage_definition_index(scope.token())
-    }
-
-    fn usage_facts_index(&self) -> &UsageFactsIndex {
-        self.inner.usage_facts_index()
-    }
-
-    fn structural_search_providers(
+    fn structural_fact_providers(
         &self,
-    ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
-        self.inner.structural_search_providers()
+    ) -> Vec<&dyn crate::analyzer::structural::StructuralFactProvider> {
+        self.inner.structural_fact_providers()
     }
 
     fn snapshot_caches(&self) -> Option<&crate::analyzer::AnalyzerSnapshotCaches> {
         Some(self.inner.snapshot_caches())
+    }
+
+    fn workspace_content_identities(
+        &self,
+    ) -> Option<crate::analyzer::content_identity::WorkspaceContentIdentities> {
+        self.inner.workspace_content_identities()
     }
 
     fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
@@ -1190,18 +1193,6 @@ impl IAnalyzer for CSharpAnalyzer {
 
 #[cfg(any(test, feature = "test-support"))]
 impl crate::analyzer::AnalyzerTestHooks for CSharpAnalyzer {
-    fn reset_global_usage_definition_index_build_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_global_usage_definition_index_build_count_for_test();
-    }
-
-    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .global_usage_definition_index_build_count_for_test()
-    }
-
     fn reset_definition_candidates_query_count_for_test(&self) {
         self.inner
             .test_hooks()
@@ -1351,7 +1342,7 @@ impl LanguageEdgePass for CSharpEdgePass {
     fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
         let scope = AnalyzerQueryScope::new(ctx.analyzer);
         let token = scope.token();
-        build_csharp_usage_edges(ctx.analyzer, token, ctx.fqns, ctx.keep_file)
+        build_rooted_csharp_usage_edges(ctx.analyzer, token, ctx.fqns, ctx.keep_file)
             .map(LanguageEdgeSites)
     }
 
@@ -1404,7 +1395,7 @@ impl StructuralReceiverResolver for CSharpSupport {
 #[derive(Default)]
 struct CSharpDeadCodeMemo {
     file_count: Option<usize>,
-    overloaded_fqns: Option<HashSet<String>>,
+    overloaded_fqns: HashMap<String, bool>,
     unsafe_using_member_forms_present: Option<bool>,
 }
 
@@ -1444,19 +1435,19 @@ impl DeadCodeBulkProof for CSharpDeadCodeBulk {
             return true;
         }
 
-        let empty_overloads = HashSet::default();
-        let overloads = if candidate.is_function() {
-            overloaded_fqns
-                .get_or_insert_with(|| overloaded_function_fqns(analyzer, Language::CSharp))
+        let overloaded = if candidate.is_function() {
+            let fqn = candidate.fq_name();
+            *overloaded_fqns.entry(fqn.clone()).or_insert_with(|| {
+                fqn_has_multiple_function_definitions(analyzer, Language::CSharp, &fqn)
+            })
         } else {
-            &empty_overloads
+            false
         };
         let has_unsafe_using_member_forms = candidate.is_function()
             && *unsafe_using_member_forms_present
                 .get_or_insert_with(|| csharp_unsafe_using_member_forms_present(analyzer));
 
-        candidate.is_function()
-            && (overloads.contains(candidate.fq_name().as_str()) || has_unsafe_using_member_forms)
+        candidate.is_function() && (overloaded || has_unsafe_using_member_forms)
     }
 
     fn preflight(&self, analyzer: &dyn IAnalyzer) -> DeadCodeBulkPreflight {
@@ -1473,13 +1464,8 @@ impl DeadCodeBulkProof for CSharpDeadCodeBulk {
     ) -> Option<DeadCodeBulkEdges> {
         let scope = AnalyzerQueryScope::new(analyzer);
         let token = scope.token();
-        let nodes = fqn_bulk_nodes(
-            analyzer,
-            Language::CSharp,
-            |unit| unit.is_function() || unit.is_class(),
-            candidates,
-        );
-        build_csharp_usage_edges(analyzer, token, &nodes, |_| true)
+        let callees = candidate_fqns(candidates);
+        build_inbound_csharp_usage_edges(analyzer, token, &callees)
             .map(|edges| DeadCodeBulkEdges::Fqn(Arc::new(edges)))
     }
 }

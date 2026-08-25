@@ -36,7 +36,7 @@ pub mod overload_selection;
 pub(crate) mod parsed_tree;
 pub(crate) mod php_graph;
 pub(crate) mod python_graph;
-pub(crate) mod receiver_query;
+pub mod receiver_query;
 pub(crate) mod receiver_sites;
 pub(crate) mod ruby_graph;
 pub(crate) mod rust_graph;
@@ -54,14 +54,17 @@ pub(crate) mod workspace_graph_cache;
 // item it holds was already crate-private, in which case the alias narrows to
 // `pub(crate)` rather than re-publishing core's promoted `pub` items.
 use brokk_bifrost_core::analyzer::usages::{local_inference, model};
-pub(crate) use brokk_bifrost_core::analyzer::usages::{outcome, receiver_analysis, reference_site};
+pub use brokk_bifrost_core::analyzer::usages::{outcome, receiver_analysis, reference_site};
 
-#[cfg(test)]
-pub(crate) use call_relations::CallArgument;
+#[cfg(any(test, feature = "test-support"))]
+pub use call_relations::CallArgument;
+pub use call_relations::{
+    CallBindingCache, CallBindingStatus, CallRelationDiagnostic, CallRelationDiagnosticCode,
+    CallRelationLimits, CallRelationResult, CallSite, bind_call_site_arguments,
+};
 pub(crate) use call_relations::{
-    CallBindingCache, CallBindingStatus, CallDispatchBoundaryKind, CallDispatchTarget,
-    CallRelationDiagnostic, CallRelationDiagnosticCode, CallRelationLimits, CallRelationResult,
-    CallSite, ExactCallLocation, bind_call_site_arguments, call_dispatch_equivalence_source,
+    CallDispatchBoundaryKind, CallDispatchTarget, ExactCallLocation,
+    call_dispatch_equivalence_source,
 };
 pub use call_relations::{CallRelationService, is_call_relation_unit, nearest_call_relation_unit};
 pub use candidates::{

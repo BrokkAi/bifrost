@@ -6,8 +6,8 @@
 
 pub use brokk_bifrost_core::cache_gc::{
     GC_AUTO_BLOB_THRESHOLD, GC_MIN_INTERVAL_SECS, GcOutcome, VERSION_STORE_GRACE_SECS,
-    force_gc as force_gc_for_semantic, maybe_gc as maybe_gc_for_semantic,
-    sweep_disused_version_stores,
+    force_gc as force_gc_for_path, force_gc as force_gc_for_semantic,
+    maybe_gc as maybe_gc_for_semantic, sweep_disused_version_stores,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use brokk_bifrost_core::cache_gc::{

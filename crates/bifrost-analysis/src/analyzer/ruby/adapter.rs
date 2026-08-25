@@ -35,6 +35,15 @@ impl LanguageAdapter for RubyAdapter {
         true
     }
 
+    /// Ruby's structured declaration identity renders nested constant owners
+    /// with `$` (`Billing$Invoice`). It is not client source syntax, but it is
+    /// a join in the internal rendered-name compatibility surface and must
+    /// expose the terminal identifier for an indexed relational candidate
+    /// seek.
+    fn lookup_candidate_separators(&self) -> &'static [&'static str] {
+        &[".", "::", "$"]
+    }
+
     fn contains_tests(
         &self,
         _file: &ProjectFile,

@@ -18,9 +18,9 @@ use crate::mcp_common::{
     BENCHMARK_PROFILE_BOUNDARY_MARKER, BENCHMARK_PROFILE_BOUNDARY_METHOD, CODEX_MCP_CLIENT_NAME,
     CODEX_SANDBOX_STATE_META_CAPABILITY, MCP_DISCOVERY_TEXT_MAX_CHARS, MCP_FILE_WATCHER_ENV,
     McpRenderOptions, McpServerSpec, UNBOUND_WORKSPACE_MESSAGE, attach_run_policy_correlation,
-    client_root_to_path, file_uri_to_path, file_watching_enabled,
-    fit_get_summaries_output_to_budget, mcp_analyzer_request_budget, mcp_request_deadline,
-    request_correlation_id, serial_tool_request,
+    attach_run_policy_correlation_result, client_root_to_path, file_uri_to_path,
+    file_watching_enabled, fit_get_summaries_output_to_budget, mcp_analyzer_request_budget,
+    mcp_request_deadline, request_correlation_id, serial_tool_request,
 };
 use crate::ordered_transport::{
     OutboundResponseTimings, ResponseTimingTransport, RootsOrderedTransport, RootsRevocations,
@@ -28,8 +28,11 @@ use crate::ordered_transport::{
 };
 use crate::tool_arguments::normalize_tool_arguments;
 use crate::{
-    SearchToolsService, SearchToolsServiceErrorCode, policy::escape_terminal_text, profiling,
+    SearchToolsService, SearchToolsServiceErrorCode,
+    policy::escape_terminal_text,
+    profiling,
     searchtools_render::RenderOptions,
+    searchtools_service::{PreparedRunPolicyPreflight, RunPolicyPreflight, TransportTimings},
 };
 use rmcp::model::{
     Annotations, CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult,
@@ -1235,9 +1238,21 @@ impl BifrostMcpHandler {
             Ok(arguments) => arguments,
             Err(message) => return Ok(PreparedToolCall::Reply(tool_error_result(message))),
         };
+        let run_policy_preflight = if name == "run_policy" {
+            match self.service.preflight_run_policy(&arguments) {
+                Ok(RunPolicyPreflight::Valid(preflight)) => Some(preflight),
+                Ok(RunPolicyPreflight::Invalid(output)) => {
+                    return Ok(PreparedToolCall::Reply(tool_success_result(output)));
+                }
+                Err(error) => return Err(map_service_error(error.code, error.message)),
+            }
+        } else {
+            None
+        };
 
         Ok(PreparedToolCall::Ready {
             arguments,
+            run_policy_preflight,
             workspace_scope: (!serial_tool_request(name)).then(|| WorkspaceRequestScope {
                 workspace_id: 0,
                 generation: self.service.workspace_generation(),
@@ -1275,11 +1290,26 @@ impl BifrostMcpHandler {
                 return Ok((service, PreparedToolCall::Reply(tool_error_result(message))));
             }
         };
+        let run_policy_preflight = if name == "run_policy" {
+            match service.preflight_run_policy(&arguments) {
+                Ok(RunPolicyPreflight::Valid(preflight)) => Some(preflight),
+                Ok(RunPolicyPreflight::Invalid(output)) => {
+                    return Ok((
+                        service,
+                        PreparedToolCall::Reply(tool_success_result(output)),
+                    ));
+                }
+                Err(error) => return Err(map_service_error(error.code, error.message)),
+            }
+        } else {
+            None
+        };
         let generation = service.workspace_generation();
         Ok((
             service,
             PreparedToolCall::Ready {
                 arguments,
+                run_policy_preflight,
                 workspace_scope: Some(WorkspaceRequestScope {
                     workspace_id,
                     generation,
@@ -1306,13 +1336,14 @@ impl BifrostMcpHandler {
         service: Arc<SearchToolsService>,
         name: String,
         arguments: Value,
+        suppression_preflight: Option<PreparedRunPolicyPreflight>,
         workspace_scope: Option<WorkspaceRequestScope>,
         deadline: Option<Instant>,
         request_correlation_id: Option<String>,
         mcp_cancellation: McpCancellationToken,
         permit: AnalyzerPermit,
         cold_workspace: bool,
-        transport_queue_wait: Duration,
+        transport_timings: TransportTimings,
         progress: Option<&ProgressReporter>,
     ) -> Result<CallToolResult, ErrorData> {
         // The deadline was set when the request was accepted, not when it
@@ -1359,12 +1390,13 @@ impl BifrostMcpHandler {
             let _execution_scope = profiling::scope(execution_label);
             let _cold_execution_scope =
                 cold_workspace.then(|| profiling::scope("mcp_cold.first_tool_execution"));
-            let output = execution_service.call_tool_output_with_transport_queue_wait(
+            let output = execution_service.call_tool_output_with_transport_timings_and_preflight(
                 &execution_name,
                 arguments,
                 render_options,
                 Some(&execution_cancellation),
-                transport_queue_wait,
+                transport_timings,
+                suppression_preflight,
             )?;
             let output = if execution_name == "get_summaries" {
                 fit_get_summaries_output_to_budget(
@@ -1443,6 +1475,7 @@ impl BifrostMcpHandler {
         &self,
         name: String,
         arguments: Value,
+        suppression_preflight: Option<PreparedRunPolicyPreflight>,
         workspace_scope: WorkspaceRequestScope,
         request_correlation_id: Option<String>,
     ) -> Result<CallToolResponse, ErrorData> {
@@ -1483,6 +1516,7 @@ impl BifrostMcpHandler {
                     render_options,
                     task_name,
                     arguments,
+                    suppression_preflight,
                     workspace_scope,
                     ttl,
                     request_correlation_id,
@@ -1542,6 +1576,7 @@ impl BifrostMcpHandler {
 enum PreparedToolCall {
     Ready {
         arguments: Value,
+        run_policy_preflight: Option<PreparedRunPolicyPreflight>,
         /// The workspace generation this result is only valid for, or `None`
         /// for a tool whose whole job is to change the workspace. Rebinding
         /// tools hold the workspace lock for their duration, so nothing else
@@ -1572,6 +1607,7 @@ async fn run_tool_as_task(
     render_options: RenderOptions,
     name: String,
     arguments: Value,
+    suppression_preflight: Option<PreparedRunPolicyPreflight>,
     workspace_scope: WorkspaceRequestScope,
     ttl: Duration,
     request_correlation_id: Option<String>,
@@ -1661,11 +1697,13 @@ async fn run_tool_as_task(
         let _permit = permit;
         let _in_flight = in_flight_guard;
         let _finished_guard = finished_guard;
-        let output = execution_service.call_tool_output_with_cancellation(
+        let output = execution_service.call_tool_output_with_transport_timings_and_preflight(
             &execution_name,
             arguments,
             render_options,
             Some(&execution_cancellation),
+            TransportTimings::default(),
+            suppression_preflight,
         )?;
         Ok::<_, crate::SearchToolsServiceError>(if execution_name == "run_policy" {
             attach_run_policy_correlation(output, request_correlation_id.as_deref())
@@ -2128,12 +2166,23 @@ impl ServerHandler for BifrostMcpHandler {
             let prepared = self.prepare_tool_call(&mut state, &name, arguments, &context.meta)?;
             (Arc::clone(&self.service), prepared, Some(state))
         };
-        let (arguments, workspace_scope) = match prepared {
-            PreparedToolCall::Reply(result) => return Ok(result.into()),
+        let correlation_id = serde_json::to_value(&context.id)
+            .ok()
+            .map(|id| request_correlation_id(&id));
+        let (arguments, run_policy_preflight, workspace_scope) = match prepared {
+            PreparedToolCall::Reply(result) => {
+                let result = if name == "run_policy" {
+                    attach_run_policy_correlation_result(result, correlation_id.as_deref())
+                } else {
+                    result
+                };
+                return Ok(result.into());
+            }
             PreparedToolCall::Ready {
                 arguments,
+                run_policy_preflight,
                 workspace_scope,
-            } => (arguments, workspace_scope),
+            } => (arguments, run_policy_preflight, workspace_scope),
         };
         let current_scope = WorkspaceRequestScope {
             workspace_id: workspace_scope.map_or(0, |scope| scope.workspace_id),
@@ -2148,9 +2197,6 @@ impl ServerHandler for BifrostMcpHandler {
         // what the pool exists to protect.
         // Derived from the wire id the same way the fallback host derives it,
         // so the two never disagree about a report's correlation value.
-        let correlation_id = serde_json::to_value(&context.id)
-            .ok()
-            .map(|id| request_correlation_id(&id));
         let serial = !named_mode && serial_tool_request(&name);
         // `state` must leave scope here either way. `if serial { state } else
         // { None }` moves it only in the serial branch; the non-serial branch
@@ -2180,7 +2226,13 @@ impl ServerHandler for BifrostMcpHandler {
                 .is_some_and(|capabilities| capabilities.supports_tasks())
             && let Some(workspace_scope) = workspace_scope
         {
-            return self.create_tool_task(name, arguments, workspace_scope, correlation_id);
+            return self.create_tool_task(
+                name,
+                arguments,
+                run_policy_preflight,
+                workspace_scope,
+                correlation_id,
+            );
         }
 
         // Progress is opt-in per request: no `progressToken`, no reporter, no
@@ -2191,6 +2243,7 @@ impl ServerHandler for BifrostMcpHandler {
 
         let accepted_at = Instant::now();
         let cold_workspace = service.workspace_build_pending();
+        let mut workspace_readiness_wait = Duration::ZERO;
         let deadline = mcp_request_deadline(
             accepted_at,
             default_cold_workspace_budget_applies(&name, cold_workspace),
@@ -2215,6 +2268,7 @@ impl ServerHandler for BifrostMcpHandler {
                 profiling::duration("mcp_cold.first_tool_execution", std::time::Duration::ZERO);
             }
             readiness.map_err(|error| map_service_error(error.code, error.message))?;
+            workspace_readiness_wait = accepted_at.elapsed();
         }
 
         // One deadline spans admission and execution. Starting the clock after
@@ -2222,6 +2276,7 @@ impl ServerHandler for BifrostMcpHandler {
         // while a client experiences queue wait plus a full budget -- and the
         // `mcp_fairness` p95 gate in benchmark/interactive-latency.toml is
         // written against what the client experiences.
+        let admission_started_at = Instant::now();
         let admission = if serial {
             Ok(Admission::Granted(AnalyzerPermit::exempt()))
         } else {
@@ -2239,6 +2294,7 @@ impl ServerHandler for BifrostMcpHandler {
                 None => Ok(self.analyzer_pool.acquire(&context.ct).await),
             }
         };
+        let analyzer_admission_wait = admission_started_at.elapsed();
         let permit = match admission {
             Ok(Admission::Granted(permit)) => permit,
             Ok(Admission::Cancelled) => {
@@ -2273,6 +2329,14 @@ impl ServerHandler for BifrostMcpHandler {
         };
         let queue_wait = accepted_at.elapsed();
         profiling::duration(
+            transport_phase_label("workspace_readiness_wait", &name, correlation_id.as_deref()),
+            workspace_readiness_wait,
+        );
+        profiling::duration(
+            transport_phase_label("analyzer_admission_wait", &name, correlation_id.as_deref()),
+            analyzer_admission_wait,
+        );
+        profiling::duration(
             transport_phase_label("queue_wait", &name, correlation_id.as_deref()),
             queue_wait,
         );
@@ -2302,13 +2366,18 @@ impl ServerHandler for BifrostMcpHandler {
                 Arc::clone(&service),
                 name.clone(),
                 arguments,
+                run_policy_preflight,
                 workspace_scope,
                 deadline,
                 correlation_id.clone(),
                 context.ct.clone(),
                 permit,
                 cold_workspace,
-                queue_wait,
+                TransportTimings {
+                    transport_queue_wait: queue_wait,
+                    workspace_readiness_wait,
+                    analyzer_admission_wait,
+                },
                 progress.as_ref(),
             )
             .await;
@@ -2603,6 +2672,81 @@ mod named_workspace_tests {
             .map(|descriptor| descriptor["name"].as_str().unwrap().to_string())
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["refresh"]);
+    }
+
+    #[test]
+    fn named_run_policy_preflights_suppressions_before_readiness() {
+        let temp = tempfile::tempdir().expect("workspace temp dir");
+        std::fs::write(temp.path().join("Policy.java"), "class Policy {}\n")
+            .expect("workspace source");
+        std::fs::create_dir_all(temp.path().join(".bifrost")).expect("suppression parent");
+        std::fs::write(
+            temp.path().join(".bifrost/suppressions.json"),
+            "{ malformed",
+        )
+        .expect("malformed suppressions");
+        let router = Arc::new(
+            NamedWorkspaceRouter::new(
+                vec![NamedWorkspace::new(
+                    "api".to_string(),
+                    temp.path().to_path_buf(),
+                )],
+                false,
+            )
+            .expect("named router"),
+        );
+        let spec =
+            crate::mcp_registry::resolve_server_spec("searchtools").expect("searchtools spec");
+        let handler = BifrostMcpHandler::new(
+            router.primary_service(),
+            Some(Arc::clone(&router)),
+            McpRenderOptions::default(),
+            &spec,
+            "test",
+            false,
+            Arc::new(RootsRevocations::default()),
+            Arc::new(OutboundResponseTimings::default()),
+        )
+        .expect("handler");
+
+        let (_, prepared) = handler
+            .prepare_named_tool_call(
+                "run_policy",
+                json!({
+                    "workspace": "api",
+                    "policy_ids": ["bifrost.correctness.dynamic-evaluation"],
+                    "evaluation_date": "2026-07-27",
+                    "fail_on": "warning"
+                }),
+            )
+            .expect("named preparation");
+        let PreparedToolCall::Reply(result) = prepared else {
+            panic!("malformed suppressions must return before named readiness");
+        };
+        let structured = result
+            .structured_content
+            .expect("early run_policy reply is structured");
+        assert_eq!(structured["status"], "unreliable");
+        assert_eq!(structured["exit_status"], 2);
+        assert_eq!(
+            structured["report"]["diagnostics"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(structured["report"]["rules"], json!([]));
+        assert_eq!(structured["report"]["runs"], json!([]));
+        let stages = structured["report"]["execution"]["stage_timings"]
+            .as_array()
+            .expect("stage timings");
+        assert!(
+            stages
+                .iter()
+                .any(|timing| timing["stage"] == "suppression_preflight")
+        );
+        assert!(
+            stages
+                .iter()
+                .all(|timing| timing["stage"] != "workspace_snapshot")
+        );
     }
 
     #[test]

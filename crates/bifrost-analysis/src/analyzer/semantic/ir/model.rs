@@ -2,8 +2,9 @@ use std::fmt;
 
 use super::super::capabilities::SemanticCapability;
 use super::super::ids::{
-    AllocationId, BlockId, CallSiteId, CaptureId, EvidenceId, MemoryLocationId, ProcedureId,
-    ProgramPointId, SemanticGapId, SemanticLocator, SourceMappingId, ValueId,
+    AllocationId, BlockId, CallSiteId, CaptureId, EvidenceId, GuardId, MemoryLocationId,
+    ProcedureId, ProgramPointId, SemanticGapId, SemanticLocator, SourceMappingId, StableDigest,
+    ValueId,
 };
 use super::super::provider::SemanticBudgetExceeded;
 pub use crate::analyzer::DispatchExtensibility;
@@ -32,6 +33,7 @@ pub enum SemanticIrErrorKind {
     AsyncContract,
     GapContract,
     DuplicateEdge,
+    GuardContract,
 }
 
 impl SemanticIrErrorKind {
@@ -58,6 +60,7 @@ impl SemanticIrErrorKind {
             Self::AsyncContract => "async_contract",
             Self::GapContract => "gap_contract",
             Self::DuplicateEdge => "duplicate_edge",
+            Self::GuardContract => "guard_contract",
         }
     }
 }
@@ -687,7 +690,7 @@ pub enum ProofStatus {
 }
 
 impl ProofStatus {
-    pub(crate) fn retained_heap_bytes(&self) -> usize {
+    pub fn retained_heap_bytes(&self) -> usize {
         match self {
             Self::Proven => 0,
             Self::Unproven(reason) => reason.len(),
@@ -716,7 +719,7 @@ pub enum EvidenceCompleteness {
 }
 
 impl EvidenceCompleteness {
-    pub(crate) fn retained_heap_bytes(&self) -> usize {
+    pub fn retained_heap_bytes(&self) -> usize {
         match self {
             Self::Complete => 0,
             Self::Partial(reason) => reason.len(),
@@ -912,7 +915,10 @@ impl SemanticGapImpacts {
             SemanticCapability::NormalControlFlow
             | SemanticCapability::ExceptionalControlFlow
             | SemanticCapability::CleanupControlFlow
-            | SemanticCapability::NonLocalControl => Self::CONTROL_FLOW,
+            | SemanticCapability::NonLocalControl
+            // An unnormalized guard leaves open which successor executes, so
+            // its downstream consequences are the control-flow ones.
+            | SemanticCapability::GuardFacts => Self::CONTROL_FLOW,
             SemanticCapability::Assignments
             | SemanticCapability::Values
             | SemanticCapability::LocalFlow
@@ -1258,6 +1264,117 @@ pub struct ControlEdge {
     pub source: SourceMappingId,
     pub evidence: EvidenceId,
 }
+
+/// A stable digest over the shape of a condition a lowerer declined to
+/// normalize.
+///
+/// The only ingredient is the adapter's own structured classification of the
+/// condition -- its grammar node kind -- never its source text. Two opaque
+/// guards therefore agree exactly when their lowerers classified the syntax the
+/// same way, and the IR carries no language-specific vocabulary of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GuardConditionDigest(u64);
+
+impl GuardConditionDigest {
+    pub fn from_syntax_kind(kind: &str) -> Self {
+        let digest = StableDigest::sha256(kind);
+        let mut head = [0_u8; 8];
+        head.copy_from_slice(&digest.as_bytes()[..8]);
+        Self(u64::from_le_bytes(head))
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// The normalized meaning of one decision point's condition (issue #2443).
+///
+/// A lowerer publishes a predicate only when its own structured syntax
+/// establishes the shape. Anything it represents but cannot normalize is
+/// `Opaque`; anything it does not represent at all publishes no row, and the
+/// [`SemanticCapability::GuardFacts`] entry in the adapter's capability table
+/// is what says which of the two an absent row means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GuardPredicate {
+    /// The condition is a compile-time constant.
+    ///
+    /// Recorded even when lowering folded the dead arm away: the fold is
+    /// exactly the evidence no consumer can recover from the frozen CFG, so
+    /// destroying it silently is the defect this variant exists to repair.
+    ConstantBoolean { value: bool },
+    /// The condition compares the subject against the language's null value.
+    /// `null_on_true` states which arm a null subject takes.
+    NullComparison { null_on_true: bool },
+    /// The condition compares the subject against a constant value.
+    /// `negated` distinguishes an inequality from an equality.
+    ConstantEquality { negated: bool, constant: ValueId },
+    /// The decision is represented, but its condition was not normalizable.
+    Opaque { digest: GuardConditionDigest },
+}
+
+impl GuardPredicate {
+    /// The value domain the `guard.predicate` row field publishes
+    /// (issue #2515), in variant order.
+    pub const LABELS: &'static [&'static str] = &[
+        "constant_boolean",
+        "null_comparison",
+        "constant_equality",
+        "opaque",
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ConstantBoolean { .. } => "constant_boolean",
+            Self::NullComparison { .. } => "null_comparison",
+            Self::ConstantEquality { .. } => "constant_equality",
+            Self::Opaque { .. } => "opaque",
+        }
+    }
+
+    /// The value the predicate proves the condition always takes, when it
+    /// proves one at all.
+    pub const fn constant_value(self) -> Option<bool> {
+        match self {
+            Self::ConstantBoolean { value } => Some(value),
+            Self::NullComparison { .. } | Self::ConstantEquality { .. } | Self::Opaque { .. } => {
+                None
+            }
+        }
+    }
+}
+
+/// One successor arm of a guarded decision, named the way a lowerer knows it.
+///
+/// Control-edge IDs are assigned when the canonical edge table is sorted at
+/// freeze time, so a lowering-time row cannot carry one. The destination and
+/// edge kind are what the lowerer chose and are together unique among one
+/// point's outgoing edges, which is what makes the freeze-time resolution to a
+/// [`ControlEdgeId`] exact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GuardArm {
+    pub target_point: ProgramPointId,
+    pub kind: ControlEdgeKind,
+}
+
+/// One normalized decision-point condition, as construction parts.
+///
+/// An arm is `None` when the lowerer emitted no edge for it. That is the
+/// ordinary shape of a folded constant condition -- `if (false)` has no true
+/// arm at all -- and it is the whole reason the predicate has to be recorded
+/// separately from the topology.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GuardFactParts {
+    pub id: GuardId,
+    pub point: ProgramPointId,
+    pub subject: Option<ValueId>,
+    pub predicate: GuardPredicate,
+    pub true_arm: Option<GuardArm>,
+    pub false_arm: Option<GuardArm>,
+    pub source: SourceMappingId,
+    pub evidence: EvidenceId,
+}
+
 /// Mutable construction parts. Once accepted by
 /// [`crate::analyzer::semantic::SemanticArtifact::try_new`],
 /// every collection is boxed and only shared immutably.
@@ -1281,6 +1398,7 @@ pub struct ProcedureSemanticsParts {
     pub blocks: Vec<BasicBlock>,
     pub points: Vec<ProgramPoint>,
     pub control_edges: Vec<ControlEdge>,
+    pub guard_facts: Vec<GuardFactParts>,
 }
 
 impl ProcedureSemanticsParts {
@@ -1310,6 +1428,7 @@ impl ProcedureSemanticsParts {
             blocks: Vec::new(),
             points: Vec::new(),
             control_edges: Vec::new(),
+            guard_facts: Vec::new(),
         }
     }
 }

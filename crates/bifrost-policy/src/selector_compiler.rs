@@ -9,16 +9,16 @@ use brokk_bifrost_analysis::analyzer::semantic::{
     EvidenceCompleteness, ProofStatus, SemanticArtifact, SemanticBudget, SemanticBudgetDimension,
     SemanticExecutionBudget, SemanticRequest, SemanticWork,
 };
-use brokk_bifrost_analysis::analyzer::structural::search::{
+use brokk_bifrost_analysis::analyzer::{ProjectFile, Range, WorkspaceAnalyzer};
+use brokk_bifrost_rql::structural::search::{
     DetailedCodeQueryDomain, execute_code_query_detailed_eager_index,
 };
-use brokk_bifrost_analysis::analyzer::structural::{
+use brokk_bifrost_rql::structural::{
     CodeQueryCompletion, CodeQueryDiagnosticCode, CodeQueryExecutionLimits, CodeQueryExecutionWork,
     CodeQueryResultItem, CodeQueryResultValue, CodeQuerySemanticCompleteness,
     CodeQuerySemanticEvidence, CodeQuerySemanticLimits, CodeQuerySemanticProof,
-    CodeQuerySemanticWork,
+    CodeQuerySemanticRowLimits, CodeQuerySemanticWork,
 };
-use brokk_bifrost_analysis::analyzer::{ProjectFile, Range, WorkspaceAnalyzer};
 use brokk_bifrost_rql::{CallInputSelector, QueryStep};
 
 #[derive(Debug)]
@@ -564,18 +564,17 @@ impl<'a> PolicySelectorSession<'a> {
     /// The current region's charge against each per-region lane, as
     /// `(largest row dimension, retained bytes, traversal steps)`.
     ///
-    /// One `max_rows_per_dimension` bounds every row dimension, so the charge
-    /// that lane must exceed is the largest of them, not any single dimension.
+    /// This calibrates `PolicyBudget`'s row lane, and that lane is one
+    /// uniform `max_rows_per_dimension` granted to every row dimension, so
+    /// the charge it must exceed is the largest single dimension's, not any
+    /// one dimension's on its own. Queries inside the region are now capped
+    /// per dimension from this budget's own remainders (#2523), but what is
+    /// being calibrated here is still the uniform grant those remainders
+    /// start from.
     fn live_region_peaks(&self) -> (usize, usize, usize) {
         let used = self.semantic_budget.used();
-        let row_peak = SemanticBudgetDimension::ALL
+        let row_peak = CodeQuerySemanticRowLimits::ROW_DIMENSIONS
             .into_iter()
-            .filter(|dimension| {
-                !matches!(
-                    dimension,
-                    SemanticBudgetDimension::SourceBytes | SemanticBudgetDimension::OwnedTextBytes
-                )
-            })
             .map(|dimension| used.get(dimension))
             .max()
             .unwrap_or(0);
@@ -586,6 +585,24 @@ impl<'a> PolicySelectorSession<'a> {
         )
     }
 
+    /// What one more selector query may spend, taken from this session's own
+    /// shared ledger.
+    ///
+    /// The row lanes are published per dimension rather than collapsed. They
+    /// deplete at wildly different rates -- `nested_entries` is a census of
+    /// every artifact's nested collections and also the dispatch walk's
+    /// exploration lane, while `procedures` counts one row per procedure --
+    /// so one whole-workspace bind can legitimately spend most of the first
+    /// while barely touching the second. Reporting the minimum of the
+    /// remainders as a uniform cap made every later query in the session run
+    /// against the most depleted lane: on google/gson, reference policy B's
+    /// second bind published verdicts for 6 of its 98 marked procedures
+    /// before it stopped (#2523). Each dimension now carries its own
+    /// remainder, so a drained lane bounds itself and nothing else.
+    ///
+    /// The uniform scalar stays populated with the minimum. It is not read
+    /// while the table is present, and the minimum is the value that cannot
+    /// overrun any lane if some later consumer reads it alone.
     fn remaining_query_limits(
         &self,
     ) -> Result<CodeQueryExecutionLimits, PolicySelectorSessionError> {
@@ -595,20 +612,16 @@ impl<'a> PolicySelectorSession<'a> {
                 .semantic_execution_budget
                 .remaining_materialized_files(),
             max_source_bytes: semantic_remaining.source_bytes,
-            max_rows_per_dimension: SemanticBudgetDimension::ALL
+            max_rows_per_dimension: CodeQuerySemanticRowLimits::ROW_DIMENSIONS
                 .into_iter()
-                .filter(|dimension| {
-                    !matches!(
-                        dimension,
-                        SemanticBudgetDimension::SourceBytes
-                            | SemanticBudgetDimension::OwnedTextBytes
-                    )
-                })
                 .map(|dimension| semantic_remaining.get(dimension))
                 .min()
                 .unwrap_or(0),
             max_retained_bytes: semantic_remaining.owned_text_bytes,
             max_traversal_steps: self.remaining_semantic_traversal_steps()?,
+            rows_per_dimension: Some(CodeQuerySemanticRowLimits::from_rows(|dimension| {
+                semantic_remaining.get(dimension)
+            })),
         };
         if !semantic.all_positive() {
             return Err(semantic_budget_error(format!(
@@ -701,22 +714,23 @@ fn semantic_budget_error(detail: impl Into<String>) -> PolicySelectorSessionErro
 }
 
 pub(super) fn semantic_work_limits(limits: CodeQuerySemanticLimits) -> SemanticWork {
+    use SemanticBudgetDimension as Dimension;
     SemanticWork {
         source_bytes: limits.max_source_bytes,
-        procedures: limits.max_rows_per_dimension,
-        blocks: limits.max_rows_per_dimension,
-        program_points: limits.max_rows_per_dimension,
-        values: limits.max_rows_per_dimension,
-        allocations: limits.max_rows_per_dimension,
-        call_sites: limits.max_rows_per_dimension,
-        memory_locations: limits.max_rows_per_dimension,
-        captures: limits.max_rows_per_dimension,
-        source_mappings: limits.max_rows_per_dimension,
-        evidence: limits.max_rows_per_dimension,
-        gaps: limits.max_rows_per_dimension,
-        events: limits.max_rows_per_dimension,
-        control_edges: limits.max_rows_per_dimension,
-        nested_entries: limits.max_rows_per_dimension,
+        procedures: limits.rows(Dimension::Procedures),
+        blocks: limits.rows(Dimension::Blocks),
+        program_points: limits.rows(Dimension::ProgramPoints),
+        values: limits.rows(Dimension::Values),
+        allocations: limits.rows(Dimension::Allocations),
+        call_sites: limits.rows(Dimension::CallSites),
+        memory_locations: limits.rows(Dimension::MemoryLocations),
+        captures: limits.rows(Dimension::Captures),
+        source_mappings: limits.rows(Dimension::SourceMappings),
+        evidence: limits.rows(Dimension::Evidence),
+        gaps: limits.rows(Dimension::Gaps),
+        events: limits.rows(Dimension::Events),
+        control_edges: limits.rows(Dimension::ControlEdges),
+        nested_entries: limits.rows(Dimension::NestedEntries),
         owned_text_bytes: limits.max_retained_bytes,
     }
 }
@@ -783,6 +797,42 @@ pub(super) fn selected_site_quality(
             CodeQueryResultValue::FlowRelation { value } => (
                 ProofStatus::Proven,
                 flow_state_completeness(value.completeness, &value.uncovered_axes),
+            ),
+            // A control-relation row states its own per-relation completeness
+            // the same way, so a derivation whose budget ran out makes the
+            // selector's evidence partial rather than silently complete
+            // (#2443).
+            CodeQueryResultValue::ControlRelation { value } => (
+                ProofStatus::Proven,
+                control_relation_completeness(value.completeness, &value.uncovered_relations),
+            ),
+            // A guard row carries the IR evidence of the decision it records,
+            // so an unproven or partial lowering makes the selector's evidence
+            // unproven or partial rather than silently clean (#2443).
+            CodeQueryResultValue::Guard { value } => (
+                proof_from_label(value.proof),
+                if value.completeness == "complete" {
+                    EvidenceCompleteness::Complete
+                } else {
+                    EvidenceCompleteness::Partial(
+                        "guard lowering evidence is partial".into(),
+                    )
+                },
+            ),
+            // A topology row states its own completeness the same way: a build
+            // model nobody could read in full makes the selector's evidence
+            // partial rather than silently complete (#2448).
+            CodeQueryResultValue::SourceSet { value } => (
+                ProofStatus::Proven,
+                topology_completeness(value.completeness),
+            ),
+            CodeQueryResultValue::BuildTarget { value } => (
+                ProofStatus::Proven,
+                topology_completeness(value.completeness),
+            ),
+            CodeQueryResultValue::TopologyEdge { value } => (
+                ProofStatus::Proven,
+                topology_completeness(value.completeness),
             ),
             // A rewrite-path row states its own per-domain completeness the
             // same way, so a derivation that could not run makes the
@@ -1040,6 +1090,33 @@ fn rewrite_path_completeness(
     }
 }
 
+fn topology_completeness(completeness: &str) -> EvidenceCompleteness {
+    if completeness == "complete" {
+        EvidenceCompleteness::Complete
+    } else {
+        EvidenceCompleteness::Partial(
+            "the workspace's declared build topology was not read in full".into(),
+        )
+    }
+}
+
+fn control_relation_completeness(
+    completeness: &str,
+    uncovered_relations: &[&'static str],
+) -> EvidenceCompleteness {
+    if completeness == "complete" {
+        EvidenceCompleteness::Complete
+    } else {
+        EvidenceCompleteness::Partial(
+            format!(
+                "control-relation derivation does not cover [{}]",
+                uncovered_relations.join(", ")
+            )
+            .into(),
+        )
+    }
+}
+
 fn proof_from_label(label: &str) -> ProofStatus {
     if label == "proven" {
         ProofStatus::Proven
@@ -1067,4 +1144,132 @@ pub(super) fn parameter_name_matches(name: &str, expected: &str) -> bool {
     name == expected
         || name.strip_prefix('$') == Some(expected)
         || expected.strip_prefix('$') == Some(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::PolicyBudget;
+    use brokk_bifrost_analysis::analyzer::{
+        AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer,
+    };
+
+    fn one_file_workspace() -> (tempfile::TempDir, WorkspaceAnalyzer) {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        std::fs::write(
+            directory.path().join("subject.py"),
+            "def subject():\n    pass\n",
+        )
+        .expect("fixture source");
+        let project: Arc<dyn Project> =
+            Arc::new(FilesystemProject::new(directory.path()).expect("fixture project"));
+        let workspace = WorkspaceAnalyzer::build_ephemeral(
+            project,
+            AnalyzerConfig {
+                parallelism: Some(1),
+                ..AnalyzerConfig::default()
+            },
+        )
+        .expect("an analyzer over the fixture");
+        (directory, workspace)
+    }
+
+    /// Issue #2523. The lanes of the shared semantic ledger deplete at wildly
+    /// different rates, so one bind that legitimately spends most of
+    /// `nested_entries` must not cap every other dimension of every later
+    /// query at what is left of that one lane.
+    #[test]
+    fn a_drained_lane_caps_itself_and_no_other_dimension() {
+        let (_directory, workspace) = one_file_workspace();
+        let cancellation = CancellationToken::default();
+        let budget = PolicyBudget::default();
+        let rows = budget.query_limits().semantic.max_rows_per_dimension;
+        let mut session = PolicySelectorSession::new(
+            &workspace,
+            "test",
+            budget.query_limits(),
+            64,
+            &cancellation,
+        );
+
+        session
+            .charge_query_semantic_work(CodeQuerySemanticWork {
+                nested_entries: rows as u64 - 1,
+                procedures: 1,
+                ..CodeQuerySemanticWork::default()
+            })
+            .expect("the charge fits the fresh ledger");
+
+        let semantic = session
+            .remaining_query_limits()
+            .expect("one drained lane does not exhaust the session")
+            .semantic;
+        assert_eq!(semantic.rows(SemanticBudgetDimension::NestedEntries), 1);
+        assert_eq!(semantic.rows(SemanticBudgetDimension::Procedures), rows - 1);
+        for dimension in CodeQuerySemanticRowLimits::ROW_DIMENSIONS {
+            if matches!(
+                dimension,
+                SemanticBudgetDimension::NestedEntries | SemanticBudgetDimension::Procedures
+            ) {
+                continue;
+            }
+            assert_eq!(
+                semantic.rows(dimension),
+                rows,
+                "an untouched lane keeps its whole remainder: {dimension:?}"
+            );
+        }
+    }
+
+    /// The other half of the same contract: the guard still fires when the
+    /// session really has nothing left, so an exhausted compile reports the
+    /// budget rather than quietly returning fewer rows.
+    #[test]
+    fn a_fully_spent_ledger_still_reports_the_semantic_budget() {
+        let (_directory, workspace) = one_file_workspace();
+        let cancellation = CancellationToken::default();
+        let budget = PolicyBudget::default();
+        let rows = budget.query_limits().semantic.max_rows_per_dimension as u64;
+        let mut session = PolicySelectorSession::new(
+            &workspace,
+            "test",
+            budget.query_limits(),
+            64,
+            &cancellation,
+        );
+
+        session
+            .charge_query_semantic_work(CodeQuerySemanticWork {
+                procedures: rows,
+                blocks: rows,
+                program_points: rows,
+                values: rows,
+                allocations: rows,
+                call_sites: rows,
+                memory_locations: rows,
+                captures: rows,
+                source_mappings: rows,
+                evidence: rows,
+                gaps: rows,
+                events: rows,
+                control_edges: rows,
+                nested_entries: rows,
+                ..CodeQuerySemanticWork::default()
+            })
+            .expect("the charge exactly fills every row lane");
+
+        let error = session
+            .remaining_query_limits()
+            .expect_err("a spent ledger cannot admit another query");
+        assert!(
+            matches!(
+                error,
+                PolicySelectorSessionError::Incomplete {
+                    completion: CodeQueryCompletion::Incomplete { ref codes },
+                    ..
+                } if codes.contains(&CodeQueryDiagnosticCode::SemanticBudgetExhausted)
+            ),
+            "{error:?}"
+        );
+    }
 }

@@ -681,10 +681,9 @@ fn ruby_method_return_receiver_type(
     receiver: &ReceiverType,
     method_name: &str,
 ) -> Option<ReceiverType> {
-    // The one reader of the analyzer's global definition index on this path, and
-    // the reason `RubyGraphSource::definitions` is a callback: the index builds
-    // on first access, and the diagnostics pass builds a `RubySemanticIndex`
-    // that never reaches here.
+    // The callback keeps the borrowed request-local definition lookup scoped to
+    // the synchronous resolution that actually needs it. The diagnostics pass
+    // builds a `RubySemanticIndex` but never reaches this path.
     let mut candidates = Vec::new();
     (semantic.graph.definitions)(&mut |support| {
         candidates =

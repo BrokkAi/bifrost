@@ -25,7 +25,6 @@ pub use external::{
     ComposerPackagePackProducer, ComposerPinnedAutoloadRule, PhpDependencyPackAdapter,
 };
 
-use crate::analyzer::QueryScope;
 use crate::analyzer::QueryToken;
 use crate::analyzer::clone_detection::{
     CloneCandidateProfile, detect_structural_clone_smells, refine_clone_similarity_with_ast,
@@ -46,7 +45,7 @@ use crate::analyzer::usages::get_definition::{
 use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_php_type_bounded};
 use crate::analyzer::usages::php_graph::{
     PhpDeadCodeBulkEligibility, PhpUsageGraphStrategy, build_php_usage_edge_weights,
-    build_php_usage_edges, dead_code_bulk_eligibility,
+    build_php_usage_edges, build_rooted_php_usage_edges, dead_code_bulk_eligibility,
 };
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::weighted_cache::{build_weighted_cache, weight_code_unit_vec_by_unit};
@@ -55,8 +54,8 @@ use crate::analyzer::{
     DescendantIndexVariant, DirectDescendantIndex, ForwardQueryProvider, IAnalyzer,
     KeyedPoolSafeMemo, Language, Project, ProjectFile, Range, SignatureMetadata,
     TestAssertionSmell, TestAssertionWeights, TestDetectionProvider, TreeSitterAnalyzer,
-    TypeHierarchyProvider, UsageFactsIndex, build_direct_descendant_index,
-    descendants_from_variant_index, resolve_analyzer,
+    TypeHierarchyProvider, build_direct_descendant_index, descendants_from_variant_index,
+    resolve_analyzer,
 };
 use crate::hash::{HashMap, HashSet};
 use crate::{CloneSmell, CloneSmellWeights};
@@ -481,6 +480,8 @@ impl CodeUnitIndex for PhpAnalyzer {
 }
 
 impl IAnalyzer for PhpAnalyzer {
+    crate::analyzer::i_analyzer::forward_relational_definition_batch!();
+
     fn invalidate_cached_file_identities(&self) {
         self.inner.invalidate_cached_file_identities();
     }
@@ -522,25 +523,20 @@ impl IAnalyzer for PhpAnalyzer {
         self.inner.workspace_file_index_cell()
     }
 
-    fn global_usage_definition_index(&self) -> crate::analyzer::DefinitionIndexHandle<'_> {
-        // Trait signature is fixed, so this boundary opens the scope the
-        // usage-graph funnel now demands proof of (issue #2423 milestone B).
-        let scope = crate::analyzer::AnalyzerQueryScope::new(self);
-        self.inner.global_usage_definition_index(scope.token())
-    }
-
-    fn usage_facts_index(&self) -> &UsageFactsIndex {
-        self.inner.usage_facts_index()
-    }
-
-    fn structural_search_providers(
+    fn structural_fact_providers(
         &self,
-    ) -> Vec<&dyn crate::analyzer::structural::StructuralSearchProvider> {
-        self.inner.structural_search_providers()
+    ) -> Vec<&dyn crate::analyzer::structural::StructuralFactProvider> {
+        self.inner.structural_fact_providers()
     }
 
     fn snapshot_caches(&self) -> Option<&crate::analyzer::AnalyzerSnapshotCaches> {
         Some(self.inner.snapshot_caches())
+    }
+
+    fn workspace_content_identities(
+        &self,
+    ) -> Option<crate::analyzer::content_identity::WorkspaceContentIdentities> {
+        self.inner.workspace_content_identities()
     }
 
     fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
@@ -685,18 +681,6 @@ impl IAnalyzer for PhpAnalyzer {
 
 #[cfg(any(test, feature = "test-support"))]
 impl crate::analyzer::AnalyzerTestHooks for PhpAnalyzer {
-    fn reset_global_usage_definition_index_build_count_for_test(&self) {
-        self.inner
-            .test_hooks()
-            .reset_global_usage_definition_index_build_count_for_test();
-    }
-
-    fn global_usage_definition_index_build_count_for_test(&self) -> usize {
-        self.inner
-            .test_hooks()
-            .global_usage_definition_index_build_count_for_test()
-    }
-
     fn reset_full_declaration_scan_count_for_test(&self) {
         self.inner
             .test_hooks()
@@ -831,7 +815,7 @@ impl LanguageEdgePass for PhpEdgePass {
     }
 
     fn edge_sites(&self, ctx: &EdgeSiteScanCtx<'_>) -> Option<LanguageEdgeSites> {
-        build_php_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file).map(LanguageEdgeSites)
+        build_rooted_php_usage_edges(ctx.analyzer, ctx.fqns, ctx.keep_file).map(LanguageEdgeSites)
     }
 
     fn edge_weights(&self, ctx: &EdgeWeightScanCtx<'_>) -> Option<LanguageEdgeWeights> {
