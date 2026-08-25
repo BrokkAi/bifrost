@@ -15,7 +15,10 @@ use crate::analyzer::structural::{
 };
 use crate::analyzer::usages::applicability::{ApplicabilityOutcome, CandidateApplicability};
 use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
-use crate::analyzer::{ImportInfo, SignatureMetadata, StructuredImportPath, StructuredImportScope};
+use crate::analyzer::{
+    ForwardQueryProvider, ImportInfo, SignatureMetadata, StructuredImportPath,
+    StructuredImportScope,
+};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::structural::callable::ApplicabilityVerdict;
 use brokk_bifrost_core::analyzer::structural::callable::CallableRejectionReason;
@@ -242,15 +245,30 @@ impl ScalaLookupCache {
 
 pub(crate) struct ScalaDefinitionProvider<'a> {
     scala: &'a ScalaAnalyzer,
+    java: Option<&'a JavaAnalyzer>,
     session: &'a ResolutionSession,
 }
 
 impl<'a> ScalaDefinitionProvider<'a> {
-    pub(crate) fn new(scala: &'a ScalaAnalyzer, session: &'a ResolutionSession) -> Self {
-        Self { scala, session }
+    pub(crate) fn new(
+        scala: &'a ScalaAnalyzer,
+        java: Option<&'a JavaAnalyzer>,
+        session: &'a ResolutionSession,
+    ) -> Self {
+        Self {
+            scala,
+            java,
+            session,
+        }
     }
 
     fn direct_children(&self, owner: &CodeUnit) -> Vec<CodeUnit> {
+        if owner.source().language() == Language::Java {
+            return self
+                .java
+                .map(|java| self.session.query_rows(|| java.direct_children(owner)))
+                .unwrap_or_default();
+        }
         self.session
             .query_limited_rows(|limit| self.scala.direct_children_limited(owner, limit))
     }
@@ -261,11 +279,23 @@ impl<'a> ScalaDefinitionProvider<'a> {
     }
 
     fn ranges(&self, unit: &CodeUnit) -> Vec<Range> {
+        if unit.source().language() == Language::Java {
+            return self
+                .java
+                .map(|java| self.session.query_rows(|| java.ranges(unit)))
+                .unwrap_or_default();
+        }
         self.session
             .query_limited_rows(|limit| self.scala.ranges_limited(unit, limit))
     }
 
     fn signature_metadata(&self, unit: &CodeUnit) -> Vec<SignatureMetadata> {
+        if unit.source().language() == Language::Java {
+            return self
+                .java
+                .map(|java| self.session.query_rows(|| java.signature_metadata(unit)))
+                .unwrap_or_default();
+        }
         self.session
             .query_limited_rows(|limit| self.scala.signature_metadata_limited(unit, limit))
     }
@@ -339,13 +369,23 @@ impl BoundedDefinitionLookup for ScalaDefinitionProvider<'_> {
     }
 
     fn fqn_in_language(&self, fqn: &str, language: Language) -> Vec<CodeUnit> {
-        if language == Language::Scala {
-            self.fqn(fqn)
-        } else {
-            // The bounded receiver path does not materialize another
-            // language's provider speculatively. An absent cross-language
-            // candidate is a resolution boundary, not resource exhaustion.
-            Vec::new()
+        match language {
+            Language::Scala => self.fqn(fqn),
+            Language::Java => {
+                let Some(java) = self.java else {
+                    return Vec::new();
+                };
+                let mut units = self.session.query_rows(|| java.forward_definition_fqn(fqn));
+                sort_units(&mut units);
+                units.dedup();
+                units
+            }
+            _ => {
+                // The bounded receiver path does not materialize another
+                // language's provider speculatively. An absent cross-language
+                // candidate is a resolution boundary, not resource exhaustion.
+                Vec::new()
+            }
         }
     }
 
@@ -359,10 +399,7 @@ impl BoundedDefinitionLookup for ScalaDefinitionProvider<'_> {
     fn fqn_direct_children(&self, fqn: &str) -> Vec<CodeUnit> {
         let mut children = Vec::new();
         for owner in self.fqn(fqn) {
-            children.extend(
-                self.session
-                    .query_limited_rows(|limit| self.scala.direct_children_limited(&owner, limit)),
-            );
+            children.extend(self.direct_children(&owner));
             if !self.session.observe_cancellation() {
                 return Vec::new();
             }
@@ -976,12 +1013,12 @@ impl<'a> ForwardScalaNameResolver<'a> {
                             }),
                     );
                 }
-                selected.sort();
-                selected.dedup();
                 if !selected.is_empty() {
                     break;
                 }
             }
+            selected.sort();
+            selected.dedup();
             if selected.len() > 1 {
                 return ScalaNameResolution::Ambiguous(selected);
             }
@@ -1319,7 +1356,8 @@ pub(crate) fn resolve_scala_bounded(
             "Scala analyzer is unavailable",
         ));
     };
-    let support = ScalaDefinitionProvider::new(scala, &session);
+    let java = resolve_analyzer::<JavaAnalyzer>(analyzer);
+    let support = ScalaDefinitionProvider::new(scala, java, &session);
     let batch = bounded_scala_definition_context(scala, token, file, &session);
     let walk = ScalaBoundedWalk::new(&session);
     let outcome = bounded_scala_definition_resolution(
@@ -2528,6 +2566,7 @@ fn bounded_scala_resolve_segments(
         return None;
     }
     let mut candidate_fqns = Vec::new();
+    let mut java_candidate_fqns = HashSet::default();
     let root_name = &segments[0];
     for import in ctx.batch.imports.iter().filter(|import| {
         scala_import_visible_at(
@@ -2553,7 +2592,9 @@ fn bounded_scala_resolve_segments(
                 } else {
                     format!("{prefix}.{}", path.render_segments("."))
                 };
-                candidate_fqns.extend(scala_nested_type_candidates(base, segments, true));
+                let imported = scala_nested_type_candidates(base, segments, true);
+                java_candidate_fqns.extend(imported.iter().cloned());
+                candidate_fqns.extend(imported);
             }
             continue;
         }
@@ -2565,7 +2606,9 @@ fn bounded_scala_resolve_segments(
         }
         let mut imported_segments = path.segments.clone();
         imported_segments.extend_from_slice(&segments[1..]);
-        candidate_fqns.push(imported_segments.join("."));
+        let imported = imported_segments.join(".");
+        java_candidate_fqns.insert(imported.clone());
+        candidate_fqns.push(imported);
     }
     for prefix in ctx
         .package_prefixes
@@ -2574,11 +2617,11 @@ fn bounded_scala_resolve_segments(
         .map(String::as_str)
         .chain(std::iter::once(""))
     {
-        candidate_fqns.extend(scala_nested_type_candidates(
-            prefix.to_string(),
-            segments,
-            false,
-        ));
+        let package_candidates = scala_nested_type_candidates(prefix.to_string(), segments, false);
+        if segments.len() > 1 {
+            java_candidate_fqns.extend(package_candidates.iter().cloned());
+        }
+        candidate_fqns.extend(package_candidates);
     }
     if segments.len() == 1 {
         candidate_fqns.extend(scala_nested_type_candidates(
@@ -2605,6 +2648,14 @@ fn bounded_scala_resolve_segments(
                 .into_iter()
                 .filter(|unit| unit.is_class() && unit.fq_name() == fqn),
         );
+        if java_candidate_fqns.contains(&fqn) {
+            declarations.extend(
+                ctx.provider
+                    .fqn_in_language(&fqn, Language::Java)
+                    .into_iter()
+                    .filter(|unit| unit.is_class() && unit.fq_name() == fqn),
+            );
+        }
         if !ctx.walk.session.observe_cancellation() {
             return None;
         }
@@ -13495,7 +13546,7 @@ object Caller {
         let cancellation = CancellationToken::new();
         let session =
             ResolutionSession::bounded(ReceiverAnalysisBudget::default(), Some(&cancellation));
-        let provider = ScalaDefinitionProvider::new(scala, &session);
+        let provider = ScalaDefinitionProvider::new(scala, None, &session);
         let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
         let token = scope.token();
         let batch = bounded_scala_definition_context(scala, token, &file, &session);
@@ -13829,6 +13880,109 @@ object Caller {
             scope.tier_access_count(InformationTier::UsageGraph),
             0,
             "a bounded definition lookup must not build the workspace usage index"
+        );
+    }
+
+    #[test]
+    fn bounded_scala_provider_resolves_java_member_by_exact_fqn() {
+        const JAVA_SOURCE: &str = r#"
+package java.sql;
+
+public interface Statement {
+    boolean execute(String sql);
+}
+"#;
+        const SCALA_SOURCE: &str = r#"
+package app
+
+final class Caller {
+  def invoke(statement: java.sql.Statement): Boolean = {
+    statement.execute("select 1")
+  }
+}
+"#;
+        let fixture = AnalyzerFixture::new(&[
+            ("Statement.java", JAVA_SOURCE),
+            ("Caller.scala", SCALA_SOURCE),
+        ]);
+        let analyzer = fixture.analyzer.analyzer();
+        let scala = resolve_analyzer::<ScalaAnalyzer>(analyzer).expect("Scala analyzer");
+        let java = resolve_analyzer::<JavaAnalyzer>(analyzer).expect("Java analyzer");
+        let session = ResolutionSession::bounded(ReceiverAnalysisBudget::default(), None);
+        let provider = ScalaDefinitionProvider::new(scala, Some(java), &session);
+
+        let candidates = provider.fqn_in_language("java.sql.Statement.execute", Language::Java);
+
+        assert!(
+            candidates.iter().any(|candidate| {
+                candidate.fq_name() == "java.sql.Statement.execute"
+                    && candidate.source().language() == Language::Java
+            }),
+            "Scala's bounded provider must retain the exact Java member: {candidates:?}"
+        );
+        assert!(matches!(
+            session.finish(()),
+            BoundedResolution::Complete { .. }
+        ));
+    }
+
+    #[test]
+    fn bounded_scala_member_resolution_reaches_java_declaration() {
+        const JAVA_SOURCE: &str = r#"
+package java.sql;
+
+public interface Statement {
+    boolean execute(String sql);
+}
+"#;
+        const SCALA_SOURCE: &str = r#"
+import java.sql.Statement
+
+object JdbcCalls {
+  def statement(target: Statement, sql: String): Boolean = target.execute(sql)
+}
+"#;
+        let fixture = AnalyzerFixture::new(&[
+            ("java/sql/Statement.java", JAVA_SOURCE),
+            ("JdbcCalls.scala", SCALA_SOURCE),
+        ]);
+        let analyzer = fixture.analyzer.analyzer();
+        let file = ProjectFile::new(fixture.project_root(), "JdbcCalls.scala");
+        let tree = parse_scala(SCALA_SOURCE);
+        let start = SCALA_SOURCE.find("execute").expect("execute call");
+        let site = ResolvedReferenceSite {
+            path: rel_path_string(&file),
+            text: "execute".to_owned(),
+            range: Range {
+                start_byte: start,
+                end_byte: start + "execute".len(),
+                start_line: 3,
+                end_line: 3,
+            },
+            focus_start_byte: start,
+            focus_end_byte: start + "execute".len(),
+        };
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let outcome = resolve_scala_bounded(
+            analyzer,
+            scope.token(),
+            &file,
+            SCALA_SOURCE,
+            Some(&tree),
+            &site,
+            ReceiverAnalysisBudget::default(),
+            None,
+        );
+        let BoundedResolution::Complete { value, .. } = outcome else {
+            panic!("bounded Scala Java-member lookup did not complete: {outcome:#?}");
+        };
+        assert_eq!(value.status, DefinitionLookupStatus::Resolved, "{value:#?}");
+        assert!(
+            value.definitions.iter().any(|definition| {
+                definition.fq_name() == "java.sql.Statement.execute"
+                    && definition.source().language() == Language::Java
+            }),
+            "Scala member lookup must retain the exact Java declaration: {value:#?}"
         );
     }
 }

@@ -16,15 +16,15 @@ use crate::analyzer::semantic::{
     ContentIdentity, DeclarationLocator, DeclarationSegment, DeclarationSegmentKind,
     DispatchBoundary, DispatchBoundaryKind, DispatchCandidate, DispatchExtensibility,
     DispatchOracle, DispatchResult, EvidenceCompleteness, EvidenceHandle,
-    ExactExternalProcedureTarget, MemoryLocationKind, OracleLimits, OracleRelationArena,
-    OracleRelationId, OracleRelationOwner, OracleRelationRecord, OracleRelationSubject,
-    ProcedureHandle, ProcedureKind, ProcedureSemantics, ProofStatus, SemanticArtifact,
-    SemanticBudgetExceeded, SemanticCallSite, SemanticCapability, SemanticGap, SemanticGapImpact,
-    SemanticGapKind, SemanticGapSubject, SemanticLanguage, SemanticLocator, SemanticOutcome,
-    SemanticProviderError, SemanticRequest, SemanticRole, SemanticWork, SourceAnchor,
-    SourcePosition, SourceSpan, StableDigest, UnmaterializedExternalTarget, WorkspaceMountId,
-    WorkspaceRelativePath, split_canonical_qualified_callee, unmaterialized_external_mount,
-    unmaterialized_external_path,
+    ExactExternalFormalContract, ExactExternalProcedureTarget, MemoryLocationKind, OracleLimits,
+    OracleRelationArena, OracleRelationId, OracleRelationOwner, OracleRelationRecord,
+    OracleRelationSubject, ProcedureHandle, ProcedureKind, ProcedureSemantics, ProofStatus,
+    SemanticArtifact, SemanticBudgetExceeded, SemanticCallSite, SemanticCapability, SemanticGap,
+    SemanticGapImpact, SemanticGapKind, SemanticGapSubject, SemanticLanguage, SemanticLocator,
+    SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticRole, SemanticWork,
+    SourceAnchor, SourcePosition, SourceSpan, StableDigest, UnmaterializedExternalTarget,
+    WorkspaceMountId, WorkspaceRelativePath, split_canonical_qualified_callee,
+    unmaterialized_external_mount, unmaterialized_external_path,
 };
 use crate::analyzer::structural::resolution::MethodFamilyRelation;
 use crate::analyzer::usages::get_definition::{
@@ -2697,21 +2697,30 @@ fn exact_external_procedure_target(
     procedure: SemanticLocator,
     has_receiver: bool,
 ) -> Option<ExactExternalProcedureTarget> {
-    let mut metadata = analyzer.signature_metadata(definition).into_iter();
-    let parameter_count = u32::try_from(metadata.next()?.parameters().len()).ok()?;
-    if metadata
-        .any(|candidate| u32::try_from(candidate.parameters().len()).ok() != Some(parameter_count))
-    {
-        return None;
-    }
+    let formal_contract = agreed_external_formal_contract(analyzer.signature_metadata(definition))?;
     let symbol = format!("{}{}", definition.identifier(), definition.signature()?);
     ExactExternalProcedureTarget::new(
         artifact.clone(),
         procedure,
         symbol,
         has_receiver,
-        parameter_count,
+        formal_contract,
     )
+}
+
+fn agreed_external_formal_contract(
+    metadata: impl IntoIterator<Item = crate::analyzer::SignatureMetadata>,
+) -> Option<ExactExternalFormalContract> {
+    let mut agreed = None;
+    for candidate in metadata {
+        let candidate = ExactExternalFormalContract::from_metadata(&candidate)?;
+        match &agreed {
+            None => agreed = Some(candidate),
+            Some(existing) if existing == &candidate => {}
+            Some(_) => return None,
+        }
+    }
+    agreed
 }
 
 fn locator_for_definition(
@@ -2882,7 +2891,9 @@ mod tests {
         OracleLimitValues, OracleRelationKind, SemanticBudget, SemanticGapDischarge, SemanticGapId,
         SemanticGapImpact, SemanticGapImpacts,
     };
-    use crate::analyzer::{Language, ProjectFile};
+    use crate::analyzer::{
+        CallableArity, Language, ParameterMetadata, ProjectFile, SignatureMetadata,
+    };
     use crate::cancellation::CancellationToken;
     use crate::test_support::AnalyzerFixture;
 
@@ -2927,6 +2938,65 @@ mod tests {
 
     fn semantic_call_handle() -> crate::analyzer::semantic::CallSiteHandle {
         semantic_call_fixture().1
+    }
+
+    fn external_signature(
+        label: &str,
+        parameter_label: &str,
+        parameter_type: Option<&str>,
+    ) -> SignatureMetadata {
+        let metadata = SignatureMetadata::new(
+            label,
+            vec![ParameterMetadata::new(
+                parameter_label,
+                0,
+                parameter_label.len(),
+            )],
+        )
+        .with_callable_arity(CallableArity::exact(1));
+        match parameter_type {
+            Some(parameter_type) => {
+                metadata.with_callable_parameter_types(vec![parameter_type.to_owned()])
+            }
+            None => metadata,
+        }
+    }
+
+    #[test]
+    fn exact_external_formal_contract_collapses_equivalent_metadata() {
+        let contract = agreed_external_formal_contract([
+            external_signature("execute(String)", "value", Some("String")),
+            external_signature("execute(String)", "value", Some("String")),
+        ])
+        .expect("equivalent metadata is exact");
+
+        assert_eq!(contract.label(), "execute(String)");
+        assert_eq!(contract.parameter_count(), 1);
+        assert_eq!(contract.arity(), Some(CallableArity::exact(1)));
+        assert_eq!(contract.parameters()[0].label(), "value");
+        assert_eq!(contract.parameters()[0].declared_type(), Some("String"));
+        assert!(!contract.parameters()[0].optional());
+        assert!(!contract.parameters()[0].repeated());
+    }
+
+    #[test]
+    fn exact_external_formal_contract_rejects_same_arity_overloads() {
+        let contract = agreed_external_formal_contract([
+            external_signature("execute(String)", "value", Some("String")),
+            external_signature("execute(int)", "value", Some("int")),
+        ]);
+
+        assert!(contract.is_none());
+    }
+
+    #[test]
+    fn exact_external_formal_contract_rejects_missing_discriminators() {
+        let contract = agreed_external_formal_contract([
+            external_signature("execute(String)", "value", None),
+            external_signature("execute(String)", "value", Some("String")),
+        ]);
+
+        assert!(contract.is_none());
     }
 
     const EXTERNAL_CALL_SOURCE: &str = "import { work } from \"third-party\";\nexport function caller(): number { work(); return 1; }\n";

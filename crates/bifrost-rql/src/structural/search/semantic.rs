@@ -305,6 +305,7 @@ impl<'a> SemanticQueryContext<'a> {
                     ),
                     target_path: locator.path().as_str().to_string(),
                     target_unit: self.definition_for_locator(locator),
+                    exact_external_target: None,
                     // A dispatch candidate names a materialized procedure, so
                     // it never carries an unmaterialized identity.
                     unmaterialized_target: None,
@@ -330,6 +331,7 @@ impl<'a> SemanticQueryContext<'a> {
                     target_id: super::dispatch::target_identity(fingerprint.as_deref(), locator),
                     target_path: locator.path().as_str().to_string(),
                     target_unit: self.definition_for_locator(locator),
+                    exact_external_target: boundary.exact_external_target().cloned(),
                     // #1978: a fully-qualified callee the workspace never
                     // materializes still has a canonical member identity. It
                     // is the only way a consumer can key an activated pack

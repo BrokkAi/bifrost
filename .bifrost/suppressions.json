@@ -122,18 +122,6 @@
       "expires_at": null
     },
     {
-      "policy_id": "bifrost.performance.file-read-in-loop",
-      "finding_id": "f94e8f1a1cc064a54d62d567e2fc9515d9a5afc995ebc972228e49419a31ecff",
-      "path": "crates/bifrost-analysis/src/analyzer/benchmark_provenance.rs",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Loop iterates distinct files; one read per file is the intended operation and cannot be hoisted.",
-      "policy_hash_at_acceptance": "a1d83845a9a14d26d5c9de154727ac2cd32ca81365d1111bf966e209b4ed89c9",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
       "policy_id": "bifrost.performance.parsing-in-loop",
       "finding_id": "abf19512e9549af4b4d3353087c8a0d960541f48c29f113b12f2e1955de9993e",
       "path": "scripts/public/voyage_sidecar.py",
@@ -209,30 +197,6 @@
       "policy_id": "bifrost.performance.serialization-in-loop",
       "finding_id": "44a0e63ac251ccfe84741f809f989b07e9daf8dab467096b14bc88a1b4707bc3",
       "path": "crates/bifrost-analysis/src/analyzer/go/dependency_discovery.rs",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Each iteration serializes a distinct item; the serialization is inherent to the loop and cannot be hoisted.",
-      "policy_hash_at_acceptance": "da0b97c9fccd69df43320804e18b2325952a603f136ad01af388816b2a49a4b4",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.serialization-in-loop",
-      "finding_id": "538456d265fb67a34ed0f8c5aeb49e4f4a6953d08ddae5dea65440afdbce94fe",
-      "path": "crates/bifrost-analysis/src/analyzer/typestate/binding.rs",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Each iteration serializes a distinct item; the serialization is inherent to the loop and cannot be hoisted.",
-      "policy_hash_at_acceptance": "da0b97c9fccd69df43320804e18b2325952a603f136ad01af388816b2a49a4b4",
-      "accepted_by": "dbakereffendi",
-      "accepted_at": "2026-08-04",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.serialization-in-loop",
-      "finding_id": "63451b3ed6687fdbaac1364c9a8598e6b091f7ee2687cabbf659795b91c2051a",
-      "path": "crates/bifrost-analysis/src/analyzer/structural/search/mod.rs",
       "identity_stability": "strong",
       "status": "accepted",
       "reason": "Each iteration serializes a distinct item; the serialization is inherent to the loop and cannot be hoisted.",
@@ -467,30 +431,6 @@
       "policy_hash_at_acceptance": "b9a5b20ef0958dde7ee5b5065f825543b6de07fd75dbfd488c99d7a242b74695",
       "accepted_by": "codex",
       "accepted_at": "2026-08-11",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.loop-invariant-sort",
-      "finding_id": "4c603ec10c0b6ecedd922d9c659aafd2ac7d253375f2bb494baa6e1fdf9e3a1c",
-      "path": "crates/bifrost-analysis/src/analyzer/value_flow/client.rs",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Worklist idiom: the active-flow set is extended with newly generated flows on every rule view, and the sort is what makes the following dedup correct. The receiver is not re-established each iteration, so the rule is right that its value is loop-invariant by identity; the per-iteration canonicalization is semantically load-bearing and cannot be hoisted.",
-      "policy_hash_at_acceptance": "933ab0a333030b76e26fdc97b8139797a6d388fa258cabc9f7fdb50d1222fcf1",
-      "accepted_by": "jbellis",
-      "accepted_at": "2026-08-17",
-      "expires_at": null
-    },
-    {
-      "policy_id": "bifrost.performance.loop-invariant-sort",
-      "finding_id": "e2c1cc71f227d4296b76bf4cd244fbe952cd7064a91d4a41a921f70fa73bc32a",
-      "path": "crates/bifrost-analysis/src/analyzer/usages/get_definition/scala.rs",
-      "identity_stability": "strong",
-      "status": "accepted",
-      "reason": "Worklist idiom: each candidate prefix extends the selected-owner set, and the sort+dedup must run before the loop's own emptiness test decides whether to break. Hoisting the sort past the loop would change which candidate wins and would leave duplicates in the ambiguity verdict.",
-      "policy_hash_at_acceptance": "933ab0a333030b76e26fdc97b8139797a6d388fa258cabc9f7fdb50d1222fcf1",
-      "accepted_by": "jbellis",
-      "accepted_at": "2026-08-17",
       "expires_at": null
     },
     {

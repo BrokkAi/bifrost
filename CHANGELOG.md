@@ -5,7 +5,7 @@ analysis behavior, integrations, and release artifacts. It is curated from the
 complete private release range because the public open-core repository is a
 projection and its commit history does not contain every source commit.
 
-## [0.10.6] - Unreleased
+## [0.10.6] - 2026-08-25
 
 ### Added
 
@@ -41,6 +41,19 @@ projection and its commit history does not contain every source commit.
   semantic vector-scan worker pools for batch consumers.
 - GitHub Releases now use this curated version entry as their release notes
   instead of generating an incomplete list from projected pull requests.
+- Rust `Self` is no longer reported as a textual type reference to its nominal
+  owner. It still resolves associated members, return types, and constructors
+  inside an `impl`, but rename and reference results list only explicit
+  nominal-type tokens.
+- Scala find-usages of a base method no longer reports statically concrete
+  calls made through a subtype receiver; the overriding declaration is still
+  reported, so the family stays reachable in one hop. Case-class `copy` now
+  navigates to the case class itself while still carrying the generated-member
+  provenance that names the rule which produced it.
+- C# references to a `using` alias navigate to the written alias binder,
+  matching Roslyn go-to-definition. An alias whose target the workspace does
+  not index still reports the unresolvable import boundary rather than
+  resolving to a dead end.
 
 ### Fixed
 
@@ -56,6 +69,13 @@ projection and its commit history does not contain every source commit.
   declaration, including dollar-prefixed JavaScript names, Scala companions,
   and basename-qualified C/C++ selectors.
 - Included the sigil in static PHP property usage ranges.
+- Rejected a malformed `run_policy` suppression document during request
+  preparation, returning one bounded unreliable report instead of spending
+  workspace readiness and analyzer admission before failing.
+- Reported an orphaned policy suppression as its own structured cause with
+  re-key candidates, instead of mislabelling it as a finding at or above the
+  `fail-on` threshold. A scan run with `--fail-on never` no longer reports
+  threshold findings it did not have.
 
 ## [0.10.5] - 2026-08-21
 

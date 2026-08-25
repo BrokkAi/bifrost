@@ -16,7 +16,9 @@
 
 use super::*;
 
-use crate::analyzer::semantic::{CandidateCoverage, SemanticLocator, UnmaterializedExternalTarget};
+use crate::analyzer::semantic::{
+    CandidateCoverage, ExactExternalProcedureTarget, SemanticLocator, UnmaterializedExternalTarget,
+};
 
 /// Domain separator for one dispatch site's stable id.
 const DISPATCH_SITE_ID_DOMAIN: &[u8] = b"bifrost.code_query.dispatch_site.v1";
@@ -153,6 +155,11 @@ pub(super) struct DispatchArm {
     pub(super) target_id: String,
     pub(super) target_path: String,
     pub(super) target_unit: Option<CodeUnit>,
+    /// The resolver's exact semantic-pack declaration, including the
+    /// structured overload contract. Retained so other call relations consume
+    /// the same target answer and identity instead of repeating pack lookup or
+    /// reconstructing an overload from a display symbol.
+    pub(super) exact_external_target: Option<ExactExternalProcedureTarget>,
     /// The resolver's canonical identity for a fully-qualified callee that
     /// never materializes to an artifact (#1978), when this arm names one.
     ///

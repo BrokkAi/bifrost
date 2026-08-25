@@ -6,7 +6,7 @@ use crate::analyzer::usages::get_definition::{
 use crate::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget;
 use crate::analyzer::usages::reference_site::ResolvedReferenceSite;
 use crate::analyzer::{
-    BoundedDefinitionLookup, IAnalyzer, ProjectFile, ScalaAnalyzer, resolve_analyzer,
+    BoundedDefinitionLookup, IAnalyzer, JavaAnalyzer, ProjectFile, ScalaAnalyzer, resolve_analyzer,
 };
 use crate::cancellation::CancellationToken;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
@@ -30,7 +30,8 @@ pub(crate) fn resolve_scala_type_bounded(
             "Scala analyzer is unavailable",
         ));
     };
-    let support = ScalaDefinitionProvider::new(scala, &session);
+    let java = resolve_analyzer::<JavaAnalyzer>(analyzer);
+    let support = ScalaDefinitionProvider::new(scala, java, &session);
     let Some(tree) = tree else {
         return session.finish(no_type(
             "scala_parse_failed",

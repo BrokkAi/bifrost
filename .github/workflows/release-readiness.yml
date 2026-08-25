@@ -79,6 +79,13 @@ jobs:
           RELEASE_VERSION: ${{ inputs.version }}
         run: bash scripts/public/release-readiness-identity.sh
 
+      # The staged-binary policy smoke gates on a suppression record that no
+      # longer resolves, and it runs after the whole build matrix. The stale-path
+      # half of that is decidable here in seconds, before a crate compiles
+      # (#2334).
+      - name: Check suppression record paths
+        run: node scripts/public/check-suppression-paths.mjs
+
       - name: Validate synchronized release version
         id: release
         env:

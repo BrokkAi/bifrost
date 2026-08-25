@@ -10,8 +10,8 @@ use super::relation::{
     CandidateCoverage, OracleRelationHandle, OracleRelationKind, OracleRelationOwner,
     collect_candidate_provenance, validate_retained_relation_arenas,
 };
-use crate::analyzer::Language;
 use crate::analyzer::languages::{LanguageSupport, language_support};
+use crate::analyzer::{CallableArity, Language, SignatureMetadata};
 
 /// One materialized workspace target for an exact semantic call site.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -213,7 +213,7 @@ pub struct ExactExternalProcedureTarget {
     procedure: SemanticLocator,
     symbol: Box<str>,
     has_receiver: bool,
-    parameter_count: u32,
+    formal_contract: ExactExternalFormalContract,
 }
 
 impl ExactExternalProcedureTarget {
@@ -222,7 +222,7 @@ impl ExactExternalProcedureTarget {
         procedure: SemanticLocator,
         symbol: impl Into<Box<str>>,
         has_receiver: bool,
-        parameter_count: u32,
+        formal_contract: ExactExternalFormalContract,
     ) -> Option<Self> {
         let symbol = symbol.into();
         (procedure.role() == SemanticRole::Procedure
@@ -235,7 +235,7 @@ impl ExactExternalProcedureTarget {
             procedure,
             symbol,
             has_receiver,
-            parameter_count,
+            formal_contract,
         })
     }
 
@@ -255,8 +255,98 @@ impl ExactExternalProcedureTarget {
         self.has_receiver
     }
 
-    pub const fn parameter_count(&self) -> u32 {
-        self.parameter_count
+    pub fn formal_contract(&self) -> &ExactExternalFormalContract {
+        &self.formal_contract
+    }
+
+    pub fn parameter_count(&self) -> u32 {
+        self.formal_contract.parameter_count()
+    }
+}
+
+/// Structured formal information selected for an exact external procedure.
+///
+/// The contract is copied from [`SignatureMetadata`] before the target crosses
+/// the semantic boundary. Consumers can therefore bind actual arguments and
+/// distinguish overloads without parsing the display symbol or source text.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ExactExternalFormalContract {
+    label: Box<str>,
+    parameters: Box<[ExactExternalFormalParameter]>,
+    arity: Option<CallableArity>,
+}
+
+impl ExactExternalFormalContract {
+    pub(crate) fn from_metadata(metadata: &SignatureMetadata) -> Option<Self> {
+        let parameter_types = metadata.callable_parameter_types();
+        if parameter_types.is_some_and(|types| types.len() != metadata.parameters().len()) {
+            return None;
+        }
+        let arity = metadata.callable_arity();
+        let last_index = metadata.parameters().len().saturating_sub(1);
+        let parameters = metadata
+            .parameters()
+            .iter()
+            .enumerate()
+            .map(|(index, parameter)| ExactExternalFormalParameter {
+                label: parameter.label().into(),
+                declared_type: parameter_types
+                    .and_then(|types| types.get(index))
+                    .map(String::as_str)
+                    .map(Into::into),
+                optional: arity.is_some_and(|arity| index >= arity.required()),
+                repeated: arity.is_some_and(|arity| arity.is_repeated() && index == last_index),
+            })
+            .collect();
+        Some(Self {
+            label: metadata.label().into(),
+            parameters,
+            arity,
+        })
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub fn parameters(&self) -> &[ExactExternalFormalParameter] {
+        &self.parameters
+    }
+
+    pub const fn arity(&self) -> Option<CallableArity> {
+        self.arity
+    }
+
+    pub fn parameter_count(&self) -> u32 {
+        u32::try_from(self.parameters.len())
+            .expect("exact external formal parameter count exceeds u32")
+    }
+}
+
+/// One parameter in an [`ExactExternalFormalContract`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ExactExternalFormalParameter {
+    label: Box<str>,
+    declared_type: Option<Box<str>>,
+    optional: bool,
+    repeated: bool,
+}
+
+impl ExactExternalFormalParameter {
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub fn declared_type(&self) -> Option<&str> {
+        self.declared_type.as_deref()
+    }
+
+    pub const fn optional(&self) -> bool {
+        self.optional
+    }
+
+    pub const fn repeated(&self) -> bool {
+        self.repeated
     }
 }
 

@@ -116,18 +116,30 @@ impl CallBindingDispatch {
         source_target: Option<&CodeUnit>,
         model_target_id: Option<&str>,
     ) -> Self {
-        let singular = (answer.arms.len() == 1 && answer.unnamed_boundaries.is_empty())
-            .then(|| &answer.arms[0])
-            .filter(|arm| {
-                // The source resolver and semantic dispatch are separate
-                // answers. A binding may carry a target id only when the
-                // materialized dispatch arm is demonstrably the same source
-                // declaration, or the external arm is the exact model target
-                // selected below.
-                (arm.target_unit.as_ref() == source_target && source_target.is_some())
-                    || (arm.target_unit.is_none()
-                        && model_target_id.is_some_and(|id| id == arm.target_id))
-            });
+        let compatible = |arm: &&super::dispatch::DispatchArm| {
+            (arm.target_unit.as_ref() == source_target && source_target.is_some())
+                || (arm.target_unit.is_none()
+                    && model_target_id.is_some_and(|id| id == arm.target_id))
+        };
+        // An exact external declaration identifies the selected endpoint even
+        // when dispatch retains an unnamed override boundary. Keep that open
+        // runtime coverage below, but do not erase the independently exact
+        // declaration join. Multiple distinct external ids remain ambiguous.
+        let mut exact_external = answer
+            .arms
+            .iter()
+            .filter(|arm| arm.exact_external_target.is_some())
+            .filter(compatible)
+            .collect::<Vec<_>>();
+        exact_external.sort_by(|left, right| left.target_id.cmp(&right.target_id));
+        exact_external.dedup_by(|left, right| left.target_id == right.target_id);
+        let singular = match exact_external.as_slice() {
+            [arm] => Some(*arm),
+            [] => (answer.arms.len() == 1 && answer.unnamed_boundaries.is_empty())
+                .then(|| &answer.arms[0])
+                .filter(compatible),
+            _ => None,
+        };
         Self {
             target_id: singular.map(|arm| arm.target_id.clone()),
             proof: singular.map(|arm| arm.proof),

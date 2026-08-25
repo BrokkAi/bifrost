@@ -16,7 +16,7 @@ publish = true
 name = "brokk_bifrost_csharp"
 
 [dependencies]
-brokk-bifrost-core = { path = "../bifrost-core", version = "=0.10.5" }
+brokk-bifrost-core = { path = "../bifrost-core", version = "=0.10.6" }
 regex = "1.12.2"
 tree-sitter = "0.25.10"
 tree-sitter-c-sharp = "0.23.1"
