@@ -660,6 +660,30 @@
       "accepted_by": "dbakereffendi",
       "accepted_at": "2026-08-19",
       "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.file-read-in-loop",
+      "finding_id": "fc4adf32652d4b84fda6e4871acb4fae7cb7646324565bdacb980b11eaf7f892",
+      "path": "scripts/public/check-suppression-paths.mjs",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Deliberate: the loop reads the two suppression documents once each, so the repeated read is the work rather than invariant work hoisted into a loop. The list is a fixed two-element constant; reviewed and accepted.",
+      "policy_hash_at_acceptance": "a1d83845a9a14d26d5c9de154727ac2cd32ca81365d1111bf966e209b4ed89c9",
+      "accepted_by": "dbakereffendi",
+      "accepted_at": "2026-08-25",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.performance.parsing-in-loop",
+      "finding_id": "59d412adf37c82083f5b1f126472aa00b91fb0e97c7aa48624b3ba90904b62b0",
+      "path": "scripts/public/check-suppression-paths.mjs",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Deliberate: each iteration parses a different suppression document, so no invariant parse is repeated. Bounded by the same fixed two-element document list; reviewed and accepted.",
+      "policy_hash_at_acceptance": "b9a5b20ef0958dde7ee5b5065f825543b6de07fd75dbfd488c99d7a242b74695",
+      "accepted_by": "dbakereffendi",
+      "accepted_at": "2026-08-25",
+      "expires_at": null
     }
   ]
 }
