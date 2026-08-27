@@ -32,6 +32,25 @@ Live sessions re-analyze when this
 configuration changes. See [Workspace Scope](/workspace-scope/) for the full
 contract.
 
+## Semantic-pack activation
+
+At workspace bind, MCP activates semantic packs through the same optional
+`.bifrost/packs.json` contract used by the CLI and LSP hosts. An absent document
+selects compatible packs from every ecosystem serving a language present in the
+workspace. A configured document selects its named `ecosystems`; an empty
+array explicitly disables dependency-pack activation. An omitted `catalog` is
+ephemeral, while a configured catalog must be workspace-relative. Activation
+never downloads packs or dependencies. Compatibility and `review_required`
+gates remain authoritative, and `enable` names the reviewed packs permitted by
+the workspace.
+
+Activation is owned by the bound workspace generation and is reused by
+`run_policy`; the policy result retains the shared activation review. Reports
+identify `default`, `configured`, or `disabled` mode and the individual
+selected, missing, incompatible, version-mismatched, rejected, or incomplete
+decisions, so failed or unavailable activation cannot appear as a clean
+negative.
+
 ## Query and RQL Availability
 
 RQL is the [Rune Query Language](/rune-query-language/), a human-friendly syntax that compiles to canonical JSON `CodeQuery`. These surfaces do not accept it in the same way:
@@ -118,14 +137,13 @@ When standard roots or sandbox-state metadata controls a rootless connection, `a
 | Toolset | Tools |
 | --- | --- |
 | `symbol` | `search_symbols`, `get_symbol_sources`, `get_summaries`, mode-specific usage and definition lookup tools, `get_type_by_location`, `rename_symbol`, `usage_graph` |
-| `nlp` | `semantic_search` when Bifrost is built with `--features nlp`, the active root is a git repository, and semantic search is available for the session. `semantic_search_status` is accepted for diagnostics but hidden from the advertised tool list. |
 | `workspace` | `refresh`, `activate_workspace`, `get_active_workspace` |
 | `extended` | `query_code`, `list_policies`, `run_policy`, `explain_policy`, `get_symbol_locations`, `get_symbol_ancestors`, `most_relevant_files` |
 | `text` | `get_file_contents`, `search_file_contents`, `find_files_containing` |
 | `slopcop` | `compute_cyclomatic_complexity`, `compute_cognitive_complexity`, `report_comment_density_for_code_unit`, `report_exception_handling_smells`, `report_comment_density_for_files`, `analyze_git_hotspots`, `report_test_assertion_smells`, `report_structural_clone_smells`, `report_long_method_and_god_object_smells`, `report_dead_code_and_unused_abstraction_smells`, `report_secret_like_code`, `analyze_diff` |
 | `cli` | `classify_test_files` |
 
-`core` expands to `symbol|nlp|workspace`. In a default build, `nlp` contributes no advertised tools, so `core` effectively publishes `symbol|workspace`. `searchtools` expands to every toolset above in registry order: `symbol|nlp|workspace|extended|text|slopcop|cli`.
+`core` expands to `symbol|workspace`. `searchtools` expands to every toolset above in registry order: `symbol|workspace|extended|text|slopcop|cli`.
 
 With line numbers enabled, `symbol` advertises `scan_usages_by_location`, `get_declarations_by_location`, and `get_definitions_by_location`. With `--no-line-numbers`, it instead advertises `scan_usages_by_reference` and `get_definitions_by_reference`; there is no declaration-by-reference tool.
 

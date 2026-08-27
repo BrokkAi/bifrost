@@ -220,7 +220,7 @@ fn scan_node(node: Node<'_>, ctx: &mut FileScan<'_>, locals: &mut LocalInference
                 for value in rhs_expressions(node) {
                     scan_node(value, ctx, locals);
                 }
-                seed_assignment_like(node, ctx, locals, true);
+                seed_short_var_bindings(node, ctx, locals);
                 return;
             } else {
                 for_each_var_spec(node, &mut |spec| {
@@ -229,9 +229,6 @@ fn scan_node(node: Node<'_>, ctx: &mut FileScan<'_>, locals: &mut LocalInference
                 });
                 return;
             }
-        }
-        "assignment_statement" => {
-            seed_local_bindings(node, ctx, locals);
         }
         "selector_expression" | "qualified_type" => scan_selector(node, ctx, locals),
         "identifier" | "type_identifier" | "package_identifier" => scan_direct(node, ctx, locals),
@@ -554,22 +551,6 @@ fn seed_parameter_declaration(
     seed_or_shadow(names, tokens, locals);
 }
 
-fn seed_local_bindings(
-    node: Node<'_>,
-    ctx: &FileScan<'_>,
-    locals: &mut LocalInferenceEngine<String>,
-) {
-    match node.kind() {
-        "var_declaration" => {
-            for_each_var_spec(node, &mut |var_spec| seed_var_spec(var_spec, ctx, locals))
-        }
-        "var_spec" => seed_var_spec(node, ctx, locals),
-        "short_var_declaration" => seed_assignment_like(node, ctx, locals, true),
-        "assignment_statement" => seed_assignment_like(node, ctx, locals, false),
-        _ => {}
-    }
-}
-
 fn seed_var_spec(node: Node<'_>, ctx: &FileScan<'_>, locals: &mut LocalInferenceEngine<String>) {
     let names = var_spec_names(node, ctx.source);
     if names.is_empty() {
@@ -596,22 +577,15 @@ fn seed_var_spec(node: Node<'_>, ctx: &FileScan<'_>, locals: &mut LocalInference
     apply_inferred_bindings(bindings, locals);
 }
 
-fn seed_assignment_like(
+fn seed_short_var_bindings(
     node: Node<'_>,
     ctx: &FileScan<'_>,
     locals: &mut LocalInferenceEngine<String>,
-    declare_lhs: bool,
 ) {
     let slots = lhs_identifier_slots(node, ctx.source);
-    let mut bindings = infer_names_from_values(slots.clone(), rhs_expressions(node), ctx, locals);
-    if declare_lhs {
-        for name in slots.into_iter().flatten() {
-            locals.declare_shadow(name);
-        }
-    } else {
-        // Ordinary `=` updates an existing lexical binding; it must not turn an
-        // otherwise unbound package name into a local shadow.
-        bindings.retain(|(name, _)| locals.is_shadowed(name));
+    let bindings = infer_names_from_values(slots.clone(), rhs_expressions(node), ctx, locals);
+    for name in slots.into_iter().flatten() {
+        locals.declare_shadow(name);
     }
     apply_inferred_bindings(bindings, locals);
 }

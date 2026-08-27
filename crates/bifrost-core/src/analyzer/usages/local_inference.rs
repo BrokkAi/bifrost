@@ -179,6 +179,21 @@ where
         }
     }
 
+    /// Start a new lexical engine from the bindings visible at a capture site.
+    ///
+    /// Language adapters use this when a nested callable captures a selected
+    /// portion of its enclosing scope. The captured declarations become the
+    /// new root scope so parameters and locals can shadow them normally.
+    pub fn from_snapshot(config: LocalInferenceConfig, snapshot: LocalBindingsSnapshot<T>) -> Self {
+        Self {
+            config,
+            scopes: vec![ScopeState {
+                shadows: snapshot.declared,
+                bindings: snapshot.bindings,
+            }],
+        }
+    }
+
     pub fn enter_scope(&mut self) {
         self.scopes.push(ScopeState::default());
     }

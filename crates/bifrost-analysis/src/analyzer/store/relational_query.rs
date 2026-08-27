@@ -10,9 +10,9 @@ use brokk_bifrost_core::analyzer::{
 
 use super::{
     AnalyzerStore, CandidateRow, CandidateRowContainer, FqIdentityHeader, GenerationId,
-    HydratedCandidateRow, RelationalUnitFq, Result, StoreError, candidate_row_from_row,
-    candidate_row_from_row_at, hydrate_candidate_rows, hydrate_unit_fq, require_generation_map,
-    signature_metadata_from_row, workspace_snapshot_fingerprints_conn,
+    HydratedCandidateRow, RelationalUnitFq, Result, StoreError, WorkspaceSnapshots,
+    candidate_row_from_row, candidate_row_from_row_at, hydrate_candidate_rows, hydrate_unit_fq,
+    require_generation_map, signature_metadata_from_row,
 };
 use crate::analyzer::tree_sitter_analyzer::LanguageAdapter;
 use crate::analyzer::{CodeUnit, ProjectFile, sort_units};
@@ -1249,7 +1249,6 @@ fn callable_values<A: LanguageAdapter>(
 pub(crate) enum RelationalStoreOutcome {
     Complete(Vec<RelationalDefinitionValue>),
     Cancelled,
-    WorkspaceChanged,
 }
 
 impl AnalyzerStore {
@@ -1263,7 +1262,7 @@ impl AnalyzerStore {
         project_root: &Path,
         generations: &HashMap<String, GenerationId>,
         storage_languages: &[String],
-        workspace_fingerprints: &HashMap<String, String>,
+        workspace_snapshots: &WorkspaceSnapshots,
         requests: &[RelationalDefinitionRequest],
         cancellation: &CancellationToken,
         merge_overlay: F,
@@ -1278,7 +1277,7 @@ impl AnalyzerStore {
         #[cfg(test)]
         self.relational_batch_reader_checkouts
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut connection = self.read_conn()?;
+        let mut connection = self.read_conn_for_workspace(workspace_snapshots)?;
         let tx = connection.transaction()?;
         #[cfg(test)]
         self.relational_batch_generation_validations
@@ -1291,13 +1290,6 @@ impl AnalyzerStore {
             generations,
             storage_languages.iter().map(String::as_str),
         )?;
-        let current_fingerprints =
-            workspace_snapshot_fingerprints_conn(&tx, storage_languages, generations)?;
-        if current_fingerprints != *workspace_fingerprints {
-            tx.commit()?;
-            return Ok(RelationalStoreOutcome::WorkspaceChanged);
-        }
-
         let mut values = requests
             .iter()
             .map(|request| RelationalDefinitionValue::empty_for(&request.query))
@@ -1411,7 +1403,7 @@ impl AnalyzerStore {
         project_root: &Path,
         generations: &HashMap<String, GenerationId>,
         storage_languages: &[String],
-        workspace_fingerprints: &HashMap<String, String>,
+        workspace_snapshots: &WorkspaceSnapshots,
         names: &[RelationalName],
         cancellation: &CancellationToken,
     ) -> Result<Option<Vec<Vec<DefinitionOrderRow>>>> {
@@ -1421,20 +1413,13 @@ impl AnalyzerStore {
         if cancellation.is_cancelled() {
             return Ok(None);
         }
-        let mut connection = self.read_conn()?;
+        let mut connection = self.read_conn_for_workspace(workspace_snapshots)?;
         let tx = connection.transaction()?;
         require_generation_map(
             &tx,
             generations,
             storage_languages.iter().map(String::as_str),
         )?;
-        let current_fingerprints =
-            workspace_snapshot_fingerprints_conn(&tx, storage_languages, generations)?;
-        if current_fingerprints != *workspace_fingerprints {
-            tx.commit()?;
-            return Ok(None);
-        }
-
         let keys = names
             .iter()
             .map(|name| {
@@ -1545,10 +1530,16 @@ mod tests {
             .expect("collect exact package-membership query plan");
 
         assert!(
-            plan.iter().any(|detail| detail.contains(
-                "SEARCH members USING PRIMARY KEY (lang=? AND generation=? AND package_name=?)"
-            )),
-            "exact package membership must seek its compound primary key: {plan:#?}"
+            plan.iter().any(|detail| {
+                detail.contains("idx_workspace_file_package_rows_name")
+                    && detail.contains("package_name=?")
+            }),
+            "exact package membership must seek its package-name index: {plan:#?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|detail| { detail.contains("idx_workspace_file_versions_snapshot_blob") }),
+            "exact package membership must seek revision membership: {plan:#?}"
         );
         assert!(
             plan.iter().all(|detail| !detail.contains("SCAN members")),
@@ -1621,19 +1612,54 @@ mod tests {
                         && !detail.contains("SCAN code_units")),
                 "{case_name} ({view}) must not scan code_units: {plan:#?}"
             );
-            // `units` (via its partial index) must drive the join, not
-            // `workspace_file_anchors`: before the fix, the wide compound
-            // view drove the anchored arm from `workspace_file_anchors`
-            // filtered by language alone (a full per-language scan of every
-            // file anchor), then probed `units` per anchor row. The fixed
-            // split view's `INDEXED BY` hint forces the opposite order:
-            // `units` is found first through its selective partial index,
-            // and any anchor lookup that follows is correlated to those
-            // already-narrowed rows, not the query's driving scan.
+            // Revision membership must follow a selective name/anchor seek,
+            // never drive the query. On Elasticsearch, allowing `workspace_file_versions`
+            // to drive made every definition request walk all 15,711 Java
+            // paths before probing the requested name. Stable names drive
+            // directly from the partial unit-name index. Anchored names drive
+            // from the requested package-name index, which supplies the
+            // anchor kind/pop needed for the anchored unit index.
+            let units_step = plan
+                .iter()
+                .position(|detail| detail.contains("units"))
+                .expect("the requested units index appears in the plan");
+            let anchored = view.contains("anchored");
+            let anchor_driven = anchored && index != "idx_code_units_lang_identifier_lookup";
+            let versions_step = plan
+                .iter()
+                .position(|detail| {
+                    if anchor_driven {
+                        detail.contains("SEARCH files USING INTEGER PRIMARY KEY")
+                    } else {
+                        detail.contains("idx_workspace_file_versions_snapshot_blob")
+                    }
+                })
+                .unwrap_or_else(|| panic!("revision membership appears in the plan: {plan:#?}"));
+            let driver_step = if anchor_driven {
+                let anchor_step = plan
+                    .iter()
+                    .position(|detail| detail.contains("idx_workspace_file_anchor_rows_package"))
+                    .expect("anchored lookup starts from the requested package");
+                assert!(
+                    anchor_step < units_step,
+                    "{case_name} ({view}) must bind anchor kind/pop before seeking units: {plan:#?}"
+                );
+                anchor_step
+            } else {
+                units_step
+            };
             assert!(
-                plan.first().is_some_and(|detail| detail.contains("units")),
-                "{case_name} ({view}) must drive the join from units, not workspace_file_anchors: {plan:#?}"
+                driver_step < versions_step,
+                "{case_name} ({view}) must narrow by name before revision membership: {plan:#?}"
             );
+            if !anchor_driven {
+                assert!(
+                    plan.iter().any(|detail| {
+                        detail.contains("idx_workspace_file_versions_snapshot_blob")
+                    }),
+                    "{case_name} ({view}) must seek revision membership by candidate blob: {plan:#?}"
+                );
+            }
             assert!(
                 plan.iter().all(|detail| !detail.contains("SCAN anchors")
                     && !detail.contains("SCAN workspace_file_anchors")),
@@ -1863,33 +1889,66 @@ mod tests {
     /// `live_stable_definition_identifiers` / `live_anchored_definition_identifiers`
     /// route that shape uses instead).
     #[test]
-    fn identifier_prefix_definition_query_seeks_identifier_index() {
+    fn identifier_definition_queries_narrow_before_revision_membership() {
         let store = AnalyzerStore::open_ephemeral().expect("ephemeral store");
         let connection = store.conn.lock().expect("store mutex");
-        let sql = content_sql(
-            "live_definition_identifiers",
-            "names.identifier >= ?2 AND names.identifier < ?3",
-        );
-        let mut statement = connection
-            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
-            .expect("prepare identifier-prefix query plan");
-        let plan = statement
-            .query_map(params!["csharp", "Widget`", "Widgeta"], |row| {
-                row.get::<_, String>(3)
-            })
-            .expect("read identifier-prefix query plan")
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .expect("collect identifier-prefix query plan");
-
-        assert!(
-            plan.iter().any(|detail| detail
-                .contains("SEARCH units USING INDEX idx_code_units_lang_identifier_lookup")),
-            "the relational prefix range must seek the identifier index: {plan:#?}"
-        );
-        assert!(
-            plan.iter().all(|detail| !detail.contains("SCAN units")),
-            "the relational prefix range must not scan code_units: {plan:#?}"
-        );
+        let adapter = JavaAdapter;
+        let name = RelationalName::stable(parse_symbol_path_fq(
+            Language::Java,
+            "demo.Widget`",
+            segment_interner(),
+        ));
+        for query in [
+            RelationalDefinitionQuery::Identifier { file: None },
+            RelationalDefinitionQuery::IdentifierPrefix { file: None },
+        ] {
+            let request = RelationalDefinitionRequest {
+                ordinal: 0,
+                language_scope: DefinitionLanguageScope::Language(Language::Java),
+                name: name.clone(),
+                query,
+            };
+            let (prefix, tail, _) = render_name(&adapter, &request.name);
+            let sources = split_view_sources(&adapter, &request, &prefix, &tail)
+                .expect("identifier lookups use split content views");
+            assert_eq!(sources.len(), 2, "stable and anchored identifier views");
+            for (view, predicate, values) in sources {
+                let sql = content_sql(view, &predicate);
+                let bindings = std::iter::once("java")
+                    .chain(values.iter().map(String::as_str))
+                    .collect::<Vec<_>>();
+                let mut statement = connection
+                    .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                    .expect("prepare identifier query plan");
+                let plan = statement
+                    .query_map(rusqlite::params_from_iter(bindings), |row| {
+                        row.get::<_, String>(3)
+                    })
+                    .expect("read identifier query plan")
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .expect("collect identifier query plan");
+                let identifier_step = plan
+                    .iter()
+                    .position(|detail| detail.contains("idx_code_units_lang_identifier_lookup"))
+                    .unwrap_or_else(|| panic!("identifier index missing: {plan:#?}"));
+                let membership_step = plan
+                    .iter()
+                    .position(|detail| detail.contains("idx_workspace_file_versions_snapshot_blob"))
+                    .unwrap_or_else(|| panic!("revision membership missing: {plan:#?}"));
+                assert!(
+                    identifier_step < membership_step,
+                    "{view} must narrow by identifier before revision membership: {plan:#?}"
+                );
+                assert!(
+                    plan.iter().all(|detail| {
+                        !detail.contains("SCAN units")
+                            && !detail.contains("SCAN code_units")
+                            && !detail.contains("SCAN files")
+                    }),
+                    "{view} must not scan persisted unit or file tables: {plan:#?}"
+                );
+            }
+        }
     }
 
     #[test]

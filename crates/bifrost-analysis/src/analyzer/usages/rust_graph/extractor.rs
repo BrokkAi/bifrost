@@ -366,7 +366,7 @@ pub(super) fn scan_files_for_target(
             // repeated construction costs no repeated work.
             let include_routes = RustIncludeRoutes::new(rust, token);
             let started = RustScanPhaseTimings::start();
-            let lexical_scope = RustLexicalScopeIndex::new(tree.root_node(), source);
+            let lexical_scope = lexical_scope::rust_lexical_scope_index(tree.root_node(), source);
             RustScanPhaseTimings::record(&timings.lexical_scope_ns, started);
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 return;
@@ -1831,7 +1831,8 @@ pub(super) fn scan_files_for_member_target(
             }
             let line_starts = prepared.line_starts();
             let started = RustScanPhaseTimings::start();
-            let lexical_scope_index = RustLexicalScopeIndex::new(tree.root_node(), source);
+            let lexical_scope_index =
+                lexical_scope::rust_lexical_scope_index(tree.root_node(), source);
             RustScanPhaseTimings::record(&timings.lexical_scope_ns, started);
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 return;

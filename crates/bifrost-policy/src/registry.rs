@@ -595,7 +595,9 @@ impl PolicyRegistry {
                 .ok_or_else(|| PolicyRegistryError::MissingDependencySelector {
                     path: dependency.selector_path.clone(),
                 })?;
-            if dependency.selector_schema.version != selector.schema_resolution.version
+            if !dependency
+                .selector_schemas
+                .same_effective_versions(&ResolvedEndpointSelectorSchemas::from_selector(&selector))
                 || dependency.selector_path != selector.path
             {
                 return Err(PolicyRegistryError::DependencySelectorMismatch {
@@ -1484,12 +1486,30 @@ fn rekey_endpoint_selector(
         "/dependencies/match-endpoints/{}/selector",
         pointer_segment(endpoint.definition().id.as_str())
     ))?;
-    ResolvedPolicySelector::try_new(
-        path,
-        endpoint.resolved_selector().schema_resolution,
-        endpoint.resolved_selector().query.clone(),
-        endpoint.resolved_selector().origin.clone(),
-    )
+    if let Some(plan) = endpoint.resolved_selector().as_rows() {
+        ResolvedPolicySelector::try_new_rows(
+            path,
+            plan.clone(),
+            endpoint.resolved_selector().origin.clone(),
+        )
+    } else {
+        ResolvedPolicySelector::try_new(
+            path,
+            endpoint
+                .resolved_selector()
+                .as_query()
+                .expect("query selector has query kind")
+                .0
+                .to_owned(),
+            endpoint
+                .resolved_selector()
+                .as_query()
+                .expect("query selector has query kind")
+                .1
+                .clone(),
+            endpoint.resolved_selector().origin.clone(),
+        )
+    }
     .map_err(Into::into)
 }
 
@@ -1519,10 +1539,9 @@ fn insert_selector(
     selector: ResolvedPolicySelector,
 ) -> Result<(), PolicyRegistryError> {
     if let Some(existing) = selectors.get(&selector.path) {
-        if existing.schema_resolution.version == selector.schema_resolution.version
-            && existing.semantic_hash == selector.semantic_hash
-            && existing.query.to_canonical_query_plan_json()
-                == selector.query.to_canonical_query_plan_json()
+        if existing.semantic_hash == selector.semantic_hash
+            && crate::canonical_loaded::resolved_selector_to_json(existing)
+                == crate::canonical_loaded::resolved_selector_to_json(&selector)
         {
             return Ok(());
         }
@@ -1561,7 +1580,9 @@ fn merge_match_dependency(
         || existing.analysis_projection_hash != incoming.analysis_projection_hash
         || existing.definition_schema.version() != incoming.definition_schema.version()
         || existing.selector_path != incoming.selector_path
-        || existing.selector_schema.version != incoming.selector_schema.version
+        || !existing
+            .selector_schemas
+            .same_effective_versions(&incoming.selector_schemas)
         || existing.model != incoming.model
     {
         return Err(PolicyRegistryError::EndpointIdentityCollision {

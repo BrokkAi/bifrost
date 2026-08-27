@@ -18,23 +18,31 @@ pub(in crate::analyzer::usages) use brokk_bifrost_csharp::graph::extractor::{
 };
 pub(in crate::analyzer::usages) use brokk_bifrost_csharp::graph::resolver::{
     CSharpDeclaredType, argument_count as csharp_argument_count, canonical_builtin_type_identity,
+    collection_target_element_type_node as csharp_collection_target_element_type_node,
     first_type_child as csharp_first_type_child,
     is_type_reference_node as csharp_is_type_reference_node,
+    member_declared_collection_element_type_fq_name as csharp_member_declared_collection_element_type_fq_name,
+    member_declared_collection_element_type_fq_name_in_session as csharp_member_declared_collection_element_type_fq_name_in_session,
     member_declared_type_fq_name as csharp_member_declared_type_fq_name,
     member_declared_type_fq_name_in_session as csharp_member_declared_type_fq_name_in_session,
     method_return_type_fq_name_for_arity as csharp_method_return_type_fq_name_for_arity,
     method_return_type_fq_name_for_arity_in_session as csharp_method_return_type_fq_name_for_arity_in_session,
     node_text as csharp_node_text, object_created_type as csharp_object_created_type,
     object_creation_assignment_target as csharp_object_creation_assignment_target,
+    object_creation_collection_target as csharp_object_creation_collection_target,
     object_initializer_for_label as csharp_object_initializer_for_label,
     object_initializer_owner_type_node as csharp_object_initializer_owner_type_node,
     reference_type_text as csharp_reference_type_text,
     resolve_type_fq_name as csharp_resolve_type_fq_name,
     seed_bindings_before as seed_csharp_bindings_before,
     seed_bindings_before_in_session as seed_csharp_bindings_before_in_session,
+    type_parameter_shadows_reference as csharp_type_parameter_shadows_reference,
 };
 
 use crate::analyzer::usages::common::language_for_target;
+pub use crate::analyzer::usages::csharp_graph::shared::{
+    CSharpAuthoritativeUsageBatch, CSharpAuthoritativeUsageRequest,
+};
 use crate::analyzer::usages::csharp_graph::shared::{CSharpEdgeResolver, CSharpQueryResolver};
 use crate::analyzer::usages::get_definition::ResolutionSession;
 use crate::analyzer::usages::inverted_edges::{

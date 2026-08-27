@@ -37,7 +37,6 @@ if ! command -v cargo-nextest >/dev/null 2>&1; then
 fi
 
 # Tests must never download models or spawn semantic indexer threads.
-export BIFROST_SEMANTIC_INDEX=off
 
 # Let nextest own machine-wide parallelism. Each test process gets one worker
 # in Bifrost-owned and global rayon pools, while nextest runs one test per
@@ -76,8 +75,7 @@ fi
 step "cargo fmt --check"
 cargo fmt --check
 
-# The nlp+python build tree is large; warn (do not fail) below the headroom
-# CLAUDE.md recommends for all-features builds.
+# Warn rather than fail when an isolated all-features build has little headroom.
 available_kib=$(df -Pk "${repo_root}" | awk 'NR == 2 { print $4 }')
 available_gib=$(( ${available_kib:-0} / 1024 / 1024 ))
 if [ "${available_gib:-0}" -lt 60 ]; then

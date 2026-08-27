@@ -11,6 +11,19 @@ bifrost --root /path/to/project --lsp
 
 The server does not open a network port. It speaks LSP over stdin and stdout, builds the workspace index in the background, and lets the first request wait for indexing when necessary.
 
+## Semantic-pack activation
+
+LSP shares the workspace semantic-pack contract used by the CLI and MCP hosts.
+Its background activation scheduler reads `.bifrost/packs.json`: an absent
+document selects compatible packs from ecosystems serving languages present in
+the workspace, a configured document selects its `ecosystems`, and an empty
+array explicitly disables dependency-pack activation. An omitted `catalog` is
+ephemeral; a configured catalog must be workspace-relative. Activation never
+downloads packs or dependencies, and compatibility plus `review_required`
+gates remain in force. Policy-capable responses expose the activation mode and
+decisions so missing, incompatible, disabled, or incomplete packs cannot look
+like a clean negative.
+
 ## Editor Integrations
 
 Install the packaged extension from the

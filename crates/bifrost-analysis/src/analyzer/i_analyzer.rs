@@ -467,7 +467,7 @@ fn escape_sigil_anchors(pattern: &str) -> String {
     let mut escaped = String::with_capacity(pattern.len());
     for (index, ch) in chars.iter().enumerate() {
         let prev_is_word = index > 0
-            && (chars[index - 1].is_alphanumeric() || matches!(chars[index - 1], '_' | '^'));
+            && (chars[index - 1].is_alphanumeric() || matches!(chars[index - 1], '_' | '$' | '^'));
         let next_is_word = chars
             .get(index + 1)
             .is_some_and(|next| next.is_alphanumeric() || matches!(next, '_' | '$'));
@@ -856,18 +856,14 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
         None
     }
 
-    /// Starts a disposable, file-local analyzer read used by broad sequential
-    /// consumers such as semantic materialization.
+    /// Starts a disposable file-local analyzer read used by broad sequential
+    /// consumers such as C++ include-visibility traversal.
     #[doc(hidden)]
     fn begin_streaming_file_read(&self, _file: &ProjectFile) {}
 
     /// Ends the matching disposable file-local read.
     #[doc(hidden)]
     fn end_streaming_file_read(&self, _file: &ProjectFile) {}
-
-    /// Releases idle connections and page caches owned by the streaming path.
-    #[doc(hidden)]
-    fn release_streaming_readers(&self) {}
 
     /// The cell in which the active request memoizes its workspace file
     /// listing, or `None` when no query scope is open.
@@ -1655,7 +1651,6 @@ impl Drop for AnalyzerQueryScope<'_> {
 }
 
 /// Releases one disposable file-local analyzer read on every return path.
-/// Public for the brokk-bifrost-nlp chunker, the streaming consumer.
 pub struct AnalyzerStreamingFileScope<'a> {
     analyzer: &'a dyn IAnalyzer,
     file: &'a ProjectFile,

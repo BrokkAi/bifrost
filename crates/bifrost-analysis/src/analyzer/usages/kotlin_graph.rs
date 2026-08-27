@@ -157,6 +157,17 @@ pub(crate) fn is_companion_object(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> 
     })
 }
 
+/// Whether `unit` is a Kotlin `typealias`.
+///
+/// The same wrapping as [`is_companion_object`]: the definition ladder (#1238)
+/// asks this from a `&dyn IAnalyzer`, and the alias marker itself lives behind
+/// the graph source's type-alias provider (#2696).
+pub(crate) fn is_kotlin_type_alias(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> bool {
+    with_kotlin_graph_source(analyzer, |graph| {
+        brokk_bifrost_jvm::kotlin::graph::resolver::is_kotlin_type_alias(&graph, unit)
+    })
+}
+
 /// Every Kotlin `caller -> callee` edge whose callee is one of `nodes`.
 #[cfg(test)]
 pub(crate) fn build_kotlin_usage_edges<F>(

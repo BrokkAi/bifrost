@@ -790,6 +790,7 @@ fn build_pack(
             generated_code_only: false,
             review_required: true,
         },
+        carried_sources: Vec::new(),
         shards: vec![AuthoredShard {
             id: format!("summaries.{}", realm.ecosystem),
             activation: vec![ActivationSelector {

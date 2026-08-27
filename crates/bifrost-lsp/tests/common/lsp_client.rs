@@ -182,6 +182,23 @@ impl LspServer {
         panic!("did not receive {method} within 32 messages");
     }
 
+    /// Read inbound messages until a `textDocument/publishDiagnostics` for
+    /// `uri` computed against document `version` arrives, skipping stale
+    /// republishes. The server stamps the open-document version on every
+    /// publish, and background work (e.g. a completed dependency-pack
+    /// activation) republishes for already-published URIs at nondeterministic
+    /// points, so "the next publishDiagnostics" is not necessarily the
+    /// response to the latest edit.
+    pub fn read_publish_diagnostics_for_version(&mut self, uri: &str, version: i64) -> Value {
+        for _ in 0..32 {
+            let msg = self.read_notification("textDocument/publishDiagnostics");
+            if msg["params"]["uri"] == uri && msg["params"]["version"] == version {
+                return msg;
+            }
+        }
+        panic!("did not receive publishDiagnostics for {uri} version {version} within 32 messages");
+    }
+
     /// Read inbound messages until the response with `id` arrives.
     pub fn read_response_for_id(&mut self, id: u64) -> Value {
         let (reader, stderr) = self.reader_and_stderr_mut();
@@ -527,7 +544,13 @@ fn lsp_command(root: &Path) -> (Command, TempDir) {
         .env(
             brokk_bifrost_analysis::gitblob::CACHE_DIR_ENV,
             cache_dir.path(),
-        );
+        )
+        // JVM stdlib discovery inspects the process `JAVA_HOME`, and #2669
+        // gave a bare JVM workspace a stdlib pack to activate from it. What a
+        // spawned server can prove absent must not depend on which machine
+        // runs the suite (#2678), so no server sees the host JDK. A test that
+        // wants stdlib proof must configure explicit `jdk_homes` instead.
+        .env_remove("JAVA_HOME");
     (command, cache_dir)
 }
 

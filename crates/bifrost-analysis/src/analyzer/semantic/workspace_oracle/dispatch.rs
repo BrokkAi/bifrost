@@ -1165,12 +1165,45 @@ fn proven_static_target_discharges_gap(
         && lookup_resolved
         && boundaries.is_empty()
         && materialization_quality == DispatchQuality::Complete
-        && candidates.iter().all(|candidate| {
-            proven_complete(candidate)
-                && matches!(
-                    candidate.target().semantics().kind(),
-                    ProcedureKind::Function | ProcedureKind::LocalFunction
-                )
+        && candidates
+            .iter()
+            .all(|candidate| proven_complete(candidate) && candidate_has_free_target(candidate))
+}
+
+/// Whether a retained candidate's target is a *free* callable: one that no type
+/// or namespace owns, so no override of it can exist to enumerate.
+///
+/// The obvious spelling is the procedure kind, and for adapters that lower
+/// their file-scope declarations as `Function` (Python, PHP, JavaScript) it is
+/// enough. Ruby lowers every `def` as `ProcedureKind::Method`, including a
+/// top-level `def` that is not a member of anything, so the kind alone would
+/// keep every Ruby call open forever (#2637). The declaration path answers the
+/// real question the kind is standing in for: a callable whose enclosing
+/// segments contain no `Type` and no `Namespace` is declared directly in the
+/// file, so it has no owning class or module, so it has no override set that
+/// the proven candidate list could be missing. A `def` inside a Ruby `class`
+/// or `module` body carries that ancestor segment and stays open here, which
+/// is exactly the case a subclass can override.
+///
+/// The invariant this relies on: a procedure's *own* trailing segment is never
+/// `Type` or `Namespace` -- those kinds name containers, not callables -- so
+/// scanning the whole path is the same test as scanning the ancestors.
+fn candidate_has_free_target(candidate: &DispatchCandidate) -> bool {
+    matches!(
+        candidate.target().semantics().kind(),
+        ProcedureKind::Function | ProcedureKind::LocalFunction
+    ) || candidate
+        .target()
+        .semantics()
+        .locator()
+        .declaration()
+        .segments()
+        .iter()
+        .all(|segment| {
+            !matches!(
+                segment.kind(),
+                DeclarationSegmentKind::Type | DeclarationSegmentKind::Namespace
+            )
         })
 }
 
@@ -4372,6 +4405,101 @@ export function local(opts: { parse(raw: string): unknown }, raw: string): unkno
                 ),
             ]
         );
+    }
+
+    /// Ruby lowers every `def` as `ProcedureKind::Method`, including a
+    /// top-level one that owns no receiver (#2637). The resolver-proven arm
+    /// therefore decides on the declaration path: a file-scope `def` has no
+    /// owning class or module and so no override set the proven candidate
+    /// list could be missing, while a `def` in a class body does.
+    #[test]
+    fn file_scope_method_candidate_discharges_a_dispatch_gap_but_a_member_does_not() {
+        const SOURCE: &str = r#"def free_target
+  "value"
+end
+
+class Owner
+  def member_target
+    "value"
+  end
+end
+
+def run
+  free_target
+end
+"#;
+        let fixture = AnalyzerFixture::new_for_language(Language::Ruby, &[("dispatch.rb", SOURCE)]);
+        let file = ProjectFile::new(fixture.project_root(), "dispatch.rb");
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact = fixture
+            .analyzer
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("Ruby semantic materialization")
+            .available_value()
+            .cloned()
+            .expect("Ruby semantic artifact");
+        let handle_named = |name: &str| {
+            artifact
+                .procedures()
+                .iter()
+                .find(|procedure| {
+                    procedure
+                        .locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some(name)
+                })
+                .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+                .unwrap_or_else(|| panic!("procedure {name} is materialized"))
+        };
+        let caller = handle_named("run");
+        let candidate = |target: ProcedureHandle| {
+            vec![
+                DispatchCandidate::new(
+                    target,
+                    ProofStatus::Proven,
+                    EvidenceCompleteness::Complete,
+                    std::iter::empty(),
+                    OracleLimits::default(),
+                )
+                .expect("an empty dispatch draft fits every positive provenance limit"),
+            ]
+        };
+        let gap = caller
+            .semantics()
+            .gaps()
+            .iter()
+            .find(|gap| {
+                gap.capability == SemanticCapability::DynamicDispatch
+                    && gap.kind == SemanticGapKind::Unknown
+            })
+            .expect("Ruby publishes an unconditional per-call dynamic-dispatch gap");
+        assert_eq!(
+            handle_named("free_target").semantics().kind(),
+            ProcedureKind::Method,
+            "the fixture is only meaningful while Ruby lowers a top-level def as a method"
+        );
+
+        let discharges = |candidates: &[DispatchCandidate]| {
+            proven_static_target_discharges_gap(
+                &caller,
+                &CallableTargetResolution::Unknown,
+                true,
+                candidates,
+                &[],
+                true,
+                DispatchQuality::Complete,
+                gap,
+            )
+        };
+        assert!(discharges(&candidate(handle_named("free_target"))));
+        assert!(!discharges(&candidate(handle_named("member_target"))));
     }
 
     #[test]

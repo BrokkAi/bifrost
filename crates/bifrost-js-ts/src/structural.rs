@@ -77,6 +77,22 @@ macro_rules! js_ts_kind_table {
                 "shorthand_property_identifier_pattern",
                 NormalizedKind::Identifier,
             ),
+            ("array", NormalizedKind::CollectionLiteral),
+            ("object", NormalizedKind::CollectionLiteral),
+            ("jsx_element", NormalizedKind::JsxElement),
+            ("jsx_self_closing_element", NormalizedKind::JsxElement),
+            ("jsx_attribute", NormalizedKind::JsxAttribute),
+            // JSX spread attributes are represented by a jsx_expression whose
+            // only named child is a spread_element. `should_extract` below
+            // admits this grammar node only in that opening-element context.
+            ("jsx_expression", NormalizedKind::JsxSpreadAttribute),
+            ("pair", NormalizedKind::ObjectProperty),
+            ("computed_property_name", NormalizedKind::ComputedProperty),
+            // `spread_element` is shared by object/array literals and call
+            // arguments. Keep that shared syntax kind context-free; the
+            // enclosing role and parent fact retain whether it is an object,
+            // array, or argument spread.
+            ("spread_element", NormalizedKind::SpreadElement),
             ("string", NormalizedKind::StringLiteral),
             ("template_string", NormalizedKind::StringLiteral),
             ("number", NormalizedKind::NumericLiteral),
@@ -116,6 +132,14 @@ pub const TS_KIND_TABLE: &[(&str, NormalizedKind)] = js_ts_kind_table!(
     ("function_signature", NormalizedKind::Function),
     ("method_signature", NormalizedKind::Method),
     ("abstract_method_signature", NormalizedKind::Method),
+    // TypeScript formal parameters are declarations in their own right. The
+    // grammar also uses `rest_pattern` for array/object destructuring, so it
+    // is intentionally not normalized here: the context-free kind table
+    // cannot soundly distinguish a rest parameter from a destructuring rest.
+    // Rest-parameter matching remains an explicit unsupported case until the
+    // adapter can refine that context without overclassifying ordinary code.
+    ("required_parameter", NormalizedKind::Parameter),
+    ("optional_parameter", NormalizedKind::Parameter),
 );
 
 fn node_text<'source>(node: Node<'_>, source: &'source str) -> Option<&'source str> {
@@ -157,6 +181,96 @@ fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Node<'tree>> {
     }
 }
 
+/// A JSX tag has intrinsic/component identity only after resolution. The
+/// structural fact keeps a name span for simple identifiers, while qualified
+/// and namespaced tags remain unnamed so a later projection cannot mistake a
+/// terminal member segment for the tag's identity.
+fn jsx_simple_tag_name<'tree>(tag: Node<'tree>) -> Option<Node<'tree>> {
+    matches!(tag.kind(), "identifier" | "property_identifier").then_some(tag)
+}
+
+fn jsx_opening_element<'tree>(element: Node<'tree>) -> Option<Node<'tree>> {
+    match element.kind() {
+        "jsx_element" => element.child_by_field_name("open_tag"),
+        "jsx_self_closing_element" => Some(element),
+        _ => None,
+    }
+}
+
+fn jsx_expression_operand<'tree>(value: Node<'tree>) -> Option<Node<'tree>> {
+    if value.kind() == "jsx_expression" {
+        first_named_child(value)
+    } else {
+        Some(value)
+    }
+}
+
+fn jsx_spread_operand<'tree>(attribute: Node<'tree>) -> Option<Node<'tree>> {
+    let spread = first_named_child(attribute).filter(|child| child.kind() == "spread_element")?;
+    first_named_child(spread)
+}
+
+fn jsx_attribute_value<'tree>(attribute: Node<'tree>) -> Option<Node<'tree>> {
+    attribute
+        .named_child(1)
+        .and_then(jsx_expression_operand)
+        .and_then(|value| {
+            if value.kind() == "spread_element" {
+                first_named_child(value)
+            } else {
+                Some(value)
+            }
+        })
+}
+
+fn attach_jsx_element_roles(sink: &mut RoleSink<'_>, element: Node<'_>) {
+    let Some(opening) = jsx_opening_element(element) else {
+        return;
+    };
+    if let Some(tag) = opening.child_by_field_name("name") {
+        let name = jsx_simple_tag_name(tag);
+        sink.role_maybe_named(Role::Tag, tag, name);
+        if let Some(name) = name {
+            sink.set_name(name);
+        }
+    }
+    for index in 0..opening.named_child_count() {
+        let Some(child) = opening.named_child(index) else {
+            continue;
+        };
+        if matches!(child.kind(), "jsx_attribute" | "jsx_expression") {
+            sink.role(Role::Attributes, child);
+        }
+    }
+    if element.kind() == "jsx_element" {
+        for index in 0..element.named_child_count() {
+            let Some(child) = element.named_child(index) else {
+                continue;
+            };
+            if !matches!(child.kind(), "jsx_opening_element" | "jsx_closing_element") {
+                sink.role(Role::Children, child);
+            }
+        }
+    }
+}
+
+fn attach_object_property_roles(sink: &mut RoleSink<'_>, property: Node<'_>) {
+    let Some(key) = property.child_by_field_name("key") else {
+        return;
+    };
+    if key.kind() != "computed_property_name" {
+        if let Some(name) = unquoted_string_span(key) {
+            sink.role_named_span(Role::Key, key, name);
+        } else {
+            sink.set_name(key);
+            sink.role_named(Role::Key, key, key);
+        }
+    }
+    if let Some(value) = property.child_by_field_name("value") {
+        sink.role(Role::Value, value);
+    }
+}
+
 fn attach_argument_roles(sink: &mut RoleSink<'_>, arguments: Node<'_>) {
     if arguments.kind() == "template_string" {
         sink.role(Role::Arg, arguments);
@@ -175,6 +289,15 @@ fn attach_decorators(sink: &mut RoleSink<'_>, declaration: Node<'_>) {
         }
     }
     attach_preceding_class_body_decorators(sink, declaration);
+}
+
+fn parameter_name_node<'tree>(parameter: Node<'tree>) -> Option<Node<'tree>> {
+    match parameter.kind() {
+        "required_parameter" | "optional_parameter" | "rest_pattern" => parameter
+            .child_by_field_name("pattern")
+            .or_else(|| parameter.child_by_field_name("name")),
+        _ => expression_name_node(parameter),
+    }
 }
 
 fn attach_preceding_class_body_decorators(sink: &mut RoleSink<'_>, declaration: Node<'_>) {
@@ -478,6 +601,18 @@ impl StructuralSpec for JsTsStructuralSpec {
     }
 
     fn should_extract(&self, node: Node<'_>, kind: NormalizedKind) -> bool {
+        if kind == NormalizedKind::JsxSpreadAttribute
+            && !(node.kind() == "jsx_expression"
+                && node.parent().is_some_and(|parent| {
+                    matches!(
+                        parent.kind(),
+                        "jsx_opening_element" | "jsx_self_closing_element"
+                    )
+                })
+                && first_named_child(node).is_some_and(|child| child.kind() == "spread_element"))
+        {
+            return false;
+        }
         kind != NormalizedKind::Assignment
             || node.kind() != "variable_declarator"
             || node.child_by_field_name("value").is_some()
@@ -618,6 +753,12 @@ impl StructuralSpec for JsTsStructuralSpec {
                 }
                 attach_decorators(sink, node);
             }
+            NormalizedKind::Parameter => {
+                if let Some(name) = parameter_name_node(node) {
+                    sink.set_name(name);
+                }
+                attach_decorators(sink, node);
+            }
             NormalizedKind::Assignment => match node.kind() {
                 "variable_declarator" => {
                     if let Some(name) = node.child_by_field_name("name") {
@@ -673,7 +814,177 @@ impl StructuralSpec for JsTsStructuralSpec {
                     sink.set_name(name);
                 }
             }
+            NormalizedKind::ForLoop => {
+                if let Some(right) = node.child_by_field_name("right") {
+                    attach_role_with_derived_name(
+                        sink,
+                        Role::Iterable,
+                        right,
+                        expression_name_node,
+                    );
+                }
+            }
+            NormalizedKind::CollectionLiteral => {
+                attach_collection_elements(sink, node);
+            }
+            NormalizedKind::JsxElement => {
+                attach_jsx_element_roles(sink, node);
+            }
+            NormalizedKind::JsxAttribute => {
+                if let Some(name) = node
+                    .named_child(0)
+                    .filter(|name| name.kind() == "property_identifier")
+                {
+                    sink.set_name(name);
+                }
+                if let Some(value) = jsx_attribute_value(node) {
+                    sink.role(Role::Value, value);
+                }
+            }
+            NormalizedKind::JsxSpreadAttribute => {
+                if let Some(value) = jsx_spread_operand(node) {
+                    sink.role(Role::Value, value);
+                }
+            }
+            NormalizedKind::ObjectProperty => {
+                attach_object_property_roles(sink, node);
+            }
+            NormalizedKind::ComputedProperty => {
+                if let Some(value) = first_named_child(node) {
+                    sink.role(Role::Value, value);
+                }
+            }
+            NormalizedKind::SpreadElement => {
+                if let Some(value) = first_named_child(node) {
+                    sink.role(Role::Value, value);
+                }
+            }
             _ => {}
         }
+    }
+}
+
+/// One `elements` role edge per element of an `array` or `object` literal.
+/// Every named child except comments is an element: array entries, object
+/// pairs, spreads, shorthand properties, and object methods all count toward
+/// the literal's element count.
+fn attach_collection_elements(sink: &mut RoleSink<'_>, literal: Node<'_>) {
+    for index in 0..literal.named_child_count() {
+        let Some(child) = literal.named_child(index) else {
+            continue;
+        };
+        if child.kind() == "comment" {
+            continue;
+        }
+        attach_role_with_derived_name(sink, Role::Element, child, expression_name_node);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brokk_bifrost_core::analyzer::structural::spec::RoleSink;
+    use brokk_bifrost_core::hash::HashMap;
+
+    #[test]
+    fn typescript_parameter_extracts_name_and_decorator_role() {
+        let source = "class Controller { handle(@Query value: string) {} }";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .expect("TypeScript grammar");
+        let tree = parser.parse(source, None).expect("TypeScript tree");
+
+        let mut fact_by_ts_node = HashMap::default();
+        let mut parameter = None;
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            let fact_id = fact_by_ts_node.len() as u32;
+            fact_by_ts_node.insert(node.id(), fact_id);
+            if node.kind() == "required_parameter" {
+                parameter = Some(node);
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        let parameter = parameter.expect("decorated required parameter");
+
+        let mut roles = Vec::new();
+        let mut occurrence_roles = Vec::new();
+        let mut sink = RoleSink::new(
+            &fact_by_ts_node,
+            &mut roles,
+            &mut occurrence_roles,
+            32,
+            None,
+        );
+        TYPESCRIPT_STRUCTURAL_SPEC.extract(parameter, NormalizedKind::Parameter, &mut sink);
+        let (name, stop) = sink.into_parts();
+
+        assert_eq!(stop, None);
+        assert_eq!(
+            name,
+            Some(Span {
+                start_byte: 33,
+                end_byte: 38
+            })
+        );
+        let decorator = roles
+            .iter()
+            .find(|target| target.role == Role::Decorator)
+            .expect("parameter decorator role");
+        assert_eq!(decorator.span.text(source), "@Query");
+        assert_eq!(decorator.name.map(|span| span.text(source)), Some("Query"));
+    }
+
+    #[test]
+    fn tsx_parameter_extracts_name_and_decorator_role() {
+        let source = "class Controller { handle(@Query value: string) {} }";
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TSX.into())
+            .expect("TSX grammar");
+        let tree = parser.parse(source, None).expect("TSX tree");
+
+        let mut fact_by_ts_node = HashMap::default();
+        let mut parameter = None;
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            let fact_id = fact_by_ts_node.len() as u32;
+            fact_by_ts_node.insert(node.id(), fact_id);
+            if node.kind() == "required_parameter" {
+                parameter = Some(node);
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        let parameter = parameter.expect("decorated required parameter");
+
+        let mut roles = Vec::new();
+        let mut occurrence_roles = Vec::new();
+        let mut sink = RoleSink::new(
+            &fact_by_ts_node,
+            &mut roles,
+            &mut occurrence_roles,
+            32,
+            None,
+        );
+        TYPESCRIPT_STRUCTURAL_SPEC.extract(parameter, NormalizedKind::Parameter, &mut sink);
+        let (name, stop) = sink.into_parts();
+
+        assert_eq!(stop, None);
+        assert_eq!(
+            name,
+            Some(Span {
+                start_byte: 33,
+                end_byte: 38
+            })
+        );
+        let decorator = roles
+            .iter()
+            .find(|target| target.role == Role::Decorator)
+            .expect("parameter decorator role");
+        assert_eq!(decorator.span.text(source), "@Query");
+        assert_eq!(decorator.name.map(|span| span.text(source)), Some("Query"));
     }
 }

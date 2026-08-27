@@ -49,10 +49,8 @@ fn mcp_server_binary() -> &'static str {
 
 fn spawn_server(root: &Path) -> Child {
     Command::new(mcp_server_binary())
-        .env("BIFROST_SEMANTIC_INDEX", "off")
         // The workspace-authoring location for semantic models is opt-in.
         .env("BIFROST_WORKSPACE_SEMANTIC_MODELS", "on")
-        .arg("--force-semantic-cpu")
         .arg("--root")
         .arg(root)
         .arg("--mcp")

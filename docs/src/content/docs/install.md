@@ -70,7 +70,7 @@ bifrost --install
 
 The command registers the current Bifrost executable with installed Codex,
 Claude Code, OpenCode, Kimi Code, Hermes, and Oh My Pi clients. It starts
-Bifrost with the `core|nlp` toolsets. The server starts without a fixed
+Bifrost with the `core` toolset. The server starts without a fixed
 project and uses the workspace root that the client supplies for each session.
 
 The command skips clients that are not installed. It does not install client
@@ -222,16 +222,3 @@ pip install brokk-bifrost-searchtools
 ```
 
 Import it as `bifrost_searchtools`. See [Python Client](../python-client/) for the API surface and local development workflow.
-
-## Optional Semantic Search
-
-Semantic search is not part of the default Rust feature set. Build with `--features nlp` and enable it at runtime:
-
-```bash
-cargo build --features nlp --bin bifrost
-BIFROST_SEMANTIC_INDEX=auto bifrost --root /path/to/project --mcp core
-```
-
-This `core` example is intentionally scoped to symbol navigation plus optional semantic search; it does not expose `query_code`. Use `--mcp "symbol|extended"` for a structural-query-capable agent, or add `extended` to the composition when semantic search and structural queries are both required.
-
-See [Semantic Search](../semantic-search/) for model, accelerator, and index details.

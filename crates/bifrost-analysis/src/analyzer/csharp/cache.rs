@@ -17,6 +17,10 @@ pub(super) struct CSharpMemoCaches {
     /// its own answer would be served the other's from here (#1726).
     pub(super) namespace_by_file: Cache<ProjectFile, Arc<String>>,
     pub(super) using_namespaces: Cache<ProjectFile, Arc<Vec<String>>>,
+    /// The non-global tier of a file's `using` directives, the visible-type
+    /// search's per-probe ask (#2679). Distinct from `using_namespaces`, which
+    /// folds the workspace `global using` set in.
+    pub(super) file_using_namespaces: Cache<ProjectFile, Arc<Vec<String>>>,
     /// Whether the workspace declares anything in a namespace, by namespace.
     ///
     /// The visible-type search asks this of every namespace a probe would
@@ -42,6 +46,9 @@ pub(super) struct CSharpMemoCaches {
     pub(super) implicit_reference_index:
         PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>,
     pub(super) global_using_namespaces: OnceLock<HashSet<String>>,
+    /// [`Self::global_using_namespaces`] sorted once for the visible-type
+    /// search's deterministic candidate order (#2679).
+    pub(super) sorted_global_using_namespaces: OnceLock<Vec<String>>,
     pub(super) global_using_aliases: OnceLock<HashMap<String, String>>,
     pub(super) global_static_using_type_names: OnceLock<Vec<String>>,
     pub(super) global_static_using_types: OnceLock<Vec<CodeUnit>>,
@@ -54,6 +61,7 @@ impl CSharpMemoCaches {
             budget_bytes,
             namespace_by_file: build_weighted_cache(budget_bytes / 16, weight_string),
             using_namespaces: build_weighted_cache(budget_bytes / 8, weight_string_vec),
+            file_using_namespaces: build_weighted_cache(budget_bytes / 8, weight_string_vec),
             // Inline because moka's weigher takes the key as `&K`, and `K` here
             // is `String`: a named function would have to spell `&String`,
             // which `clippy::ptr_arg` rejects.
@@ -78,6 +86,7 @@ impl CSharpMemoCaches {
             reverse_import_index: PoolSafeMemo::new(),
             implicit_reference_index: PoolSafeMemo::new(),
             global_using_namespaces: OnceLock::new(),
+            sorted_global_using_namespaces: OnceLock::new(),
             global_using_aliases: OnceLock::new(),
             global_static_using_type_names: OnceLock::new(),
             global_static_using_types: OnceLock::new(),

@@ -17,7 +17,7 @@ That produces a dependency like:
 
 ```toml
 [dependencies]
-brokk-bifrost = "0.10.6"
+brokk-bifrost = "0.10.7"
 ```
 
 For local development against a checkout, use a path dependency:
@@ -87,7 +87,7 @@ during initialization. Reserve the process's standard input and output for LSP
 messages, and follow the [LSP server guide](/lsp/) for protocol configuration.
 
 `brokk-bifrost-core`, the language adapters above, `brokk-bifrost-analysis`,
-`brokk-bifrost-policy`, `brokk-bifrost-nlp`, `brokk-bifrost-runtime`, and
+`brokk-bifrost-policy`, `brokk-bifrost-runtime`, and
 `brokk-bifrost-mcp` are lower-level workspace components. They are published
 so focused hosts can compose them, but they are not necessary for ordinary
 library consumers. Prefer the facade unless you own one of those boundaries.
@@ -158,7 +158,5 @@ For most embedded code-intelligence workflows, prefer `SearchToolsService` over 
 ## Features
 
 The default Rust build has no optional features enabled.
-
-`nlp` enables semantic search support. It adds the model download, tokenization, and semantic-index plumbing, while the embedding sidecar selects CUDA, Apple Metal, or CPU at runtime.
 
 `python` enables the PyO3 extension module used by the Python package. Maturin turns this on automatically through `pyproject.toml`; ordinary CLI and library builds do not need it.

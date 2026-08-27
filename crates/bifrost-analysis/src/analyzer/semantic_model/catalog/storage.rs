@@ -1,4 +1,4 @@
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -26,6 +26,7 @@ pub(super) fn prepare_root(root: &Path) -> Result<PathBuf, CatalogError> {
         root.join("objects"),
         root.join("objects/sha256"),
         root.join("staging"),
+        root.join("locks"),
     ] {
         reject_symlink(&directory, "catalog directory")?;
         let existed = directory.exists();
@@ -59,6 +60,24 @@ pub(super) fn open_read_only_root(root: &Path) -> Result<PathBuf, CatalogError> 
         reject_symlink(&path, "catalog path")?;
     }
     Ok(root)
+}
+
+pub(super) fn open_generated_production_lock(
+    root: &Path,
+    digest: &str,
+) -> Result<File, CatalogError> {
+    validate_digest(digest)?;
+    let lock_root = root.join("locks");
+    reject_symlink(&lock_root, "catalog lock directory")?;
+    let lock_path = lock_root.join(format!("{digest}.lock"));
+    reject_symlink(&lock_path, "generated-production lock")?;
+    OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .map_err(|error| CatalogError::io("open generated-production lock", error))
 }
 
 pub(super) fn publish(

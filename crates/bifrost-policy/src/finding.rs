@@ -1081,6 +1081,12 @@ pub enum PolicyQueryResultRef {
         parameter_index: Option<u32>,
         parameter_name: Option<String>,
     },
+    JsxAttributeValue {
+        location: PolicySourceLocation,
+        ast_id: String,
+        element_identity: String,
+        coverage: String,
+    },
     ReceiverAnalysis {
         location: PolicySourceLocation,
         analysis_kind: String,
@@ -1106,6 +1112,7 @@ impl PolicyQueryResultRef {
             Self::ReferenceSite { .. } => Some(MatchResultDomain::ReferenceSite),
             Self::CallSite { .. } => Some(MatchResultDomain::CallSite),
             Self::ExpressionSite { .. } => Some(MatchResultDomain::ExpressionSite),
+            Self::JsxAttributeValue { .. } => Some(MatchResultDomain::JsxAttributeValue),
             Self::ReceiverAnalysis { .. } | Self::Unsupported { .. } => None,
         }
     }
@@ -1117,6 +1124,7 @@ impl PolicyQueryResultRef {
             | Self::ReferenceSite { location, .. }
             | Self::CallSite { location, .. }
             | Self::ExpressionSite { location, .. }
+            | Self::JsxAttributeValue { location, .. }
             | Self::ReceiverAnalysis { location, .. } => Some(location),
             Self::File { .. } => None,
             Self::Unsupported { location, .. } => location.as_ref(),
@@ -1184,6 +1192,17 @@ impl PolicyQueryResultRef {
                     validate_report_prose(parameter_name)?;
                 }
             }
+            Self::JsxAttributeValue {
+                location,
+                ast_id,
+                element_identity,
+                coverage,
+            } => {
+                require_span_bearing(location)?;
+                validate_report_identifier(ast_id)?;
+                validate_report_identifier(element_identity)?;
+                validate_report_identifier(coverage)?;
+            }
             Self::ReceiverAnalysis {
                 location,
                 analysis_kind,
@@ -1247,6 +1266,16 @@ impl PolicyQueryResultRef {
                 if let Some(parameter_name) = parameter_name {
                     tighten_string(parameter_name);
                 }
+            }
+            Self::JsxAttributeValue {
+                ast_id,
+                element_identity,
+                coverage,
+                ..
+            } => {
+                tighten_string(ast_id);
+                tighten_string(element_identity);
+                tighten_string(coverage);
             }
             Self::ReceiverAnalysis {
                 analysis_kind,
@@ -1319,6 +1348,15 @@ impl RetainedSize for PolicyQueryResultRef {
             } => retained_extra(location)
                 .saturating_add(input_kind.capacity())
                 .saturating_add(retained_extra(parameter_name)),
+            Self::JsxAttributeValue {
+                location,
+                ast_id,
+                element_identity,
+                coverage,
+            } => retained_extra(location)
+                .saturating_add(ast_id.capacity())
+                .saturating_add(element_identity.capacity())
+                .saturating_add(coverage.capacity()),
             Self::ReceiverAnalysis {
                 location,
                 analysis_kind,
@@ -1987,11 +2025,19 @@ impl PolicyDiagnostic {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PolicyDiagnosticCode {
-    CodeQuery { code: CodeQueryDiagnosticCode },
+    CodeQuery {
+        code: CodeQueryDiagnosticCode,
+    },
     UnsupportedAnalysis,
     StableAnchorUnavailable,
     EndpointDominanceUndecidable,
     EvaluationFailure,
+    /// A declared selection bound no location in the scanned workspace, so the
+    /// verdict it participates in is vacuous rather than proven (#2659). The
+    /// run stays honest about what it did -- zero findings over an empty
+    /// selection is still a correct verdict -- but the report says the
+    /// selection was empty instead of looking identical to a proven-clean run.
+    EmptySelection,
     BatchFindingLimit,
     ReportRetentionBudget,
     CvssVariantBudget,
@@ -2009,6 +2055,7 @@ impl PolicyDiagnosticCode {
             Self::StableAnchorUnavailable => "stable_anchor_unavailable".to_owned(),
             Self::EndpointDominanceUndecidable => "endpoint_dominance_undecidable".to_owned(),
             Self::EvaluationFailure => "evaluation_failure".to_owned(),
+            Self::EmptySelection => "empty_selection".to_owned(),
             Self::BatchFindingLimit => "batch_finding_limit".to_owned(),
             Self::ReportRetentionBudget => "report_retention_budget".to_owned(),
             Self::CvssVariantBudget => "cvss_variant_budget".to_owned(),

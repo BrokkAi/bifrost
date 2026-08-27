@@ -215,6 +215,16 @@ impl RetainedNpmSurface {
 struct TypeScriptNpmSurface(RetainedNpmSurface);
 
 impl JsTsExternalSurfaceEvidence for TypeScriptNpmSurface {
+    fn classify_global_name(&self, name: &str) -> bool {
+        self.0.overlay.as_ref().is_some_and(|overlay| {
+            overlay
+                .symbols_named(name)
+                .records
+                .iter()
+                .any(|symbol| symbol.qualified_name == name)
+        })
+    }
+
     fn classify_exported_name(
         &self,
         module_specifier: &str,

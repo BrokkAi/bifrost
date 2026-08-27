@@ -38,5 +38,9 @@ pub fn force_gc_for_analyzer(
     let Some(db_path) = store.db_path() else {
         return Ok(GcOutcome::skipped(0));
     };
-    force_gc(db_path, repo, workspace_root)
+    let outcome = force_gc(db_path, repo, workspace_root)?;
+    store
+        .reclaim_stale_generations(i64::MAX as usize)
+        .map_err(|error| format!("analyzer stale-generation GC failed: {error}"))?;
+    Ok(outcome)
 }

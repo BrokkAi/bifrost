@@ -62,8 +62,9 @@ pub use analyzer::{
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use analyzer::{
-    reset_rust_tree_parse_counters_for_test, rust_tree_parse_count_for_test,
-    rust_tree_parse_request_count_for_test, rust_tree_parsed_bytes_for_test,
+    reset_rust_tree_parse_counters_for_test, rust_scope_index_build_count_for_test,
+    rust_tree_parse_count_for_test, rust_tree_parse_request_count_for_test,
+    rust_tree_parsed_bytes_for_test,
 };
 pub use cancellation::CancellationToken;
 pub use navigation::NavigationOperation;

@@ -43,8 +43,9 @@ use crate::graph::resolver::{
     cpp_template_reference_arguments, cpp_type_name_components, declarator_name_node,
     designated_initializer_owner, extract_variable_name, first_type_child, function_terminal_node,
     has_ancestor_kind, infer_cpp_initializer_binding, infer_cpp_initializer_type,
-    initialized_type_declaration_with_cast, is_cpp_template_argument_type_leaf,
-    is_declaration_name, is_declarator_node, is_globally_qualified_cpp_name, is_nested_type_node,
+    initialized_type_declaration_with_cast, is_c_sizeof_expression_type_candidate,
+    is_cpp_template_argument_type_leaf, is_declaration_name, is_declarator_node,
+    is_globally_qualified_cpp_name, is_nested_type_node,
     is_recovered_qualified_friend_class_type_reference, normalize_type_text,
     out_of_line_member_definition_owner, parameter_belongs_to_callable_scope,
     qualified_alias_reference_preserves_target, qualified_alias_reference_requires_terminal,
@@ -281,6 +282,17 @@ fn record_reference(
         return;
     }
     if has_ancestor_kind(node, "using_declaration") {
+        return;
+    }
+    if is_c_sizeof_expression_type_candidate(ctx.file, node) {
+        let name = node_text(node, ctx.source);
+        if bindings.is_shadowed(name) {
+            return;
+        }
+        match ctx.resolve_type_node_result(node) {
+            Ok(Some(unit)) => ctx.record(unit.fq_name(), node),
+            Ok(None) | Err(_) => ctx.record_unproven(name, node),
+        }
         return;
     }
     if matches!(node.kind(), "qualified_identifier" | "scoped_identifier")

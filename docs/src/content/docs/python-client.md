@@ -74,7 +74,6 @@ Use `manual=True` with `update_paths(...)` when the caller wants to control incr
 | Declarations, definitions, and types | `get_declarations_by_location(...)`, `get_definitions_by_location(...)`, `get_definitions_by_reference(...)`, `get_type_by_location(...)` |
 | Usages and graph | `scan_usages_by_reference(...)`, `scan_usages_by_location(...)`, `rename_symbol(...)`, `usage_graph(...)`, `most_relevant_files(...)`, `analyze_diff(...)` |
 | Code query | `query_code(...)` |
-| Semantic search | `semantic_search(...)`, `semantic_search_status()` |
 | Files | `get_file_contents(...)`, `search_file_contents(...)`, `find_files_containing(...)` |
 | Code quality | `compute_cyclomatic_complexity(...)`, `compute_cognitive_complexity(...)`, `report_comment_density_for_code_unit(...)`, `report_comment_density_for_files(...)`, `report_exception_handling_smells(...)`, `report_test_assertion_smells(...)`, `report_structural_clone_smells(...)`, `report_long_method_and_god_object_smells(...)`, `report_dead_code_and_unused_abstraction_smells(...)`, `report_secret_like_code(...)`, `analyze_git_hotspots(...)` |
 

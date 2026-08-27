@@ -274,6 +274,22 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), KotlinLoweringError> {
         match node.kind() {
+            // A folded literal keeps exactly one arm, so an `if (false)` body
+            // is never reachable. The guard row is what still says the branch
+            // was constant after the fold removed the other edge (#2443).
+            "boolean_literal" => match boolean_literal_value(self.prepared.source(), node) {
+                Some(true) => {
+                    self.edge(builder, entry, when_true)?;
+                    self.record_guard(builder, entry, node, Some(when_true), None)
+                }
+                Some(false) => {
+                    self.edge(builder, entry, when_false)?;
+                    self.record_guard(builder, entry, node, None, Some(when_false))
+                }
+                None => {
+                    self.opaque_condition(builder, node, entry, when_true, when_false, scope, stack)
+                }
+            },
             "conjunction_expression" | "disjunction_expression" => {
                 let operands = binary_operands(node);
                 let (Some(left), Some(right)) =
@@ -373,6 +389,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let decision = self.point(builder, node, Vec::new())?;
         self.edge(builder, decision, when_true)?;
         self.edge(builder, decision, when_false)?;
+        self.record_guard(builder, decision, node, Some(when_true), Some(when_false))?;
         stack.push(Work::Expression {
             node,
             entry,
@@ -380,6 +397,81 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             scope,
         });
         Ok(())
+    }
+
+    /// Publish one normalized guard fact for a decision the condition lowering
+    /// just made.
+    ///
+    /// Only a constant boolean is normalized today. Everything else this
+    /// lowerer decides is recorded `Opaque` rather than guessed, so an absent
+    /// guard row means the condition lowering made no decision at that point
+    /// at all -- which is what makes the [`SemanticCapability::GuardFacts`]
+    /// entry readable.
+    fn record_guard(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        condition: Node<'tree>,
+        when_true: Option<EdgeTarget>,
+        when_false: Option<EdgeTarget>,
+    ) -> Result<(), KotlinLoweringError> {
+        let arm = |target: Option<EdgeTarget>| {
+            target.map(|target| GuardArm {
+                target_point: target.point,
+                kind: target.kind,
+            })
+        };
+        let (predicate, subject) = match self.normalize_condition(condition) {
+            Some(predicate) => (predicate, None),
+            None => (
+                GuardPredicate::Opaque {
+                    digest: GuardConditionDigest::from_syntax_kind(condition.kind()),
+                },
+                // The condition's own value is the one thing an opaque guard
+                // can honestly name: the decision tested it, whatever it means.
+                Some(self.expression_value(
+                    builder,
+                    condition,
+                    expression_value_kind(condition),
+                )?),
+            ),
+        };
+        self.session.add_guard_fact(
+            builder,
+            point,
+            predicate,
+            subject,
+            arm(when_true),
+            arm(when_false),
+        )?;
+        Ok(())
+    }
+
+    /// Normalize one Kotlin condition into a guard predicate, or answer `None`
+    /// when the syntax is represented but not normalizable.
+    ///
+    /// `!` and parentheses are peeled iteratively before the match, because a
+    /// negated guard is the same guard with its outcome swapped rather than a
+    /// decision of its own. [`Self::condition`] already peels both by
+    /// recursion, so this loop only matters on the fallback paths that reach
+    /// [`Self::opaque_condition`] with a wrapper still attached.
+    fn normalize_condition(&self, condition: Node<'tree>) -> Option<GuardPredicate> {
+        let mut cursor = condition;
+        let mut negated = false;
+        loop {
+            match cursor.kind() {
+                "parenthesized_expression" => cursor = first_named_child(cursor)?,
+                "prefix_expression" if has_token(cursor, "!") => {
+                    negated = !negated;
+                    cursor = unary_operand(cursor)?;
+                }
+                _ => break,
+            }
+        }
+        let value = boolean_literal_value(self.prepared.source(), cursor)?;
+        Some(GuardPredicate::ConstantBoolean {
+            value: value != negated,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -532,12 +624,30 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 Ok(())
             }
             "parenthesized_expression" | "spread_expression" | "interpolated_expression" => {
+                // A wrapper mints a result temporary like any other expression,
+                // and the parent reads that temporary rather than the inner
+                // one. Forwarding the inner value into it is what keeps
+                // `(value * 3)` and `"a${value}"` carrying the value they
+                // wrap instead of a slot nothing ever wrote.
                 match first_named_child(node) {
                     Some(inner) => {
+                        let terminal = self.point(builder, node, Vec::new())?;
+                        let source =
+                            self.expression_value(builder, inner, expression_value_kind(inner))?;
+                        self.append_effect(
+                            builder,
+                            terminal,
+                            SemanticEffect::ValueFlow {
+                                kind: ValueFlowKind::Local,
+                                source,
+                                target: result,
+                            },
+                        )?;
+                        self.edge(builder, terminal, next)?;
                         stack.push(Work::Expression {
                             node: inner,
                             entry,
-                            next,
+                            next: EdgeTarget::normal(terminal),
                             scope,
                         });
                         Ok(())
@@ -1208,6 +1318,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let (binding, iterable, body) =
             for_statement_parts(node).ok_or_else(|| missing_slot(node, "for-in parts"))?;
         let header = self.point(builder, binding, Vec::new())?;
+        // An integer-literal-bounded range provably yields a first element, and
+        // the compiler lowers such a `for` into a counted loop with no iterator
+        // object at all. Entering at the binding rather than at the header is
+        // what keeps a zero-trip path from claiming the body never ran. Without
+        // the proof the header keeps carrying the rebinding itself, so an
+        // unprovable iterable lowers exactly as before.
+        let first_iteration = kotlin_range_has_first_iteration(self.prepared.source(), iterable);
+        let binding_point = if first_iteration {
+            self.point(builder, binding, Vec::new())?
+        } else {
+            header
+        };
         let body_entry = self.point(builder, body.unwrap_or(node), Vec::new())?;
         let loop_scope = builder.push_scope(
             Some(scope),
@@ -1220,26 +1342,28 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             },
         );
         let destructures = binding.kind() == "multi_variable_declaration";
-        self.add_gap(
-            builder,
-            header,
-            SemanticGapSubject::Point,
-            SemanticCapability::Calls,
-            SemanticGapKind::Unsupported,
-            if destructures {
-                "implicit iterator()/hasNext()/next() and destructuring componentN operator calls are compiler-generated"
-            } else {
-                "implicit iterator()/hasNext()/next() operator calls are compiler-generated"
-            },
-        )?;
-        self.add_gap(
-            builder,
-            header,
-            SemanticGapSubject::Point,
-            SemanticCapability::ExceptionalControlFlow,
-            SemanticGapKind::Unsupported,
-            "implicit iterator acquisition and advancement exceptions are not yet lowered",
-        )?;
+        if !first_iteration {
+            self.add_gap(
+                builder,
+                header,
+                SemanticGapSubject::Point,
+                SemanticCapability::Calls,
+                SemanticGapKind::Unsupported,
+                if destructures {
+                    "implicit iterator()/hasNext()/next() and destructuring componentN operator calls are compiler-generated"
+                } else {
+                    "implicit iterator()/hasNext()/next() operator calls are compiler-generated"
+                },
+            )?;
+            self.add_gap(
+                builder,
+                header,
+                SemanticGapSubject::Point,
+                SemanticCapability::ExceptionalControlFlow,
+                SemanticGapKind::Unsupported,
+                "implicit iterator acquisition and advancement exceptions are not yet lowered",
+            )?;
+        }
         let names = binding_names(binding);
         // Each iteration rebinds the loop variables to a value the iterator
         // produces, which no source expression names.
@@ -1250,10 +1374,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             let Some(target) = self.local_declaration_value(text, name.start_byte()) else {
                 continue;
             };
-            let element = self.value(builder, header, SemanticValueKind::Temporary)?;
+            let element = self.value(builder, binding_point, SemanticValueKind::Temporary)?;
             self.append_effect(
                 builder,
-                header,
+                binding_point,
                 SemanticEffect::Assignment {
                     target,
                     value: element,
@@ -1261,7 +1385,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             )?;
             self.append_effect(
                 builder,
-                header,
+                binding_point,
                 SemanticEffect::ValueFlow {
                     kind: ValueFlowKind::Local,
                     source: element,
@@ -1273,10 +1397,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             builder,
             header,
             EdgeTarget {
-                point: body_entry,
+                point: if first_iteration {
+                    binding_point
+                } else {
+                    body_entry
+                },
                 kind: ControlEdgeKind::ConditionalTrue,
             },
         )?;
+        if first_iteration {
+            self.edge(builder, binding_point, EdgeTarget::normal(body_entry))?;
+        }
         self.edge(
             builder,
             header,
@@ -1301,7 +1432,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack.push(Work::Expression {
             node: iterable,
             entry,
-            next: EdgeTarget::normal(header),
+            next: EdgeTarget::normal(if first_iteration {
+                binding_point
+            } else {
+                header
+            }),
             scope: loop_scope,
         });
         Ok(())
@@ -2384,6 +2519,79 @@ struct NullGate {
     test: ProgramPointId,
     gated: ProgramPointId,
     join: ProgramPointId,
+}
+
+/// The value of a `boolean_literal`, which the grammar spells as bare text
+/// rather than as two node kinds.
+fn boolean_literal_value(source: &str, node: Node<'_>) -> Option<bool> {
+    if node.kind() != "boolean_literal" {
+        return None;
+    }
+    match node_text(source, node)? {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// The value of an `integer_literal`, or `None` when it is not a plain decimal
+/// the adapter can read exactly.
+fn integer_literal_value(source: &str, node: Node<'_>) -> Option<i64> {
+    (node.kind() == "integer_literal")
+        .then(|| node_text(source, node))
+        .flatten()
+        .and_then(|text| text.parse().ok())
+}
+
+/// Whether an integer-literal-bounded Kotlin range provably yields at least one
+/// element, so the loop body runs before the header's exit test is ever taken.
+///
+/// Only the three range builders the grammar gives structure to are proven:
+/// `A..B` (and `A..<B`) as a `range_expression`, and `A until B` / `A downTo B`
+/// as an `infix_expression` whose middle child is the operator name. Anything
+/// else -- a `step`-wrapped range, a collection, an arbitrary expression --
+/// answers `false`, which keeps the shared zero-trip over-approximation.
+pub(super) fn kotlin_range_has_first_iteration(source: &str, iterable: Node<'_>) -> bool {
+    let operands = binary_operands(iterable);
+    match iterable.kind() {
+        "range_expression" => {
+            let (Some(start), Some(end)) = (operands.first(), operands.get(1)) else {
+                return false;
+            };
+            let (Some(start), Some(end)) = (
+                integer_literal_value(source, *start),
+                integer_literal_value(source, *end),
+            ) else {
+                return false;
+            };
+            // `..` is inclusive of its end, `..<` is not.
+            if has_token(iterable, "..<") {
+                start < end
+            } else {
+                start <= end
+            }
+        }
+        "infix_expression" => {
+            let [start, operator, end] = operands.as_slice() else {
+                return false;
+            };
+            if operator.kind() != "simple_identifier" {
+                return false;
+            }
+            let (Some(start), Some(end)) = (
+                integer_literal_value(source, *start),
+                integer_literal_value(source, *end),
+            ) else {
+                return false;
+            };
+            match node_text(source, *operator) {
+                Some("until") => start < end,
+                Some("downTo") => start >= end,
+                _ => false,
+            }
+        }
+        _ => false,
+    }
 }
 
 /// Operations Kotlin resolves through an operator convention: a member call the

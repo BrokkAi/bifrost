@@ -1,10 +1,10 @@
 use super::ir::{
     ArityConstraint, BindingFilter, BindingSeed, CallInputSelector, CandidateFilter, CodeQuery,
     CodeQueryPlan, CodeQueryPlanSource, CodeQuerySeed, ControlRelationFilter,
-    DeclarationStateFilter, EdgeFilter, ExportFilter, ExportSeed, FlowRelationFilter,
-    GenerationSiteFilter, GenerationSiteSeed, HierarchyTraversal, OccurrenceFilter, OccurrenceSeed,
-    PathSeed, Pattern, QueryStep, RewritePathFilter, ScopeFilter, ScopeSeed, StateEventFilter,
-    StringPredicate, UNATTRIBUTED_TIER_LABEL,
+    DeclarationStateFilter, DecoratorBindingFilter, EdgeFilter, ExportFilter, ExportSeed,
+    FlowRelationFilter, GenerationSiteFilter, GenerationSiteSeed, HierarchyTraversal,
+    OccurrenceFilter, OccurrenceSeed, PathSeed, Pattern, QueryStep, RewritePathFilter, ScopeFilter,
+    ScopeSeed, StateEventFilter, StringPredicate, UNATTRIBUTED_TIER_LABEL,
 };
 use super::schema::{
     CallTraversalCompleteness, QueryStepField, reference_kind_label, usage_proof_label,
@@ -244,6 +244,22 @@ pub(super) fn binding_filter_to_json(filter: &BindingFilter) -> Map<String, Valu
                     .map(|class| json!(class.label()))
                     .collect(),
             ),
+        );
+    }
+    object
+}
+
+pub(super) fn decorator_binding_filter_to_json(
+    filter: &DecoratorBindingFilter,
+) -> Map<String, Value> {
+    let mut object = Map::new();
+    if let Some(module) = &filter.module {
+        object.insert("module".to_string(), Value::String(module.clone()));
+    }
+    if let Some(imported_name) = &filter.imported_name {
+        object.insert(
+            "imported_name".to_string(),
+            Value::String(imported_name.clone()),
         );
     }
     object
@@ -748,6 +764,9 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         | QueryStep::SignatureParameters
         | QueryStep::CallableApplicability
         | QueryStep::OverloadSelection => {}
+        QueryStep::DecoratorBindings(filter) => {
+            object.extend(decorator_binding_filter_to_json(filter));
+        }
         QueryStep::MemberSelection
         | QueryStep::CandidateHierarchy
         | QueryStep::DispatchOutcome
@@ -870,6 +889,17 @@ fn query_step_to_json(step: &QueryStep) -> Value {
                 object.insert("parameter_name".to_string(), json!(name));
             }
         },
+        QueryStep::JsxAttributeValue(traversal) => {
+            if let Some(identity) = traversal.identity {
+                object.insert("identity".to_string(), json!(identity.label()));
+            }
+            if let Some(element_name) = &traversal.element_name {
+                object.insert("element_name".to_string(), json!(element_name));
+            }
+            if let Some(property_name) = &traversal.property_name {
+                object.insert("property_name".to_string(), json!(property_name));
+            }
+        }
         QueryStep::ReceiverTargets(filter)
         | QueryStep::PointsTo(filter)
         | QueryStep::MemberTargets(filter) => {

@@ -139,6 +139,29 @@ impl From<git2::Error> for StoreError {
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct WorkspaceId(String);
+
+impl WorkspaceId {
+    pub(crate) fn for_root(root: &Path) -> Self {
+        Self(brokk_bifrost_core::gitblob::workspace_cache_identity(root))
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkspaceSnapshotId {
+    pub(crate) workspace_id: WorkspaceId,
+    pub(crate) lang: String,
+    pub(crate) generation: GenerationId,
+    pub(crate) revision: i64,
+}
+
+pub(crate) type WorkspaceSnapshots = HashMap<String, WorkspaceSnapshotId>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum SemanticPackActivationSourceKind {
     Installed,
@@ -232,8 +255,7 @@ const NORMALIZED_PATH_SYMBOL_FQN_SQL: &str =
     FROM workspace_path_symbol_normalized_names
     WHERE lang = ?1 AND normalized_fqn = ?2
     ORDER BY rel_path, exact_fqn";
-const WORKSPACE_SNAPSHOT_FINGERPRINT_SQL: &str =
-    "SELECT fingerprint FROM workspace_snapshots WHERE lang = ?1 AND generation = ?2";
+const REVISIONED_WORKSPACE_VIEWS_SQL: &str = include_str!("revisioned_workspace_views.sql");
 
 /// The full verification predicate: membership, plus a re-count of every fact
 /// table against the counts `blob_meta` recorded.
@@ -526,13 +548,6 @@ impl ReaderPool {
         // let it drop and close.
     }
 
-    fn close_idle(&self) {
-        self.idle
-            .lock()
-            .expect("analyzer store reader pool poisoned")
-            .clear();
-    }
-
     #[cfg(test)]
     fn idle_len(&self) -> usize {
         self.idle
@@ -817,7 +832,6 @@ pub(crate) struct RenderedDefinitionRequest {
 pub(crate) enum RenderedDefinitionCandidateOutcome {
     Complete(Vec<Vec<HydratedDefinitionOrderCandidateRow>>),
     Cancelled,
-    WorkspaceChanged,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -854,6 +868,7 @@ pub(crate) struct WorkspacePackageFileRow {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct WorkspacePackageEdgeRow {
+    pub(crate) rel_path: String,
     pub(crate) parent_package_name: String,
     pub(crate) child_package_name: String,
 }
@@ -940,32 +955,113 @@ fn path_symbol_rows_by_fqn_in_tx(
     Ok(out)
 }
 
-fn workspace_snapshot_fingerprint(
-    files: &[WorkspaceFileRow],
-    path_symbols: &[PathSymbolRow],
-    packages: &[String],
-    package_files: &[WorkspacePackageFileRow],
-    package_edges: &[WorkspacePackageEdgeRow],
-    anchors: &[WorkspaceAnchorRow],
-) -> String {
-    let mut ordered_files = files.iter().collect::<Vec<_>>();
-    ordered_files.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
-    let mut digest = Sha256::new();
-    digest.update(b"bifrost.workspace-snapshot.v1\0");
-    for file in ordered_files {
-        for value in [file.rel_path.as_bytes(), file.blob_oid.as_bytes()] {
-            digest.update(value.len().to_le_bytes());
-            digest.update(value);
-        }
-    }
-    let mut ordered_symbols = path_symbols.iter().collect::<Vec<_>>();
-    ordered_symbols.sort_by(|left, right| {
-        left.rel_path
-            .cmp(&right.rel_path)
-            .then_with(|| left.exact_fqn.cmp(&right.exact_fqn))
+#[derive(Default)]
+struct WorkspaceFileProjection<'a> {
+    path_symbols: Vec<&'a PathSymbolRow>,
+    package_files: Vec<&'a WorkspacePackageFileRow>,
+    package_edges: Vec<&'a WorkspacePackageEdgeRow>,
+    anchors: Vec<&'a WorkspaceAnchorRow>,
+}
+
+fn sort_workspace_file_projection(projection: &mut WorkspaceFileProjection<'_>) {
+    projection.path_symbols.sort_by(|left, right| {
+        left.exact_fqn
+            .cmp(&right.exact_fqn)
             .then_with(|| left.kind.cmp(&right.kind))
     });
-    for row in ordered_symbols {
+    projection.package_files.sort_unstable();
+    projection.package_edges.sort_unstable();
+    projection.anchors.sort_unstable();
+}
+
+fn workspace_file_projections<'a>(
+    files: &'a [WorkspaceFileRow],
+    path_symbols: &'a [PathSymbolRow],
+    package_files: &'a [WorkspacePackageFileRow],
+    package_edges: &'a [WorkspacePackageEdgeRow],
+    anchors: &'a [WorkspaceAnchorRow],
+) -> HashMap<&'a str, WorkspaceFileProjection<'a>> {
+    let mut projections = files
+        .iter()
+        .map(|file| (file.rel_path.as_str(), WorkspaceFileProjection::default()))
+        .collect::<HashMap<_, _>>();
+    assert_eq!(projections.len(), files.len(), "workspace paths are unique");
+
+    for row in path_symbols {
+        projections
+            .get_mut(row.rel_path.as_str())
+            .expect("path-symbol row belongs to a workspace file")
+            .path_symbols
+            .push(row);
+    }
+    for row in package_files {
+        projections
+            .get_mut(row.rel_path.as_str())
+            .expect("package row belongs to a workspace file")
+            .package_files
+            .push(row);
+    }
+    for row in package_edges {
+        projections
+            .get_mut(row.rel_path.as_str())
+            .expect("package-edge row belongs to a workspace file")
+            .package_edges
+            .push(row);
+    }
+    for row in anchors {
+        projections
+            .get_mut(row.rel_path.as_str())
+            .expect("anchor row belongs to a workspace file")
+            .anchors
+            .push(row);
+    }
+
+    for projection in projections.values_mut() {
+        sort_workspace_file_projection(projection);
+    }
+    projections
+}
+
+fn workspace_file_projection<'a>(
+    rel_path: &str,
+    path_symbols: &'a [PathSymbolRow],
+    package_files: &'a [WorkspacePackageFileRow],
+    package_edges: &'a [WorkspacePackageEdgeRow],
+    anchors: &'a [WorkspaceAnchorRow],
+) -> WorkspaceFileProjection<'a> {
+    let mut projection = WorkspaceFileProjection {
+        path_symbols: path_symbols
+            .iter()
+            .filter(|row| row.rel_path == rel_path)
+            .collect(),
+        package_files: package_files
+            .iter()
+            .filter(|row| row.rel_path == rel_path)
+            .collect(),
+        package_edges: package_edges
+            .iter()
+            .filter(|row| row.rel_path == rel_path)
+            .collect(),
+        anchors: anchors
+            .iter()
+            .filter(|row| row.rel_path == rel_path)
+            .collect(),
+    };
+    sort_workspace_file_projection(&mut projection);
+    projection
+}
+
+fn workspace_file_projection_digest(
+    file: &WorkspaceFileRow,
+    projection: &WorkspaceFileProjection<'_>,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"bifrost.workspace-file-projection.v1\0");
+    for value in [file.rel_path.as_bytes(), file.blob_oid.as_bytes()] {
+        digest.update(value.len().to_le_bytes());
+        digest.update(value);
+    }
+    for row in &projection.path_symbols {
         for value in [
             row.rel_path.as_bytes(),
             row.blob_oid.as_bytes(),
@@ -979,24 +1075,15 @@ fn workspace_snapshot_fingerprint(
         }
         digest.update([code_unit_kind_to_i64(row.kind) as u8]);
     }
-    let mut ordered_packages = packages.iter().collect::<Vec<_>>();
-    ordered_packages.sort();
-    for package in ordered_packages {
-        digest.update(package.len().to_le_bytes());
-        digest.update(package.as_bytes());
-    }
-    let mut ordered_package_files = package_files.iter().collect::<Vec<_>>();
-    ordered_package_files.sort();
-    for row in ordered_package_files {
+    for row in &projection.package_files {
         for value in [row.package_name.as_bytes(), row.rel_path.as_bytes()] {
             digest.update(value.len().to_le_bytes());
             digest.update(value);
         }
     }
-    let mut ordered_package_edges = package_edges.iter().collect::<Vec<_>>();
-    ordered_package_edges.sort();
-    for row in ordered_package_edges {
+    for row in &projection.package_edges {
         for value in [
+            row.rel_path.as_bytes(),
             row.parent_package_name.as_bytes(),
             row.child_package_name.as_bytes(),
         ] {
@@ -1004,9 +1091,7 @@ fn workspace_snapshot_fingerprint(
             digest.update(value);
         }
     }
-    let mut ordered_anchors = anchors.iter().collect::<Vec<_>>();
-    ordered_anchors.sort();
-    for row in ordered_anchors {
+    for row in &projection.anchors {
         for value in [row.rel_path.as_bytes(), row.package_name.as_bytes()] {
             digest.update(value.len().to_le_bytes());
             digest.update(value);
@@ -1019,123 +1104,129 @@ fn workspace_snapshot_fingerprint(
     format!("{:x}", digest.finalize())
 }
 
-fn refresh_incremental_workspace_fingerprint(
-    tx: &Transaction<'_>,
-    lang: &str,
-    generation: GenerationId,
-) -> Result<()> {
-    let mut digest = Sha256::new();
-    digest.update(b"bifrost.workspace-file-set.v1\0");
-    let mut statement = tx.prepare_cached(
-        "SELECT rel_path, blob_oid FROM workspace_files
-         WHERE lang = ?1 AND generation = ?2
-         ORDER BY rel_path",
+fn workspace_snapshots_conn(
+    conn: &Connection,
+    workspace_id: &WorkspaceId,
+    langs: &[String],
+    generations: &HashMap<String, GenerationId>,
+) -> Result<WorkspaceSnapshots> {
+    let mut statement = conn.prepare_cached(
+        "SELECT revision FROM workspace_heads
+         WHERE workspace_id = ?1 AND lang = ?2 AND generation = ?3",
     )?;
-    let rows = statement.query_map(params![lang, generation.0], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
-    for row in rows {
-        let (rel_path, blob_oid) = row?;
-        for value in [rel_path.as_bytes(), blob_oid.as_bytes()] {
-            digest.update(value.len().to_le_bytes());
-            digest.update(value);
+    let mut snapshots = HashMap::default();
+    for lang in langs {
+        let generation = generations[lang];
+        let revision = statement
+            .query_row(params![workspace_id.as_str(), lang, generation.0], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        if let Some(revision) = revision {
+            snapshots.insert(
+                lang.clone(),
+                WorkspaceSnapshotId {
+                    workspace_id: workspace_id.clone(),
+                    lang: lang.clone(),
+                    generation,
+                    revision,
+                },
+            );
         }
     }
-    drop(statement);
-    let fingerprint = format!("{:x}", digest.finalize());
-    let updated = tx.execute(
-        "UPDATE workspace_snapshots SET fingerprint = ?3
-         WHERE lang = ?1 AND generation = ?2",
-        params![lang, generation.0, fingerprint],
+    Ok(snapshots)
+}
+
+fn select_workspace_snapshots(conn: &Connection, snapshots: &WorkspaceSnapshots) -> Result<()> {
+    let configured = conn
+        .query_row(
+            "SELECT 1 FROM temp.sqlite_schema
+             WHERE type = 'table' AND name = 'selected_workspace_revisions'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !configured {
+        conn.execute_batch(REVISIONED_WORKSPACE_VIEWS_SQL)?;
+    }
+    conn.execute("DELETE FROM temp.selected_workspace_revisions", [])?;
+    let mut insert = conn.prepare_cached(
+        "INSERT INTO temp.selected_workspace_revisions(
+           workspace_id, lang, generation, revision
+         ) VALUES(?1, ?2, ?3, ?4)",
     )?;
-    assert_eq!(
-        updated, 1,
-        "incremental workspace replacement requires an initialized snapshot"
-    );
+    for snapshot in snapshots.values() {
+        insert.execute(params![
+            snapshot.workspace_id.as_str(),
+            snapshot.lang,
+            snapshot.generation.0,
+            snapshot.revision,
+        ])?;
+    }
     Ok(())
 }
 
-fn workspace_snapshot_fingerprints_conn(
-    conn: &Connection,
-    langs: &[String],
-    generations: &HashMap<String, GenerationId>,
-) -> Result<HashMap<String, String>> {
-    let mut statement = conn.prepare_cached(WORKSPACE_SNAPSHOT_FINGERPRINT_SQL)?;
-    let mut fingerprints = HashMap::default();
-    for lang in langs {
-        let fingerprint = statement
-            .query_row(params![lang, generations[lang].0], |row| row.get(0))
-            .optional()?;
-        if let Some(fingerprint) = fingerprint {
-            fingerprints.insert(lang.clone(), fingerprint);
+#[cfg(test)]
+fn select_current_test_workspace(conn: &Connection) -> Result<()> {
+    let workspace_id =
+        WorkspaceId("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into());
+    let snapshots = {
+        let mut statement = conn.prepare_cached(
+            "SELECT heads.lang, heads.generation, heads.revision
+             FROM workspace_heads AS heads
+             LEFT JOIN analysis_epochs AS epochs ON epochs.lang = heads.lang
+             WHERE heads.workspace_id = ?1
+               AND heads.generation = COALESCE(epochs.generation, 0)",
+        )?;
+        let rows = statement.query_map([workspace_id.as_str()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                GenerationId(row.get::<_, i64>(1)?),
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut snapshots = HashMap::default();
+        for row in rows {
+            let (lang, generation, revision) = row?;
+            snapshots.insert(
+                lang.clone(),
+                WorkspaceSnapshotId {
+                    workspace_id: workspace_id.clone(),
+                    lang,
+                    generation,
+                    revision,
+                },
+            );
         }
-    }
-    Ok(fingerprints)
+        snapshots
+    };
+    select_workspace_snapshots(conn, &snapshots)
 }
 
-fn insert_path_symbol_row(
-    statement: &mut rusqlite::Statement<'_>,
-    lang: &str,
-    generation: GenerationId,
-    row: &PathSymbolRow,
-) -> rusqlite::Result<usize> {
-    statement.execute(params![
-        lang,
-        row.rel_path,
-        row.blob_oid.to_string(),
-        code_unit_kind_to_i64(row.kind),
-        row.package_name,
-        row.short_name,
-        row.exact_fqn,
-        row.normalized_fqn,
-        generation.0,
-    ])
-}
-
-fn insert_workspace_relation_rows(
+fn insert_workspace_file_projection_rows(
     tx: &Transaction<'_>,
-    lang: &str,
-    generation: GenerationId,
-    packages: &[String],
-    package_files: &[WorkspacePackageFileRow],
-    package_edges: &[WorkspacePackageEdgeRow],
-    anchors: &[WorkspaceAnchorRow],
+    file_version_id: i64,
+    projection: &WorkspaceFileProjection<'_>,
 ) -> Result<()> {
     {
         let mut insert = tx.prepare_cached(
-            "INSERT OR IGNORE INTO workspace_packages(lang, generation, package_name)
-             VALUES(?1, ?2, ?3)",
+            "INSERT INTO workspace_file_package_rows(file_version_id, package_name)
+             VALUES(?1, ?2)",
         )?;
-        for package in packages {
-            insert.execute(params![lang, generation.0, package])?;
+        for row in &projection.package_files {
+            insert.execute(params![file_version_id, row.package_name])?;
         }
     }
     {
         let mut insert = tx.prepare_cached(
-            "INSERT OR REPLACE INTO workspace_package_files(
-               lang, generation, package_name, file_id
-             )
-             SELECT ?1, ?2, ?3, files.file_id
-             FROM workspace_files AS files
-             WHERE files.lang = ?1 AND files.generation = ?2
-               AND files.rel_path = ?4",
+            "INSERT INTO workspace_file_package_edge_rows(
+               file_version_id, parent_package_name, child_package_name
+             ) VALUES(?1, ?2, ?3)",
         )?;
-        for row in package_files {
-            let inserted =
-                insert.execute(params![lang, generation.0, row.package_name, row.rel_path])?;
-            assert_eq!(inserted, 1, "package membership names one workspace file");
-        }
-    }
-    {
-        let mut insert = tx.prepare_cached(
-            "INSERT OR IGNORE INTO workspace_package_edges(
-               lang, generation, parent_package_name, child_package_name
-             ) VALUES(?1, ?2, ?3, ?4)",
-        )?;
-        for row in package_edges {
+        for row in &projection.package_edges {
             insert.execute(params![
-                lang,
-                generation.0,
+                file_version_id,
                 row.parent_package_name,
                 row.child_package_name
             ])?;
@@ -1143,28 +1234,34 @@ fn insert_workspace_relation_rows(
     }
     {
         let mut insert = tx.prepare_cached(
-            "INSERT OR REPLACE INTO workspace_file_anchors(
-               lang, generation, file_id, anchor_kind, anchor_pop, package_name
-             )
-             SELECT ?1, ?2, files.file_id, ?4, ?5, ?6
-             FROM workspace_files AS files
-             WHERE files.lang = ?1 AND files.generation = ?2
-               AND files.rel_path = ?3",
+            "INSERT INTO workspace_file_anchor_rows(
+               file_version_id, anchor_kind, anchor_pop, package_name
+             ) VALUES(?1, ?2, ?3, ?4)",
         )?;
-        for row in anchors {
+        for row in &projection.anchors {
             let (kind, pop) = match row.anchor {
                 PackageAnchor::OwnModule { pop } => ("own_module", i64::from(pop)),
                 PackageAnchor::CrateRoot => ("crate_root", 0),
             };
-            let inserted = insert.execute(params![
-                lang,
-                generation.0,
-                row.rel_path,
-                kind,
-                pop,
-                row.package_name
+            insert.execute(params![file_version_id, kind, pop, row.package_name])?;
+        }
+    }
+    {
+        let mut insert = tx.prepare_cached(
+            "INSERT INTO workspace_file_path_symbol_rows(
+               file_version_id, kind, package_name, short_name,
+               exact_fqn, normalized_fqn
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        for row in &projection.path_symbols {
+            insert.execute(params![
+                file_version_id,
+                code_unit_kind_to_i64(row.kind),
+                row.package_name,
+                row.short_name,
+                row.exact_fqn,
+                row.normalized_fqn,
             ])?;
-            assert_eq!(inserted, 1, "workspace anchor names one workspace file");
         }
     }
     Ok(())
@@ -1248,6 +1345,43 @@ pub struct UsageFactRow<I = FqIdentityHeader> {
 
 pub type HydratedUsageFactRow = UsageFactRow<RelationalUnitFq>;
 
+fn workspace_content_package_facts_sql(oid_count: usize) -> String {
+    assert!(oid_count > 0, "package-fact query needs at least one blob");
+    let placeholders = std::iter::repeat_n("?", oid_count)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "WITH package_units AS (
+           SELECT units.blob_oid, units.lang, units.fq_anchor_kind,
+                  units.fq_anchor_pop, units.content_qualifier,
+                  units.package_fqn_tail, units.fq_package_tail_segments,
+                  MIN(units.unit_key) AS unit_key
+           FROM live_declarations AS units
+           WHERE units.lang = ?
+             AND units.blob_oid IN ({placeholders})
+             AND units.package_fqn_tail IS NOT NULL
+             AND units.fq_package_tail_segments IS NOT NULL
+           GROUP BY units.blob_oid, units.lang, units.fq_anchor_kind,
+                    units.fq_anchor_pop, units.content_qualifier,
+                    units.package_fqn_tail, units.fq_package_tail_segments
+         )
+         SELECT packages.blob_oid, packages.fq_anchor_kind,
+                packages.fq_anchor_pop, packages.content_qualifier,
+                packages.package_fqn_tail,
+                packages.fq_package_tail_segments,
+                segments.seg_ordinal, segments.seg_kind, segments.segment
+         FROM package_units AS packages
+         LEFT JOIN code_unit_fq_segments AS segments
+           ON segments.blob_oid = packages.blob_oid
+          AND segments.lang = packages.lang
+          AND segments.unit_key = packages.unit_key
+          AND segments.seg_ordinal < packages.fq_package_tail_segments
+         ORDER BY packages.blob_oid, packages.fq_anchor_kind,
+                  packages.fq_anchor_pop, packages.content_qualifier,
+                  packages.package_fqn_tail, segments.seg_ordinal"
+    )
+}
+
 impl AnalyzerStore {
     pub(crate) fn workspace_content_package_facts(
         &self,
@@ -1258,36 +1392,7 @@ impl AnalyzerStore {
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_current_generation(&tx, lang, generation)?;
-        let mut statement = tx.prepare(
-            "WITH package_units AS (
-               SELECT units.blob_oid, units.lang, units.fq_anchor_kind,
-                      units.fq_anchor_pop, units.content_qualifier,
-                      units.package_fqn_tail, units.fq_package_tail_segments,
-                      MIN(units.unit_key) AS unit_key
-               FROM live_declarations AS units
-               WHERE units.lang = ?1
-                 AND units.blob_oid = ?2
-                 AND units.package_fqn_tail IS NOT NULL
-                 AND units.fq_package_tail_segments IS NOT NULL
-               GROUP BY units.blob_oid, units.lang, units.fq_anchor_kind,
-                        units.fq_anchor_pop, units.content_qualifier,
-                        units.package_fqn_tail, units.fq_package_tail_segments
-             )
-             SELECT packages.blob_oid, packages.fq_anchor_kind,
-                    packages.fq_anchor_pop, packages.content_qualifier,
-                    packages.package_fqn_tail,
-                    packages.fq_package_tail_segments,
-                    segments.seg_ordinal, segments.seg_kind, segments.segment
-             FROM package_units AS packages
-             LEFT JOIN code_unit_fq_segments AS segments
-               ON segments.blob_oid = packages.blob_oid
-              AND segments.lang = packages.lang
-              AND segments.unit_key = packages.unit_key
-              AND segments.seg_ordinal < packages.fq_package_tail_segments
-             ORDER BY packages.blob_oid, packages.fq_anchor_kind,
-                      packages.fq_anchor_pop, packages.content_qualifier,
-                      packages.package_fqn_tail, segments.seg_ordinal",
-        )?;
+        const OIDS_PER_QUERY: usize = 900;
         #[derive(PartialEq)]
         struct GroupKey {
             blob_oid: Oid,
@@ -1308,13 +1413,15 @@ impl AnalyzerStore {
             Option<String>,
             Option<String>,
         );
-        let mut requested_blobs = blob_oids.to_vec();
+        let mut requested_blobs = blob_oids.iter().map(Oid::to_string).collect::<Vec<_>>();
         requested_blobs.sort_unstable();
         requested_blobs.dedup();
         let mut rows = Vec::new();
-        for blob_oid in requested_blobs {
-            let oid = blob_oid.to_string();
-            let mapped = statement.query_map(params![lang, oid], |row| {
+        for chunk in requested_blobs.chunks(OIDS_PER_QUERY) {
+            let mut statement =
+                tx.prepare_cached(&workspace_content_package_facts_sql(chunk.len()))?;
+            let parameters = std::iter::once(lang).chain(chunk.iter().map(String::as_str));
+            let mapped = statement.query_map(params_from_iter(parameters), |row| {
                 Ok((
                     row.get(0)?,
                     row.get(1)?,
@@ -1329,7 +1436,6 @@ impl AnalyzerStore {
             })?;
             rows.extend(mapped.collect::<std::result::Result<Vec<RawRow>, _>>()?);
         }
-        drop(statement);
         tx.commit()?;
 
         let interner = segment_interner();
@@ -1420,7 +1526,163 @@ impl AnalyzerStore {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn sync_workspace_snapshot(
+    pub(crate) fn sync_workspace_snapshot_for_workspace(
+        &self,
+        workspace_id: &WorkspaceId,
+        lang: &str,
+        generation: GenerationId,
+        files: &[WorkspaceFileRow],
+        path_symbols: &[PathSymbolRow],
+        _packages: &[String],
+        package_files: &[WorkspacePackageFileRow],
+        package_edges: &[WorkspacePackageEdgeRow],
+        anchors: &[WorkspaceAnchorRow],
+    ) -> Result<WorkspaceSnapshotId> {
+        let workspace_id = workspace_id.clone();
+        let lang = lang.to_string();
+        let files = files.to_vec();
+        let path_symbols = path_symbols.to_vec();
+        let package_files = package_files.to_vec();
+        let package_edges = package_edges.to_vec();
+        let anchors = anchors.to_vec();
+        self.conn.execute(move |conn| {
+            let workspace_id_text = workspace_id.as_str();
+            let lang = lang.as_str();
+            let files = files.as_slice();
+            let path_symbols = path_symbols.as_slice();
+            let package_files = package_files.as_slice();
+            let package_edges = package_edges.as_slice();
+            let anchors = anchors.as_slice();
+            let tx = conn.transaction()?;
+            require_current_generation(&tx, lang, generation)?;
+            let head_revision = tx
+                .query_row(
+                    "SELECT revision FROM workspace_heads
+                     WHERE workspace_id = ?1 AND lang = ?2 AND generation = ?3",
+                    params![workspace_id_text, lang, generation.0],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+
+            let projections = workspace_file_projections(
+                files,
+                path_symbols,
+                package_files,
+                package_edges,
+                anchors,
+            );
+            let incoming = files
+                .iter()
+                .map(|file| {
+                    (
+                        file.rel_path.clone(),
+                        workspace_file_projection_digest(file, &projections[&*file.rel_path]),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            let mut existing = HashMap::default();
+            {
+                let mut statement = tx.prepare_cached(
+                    "SELECT rel_path, projection_digest
+                     FROM workspace_file_versions
+                     WHERE workspace_id = ?1 AND lang = ?2 AND generation = ?3
+                       AND valid_until IS NULL",
+                )?;
+                let rows = statement
+                    .query_map(params![workspace_id_text, lang, generation.0], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?;
+                for row in rows {
+                    let (path, digest) = row?;
+                    existing.insert(path, digest);
+                }
+            }
+            if let Some(revision) = head_revision.filter(|_| existing == incoming) {
+                tx.commit()?;
+                return Ok(WorkspaceSnapshotId {
+                    workspace_id,
+                    lang: lang.to_string(),
+                    generation,
+                    revision,
+                });
+            }
+
+            let revision = head_revision.unwrap_or(0) + 1;
+            tx.execute(
+                "INSERT INTO workspace_revisions(workspace_id, lang, generation, revision)
+                 VALUES(?1, ?2, ?3, ?4)",
+                params![workspace_id_text, lang, generation.0, revision],
+            )?;
+            {
+                let mut close = tx.prepare_cached(
+                    "UPDATE workspace_file_versions SET valid_until = ?4
+                     WHERE workspace_id = ?1 AND lang = ?2 AND generation = ?3
+                       AND rel_path = ?5 AND valid_until IS NULL",
+                )?;
+                for (path, old_digest) in &existing {
+                    if incoming.get(path) != Some(old_digest) {
+                        let closed = close.execute(params![
+                            workspace_id_text,
+                            lang,
+                            generation.0,
+                            revision,
+                            path,
+                        ])?;
+                        assert_eq!(closed, 1, "one open workspace file version per path");
+                    }
+                }
+            }
+            for row in path_symbols {
+                assert!(incoming.contains_key(&row.rel_path));
+            }
+            for file in files {
+                let digest = &incoming[&file.rel_path];
+                if existing.get(&file.rel_path) == Some(digest) {
+                    continue;
+                }
+                tx.execute(
+                    "INSERT INTO workspace_file_versions(
+                       workspace_id, lang, generation, rel_path, blob_oid,
+                       projection_digest, valid_from
+                     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        workspace_id_text,
+                        lang,
+                        generation.0,
+                        file.rel_path,
+                        file.blob_oid.to_string(),
+                        digest,
+                        revision,
+                    ],
+                )?;
+                let file_version_id = tx.last_insert_rowid();
+                insert_workspace_file_projection_rows(
+                    &tx,
+                    file_version_id,
+                    &projections[&*file.rel_path],
+                )?;
+            }
+            tx.execute(
+                "INSERT INTO workspace_heads(workspace_id, lang, generation, revision)
+                 VALUES(?1, ?2, ?3, ?4)
+                 ON CONFLICT(workspace_id, lang, generation)
+                 DO UPDATE SET revision = excluded.revision",
+                params![workspace_id_text, lang, generation.0, revision],
+            )?;
+            tx.commit()?;
+            let _ = reclaim_stale_generations_conn(conn, STALE_GENERATION_RECLAIM_ROWS);
+            Ok(WorkspaceSnapshotId {
+                workspace_id,
+                lang: lang.to_string(),
+                generation,
+                revision,
+            })
+        })
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn sync_workspace_snapshot(
         &self,
         lang: &str,
         generation: GenerationId,
@@ -1430,103 +1692,62 @@ impl AnalyzerStore {
         package_files: &[WorkspacePackageFileRow],
         package_edges: &[WorkspacePackageEdgeRow],
         anchors: &[WorkspaceAnchorRow],
-    ) -> Result<()> {
-        let fingerprint = workspace_snapshot_fingerprint(
+    ) -> Result<WorkspaceSnapshotId> {
+        let snapshot = self.sync_workspace_snapshot_for_workspace(
+            &WorkspaceId("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+            lang,
+            generation,
             files,
             path_symbols,
             packages,
             package_files,
             package_edges,
             anchors,
-        );
-        let lang = lang.to_string();
-        let files = files.to_vec();
-        let path_symbols = path_symbols.to_vec();
-        let packages = packages.to_vec();
-        let package_files = package_files.to_vec();
-        let package_edges = package_edges.to_vec();
-        let anchors = anchors.to_vec();
-        self.conn.execute(move |conn| {
-            let lang = lang.as_str();
-            let files = files.as_slice();
-            let path_symbols = path_symbols.as_slice();
-            let packages = packages.as_slice();
-            let package_files = package_files.as_slice();
-            let package_edges = package_edges.as_slice();
-            let anchors = anchors.as_slice();
-            let tx = conn.transaction()?;
-            require_current_generation(&tx, lang, generation)?;
-            let existing_fingerprint = tx
-                .query_row(
-                    "SELECT fingerprint FROM workspace_snapshots
-                 WHERE lang = ?1 AND generation = ?2",
-                    params![lang, generation.0],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?;
-            if existing_fingerprint.as_deref() == Some(fingerprint.as_str()) {
-                tx.commit()?;
-                return Ok(());
-            }
-            tx.execute("DELETE FROM path_symbol_units WHERE lang = ?1", [lang])?;
-            tx.execute("DELETE FROM workspace_snapshots WHERE lang = ?1", [lang])?;
-            tx.execute(
-                "INSERT INTO workspace_snapshots(lang, generation, fingerprint)
-             VALUES(?1, ?2, ?3)",
-                params![lang, generation.0, fingerprint],
+        )?;
+        if self.db_path.is_none() {
+            let conn = self.conn.lock().expect("ephemeral test store mutex");
+            select_workspace_snapshots(
+                &conn,
+                &HashMap::from_iter([(lang.to_string(), snapshot.clone())]),
             )?;
-            {
-                let mut insert = tx.prepare(
-                    "INSERT INTO workspace_files(lang, generation, rel_path, blob_oid)
-                 VALUES(?1, ?2, ?3, ?4)",
-                )?;
-                for file in files {
-                    insert.execute(params![
-                        lang,
-                        generation.0,
-                        file.rel_path,
-                        file.blob_oid.to_string()
-                    ])?;
-                }
-            }
-            let mut insert = tx.prepare(
-                "INSERT INTO path_symbol_units(
-               lang, rel_path, blob_oid, kind, package_name, short_name,
-               exact_fqn, normalized_fqn, generation
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            )?;
-            for row in path_symbols {
-                insert_path_symbol_row(&mut insert, lang, generation, row)?;
-            }
-            drop(insert);
-            insert_workspace_relation_rows(
-                &tx,
-                lang,
-                generation,
-                packages,
-                package_files,
-                package_edges,
-                anchors,
-            )?;
-            tx.commit()?;
-            let _ = reclaim_stale_generations_conn(conn, STALE_GENERATION_RECLAIM_ROWS);
-            Ok(())
-        })
+        }
+        Ok(snapshot)
     }
 
-    pub(crate) fn path_symbol_rows_by_fqn_for_langs(
+    pub(crate) fn path_symbol_rows_by_fqn_for_langs_at_snapshots(
+        &self,
+        workspace_snapshots: &WorkspaceSnapshots,
+        langs: &[String],
+        generations: &HashMap<String, GenerationId>,
+        exact_fqn: &str,
+        normalized_fqn: &str,
+    ) -> Result<Vec<(String, PathSymbolRow)>> {
+        let mut conn = self.read_conn_for_workspace(workspace_snapshots)?;
+        let tx = conn.transaction()?;
+        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
+        let out = path_symbol_rows_by_fqn_in_tx(&tx, langs, exact_fqn, normalized_fqn)?;
+        tx.commit()?;
+        Ok(out)
+    }
+
+    #[cfg(test)]
+    fn path_symbol_rows_by_fqn_for_langs(
         &self,
         langs: &[String],
         generations: &HashMap<String, GenerationId>,
         exact_fqn: &str,
         normalized_fqn: &str,
     ) -> Result<Vec<(String, PathSymbolRow)>> {
-        let mut conn = self.read_conn()?;
-        let tx = conn.transaction()?;
-        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
-        let out = path_symbol_rows_by_fqn_in_tx(&tx, langs, exact_fqn, normalized_fqn)?;
-        tx.commit()?;
-        Ok(out)
+        let workspace_id =
+            WorkspaceId("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into());
+        let snapshots = self.workspace_snapshots_for_langs(&workspace_id, langs, generations)?;
+        self.path_symbol_rows_by_fqn_for_langs_at_snapshots(
+            &snapshots,
+            langs,
+            generations,
+            exact_fqn,
+            normalized_fqn,
+        )
     }
 
     /// Batched sibling of `path_symbol_rows_by_fqn_for_langs`: resolves many (exact_fqn,
@@ -1536,13 +1757,14 @@ impl AnalyzerStore {
     /// The outer `Result` covers setup failures (can't open the transaction at all); each item's own
     /// `Result` is independent, so one FQN's query/decode error doesn't discard the rest of the
     /// batch's already-successful results the way propagating a single `?` through the loop would.
-    pub(crate) fn path_symbol_rows_by_fqns_for_langs_batch(
+    pub(crate) fn path_symbol_rows_by_fqns_for_langs_batch_at_snapshots(
         &self,
+        workspace_snapshots: &WorkspaceSnapshots,
         langs: &[String],
         generations: &HashMap<String, GenerationId>,
         fqns: &[(String, String)],
     ) -> Result<Vec<PathSymbolRowsResult>> {
-        let mut conn = self.read_conn()?;
+        let mut conn = self.read_conn_for_workspace(workspace_snapshots)?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
         let results = fqns
@@ -1558,29 +1780,34 @@ impl AnalyzerStore {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn replace_path_symbol_unit(
         &self,
+        workspace_id: &WorkspaceId,
+        base_snapshots: &WorkspaceSnapshots,
         storage_langs: &[String],
         generations: &HashMap<String, GenerationId>,
         rel_path: &str,
         file_replacement: Option<(&str, Oid)>,
         path_symbol_replacement: Option<(&str, &PathSymbolRow)>,
-        packages: &[String],
+        _packages: &[String],
         package_files: &[WorkspacePackageFileRow],
         package_edges: &[WorkspacePackageEdgeRow],
         anchors: &[WorkspaceAnchorRow],
-    ) -> Result<()> {
+    ) -> Result<WorkspaceSnapshots> {
+        let workspace_id = workspace_id.clone();
+        let base_snapshots = base_snapshots.clone();
         let storage_langs = storage_langs.to_vec();
         let generations = generations.clone();
         let rel_path = rel_path.to_string();
         let file_replacement = file_replacement.map(|(lang, oid)| (lang.to_string(), oid));
         let path_symbol_replacement =
             path_symbol_replacement.map(|(lang, row)| (lang.to_string(), row.clone()));
-        let packages = packages.to_vec();
         let package_files = package_files.to_vec();
         let package_edges = package_edges.to_vec();
         let anchors = anchors.to_vec();
         self.conn.execute(move |conn| {
             let storage_langs = storage_langs.as_slice();
+            let workspace_id_text = workspace_id.as_str();
             let generations = &generations;
+            let base_snapshots = &base_snapshots;
             let rel_path = rel_path.as_str();
             let file_replacement = file_replacement
                 .as_ref()
@@ -1588,81 +1815,129 @@ impl AnalyzerStore {
             let path_symbol_replacement = path_symbol_replacement
                 .as_ref()
                 .map(|(lang, row)| (lang.as_str(), row));
-            let packages = packages.as_slice();
             let package_files = package_files.as_slice();
             let package_edges = package_edges.as_slice();
             let anchors = anchors.as_slice();
             let tx = conn.transaction()?;
+            let mut snapshots = HashMap::default();
             for lang in storage_langs {
                 let generation = generations.get(lang).copied().ok_or_else(|| {
                     StoreError::new(format!("missing captured generation for {lang}"))
                 })?;
                 require_current_generation(&tx, lang, generation)?;
-                tx.execute(
-                    "DELETE FROM path_symbol_units
-                 WHERE lang = ?1 AND rel_path = ?2 AND generation = ?3",
-                    params![lang, rel_path, generation.0],
+                let head_revision = tx.query_row(
+                    "SELECT revision FROM workspace_heads
+                     WHERE workspace_id = ?1 AND lang = ?2 AND generation = ?3",
+                    params![workspace_id_text, lang, generation.0],
+                    |row| row.get::<_, i64>(0),
                 )?;
-                tx.execute(
-                    "DELETE FROM workspace_files
-                 WHERE lang = ?1 AND generation = ?2 AND rel_path = ?3",
-                    params![lang, generation.0, rel_path],
-                )?;
-            }
-            if let Some((lang, blob_oid)) = file_replacement {
-                let generation = generations[lang];
-                tx.execute(
-                    "INSERT INTO workspace_files(lang, generation, rel_path, blob_oid)
-                 VALUES(?1, ?2, ?3, ?4)",
-                    params![lang, generation.0, rel_path, blob_oid.to_string()],
-                )?;
-            }
-            if let Some((lang, row)) = path_symbol_replacement {
-                let generation = generations[lang];
-                let mut insert = tx.prepare(
-                    "INSERT INTO path_symbol_units(
-                   lang, rel_path, blob_oid, kind, package_name, short_name,
-                   exact_fqn, normalized_fqn, generation
-                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                )?;
-                insert_path_symbol_row(&mut insert, lang, generation, row)?;
-            }
-            if let Some((lang, _)) = file_replacement {
-                let generation = generations[lang];
-                insert_workspace_relation_rows(
-                    &tx,
-                    lang,
-                    generation,
-                    packages,
+                let base_revision = base_snapshots
+                    .get(lang)
+                    .filter(|snapshot| {
+                        snapshot.workspace_id == workspace_id && snapshot.generation == generation
+                    })
+                    .map(|snapshot| snapshot.revision)
+                    .ok_or_else(|| {
+                        StoreError::new(format!(
+                            "missing base workspace revision for {lang} generation {}",
+                            generation.0
+                        ))
+                    })?;
+                if head_revision != base_revision {
+                    return Err(StoreError::new(format!(
+                        "workspace revision conflict for {lang}: analyzer has {base_revision}, head is {head_revision}"
+                    )));
+                }
+                let old_digest = tx
+                    .query_row(
+                        "SELECT projection_digest FROM workspace_file_versions
+                         WHERE workspace_id = ?1 AND lang = ?2 AND generation = ?3
+                           AND rel_path = ?4 AND valid_until IS NULL",
+                        params![workspace_id_text, lang, generation.0, rel_path],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                let replacement_file = file_replacement
+                    .filter(|(replacement_lang, _)| *replacement_lang == lang)
+                    .map(|(_, blob_oid)| WorkspaceFileRow {
+                        rel_path: rel_path.to_string(),
+                        blob_oid,
+                    });
+                let replacement_symbols = path_symbol_replacement
+                    .filter(|(replacement_lang, _)| *replacement_lang == lang)
+                    .map(|(_, row)| std::slice::from_ref(row))
+                    .unwrap_or_default();
+                let replacement_projection = workspace_file_projection(
+                    rel_path,
+                    replacement_symbols,
                     package_files,
                     package_edges,
                     anchors,
-                )?;
-            }
-            for lang in storage_langs {
-                let generation = generations[lang];
-                tx.execute(
-                    "WITH RECURSIVE retained(package_name) AS (
-                   SELECT package_name
-                   FROM workspace_package_files
-                   WHERE lang = ?1 AND generation = ?2
-                   UNION
-                   SELECT edges.parent_package_name
-                   FROM workspace_package_edges AS edges
-                   JOIN retained
-                     ON retained.package_name = edges.child_package_name
-                   WHERE edges.lang = ?1 AND edges.generation = ?2
-                 )
-                 DELETE FROM workspace_packages
-                 WHERE lang = ?1 AND generation = ?2
-                   AND package_name NOT IN (SELECT package_name FROM retained)",
-                    params![lang, generation.0],
-                )?;
-                refresh_incremental_workspace_fingerprint(&tx, lang, generation)?;
+                );
+                let new_digest = replacement_file.as_ref().map(|file| {
+                    workspace_file_projection_digest(file, &replacement_projection)
+                });
+                let revision = if old_digest == new_digest {
+                    head_revision
+                } else {
+                    let revision = head_revision + 1;
+                    tx.execute(
+                        "INSERT INTO workspace_revisions(
+                           workspace_id, lang, generation, revision
+                         ) VALUES(?1, ?2, ?3, ?4)",
+                        params![workspace_id_text, lang, generation.0, revision],
+                    )?;
+                    if old_digest.is_some() {
+                        let closed = tx.execute(
+                            "UPDATE workspace_file_versions SET valid_until = ?5
+                             WHERE workspace_id = ?1 AND lang = ?2 AND generation = ?3
+                               AND rel_path = ?4 AND valid_until IS NULL",
+                            params![workspace_id_text, lang, generation.0, rel_path, revision],
+                        )?;
+                        assert_eq!(closed, 1, "one open workspace file version per path");
+                    }
+                    if let Some(file) = replacement_file.as_ref() {
+                        tx.execute(
+                            "INSERT INTO workspace_file_versions(
+                               workspace_id, lang, generation, rel_path, blob_oid,
+                               projection_digest, valid_from
+                             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                            params![
+                                workspace_id_text,
+                                lang,
+                                generation.0,
+                                rel_path,
+                                file.blob_oid.to_string(),
+                                new_digest.as_ref().expect("replacement has a digest"),
+                                revision,
+                            ],
+                        )?;
+                        insert_workspace_file_projection_rows(
+                            &tx,
+                            tx.last_insert_rowid(),
+                            &replacement_projection,
+                        )?;
+                    }
+                    tx.execute(
+                        "UPDATE workspace_heads SET revision = ?4
+                         WHERE workspace_id = ?1 AND lang = ?2 AND generation = ?3",
+                        params![workspace_id_text, lang, generation.0, revision],
+                    )?;
+                    revision
+                };
+                snapshots.insert(
+                    lang.clone(),
+                    WorkspaceSnapshotId {
+                        workspace_id: workspace_id.clone(),
+                        lang: lang.clone(),
+                        generation,
+                        revision,
+                    },
+                );
             }
             tx.commit()?;
             let _ = reclaim_stale_generations_conn(conn, STALE_GENERATION_RECLAIM_ROWS);
-            Ok(())
+            Ok(snapshots)
         })
     }
 
@@ -1680,6 +1955,9 @@ impl AnalyzerStore {
         db_path: Option<PathBuf>,
         ephemeral: Option<EphemeralDb>,
     ) -> Self {
+        #[cfg(test)]
+        conn.execute_batch(REVISIONED_WORKSPACE_VIEWS_SQL)
+            .expect("configure test workspace views");
         Self {
             conn: StoreWriter::local(conn),
             readers: ReaderPool::new(reader_source.clone()),
@@ -1882,17 +2160,26 @@ impl AnalyzerStore {
     /// taken by these paths (except in the in-memory single-connection
     /// fallback, where `source` is `None`).
     fn read_conn(&self) -> Result<ReaderGuard<'_>> {
-        if self.streaming_read_active() {
-            return self.streaming_read_conn();
-        }
-        self.read_conn_from_pool(&self.readers, crate::cache_db::open_readonly_connection)
+        let conn = if self.streaming_read_active() {
+            self.read_conn_from_pool(
+                &self.streaming_readers,
+                crate::cache_db::open_streaming_readonly_connection,
+            )?
+        } else {
+            self.read_conn_from_pool(
+                &self.readers,
+                crate::cache_db::open_readonly_temp_connection,
+            )?
+        };
+        #[cfg(test)]
+        select_current_test_workspace(&conn)?;
+        Ok(conn)
     }
 
-    fn streaming_read_conn(&self) -> Result<ReaderGuard<'_>> {
-        self.read_conn_from_pool(
-            &self.streaming_readers,
-            crate::cache_db::open_streaming_readonly_connection,
-        )
+    fn read_conn_for_workspace(&self, snapshots: &WorkspaceSnapshots) -> Result<ReaderGuard<'_>> {
+        let conn = self.read_conn()?;
+        select_workspace_snapshots(&conn, snapshots)?;
+        Ok(conn)
     }
 
     fn active_read_conn(&self) -> Result<ReaderGuard<'_>> {
@@ -1929,10 +2216,6 @@ impl AnalyzerStore {
                 inner: ReaderConn::Writer(self.conn.lock().expect("analyzer store mutex poisoned")),
             }),
         }
-    }
-
-    pub(crate) fn close_idle_streaming_readers(&self) {
-        self.streaming_readers.close_idle();
     }
 
     pub(crate) fn begin_streaming_read(&self) {
@@ -1996,7 +2279,6 @@ impl AnalyzerStore {
                 }
             }
             tx.commit()?;
-            let _ = reclaim_stale_generations_conn(conn, STALE_GENERATION_RECLAIM_ROWS);
             Ok(())
         })
     }
@@ -2901,33 +3183,27 @@ impl AnalyzerStore {
     /// path and precedence after hydrating the small surviving set. False
     /// positives are harmless; a false negative would change relevance.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn reverse_reference_candidate_oids(
+    pub(crate) fn reverse_reference_candidate_paths(
         &self,
+        workspace_snapshots: &WorkspaceSnapshots,
         lang: &str,
         generation: GenerationId,
-        candidate_oids: &[Oid],
         explicit_import_segments: &HashSet<String>,
         wildcard_import_segments: &HashSet<String>,
         type_identifiers: &HashSet<String>,
         cancellation: &CancellationToken,
-    ) -> Result<HashSet<Oid>> {
-        if candidate_oids.is_empty()
-            || (explicit_import_segments.is_empty()
-                && wildcard_import_segments.is_empty()
-                && type_identifiers.is_empty())
+    ) -> Result<HashSet<String>> {
+        if explicit_import_segments.is_empty()
+            && wildcard_import_segments.is_empty()
+            && type_identifiers.is_empty()
         {
             return Ok(HashSet::default());
         }
 
         let mut conn = self.active_read_conn()?;
+        select_workspace_snapshots(&conn, workspace_snapshots)?;
         let tx = conn.transaction()?;
         require_current_generation(&tx, lang, generation)?;
-        let active_blobs = candidate_oids
-            .iter()
-            .copied()
-            .map(ActiveSearchBlob::unfiltered)
-            .collect::<Vec<_>>();
-        sync_active_blob_oids(&tx, &active_blobs)?;
         sync_reverse_reference_lookup_keys(
             &tx,
             explicit_import_segments,
@@ -2937,25 +3213,27 @@ impl AnalyzerStore {
 
         let mut matches = HashSet::default();
         if !explicit_import_segments.is_empty() || !wildcard_import_segments.is_empty() {
+            let _scope =
+                crate::profiling::scope("AnalyzerStore::reverse_reference.import_candidates");
             let mut statement = tx.prepare_cached(REVERSE_IMPORT_CANDIDATE_BLOBS_SQL)?;
             let mut rows = statement.query([lang])?;
             while let Some(row) = rows.next()? {
                 if cancellation.is_cancelled() {
                     return Ok(HashSet::default());
                 }
-                let oid = row.get::<_, String>(0)?;
-                matches.insert(Oid::from_str(&oid)?);
+                matches.insert(row.get::<_, String>(0)?);
             }
         }
         if !type_identifiers.is_empty() {
+            let _scope =
+                crate::profiling::scope("AnalyzerStore::reverse_reference.type_candidates");
             let mut statement = tx.prepare_cached(REVERSE_TYPE_CANDIDATE_BLOBS_SQL)?;
             let mut rows = statement.query([lang])?;
             while let Some(row) = rows.next()? {
                 if cancellation.is_cancelled() {
                     return Ok(HashSet::default());
                 }
-                let oid = row.get::<_, String>(0)?;
-                matches.insert(Oid::from_str(&oid)?);
+                matches.insert(row.get::<_, String>(0)?);
             }
         }
         tx.commit()?;
@@ -2967,6 +3245,7 @@ impl AnalyzerStore {
     /// or construct a temporary active-blob relation first.
     pub(crate) fn reverse_identifier_candidate_paths(
         &self,
+        workspace_snapshots: &WorkspaceSnapshots,
         lang: &str,
         generation: GenerationId,
         identifiers: &HashSet<String>,
@@ -2977,6 +3256,7 @@ impl AnalyzerStore {
         }
 
         let mut conn = self.active_read_conn()?;
+        select_workspace_snapshots(&conn, workspace_snapshots)?;
         let tx = conn.transaction()?;
         require_current_generation(&tx, lang, generation)?;
         sync_reverse_reference_lookup_keys(
@@ -2986,7 +3266,7 @@ impl AnalyzerStore {
             identifiers,
         )?;
         let mut statement = tx.prepare_cached(REVERSE_IDENTIFIER_CANDIDATE_PATHS_SQL)?;
-        let mut rows = statement.query(params![lang, generation.0])?;
+        let mut rows = statement.query([lang])?;
         let mut paths = HashSet::default();
         while let Some(row) = rows.next()? {
             if cancellation.is_cancelled() {
@@ -3346,7 +3626,7 @@ impl AnalyzerStore {
         &self,
         langs: &[String],
         generations: &HashMap<String, GenerationId>,
-        workspace_fingerprints: &HashMap<String, String>,
+        workspace_snapshots: &WorkspaceSnapshots,
         requests: &[RenderedDefinitionRequest],
         include_definition_lookup_units: bool,
         cancellation: Option<&CancellationToken>,
@@ -3366,14 +3646,9 @@ impl AnalyzerStore {
         } else {
             "units.in_declarations = 1"
         };
-        let mut conn = self.read_conn()?;
+        let mut conn = self.read_conn_for_workspace(workspace_snapshots)?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
-        if workspace_snapshot_fingerprints_conn(&tx, langs, generations)? != *workspace_fingerprints
-        {
-            tx.commit()?;
-            return Ok(RenderedDefinitionCandidateOutcome::WorkspaceChanged);
-        }
         let mut rows = Vec::new();
 
         // Arity one is semantically the same operation as the batch below,
@@ -3590,45 +3865,6 @@ impl AnalyzerStore {
             .iter()
             .map(|identifier| identifier as &dyn ToSql)
             .collect();
-        let rows =
-            candidate_rows_for_languages(&tx, langs.iter().map(String::as_str), &sql, &values)?;
-        tx.commit()?;
-        Ok(rows)
-    }
-
-    pub(crate) fn retained_definition_candidate_rows_by_identifiers_for_langs(
-        &self,
-        langs: &[String],
-        generations: &HashMap<String, GenerationId>,
-        identifiers: &[&str],
-        include_definition_lookup_units: bool,
-    ) -> Result<Vec<HydratedCandidateRow>> {
-        assert!(!identifiers.is_empty());
-        let mut conn = self.read_conn()?;
-        let tx = conn.transaction()?;
-        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
-        let placeholders = (0..identifiers.len())
-            .map(|index| format!("?{}", index + 2))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let membership = if include_definition_lookup_units {
-            "(units.in_declarations = 1 OR units.in_definition_lookup = 1)"
-        } else {
-            "units.in_declarations = 1"
-        };
-        let sql = candidate_rows_sql_with_membership(
-            "units",
-            "FROM code_units AS units
-             JOIN blob_meta AS meta
-               ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang",
-            &format!("units.lang = ?1 AND units.identifier IN ({placeholders})"),
-            membership,
-            "units.blob_oid, units.unit_key",
-        );
-        let values = identifiers
-            .iter()
-            .map(|identifier| identifier as &dyn ToSql)
-            .collect::<Vec<_>>();
         let rows =
             candidate_rows_for_languages(&tx, langs.iter().map(String::as_str), &sql, &values)?;
         tx.commit()?;
@@ -4210,39 +4446,18 @@ impl AnalyzerStore {
         Ok(rows)
     }
 
-    pub(crate) fn definition_candidate_rows_for_langs(
+    pub(crate) fn workspace_snapshots_for_langs(
         &self,
+        workspace_id: &WorkspaceId,
         langs: &[String],
         generations: &HashMap<String, GenerationId>,
-    ) -> Result<Vec<HydratedCandidateRow>> {
+    ) -> Result<WorkspaceSnapshots> {
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
-        let sql = candidate_rows_sql_with_membership(
-            "units",
-            "FROM code_units AS units
-             JOIN blob_meta AS meta
-               ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang",
-            "units.lang = ?1",
-            "(units.in_declarations = 1 OR units.in_definition_lookup = 1)",
-            "units.blob_oid, units.unit_key",
-        );
-        let rows = candidate_rows_for_languages(&tx, langs.iter().map(String::as_str), &sql, &[])?;
+        let snapshots = workspace_snapshots_conn(&tx, workspace_id, langs, generations)?;
         tx.commit()?;
-        Ok(rows)
-    }
-
-    pub(crate) fn workspace_snapshot_fingerprints_for_langs(
-        &self,
-        langs: &[String],
-        generations: &HashMap<String, GenerationId>,
-    ) -> Result<HashMap<String, String>> {
-        let mut conn = self.read_conn()?;
-        let tx = conn.transaction()?;
-        require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
-        let fingerprints = workspace_snapshot_fingerprints_conn(&tx, langs, generations)?;
-        tx.commit()?;
-        Ok(fingerprints)
+        Ok(snapshots)
     }
 
     /// Enumerate declarations through the schema's mounted-name interface.
@@ -4253,10 +4468,11 @@ impl AnalyzerStore {
     /// workspace relation from the blob-to-path index.
     pub(crate) fn mounted_declaration_rows_for_langs(
         &self,
+        workspace_snapshots: &WorkspaceSnapshots,
         langs: &[String],
         generations: &HashMap<String, GenerationId>,
     ) -> Result<Vec<HydratedMountedCandidateRow>> {
-        let mut conn = self.read_conn()?;
+        let mut conn = self.read_conn_for_workspace(workspace_snapshots)?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
         let sql = candidate_rows_sql_with_membership_and_projection(
@@ -4583,7 +4799,12 @@ impl AnalyzerStore {
                     "SELECT blobs.blob_oid, blobs.lang
                  FROM blobs
                  LEFT JOIN analysis_epochs AS epochs ON epochs.lang = blobs.lang
-                 WHERE blobs.generation = COALESCE(epochs.generation, 0)",
+                 WHERE blobs.generation = COALESCE(epochs.generation, 0)
+                   AND NOT EXISTS (
+                     SELECT 1 FROM workspace_file_versions AS files
+                     WHERE files.blob_oid = blobs.blob_oid
+                       AND files.lang = blobs.lang
+                   )",
                 )?;
                 let rows = stmt.query_map([], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -4610,13 +4831,11 @@ impl AnalyzerStore {
                 }
             }
             tx.commit()?;
-            let _ = reclaim_stale_generations_conn(conn, STALE_GENERATION_RECLAIM_ROWS);
             conn.pragma_update(None, "incremental_vacuum", 0)?;
             Ok(dead.len())
         })
     }
 
-    #[cfg(test)]
     pub(crate) fn reclaim_stale_generations(&self, max_logical_rows: usize) -> Result<usize> {
         self.conn
             .execute(move |conn| reclaim_stale_generations_conn(conn, max_logical_rows))
@@ -7313,10 +7532,9 @@ impl<'a> PreparedPersistenceWriter<'a> {
                 .saturating_add(replaced.payload_bytes);
         }
         drop(fallback_cost_statement);
-        if prepared.len() > 1
-            && (prepared.len() > limits.max_blobs
-                || cost.logical_rows > limits.max_rows
-                || cost.payload_bytes > limits.max_payload_bytes)
+        if prepared.len() > limits.max_blobs
+            || cost.logical_rows > limits.max_rows
+            || cost.payload_bytes > limits.max_payload_bytes
         {
             return Err(StoreError::new(format!(
                 "prepared replacement mutation batch exceeds limits: blobs={}, rows={}, bytes={}",
@@ -7329,7 +7547,6 @@ impl<'a> PreparedPersistenceWriter<'a> {
             write_prepared_blob_unchecked_tx(&tx, blob)?;
         }
         tx.commit()?;
-        let _ = reclaim_stale_generations_conn(self.conn, STALE_GENERATION_RECLAIM_ROWS);
         Ok(cost)
     }
 }
@@ -10798,21 +11015,30 @@ fn sync_active_blob_oids(conn: &Connection, active_blobs: &[ActiveSearchBlob]) -
     Ok(())
 }
 
-const REVERSE_IMPORT_CANDIDATE_BLOBS_SQL: &str = "SELECT segments.blob_oid
+const REVERSE_IMPORT_CANDIDATE_BLOBS_SQL: &str = "SELECT DISTINCT files.rel_path
      FROM temp.reverse_import_lookup_keys AS requested
      CROSS JOIN import_path_segments AS segments
        INDEXED BY idx_import_path_segments_by_segment
        ON segments.lang = ?1 AND segments.segment = requested.value
-     JOIN temp.active_blob_oids AS active ON active.blob_oid = segments.blob_oid
      JOIN import_statements AS imports
        ON imports.blob_oid = segments.blob_oid
       AND imports.lang = segments.lang
       AND imports.ordinal = segments.ordinal
+     CROSS JOIN selected_workspace_revisions AS selected
+       ON selected.lang = segments.lang
+     CROSS JOIN main.workspace_file_versions AS files
+       INDEXED BY idx_workspace_file_versions_snapshot_blob
+       ON files.workspace_id = selected.workspace_id
+      AND files.lang = selected.lang
+      AND files.generation = selected.generation
+      AND files.blob_oid = segments.blob_oid
+      AND files.valid_from <= selected.revision
+      AND (files.valid_until IS NULL OR selected.revision < files.valid_until)
      WHERE requested.kind IN (0, 1)
        AND imports.is_wildcard = requested.kind
        AND imports.path_kind IS NOT 'static_member'";
 
-const REVERSE_TYPE_CANDIDATE_BLOBS_SQL: &str = "SELECT identifiers.blob_oid
+const REVERSE_TYPE_CANDIDATE_BLOBS_SQL: &str = "SELECT DISTINCT files.rel_path
      FROM temp.reverse_import_lookup_keys AS requested
      CROSS JOIN reference_identifiers AS identifiers
        INDEXED BY idx_reference_identifiers_by_identifier
@@ -10823,10 +11049,19 @@ const REVERSE_TYPE_CANDIDATE_BLOBS_SQL: &str = "SELECT identifiers.blob_oid
      JOIN reference_fact_epochs AS reference_epoch
        ON reference_epoch.lang = reference_manifest.lang
       AND reference_epoch.epoch = reference_manifest.epoch
-     JOIN temp.active_blob_oids AS active ON active.blob_oid = identifiers.blob_oid
+     CROSS JOIN selected_workspace_revisions AS selected
+       ON selected.lang = identifiers.lang
+     CROSS JOIN main.workspace_file_versions AS files
+       INDEXED BY idx_workspace_file_versions_snapshot_blob
+       ON files.workspace_id = selected.workspace_id
+      AND files.lang = selected.lang
+      AND files.generation = selected.generation
+      AND files.blob_oid = identifiers.blob_oid
+      AND files.valid_from <= selected.revision
+      AND (files.valid_until IS NULL OR selected.revision < files.valid_until)
      WHERE requested.kind = 2";
 
-const REVERSE_IDENTIFIER_CANDIDATE_PATHS_SQL: &str = "SELECT files.rel_path
+const REVERSE_IDENTIFIER_CANDIDATE_PATHS_SQL: &str = "SELECT DISTINCT files.rel_path
      FROM temp.reverse_import_lookup_keys AS requested
      CROSS JOIN reference_identifiers AS identifiers
        INDEXED BY idx_reference_identifiers_by_identifier
@@ -10837,10 +11072,16 @@ const REVERSE_IDENTIFIER_CANDIDATE_PATHS_SQL: &str = "SELECT files.rel_path
      JOIN reference_fact_epochs AS reference_epoch
        ON reference_epoch.lang = reference_manifest.lang
       AND reference_epoch.epoch = reference_manifest.epoch
-     JOIN workspace_files AS files INDEXED BY idx_workspace_files_blob
-       ON files.lang = identifiers.lang
-      AND files.generation = ?2
+     CROSS JOIN selected_workspace_revisions AS selected
+       ON selected.lang = identifiers.lang
+     CROSS JOIN main.workspace_file_versions AS files
+       INDEXED BY idx_workspace_file_versions_snapshot_blob
+       ON files.workspace_id = selected.workspace_id
+      AND files.lang = selected.lang
+      AND files.generation = selected.generation
       AND files.blob_oid = identifiers.blob_oid
+      AND files.valid_from <= selected.revision
+      AND (files.valid_until IS NULL OR selected.revision < files.valid_until)
      WHERE requested.kind = 2";
 
 fn sync_reverse_reference_lookup_keys(
@@ -12451,32 +12692,25 @@ fn reclaim_stale_generations_conn(conn: &mut Connection, max_logical_rows: usize
         }
     }
 
-    let mut remaining = max_logical_rows.saturating_sub(reclaimed);
+    let remaining = max_logical_rows.saturating_sub(reclaimed);
     if remaining > 0 {
-        let removed = tx.execute(
-            "DELETE FROM path_symbol_units
-             WHERE (lang, rel_path, kind, exact_fqn) IN (
-               SELECT units.lang, units.rel_path, units.kind, units.exact_fqn
-               FROM path_symbol_units AS units
-               LEFT JOIN analysis_epochs AS epochs ON epochs.lang = units.lang
-               WHERE units.generation <> COALESCE(epochs.generation, 0)
-               ORDER BY units.lang, units.generation, units.rel_path
-               LIMIT ?1
+        tx.execute(
+            "DELETE FROM workspace_heads
+             WHERE generation <> COALESCE(
+               (SELECT generation FROM analysis_epochs
+                WHERE analysis_epochs.lang = workspace_heads.lang), 0
              )",
-            [usize_to_i64(remaining)?],
+            [],
         )?;
-        reclaimed = reclaimed.saturating_add(removed);
-        remaining = remaining.saturating_sub(removed);
-    }
-    if remaining > 0 {
         reclaimed = reclaimed.saturating_add(tx.execute(
-            "DELETE FROM workspace_snapshots
-             WHERE (lang, generation) IN (
-               SELECT snapshots.lang, snapshots.generation
-               FROM workspace_snapshots AS snapshots
-               LEFT JOIN analysis_epochs AS epochs ON epochs.lang = snapshots.lang
-               WHERE snapshots.generation <> COALESCE(epochs.generation, 0)
-               ORDER BY snapshots.lang, snapshots.generation
+            "DELETE FROM workspace_revisions
+             WHERE (workspace_id, lang, generation, revision) IN (
+               SELECT revisions.workspace_id, revisions.lang,
+                      revisions.generation, revisions.revision
+               FROM workspace_revisions AS revisions
+               LEFT JOIN analysis_epochs AS epochs ON epochs.lang = revisions.lang
+               WHERE revisions.generation <> COALESCE(epochs.generation, 0)
+               ORDER BY revisions.lang, revisions.generation, revisions.revision
                LIMIT ?1
              )",
             [usize_to_i64(remaining)?],
@@ -15283,7 +15517,19 @@ mod tests {
                 &[],
             )
             .unwrap();
-        let changes_after_cold_sync = store.conn.lock().expect("store mutex").total_changes();
+        let rows_after_cold_sync = {
+            let conn = store.conn.lock().expect("store mutex");
+            (
+                conn.query_row("SELECT COUNT(*) FROM workspace_revisions", [], |row| {
+                    row.get::<_, usize>(0)
+                })
+                .unwrap(),
+                conn.query_row("SELECT COUNT(*) FROM workspace_file_versions", [], |row| {
+                    row.get::<_, usize>(0)
+                })
+                .unwrap(),
+            )
+        };
         store
             .sync_workspace_snapshot(
                 "python",
@@ -15299,9 +15545,370 @@ mod tests {
                 &[],
             )
             .unwrap();
-        let changes_after_warm_sync = store.conn.lock().expect("store mutex").total_changes();
+        let rows_after_warm_sync = {
+            let conn = store.conn.lock().expect("store mutex");
+            (
+                conn.query_row("SELECT COUNT(*) FROM workspace_revisions", [], |row| {
+                    row.get::<_, usize>(0)
+                })
+                .unwrap(),
+                conn.query_row("SELECT COUNT(*) FROM workspace_file_versions", [], |row| {
+                    row.get::<_, usize>(0)
+                })
+                .unwrap(),
+            )
+        };
 
-        assert_eq!(changes_after_warm_sync, changes_after_cold_sync);
+        assert_eq!(rows_after_warm_sync, rows_after_cold_sync);
+    }
+
+    #[test]
+    fn retained_workspace_revision_keeps_exact_file_and_child_projection() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let workspace_id =
+            WorkspaceId("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into());
+        let generation = GenerationId::BOOTSTRAP;
+        let old_a = WorkspaceFileRow {
+            rel_path: "src/A.java".into(),
+            blob_oid: oid_for(b"old A"),
+        };
+        let old_b = WorkspaceFileRow {
+            rel_path: "src/B.java".into(),
+            blob_oid: oid_for(b"old B"),
+        };
+        let old_symbols = [old_a.clone(), old_b.clone()].map(|file| PathSymbolRow {
+            rel_path: file.rel_path,
+            blob_oid: file.blob_oid,
+            kind: CodeUnitType::Class,
+            package_name: "pkg".into(),
+            short_name: "Old".into(),
+            exact_fqn: "pkg.Old".into(),
+            normalized_fqn: "pkg.Old".into(),
+        });
+        let old_members = [old_a.rel_path.clone(), old_b.rel_path.clone()].map(|rel_path| {
+            WorkspacePackageFileRow {
+                package_name: "pkg".into(),
+                rel_path,
+            }
+        });
+        let old_edges = [old_a.rel_path.clone(), old_b.rel_path.clone()].map(|rel_path| {
+            WorkspacePackageEdgeRow {
+                rel_path,
+                parent_package_name: String::new(),
+                child_package_name: "pkg".into(),
+            }
+        });
+        let old_anchors =
+            [old_a.rel_path.clone(), old_b.rel_path.clone()].map(|rel_path| WorkspaceAnchorRow {
+                rel_path,
+                anchor: PackageAnchor::OwnModule { pop: 0 },
+                package_name: "pkg".into(),
+            });
+        let r1 = store
+            .sync_workspace_snapshot_for_workspace(
+                &workspace_id,
+                "java",
+                generation,
+                &[old_a, old_b],
+                &old_symbols,
+                &[String::new(), "pkg".into()],
+                &old_members,
+                &old_edges,
+                &old_anchors,
+            )
+            .unwrap();
+
+        let new_a = WorkspaceFileRow {
+            rel_path: "src/A.java".into(),
+            blob_oid: oid_for(b"new A"),
+        };
+        let new_c = WorkspaceFileRow {
+            rel_path: "src/C.java".into(),
+            blob_oid: oid_for(b"new C"),
+        };
+        let new_symbols = [new_a.clone(), new_c.clone()].map(|file| PathSymbolRow {
+            rel_path: file.rel_path,
+            blob_oid: file.blob_oid,
+            kind: CodeUnitType::Class,
+            package_name: "next".into(),
+            short_name: "New".into(),
+            exact_fqn: "next.New".into(),
+            normalized_fqn: "next.New".into(),
+        });
+        let new_members = [new_a.rel_path.clone(), new_c.rel_path.clone()].map(|rel_path| {
+            WorkspacePackageFileRow {
+                package_name: "next".into(),
+                rel_path,
+            }
+        });
+        let new_edges = [new_a.rel_path.clone(), new_c.rel_path.clone()].map(|rel_path| {
+            WorkspacePackageEdgeRow {
+                rel_path,
+                parent_package_name: String::new(),
+                child_package_name: "next".into(),
+            }
+        });
+        let new_anchors =
+            [new_a.rel_path.clone(), new_c.rel_path.clone()].map(|rel_path| WorkspaceAnchorRow {
+                rel_path,
+                anchor: PackageAnchor::OwnModule { pop: 0 },
+                package_name: "next".into(),
+            });
+        let r2 = store
+            .sync_workspace_snapshot_for_workspace(
+                &workspace_id,
+                "java",
+                generation,
+                &[new_a.clone(), new_c.clone()],
+                &new_symbols,
+                &[String::new(), "next".into()],
+                &new_members,
+                &new_edges,
+                &new_anchors,
+            )
+            .unwrap();
+        assert_eq!(r2.revision, r1.revision + 1);
+
+        let conn = store.conn.lock().expect("store mutex");
+        for (snapshot, expected_paths, expected_package) in [
+            (&r1, vec!["src/A.java", "src/B.java"], "pkg"),
+            (&r2, vec!["src/A.java", "src/C.java"], "next"),
+        ] {
+            select_workspace_snapshots(
+                &conn,
+                &HashMap::from_iter([("java".to_string(), snapshot.clone())]),
+            )
+            .unwrap();
+            let paths = conn
+                .prepare("SELECT rel_path FROM workspace_files ORDER BY rel_path")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(paths, expected_paths);
+            for (relation, expected_count) in [
+                ("workspace_package_files", 2),
+                ("workspace_package_edges", 1),
+                ("workspace_file_anchors", 2),
+                ("path_symbol_units", 2),
+            ] {
+                let count = conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {relation}"), [], |row| {
+                        row.get::<_, usize>(0)
+                    })
+                    .unwrap();
+                assert_eq!(count, expected_count, "{relation} is revision-bound");
+            }
+            assert_eq!(
+                conn.query_row(
+                    "SELECT package_name FROM workspace_package_files LIMIT 1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+                expected_package
+            );
+        }
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM workspace_file_versions", [], |row| {
+                row.get::<_, usize>(0)
+            })
+            .unwrap(),
+            4
+        );
+        drop(conn);
+
+        let unchanged = store
+            .sync_workspace_snapshot_for_workspace(
+                &workspace_id,
+                "java",
+                generation,
+                &[new_a, new_c],
+                &new_symbols,
+                &[String::new(), "next".into()],
+                &new_members,
+                &new_edges,
+                &new_anchors,
+            )
+            .unwrap();
+        assert_eq!(unchanged, r2);
+    }
+
+    #[test]
+    fn one_file_updates_grow_temporal_projection_by_one_row_each() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let workspace_id =
+            WorkspaceId("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".into());
+        let generation = GenerationId::BOOTSTRAP;
+        let files = (0..10_000)
+            .map(|index| WorkspaceFileRow {
+                rel_path: format!("src/File{index}.java"),
+                blob_oid: oid_for(format!("old {index}").as_bytes()),
+            })
+            .collect::<Vec<_>>();
+        // One fact per file makes this a regression for the production-scale
+        // grouping path. Rescanning the complete fact collection once per file
+        // turns this initial publication quadratic before SQLite writes begin.
+        let path_symbols = files
+            .iter()
+            .enumerate()
+            .map(|(index, file)| PathSymbolRow {
+                rel_path: file.rel_path.clone(),
+                blob_oid: file.blob_oid,
+                kind: CodeUnitType::Class,
+                package_name: "example".into(),
+                short_name: format!("File{index}"),
+                exact_fqn: format!("example.File{index}"),
+                normalized_fqn: format!("example.File{index}"),
+            })
+            .collect::<Vec<_>>();
+        let first = store
+            .sync_workspace_snapshot_for_workspace(
+                &workspace_id,
+                "java",
+                generation,
+                &files,
+                &path_symbols,
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        let langs = vec!["java".to_string()];
+        let generations = HashMap::from_iter([("java".to_string(), generation)]);
+        let mut snapshots = HashMap::from_iter([("java".to_string(), first)]);
+        for index in 0..100 {
+            let rel_path = format!("src/File{index}.java");
+            snapshots = store
+                .replace_path_symbol_unit(
+                    &workspace_id,
+                    &snapshots,
+                    &langs,
+                    &generations,
+                    &rel_path,
+                    Some(("java", oid_for(format!("new {index}").as_bytes()))),
+                    None,
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                )
+                .unwrap();
+        }
+        let conn = store.conn.lock().expect("store mutex");
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM workspace_file_versions", [], |row| {
+                row.get::<_, usize>(0)
+            })
+            .unwrap(),
+            10_100
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM workspace_file_versions WHERE valid_until IS NULL",
+                [],
+                |row| row.get::<_, usize>(0),
+            )
+            .unwrap(),
+            10_000
+        );
+    }
+
+    #[test]
+    fn retained_logical_revision_does_not_pin_wal_and_roots_its_blob() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = AnalyzerStore::open_persistent(&temp.path().join("cache.db")).unwrap();
+        let workspace_id =
+            WorkspaceId("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".into());
+        let generation = GenerationId::BOOTSTRAP;
+        let old_oid = oid_for(b"old");
+        store
+            .conn
+            .execute(move |conn| {
+                conn.execute(
+                    "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'java', 0)",
+                    [old_oid.to_string()],
+                )?;
+                Ok::<(), StoreError>(())
+            })
+            .unwrap();
+        let r1 = store
+            .sync_workspace_snapshot_for_workspace(
+                &workspace_id,
+                "java",
+                generation,
+                &[WorkspaceFileRow {
+                    rel_path: "Old.java".into(),
+                    blob_oid: old_oid,
+                }],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        let r1_snapshots = HashMap::from_iter([("java".to_string(), r1)]);
+        {
+            let conn = store.read_conn_for_workspace(&r1_snapshots).unwrap();
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM workspace_files", [], |row| {
+                    row.get::<_, usize>(0)
+                })
+                .unwrap(),
+                1
+            );
+        }
+        store
+            .sync_workspace_snapshot_for_workspace(
+                &workspace_id,
+                "java",
+                generation,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(store.gc_with(|_| false).unwrap(), 0);
+        let checkpoint = store
+            .conn
+            .execute(|conn| {
+                Ok::<_, StoreError>(conn.query_row(
+                    "PRAGMA wal_checkpoint(TRUNCATE)",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
+                )?)
+            })
+            .unwrap();
+        assert_eq!(checkpoint.0, 0, "logical snapshots hold no SQLite reader");
+        let conn = store.read_conn_for_workspace(&r1_snapshots).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM blobs WHERE blob_oid = ?1",
+                [old_oid.to_string()],
+                |row| { row.get::<_, usize>(0) }
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT rel_path FROM workspace_files", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+            "Old.java"
+        );
     }
 
     /// Every table the full verification predicate re-counts. The read-path
@@ -15393,14 +16000,15 @@ mod tests {
     fn path_symbol_name_lookups_use_their_fqn_indexes() {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
+        select_workspace_snapshots(&conn, &HashMap::default()).unwrap();
         for (sql, expected_index) in [
             (
                 EXACT_PATH_SYMBOL_FQN_SQL,
-                "idx_path_symbol_units_lang_generation_exact_fqn",
+                "idx_workspace_file_path_symbol_rows_exact",
             ),
             (
                 NORMALIZED_PATH_SYMBOL_FQN_SQL,
-                "idx_path_symbol_units_lang_generation_normalized_fqn",
+                "idx_workspace_file_path_symbol_rows_normalized",
             ),
         ] {
             let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
@@ -15427,24 +16035,33 @@ mod tests {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
         let mut statement = conn
-            .prepare(&format!(
-                "EXPLAIN QUERY PLAN {WORKSPACE_SNAPSHOT_FINGERPRINT_SQL}"
-            ))
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT revision FROM workspace_heads
+                 WHERE workspace_id = ?1 AND lang = ?2 AND generation = ?3",
+            )
             .unwrap();
         let plan = statement
-            .query_map(params!["python", 0], |row| row.get::<_, String>(3))
+            .query_map(
+                params![
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "python",
+                    0,
+                ],
+                |row| row.get::<_, String>(3),
+            )
             .unwrap()
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap();
         assert!(
             plan.iter()
-                .any(|detail| { detail.contains("SEARCH workspace_snapshots USING PRIMARY KEY") }),
+                .any(|detail| detail.contains("SEARCH workspace_heads USING PRIMARY KEY")),
             "workspace identity must seek the snapshot primary key: {plan:?}"
         );
         assert!(
             plan.iter()
-                .all(|detail| !detail.contains("SCAN workspace_snapshots")),
-            "workspace identity must not scan snapshots: {plan:?}"
+                .all(|detail| !detail.contains("SCAN workspace_heads")),
+            "workspace identity must not scan heads: {plan:?}"
         );
     }
 
@@ -18483,16 +19100,15 @@ mod tests {
         );
         assert!(
             header_plan.iter().any(|detail| {
-                detail.contains("idx_workspace_file_anchors_by_package")
+                detail.contains("idx_workspace_file_anchor_rows_package")
                     && detail.contains("package_name=?")
             }),
             "mounted lookup must seek the request prefix: {header_plan:#?}"
         );
         assert!(
-            header_plan.iter().any(|detail| {
-                detail.contains("idx_code_units_anchored_blob_exact_tail")
-                    && detail.contains("exact_fqn_tail=?")
-            }),
+            header_plan
+                .iter()
+                .any(|detail| detail.contains("idx_code_units_anchored_blob_exact_tail")),
             "mounted lookup must seek the request tail inside the selected blob: {header_plan:#?}"
         );
         assert!(
@@ -18864,7 +19480,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_replacement_budget_counts_deleted_rows_and_isolates_oversize_work() {
+    fn oversized_prepared_replacement_is_not_persisted_past_the_resource_bound() {
         let temp = tempfile::TempDir::new().unwrap();
         let old_file = write_file(
             temp.path(),
@@ -18924,29 +19540,45 @@ mod tests {
             },
         );
 
-        assert!(outcomes.iter().all(|outcome| outcome.error.is_none()));
-        assert_eq!(
-            stats.transactions, 2,
-            "oversize replacement must be isolated"
-        );
-        assert_eq!(stats.committed_blobs, 2);
-        assert!(stats.logical_rows > row_cap, "deleted rows must be counted");
+        let replacement_outcome = outcomes
+            .iter()
+            .find(|outcome| outcome.prepared.oid() == replaced_oid)
+            .expect("replacement outcome");
         assert!(
-            stats.peak_batch_rows > row_cap,
-            "one oversize item must progress"
+            replacement_outcome.error.is_some(),
+            "an oversized replacement must remain an in-memory analysis result instead of starting an unbounded cache transaction"
+        );
+        let peer_outcome = outcomes
+            .iter()
+            .find(|outcome| outcome.prepared.oid() == peer_oid)
+            .expect("peer outcome");
+        assert!(
+            peer_outcome.error.is_none(),
+            "a bounded peer still persists"
+        );
+        assert_eq!(stats.transactions, 1);
+        assert_eq!(stats.committed_blobs, 1);
+        assert_eq!(stats.failed_blobs, 1);
+        assert!(
+            stats.peak_batch_rows <= row_cap,
+            "no committed transaction may exceed the row cap: {stats:#?}"
         );
         assert!(
-            stats.payload_bytes > byte_cap,
-            "deleted bytes must be counted"
+            stats.peak_batch_payload_bytes <= byte_cap,
+            "no committed transaction may exceed the byte cap: {stats:#?}"
         );
-        assert!(
-            stats.peak_batch_payload_bytes > byte_cap,
-            "one oversized replacement must progress past the byte cap"
-        );
-        assert_eq!(
-            stats.peak_batch_blobs, 2,
-            "stats must retain the failed two-blob attempt that triggered isolation"
-        );
+        assert!(!store.contains_parsed_blob(replaced_oid, "java").unwrap());
+        let stale_generation: i64 = store
+            .conn
+            .lock()
+            .expect("store mutex")
+            .query_row(
+                "SELECT generation FROM blobs WHERE blob_oid = ?1 AND lang = 'java'",
+                [replaced_oid.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_generation, generation_a.0);
     }
 
     #[test]
@@ -20788,10 +21420,84 @@ mod tests {
     }
 
     #[test]
+    fn workspace_package_fact_batch_seeks_each_requested_blob() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let conn = store.conn.lock().expect("store mutex");
+        let sql = workspace_content_package_facts_sql(2);
+        let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let plan = statement
+            .query_map(params_from_iter(["java", TEST_OID, TEST_OID]), |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|detail| {
+                detail.contains("SEARCH units USING PRIMARY KEY")
+                    || detail.contains("SEARCH code_units USING PRIMARY KEY")
+            }),
+            "package facts must seek the requested blob keys: {plan:#?}"
+        );
+        assert!(
+            plan.iter().any(|detail| {
+                detail.contains("SEARCH segments USING PRIMARY KEY")
+                    || detail.contains("SEARCH code_unit_fq_segments USING PRIMARY KEY")
+            }),
+            "package segments must seek the selected declaration keys: {plan:#?}"
+        );
+        assert!(
+            plan.iter().all(|detail| {
+                !detail.contains("SCAN units")
+                    && !detail.contains("SCAN code_units")
+                    && !detail.contains("SCAN blobs")
+                    && !detail.contains("SCAN blob_meta")
+                    && !detail.contains("SCAN segments")
+                    && !detail.contains("SCAN code_unit_fq_segments")
+            }),
+            "package-fact batching must not scan persisted fact tables: {plan:#?}"
+        );
+    }
+
+    #[test]
+    fn workspace_package_fact_batch_matches_single_blob_queries() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let mut oids = Vec::new();
+        for (path, source) in [
+            ("src/One.java", "package first.pkg; class One {}\n"),
+            ("src/Two.java", "package second.pkg; class Two {}\n"),
+        ] {
+            let file = write_file(temp.path(), path, source);
+            let oid = oid_for(source.as_bytes());
+            store
+                .write_parsed_blob(oid, "java", &JavaAdapter, &parse_state(&JavaAdapter, &file))
+                .unwrap();
+            oids.push(oid);
+        }
+        let generation = store.current_generation("java").unwrap();
+        let batched = store
+            .workspace_content_package_facts("java", generation, &oids)
+            .unwrap()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let singles = oids
+            .iter()
+            .flat_map(|oid| {
+                store
+                    .workspace_content_package_facts("java", generation, &[*oid])
+                    .unwrap()
+            })
+            .collect::<HashSet<_>>();
+        assert!(!batched.is_empty(), "fixture must publish package facts");
+        assert_eq!(batched, singles);
+    }
+
+    #[test]
     fn reverse_reference_candidates_use_name_first_indexes() {
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let conn = store.conn.lock().expect("store mutex");
-        sync_active_blob_oids(&conn, &[]).unwrap();
+        select_workspace_snapshots(&conn, &HashMap::default()).unwrap();
         sync_reverse_reference_lookup_keys(
             &conn,
             &["Target".to_string()].into_iter().collect(),
@@ -20823,6 +21529,12 @@ mod tests {
                 .all(|detail| !detail.contains("SCAN segments")),
             "reverse import lookup must not scan import_path_segments: {imports:#?}"
         );
+        assert!(
+            imports
+                .iter()
+                .any(|detail| { detail.contains("idx_workspace_file_versions_snapshot_blob") }),
+            "reverse import lookup must seek snapshot membership by blob: {imports:#?}"
+        );
 
         let identifiers = explain(REVERSE_TYPE_CANDIDATE_BLOBS_SQL);
         assert!(
@@ -20846,7 +21558,7 @@ mod tests {
             ))
             .unwrap();
         let paths = statement
-            .query_map(params!["java", 1_i64], |row| row.get::<_, String>(3))
+            .query_map(["java"], |row| row.get::<_, String>(3))
             .unwrap()
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap();
@@ -20857,17 +21569,22 @@ mod tests {
             "reverse path lookup must seek the requested identifier: {paths:#?}"
         );
         assert!(
-            paths.iter().any(|detail| {
-                detail.contains("SEARCH files USING INDEX idx_workspace_files_blob")
-                    || detail.contains("SEARCH files USING COVERING INDEX idx_workspace_files_blob")
-            }),
-            "reverse path lookup must seek live workspace blobs: {paths:#?}"
+            paths
+                .iter()
+                .any(|detail| detail.contains("idx_workspace_file_versions_snapshot_blob")),
+            "reverse path lookup must seek snapshot membership by blob: {paths:#?}"
         );
         assert!(
             paths.iter().all(|detail| {
                 !detail.contains("SCAN identifiers") && !detail.contains("SCAN files")
             }),
             "reverse path lookup must not scan persisted facts: {paths:#?}"
+        );
+        assert!(
+            identifiers
+                .iter()
+                .any(|detail| { detail.contains("idx_workspace_file_versions_snapshot_blob") }),
+            "reverse type lookup must seek snapshot membership by blob: {identifiers:#?}"
         );
     }
 

@@ -11,8 +11,6 @@ pub use brokk_bifrost_analysis::{
     symbol_rename, workspace_document,
 };
 pub use brokk_bifrost_flow as flow;
-#[cfg(feature = "nlp")]
-pub use brokk_bifrost_nlp as nlp;
 pub use brokk_bifrost_policy as policy;
 pub use brokk_bifrost_rql::{self as rql, sexp};
 pub use brokk_bifrost_runtime::{CodeIntelligenceRuntime, code_intelligence};
@@ -22,7 +20,6 @@ pub mod mcp_cli;
 pub mod mcp_common;
 pub mod mcp_core;
 pub mod mcp_extended;
-pub mod mcp_nlp;
 pub mod mcp_registry;
 pub mod mcp_slopcop;
 pub mod mcp_text;

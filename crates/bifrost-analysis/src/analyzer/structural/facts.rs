@@ -42,7 +42,15 @@ use std::fmt;
 /// normalize as callables, so declaration-only stubs are addressable (#1658).
 /// Version 9 records the exact language-neutral value of normalized boolean
 /// literals for the RQL `boolean_value` predicate (#2623).
-pub(crate) const STRUCTURAL_FACTS_SNAPSHOT_VERSION: i64 = 9;
+/// Version 10 makes collection display literals facts (`collection_literal`,
+/// a `literal` subtype) and adds the `iterable` role edge from a for-each
+/// loop to its iterated expression and the `elements` role edges from a
+/// collection literal to its elements (#2647).
+/// Version 11 adds TypeScript formal parameter facts (`parameter`, a
+/// `declaration` subtype) and parameter decorator role edges (#2644).
+/// Version 12 adds JSX element/attribute facts, object-property facts, and
+/// structured tag, attribute, child, key, and value role edges (#2645).
+pub(crate) const STRUCTURAL_FACTS_SNAPSHOT_VERSION: i64 = 12;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StructuralSnapshotError(String);
@@ -134,6 +142,14 @@ fn kind_code(kind: NormalizedKind) -> u8 {
         ForLoop => 23,
         WhileLoop => 24,
         Block => 25,
+        CollectionLiteral => 26,
+        Parameter => 27,
+        JsxElement => 28,
+        JsxAttribute => 29,
+        JsxSpreadAttribute => 30,
+        ObjectProperty => 31,
+        ComputedProperty => 32,
+        SpreadElement => 33,
     }
 }
 
@@ -166,6 +182,14 @@ fn decode_kind(code: u8) -> Result<NormalizedKind, StructuralSnapshotError> {
         23 => Ok(ForLoop),
         24 => Ok(WhileLoop),
         25 => Ok(Block),
+        26 => Ok(CollectionLiteral),
+        27 => Ok(Parameter),
+        28 => Ok(JsxElement),
+        29 => Ok(JsxAttribute),
+        30 => Ok(JsxSpreadAttribute),
+        31 => Ok(ObjectProperty),
+        32 => Ok(ComputedProperty),
+        33 => Ok(SpreadElement),
         _ => Err(StructuralSnapshotError::invalid(format!(
             "unknown structural kind code {code}"
         ))),
@@ -184,6 +208,13 @@ fn role_code(role: Role) -> u8 {
         Role::Decorator => 7,
         Role::Object => 8,
         Role::Field => 9,
+        Role::Iterable => 10,
+        Role::Element => 11,
+        Role::Tag => 12,
+        Role::Attributes => 13,
+        Role::Children => 14,
+        Role::Value => 15,
+        Role::Key => 16,
     }
 }
 
@@ -199,6 +230,13 @@ fn decode_role(code: u8) -> Result<Role, StructuralSnapshotError> {
         7 => Ok(Role::Decorator),
         8 => Ok(Role::Object),
         9 => Ok(Role::Field),
+        10 => Ok(Role::Iterable),
+        11 => Ok(Role::Element),
+        12 => Ok(Role::Tag),
+        13 => Ok(Role::Attributes),
+        14 => Ok(Role::Children),
+        15 => Ok(Role::Value),
+        16 => Ok(Role::Key),
         _ => Err(StructuralSnapshotError::invalid(format!(
             "unknown structural role code {code}"
         ))),
@@ -724,9 +762,9 @@ impl FileFacts {
 #[cfg(test)]
 mod tests {
     use super::{
-        FileFacts, NormalizedNode, RoleTarget, SnapshotNode, SnapshotRoleTarget, SnapshotSpan,
-        Span, StructuralFactsSnapshot, decode_kind, decode_occurrence_role, decode_role, kind_code,
-        occurrence_role_code, role_code,
+        FileFacts, NormalizedNode, RoleTarget, STRUCTURAL_FACTS_SNAPSHOT_VERSION, SnapshotNode,
+        SnapshotRoleTarget, SnapshotSpan, Span, StructuralFactsSnapshot, decode_kind,
+        decode_occurrence_role, decode_role, kind_code, occurrence_role_code, role_code,
     };
     use crate::analyzer::Range;
     use crate::analyzer::structural::kinds::{ALL_KINDS, ALL_ROLES, NormalizedKind, Role};
@@ -948,6 +986,23 @@ mod tests {
         }
         let unknown = u8::try_from(ALL_OCCURRENCE_ROLES.len()).expect("occurrence role count fits");
         assert!(decode_occurrence_role(unknown).is_err());
+    }
+
+    #[test]
+    fn jsx_snapshot_codes_append_after_parameter_vocabulary() {
+        assert_eq!(STRUCTURAL_FACTS_SNAPSHOT_VERSION, 12);
+        assert_eq!(kind_code(NormalizedKind::Parameter), 27);
+        assert_eq!(kind_code(NormalizedKind::JsxElement), 28);
+        assert_eq!(kind_code(NormalizedKind::JsxAttribute), 29);
+        assert_eq!(kind_code(NormalizedKind::JsxSpreadAttribute), 30);
+        assert_eq!(kind_code(NormalizedKind::ObjectProperty), 31);
+        assert_eq!(kind_code(NormalizedKind::ComputedProperty), 32);
+        assert_eq!(kind_code(NormalizedKind::SpreadElement), 33);
+        assert_eq!(role_code(Role::Tag), 12);
+        assert_eq!(role_code(Role::Attributes), 13);
+        assert_eq!(role_code(Role::Children), 14);
+        assert_eq!(role_code(Role::Value), 15);
+        assert_eq!(role_code(Role::Key), 16);
     }
 
     #[test]

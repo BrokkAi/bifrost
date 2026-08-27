@@ -890,7 +890,7 @@ fn is_pattern_identifier(node: Node<'_>) -> bool {
     false
 }
 
-fn is_python_builtin_or_constant(name: &str) -> bool {
+pub fn is_python_builtin_or_constant(name: &str) -> bool {
     matches!(
         name,
         "None"
@@ -1051,5 +1051,22 @@ fn is_python_builtin_or_constant(name: &str) -> bool {
             | "vars"
             | "zip"
             | "__import__"
+            // Python 2 compatibility modules remain analyzable Python source.
+            // These names are supplied by that runtime even though modern
+            // Python no longer exposes them.
+            | "apply"
+            | "basestring"
+            | "buffer"
+            | "cmp"
+            | "coerce"
+            | "execfile"
+            | "intern"
+            | "long"
+            | "raw_input"
+            | "reduce"
+            | "reload"
+            | "unichr"
+            | "unicode"
+            | "xrange"
     )
 }

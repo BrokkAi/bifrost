@@ -451,6 +451,13 @@ pub struct SemanticModelOverlay {
     active_model_set_hash: String,
     extraction_gaps: Vec<ActivePackExtractionGap>,
     extraction_gap_by_declaration: HashMap<String, usize>,
+    /// The manifest languages of the active shards that carry declaration
+    /// facts, deduplicated. An overlay can be built entirely from
+    /// generator-rule packs (e.g. `bifrost.scala.case-class`), and such an
+    /// overlay declares no API surface at all: its existence must not license
+    /// an absence proof (#2678). Only a language listed here has a published
+    /// declaration surface to prove a miss against.
+    declaration_surface_languages: Vec<String>,
     symbols: Vec<SemanticModelSymbol>,
     relations: Vec<SemanticModelRelation>,
     symbols_by_id: HashMap<String, Vec<usize>>,
@@ -484,6 +491,7 @@ impl SemanticModelOverlay {
                 active_model_set_hash: active.active_model_set_hash().to_string(),
                 extraction_gaps: active.extraction_gaps().to_vec(),
                 extraction_gap_by_declaration: extraction_gap_index(active.extraction_gaps()),
+                declaration_surface_languages: Vec::new(),
                 symbols: Vec::new(),
                 relations: Vec::new(),
                 symbols_by_id: HashMap::default(),
@@ -498,9 +506,15 @@ impl SemanticModelOverlay {
         let mut type_ids = Vec::new();
         let mut member_ids = Vec::new();
         let mut relation_ids = Vec::new();
+        let mut declaration_surface_languages: Vec<String> = Vec::new();
         for shard in active.shards() {
             if cancellation.is_cancelled() {
                 return Err(SemanticModelOverlayBuildError::Cancelled);
+            }
+            if shard.shard.payload().declaration_facts().is_some()
+                && !declaration_surface_languages.contains(&shard.manifest.language)
+            {
+                declaration_surface_languages.push(shard.manifest.language.clone());
             }
             if let Some((types, members, relations)) = shard.shard.payload().declaration_facts() {
                 // A guarded record the pinned activation coordinates exclude
@@ -629,6 +643,7 @@ impl SemanticModelOverlay {
             active_model_set_hash: active.active_model_set_hash().to_string(),
             extraction_gaps: active.extraction_gaps().to_vec(),
             extraction_gap_by_declaration: extraction_gap_index(active.extraction_gaps()),
+            declaration_surface_languages,
             symbols,
             relations,
             symbols_by_id: HashMap::default(),
@@ -652,6 +667,18 @@ impl SemanticModelOverlay {
 
     pub fn active_model_set_hash(&self) -> &str {
         &self.active_model_set_hash
+    }
+
+    /// Whether any active shard publishes declaration facts for `language`.
+    ///
+    /// An overlay built only from generator-rule packs declares no API
+    /// surface, so nothing can be proved absent against it (#2678). Absence
+    /// gates must ask this instead of treating the overlay's existence as a
+    /// published surface.
+    pub fn publishes_declaration_surface_for(&self, language: &str) -> bool {
+        self.declaration_surface_languages
+            .iter()
+            .any(|surface| surface == language)
     }
 
     pub fn gapped(&self, declaration: &str) -> Option<&ActivePackExtractionGap> {
@@ -3823,21 +3850,31 @@ fn location(
     record_kind: &str,
     record_id: &str,
 ) -> SemanticModelLocation {
-    authored_anchor(analyzer, locator, fallback_symbol)
-        .map(SemanticModelLocation::Authored)
-        .unwrap_or_else(|| model_location(shard, record_kind, record_id))
+    authored_anchor(
+        analyzer,
+        &shard.manifest.carried_sources,
+        locator,
+        fallback_symbol,
+    )
+    .map(SemanticModelLocation::Authored)
+    .unwrap_or_else(|| model_location(shard, record_kind, record_id))
 }
 
 fn authored_anchor(
     analyzer: &dyn IAnalyzer,
+    carried_sources: &[String],
     locator: &Locator,
     fallback_symbol: &str,
 ) -> Option<SemanticModelAuthoredAnchor> {
-    let Locator::Source { path, symbol } = locator else {
+    let Locator::Source {
+        path: locator_path,
+        symbol,
+    } = locator
+    else {
         return None;
     };
     let symbol = symbol.as_deref().unwrap_or(fallback_symbol);
-    let path = Path::new(path);
+    let path = Path::new(locator_path);
     let file = if path.is_absolute() {
         analyzer.project().file_by_abs_path(path)
     } else {
@@ -3858,16 +3895,28 @@ fn authored_anchor(
             range: range.into(),
         });
     }
-    Some(SemanticModelAuthoredAnchor {
-        path: path.to_string_lossy().replace('\\', "/"),
-        symbol: symbol.to_owned(),
-        range: SemanticModelRange {
-            start_byte: 0,
-            end_byte: 0,
-            start_line: 0,
-            end_line: 0,
-        },
-    })
+    // The pack carries this source (its producer parsed the named entry), so
+    // the verbatim entry path is a legitimate authored target even though it is
+    // not a workspace file. A path the pack merely names without carrying it
+    // has no openable source anywhere, so the caller falls back to the durable
+    // bifrost-model URI (#2613). Carried sources are validated to be strictly
+    // ascending, which makes the binary search sound.
+    if carried_sources
+        .binary_search_by(|carried| carried.as_str().cmp(locator_path))
+        .is_ok()
+    {
+        return Some(SemanticModelAuthoredAnchor {
+            path: path.to_string_lossy().replace('\\', "/"),
+            symbol: symbol.to_owned(),
+            range: SemanticModelRange {
+                start_byte: 0,
+                end_byte: 0,
+                start_line: 0,
+                end_line: 0,
+            },
+        });
+    }
+    None
 }
 
 fn model_location(
@@ -4159,6 +4208,55 @@ fn render_named_type(name: &str, arguments: &[TypeRef], nullable: bool) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::Language;
+    use crate::test_support::AnalyzerFixture;
+
+    #[test]
+    fn unavailable_dependency_source_uses_a_durable_model_location() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Java,
+            &[("src/Main.java", "package app; class Main {}\n")],
+        );
+        let locator = Locator::Source {
+            path: "java.base/java/util/ArrayList.java".to_string(),
+            symbol: Some("java.util.ArrayList".to_string()),
+        };
+
+        assert!(
+            authored_anchor(
+                fixture.analyzer.analyzer(),
+                &[],
+                &locator,
+                "java.util.ArrayList"
+            )
+            .is_none(),
+            "a dependency source outside the indexed workspace and the pack's carried sources cannot be an authored navigation target"
+        );
+    }
+
+    #[test]
+    fn carried_dependency_source_preserves_the_authored_anchor() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Java,
+            &[("src/Main.java", "package app; class Main {}\n")],
+        );
+        let locator = Locator::Source {
+            path: "java.base/java/util/ArrayList.java".to_string(),
+            symbol: Some("java.util.ArrayList".to_string()),
+        };
+
+        let anchor = authored_anchor(
+            fixture.analyzer.analyzer(),
+            &["java.base/java/util/ArrayList.java".to_string()],
+            &locator,
+            "java.util.ArrayList",
+        )
+        .expect("a carried source stays an authored navigation target");
+        assert_eq!(anchor.path, "java.base/java/util/ArrayList.java");
+        assert_eq!(anchor.symbol, "java.util.ArrayList");
+        assert_eq!(anchor.range.start_line, 0);
+        assert_eq!(anchor.range.end_line, 0);
+    }
 
     /// Build an overlay straight from records. The pack pipeline that
     /// ordinarily produces them is exercised by the semantic-model suites; what
@@ -4173,6 +4271,7 @@ mod tests {
             active_model_set_hash: "test".to_string(),
             extraction_gaps: Vec::new(),
             extraction_gap_by_declaration: HashMap::default(),
+            declaration_surface_languages: Vec::new(),
             symbols,
             relations,
             symbols_by_id: HashMap::default(),

@@ -11,8 +11,11 @@ use crate::CancellationToken;
 use crate::analyzer::WorkspaceAnalyzer;
 use crate::policy::{
     PolicyBatchOutcome, PolicyCoordinatorError, PolicyEvaluationInput, PolicyEvaluationOptions,
-    PolicySourceIdentity, PolicySuppressionPreflight, evaluate_policy_inputs_with_analyzer,
-    evaluate_policy_inputs_with_analyzer_and_suppression_preflight, evaluate_policy_source,
+    PolicyHostActivationContext, PolicySourceIdentity, PolicySuppressionPreflight,
+    evaluate_policy_inputs_with_analyzer, evaluate_policy_inputs_with_analyzer_and_host_activation,
+    evaluate_policy_inputs_with_analyzer_and_suppression_preflight,
+    evaluate_policy_inputs_with_analyzer_and_suppression_preflight_and_host_activation,
+    evaluate_policy_source, evaluate_policy_source_with_host_activation,
 };
 use brokk_bifrost_flow::FlowWorkspaceState;
 use brokk_bifrost_rql::{
@@ -35,6 +38,7 @@ pub struct CodeIntelligenceRuntime<'a> {
     workspace: &'a WorkspaceAnalyzer,
     flow_state: &'a FlowWorkspaceState,
     cancellation: Option<&'a CancellationToken>,
+    host_activation: Option<PolicyHostActivationContext<'a>>,
 }
 
 impl<'a> CodeIntelligenceRuntime<'a> {
@@ -47,7 +51,19 @@ impl<'a> CodeIntelligenceRuntime<'a> {
             workspace,
             flow_state,
             cancellation,
+            host_activation: None,
         }
+    }
+
+    /// Borrow activation state completed by the host for this workspace
+    /// snapshot. Policy evaluation attaches its review without activating
+    /// semantic packs again.
+    pub fn with_host_activation_context(
+        mut self,
+        host_activation: PolicyHostActivationContext<'a>,
+    ) -> Self {
+        self.host_activation = Some(host_activation);
+        self
     }
 
     /// Execute a structural query without host-specific protocol registrations.
@@ -148,14 +164,25 @@ impl<'a> CodeIntelligenceRuntime<'a> {
         policy_inputs: &[PolicyEvaluationInput],
         options: &PolicyEvaluationOptions,
     ) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
-        evaluate_policy_inputs_with_analyzer(
-            root,
-            policy_inputs,
-            self.workspace,
-            self.flow_state,
-            options,
-            self.cancellation,
-        )
+        match self.host_activation {
+            Some(host_activation) => evaluate_policy_inputs_with_analyzer_and_host_activation(
+                root,
+                policy_inputs,
+                self.workspace,
+                self.flow_state,
+                options,
+                host_activation,
+                self.cancellation,
+            ),
+            None => evaluate_policy_inputs_with_analyzer(
+                root,
+                policy_inputs,
+                self.workspace,
+                self.flow_state,
+                options,
+                self.cancellation,
+            ),
+        }
     }
 
     /// Evaluate policies using suppression configuration already validated by
@@ -167,15 +194,29 @@ impl<'a> CodeIntelligenceRuntime<'a> {
         options: &PolicyEvaluationOptions,
         suppression_preflight: PolicySuppressionPreflight,
     ) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
-        evaluate_policy_inputs_with_analyzer_and_suppression_preflight(
-            root,
-            policy_inputs,
-            self.workspace,
-            self.flow_state,
-            options,
-            suppression_preflight,
-            self.cancellation,
-        )
+        match self.host_activation {
+            Some(host_activation) => {
+                evaluate_policy_inputs_with_analyzer_and_suppression_preflight_and_host_activation(
+                    root,
+                    policy_inputs,
+                    self.workspace,
+                    self.flow_state,
+                    options,
+                    suppression_preflight,
+                    host_activation,
+                    self.cancellation,
+                )
+            }
+            None => evaluate_policy_inputs_with_analyzer_and_suppression_preflight(
+                root,
+                policy_inputs,
+                self.workspace,
+                self.flow_state,
+                options,
+                suppression_preflight,
+                self.cancellation,
+            ),
+        }
     }
 
     /// Evaluate an editor-provided RQL policy source against this workspace.
@@ -186,14 +227,26 @@ impl<'a> CodeIntelligenceRuntime<'a> {
         source: &str,
         options: &PolicyEvaluationOptions,
     ) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
-        evaluate_policy_source(
-            root,
-            source_identity,
-            source,
-            self.workspace,
-            self.flow_state,
-            options,
-            self.cancellation,
-        )
+        match self.host_activation {
+            Some(host_activation) => evaluate_policy_source_with_host_activation(
+                root,
+                source_identity,
+                source,
+                self.workspace,
+                self.flow_state,
+                options,
+                host_activation,
+                self.cancellation,
+            ),
+            None => evaluate_policy_source(
+                root,
+                source_identity,
+                source,
+                self.workspace,
+                self.flow_state,
+                options,
+                self.cancellation,
+            ),
+        }
     }
 }

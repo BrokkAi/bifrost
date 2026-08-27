@@ -322,7 +322,7 @@ pub(crate) fn most_relevant_project_files_cascade(
     if history.status == HistoryRankingStatus::Cancelled {
         return MostRelevantProjectFilesOutcome::Cancelled;
     }
-    let neighbours = import_neighbourhood(analyzer, &universe, &seed_files, cancellation);
+    let neighbours = import_neighbourhood(analyzer, &seed_files, cancellation);
     if cancellation.is_cancelled() {
         return MostRelevantProjectFilesOutcome::Cancelled;
     }
@@ -374,7 +374,6 @@ fn cascade_universe(analyzer: &dyn IAnalyzer) -> Vec<ProjectFile> {
 /// for its seeds and asks the provider for all reverse seed edges in one batch.
 fn import_neighbourhood(
     analyzer: &dyn IAnalyzer,
-    universe: &[ProjectFile],
     seeds: &HashSet<ProjectFile>,
     cancellation: &CancellationToken,
 ) -> HashSet<ProjectFile> {
@@ -394,7 +393,7 @@ fn import_neighbourhood(
                 .map(|code_unit| code_unit.source().clone()),
         );
     }
-    neighbours.extend(provider.referencing_files_of_targets(seeds, universe, cancellation));
+    neighbours.extend(provider.referencing_files_of_targets(seeds, cancellation));
     neighbours
 }
 

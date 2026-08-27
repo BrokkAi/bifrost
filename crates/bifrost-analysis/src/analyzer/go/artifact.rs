@@ -157,6 +157,7 @@ impl DependencyPackAdapter for GoDependencyPackAdapter {
                     generated_code_only: false,
                     review_required: false,
                 },
+                carried_sources: Vec::new(),
                 shards: vec![AuthoredShard {
                     id: "declarations.external".to_owned(),
                     activation: request.activation,
@@ -273,6 +274,7 @@ impl GoModulePackProducer {
                 license: request.license.clone(),
                 completeness,
                 safety: request.safety.clone(),
+                carried_sources: Vec::new(),
                 shards: vec![AuthoredShard {
                     id: "declarations.external".to_owned(),
                     activation,
@@ -2665,6 +2667,7 @@ var privateValue int
                 generated_code_only: false,
                 review_required: false,
             },
+            carried_sources: Vec::new(),
             shards: vec![AuthoredShard {
                 id: "go".to_owned(),
                 activation: vec![ActivationSelector {

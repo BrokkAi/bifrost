@@ -285,6 +285,77 @@ impl PolicySuppressionDocument {
     }
 }
 
+/// The fields needed to author one accepted suppression from a current strong
+/// finding. The caller is responsible for proving that the finding is current
+/// and strong before constructing this value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicySuppressionAuthoringInput {
+    pub policy_id: PolicyId,
+    pub finding_id: PolicyFindingId,
+    pub path: Option<WorkspaceRelativePath>,
+    pub policy_hash_at_acceptance: Option<AcceptedPolicyHash>,
+    pub accepted_at: PolicyEvaluationDate,
+    pub reason: Option<String>,
+    pub accepted_by: Option<String>,
+    pub expires_at: Option<PolicyEvaluationDate>,
+}
+
+/// Parse, update, and serialize one suppression destination.
+///
+/// `existing_source` is `None` when the destination file does not exist. The
+/// returned document is always schema version one, canonically sorted, and
+/// terminated by one newline. The caller should check the other configured
+/// suppression sources separately before applying the returned text.
+pub fn prepare_policy_suppression_document(
+    existing_source: Option<&str>,
+    input: PolicySuppressionAuthoringInput,
+) -> Result<String, PolicySuppressionDocumentError> {
+    let mut document = existing_source
+        .map(parse_policy_suppression_document)
+        .transpose()?
+        .unwrap_or_else(|| PolicySuppressionDocument {
+            schema_version: POLICY_SUPPRESSION_SCHEMA_VERSION,
+            suppressions: Box::new([]),
+        });
+    let index = document.suppressions.len();
+    if index >= MAX_POLICY_SUPPRESSIONS {
+        return Err(PolicySuppressionDocumentError::Validation(
+            PolicySuppressionValidationError::TooManySuppressions {
+                max: MAX_POLICY_SUPPRESSIONS,
+            },
+        ));
+    }
+
+    let record = normalize_authoring_input(index, input)
+        .map_err(PolicySuppressionDocumentError::Validation)?;
+    if let Some(existing) = document.suppressions.iter().find(|existing| {
+        existing.policy_id == record.policy_id && existing.finding_id == record.finding_id
+    }) {
+        let error = if existing == &record {
+            PolicySuppressionValidationError::DuplicateSuppression {
+                policy_id: record.policy_id.clone(),
+                finding_id: record.finding_id,
+            }
+        } else {
+            PolicySuppressionValidationError::ConflictingSuppression {
+                policy_id: record.policy_id.clone(),
+                finding_id: record.finding_id,
+            }
+        };
+        return Err(PolicySuppressionDocumentError::Validation(error));
+    }
+
+    let mut suppressions = document.suppressions.into_vec();
+    suppressions.push(record);
+    suppressions.sort_by(compare_suppression_key);
+    document.suppressions = suppressions.into_boxed_slice();
+
+    let mut encoded = serde_json::to_string_pretty(&document)
+        .expect("policy suppression document serialization cannot fail");
+    encoded.push('\n');
+    Ok(encoded)
+}
+
 /// Location used to load one suppression document.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum PolicySuppressionSource {
@@ -1123,6 +1194,56 @@ fn normalize_wire_record(
     })
 }
 
+fn normalize_authoring_input(
+    index: usize,
+    input: PolicySuppressionAuthoringInput,
+) -> Result<PolicySuppressionRecord, PolicySuppressionValidationError> {
+    let reason = input
+        .reason
+        .filter(|reason| !reason.trim().is_empty())
+        .unwrap_or_else(|| "unspecified".to_owned());
+    validate_required_text(&reason, MAX_POLICY_SUPPRESSION_REASON_BYTES)
+        .map_err(|source| PolicySuppressionValidationError::InvalidReason { index, source })?;
+
+    if let Some(accepted_by) = input.accepted_by.as_deref() {
+        validate_required_text(accepted_by, MAX_POLICY_SUPPRESSION_ACCEPTED_BY_BYTES).map_err(
+            |source| PolicySuppressionValidationError::InvalidAcceptedBy { index, source },
+        )?;
+        if accepted_by.trim().is_empty() {
+            return Err(PolicySuppressionValidationError::BlankAcceptedBy { index });
+        }
+    }
+    if input
+        .expires_at
+        .is_some_and(|expires_at| expires_at < input.accepted_at)
+    {
+        return Err(PolicySuppressionValidationError::ExpirationBeforeAcceptance { index });
+    }
+    if input
+        .path
+        .as_ref()
+        .is_some_and(|path| path.as_str().len() > MAX_POLICY_SUPPRESSION_PATH_BYTES)
+    {
+        return Err(PolicySuppressionValidationError::PathTooLong {
+            index,
+            max_bytes: MAX_POLICY_SUPPRESSION_PATH_BYTES,
+        });
+    }
+
+    Ok(PolicySuppressionRecord {
+        policy_id: input.policy_id,
+        finding_id: input.finding_id,
+        path: input.path,
+        identity_stability: FindingIdentityStability::Strong,
+        status: PolicySuppressionStatus::Accepted,
+        reason: reason.into_boxed_str(),
+        policy_hash_at_acceptance: input.policy_hash_at_acceptance,
+        accepted_by: input.accepted_by.map(String::into_boxed_str),
+        accepted_at: input.accepted_at,
+        expires_at: input.expires_at,
+    })
+}
+
 /// Emit the record's optional path as the same portable slash-separated
 /// string the loader accepted. `WorkspaceRelativePath` is not `Serialize`,
 /// and the field is skipped entirely when absent.
@@ -1544,6 +1665,31 @@ impl std::error::Error for PolicySuppressionLoadError {
 mod tests {
     use super::*;
 
+    fn authoring_input(
+        policy_id: &str,
+        finding_byte: u8,
+        reason: Option<&str>,
+    ) -> PolicySuppressionAuthoringInput {
+        PolicySuppressionAuthoringInput {
+            policy_id: PolicyId::new(policy_id).expect("policy id"),
+            finding_id: char::from(finding_byte)
+                .to_string()
+                .repeat(64)
+                .parse()
+                .expect("finding id"),
+            path: Some(WorkspaceRelativePath::new("src/app.rs").expect("path")),
+            policy_hash_at_acceptance: Some(
+                "a".repeat(64)
+                    .parse::<AcceptedPolicyHash>()
+                    .expect("policy hash"),
+            ),
+            accepted_at: "2026-08-01".parse().expect("accepted date"),
+            reason: reason.map(str::to_owned),
+            accepted_by: Some("reviewer".to_owned()),
+            expires_at: Some("2026-09-01".parse().expect("expiry date")),
+        }
+    }
+
     fn document_with_path(path: Option<&str>) -> String {
         let path_field = path.map_or_else(String::new, |path| {
             format!("\"path\": \"{path}\",\n            ")
@@ -1565,6 +1711,81 @@ mod tests {
             id = "a".repeat(64),
             path_field = path_field,
         )
+    }
+
+    #[test]
+    fn authoring_creates_a_canonical_document_and_normalizes_blank_reason() {
+        let encoded = prepare_policy_suppression_document(
+            None,
+            authoring_input("test.policy", b'a', Some("   ")),
+        )
+        .expect("authoring succeeds");
+
+        assert!(encoded.ends_with("}\n"));
+        let document = parse_policy_suppression_document(&encoded).expect("encoded document");
+        assert_eq!(document.schema_version(), 1);
+        assert_eq!(document.suppressions().len(), 1);
+        let record = &document.suppressions()[0];
+        assert_eq!(record.reason(), "unspecified");
+        assert_eq!(record.accepted_by(), Some("reviewer"));
+        assert_eq!(
+            record.path().map(WorkspaceRelativePath::as_str),
+            Some("src/app.rs")
+        );
+        assert_eq!(
+            record
+                .policy_hash_at_acceptance()
+                .map(|hash| hash.to_string()),
+            Some("a".repeat(64))
+        );
+    }
+
+    #[test]
+    fn authoring_inserts_and_sorts_records() {
+        let first = authoring_input("test.z-policy", b'f', Some("first"));
+        let first_encoded =
+            prepare_policy_suppression_document(None, first).expect("first authoring");
+        let second = authoring_input("test.a-policy", b'b', Some("second"));
+        let encoded = prepare_policy_suppression_document(Some(&first_encoded), second)
+            .expect("second authoring");
+        let document = parse_policy_suppression_document(&encoded).expect("encoded document");
+
+        assert_eq!(document.suppressions().len(), 2);
+        assert_eq!(
+            document.suppressions()[0].policy_id().as_str(),
+            "test.a-policy"
+        );
+        assert_eq!(
+            document.suppressions()[1].policy_id().as_str(),
+            "test.z-policy"
+        );
+        assert!(encoded.ends_with('\n'));
+    }
+
+    #[test]
+    fn authoring_rejects_duplicate_and_conflicting_keys() {
+        let input = authoring_input("test.policy", b'a', Some("reviewed"));
+        let existing =
+            prepare_policy_suppression_document(None, input.clone()).expect("initial authoring");
+
+        let duplicate = prepare_policy_suppression_document(Some(&existing), input.clone())
+            .expect_err("duplicate key");
+        assert!(matches!(
+            duplicate,
+            PolicySuppressionDocumentError::Validation(
+                PolicySuppressionValidationError::DuplicateSuppression { .. }
+            )
+        ));
+
+        let conflict_input = authoring_input("test.policy", b'a', Some("different review"));
+        let conflict = prepare_policy_suppression_document(Some(&existing), conflict_input)
+            .expect_err("conflicting key");
+        assert!(matches!(
+            conflict,
+            PolicySuppressionDocumentError::Validation(
+                PolicySuppressionValidationError::ConflictingSuppression { .. }
+            )
+        ));
     }
 
     #[test]

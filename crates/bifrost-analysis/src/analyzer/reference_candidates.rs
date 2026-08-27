@@ -1,7 +1,9 @@
 use crate::analyzer::cpp::cpp_is_range_for_binding_name;
 use crate::analyzer::{Language, Range};
 use brokk_bifrost_cpp::graph::resolver::is_cpp_template_argument_type_leaf;
-use brokk_bifrost_csharp::graph::extractor::is_statement_label as csharp_is_statement_label;
+use brokk_bifrost_csharp::graph::extractor::{
+    is_declaration_name as csharp_declaration_name, is_statement_label as csharp_is_statement_label,
+};
 use brokk_bifrost_csharp::syntax::{
     csharp_implicit_accessor_value, csharp_is_type_position, csharp_local_binder_name,
 };
@@ -20,6 +22,7 @@ use brokk_bifrost_jvm::scala::graph::syntax::named_argument_invocation_owner as 
 use brokk_bifrost_php::bare_name_scopes::PhpBareNameFunctionScopes;
 use brokk_bifrost_php::graph::resolver::is_declaration_name as php_declaration_name;
 use brokk_bifrost_php::graph::resolver::is_recovered_membership_reference as php_is_recovered_membership_reference;
+use brokk_bifrost_python::graph::extractor::is_declaration_identifier as python_declaration_identifier;
 use brokk_bifrost_python::syntax::{
     python_deferred_annotation_identifier_ranges,
     python_keyword_argument_label as python_keyword_label,
@@ -463,6 +466,15 @@ pub fn jsts_is_declaration_name(node: Node<'_>) -> bool {
     jsts_declaration_identifier(node)
 }
 
+/// Whether a Python identifier occupies a structured binding position.
+///
+/// Keep the census on the same predicate as forward and inverse Python usage
+/// resolution. In particular, tuple targets and PEP 695 type parameters are
+/// nested below their owning assignment/declaration node.
+pub fn python_is_declaration_name(node: Node<'_>) -> bool {
+    python_declaration_identifier(node)
+}
+
 /// Whether a JavaScript/TypeScript terminal is an object property key: the
 /// `key` field of an object-literal `pair` or of a destructuring
 /// `pair_pattern`.
@@ -505,6 +517,10 @@ pub fn csharp_is_local_binder_name(node: Node<'_>) -> bool {
 /// declaration can be its target.
 pub fn csharp_is_type_reference(node: Node<'_>) -> bool {
     csharp_is_type_position(node)
+}
+
+pub fn csharp_is_declaration_name(node: Node<'_>) -> bool {
+    csharp_declaration_name(node)
 }
 
 /// Whether a PHP terminal is a namespace or constant declaration name rather

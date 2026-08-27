@@ -14,6 +14,7 @@ pub(crate) mod handlers;
 mod progress;
 mod request_context;
 mod server;
+mod suppression_authoring;
 mod text_sync;
 
 pub use server::run_lsp_stdio_server;

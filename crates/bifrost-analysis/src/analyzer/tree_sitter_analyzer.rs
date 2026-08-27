@@ -24,6 +24,7 @@ pub(crate) use brokk_bifrost_core::analyzer::prepared_syntax::{
 use crate::analyzer::CodeUnitIndex;
 use arc_swap::ArcSwapOption;
 use brokk_bifrost_core::analyzer::code_unit_index::file_namespace_from_top_level_declarations;
+use brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex;
 
 use crate::analyzer::cognitive_complexity;
 use crate::analyzer::common::{
@@ -42,7 +43,7 @@ use crate::analyzer::store::{
     LimitedQueryRows, PathSymbolRow, PersistBatchLimits, PersistBatchStats, PreparedParsedBlob,
     RelationalStoreOutcome, RenderedDefinitionCandidateOutcome, RenderedDefinitionRequest,
     StoreError, WorkspaceAnchorRow, WorkspaceContentPackageFact, WorkspaceFileRow,
-    WorkspacePackageEdgeRow, WorkspacePackageFileRow,
+    WorkspacePackageEdgeRow, WorkspacePackageFileRow, WorkspaceSnapshots,
 };
 use crate::analyzer::structural::materialization::MaterializationRecord;
 use crate::analyzer::tier_demand::TierDemand;
@@ -61,7 +62,6 @@ use crate::gitblob;
 use crate::hash::{HashMap, HashSet, map_with_capacity, set_with_capacity};
 use crate::profiling;
 use crate::text_utils::compute_line_starts;
-use brokk_bifrost_core::analyzer::{PackageRelationKind, PackageRelationValue};
 use git2::{ObjectType, Oid};
 use rayon::prelude::*;
 use regex::RegexBuilder;
@@ -347,6 +347,7 @@ pub(crate) enum BulkFileStateSource {
 #[derive(Clone)]
 pub(crate) struct AnalyzerStoreContext {
     pub(crate) store: Arc<AnalyzerStore>,
+    pub(crate) workspace_id: crate::analyzer::store::WorkspaceId,
     pub(crate) gc: Arc<crate::analyzer::store::gc::AnalyzerGcCoordinator>,
     pub(crate) liveness: Option<Arc<Liveness>>,
     /// The immutable listing and live identities captured for one workspace
@@ -523,6 +524,7 @@ fn store_context_from_store(
     };
     AnalyzerStoreContext {
         store: Arc::new(store),
+        workspace_id: crate::analyzer::store::WorkspaceId::for_root(project.root()),
         gc: Arc::new(gc),
         liveness,
         workspace_snapshot: None,
@@ -1428,7 +1430,6 @@ struct StreamingFileRead {
     depth: usize,
     file: ProjectFile,
     state: Option<Arc<FileState>>,
-    definition_ranges: Option<HashMap<String, Vec<Range>>>,
 }
 
 thread_local! {
@@ -2149,6 +2150,16 @@ struct QueryReadCache {
     /// The workspace's path-synthetic module units, walked at most once per
     /// request (#1774). See [`TreeSitterAnalyzer::workspace_module_walk`].
     workspace_module_walk: Arc<RwLock<Option<Arc<WorkspaceModuleWalk>>>>,
+    /// Per-file [`ClassRangeIndex`], built at most once per file per request
+    /// (#2679). The definition resolvers ask the enclosing-class question once
+    /// per reference site, so a bulk scan rebuilt this whole-file index — a
+    /// declaration-set clone plus one range lookup per class — once per
+    /// occurrence, and in Scala inside per-import and per-preceding-binding
+    /// loops on top of that. A plain `HashMap` under one lock, following
+    /// `parent_units`: each entry is a bounded per-file build, so a racing
+    /// duplicate is cheap and per-key single-flighting would cost more than it
+    /// saves.
+    class_ranges: Arc<RwLock<HashMap<ProjectFile, Arc<ClassRangeIndex>>>>,
 }
 
 /// One request's materialization of the workspace's path-synthetic module
@@ -2209,6 +2220,7 @@ impl QueryReadCache {
             parent_units: Arc::new(RwLock::new(HashMap::default())),
             definition_units: Arc::new(KeyedPoolSafeMemo::new()),
             workspace_module_walk: Arc::new(RwLock::new(None)),
+            class_ranges: Arc::new(RwLock::new(HashMap::default())),
         }
     }
 
@@ -2255,6 +2267,7 @@ impl QueryReadCache {
         self.parent_units = Arc::new(RwLock::new(HashMap::default()));
         self.definition_units = Arc::new(KeyedPoolSafeMemo::new());
         self.workspace_module_walk = Arc::new(RwLock::new(None));
+        self.class_ranges = Arc::new(RwLock::new(HashMap::default()));
     }
 
     fn is_active(&self) -> bool {
@@ -2451,7 +2464,7 @@ pub struct TreeSitterAnalyzer<A> {
     /// this immutable analyzer generation. Comparing these scalar rows keeps
     /// the hot relational path on liveness views while allowing a retained
     /// analyzer to detect that those mutable views now describe a successor.
-    relational_workspace_fingerprints: Arc<HashMap<String, String>>,
+    relational_workspace_snapshots: Arc<arc_swap::ArcSwap<WorkspaceSnapshots>>,
     /// Per-request persisted read model. Live OIDs are validated once and
     /// hydrated states remain available for the graph traversal.
     query_read_cache: Arc<RwLock<QueryReadCache>>,
@@ -2542,7 +2555,7 @@ impl<A> Clone for TreeSitterAnalyzer<A> {
             semantic_cache: self.semantic_cache.clone(),
             semantic_source_digests: self.semantic_source_digests.clone(),
             store_context: self.store_context.clone(),
-            relational_workspace_fingerprints: Arc::clone(&self.relational_workspace_fingerprints),
+            relational_workspace_snapshots: Arc::clone(&self.relational_workspace_snapshots),
             query_read_cache: Arc::new(RwLock::new(QueryReadCache::default())),
             live_source_snapshot: Arc::new(ArcSwapOption::empty()),
             query_file_state_snapshot: Arc::new(ArcSwapOption::empty()),
@@ -2743,10 +2756,11 @@ where
             .into_iter()
             .map(|(lang, _)| lang)
             .collect::<Vec<_>>();
-        let relational_workspace_fingerprints = Arc::new(
+        let relational_workspace_snapshots = Arc::new(
             store_context
                 .store
-                .workspace_snapshot_fingerprints_for_langs(
+                .workspace_snapshots_for_langs(
+                    &store_context.workspace_id,
                     &storage_languages,
                     store_context.generations.as_ref(),
                 )
@@ -2765,7 +2779,9 @@ where
             semantic_source_digests:
                 crate::analyzer::semantic::service::SourceContentIdentityMemo::default(),
             store_context,
-            relational_workspace_fingerprints,
+            relational_workspace_snapshots: Arc::new(arc_swap::ArcSwap::from(
+                relational_workspace_snapshots,
+            )),
             query_read_cache: Arc::new(RwLock::new(QueryReadCache::new(
                 query_file_state_cache_budget,
             ))),
@@ -3080,7 +3096,7 @@ where
         content_identity_base: StableDigest,
         semantic_cache: crate::analyzer::semantic::service::CompleteSemanticArtifactCache,
         store_context: AnalyzerStoreContext,
-        relational_workspace_fingerprints: Arc<HashMap<String, String>>,
+        relational_workspace_snapshots: Arc<WorkspaceSnapshots>,
     ) -> Self {
         let mut source_snapshot_file_states =
             map_with_capacity(SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY);
@@ -3106,7 +3122,9 @@ where
             semantic_source_digests:
                 crate::analyzer::semantic::service::SourceContentIdentityMemo::default(),
             store_context,
-            relational_workspace_fingerprints,
+            relational_workspace_snapshots: Arc::new(arc_swap::ArcSwap::from(
+                relational_workspace_snapshots,
+            )),
             query_read_cache: Arc::new(RwLock::new(QueryReadCache::new(
                 query_file_state_cache_budget,
             ))),
@@ -4406,7 +4424,7 @@ where
                     let parent_name = parent.display_native(adapter.language(), interner);
                     let child_name = child.display_native(adapter.language(), interner);
                     packages.insert(parent_name.clone());
-                    edges.insert((parent_name, child_name));
+                    edges.insert((file.rel_path.clone(), parent_name, child_name));
                     child = parent;
                 }
                 Ok(())
@@ -4468,7 +4486,8 @@ where
         let mut edges = edges
             .into_iter()
             .map(
-                |(parent_package_name, child_package_name)| WorkspacePackageEdgeRow {
+                |(rel_path, parent_package_name, child_package_name)| WorkspacePackageEdgeRow {
+                    rel_path,
                     parent_package_name,
                     child_package_name,
                 },
@@ -4532,7 +4551,8 @@ where
                 for attempt in 0..=STORE_WRITE_IMMEDIATE_RETRIES {
                     if store_context
                         .store
-                        .sync_workspace_snapshot(
+                        .sync_workspace_snapshot_for_workspace(
+                            &store_context.workspace_id,
                             &lang,
                             store_context.generations[&lang],
                             &files,
@@ -4604,17 +4624,25 @@ where
 
         let mut last_error = None;
         for attempt in 0..=STORE_WRITE_IMMEDIATE_RETRIES {
-            match self.store_context.store.sync_workspace_snapshot(
-                storage_lang,
-                generation,
-                &rows,
-                &[],
-                &[],
-                &[],
-                &[],
-                &[],
-            ) {
-                Ok(()) => {
+            match self
+                .store_context
+                .store
+                .sync_workspace_snapshot_for_workspace(
+                    &self.store_context.workspace_id,
+                    storage_lang,
+                    generation,
+                    &rows,
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                ) {
+                Ok(snapshot) => {
+                    let mut snapshots = self.selected_workspace_snapshots().as_ref().clone();
+                    snapshots.insert(storage_lang.to_string(), snapshot);
+                    self.relational_workspace_snapshots
+                        .store(Arc::new(snapshots));
                     self.store_context.live_paths.replace_additional_mounts(
                         storage_lang,
                         files
@@ -4639,6 +4667,7 @@ where
         adapter: &A,
         files: &BTreeSet<ProjectFile>,
         store_context: &AnalyzerStoreContext,
+        workspace_snapshots: &mut WorkspaceSnapshots,
         dirty: &mut HashMap<ProjectFile, (String, PathSymbolRow)>,
     ) {
         let storage_languages = adapter
@@ -4680,21 +4709,20 @@ where
             let mut persisted = false;
             if let Ok((packages, package_files, package_edges, anchors)) = relations {
                 for attempt in 0..=STORE_WRITE_IMMEDIATE_RETRIES {
-                    if store_context
-                        .store
-                        .replace_path_symbol_unit(
-                            &storage_languages,
-                            &generations,
-                            &rel_path,
-                            file_replacement,
-                            replacement_ref,
-                            &packages,
-                            &package_files,
-                            &package_edges,
-                            &anchors,
-                        )
-                        .is_ok()
-                    {
+                    if let Ok(next) = store_context.store.replace_path_symbol_unit(
+                        &store_context.workspace_id,
+                        workspace_snapshots,
+                        &storage_languages,
+                        &generations,
+                        &rel_path,
+                        file_replacement,
+                        replacement_ref,
+                        &packages,
+                        &package_files,
+                        &package_edges,
+                        &anchors,
+                    ) {
+                        workspace_snapshots.extend(next);
                         persisted = true;
                         break;
                     }
@@ -5271,7 +5299,6 @@ where
                             depth: 1,
                             file: file.clone(),
                             state: None,
-                            definition_ranges: None,
                         },
                     );
                 }
@@ -5321,8 +5348,6 @@ where
         }
 
         let oid = self.resolve_live_oid_for_file(file)?;
-        // A foreign file has no state here and must not be parsed as this
-        // adapter's language. See `storage_key_and_generation`.
         let (storage_key, generation) = self.storage_key_and_generation(file)?;
         self.full_hydration_count.fetch_add(1, Ordering::Relaxed);
         let source = self.source_for_oid(file, oid)?;
@@ -5354,31 +5379,6 @@ where
             active.state = Some(Arc::clone(&state));
         });
         Some(state)
-    }
-
-    fn streaming_definition_ranges(&self, code_unit: &CodeUnit) -> Option<Vec<Range>> {
-        let state = self.streaming_file_state(code_unit.source())?;
-        let id = self.streaming_file_read_id();
-        let fq_name = code_unit.fq_name();
-        STREAMING_FILE_READS.with(|reads| {
-            let mut reads = reads.borrow_mut();
-            let active = reads
-                .get_mut(&id)
-                .expect("streaming file read must remain active during source extraction");
-            let ranges = active.definition_ranges.get_or_insert_with(|| {
-                let mut by_fq_name: HashMap<String, Vec<Range>> = HashMap::default();
-                for candidate in &state.declarations {
-                    if let Some(candidate_ranges) = state.ranges.get(candidate) {
-                        by_fq_name
-                            .entry(candidate.fq_name())
-                            .or_default()
-                            .extend(candidate_ranges.iter().cloned());
-                    }
-                }
-                by_fq_name
-            });
-            ranges.get(&fq_name).cloned()
-        })
     }
 
     pub(crate) fn fetch_file_state(&self, file: &ProjectFile) -> Option<Arc<FileState>> {
@@ -5511,7 +5511,7 @@ where
         if let Some(state) = self.retry_dirty_file_state(key, storage_key) {
             return Some(state);
         }
-        if self.streaming_file_read_active(file) {
+        if exact_source.is_none() && self.streaming_file_read_active(file) {
             return self.streaming_file_state(file);
         }
         if let Some(state) = self.query_file_state_snapshot(key) {
@@ -6222,7 +6222,6 @@ where
     /// decide exact matches.
     pub(crate) fn reverse_reference_candidates(
         &self,
-        files: impl IntoIterator<Item = ProjectFile>,
         explicit_import_segments: &HashSet<String>,
         wildcard_import_segments: &HashSet<String>,
         type_identifiers: &HashSet<String>,
@@ -6230,13 +6229,12 @@ where
     ) -> HashSet<ProjectFile> {
         let live = self.live_snapshot();
         let mut result = HashSet::default();
-        let mut clean_by_lang: HashMap<String, Vec<(ProjectFile, Oid)>> = HashMap::default();
-        let mut seen = HashSet::default();
-        for file in files {
+        let mut clean_languages = HashSet::default();
+        for file in live.all_paths().cloned() {
             if cancellation.is_cancelled() {
                 return HashSet::default();
             }
-            if !self.adapter_owns_file(&file, &live) || !seen.insert(file.clone()) {
+            if !self.adapter_owns_file(&file, &live) {
                 continue;
             }
             let Some(oid) = self.resolve_live_oid_for_file(&file) else {
@@ -6250,14 +6248,11 @@ where
                 // performs the exact test from their in-memory facts.
                 result.insert(file);
             } else {
-                clean_by_lang
-                    .entry(storage_key.to_string())
-                    .or_default()
-                    .push((file, oid));
+                clean_languages.insert(storage_key.to_string());
             }
         }
 
-        for (lang, entries) in clean_by_lang {
+        for lang in clean_languages {
             if cancellation.is_cancelled() {
                 return HashSet::default();
             }
@@ -6265,14 +6260,17 @@ where
                 // A missing generation is an analyzer/store consistency error.
                 // Conservatively retain the group so the optimization cannot
                 // change a relevance answer.
-                result.extend(entries.into_iter().map(|(file, _)| file));
+                result.extend(
+                    live.all_paths()
+                        .filter(|file| self.adapter.storage_language_key_for_file(file) == lang)
+                        .cloned(),
+                );
                 continue;
             };
-            let oids = entries.iter().map(|(_, oid)| *oid).collect::<Vec<_>>();
-            let matches = self.store_context.store.reverse_reference_candidate_oids(
+            let matches = self.store_context.store.reverse_reference_candidate_paths(
+                self.selected_workspace_snapshots().as_ref(),
                 &lang,
                 generation,
-                &oids,
                 explicit_import_segments,
                 wildcard_import_segments,
                 type_identifiers,
@@ -6280,16 +6278,17 @@ where
             );
             match matches {
                 Ok(matches) => {
-                    result.extend(
-                        entries
-                            .into_iter()
-                            .filter(|(_, oid)| matches.contains(oid))
-                            .map(|(file, _)| file),
-                    );
+                    result.extend(matches.into_iter().map(|rel_path| {
+                        ProjectFile::new(self.project.root().to_path_buf(), rel_path)
+                    }));
                 }
                 Err(error) => {
                     self.record_store_error(error.context("prefiltering reverse references"));
-                    result.extend(entries.into_iter().map(|(file, _)| file));
+                    result.extend(
+                        live.all_paths()
+                            .filter(|file| self.adapter.storage_language_key_for_file(file) == lang)
+                            .cloned(),
+                    );
                 }
             }
         }
@@ -6312,6 +6311,7 @@ where
             return self.all_files().into_iter().collect();
         };
         let paths = match self.store_context.store.reverse_identifier_candidate_paths(
+            self.selected_workspace_snapshots().as_ref(),
             lang,
             generation,
             identifiers,
@@ -7054,7 +7054,8 @@ where
         let rows = self
             .store_context
             .store
-            .path_symbol_rows_by_fqn_for_langs(
+            .path_symbol_rows_by_fqn_for_langs_at_snapshots(
+                self.selected_workspace_snapshots().as_ref(),
                 &self.storage_language_keys_for_queries(),
                 self.store_context.generations.as_ref(),
                 fq_name,
@@ -7088,7 +7089,8 @@ where
         match self
             .store_context
             .store
-            .path_symbol_rows_by_fqns_for_langs_batch(
+            .path_symbol_rows_by_fqns_for_langs_batch_at_snapshots(
+                self.selected_workspace_snapshots().as_ref(),
                 &self.storage_language_keys_for_queries(),
                 self.store_context.generations.as_ref(),
                 &pairs,
@@ -8000,6 +8002,7 @@ where
         let mut units = if workspace_is_current {
             let rows = self.store_query_or_record(
                 self.store_context.store.mounted_declaration_rows_for_langs(
+                    self.selected_workspace_snapshots().as_ref(),
                     &storage_languages,
                     self.store_context.generations.as_ref(),
                 ),
@@ -8036,27 +8039,22 @@ where
     }
 
     fn relational_workspace_is_current(&self) -> std::result::Result<bool, StoreError> {
-        let storage_languages = self.storage_language_keys_for_queries();
-        let current = self
-            .store_context
-            .store
-            .workspace_snapshot_fingerprints_for_langs(
-                &storage_languages,
-                self.store_context.generations.as_ref(),
-            )?;
-        Ok(current == *self.relational_workspace_fingerprints)
+        Ok(true)
     }
 
-    fn capture_relational_workspace_fingerprints(&self) -> Arc<HashMap<String, String>> {
+    fn selected_workspace_snapshots(&self) -> Arc<WorkspaceSnapshots> {
+        self.relational_workspace_snapshots.load_full()
+    }
+
+    fn capture_relational_workspace_snapshots(&self) -> Arc<WorkspaceSnapshots> {
         let storage_languages = self.storage_language_keys_for_queries();
         Arc::new(
             self.store_query_or_record(
-                self.store_context
-                    .store
-                    .workspace_snapshot_fingerprints_for_langs(
-                        &storage_languages,
-                        self.store_context.generations.as_ref(),
-                    ),
+                self.store_context.store.workspace_snapshots_for_langs(
+                    &self.store_context.workspace_id,
+                    &storage_languages,
+                    self.store_context.generations.as_ref(),
+                ),
                 "capturing relational workspace identities",
             )
             .unwrap_or_default(),
@@ -8312,7 +8310,7 @@ where
                         self.project.root(),
                         self.store_context.generations.as_ref(),
                         &storage_languages,
-                        self.relational_workspace_fingerprints.as_ref(),
+                        self.selected_workspace_snapshots().as_ref(),
                         &names,
                         &cancellation,
                     ),
@@ -8459,7 +8457,7 @@ where
             .rendered_definition_order_candidate_rows_for_langs(
                 &langs,
                 self.store_context.generations.as_ref(),
-                self.relational_workspace_fingerprints.as_ref(),
+                self.selected_workspace_snapshots().as_ref(),
                 &requests,
                 include_definition_lookup_units,
                 self.active_query_cancellation().as_ref(),
@@ -8470,13 +8468,6 @@ where
         let mut rows = match outcome {
             RenderedDefinitionCandidateOutcome::Complete(rows) => rows,
             RenderedDefinitionCandidateOutcome::Cancelled => return Ok(Vec::new()),
-            RenderedDefinitionCandidateOutcome::WorkspaceChanged => {
-                return self.historical_definition_candidates_vec(
-                    fq_name,
-                    &normalized,
-                    include_definition_lookup_units,
-                );
-            }
         };
         let path_units = {
             let _path_scope = crate::profiling::scope(format!(
@@ -8599,48 +8590,6 @@ where
             .collect()
     }
 
-    fn historical_definition_candidates_vec(
-        &self,
-        fq_name: &str,
-        normalized: &str,
-        include_definition_lookup_units: bool,
-    ) -> std::result::Result<Vec<CodeUnit>, StoreError> {
-        let identifiers = self.definition_candidate_short_names(fq_name);
-        if identifiers.is_empty() {
-            return Ok(Vec::new());
-        }
-        let identifier_refs = identifiers.iter().map(String::as_str).collect::<Vec<_>>();
-        let rows = self
-            .store_context
-            .store
-            .retained_definition_candidate_rows_by_identifiers_for_langs(
-                &self.storage_language_keys_for_queries(),
-                self.store_context.generations.as_ref(),
-                &identifier_refs,
-                include_definition_lookup_units,
-            )?;
-        let candidates = self
-            .resolve_candidate_rows(rows)
-            .into_iter()
-            .map(|unit| DefinitionSortCandidate {
-                unit,
-                range_start: DefinitionRangeStart::FileState,
-            })
-            .collect();
-        let path_units = self
-            .live_snapshot()
-            .all_paths()
-            .filter_map(|file| self.adapter.path_synthetic_module_unit(file))
-            .collect();
-        Ok(self.assemble_definition_candidates_from_units(
-            fq_name,
-            normalized,
-            candidates,
-            path_units,
-            include_definition_lookup_units,
-        ))
-    }
-
     /// Resolve many fq names into the request-scoped `definitions` memo using
     /// chunked `IN`-list seeks instead of one point lookup per name (#1748).
     ///
@@ -8704,14 +8653,13 @@ where
             .rendered_definition_order_candidate_rows_for_langs(
                 &self.storage_language_keys_for_queries(),
                 self.store_context.generations.as_ref(),
-                self.relational_workspace_fingerprints.as_ref(),
+                self.selected_workspace_snapshots().as_ref(),
                 &requests,
                 false,
                 cancellation.as_ref(),
             ) {
             Ok(RenderedDefinitionCandidateOutcome::Complete(rows)) => rows,
-            Ok(RenderedDefinitionCandidateOutcome::Cancelled)
-            | Ok(RenderedDefinitionCandidateOutcome::WorkspaceChanged) => return,
+            Ok(RenderedDefinitionCandidateOutcome::Cancelled) => return,
             Err(error) => {
                 self.record_store_error(
                     error.context("prefetching definition candidates by short name"),
@@ -10294,6 +10242,7 @@ where
         let rows = self
             .store_query_or_record(
                 self.store_context.store.mounted_declaration_rows_for_langs(
+                    self.selected_workspace_snapshots().as_ref(),
                     &self.storage_language_keys_for_queries(),
                     self.store_context.generations.as_ref(),
                 ),
@@ -10829,170 +10778,6 @@ where
         }
     }
 
-    fn historical_package_projection(
-        &self,
-        storage_languages: &[String],
-        cancellation: &CancellationToken,
-    ) -> std::result::Result<HistoricalPackageProjection, StoreError> {
-        let snapshot = self.live_snapshot();
-        let mut projection = HistoricalPackageProjection::default();
-        for lang in storage_languages {
-            if cancellation.is_cancelled() {
-                return Ok(projection);
-            }
-            let mut entries = Vec::new();
-            for file in snapshot.all_paths() {
-                let Some(blob_oid) = snapshot.oid_for_path(file) else {
-                    continue;
-                };
-                let primary = self.adapter.storage_language_key_for_file(file);
-                if !snapshot.is_mounted_under(file, primary, lang) {
-                    continue;
-                }
-                let workspace_file = WorkspaceFileRow {
-                    rel_path: crate::path_utils::rel_path_string(file),
-                    blob_oid,
-                };
-                let path_symbol = (primary == lang)
-                    .then(|| Self::path_symbol_row(self.adapter.as_ref(), file, blob_oid))
-                    .flatten();
-                entries.push((file.clone(), workspace_file, path_symbol));
-            }
-            let blob_oids = entries
-                .iter()
-                .map(|(_, row, _)| row.blob_oid)
-                .collect::<Vec<_>>();
-            let facts = self.store_context.store.workspace_content_package_facts(
-                lang,
-                self.store_context.generations[lang],
-                &blob_oids,
-            )?;
-            let (_, files, edges, _) =
-                Self::workspace_snapshot_relations(self.adapter.as_ref(), &entries, &facts)?;
-            projection.files.extend(
-                files
-                    .into_iter()
-                    .map(|row| (row.package_name, row.rel_path)),
-            );
-            projection.edges.extend(
-                edges
-                    .into_iter()
-                    .map(|row| (row.parent_package_name, row.child_package_name)),
-            );
-        }
-        Ok(projection)
-    }
-
-    fn historical_relational_values(
-        &self,
-        requests: &[RelationalDefinitionRequest],
-        storage_languages: &[String],
-        dirty_states: &[FileState],
-        dirty_paths: &HashSet<ProjectFile>,
-        cancellation: &CancellationToken,
-    ) -> std::result::Result<Option<Vec<RelationalDefinitionValue>>, StoreError> {
-        let rows = self
-            .store_context
-            .store
-            .definition_candidate_rows_for_langs(
-                storage_languages,
-                self.store_context.generations.as_ref(),
-            )?;
-        if cancellation.is_cancelled() {
-            return Ok(None);
-        }
-        let mut units = self.resolve_candidate_rows(rows);
-        units.retain(|unit| !dirty_paths.contains(unit.source()) && !unit.is_file_scope());
-        let storage_language_set = storage_languages
-            .iter()
-            .map(String::as_str)
-            .collect::<HashSet<_>>();
-        for file in self.live_snapshot().all_paths() {
-            let primary = self.adapter.storage_language_key_for_file(file);
-            if storage_language_set.contains(primary)
-                && let Some(unit) = self.adapter.path_synthetic_module_unit(file)
-                && !unit.is_file_scope()
-                && !dirty_paths.contains(file)
-            {
-                units.push(unit);
-            }
-        }
-        crate::analyzer::sort_units(&mut units);
-        units.dedup();
-
-        let package_projection = requests
-            .iter()
-            .any(|request| matches!(request.query, RelationalDefinitionQuery::PackageRelation(_)))
-            .then(|| self.historical_package_projection(storage_languages, cancellation))
-            .transpose()?;
-        if cancellation.is_cancelled() {
-            return Ok(None);
-        }
-
-        let mut values = Vec::with_capacity(requests.len());
-        for request in requests {
-            if cancellation.is_cancelled() {
-                return Ok(None);
-            }
-            let mut value = match request.query {
-                RelationalDefinitionQuery::PackageRelation(relation) => {
-                    let projection = package_projection
-                        .as_ref()
-                        .expect("package requests build one historical projection");
-                    RelationalDefinitionValue::PackageRelation(projection.value(
-                        self.adapter.as_ref(),
-                        self.project.root(),
-                        &request.name,
-                        relation,
-                    ))
-                }
-                RelationalDefinitionQuery::CallableFacts => {
-                    let mut facts = Vec::new();
-                    for unit in units.iter().filter(|unit| {
-                        unit_matches_relational_request(self.adapter.as_ref(), unit, request)
-                    }) {
-                        let signatures = self.signatures_limited(unit, usize::MAX);
-                        let metadata = self.signature_metadata_limited(unit, usize::MAX);
-                        if !signatures.complete || !metadata.complete {
-                            return Err(StoreError::new(format!(
-                                "incomplete historical callable facts for `{}`",
-                                unit.fq_name()
-                            )));
-                        }
-                        facts.extend(signatures.rows.into_iter().enumerate().map(
-                            |(signature_ordinal, signature)| RelationalCallableFact {
-                                declaration: unit.clone(),
-                                signature_ordinal,
-                                signature,
-                                metadata: metadata.rows.get(signature_ordinal).cloned(),
-                            },
-                        ));
-                    }
-                    RelationalDefinitionValue::CallableFacts(facts)
-                }
-                _ => RelationalDefinitionValue::Definitions(
-                    units
-                        .iter()
-                        .filter(|unit| {
-                            unit_matches_relational_request(self.adapter.as_ref(), unit, request)
-                        })
-                        .cloned()
-                        .collect(),
-                ),
-            };
-            merge_dirty_relational_value(
-                self.adapter.as_ref(),
-                request,
-                dirty_states,
-                dirty_paths,
-                &mut value,
-            );
-            value.canonicalize();
-            values.push(value);
-        }
-        Ok(Some(values))
-    }
-
     fn child_first_start(&self, child: &CodeUnit) -> usize {
         <Self as crate::analyzer::CodeUnitIndex>::ranges(self, child)
             .into_iter()
@@ -11007,64 +10792,6 @@ struct RelationalRequestKey {
     language_scope: DefinitionLanguageScope,
     name: brokk_bifrost_core::analyzer::RelationalName,
     query: RelationalDefinitionQuery,
-}
-
-#[derive(Default)]
-struct HistoricalPackageProjection {
-    files: HashSet<(String, String)>,
-    edges: HashSet<(String, String)>,
-}
-
-impl HistoricalPackageProjection {
-    fn value<A: LanguageAdapter>(
-        &self,
-        adapter: &A,
-        project_root: &std::path::Path,
-        name: &brokk_bifrost_core::analyzer::RelationalName,
-        relation: PackageRelationKind,
-    ) -> PackageRelationValue {
-        let package = name.full_name().display_native(
-            adapter.language(),
-            crate::analyzer::fq_name::segment_interner(),
-        );
-        match relation {
-            PackageRelationKind::Exists => PackageRelationValue::Exists(
-                self.files
-                    .iter()
-                    .any(|(candidate, _)| candidate == &package),
-            ),
-            PackageRelationKind::Files => PackageRelationValue::Files(
-                self.files
-                    .iter()
-                    .filter(|(candidate, _)| candidate == &package)
-                    .map(|(_, path)| ProjectFile::new(project_root.to_path_buf(), path))
-                    .collect(),
-            ),
-            PackageRelationKind::Children => PackageRelationValue::Packages(
-                self.edges
-                    .iter()
-                    .filter(|(parent, _)| parent == &package)
-                    .map(|(_, child)| child.clone())
-                    .collect(),
-            ),
-            PackageRelationKind::Descendants => {
-                let mut descendants = HashSet::default();
-                let mut stack = vec![package];
-                while let Some(parent) = stack.pop() {
-                    for (_, child) in self
-                        .edges
-                        .iter()
-                        .filter(|(candidate, _)| candidate == &parent)
-                    {
-                        if descendants.insert(child.clone()) {
-                            stack.push(child.clone());
-                        }
-                    }
-                }
-                PackageRelationValue::Packages(descendants.into_iter().collect())
-            }
-        }
-    }
 }
 
 fn unit_matches_relational_request<A: LanguageAdapter>(
@@ -11289,7 +11016,7 @@ where
                 self.project.root(),
                 self.store_context.generations.as_ref(),
                 &storage_languages,
-                self.relational_workspace_fingerprints.as_ref(),
+                self.selected_workspace_snapshots().as_ref(),
                 &unique,
                 cancellation,
                 |values| {
@@ -11309,24 +11036,6 @@ where
                 Ok(RelationalStoreOutcome::Complete(values)) => values,
                 Ok(RelationalStoreOutcome::Cancelled) => {
                     return RelationalBatchOutcome::Cancelled;
-                }
-                Ok(RelationalStoreOutcome::WorkspaceChanged) => {
-                    match self.historical_relational_values(
-                        &unique,
-                        &storage_languages,
-                        &dirty_states,
-                        &dirty_paths,
-                        cancellation,
-                    ) {
-                        Ok(Some(values)) => values,
-                        Ok(None) => return RelationalBatchOutcome::Cancelled,
-                        Err(error) => {
-                            self.record_store_error(error.clone());
-                            return RelationalBatchOutcome::Failed(RelationalBatchError::new(
-                                error.to_string(),
-                            ));
-                        }
-                    }
                 }
                 Err(error) => {
                     self.record_store_error(error.clone());
@@ -11361,6 +11070,31 @@ impl<A> crate::analyzer::CodeUnitIndex for TreeSitterAnalyzer<A>
 where
     A: LanguageAdapter,
 {
+    /// The request-memoized [`ClassRangeIndex`] (#2679). With no scope open
+    /// there is no memo and the behaviour is exactly the unmemoized build,
+    /// like `definition_parent_unit`.
+    fn class_range_index(&self, file: &ProjectFile) -> Arc<ClassRangeIndex> {
+        let class_ranges = self.active_query_cache_handle(|cache| &cache.class_ranges);
+        let cached = class_ranges.as_ref().and_then(|class_ranges| {
+            class_ranges
+                .read()
+                .expect("query class-range cache read lock poisoned")
+                .get(file)
+                .cloned()
+        });
+        if let Some(index) = cached {
+            return index;
+        }
+        let index = Arc::new(ClassRangeIndex::build(self, file));
+        if let Some(class_ranges) = class_ranges.as_ref() {
+            class_ranges
+                .write()
+                .expect("query class-range cache write lock poisoned")
+                .insert(file.clone(), Arc::clone(&index));
+        }
+        index
+    }
+
     fn enclosing_code_unit(&self, file: &ProjectFile, range: &Range) -> Option<CodeUnit> {
         self.enclosing_code_unit_query_count
             .fetch_add(1, Ordering::Relaxed);
@@ -11462,15 +11196,6 @@ where
         // generation entry in this analyzer's storage context.
         if !self.owns_storage_language_key(storage_key) {
             return None;
-        }
-        if self.streaming_file_read_active(file) {
-            let state = self.fetch_file_state(file)?;
-            return Some(Arc::new(SummaryFileProjection {
-                top_level_declarations: state.top_level_declarations.clone(),
-                signatures: state.signatures.clone(),
-                ranges: state.ranges.clone(),
-                children: state.children.clone(),
-            }));
         }
         let oid = self.resolve_live_oid_for_file(file)?;
         let cache_key = Self::transient_cache_key(oid, file);
@@ -11752,23 +11477,14 @@ where
 
     fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String> {
         let mut ranges = if code_unit.is_function() {
-            if self.streaming_file_read_active(code_unit.source()) {
-                // Semantic indexing already hydrates the complete file state once per
-                // file. Re-querying the global definition index for every function made
-                // C++ repositories with many declarations spend most extraction time in
-                // redundant SQLite B-tree lookups and reader-pool mutexes.
-                self.streaming_definition_ranges(code_unit)
-                    .unwrap_or_default()
-            } else {
-                let _scope = profiling::scope("TreeSitterAnalyzer::get_sources::definitions");
-                let mut grouped = Vec::new();
-                for candidate in self.definitions(&code_unit.fq_name()) {
-                    if candidate.source() == code_unit.source() {
-                        grouped.extend(self.ranges(&candidate));
-                    }
+            let _scope = profiling::scope("TreeSitterAnalyzer::get_sources::definitions");
+            let mut grouped = Vec::new();
+            for candidate in self.definitions(&code_unit.fq_name()) {
+                if candidate.source() == code_unit.source() {
+                    grouped.extend(self.ranges(&candidate));
                 }
-                grouped
             }
+            grouped
         } else {
             self.ranges(code_unit)
         };
@@ -11871,10 +11587,6 @@ where
         TreeSitterAnalyzer::end_streaming_file_read(self, file);
     }
 
-    fn release_streaming_readers(&self) {
-        self.store_context.store.close_idle_streaming_readers();
-    }
-
     fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {
         self.query_read_cache_lock().workspace_file_index_cell()
     }
@@ -11913,6 +11625,8 @@ where
 
         let mut store_context = self.store_context.clone();
         store_context.live_paths = Arc::new(self.store_context.live_paths.fork());
+        let mut relational_workspace_snapshots =
+            self.selected_workspace_snapshots().as_ref().clone();
         let mut to_update = Vec::new();
         let mut claim_roots = Vec::new();
         let mut new_claimable_file_appeared = false;
@@ -12003,6 +11717,7 @@ where
             self.adapter.as_ref(),
             &workspace_paths_to_refresh,
             &store_context,
+            &mut relational_workspace_snapshots,
             &mut dirty_path_symbol_rows,
         );
         *state
@@ -12012,7 +11727,7 @@ where
         store_context
             .gc
             .schedule(self.project.root(), Arc::clone(&store_context.store));
-        let relational_workspace_fingerprints = self.capture_relational_workspace_fingerprints();
+        let relational_workspace_snapshots = Arc::new(relational_workspace_snapshots);
         Self::from_state(
             Arc::clone(&self.project),
             Arc::clone(&self.adapter),
@@ -12024,7 +11739,7 @@ where
             self.content_identity_base,
             self.semantic_cache.clone(),
             store_context,
-            relational_workspace_fingerprints,
+            relational_workspace_snapshots,
         )
     }
 
@@ -12038,7 +11753,7 @@ where
             None,
             &store_context,
         );
-        let relational_workspace_fingerprints = self.capture_relational_workspace_fingerprints();
+        let relational_workspace_snapshots = self.capture_relational_workspace_snapshots();
         Self::from_state(
             Arc::clone(&self.project),
             Arc::clone(&self.adapter),
@@ -12050,7 +11765,7 @@ where
             self.content_identity_base,
             self.semantic_cache.clone(),
             store_context,
-            relational_workspace_fingerprints,
+            relational_workspace_snapshots,
         )
     }
 
@@ -13361,6 +13076,7 @@ mod tests {
         let project: Arc<dyn Project> = Arc::new(TestProject::new(&root, Language::Java));
         let store_context = AnalyzerStoreContext {
             store,
+            workspace_id: crate::analyzer::store::WorkspaceId::for_root(project.root()),
             gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
             liveness: None,
             workspace_snapshot: None,
@@ -13804,6 +13520,7 @@ mod tests {
         let store = Arc::new(AnalyzerStore::open_persistent(&db).expect("persistent store"));
         let store_context = AnalyzerStoreContext {
             store: Arc::clone(&store),
+            workspace_id: crate::analyzer::store::WorkspaceId::for_root(project.root()),
             gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
             liveness: None,
             workspace_snapshot: None,
@@ -13920,6 +13637,7 @@ mod tests {
             Arc::new(AnalyzerStore::open_persistent(&db).expect("reopen persistent store"));
         let reopened_context = AnalyzerStoreContext {
             store: Arc::clone(&reopened_store),
+            workspace_id: crate::analyzer::store::WorkspaceId::for_root(project.root()),
             gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
             liveness: None,
             workspace_snapshot: None,
@@ -14011,6 +13729,7 @@ mod tests {
         let store = Arc::new(AnalyzerStore::open_ephemeral().unwrap());
         let store_context = AnalyzerStoreContext {
             store: Arc::clone(&store),
+            workspace_id: crate::analyzer::store::WorkspaceId::for_root(project.root()),
             gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
             liveness: None,
             workspace_snapshot: None,
@@ -14454,7 +14173,7 @@ mod tests {
             headers.rows.len(),
             candidates,
             "the timed lookup starts only after every mounted identity header is visible; fingerprints={:?}",
-            analyzer.relational_workspace_fingerprints
+            analyzer.selected_workspace_snapshots()
         );
         let requested = "pkg.mod_0.Shared";
         let warm = CodeUnitIndex::definitions(&analyzer, requested).collect::<Vec<_>>();
@@ -14687,6 +14406,7 @@ mod tests {
         live_paths.refresh([LivePathEntry::overlay(file.clone(), oid)]);
         let store_context = AnalyzerStoreContext {
             store: Arc::new(AnalyzerStore::open_ephemeral().unwrap()),
+            workspace_id: crate::analyzer::store::WorkspaceId::for_root(project.root()),
             gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
             liveness: None,
             workspace_snapshot: None,
@@ -14774,6 +14494,7 @@ mod tests {
         let store = Arc::new(AnalyzerStore::open_ephemeral().unwrap());
         let store_context = AnalyzerStoreContext {
             store: Arc::clone(&store),
+            workspace_id: crate::analyzer::store::WorkspaceId::for_root(project.root()),
             gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
             liveness: None,
             workspace_snapshot: None,
@@ -16025,6 +15746,7 @@ mod tests {
         let store = Arc::new(AnalyzerStore::open_ephemeral().unwrap());
         let store_context = AnalyzerStoreContext {
             store,
+            workspace_id: crate::analyzer::store::WorkspaceId::for_root(project.root()),
             gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
             liveness: None,
             workspace_snapshot: None,
@@ -16432,6 +16154,7 @@ mod tests {
         );
         let store_context = AnalyzerStoreContext {
             store: Arc::clone(&store),
+            workspace_id: crate::analyzer::store::WorkspaceId::for_root(project.root()),
             gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
             liveness: None,
             workspace_snapshot: None,
@@ -16710,5 +16433,20 @@ mod sigil_anchor_tests {
         let anchored = SearchSymbolPatternBatch::compile(vec!["foo.$".to_string()], false, None);
         assert!(anchored.is_match("foo."));
         assert!(!anchored.is_match("foo.$"));
+    }
+
+    #[test]
+    fn dollar_after_dollar_is_identifier_text_not_end_anchor() {
+        // #1059 (reopened): `next_is_word` counted `$` as word-ish but
+        // `prev_is_word` did not, so the trailing `$` of `_$$` followed a
+        // `$` and stayed a regex end-anchor. The compiled `_\$$` matched
+        // `App._$` but never `App._$$` (bit on a JS class field
+        // `_$$ = $$;`). The prev-side set now includes `$`.
+        let batch = SearchSymbolPatternBatch::compile(vec!["_$$".to_string()], false, None);
+        assert!(batch.is_match("_$$"));
+        assert!(!batch.is_match("_$"));
+        let longer = SearchSymbolPatternBatch::compile(vec!["_$_$$".to_string()], false, None);
+        assert!(longer.is_match("_$_$$"));
+        assert!(!longer.is_match("_$_$"));
     }
 }

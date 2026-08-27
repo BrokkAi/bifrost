@@ -214,7 +214,7 @@ impl<'a> CSharpDefinitionProvider<'a> {
                 Some(session) => session.query_limited_rows(|limit| {
                     graph_support::file_using_namespaces_limited(self.csharp, token, file, limit)
                 }),
-                None => graph_support::file_using_namespaces(self.csharp, token, file),
+                None => self.csharp.file_using_namespaces_of(token, file),
             };
             self.observe_cancellation().then_some(namespaces)
         };
@@ -790,6 +790,12 @@ fn resolve_csharp_in_session(
         }
         Some(CSharpReferenceNode::Type(type_node)) => {
             let reference = csharp_reference_type_text(type_node, source);
+            if csharp_type_parameter_shadows_reference(type_node, source, &reference) {
+                return no_definition(
+                    LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND,
+                    format!("`{reference}` is a lexical C# type parameter"),
+                );
+            }
             if preserve_using_alias
                 && let Some(alias) = csharp_navigable_using_alias_binding(
                     csharp,
@@ -3190,6 +3196,36 @@ fn csharp_object_initializer_label_outcome(
     let initializer = csharp_object_initializer_for_label(label)?;
     let member = csharp_node_text(label, source);
     let Some(type_node) = csharp_object_initializer_owner_type_node(initializer) else {
+        if let Some(collection_target) = csharp_object_creation_collection_target(initializer) {
+            let owners = csharp_collection_element_owner_types(
+                analyzer,
+                token,
+                csharp,
+                definitions,
+                file,
+                source,
+                collection_target,
+            );
+            let target_text = csharp_node_text(collection_target, source);
+            return Some(
+                csharp_initializer_member_outcome(
+                    analyzer,
+                    token,
+                    definitions,
+                    owners,
+                    member,
+                    target_text,
+                )
+                .unwrap_or_else(|| {
+                    no_definition(
+                        "unknown_object_initializer_owner",
+                        format!(
+                            "C# object initializer element type could not be inferred from collection target `{target_text}`"
+                        ),
+                    )
+                }),
+            );
+        }
         // A target-typed `new()` whose target type the tree does not write.
         // The one such target the index can still prove is an assignment's
         // left side: it types exactly like a receiver, because the type of
@@ -3245,6 +3281,76 @@ fn csharp_object_initializer_label_outcome(
                 )
             }),
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn csharp_collection_element_owner_types(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    csharp: &CSharpAnalyzer,
+    definitions: &CSharpDefinitionProvider<'_>,
+    file: &ProjectFile,
+    source: &str,
+    target: Node<'_>,
+) -> Vec<CodeUnit> {
+    if target.kind() != "identifier" {
+        return Vec::new();
+    }
+    let name = csharp_node_text(target, source);
+    if let Some(type_node) = csharp_collection_target_element_type_node(target, source) {
+        let type_name = csharp_reference_type_text(type_node, source);
+        let mut owners = csharp_constructed_type_candidates(
+            analyzer,
+            token,
+            csharp,
+            definitions,
+            file,
+            &type_name,
+            type_node.start_byte(),
+        );
+        sort_units(&mut owners);
+        owners.dedup();
+        return owners;
+    }
+
+    let owners = csharp_enclosing_class_chain(analyzer, definitions, file, target.start_byte());
+    for owner in owners {
+        let mut seen = HashSet::default();
+        let mut level = vec![owner];
+        while !level.is_empty() {
+            let mut next_level = Vec::new();
+            for current in level {
+                if !definitions.scope_step() {
+                    return Vec::new();
+                }
+                if !seen.insert(current.clone()) {
+                    continue;
+                }
+                let members = definitions.members_for_owner_name(&current.fq_name(), name);
+                if !members.is_empty() {
+                    let element = match definitions.session() {
+                        Some(session) => {
+                            csharp_member_declared_collection_element_type_fq_name_in_session(
+                                csharp, token, &current, name, session,
+                            )
+                        }
+                        None => csharp_member_declared_collection_element_type_fq_name(
+                            csharp, token, &current, name,
+                        ),
+                    };
+                    return element
+                        .into_iter()
+                        .flat_map(|fqn| definitions.fqn(&fqn))
+                        .collect();
+                }
+                if let Some(provider) = analyzer.type_hierarchy_provider() {
+                    next_level.extend(definitions.direct_ancestors(provider, token, &current));
+                }
+            }
+            level = next_level;
+        }
+    }
+    Vec::new()
 }
 
 /// Every declaration the constructed type of an object creation can name.
@@ -4413,7 +4519,7 @@ fn csharp_enclosing_class(
         })
         .find(CodeUnit::is_class);
     }
-    if let Some(unit) = ClassRangeIndex::build(analyzer, file).enclosing_unit(byte) {
+    if let Some(unit) = analyzer.class_range_index(file).enclosing_unit(byte) {
         return Some(unit.clone());
     }
 

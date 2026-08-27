@@ -1383,11 +1383,32 @@ export function leak_resource(): object {
         json!([]),
         "{taint}"
     );
-    assert_eq!(
-        taint["result"]["report"]["runs"][0]["diagnostics"],
-        json!([]),
-        "{taint}"
-    );
+    // This policy's `request`/`store` selectors match nothing in `app.ts`, so
+    // the run is vacuously clean rather than proven clean. It stays `complete`
+    // with no findings -- zero findings over an empty selection is the correct
+    // verdict -- but each empty endpoint set is named by an advisory note so an
+    // editor can tell a vacuous report from a proof (#2659).
+    let diagnostics = taint["result"]["report"]["runs"][0]["diagnostics"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected run diagnostics: {taint}"));
+    assert_eq!(diagnostics.len(), 2, "{taint}");
+    for diagnostic in diagnostics {
+        assert_eq!(diagnostic["code"]["type"], "empty_selection", "{taint}");
+        assert_eq!(diagnostic["severity"], "note", "{taint}");
+        assert_eq!(diagnostic["impact"], "advisory", "{taint}");
+    }
+    let messages: Vec<&str> = diagnostics
+        .iter()
+        .filter_map(|diagnostic| diagnostic["message"].as_str())
+        .collect();
+    for endpoint_set in ["source", "sink"] {
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains(&format!("bound no {endpoint_set} endpoint"))),
+            "expected the empty {endpoint_set} set to be named in {messages:?}"
+        );
+    }
 
     let typestate = server.request(
         "bifrost/runPolicy",
@@ -1476,6 +1497,305 @@ export function leak_resource(): object {
             .as_str()
             .is_some_and(|message| message.contains("outside the active Bifrost workspace")),
         "{outside_response}"
+    );
+}
+
+#[test]
+fn bifrost_lsp_server_prepares_version_aware_policy_suppression_edit() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    let source_path = root.join("app.ts");
+    let policy_path = root.join("policy.rqlp");
+    fs::write(&source_path, "export function target() {}\n").expect("write source");
+    fs::write(&policy_path, "").expect("write policy placeholder");
+    let source = r#"(policy
+  :schema-version 1
+  :id "test.prepare-suppression"
+  :name "Prepare suppression"
+  :message "Avoid target"
+  :severity warning
+  :analysis
+    (analysis
+      :type match
+      :selector
+        (rql :schema-version 1
+          (language typescript (function :name "target")))))"#;
+    let mut server = LspServer::start(&root);
+    let report = server.request(
+        "bifrost/runPolicy",
+        json!({
+            "documentUri": uri_for(&policy_path),
+            "evaluationDate": "2026-07-27",
+            "source": source,
+        }),
+    );
+    assert!(report["error"].is_null(), "{report}");
+    let finding = &report["result"]["report"]["runs"][0]["findings"][0];
+    let rule = &report["result"]["report"]["rules"][0];
+    let request = json!({
+        "reportRootUri": uri_for(&root),
+        "policyDocumentUri": uri_for(&policy_path),
+        "finding": {
+            "policyId": rule["policy_id"],
+            "findingId": finding["id"],
+            "path": finding["primary"]["path"],
+            "identityStability": finding["identity_stability"],
+            "policyHash": rule["policy_hash"],
+            "sourceUri": uri_for(&source_path),
+        },
+        "destination": "public",
+        "evaluationDate": "2026-07-27",
+    });
+
+    let missing = server.request("bifrost/preparePolicySuppression", request.clone());
+    assert!(missing["error"].is_null(), "{missing}");
+    assert_eq!(missing["result"]["create"], true, "{missing}");
+    assert_eq!(
+        missing["result"]["expectedVersion"],
+        Value::Null,
+        "{missing}"
+    );
+    assert!(missing["result"]["expectedText"].is_null(), "{missing}");
+    assert!(
+        missing["result"]["content"]
+            .as_str()
+            .unwrap()
+            .ends_with('\n')
+    );
+    assert!(!root.join(".bifrost/suppressions.json").exists());
+
+    let mut private_looking_path = request.clone();
+    private_looking_path["finding"]["path"] = json!("private/secret.ts");
+    private_looking_path["finding"]["sourceUri"] = json!(uri_for(&root.join("private/secret.ts")));
+    private_looking_path["destination"] = json!("local");
+    let private_looking = server.request("bifrost/preparePolicySuppression", private_looking_path);
+    assert!(private_looking["error"].is_null(), "{private_looking}");
+    assert_eq!(
+        private_looking["result"]["documentUri"],
+        uri_for(&root.join(".bifrost/suppressions.local.json")),
+        "{private_looking}"
+    );
+
+    let suppression_path = root.join(".bifrost/suppressions.json");
+    fs::create_dir_all(suppression_path.parent().unwrap()).expect("create .bifrost");
+    fs::write(
+        &suppression_path,
+        json!({
+            "schema_version": 1,
+            "suppressions": [{
+                "policy_id": "test.existing",
+                "finding_id": "1111111111111111111111111111111111111111111111111111111111111111",
+                "identity_stability": "strong",
+                "status": "accepted",
+                "reason": "existing",
+                "accepted_at": "2026-07-01"
+            }]
+        })
+        .to_string(),
+    )
+    .expect("write existing suppression");
+    let existing = server.request("bifrost/preparePolicySuppression", request.clone());
+    assert!(existing["error"].is_null(), "{existing}");
+    assert_eq!(existing["result"]["create"], false, "{existing}");
+    assert_eq!(
+        existing["result"]["expectedText"]
+            .as_str()
+            .expect("expected existing source"),
+        fs::read_to_string(&suppression_path).unwrap()
+    );
+    let content = existing["result"]["content"].as_str().unwrap();
+    let canonical: Value = serde_json::from_str(content).expect("canonical suppression JSON");
+    assert_eq!(canonical["suppressions"].as_array().unwrap().len(), 2);
+    assert_eq!(canonical["suppressions"][1]["reason"], "unspecified");
+    let preconditions = existing["result"]["sourcePreconditions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected source preconditions: {existing}"));
+    assert_eq!(preconditions.len(), 3, "{existing}");
+    assert_eq!(
+        preconditions
+            .iter()
+            .map(|source| source["path"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec![
+            ".bifrost/suppressions.json",
+            ".bifrost/suppressions.private.json",
+            ".bifrost/suppressions.local.json"
+        ]
+    );
+    assert_eq!(preconditions[0]["exists"], true, "{existing}");
+    assert_eq!(
+        preconditions[0]["expectedVersion"],
+        Value::Null,
+        "{existing}"
+    );
+    assert_eq!(preconditions[1]["exists"], false, "{existing}");
+    assert_eq!(preconditions[2]["exists"], false, "{existing}");
+    assert!(
+        !suppression_path.exists()
+            || fs::read_to_string(&suppression_path)
+                .unwrap()
+                .contains("test.existing")
+    );
+
+    let private_path = root.join(".bifrost/suppressions.private.json");
+    let private_text = json!({
+        "schema_version": 1,
+        "suppressions": [{
+            "policy_id": "test.private-existing",
+            "finding_id": "2222222222222222222222222222222222222222222222222222222222222222",
+            "identity_stability": "strong",
+            "status": "accepted",
+            "reason": "private existing",
+            "accepted_at": "2026-07-01"
+        }]
+    })
+    .to_string();
+    server.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri_for(&private_path),
+                "languageId": "json",
+                "version": 7,
+                "text": private_text.clone(),
+            }
+        }),
+    );
+    let private_precondition = server.request("bifrost/preparePolicySuppression", request.clone());
+    assert!(
+        private_precondition["error"].is_null(),
+        "{private_precondition}"
+    );
+    assert_eq!(
+        private_precondition["result"]["sourcePreconditions"][1]["exists"], true,
+        "{private_precondition}"
+    );
+    assert_eq!(
+        private_precondition["result"]["sourcePreconditions"][1]["expectedVersion"], 7,
+        "{private_precondition}"
+    );
+    assert_eq!(
+        private_precondition["result"]["sourcePreconditions"][1]["expectedText"], private_text,
+        "{private_precondition}"
+    );
+    let private_duplicate_text = json!({
+        "schema_version": 1,
+        "suppressions": [{
+            "policy_id": "test.cross-source",
+            "finding_id": "3333333333333333333333333333333333333333333333333333333333333333",
+            "identity_stability": "strong",
+            "status": "accepted",
+            "reason": "private cross-source duplicate",
+            "policy_hash_at_acceptance": rule["policy_hash"],
+            "accepted_at": "2026-07-01"
+        }]
+    })
+    .to_string();
+    server.notify(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {"uri": uri_for(&private_path), "version": 8},
+            "contentChanges": [{"text": private_duplicate_text}],
+        }),
+    );
+    let public_text = json!({
+        "schema_version": 1,
+        "suppressions": [{
+            "policy_id": "test.cross-source",
+            "finding_id": "3333333333333333333333333333333333333333333333333333333333333333",
+            "identity_stability": "strong",
+            "status": "accepted",
+            "reason": "public cross-source duplicate",
+            "policy_hash_at_acceptance": rule["policy_hash"],
+            "accepted_at": "2026-07-01"
+        }]
+    })
+    .to_string();
+    server.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri_for(&suppression_path),
+                "languageId": "json",
+                "version": 8,
+                "text": public_text,
+            }
+        }),
+    );
+    let collision = server.request("bifrost/preparePolicySuppression", request.clone());
+    assert_eq!(collision["error"]["code"], -32602, "{collision}");
+    assert!(
+        collision["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("suppressions.private.json")),
+        "{collision}"
+    );
+
+    server.notify(
+        "textDocument/didClose",
+        json!({"textDocument": {"uri": uri_for(&suppression_path)}}),
+    );
+
+    fs::write(
+        &suppression_path,
+        vec![b' '; brokk_bifrost_policy::MAX_POLICY_SUPPRESSION_DOCUMENT_BYTES as usize + 1],
+    )
+    .expect("write oversized suppression");
+    let oversized = server.request("bifrost/preparePolicySuppression", request.clone());
+    assert_eq!(oversized["error"]["code"], -32602, "{oversized}");
+    assert!(
+        oversized["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("exceeds")),
+        "{oversized}"
+    );
+
+    let mut weak = request.clone();
+    weak["finding"]["identityStability"] = json!("weak");
+    let weak_response = server.request("bifrost/preparePolicySuppression", weak);
+    assert_eq!(weak_response["error"]["code"], -32602, "{weak_response}");
+    assert!(
+        weak_response["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Only strong")),
+        "{weak_response}"
+    );
+
+    let mut traversal = request.clone();
+    traversal["finding"]["path"] = json!("../outside.ts");
+    traversal["finding"]["sourceUri"] = json!(uri_for(&root.join("../outside.ts")));
+    let traversal_response = server.request("bifrost/preparePolicySuppression", traversal);
+    assert_eq!(
+        traversal_response["error"]["code"], -32602,
+        "{traversal_response}"
+    );
+    assert!(
+        traversal_response["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Invalid suppression finding path")),
+        "{traversal_response}"
+    );
+
+    server.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri_for(&policy_path),
+                "languageId": "bifrost-rql-policy",
+                "version": 2,
+                "text": source,
+            }
+        }),
+    );
+    let mut stale = request;
+    stale["policyDocumentVersion"] = json!(1);
+    let stale_response = server.request("bifrost/preparePolicySuppression", stale);
+    assert_eq!(stale_response["error"]["code"], -32602, "{stale_response}");
+    assert!(
+        stale_response["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("stale")),
+        "{stale_response}"
     );
 }
 
@@ -2314,9 +2634,15 @@ fn bifrost_lsp_server_runtime_configuration_clears_departed_diagnostics() {
             "settings": {"roots": [], "exclude": ["Broken.java"], "formatterCommands": []}
         }),
     );
-    let cleared = server.read_notification("textDocument/publishDiagnostics");
+    // Settle: the didOpen-scheduled dependency-pack activation can republish
+    // the pre-exclusion diagnostic between the configuration change and the
+    // clear, and both publishes carry the same open-document version.
+    let cleared = published_diagnostics_settle(
+        &mut server,
+        |items| items.is_empty(),
+        "empty diagnostics after runtime exclusion",
+    );
     assert_eq!(cleared["params"]["uri"], file_uri);
-    assert_eq!(cleared["params"]["diagnostics"], json!([]));
 }
 
 #[test]
@@ -2881,18 +3207,18 @@ fn bifrost_lsp_server_removes_workspace_folder_dynamically() {
             }
         }
     }));
-    let publish_clear = server.read_notification("textDocument/publishDiagnostics");
+    // Settle rather than read the next notification: the didSave above also
+    // scheduled a background dependency-pack activation, and its refresh can
+    // republish the still-broken diagnostics between the save and this clear.
+    let publish_clear = published_diagnostics_settle(
+        &mut server,
+        |items| items.is_empty(),
+        "empty diagnostics after root removal",
+    );
     assert_eq!(
         publish_clear["params"]["uri"],
         uri_for(&removed_path),
         "expected removed-root diagnostics to be cleared: {publish_clear}"
-    );
-    assert!(
-        publish_clear["params"]["diagnostics"]
-            .as_array()
-            .unwrap_or_else(|| panic!("expected diagnostics array, got {publish_clear}"))
-            .is_empty(),
-        "expected empty diagnostics after root removal: {publish_clear}"
     );
 
     server.notify_value(json!({
@@ -5245,7 +5571,10 @@ fn bifrost_lsp_server_type_definition_uses_did_open_overlay() {
             "position": {"line": 2, "character": 0}
         }
     }));
-    let response = server.read_message();
+    // Matched by id: the background dependency-pack activation can republish
+    // diagnostics for the opened document between this request and its
+    // response.
+    let response = server.read_response_for_id(2);
     let locations = response["result"]
         .as_array()
         .unwrap_or_else(|| panic!("expected location array, got {response}"));
@@ -7081,17 +7410,22 @@ func Run() {
 /// second gate on top of it: the pass may publish an unrecognized symbol only
 /// where structured analysis proved the name absent.
 ///
-/// A bare workspace has no configured classpath and no activated dependency
-/// model, so nothing past the workspace has been read and `MissingType` may
-/// well be a JDK or dependency type. Publishing it would be exactly the false
-/// positive #1615 exists to prevent, so an enabled pass correctly publishes
-/// nothing here.
+/// Two things keep this deterministic on every machine (#2678). The harness
+/// spawns every server without a discoverable JDK (`lsp_command` removes
+/// `JAVA_HOME`), so the #1628 background activation has no stdlib pack to
+/// publish (#2669). And the embedded generator-rule packs a bare workspace
+/// does activate (e.g. `bifrost.scala.case-class`) publish no declaration
+/// surface, so their overlay licenses no absence proof. Nothing past the
+/// workspace has been read and `MissingType` may well be a JDK or dependency
+/// type; publishing it would be exactly the false positive #1615 exists to
+/// prevent, so an enabled pass correctly publishes nothing here whether or
+/// not that activation has completed. On a host whose `JAVA_HOME` reaches a
+/// real server, activation publishes the stdlib declaration surface and the
+/// same pass correctly reports the name.
 ///
-/// The positive case -- a proved absence reaching a client -- needs activated
-/// dependency packs. The LSP host does not activate them yet; the MCP service
-/// does, through `acquire_active_semantic_models`. Until the LSP does too, the
-/// error-producing half is pinned in process by
-/// `tests/suite_semantic/jvm_diagnostic_proof.rs`.
+/// The positive case -- a proved absence reaching a client -- is pinned in
+/// process by `tests/suite_semantic/jvm_diagnostic_proof.rs` against an
+/// embedded fixture pack, which needs no host toolchain.
 fn bifrost_lsp_server_scala_unproved_symbols_are_never_published() {
     let temp = TempDir::new().expect("temp dir");
     let temp_root = temp.path().canonicalize().expect("canon temp");
@@ -7363,7 +7697,7 @@ fn has_code(items: &[serde_json::Value], code: &str) -> bool {
 }
 
 #[test]
-fn bifrost_lsp_server_opt_in_activates_dependency_packs_off_the_request_path() {
+fn bifrost_lsp_server_default_activates_dependency_packs_off_the_request_path() {
     let temp = TempDir::new().expect("temp dir");
     let temp_root = temp.path().canonicalize().expect("canon temp");
     fs::write(temp_root.join("app.py"), "def run():\n    missing_value\n").expect("write app.py");
@@ -7377,33 +7711,13 @@ fn bifrost_lsp_server_opt_in_activates_dependency_packs_off_the_request_path() {
         "params": {"textDocument": {"uri": app_uri}}
     }));
     let published = server.read_notification("textDocument/publishDiagnostics");
-    assert!(
-        published["params"]["diagnostics"]
-            .as_array()
-            .is_some_and(Vec::is_empty),
-        "the opt-in is off, so nothing may publish yet: {published}"
-    );
-
-    server.notify_value(json!({
-        "jsonrpc": "2.0",
-        "method": "workspace/didChangeConfiguration",
-        "params": {"settings": {"unrecognizedSymbolDiagnostics": true}}
-    }));
-    // The configuration flip refreshes synchronously on the main loop; the
-    // activation it schedules refreshes again once it has published its proof.
-    let flip_refresh = server.read_notification("textDocument/publishDiagnostics");
-    assert_eq!(flip_refresh["params"]["uri"], app_uri);
-    let activation_refresh = server.read_notification("textDocument/publishDiagnostics");
-    assert_eq!(
-        activation_refresh["params"]["uri"], app_uri,
-        "a completed activation must refresh every published document: {activation_refresh}"
-    );
+    assert_eq!(published["params"]["uri"], app_uri);
 
     let stderr = server.shutdown_with_stderr();
     assert_eq!(
         activation_count(&stderr),
         1,
-        "expected exactly one background activation: {stderr}"
+        "the absent document must schedule one default activation: {stderr}"
     );
     assert!(
         stderr.contains("ecosystems=[Python]"),
@@ -7423,8 +7737,8 @@ fn bifrost_lsp_server_packs_document_opts_the_session_into_its_named_ecosystems(
     )
     .expect("write main.go");
     fs::create_dir_all(temp_root.join(".bifrost")).expect("create .bifrost");
-    // The document is the opt-in (#1868): no client diagnostic setting is
-    // required, and activation covers only the document's ecosystems even
+    // The document narrows the default (#1868): no client diagnostic setting
+    // is required, and activation covers only the document's ecosystems even
     // though Python source is present too.
     fs::write(
         temp_root.join(".bifrost/packs.json"),
@@ -7466,7 +7780,7 @@ fn bifrost_lsp_server_packs_document_opts_the_session_into_its_named_ecosystems(
 }
 
 #[test]
-fn bifrost_lsp_server_opted_out_session_never_activates_dependency_packs() {
+fn bifrost_lsp_server_absent_document_uses_present_language_defaults() {
     let temp = TempDir::new().expect("temp dir");
     let temp_root = temp.path().canonicalize().expect("canon temp");
     fs::write(temp_root.join("app.py"), "def run():\n    missing_value\n").expect("write app.py");
@@ -7481,18 +7795,35 @@ fn bifrost_lsp_server_opted_out_session_never_activates_dependency_packs() {
         "params": {"textDocument": {"uri": app_uri}}
     }));
     let published = server.read_notification("textDocument/publishDiagnostics");
-    assert!(
-        published["params"]["diagnostics"]
-            .as_array()
-            .is_some_and(Vec::is_empty),
-        "a default session publishes no semantic diagnostics: {published}"
-    );
+    assert_eq!(published["params"]["uri"], app_uri);
 
     let stderr = server.shutdown_with_stderr();
     assert_eq!(
         activation_count(&stderr),
+        1,
+        "an absent document must activate present-language defaults: {stderr}"
+    );
+    assert!(stderr.contains("ecosystems=[Python]"), "{stderr}");
+}
+
+#[test]
+fn bifrost_lsp_server_empty_packs_document_disables_dependency_packs() {
+    let temp = TempDir::new().expect("temp dir");
+    let temp_root = temp.path().canonicalize().expect("canon temp");
+    fs::write(temp_root.join("app.py"), "def run():\n    missing_value\n").expect("write app.py");
+    fs::create_dir_all(temp_root.join(".bifrost")).expect("create .bifrost");
+    fs::write(
+        temp_root.join(".bifrost/packs.json"),
+        r#"{ "schema_version": 1, "ecosystems": [] }"#,
+    )
+    .expect("write disabled packs document");
+
+    let server = LspServer::start(&temp_root);
+    let stderr = server.shutdown_with_stderr();
+    assert_eq!(
+        activation_count(&stderr),
         0,
-        "a session that never opted in must never discover dependencies: {stderr}"
+        "an explicit empty ecosystem list must not start an activation worker: {stderr}"
     );
 }
 
@@ -7551,10 +7882,9 @@ fn bifrost_lsp_server_dependency_input_change_invalidates_and_reactivates() {
     );
 
     let stderr = server.shutdown_with_stderr();
-    assert_eq!(
-        activation_count(&stderr),
-        2,
-        "the changed go.mod must schedule a second activation: {stderr}"
+    assert!(
+        activation_count(&stderr) >= 2,
+        "the changed go.mod must schedule a later activation after the default/configuration work: {stderr}"
     );
     assert!(
         stderr.contains("ecosystems=[Go]"),
@@ -7563,7 +7893,7 @@ fn bifrost_lsp_server_dependency_input_change_invalidates_and_reactivates() {
 }
 
 #[test]
-fn bifrost_lsp_server_dependency_pack_activation_stops_cleanly_on_opt_out() {
+fn bifrost_lsp_server_diagnostic_opt_out_does_not_stop_default_pack_activation() {
     let temp = TempDir::new().expect("temp dir");
     let temp_root = temp.path().canonicalize().expect("canon temp");
     fs::write(temp_root.join("app.py"), "def run():\n    missing_value\n").expect("write app.py");
@@ -7591,12 +7921,10 @@ fn bifrost_lsp_server_dependency_pack_activation_stops_cleanly_on_opt_out() {
         "method": "workspace/didChangeConfiguration",
         "params": {"settings": {"unrecognizedSymbolDiagnostics": false}}
     }));
-    let cleared = server.read_notification("textDocument/publishDiagnostics");
-    assert!(
-        cleared["params"]["diagnostics"]
-            .as_array()
-            .is_some_and(Vec::is_empty),
-        "opting out must clear the published lints: {cleared}"
+    published_diagnostics_settle(
+        &mut server,
+        |items| items.is_empty(),
+        "opting out must clear the published lints",
     );
 
     // `shutdown` asserts a successful exit status, which the server can only
@@ -7651,14 +7979,10 @@ fn bifrost_lsp_server_cpp_semantic_diagnostics_require_context_and_opt_in() {
         "method": "workspace/didChangeConfiguration",
         "params": {"settings": {"unrecognizedSymbolDiagnostics": true}}
     }));
-    let enabled_publish = server.read_notification("textDocument/publishDiagnostics");
-    assert!(
-        enabled_publish["params"]["diagnostics"]
-            .as_array()
-            .is_some_and(|items| items
-                .iter()
-                .any(|item| item["code"] == "cpp_unrecognized_symbol")),
-        "enabling the opt-in must refresh C++ diagnostics: {enabled_publish}"
+    published_diagnostics_settle(
+        &mut server,
+        |items| has_code(items, "cpp_unrecognized_symbol"),
+        "enabling the opt-in must refresh C++ diagnostics",
     );
 
     server.notify_value(json!({
@@ -7819,7 +8143,11 @@ fn bifrost_lsp_server_ruby_semantic_diagnostics_are_constant_only() {
         "method": "workspace/didChangeConfiguration",
         "params": {"settings": {"unrecognizedSymbolDiagnostics": true}}
     }));
-    let republished = server.read_notification("textDocument/publishDiagnostics");
+    let republished = published_diagnostics_settle(
+        &mut server,
+        |items| has_code(items, "ruby_unrecognized_symbol"),
+        "enabling the opt-in must republish the Ruby constant diagnostic",
+    );
     let republished_items = republished["params"]["diagnostics"]
         .as_array()
         .unwrap_or_else(|| panic!("expected republished Ruby diagnostics, got {republished}"));
@@ -7877,7 +8205,7 @@ fn bifrost_lsp_server_ruby_semantic_diagnostics_are_constant_only() {
 }
 
 #[test]
-/// Kotlin's half of the same contract. See
+/// Kotlin's half of the same contract, hermetic for the same reason. See
 /// [`bifrost_lsp_server_scala_unproved_symbols_are_never_published`].
 fn bifrost_lsp_server_kotlin_unproved_symbols_are_never_published() {
     let temp = TempDir::new().expect("temp dir");
@@ -9924,7 +10252,10 @@ fn bifrost_lsp_server_incremental_utf16_crlf_edits_refresh_hover_and_diagnostics
             }
         }
     }));
-    let _ = server.read_notification("textDocument/publishDiagnostics");
+    // Match each publish to the document version it was computed against:
+    // a background dependency-pack activation can republish for this URI at
+    // any point, so "the next publishDiagnostics" may be a stale refresh.
+    let _ = server.read_publish_diagnostics_for_version(&file_uri, 1);
 
     // The emoji occupies two UTF-16 code units. Rename the valid function,
     // then append malformed Rust at the CRLF-created trailing line.
@@ -9951,7 +10282,7 @@ fn bifrost_lsp_server_incremental_utf16_crlf_edits_refresh_hover_and_diagnostics
             ]
         }
     }));
-    let broken = server.read_notification("textDocument/publishDiagnostics");
+    let broken = server.read_publish_diagnostics_for_version(&file_uri, 2);
     assert!(
         !broken["params"]["diagnostics"]
             .as_array()
@@ -9975,7 +10306,7 @@ fn bifrost_lsp_server_incremental_utf16_crlf_edits_refresh_hover_and_diagnostics
             }]
         }
     }));
-    let cleared = server.read_notification("textDocument/publishDiagnostics");
+    let cleared = server.read_publish_diagnostics_for_version(&file_uri, 3);
     assert!(
         cleared["params"]["diagnostics"]
             .as_array()
@@ -10016,6 +10347,16 @@ fn bifrost_lsp_server_rejected_didchanges_preserve_overlay() {
     let root = temp.path().canonicalize().expect("canon temp");
     let file_path = root.join("lib.rs");
     fs::write(&file_path, "fn original() {}\n").expect("write disk");
+    // The proof below is "the very next inbound message is the hover
+    // response". A background dependency-pack activation republishes
+    // diagnostics for published URIs at nondeterministic points and would
+    // break that ordering, so disable activation for this workspace.
+    fs::create_dir_all(root.join(".bifrost")).expect("create .bifrost");
+    fs::write(
+        root.join(".bifrost/packs.json"),
+        r#"{ "schema_version": 1, "ecosystems": [] }"#,
+    )
+    .expect("write disabled packs document");
 
     let mut server = LspServer::start(&root);
     let file_uri = uri_for(&file_path);

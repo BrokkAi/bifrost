@@ -15,7 +15,44 @@ use super::aliases::{
 use brokk_bifrost_core::analyzer::capabilities::TypeHierarchyProvider;
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, ProjectFile};
 use brokk_bifrost_core::hash::{HashMap, HashSet};
-use tree_sitter::{Node, Parser};
+use moka::sync::Cache;
+use std::sync::{Arc, OnceLock};
+use tree_sitter::{Node, Parser, Tree};
+
+/// A whole-file PHP parse memoized on the exact source bytes (#2679).
+///
+/// `php_is_interface` / `php_is_trait` re-read and re-parsed an ancestor's
+/// whole file once per classification, and the definition resolver asks them
+/// once per hierarchy ancestor per reference occurrence. A parse is a pure
+/// function of the source bytes, so the memo is observationally identical,
+/// and the byte-weighted cache ages stale sources out like the analogous
+/// per-language tree memos in the definition resolvers.
+static PHP_TREES: OnceLock<Cache<Arc<str>, Option<Tree>>> = OnceLock::new();
+
+const PHP_TREE_MEMO_SOURCE_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
+
+fn parse_php_tree_memoized(source: &str) -> Option<Tree> {
+    let cache = PHP_TREES.get_or_init(|| {
+        Cache::builder()
+            .max_capacity(PHP_TREE_MEMO_SOURCE_BUDGET_BYTES)
+            .weigher(|key: &Arc<str>, _value: &Option<Tree>| {
+                key.len().min(u32::MAX as usize) as u32
+            })
+            .build()
+    });
+    if let Some(tree) = cache.get(source) {
+        return tree;
+    }
+    let tree = (|| {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
+            .ok()?;
+        parser.parse(source, None)
+    })();
+    cache.insert(Arc::from(source), tree.clone());
+    tree
+}
 
 /// The analyzer-resident products PHP's language logic resolves through: the
 /// core declaration index plus the memoized type hierarchy. `PhpAnalyzer` is the
@@ -95,11 +132,7 @@ fn php_aliases_visible_before_declaration(
     declaration_start: usize,
 ) -> Option<PhpUseAliases> {
     let source = php.project().read_source(file).ok()?;
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
-        .ok()?;
-    let tree = parser.parse(source.as_str(), None)?;
+    let tree = parse_php_tree_memoized(&source)?;
     Some(php_aliases_visible_before(
         tree.root_node(),
         &source,
@@ -148,11 +181,7 @@ pub fn php_direct_declared_class_parent(
 
 fn php_declaration_kind(php: &dyn PhpSource, code_unit: &CodeUnit) -> Option<&'static str> {
     let source = php.project().read_source(code_unit.source()).ok()?;
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
-        .ok()?;
-    let tree = parser.parse(source.as_str(), None)?;
+    let tree = parse_php_tree_memoized(&source)?;
     let ranges = php.ranges(code_unit);
     let start = ranges.iter().map(|range| range.start_byte).min()?;
     let end = ranges.iter().map(|range| range.end_byte).max()?;

@@ -225,10 +225,17 @@ fn go_fqn_candidates(
     candidates
 }
 
+/// Memoized on exact source bytes (#2679): the package-selector chain probe
+/// re-reads and re-parses the same package variable files once per
+/// occurrence.
+static GO_TREES: super::TreeParseMemo = super::TreeParseMemo::new();
+
 pub(super) fn parse_go_tree(source: &str) -> Option<Tree> {
-    let mut parser = Parser::new();
-    parser.set_language(&tree_sitter_go::LANGUAGE.into()).ok()?;
-    parser.parse(source, None)
+    GO_TREES.parse(source, |source| {
+        let mut parser = Parser::new();
+        parser.set_language(&tree_sitter_go::LANGUAGE.into()).ok()?;
+        parser.parse(source, None)
+    })
 }
 
 pub(crate) fn resolve_go_bounded(
@@ -571,11 +578,8 @@ fn go_keyed_composite_label_outcome(
             ),
         ));
     };
-    let candidates: Vec<_> = support
-        .members_for_owner_name(&owner_fqn, label)
-        .into_iter()
-        .filter(CodeUnit::is_field)
-        .collect();
+    let candidates =
+        go_composite_literal_field_candidates(analyzer, token, support, &owner_fqn, label);
     if candidates.is_empty() {
         return Some(no_definition(
             "no_indexed_definition",
@@ -583,6 +587,68 @@ fn go_keyed_composite_label_outcome(
         ));
     }
     Some(candidates_outcome(candidates))
+}
+
+fn go_composite_literal_field_candidates(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    support: &dyn GoDefinitionProvider,
+    owner_fqn: &str,
+    label: &str,
+) -> Vec<CodeUnit> {
+    let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer) else {
+        return Vec::new();
+    };
+    let mut owner_fqn = owner_fqn.to_string();
+    let mut visited = HashSet::default();
+    while visited.insert(owner_fqn.clone()) {
+        let mut fields: Vec<_> = support
+            .members_for_owner_name(&owner_fqn, label)
+            .into_iter()
+            .filter(CodeUnit::is_field)
+            .collect();
+        sort_units(&mut fields);
+        fields.dedup();
+        if !fields.is_empty() {
+            return fields;
+        }
+
+        let mut underlying = Vec::new();
+        for unit in support
+            .fqn(&owner_fqn)
+            .into_iter()
+            .filter(CodeUnit::is_class)
+        {
+            if !support.scope_step() {
+                return Vec::new();
+            }
+            for metadata in support.signature_metadata(analyzer, &unit) {
+                if !support.scope_step() {
+                    return Vec::new();
+                }
+                let Some(identity) = metadata.into_underlying_type_identity() else {
+                    continue;
+                };
+                if let Some(fqn) = go_resolve_structured_type_fqn(
+                    support,
+                    token,
+                    go,
+                    unit.source(),
+                    unit.package_name(),
+                    &identity,
+                ) {
+                    underlying.push(fqn);
+                }
+            }
+        }
+        underlying.sort();
+        underlying.dedup();
+        let [next] = underlying.as_slice() else {
+            return Vec::new();
+        };
+        owner_fqn.clone_from(next);
+    }
+    Vec::new()
 }
 
 enum GoCompositeOwnerStep {

@@ -34,7 +34,49 @@ pub struct AuthoredSemanticModelPack {
     pub license: String,
     pub completeness: Completeness,
     pub safety: Safety,
+    /// The producer's explicit claim that it read and parsed each of these
+    /// relative source paths from a sources artifact while generating the pack
+    /// (#2613). A consumer uses the inventory to distinguish a `Locator::Source`
+    /// path the pack carries -- a legitimate authored navigation target -- from
+    /// an upstream path the pack merely names, which must render as a durable
+    /// `bifrost-model://` location instead.
+    ///
+    /// Entries are canonical relative slash-separated paths in strictly
+    /// ascending order. Serialized only when non-empty, so adding the field
+    /// leaves the manifest bytes and digests of every pack that does not carry
+    /// sources unchanged -- the same discipline `declared_effects` uses.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub carried_sources: Vec<String>,
     pub shards: Vec<AuthoredShard>,
+}
+
+/// The distinct `Locator::Source` paths across a pack's declaration facts, in
+/// strictly ascending order.
+///
+/// Only a producer whose `Locator::Source` paths are, by construction, entries
+/// it actually parsed from a sources artifact may use this to populate
+/// `AuthoredSemanticModelPack::carried_sources`; the call site is the claim.
+pub fn carried_source_paths(shards: &[AuthoredShard]) -> Vec<String> {
+    let mut paths: Vec<String> = shards
+        .iter()
+        .flat_map(|shard| match &shard.payload {
+            AuthoredPayload::DeclarationFacts { types, members, .. } => types
+                .iter()
+                .map(|fact| &fact.locator)
+                .chain(members.iter().map(|fact| &fact.locator))
+                .filter_map(|locator| match locator {
+                    Locator::Source { path, .. } => Some(path.clone()),
+                    Locator::Artifact { .. } => None,
+                })
+                .collect::<Vec<_>>(),
+            AuthoredPayload::GeneratorRules { .. } | AuthoredPayload::ProcedureSummaries { .. } => {
+                Vec::new()
+            }
+        })
+        .collect();
+    paths.sort_unstable();
+    paths.dedup();
+    paths
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

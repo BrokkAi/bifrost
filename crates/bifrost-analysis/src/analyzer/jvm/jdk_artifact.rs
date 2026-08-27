@@ -7,7 +7,7 @@ use crate::analyzer::semantic_model::{
     ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest, AuthoredPayload,
     AuthoredSemanticModelPack, AuthoredShard, BoundedProducerDiagnostics, Completeness,
     ExternalArtifactKind, ExternalArtifactPackProducer, Producer, ProducerDiagnostic,
-    ProducerDiagnosticSeverity, Visibility, read_exact_artifact_while,
+    ProducerDiagnosticSeverity, Visibility, carried_source_paths, read_exact_artifact_while,
 };
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_jvm::java::declarations::{node_text, parse_tree};
@@ -433,6 +433,9 @@ impl JdkSourceArchivePackProducer {
                 license: request.license.clone(),
                 completeness,
                 safety: request.safety.clone(),
+                // Every Source locator in these shards names a src.zip entry
+                // this producer parsed, so the pack carries them all.
+                carried_sources: carried_source_paths(&shards),
                 shards,
             }),
             completeness,

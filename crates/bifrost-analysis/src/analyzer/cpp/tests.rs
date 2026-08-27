@@ -257,6 +257,7 @@ int DecoyOuter::DecoyInner::method() const { return 3; }
     let analyzer = CppAnalyzer::from_project(crate::TestProject::new(root, Language::Cpp));
 
     analyzer.reset_visible_type_units_build_count_for_test();
+    analyzer.reset_reconcile_counts_for_test();
     let definitions: Vec<_> = analyzer.definitions("log4cxx.Outer$Inner.method").collect();
 
     assert!(
@@ -269,6 +270,11 @@ int DecoyOuter::DecoyInner::method() const { return 3; }
         analyzer.visible_type_units_build_count_for_test(),
         1,
         "the owner-bounded query may build only the matching candidate's class table"
+    );
+    assert_eq!(
+        analyzer.reconcile_stored_signature_metadata_count_for_test(),
+        analyzer.reconcile_candidate_evaluation_count_for_test(),
+        "every reconcile candidate must read raw stored signature facts instead of the overlay-aware metadata surface"
     );
 
     let parsed = |name: &str| {

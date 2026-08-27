@@ -44,6 +44,12 @@ pub enum RelationalAssertionPlanError {
     UnknownBinding {
         name: String,
     },
+    NestedRowSelector {
+        binding: String,
+    },
+    InvalidRowSelectorOutput {
+        detail: String,
+    },
     UnknownGroup {
         name: String,
     },
@@ -207,6 +213,13 @@ impl fmt::Display for RelationalAssertionPlanError {
             }
             Self::DuplicateAssertion { id } => write!(formatter, "duplicate assertion `{id}`"),
             Self::UnknownBinding { name } => write!(formatter, "unknown binding `{name}`"),
+            Self::NestedRowSelector { binding } => write!(
+                formatter,
+                "binding `{binding}` cannot use a nested row selector as its query"
+            ),
+            Self::InvalidRowSelectorOutput { detail } => {
+                write!(formatter, "invalid row-selector output: {detail}")
+            }
             Self::UnknownGroup { name } => write!(formatter, "unknown group `{name}`"),
             Self::UnknownAggregate { group, name } => {
                 write!(formatter, "unknown aggregate `{group}.{name}`")

@@ -24,6 +24,56 @@ fn parse_ok(json: Value) -> CodeQuery {
     parse(json).expect("query should parse")
 }
 
+#[test]
+fn decorator_bindings_accepts_exact_import_identity_filters() {
+    let json_query = parse_ok(json!({
+        "match": { "kind": "parameter" },
+        "steps": [{
+            "op": "decorator_bindings",
+            "module": "@nestjs/common",
+            "imported_name": "Query"
+        }]
+    }));
+    assert_eq!(
+        json_query.plan.steps[0],
+        QueryStep::DecoratorBindings(DecoratorBindingFilter {
+            module: Some("@nestjs/common".to_string()),
+            imported_name: Some("Query".to_string()),
+        })
+    );
+    assert_eq!(
+        json_query.to_canonical_json()["steps"][0],
+        json!({
+            "op": "decorator_bindings",
+            "module": "@nestjs/common",
+            "imported_name": "Query"
+        })
+    );
+
+    let rql_query = CodeQuery::from_sexp(
+        r#"(decorator-bindings :module "@nestjs/common" :imported-name Query (parameter))"#,
+    )
+    .expect("decorator binding identity filters should lower");
+    assert_eq!(
+        rql_query.to_canonical_json(),
+        json_query.to_canonical_json()
+    );
+
+    assert!(
+        parse(json!({
+            "match": { "kind": "parameter" },
+            "steps": [{ "op": "decorator_bindings", "module": 7 }]
+        }))
+        .is_err()
+    );
+    assert!(
+        CodeQuery::from_sexp(
+            r#"(decorator-bindings :imported-name Query :imported_name Other (parameter))"#,
+        )
+        .is_err()
+    );
+}
+
 fn error_of(json: Value) -> QueryError {
     parse(json).expect_err("query should be rejected")
 }
@@ -1589,6 +1639,61 @@ fn receiver_analysis_projects_typed_outcome_and_evidence_rows() {
 }
 
 #[test]
+fn jsx_attribute_value_is_a_distinct_operand_ranged_terminal() {
+    let query = parse_ok(json!({
+        "match": { "kind": "jsx_attribute", "name": "dangerouslySetInnerHTML" },
+        "steps": [{
+            "op": "jsx_attribute_value",
+            "identity": "intrinsic",
+            "element_name": "div",
+            "property_name": "__html"
+        }]
+    }));
+    assert_eq!(
+        query.validate_steps().unwrap(),
+        QueryValueKind::JsxAttributeValue
+    );
+    assert_eq!(
+        query.plan.steps[0],
+        QueryStep::JsxAttributeValue(JsxAttributeValueTraversal {
+            identity: Some(JsxElementIdentity::Intrinsic),
+            element_name: Some("div".to_string()),
+            property_name: Some("__html".to_string()),
+        })
+    );
+    assert_eq!(
+        query.to_canonical_json()["steps"][0],
+        json!({
+            "op": "jsx_attribute_value",
+            "identity": "intrinsic",
+            "element_name": "div",
+            "property_name": "__html"
+        })
+    );
+
+    let rql = CodeQuery::from_sexp(
+        r#"(jsx-attribute-value :identity intrinsic :element-name div :property-name __html
+             (jsx_attribute (name "dangerouslySetInnerHTML")))"#,
+    )
+    .expect("JSX value projection RQL");
+    assert_eq!(
+        rql.validate_steps().unwrap(),
+        QueryValueKind::JsxAttributeValue
+    );
+    assert_eq!(rql.to_canonical_json(), query.to_canonical_json());
+}
+
+#[test]
+fn jsx_attribute_value_rejects_unknown_identity() {
+    let error = error_of(json!({
+        "match": { "kind": "jsx_attribute" },
+        "steps": [{ "op": "jsx_attribute_value", "identity": "maybe" }]
+    }));
+    assert!(error.path.ends_with("identity"));
+    assert!(error.message.contains("intrinsic"));
+}
+
+#[test]
 fn call_shape_projects_typed_group_and_argument_rows() {
     let shape =
         CodeQuery::from_sexp(r#"(call-shape (call :callee "run"))"#).expect("call shape RQL");
@@ -1843,6 +1948,50 @@ fn callable_signature_projects_typed_signature_and_parameter_rows() {
         ]
     }));
     assert_eq!(files.validate_steps().unwrap(), QueryValueKind::File);
+}
+
+#[test]
+fn decorator_bindings_projects_parameter_rows_and_accepts_both_frontends() {
+    let json = parse_ok(json!({
+        "schema_version": SCHEMA_VERSION,
+        "match": { "kind": "parameter" },
+        "steps": [{ "op": "decorator_bindings" }]
+    }));
+    assert_eq!(
+        json.validate_steps().unwrap(),
+        QueryValueKind::DecoratedParameter
+    );
+    assert_eq!(
+        json.to_canonical_json()["steps"][0]["op"],
+        "decorator_bindings"
+    );
+
+    let sexp =
+        CodeQuery::from_sexp("(decorator-bindings (parameter))").expect("decorator-binding RQL");
+    assert_eq!(
+        sexp.validate_steps().unwrap(),
+        QueryValueKind::DecoratedParameter
+    );
+    assert_eq!(
+        sexp.to_canonical_json()["steps"][0]["op"],
+        "decorator_bindings"
+    );
+
+    let files = parse_ok(json!({
+        "match": { "kind": "parameter" },
+        "steps": [{ "op": "decorator_bindings" }, { "op": "file_of" }]
+    }));
+    assert_eq!(files.validate_steps().unwrap(), QueryValueKind::File);
+
+    let wrong_upstream = CodeQuery::from_json(&json!({
+        "match": { "kind": "parameter" },
+        "steps": [
+            { "op": "decorator_bindings" },
+            { "op": "decorator_bindings" }
+        ]
+    }))
+    .expect_err("decorator_bindings must consume structural matches");
+    assert!(wrong_upstream.message.contains("requires structural_match"));
 }
 
 /// The two callable-applicability steps are occurrence-shaped and register the
@@ -2197,6 +2346,13 @@ fn role_accessors_cover_every_role_category() {
         decorators: vec![sub.clone()],
         object: Some(Box::new(sub.clone())),
         field: Some(Box::new(sub.clone())),
+        iterable: Some(Box::new(sub.clone())),
+        elements: vec![sub.clone()],
+        tag: Some(Box::new(sub.clone())),
+        attributes: vec![sub.clone()],
+        children: vec![sub.clone()],
+        value: Some(Box::new(sub.clone())),
+        key: Some(Box::new(sub.clone())),
         ..Pattern::default()
     };
 
@@ -2208,11 +2364,15 @@ fn role_accessors_cover_every_role_category() {
             | Role::Right
             | Role::Module
             | Role::Object
-            | Role::Field => {
+            | Role::Field
+            | Role::Iterable
+            | Role::Tag
+            | Role::Value
+            | Role::Key => {
                 assert!(pattern.single_role_pattern(role).is_some(), "{role:?}");
                 assert!(pattern.list_role_patterns(role).is_empty(), "{role:?}");
             }
-            Role::Arg | Role::Decorator => {
+            Role::Arg | Role::Decorator | Role::Element | Role::Attributes | Role::Children => {
                 assert!(pattern.single_role_pattern(role).is_none(), "{role:?}");
                 assert_eq!(pattern.list_role_patterns(role).len(), 1, "{role:?}");
             }
@@ -2226,6 +2386,7 @@ fn role_accessors_cover_every_role_category() {
 
     pattern.args.clear();
     pattern.decorators.clear();
+    pattern.elements.clear();
     pattern.kwargs.clear();
     assert!(pattern.has_role_constraints());
 }

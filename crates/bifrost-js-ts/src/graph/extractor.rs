@@ -457,6 +457,7 @@ struct LocalPropertyDefinition {
     scope: JsTsLexicalBindingScope,
     property_range: Range,
     aliases: Vec<LocalPropertyReceiverAlias>,
+    receiver_owner_binding: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -630,6 +631,11 @@ fn collect_local_property_definitions(
                 scope,
                 property_range: fact.property_range,
                 aliases: Vec::new(),
+                receiver_owner_binding: this_alias_owner_binding(
+                    fact.receiver.root,
+                    source,
+                    lexical_bindings,
+                ),
             };
             definition.aliases = chained_assignment_aliases_for_local_property(
                 root,
@@ -783,6 +789,105 @@ fn enclosing_function_range(mut node: Node<'_>) -> Option<(usize, usize)> {
     }
 }
 
+/// The constructor/prototype binding whose `this` value a local alias names.
+///
+/// Both `Server = function () { const self = this; ... }` and a function in
+/// `Object.assign(Server.prototype, { open() { const self = this; ... } })`
+/// describe the same receiver family. The binding and prototype are read from
+/// tree-sitter fields; no source-text path parsing is involved.
+fn this_alias_owner_binding(
+    alias: Node<'_>,
+    source: &str,
+    lexical_bindings: &JsTsLexicalBindingIndex,
+) -> Option<String> {
+    let alias_name = simple_identifier_text(alias, source)?;
+    let alias_scope = lexical_bindings.binding_scope_at(alias_name, alias.start_byte())?;
+    let mut root = alias;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+
+    let mut binding = None;
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "variable_declarator"
+            && let (Some(name), Some(value)) = (
+                node.child_by_field_name("name"),
+                node.child_by_field_name("value"),
+            )
+            && simple_identifier_text(name, source) == Some(alias_name)
+            && value.kind() == "this"
+            && lexical_bindings.binding_scope_at(alias_name, name.start_byte()) == Some(alias_scope)
+        {
+            if binding.replace(node).is_some() {
+                return None;
+            }
+            continue;
+        }
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+
+    enclosing_function_node(binding?).and_then(|function| {
+        local_function_binding_name(function, source)
+            .map(str::to_string)
+            .or_else(|| object_assign_prototype_owner(function, source))
+    })
+}
+
+fn enclosing_function_node(mut node: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        if matches!(
+            node.kind(),
+            "arrow_function"
+                | "function_declaration"
+                | "function_expression"
+                | "generator_function"
+                | "generator_function_declaration"
+                | "method_definition"
+        ) {
+            return Some(node);
+        }
+        node = node.parent()?;
+    }
+}
+
+fn object_assign_prototype_owner(function: Node<'_>, source: &str) -> Option<String> {
+    let entry = function
+        .parent()
+        .filter(|parent| matches!(parent.kind(), "pair" | "object"))?;
+    let object = if entry.kind() == "object" {
+        entry
+    } else {
+        entry.parent().filter(|parent| parent.kind() == "object")?
+    };
+    let arguments = object
+        .parent()
+        .filter(|parent| parent.kind() == "arguments")?;
+    let call = arguments
+        .parent()
+        .filter(|parent| parent.kind() == "call_expression")?;
+    let callee = call.child_by_field_name("function")?;
+    let callee_receiver = static_member_receiver(callee, source)?;
+    if simple_identifier_text(callee_receiver.root, source) != Some("Object")
+        || callee_receiver.members.len() != 1
+        || slice(callee_receiver.members[0], source) != "assign"
+    {
+        return None;
+    }
+    let prototype = arguments.named_child(0)?;
+    let prototype_receiver = static_member_receiver(prototype, source)?;
+    if prototype_receiver.members.len() != 1
+        || slice(prototype_receiver.members[0], source) != "prototype"
+    {
+        return None;
+    }
+    simple_identifier_text(prototype_receiver.root, source).map(str::to_string)
+}
+
 fn local_property_read_matches(
     object: Node<'_>,
     property: Node<'_>,
@@ -797,6 +902,8 @@ fn local_property_read_matches(
         let direct = definition.receiver_root == receiver.receiver_root
             && definition.receiver_members == receiver.receiver_members
             && receiver.binding_scope == Some(definition.scope);
+        let definition_is_available = definition.property_range.end_byte <= property.start_byte()
+            || later_object_literal_definition_is_captured(object, &definition.property_range);
         let alias = definition.aliases.iter().any(|alias| {
             alias.receiver_root == receiver.receiver_root
                 && alias.receiver_members == receiver.receiver_members
@@ -805,7 +912,7 @@ fn local_property_read_matches(
                 && (alias.enclosing_function_range != receiver.enclosing_function_range
                     || definition.property_range.end_byte <= property.start_byte())
         });
-        direct && definition.property_range.end_byte <= property.start_byte() || alias
+        direct && definition_is_available || alias
     })
 }
 
@@ -1073,7 +1180,7 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             handle_identifier_candidate(node, ctx);
         }
         "member_expression" | "subscript_expression" => handle_member_expression(node, ctx),
-        "call_expression" => register_target_object_call_arguments(node, ctx),
+        "call_expression" | "new_expression" => register_target_object_call_arguments(node, ctx),
         "object" => handle_contextual_object_literal(node, ctx),
         "jsx_opening_element" | "jsx_self_closing_element" => handle_jsx_element(node, ctx),
         _ => {}
@@ -1641,8 +1748,111 @@ fn expression_carries_target_object(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
             .child_by_field_name("function")
             .and_then(|callee| simple_identifier_text(callee, ctx.source))
             .is_some_and(|callee| ctx.binds_target(callee)),
+        "member_expression" => local_member_expression_carries_target_object(node, ctx),
         _ => false,
     }
+}
+
+/// Whether a same-file member chain is the exact receiver on which the target
+/// property is declared. This lets a call such as `consume(self.options)`
+/// carry `self.options.timeout` into the callee parameter without treating an
+/// unrelated scope's same-spelled `self.options` as the same object.
+fn local_member_expression_carries_target_object(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    // Same-file local-property identity is established by the target's
+    // assignment. Do not let the broader target-object propagation route turn
+    // a read before that assignment into a usage; the direct read matcher
+    // applies the same ordering rule. Cross-file propagation has no comparable
+    // byte ordering and reaches this helper without local definitions.
+    if let Some(definitions) = ctx.local_property_definitions.as_deref()
+        && definitions
+            .iter()
+            .all(|definition| definition.property_range.end_byte > node.start_byte())
+        && !definitions.iter().any(|definition| {
+            later_object_literal_definition_is_captured(node, &definition.property_range)
+        })
+    {
+        return false;
+    }
+
+    if let Some((lexical_bindings, definitions)) = ctx
+        .lexical_bindings
+        .as_ref()
+        .zip(ctx.local_property_definitions.as_deref())
+        && let Some(receiver) = local_property_receiver_alias(node, ctx.source, lexical_bindings)
+        && definitions.iter().any(|definition| {
+            definition.receiver_root == receiver.receiver_root
+                && definition.receiver_members == receiver.receiver_members
+                && receiver.binding_scope == Some(definition.scope)
+        })
+    {
+        return true;
+    }
+
+    if let Some(receiver) = static_member_receiver(node, ctx.source)
+        && let Some(lexical_bindings) = ctx.lexical_bindings.as_ref()
+        && let Some(owner) = this_alias_owner_binding(receiver.root, ctx.source, lexical_bindings)
+        && ctx
+            .local_property_definitions
+            .as_deref()
+            .is_some_and(|definitions| {
+                definitions
+                    .iter()
+                    .any(|definition| definition.receiver_owner_binding.as_deref() == Some(&owner))
+            })
+    {
+        return true;
+    }
+
+    let Some(target_member) = ctx.target_member else {
+        return false;
+    };
+    matches!(
+        ctx.receiver_facts.resolve_member_targets(
+            node,
+            target_member,
+            node.start_byte(),
+            ReceiverAnalysisBudget::default(),
+        ),
+        ReceiverAnalysisOutcome::Precise(targets)
+            if targets.iter().any(|target| same_js_ts_target(target, ctx.target))
+    )
+}
+
+/// Whether a member read in a nested callable can capture an outer binding
+/// initialized by a later object literal. The callable cannot execute merely
+/// because its body appears earlier in source order; direct reads and later
+/// assignments in the same execution scope remain order-sensitive.
+fn later_object_literal_definition_is_captured(node: Node<'_>, range: &Range) -> bool {
+    let Some(function) = enclosing_function_scope(node) else {
+        return false;
+    };
+    if function.start_byte() <= range.start_byte && range.end_byte <= function.end_byte() {
+        return false;
+    }
+
+    let mut root = node;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    let Some(mut definition) = root.descendant_for_byte_range(range.start_byte, range.end_byte)
+    else {
+        return false;
+    };
+    while !matches!(
+        definition.kind(),
+        "pair" | "shorthand_property_identifier" | "method_definition"
+    ) {
+        let Some(parent) = definition.parent() else {
+            return false;
+        };
+        if matches!(parent.kind(), "assignment_expression" | "program") {
+            return false;
+        }
+        definition = parent;
+    }
+    definition
+        .parent()
+        .is_some_and(|parent| parent.kind() == "object")
 }
 
 fn expression_resolves_to_target_value(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
@@ -1739,7 +1949,12 @@ fn register_target_object_call_arguments(node: Node<'_>, ctx: &mut ScanCtx<'_>) 
     if ctx.target_property_receivers.is_empty() {
         return;
     }
-    let Some(callee) = node.child_by_field_name("function") else {
+    let callee_field = if node.kind() == "new_expression" {
+        "constructor"
+    } else {
+        "function"
+    };
+    let Some(callee) = node.child_by_field_name(callee_field) else {
         return;
     };
     let Some(target) = local_function_target_for_reference(callee, ctx) else {
@@ -1859,9 +2074,17 @@ fn local_function_binding_name<'a>(function: Node<'_>, source: &'a str) -> Optio
             .child_by_field_name("name")
             .and_then(|name| simple_identifier_text(name, source));
     }
-    let declarator = function
-        .parent()
-        .filter(|parent| parent.kind() == "variable_declarator")?;
+    let parent = function.parent()?;
+    if parent.kind() == "assignment_expression"
+        && parent
+            .child_by_field_name("right")
+            .is_some_and(|right| right.id() == function.id())
+    {
+        return parent
+            .child_by_field_name("left")
+            .and_then(|left| simple_identifier_text(left, source));
+    }
+    let declarator = (parent.kind() == "variable_declarator").then_some(parent)?;
     if declarator
         .child_by_field_name("value")
         .is_none_or(|value| value.id() != function.id())
@@ -2584,60 +2807,99 @@ fn member_object_match_status(
 }
 
 fn receiver_fact_match_status(node: Node<'_>, ctx: &ScanCtx<'_>) -> ReceiverMatchStatus {
-    let Some(owner) = ctx.target_owner else {
+    let Some(member) = ctx.target_member else {
         return ReceiverMatchStatus::Unproven;
     };
-    match ctx
-        .receiver_facts
-        .resolve_receiver_node(node, ReceiverAnalysisBudget::default())
-    {
-        ReceiverAnalysisOutcome::Precise(values) => {
-            if values
+    match ctx.receiver_facts.resolve_member_targets(
+        node,
+        member,
+        node.start_byte(),
+        ReceiverAnalysisBudget::default(),
+    ) {
+        ReceiverAnalysisOutcome::Precise(targets) => {
+            if targets
                 .iter()
-                .any(|value| receiver_value_matches_owner(value, owner))
+                .any(|target| same_js_ts_target(target, ctx.target))
             {
                 ReceiverMatchStatus::Proven
+            } else if let Some(status) = synthetic_factory_surface_match_status(node, ctx) {
+                status
             } else if node.kind() == "call_expression" {
                 ReceiverMatchStatus::Unproven
             } else {
                 ReceiverMatchStatus::NoMatch
             }
         }
-        ReceiverAnalysisOutcome::Ambiguous(values) => {
-            if values
+        ReceiverAnalysisOutcome::Ambiguous(targets) => {
+            if targets
                 .iter()
-                .any(|value| receiver_value_matches_owner(value, owner))
+                .any(|target| same_js_ts_target(target, ctx.target))
             {
                 ReceiverMatchStatus::Unproven
+            } else if let Some(status) = synthetic_factory_surface_match_status(node, ctx) {
+                status
             } else {
                 ReceiverMatchStatus::NoMatch
             }
         }
         ReceiverAnalysisOutcome::Unknown
         | ReceiverAnalysisOutcome::Unsupported { .. }
-        | ReceiverAnalysisOutcome::ExceededBudget { .. } => ReceiverMatchStatus::Unproven,
+        | ReceiverAnalysisOutcome::ExceededBudget { .. } => {
+            synthetic_factory_surface_match_status(node, ctx)
+                .unwrap_or(ReceiverMatchStatus::Unproven)
+        }
     }
 }
 
-fn receiver_value_matches_owner(mut value: &ReceiverValue, owner: &CodeUnit) -> bool {
-    loop {
+/// A TypeScript function's anonymous result shape is indexed under the
+/// function itself (`fetchLatest.sha`), while ordinary member lookup through
+/// its declared result type resolves the structural member
+/// (`LatestResult.sha`). Preserve the factory wrapper carried by receiver
+/// analysis so those two valid identities do not erase one another.
+fn synthetic_factory_surface_match_status(
+    node: Node<'_>,
+    ctx: &ScanCtx<'_>,
+) -> Option<ReceiverMatchStatus> {
+    if !ctx.target.is_synthetic() {
+        return None;
+    }
+    let target_factory = ctx.target.fq().parent()?;
+    let matches_factory = |mut value: &ReceiverValue| loop {
         match value {
             ReceiverValue::FactoryReturn {
                 factory,
                 value: returned,
             } => {
-                if factory.source() == owner.source() && factory.fq_name() == owner.fq_name() {
-                    return true;
+                if factory.source() == ctx.target.source() && factory.fq() == &target_factory {
+                    break true;
                 }
                 value = returned;
             }
-            _ => {
-                let resolved = value.owner();
-                return resolved.source() == owner.source()
-                    && resolved.fq_name() == owner.fq_name();
-            }
+            _ => break false,
         }
+    };
+    match ctx
+        .receiver_facts
+        .resolve_receiver_node(node, ReceiverAnalysisBudget::default())
+    {
+        ReceiverAnalysisOutcome::Precise(values) => Some(if values.iter().any(matches_factory) {
+            ReceiverMatchStatus::Proven
+        } else {
+            ReceiverMatchStatus::NoMatch
+        }),
+        ReceiverAnalysisOutcome::Ambiguous(values) => Some(if values.iter().any(matches_factory) {
+            ReceiverMatchStatus::Unproven
+        } else {
+            ReceiverMatchStatus::NoMatch
+        }),
+        ReceiverAnalysisOutcome::Unknown
+        | ReceiverAnalysisOutcome::Unsupported { .. }
+        | ReceiverAnalysisOutcome::ExceededBudget { .. } => None,
     }
+}
+
+fn same_js_ts_target(left: &CodeUnit, right: &CodeUnit) -> bool {
+    left.source() == right.source() && left.fq_name() == right.fq_name()
 }
 
 fn this_receiver_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
@@ -2908,13 +3170,12 @@ fn visit_commonjs_export_statement(node: Node<'_>, source: &str, index: &mut Exp
 
     match commonjs_export_target(left, source) {
         Some(CommonJsExportTarget::Named(exported_name)) => {
-            if let Some(local_name) = local_export_name(right, source)
+            let local_name = local_export_name(right, source)
                 .or_else(|| exported_function_name(right, &exported_name))
-            {
-                index
-                    .exports_by_name
-                    .insert(exported_name, ExportEntry::Local { local_name });
-            }
+                .unwrap_or_else(|| exported_name.clone());
+            index
+                .exports_by_name
+                .insert(exported_name, ExportEntry::Local { local_name });
         }
         Some(CommonJsExportTarget::ModuleExports) => {
             register_module_exports_assignment(right, source, index);

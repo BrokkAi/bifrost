@@ -56,19 +56,39 @@ import {
   runRqlQuery
 } from "./rql_query";
 import { RqlQueryResultsProvider } from "./rql_results";
-import type { PolicySourceLocation, RqlPolicyDocument, RqlPolicyResponse } from "./rql_policy";
+import type {
+  PolicySourceLocation,
+  PolicySuppressionAuthoringParams,
+  PolicySuppressionAuthoringResponse,
+  PolicySuppressionDestination,
+  RqlPolicyDocument,
+  RqlPolicyResponse
+} from "./rql_policy";
 import {
+  PREPARE_POLICY_SUPPRESSION_METHOD,
+  decodePolicySuppressionAuthoringResponse,
+  ExpectedPolicySuppressionWrite,
+  isPolicyFindingSuppressible,
+  isPolicySuppressionDestination,
+  normalizeSuppressionReason,
   PolicyRunTracker,
   policyLocationRange,
   policyReportCompletedWithoutFindings,
-  runRqlPolicy
+  runRqlPolicy,
+  utcEvaluationDate
 } from "./rql_policy";
-import type { PolicyDisplayStepTarget, PolicyFindingTarget } from "./rql_policy_results";
+import {
+  effectivePolicyFindingSourceVersion,
+  PolicyFindingItem,
+  type PolicyDisplayStepTarget,
+  type PolicyFindingTarget
+} from "./rql_policy_results";
 import { RqlPolicyResultsProvider } from "./rql_policy_results";
 import type { RuneIrRange, RuneIrResponse } from "./rune_ir";
 import { RUNE_IR_LANGUAGE_ID, RUNE_IR_SOURCE_LANGUAGE_IDS, showRuneIr } from "./rune_ir";
 import type { WireDiagnostic, WireHover } from "./rql_validation";
 import {
+  RQL_POLICY_LANGUAGE_ID,
   RqlValidationController,
   handleRqlServerClosed,
   hoverRequest,
@@ -89,6 +109,7 @@ let lastLaunchConfig: BifrostLaunchConfig | undefined;
 let startInFlight: Promise<void> | undefined;
 let pendingManagedBinaryPreparation: ManagedBinaryPreparation | undefined;
 let extensionActive = false;
+const expectedPolicySuppressionWrite = new ExpectedPolicySuppressionWrite();
 const BIFROST_GITIGNORE_DECLINED_KEY_PREFIX = "bifrost.legacyGitignoreMigrationDeclined:";
 
 export function activate(context: vscode.ExtensionContext): void {
@@ -125,6 +146,10 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("bifrost.stopServer", stopClient),
     vscode.commands.registerCommand("bifrost.restartServer", () => restartClient(context)),
     vscode.commands.registerCommand("bifrost.showOutput", () => outputChannel?.show(true)),
+    vscode.commands.registerCommand("bifrost.clearRqlPolicyResults", () => {
+      cancelActivePolicyRun();
+      rqlPolicyResults?.clear();
+    }),
     vscode.commands.registerCommand("bifrost.runRqlQuery", (resource?: vscode.Uri) =>
       runRqlQueryForEditor(resource)
     ),
@@ -140,6 +165,10 @@ export function activate(context: vscode.ExtensionContext): void {
       openRqlPolicyFinding(target)
     ),
     vscode.commands.registerCommand(
+      "bifrost.suppressRqlPolicyFinding",
+      (target: PolicyFindingTarget | PolicyFindingItem) => suppressRqlPolicyFinding(target)
+    ),
+    vscode.commands.registerCommand(
       "bifrost.openRqlPolicyDisplayStep",
       (target: PolicyDisplayStepTarget) => openRqlPolicyDisplayStep(target)
     ),
@@ -150,8 +179,18 @@ export function activate(context: vscode.ExtensionContext): void {
   const policyWorkspaceWatcher = vscode.workspace.createFileSystemWatcher(
     "**/*.{java,go,c,cc,cpp,cxx,h,hpp,hh,hxx,inc,js,mjs,cjs,jsx,ts,tsx,py,rs,php,scala,kt,kts,cs,rb,rql,rqlp,json,toml}"
   );
-  const markWorkspacePolicyResultsStale = (uri: vscode.Uri): void => {
+  const markWorkspacePolicyResultsStale = async (uri: vscode.Uri): Promise<void> => {
     if (!isGeneratedWorkspacePath(uri)) {
+      if (expectedPolicySuppressionWrite.isPending(uri.toString())) {
+        try {
+          const content = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString("utf8");
+          if (expectedPolicySuppressionWrite.observe(uri.toString(), content)) {
+            return;
+          }
+        } catch {
+          expectedPolicySuppressionWrite.clear(uri.toString());
+        }
+      }
       markPolicyResultsStale("workspace changed");
     }
   };
@@ -310,7 +349,8 @@ async function runRqlPolicyForEditor(resource?: vscode.Uri): Promise<void> {
     ? {
         languageId: document.languageId,
         uri: document.uri.toString(),
-        text: document.getText()
+        text: document.getText(),
+        version: document.version
       }
     : undefined;
   const currentClient = client;
@@ -365,7 +405,7 @@ async function runRqlPolicyForEditor(resource?: vscode.Uri): Promise<void> {
   if (!publication.publish) {
     return;
   }
-  rqlPolicyResults.update(response);
+  rqlPolicyResults.update(response, policyDocument);
   if (publication.staleReason) {
     rqlPolicyResults.markStale(publication.staleReason);
   }
@@ -414,6 +454,327 @@ async function openRqlQueryResult(
 
 async function openRqlPolicyFinding(target: PolicyFindingTarget): Promise<void> {
   return openRqlPolicyLocation(target.reportRootUri, target.finding.primary);
+}
+
+async function suppressRqlPolicyFinding(
+  target: PolicyFindingTarget | PolicyFindingItem
+): Promise<void> {
+  const normalizedTarget: PolicyFindingTarget =
+    target instanceof PolicyFindingItem
+      ? {
+          reportRootUri: target.reportRootUri,
+          finding: target.finding,
+          policyDocument: target.policyDocument,
+          resultGeneration: target.resultGeneration,
+          sourceVersion: target.sourceVersion
+        }
+      : target;
+  if (
+    !isPolicyFindingSuppressible(normalizedTarget.finding) ||
+    !rqlPolicyResults?.canSuppress(normalizedTarget.finding, normalizedTarget.resultGeneration)
+  ) {
+    void vscode.window.showWarningMessage(
+      "This policy finding is stale, already suppressed, or does not have a strong identity."
+    );
+    return;
+  }
+  const sourceVersion = effectivePolicyFindingSourceVersion(
+    normalizedTarget.reportRootUri,
+    normalizedTarget.finding,
+    normalizedTarget.sourceVersion
+  );
+  if (!client || client.state !== State.Running) {
+    void vscode.window.showWarningMessage(
+      "Bifrost is not ready. Start the language server before authoring a suppression."
+    );
+    return;
+  }
+
+  const destination = await choosePolicySuppressionDestination();
+  if (!destination) {
+    return;
+  }
+  const reasonInput = await vscode.window.showInputBox({
+    title: "Suppress Bifrost policy finding",
+    prompt: "Reason (optional)",
+    placeHolder: 'Leave blank to use "unspecified"',
+    ignoreFocusOut: true
+  });
+  if (reasonInput === undefined) {
+    return;
+  }
+  const workspaceRoot = vscode.Uri.parse(normalizedTarget.reportRootUri);
+  const requireReason = vscode.workspace
+    .getConfiguration("bifrost", workspaceRoot)
+    .get<boolean>("requireSuppressionReason", false);
+  const reason = normalizeSuppressionReason(reasonInput, requireReason);
+  if (!reason) {
+    void vscode.window.showErrorMessage(
+      "A suppression reason is required by the bifrost.requireSuppressionReason setting."
+    );
+    return;
+  }
+
+  const policyDocument = normalizedTarget.policyDocument ?? currentPolicyDocument();
+  if (!policyDocument) {
+    void vscode.window.showWarningMessage(
+      "Open the RQL policy document that produced this finding before suppressing it."
+    );
+    return;
+  }
+  const params: PolicySuppressionAuthoringParams = {
+    reportRootUri: normalizedTarget.reportRootUri,
+    policyDocumentUri: policyDocument.uri,
+    policyDocumentVersion: policyDocument.version,
+    finding: {
+      policyId: normalizedTarget.finding.policy_id,
+      findingId: normalizedTarget.finding.id,
+      path: normalizedTarget.finding.primary.path,
+      identityStability: "strong",
+      policyHash: normalizedTarget.finding.policy_hash,
+      sourceUri: sourceUriForFinding(normalizedTarget.reportRootUri, normalizedTarget.finding),
+      sourceVersion
+    },
+    destination,
+    evaluationDate: utcEvaluationDate(),
+    reason
+  };
+
+  let rawResponse: unknown;
+  try {
+    rawResponse = await client.sendRequest<unknown>(PREPARE_POLICY_SUPPRESSION_METHOD, params);
+  } catch (error) {
+    void vscode.window.showErrorMessage(
+      `Bifrost could not prepare the suppression: ${formatError(error)}`
+    );
+    return;
+  }
+  const response = decodePolicySuppressionAuthoringResponse(rawResponse);
+  if (!response) {
+    void vscode.window.showErrorMessage("Bifrost returned an invalid suppression edit.");
+    return;
+  }
+  if (!(await applyPreparedPolicySuppression(response))) {
+    return;
+  }
+
+  const rerunUri = policyDocument.uri ? vscode.Uri.parse(policyDocument.uri) : undefined;
+  await runRqlPolicyForEditor(rerunUri);
+}
+
+async function choosePolicySuppressionDestination(): Promise<
+  PolicySuppressionDestination | undefined
+> {
+  const choice = await vscode.window.showQuickPick(
+    [
+      {
+        label: "Public (.bifrost/suppressions.json)",
+        description: "Share this suppression with the project.",
+        destination: "public" as const
+      },
+      {
+        label: "Private (.bifrost/suppressions.private.json)",
+        description: "Keep this suppression out of the public project file.",
+        destination: "private" as const
+      },
+      {
+        label: "Local (.bifrost/suppressions.local.json)",
+        description: "Keep this suppression local to your checkout.",
+        destination: "local" as const
+      }
+    ],
+    {
+      title: "Choose suppression destination",
+      placeHolder: "Public suppression file"
+    }
+  );
+  return choice && isPolicySuppressionDestination(choice.destination)
+    ? choice.destination
+    : undefined;
+}
+
+function currentPolicyDocument(): RqlPolicyDocument | undefined {
+  const document = vscode.window.activeTextEditor?.document;
+  return document && document.languageId === RQL_POLICY_LANGUAGE_ID
+    ? {
+        languageId: document.languageId,
+        uri: document.uri.toString(),
+        text: document.getText(),
+        version: document.version
+      }
+    : undefined;
+}
+
+function sourceUriForFinding(
+  reportRootUri: string,
+  finding: PolicyFindingTarget["finding"]
+): string {
+  return vscode.Uri.joinPath(vscode.Uri.parse(reportRootUri), finding.primary.path).toString();
+}
+
+async function applyPreparedPolicySuppression(
+  response: PolicySuppressionAuthoringResponse
+): Promise<boolean> {
+  const uri = vscode.Uri.parse(response.documentUri);
+  let document: vscode.TextDocument | undefined;
+  if (response.create) {
+    try {
+      await vscode.workspace.fs.stat(uri);
+      void vscode.window.showWarningMessage(
+        "The suppression destination was created after the request. Reload the finding and retry."
+      );
+      return false;
+    } catch (error) {
+      if (!(error instanceof vscode.FileSystemError) || error.code !== "FileNotFound") {
+        void vscode.window.showErrorMessage(
+          `Bifrost could not inspect the suppression destination: ${formatError(error)}`
+        );
+        return false;
+      }
+      // A missing destination is expected for a create response.
+    }
+  } else {
+    try {
+      document = await vscode.workspace.openTextDocument(uri);
+    } catch (error) {
+      void vscode.window.showErrorMessage(
+        `Bifrost could not open the suppression file: ${formatError(error)}`
+      );
+      return false;
+    }
+    if (response.expectedVersion !== null && document.version !== response.expectedVersion) {
+      void vscode.window.showWarningMessage(
+        "The suppression file changed while the edit was being prepared. Reload the finding and retry."
+      );
+      return false;
+    }
+    if (
+      response.expectedText !== undefined &&
+      response.expectedText !== null &&
+      document.getText() !== response.expectedText
+    ) {
+      void vscode.window.showWarningMessage(
+        "The suppression file changed while the edit was being prepared. Reload the finding and retry."
+      );
+      return false;
+    }
+  }
+
+  if (!(await verifyPolicySuppressionSourcePreconditions(response))) {
+    return false;
+  }
+  if (response.create) {
+    const parent = vscode.Uri.joinPath(uri, "..");
+    try {
+      await vscode.workspace.fs.stat(parent);
+    } catch (error) {
+      if (!(error instanceof vscode.FileSystemError) || error.code !== "FileNotFound") {
+        void vscode.window.showErrorMessage(
+          `Bifrost could not inspect the suppression directory: ${formatError(error)}`
+        );
+        return false;
+      }
+      try {
+        await vscode.workspace.fs.createDirectory(parent);
+      } catch (createError) {
+        void vscode.window.showErrorMessage(
+          `Bifrost could not create the suppression directory: ${formatError(createError)}`
+        );
+        return false;
+      }
+    }
+    // Directory creation is the only setup write before the WorkspaceEdit;
+    // verify the complete source snapshot again after that setup.
+    if (!(await verifyPolicySuppressionSourcePreconditions(response))) {
+      return false;
+    }
+  }
+
+  expectedPolicySuppressionWrite.expect(uri.toString(), response.content);
+  const edit = new vscode.WorkspaceEdit();
+  if (response.create) {
+    edit.createFile(uri, { ignoreIfExists: false });
+    edit.insert(uri, new vscode.Position(0, 0), response.content);
+  } else {
+    if (!document) {
+      return false;
+    }
+    edit.replace(
+      uri,
+      new vscode.Range(new vscode.Position(0, 0), document.positionAt(document.getText().length)),
+      response.content
+    );
+  }
+  if (!(await vscode.workspace.applyEdit(edit))) {
+    expectedPolicySuppressionWrite.clear(uri.toString());
+    void vscode.window.showErrorMessage("VS Code could not apply the prepared suppression edit.");
+    return false;
+  }
+  const saved = await vscode.workspace.openTextDocument(uri);
+  if (!(await saved.save())) {
+    expectedPolicySuppressionWrite.clear(uri.toString());
+    void vscode.window.showErrorMessage("VS Code could not save the suppression document.");
+    return false;
+  }
+  return true;
+}
+
+async function verifyPolicySuppressionSourcePreconditions(
+  response: PolicySuppressionAuthoringResponse
+): Promise<boolean> {
+  for (const source of response.sourcePreconditions) {
+    const uri = vscode.Uri.parse(source.uri);
+    let exists: boolean;
+    try {
+      await vscode.workspace.fs.stat(uri);
+      exists = true;
+    } catch (error) {
+      if (error instanceof vscode.FileSystemError && error.code === "FileNotFound") {
+        exists = false;
+      } else {
+        void vscode.window.showErrorMessage(
+          `Bifrost could not inspect suppression source ${source.path}: ${formatError(error)}`
+        );
+        return false;
+      }
+    }
+    if (exists !== source.exists) {
+      void vscode.window.showWarningMessage(
+        `A suppression source changed after preparation (${source.path} appeared or disappeared). Reload the finding and retry.`
+      );
+      return false;
+    }
+    if (!exists) {
+      continue;
+    }
+
+    let document: vscode.TextDocument;
+    try {
+      document = await vscode.workspace.openTextDocument(uri);
+    } catch (error) {
+      void vscode.window.showErrorMessage(
+        `Bifrost could not read suppression source ${source.path}: ${formatError(error)}`
+      );
+      return false;
+    }
+    if (source.expectedVersion !== null && document.version !== source.expectedVersion) {
+      void vscode.window.showWarningMessage(
+        `A suppression source changed after preparation (${source.path} has a newer document version). Reload the finding and retry.`
+      );
+      return false;
+    }
+    if (
+      source.expectedText !== undefined &&
+      source.expectedText !== null &&
+      document.getText() !== source.expectedText
+    ) {
+      void vscode.window.showWarningMessage(
+        `A suppression source changed after preparation (${source.path} contents differ). Reload the finding and retry.`
+      );
+      return false;
+    }
+  }
+  return true;
 }
 
 async function openRqlPolicyDisplayStep(target: PolicyDisplayStepTarget): Promise<void> {

@@ -84,6 +84,8 @@ pub const RUST_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("boolean_literal", NormalizedKind::BooleanLiteral),
     ("return_expression", NormalizedKind::Return),
     ("if_expression", NormalizedKind::If),
+    ("array_expression", NormalizedKind::CollectionLiteral),
+    ("tuple_expression", NormalizedKind::CollectionLiteral),
     ("for_expression", NormalizedKind::ForLoop),
     ("while_expression", NormalizedKind::WhileLoop),
     ("loop_expression", NormalizedKind::Loop),
@@ -654,6 +656,35 @@ impl StructuralSpec for RustStructuralSpec {
                 Some(name) => sink.set_name(name),
                 None => sink.set_name(node),
             },
+            NormalizedKind::ForLoop => {
+                if let Some(value) = node.child_by_field_name("value") {
+                    attach_role_with_derived_name(
+                        sink,
+                        Role::Iterable,
+                        value,
+                        expression_name_node,
+                    );
+                }
+            }
+            NormalizedKind::CollectionLiteral => {
+                // `[x; n]` repeat syntax spells a length operand, not an
+                // element list, and its run-time size can be anything, so it
+                // deliberately gets no element edges: with zero `elements`
+                // edges it can never satisfy an at-least-one-element arity
+                // bound, which is how the origin-shape assert asks.
+                if node.child_by_field_name("length").is_some() {
+                    return;
+                }
+                for index in 0..node.named_child_count() {
+                    let Some(child) = node.named_child(index) else {
+                        continue;
+                    };
+                    if matches!(child.kind(), "line_comment" | "block_comment") {
+                        continue;
+                    }
+                    attach_role_with_derived_name(sink, Role::Element, child, expression_name_node);
+                }
+            }
             _ => {}
         }
     }

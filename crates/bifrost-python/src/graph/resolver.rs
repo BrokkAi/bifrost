@@ -12,7 +12,9 @@ use crate::syntax::{
     python_deferred_annotation_identifier_ranges, python_deferred_annotation_tree,
     python_node_is_in_annotation,
 };
-use crate::usage_index::usage_seeds;
+use crate::usage_index::{
+    ModuleBindingEventKind, ModuleBindingTimeline, usage_resolve_module_files, usage_seeds,
+};
 use brokk_bifrost_core::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
 use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
 use brokk_bifrost_core::analyzer::usages::model::{ExportEntry, ImportBinder, ImportKind};
@@ -165,8 +167,19 @@ pub fn resolve_receiver_type(
     target_self_file: bool,
 ) -> Option<CodeUnit> {
     let raw_type = raw_type.trim();
-    if raw_type.is_empty() || raw_type.contains('.') || raw_type.contains('|') {
+    if raw_type.is_empty() || raw_type.contains('|') {
         return None;
+    }
+    if raw_type.contains('.') {
+        let candidates = resolve_fqn_candidates(python, raw_type, |name| {
+            graph.index.definitions(name).collect()
+        })
+        .into_iter()
+        .filter(CodeUnit::is_class)
+        .collect::<Vec<_>>();
+        return (candidates.len() == 1)
+            .then(|| candidates.into_iter().next())
+            .flatten();
     }
 
     if let Some(binding) = python.import_binder_of(file).bindings.get(raw_type)
@@ -234,8 +247,13 @@ fn resolve_bare_annotation_symbol(
         && let Some(imported) = binding.imported_name.as_ref()
     {
         let fqn = format!("{}.{}", binding.module_specifier, imported);
-        let mut imported_candidates =
-            resolve_fqn_candidates(python, &fqn, |name| graph.index.definitions(name).collect());
+        let mut imported_candidates = resolve_fqn_candidates(python, &fqn, |name| {
+            graph
+                .index
+                .definitions(name)
+                .filter(|candidate| candidate.source().language() == Language::Python)
+                .collect()
+        });
         imported_candidates.retain(|candidate| {
             !candidate.is_module() || candidate.fq_name() != binding.module_specifier
         });
@@ -277,7 +295,7 @@ pub fn annotation_reference_candidates(
     node: Node<'_>,
     target_self_file: bool,
 ) -> Option<Vec<CodeUnit>> {
-    if !is_annotation_reference_node(node) {
+    if !is_annotation_reference_node(node, source) {
         return None;
     }
 
@@ -352,7 +370,7 @@ pub fn annotation_reference_candidates_at_focus(
     focus_end: usize,
     target_self_file: bool,
 ) -> Option<Vec<CodeUnit>> {
-    if !is_annotation_reference_node(node) {
+    if !is_annotation_reference_node(node, source) {
         return None;
     }
 
@@ -474,7 +492,10 @@ pub fn annotation_class_qualifier_site<'tree>(
     node: Node<'tree>,
     target: &CodeUnit,
 ) -> Option<Node<'tree>> {
-    if node.kind() != "attribute" || !target.is_class() || !is_annotation_reference_node(node) {
+    if node.kind() != "attribute"
+        || !target.is_class()
+        || !is_annotation_reference_node(node, source)
+    {
         return None;
     }
 
@@ -689,11 +710,150 @@ fn structural_annotation_owner_class(
     None
 }
 
-fn is_annotation_reference_node(node: Node<'_>) -> bool {
+fn is_annotation_reference_node(node: Node<'_>, source: &str) -> bool {
     if !matches!(node.kind(), "identifier" | "attribute" | "string_content") {
         return false;
     }
-    python_node_is_in_annotation(node)
+    if !python_node_is_in_annotation(node) {
+        return false;
+    }
+
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "call"
+            && parent
+                .child_by_field_name("arguments")
+                .is_some_and(|arguments| {
+                    arguments.start_byte() <= node.start_byte()
+                        && node.end_byte() <= arguments.end_byte()
+                })
+        {
+            return false;
+        }
+        if parent.kind() == "subscript"
+            && let Some(value) = parent.child_by_field_name("value")
+            && value.kind() == "identifier"
+        {
+            match node_text(value, source) {
+                // Literal parameters are values, including invalid values a
+                // type checker will diagnose. They are still ordinary Python
+                // references for definition and usage resolution.
+                "Literal" => return false,
+                // Only Annotated's first parameter is a type. Every following
+                // metadata expression is evaluated as a value.
+                "Annotated" => {
+                    let Some(arguments) = parent.child_by_field_name("subscript") else {
+                        return false;
+                    };
+                    let type_argument = if arguments.kind() == "expression_list" {
+                        arguments.named_child(0)
+                    } else {
+                        Some(arguments)
+                    };
+                    if !type_argument.is_some_and(|argument| {
+                        argument.start_byte() <= node.start_byte()
+                            && node.end_byte() <= argument.end_byte()
+                    }) {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if parent.kind() == "type_parameter"
+            && let Some(generic) = parent
+                .parent()
+                .filter(|parent| parent.kind() == "generic_type")
+        {
+            let generic_name = generic
+                .child_by_field_name("name")
+                .or_else(|| generic.named_child(0))
+                .map(|name| node_text(name, source));
+            match generic_name {
+                Some("Literal") => return false,
+                Some("Annotated") => {
+                    let type_argument = parent.named_child(0);
+                    if !type_argument.is_some_and(|argument| {
+                        argument.start_byte() <= node.start_byte()
+                            && node.end_byte() <= argument.end_byte()
+                    }) {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+        current = parent;
+    }
+    true
+}
+
+/// Resolve every visible named-import binding for one local symbol.
+///
+/// The ordinary import binder intentionally stores one effective binding per
+/// local name. A conditional `if TYPE_CHECKING: from .m import T; else: from m
+/// import T` has two possible bindings, however, and usage resolution must keep
+/// every workspace candidate rather than whichever arm the binder visited
+/// last.
+pub fn resolve_visible_named_import_candidates(
+    graph: &PythonGraphSource<'_>,
+    python: &dyn PythonUsageSource,
+    file: &ProjectFile,
+    timeline: &ModuleBindingTimeline,
+    local: &str,
+    cutoff: usize,
+) -> Vec<CodeUnit> {
+    let Some(events) = timeline.get(local) else {
+        return Vec::new();
+    };
+    let visible: Vec<_> = events
+        .iter()
+        .filter(|event| event.visible_from <= cutoff)
+        .collect();
+    let start = visible
+        .iter()
+        .rposition(|event| !event.conditional)
+        .unwrap_or(0);
+    let mut candidates = Vec::new();
+    for event in &visible[start..] {
+        let ModuleBindingEventKind::FromImport {
+            module,
+            imported_name,
+        } = &event.kind
+        else {
+            continue;
+        };
+        let mut resolved_module = false;
+        for module_file in usage_resolve_module_files(python, file, module) {
+            let Some(module_fqn) = graph
+                .index
+                .declarations(&module_file)
+                .into_iter()
+                .find(CodeUnit::is_module)
+                .map(|unit| unit.fq_name())
+            else {
+                continue;
+            };
+            resolved_module = true;
+            let fqn = format!("{module_fqn}.{imported_name}");
+            candidates.extend(resolve_fqn_candidates(python, &fqn, |name| {
+                graph.index.definitions(name).collect()
+            }));
+        }
+        if !resolved_module {
+            let fqn = if module.ends_with('.') {
+                format!("{module}{imported_name}")
+            } else {
+                format!("{module}.{imported_name}")
+            };
+            candidates.extend(resolve_fqn_candidates(python, &fqn, |name| {
+                graph.index.definitions(name).collect()
+            }));
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    candidates
 }
 
 /// Resolve the class constructed by a Python call callee without interpreting
@@ -891,7 +1051,12 @@ fn relational_definitions(
     query: RelationalDefinitionQuery,
 ) -> Vec<CodeUnit> {
     let question = RelationalDefinitionQuestion {
-        language_scope: DefinitionLanguageScope::Workspace,
+        // Python's graph owns Python declarations. Cross-language interop is
+        // an explicit exact-FQN decision in the dispatching definition layer;
+        // a workspace-wide normalized/simple-name query here would let an
+        // unresolved Python annotation borrow an unrelated declaration from
+        // another language.
+        language_scope: DefinitionLanguageScope::Language(Language::Python),
         name,
         query,
     };

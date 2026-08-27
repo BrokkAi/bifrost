@@ -1632,6 +1632,26 @@ impl StructuredTypeIdentity {
         Some(self)
     }
 
+    /// Consumes a generic identity with exactly one argument and selects that
+    /// argument without cloning the arena.
+    ///
+    /// The identity itself does not claim that a one-argument generic is a
+    /// collection. Language-specific callers make that semantic decision; this
+    /// operation only provides the bounded structural projection.
+    pub fn into_single_generic_argument_with(
+        mut self,
+        mut visit: impl FnMut() -> bool,
+    ) -> Option<Self> {
+        if !visit() {
+            return None;
+        }
+        self.root = match self.node(self.root)? {
+            StructuredTypeNode::Generic { arguments, .. } if arguments.len() == 1 => arguments[0],
+            _ => return None,
+        };
+        Some(self)
+    }
+
     /// Consumes a map identity and selects its key node without cloning the
     /// arena.
     pub fn into_map_key_with(mut self, mut visit: impl FnMut() -> bool) -> Option<Self> {

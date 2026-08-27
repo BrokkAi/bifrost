@@ -1,0 +1,10 @@
+Rust standard-library rustdoc JSON
+
+The generated declaration data is derived from the official Rust
+`rust-docs-json-preview` component for `nightly-2026-08-24`, rustc
+`1.100.0-nightly (fb6531d55 2026-08-23)`. Rust is dual-licensed under the
+Apache License, Version 2.0 and the MIT License.
+
+Project: https://www.rust-lang.org/
+Source archive: https://static.rust-lang.org/dist/2026-08-24/rust-docs-json-nightly-x86_64-unknown-linux-gnu.tar.xz
+License: https://github.com/rust-lang/rust/blob/fb6531d550e0075b9eb9a51464f404805eec87d9/LICENSE-APACHE

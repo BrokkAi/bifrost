@@ -438,6 +438,11 @@ impl StructuralSpec for ScalaStructuralSpec {
     /// Scala has not learned occurrence-role classification yet (#1473).
     /// The empty table is the honest answer: queries and assertions that ask
     /// for an occurrence role here report incomplete rather than clean-empty.
+    fn supports_role(&self, role: Role) -> bool {
+        // #2647: not yet extracted by this adapter.
+        !matches!(role, Role::Iterable | Role::Element)
+    }
+
     fn occurrence_role_support(&self) -> &OccurrenceRoleSupport {
         &NO_OCCURRENCE_ROLE_SUPPORT
     }

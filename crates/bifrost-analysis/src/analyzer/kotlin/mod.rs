@@ -514,6 +514,15 @@ impl KotlinSource for KotlinAnalyzer {
 use crate::analyzer::CodeUnitIndex;
 
 impl CodeUnitIndex for KotlinAnalyzer {
+    /// Forwarded so the request-scoped memo on the inner analyzer answers
+    /// (#2679); the trait default would rebuild uncached per call.
+    fn class_range_index(
+        &self,
+        file: &ProjectFile,
+    ) -> std::sync::Arc<brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex> {
+        self.inner.class_range_index(file)
+    }
+
     fn enclosing_code_unit(
         &self,
         file: &ProjectFile,
@@ -712,18 +721,6 @@ impl IAnalyzer for KotlinAnalyzer {
 
     fn record_query_failure(&self, error: crate::analyzer::store::StoreError) {
         self.inner.record_query_failure(error);
-    }
-
-    fn begin_streaming_file_read(&self, file: &ProjectFile) {
-        self.inner.begin_streaming_file_read(file);
-    }
-
-    fn end_streaming_file_read(&self, file: &ProjectFile) {
-        self.inner.end_streaming_file_read(file);
-    }
-
-    fn release_streaming_readers(&self) {
-        self.inner.release_streaming_readers();
     }
 
     fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {

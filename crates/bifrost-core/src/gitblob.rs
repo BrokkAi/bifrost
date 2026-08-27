@@ -54,7 +54,7 @@ pub fn primary_repo_root(repo: &Repository) -> Option<PathBuf> {
     repo.workdir().map(Path::to_path_buf)
 }
 
-/// Resolve the unified cache database path under `.bifrost/cache` at the primary
+/// Resolve the generated cache directory under `.bifrost/cache` at the primary
 /// repo root. Non-git roots fall back to the provided workspace root.
 ///
 /// This is the single cache-location contract, and every entry point resolves
@@ -73,24 +73,21 @@ pub fn primary_repo_root(repo: &Repository) -> Option<PathBuf> {
 /// directory, at the cost of per-root divergence and cross-repository writer
 /// contention; version-keyed naming applies inside either override too.
 ///
-/// The file name carries the schema version this build reads
-/// (`crate::cache_db::cache_db_file_name`), so checkouts at different versions
-/// share the directory without sharing a file (issue #1589).
-pub fn cache_db_path(workspace_root: &Path) -> PathBuf {
-    cache_db_path_with_overrides(
+pub fn cache_dir_path(workspace_root: &Path) -> PathBuf {
+    cache_dir_path_with_overrides(
         workspace_root,
         std::env::var_os(CACHE_DIR_ENV).filter(|value| !value.is_empty()),
         std::env::var_os(CACHE_ROOT_ENV).filter(|value| !value.is_empty()),
     )
 }
 
-fn cache_db_path_with_overrides(
+fn cache_dir_path_with_overrides(
     workspace_root: &Path,
     cache_dir: Option<std::ffi::OsString>,
     cache_root: Option<std::ffi::OsString>,
 ) -> PathBuf {
     if let Some(cache_dir) = cache_dir {
-        return PathBuf::from(cache_dir).join(crate::cache_db::cache_db_file_name());
+        return PathBuf::from(cache_dir);
     }
     let primary_root = discover(workspace_root)
         .as_ref()
@@ -98,13 +95,27 @@ fn cache_db_path_with_overrides(
         .unwrap_or_else(|| workspace_root.to_path_buf());
     if let Some(cache_root) = cache_root {
         let canonical_primary = primary_root.canonicalize().unwrap_or(primary_root);
-        return PathBuf::from(cache_root)
-            .join(cache_repository_key(&canonical_primary))
-            .join(crate::cache_db::cache_db_file_name());
+        return PathBuf::from(cache_root).join(cache_repository_key(&canonical_primary));
     }
-    primary_root
-        .join(PROJECT_DIR_NAME)
-        .join(CACHE_SUBDIR_NAME)
+    primary_root.join(PROJECT_DIR_NAME).join(CACHE_SUBDIR_NAME)
+}
+
+/// Resolve the unified cache database path through [`cache_dir_path`].
+///
+/// The file name carries the schema version this build reads
+/// (`crate::cache_db::cache_db_file_name`), so checkouts at different versions
+/// share the directory without sharing a file (issue #1589).
+pub fn cache_db_path(workspace_root: &Path) -> PathBuf {
+    cache_dir_path(workspace_root).join(crate::cache_db::cache_db_file_name())
+}
+
+#[cfg(test)]
+fn cache_db_path_with_overrides(
+    workspace_root: &Path,
+    cache_dir: Option<std::ffi::OsString>,
+    cache_root: Option<std::ffi::OsString>,
+) -> PathBuf {
+    cache_dir_path_with_overrides(workspace_root, cache_dir, cache_root)
         .join(crate::cache_db::cache_db_file_name())
 }
 
@@ -131,6 +142,22 @@ fn cache_repository_key(primary_root: &Path) -> String {
     );
     let digest = lower_hex_string(&digest);
     format!("{readable}-{}", &digest[..16])
+}
+
+/// Stable machine-local identity of one bound workspace root.
+///
+/// A cache database is shared by linked worktrees, so workspace-derived rows
+/// need the bound root in their identity even though blob-derived rows do not.
+/// Hash the canonical platform path bytes rather than storing an absolute path
+/// or requiring it to be Unicode.
+pub fn workspace_cache_identity(workspace_root: &Path) -> String {
+    let canonical = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    lower_hex_string(&hash_domain_bytes(
+        b"bifrost-cache-workspace-root-v1",
+        &platform_path_bytes(&canonical),
+    ))
 }
 
 #[cfg(unix)]
@@ -1147,6 +1174,14 @@ mod tests {
         assert_eq!(first_cache, linked_cache);
         assert_ne!(first_cache, second_cache);
         assert_eq!(
+            cache_dir_path_with_overrides(
+                &first_root,
+                None,
+                Some(cache_root.as_os_str().to_owned()),
+            ),
+            first_cache.parent().unwrap()
+        );
+        assert_eq!(
             first_cache.parent().and_then(Path::parent),
             Some(cache_root.as_path())
         );
@@ -1176,6 +1211,14 @@ mod tests {
                 Some(root.as_os_str().to_owned()),
             ),
             exact.join(crate::cache_db::cache_db_file_name())
+        );
+        assert_eq!(
+            cache_dir_path_with_overrides(
+                &workspace,
+                Some(exact.as_os_str().to_owned()),
+                Some(root.as_os_str().to_owned()),
+            ),
+            exact
         );
     }
 

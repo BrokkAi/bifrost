@@ -3,7 +3,7 @@ title: TypeScript
 description: Query TypeScript declarations, callable refinements, decorators, and TSX with query_code.
 ---
 
-> Last verified end to end: 2026-07-14 (`query_code` schema version 1).
+> Last verified end to end: 2026-08-26 (`query_code` schema version 1).
 
 For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](../reference-traversal/). For bounded allocation/factory provenance, ambiguity, exact member targets, and call-input composition, see [Receiver Traversal](../receiver-traversal/).
 
@@ -40,12 +40,34 @@ class Service extends BaseService {
 }
 
 export const service = new Service();
+
+function Input(_target: object, _key: string, _index: number) {}
+
+class Controller {
+  handle(@Input value: string): string {
+    return value;
+  }
+}
 ```
 
 <!-- code-query-fixture:typescript/view.tsx -->
 ```tsx
 export const View = () => (
   <button onClick={() => service.save("tsx")}>Save</button>
+);
+```
+
+<!-- code-query-fixture:typescript/jsx-structure.tsx -->
+```tsx
+const props = { title: "Save" };
+const dynamicKey = "tone";
+const html = "safe";
+const config = { __html: html, [dynamicKey]: "warm", ...props };
+
+export const StructuredView = () => (
+  <div {...props} dangerouslySetInnerHTML={config}>
+    <span>{html}</span>
+  </div>
 );
 ```
 
@@ -158,6 +180,48 @@ A type alias is a normalized `declaration`; interfaces, enums, and abstract clas
 }
 ```
 
+## Select A Decorated Parameter
+
+Parameters are file-backed declarations with their own exact source ranges. A `decorators` constraint selects the parameter through its structural decorator edge instead of matching decorator text.
+
+<!-- code-query-case:decorated-parameter:rql -->
+```lisp
+(language typescript
+  (parameter :name "value"
+    :decorators [(decorator :name "Input")]))
+```
+
+<!-- code-query-case:decorated-parameter:json -->
+```json
+{
+  "languages": ["typescript"],
+  "match": {
+    "kind": "parameter",
+    "name": "value",
+    "decorators": [{"kind": "decorator", "name": "Input"}]
+  }
+}
+```
+
+<!-- code-query-case:decorated-parameter:expected -->
+```json
+{
+  "results": [
+    {
+      "result_type": "structural_match",
+      "path": "typescript/service.ts",
+      "language": "typescript",
+      "kind": "parameter",
+      "start_line": 32,
+      "end_line": 32,
+      "text": "@Input value: string",
+      "enclosing_symbol": "Controller.handle"
+    }
+  ],
+  "truncated": false
+}
+```
+
 ## Scope A Query To TSX
 
 The TypeScript language filter includes `.tsx`; `where` narrows this call to the TSX fixture and excludes the `new Service()` call in the `.ts` file.
@@ -197,6 +261,167 @@ The TypeScript language filter includes `.tsx`; `where` narrows this call to the
       "text": "service.save(\"tsx\")",
       "captures": [{"name":"value","text":"\"tsx\"","start_line":2}],
       "enclosing_symbol": "View"
+    }
+  ],
+  "truncated": false
+}
+```
+
+## Query JSX And Object Structure
+
+JSX elements, named and spread attributes, and their exact value operands are
+structural facts. Tag, attribute, child, and value roles compose without
+parsing source text.
+
+<!-- code-query-case:jsx-structure:rql -->
+```lisp
+(language typescript
+  (jsx_element
+    :tag "div"
+    :attributes [
+      (jsx_spread_attribute :value "props")
+      (jsx_attribute :name "dangerouslySetInnerHTML" :value "config")
+    ]
+    :children [(jsx_element :tag "span")]))
+```
+
+<!-- code-query-case:jsx-structure:json -->
+```json
+{
+  "languages": ["typescript"],
+  "match": {
+    "kind": "jsx_element",
+    "tag": {"name": "div"},
+    "attributes": [
+      {"kind": "jsx_spread_attribute", "value": {"name": "props"}},
+      {"kind": "jsx_attribute", "name": "dangerouslySetInnerHTML", "value": {"name": "config"}}
+    ],
+    "children": [{"kind": "jsx_element", "tag": {"name": "span"}}]
+  }
+}
+```
+
+<!-- code-query-case:jsx-structure:expected -->
+```json
+{
+  "results": [
+    {
+      "result_type": "structural_match",
+      "path": "typescript/jsx-structure.tsx",
+      "language": "typescript",
+      "kind": "jsx_element",
+      "start_line": 7,
+      "end_line": 9,
+      "text": "<div {...props} dangerouslySetInnerHTML={config}>…",
+      "enclosing_symbol": "StructuredView"
+    }
+  ],
+  "truncated": false
+}
+```
+
+Object properties expose structured key and value roles. Computed properties
+remain distinct from static keys, while spreads use the context-free
+`spread_element` kind in object, array, and argument contexts.
+
+<!-- code-query-case:object-property:rql -->
+```lisp
+(language typescript (object_property :key "__html" :value "html"))
+```
+
+<!-- code-query-case:object-property:json -->
+```json
+{
+  "languages": ["typescript"],
+  "match": {
+    "kind": "object_property",
+    "key": {"name": "__html"},
+    "value": {"name": "html"}
+  }
+}
+```
+
+<!-- code-query-case:object-property:expected -->
+```json
+{
+  "results": [
+    {
+      "result_type": "structural_match",
+      "path": "typescript/jsx-structure.tsx",
+      "language": "typescript",
+      "kind": "object_property",
+      "start_line": 4,
+      "end_line": 4,
+      "text": "__html: html",
+      "enclosing_symbol": "jsx-structure.tsx.config"
+    }
+  ],
+  "truncated": false
+}
+```
+
+<!-- code-query-case:computed-property:rql -->
+```lisp
+(language typescript (computed_property :value "dynamicKey"))
+```
+
+<!-- code-query-case:computed-property:json -->
+```json
+{"languages":["typescript"],"match":{"kind":"computed_property","value":{"name":"dynamicKey"}}}
+```
+
+<!-- code-query-case:computed-property:expected -->
+```json
+{
+  "results": [
+    {
+      "result_type": "structural_match",
+      "path": "typescript/jsx-structure.tsx",
+      "language": "typescript",
+      "kind": "computed_property",
+      "start_line": 4,
+      "end_line": 4,
+      "text": "[dynamicKey]",
+      "enclosing_symbol": "jsx-structure.tsx.config"
+    }
+  ],
+  "truncated": false
+}
+```
+
+<!-- code-query-case:spread-elements:rql -->
+```lisp
+(language typescript (spread_element :value "props"))
+```
+
+<!-- code-query-case:spread-elements:json -->
+```json
+{"languages":["typescript"],"match":{"kind":"spread_element","value":{"name":"props"}}}
+```
+
+<!-- code-query-case:spread-elements:expected -->
+```json
+{
+  "results": [
+    {
+      "result_type": "structural_match",
+      "path": "typescript/jsx-structure.tsx",
+      "language": "typescript",
+      "kind": "spread_element",
+      "start_line": 4,
+      "end_line": 4,
+      "text": "...props",
+      "enclosing_symbol": "jsx-structure.tsx.config"
+    },
+    {
+      "result_type": "structural_match",
+      "path": "typescript/jsx-structure.tsx",
+      "language": "typescript",
+      "kind": "spread_element",
+      "start_line": 7,
+      "end_line": 7,
+      "text": "...props",
+      "enclosing_symbol": "StructuredView"
     }
   ],
   "truncated": false

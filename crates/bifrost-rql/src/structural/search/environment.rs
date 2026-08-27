@@ -494,6 +494,7 @@ pub(super) fn public_binding(value: &BindingValue, range: CodeQueryRange) -> Cod
         visibility: row.visibility.label(),
         import: row.import.as_ref().map(|import| CodeQueryImportBinder {
             local_name: import.local_name.clone(),
+            imported_name: import.imported_name.clone(),
             alias: import.alias.clone(),
             target_segments: import.target_segments.clone(),
             wildcard: import.wildcard,

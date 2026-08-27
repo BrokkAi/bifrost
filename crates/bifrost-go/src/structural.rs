@@ -227,7 +227,10 @@ impl StructuralSpec for GoStructuralSpec {
     }
 
     fn supports_role(&self, role: Role) -> bool {
-        !matches!(role, Role::Kwarg | Role::Decorator)
+        !matches!(
+            role,
+            Role::Kwarg | Role::Decorator | Role::Iterable | Role::Element
+        )
     }
 
     fn occurrence_role_support(&self) -> &OccurrenceRoleSupport {

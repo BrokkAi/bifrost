@@ -19,7 +19,7 @@ example.
 
 No Bifrost source, artifact, or dependency is licensed under GPL-3.0 or
 LGPL-3.0. Where a dependency does carry a reciprocal license -- libgit2 under
-GPL-2.0 with a linking exception, its bundled winhttp definitions under
-LGPL-2.1, and `option-ext` under MPL-2.0 on the optional `nlp` feature --
+GPL-2.0 with a linking exception and its bundled winhttp definitions under
+LGPL-2.1 --
 `licenses/SUPPLEMENTAL_THIRD_PARTY_NOTICES.txt` reproduces the required text in
 full alongside the binary.

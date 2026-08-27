@@ -54,13 +54,16 @@ use brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus;
 /// [`crate::java::graph_support::JavaSource::external_boundary_evidence`]'s
 /// answer.
 pub trait JvmActiveSemanticModel {
-    /// Whether a model set is published for the analyzer generation serving
-    /// this request.
+    /// Whether a JVM declaration surface is published for the analyzer
+    /// generation serving this request.
     ///
     /// Publication is what makes a miss provable. A jar index built from
     /// whatever artifacts happen to be on disk claims nothing about the whole
-    /// classpath; a published model set is an activated, complete API surface,
-    /// so missing it is evidence rather than silence.
+    /// classpath; a published declaration surface is an activated API surface,
+    /// so missing it is evidence rather than silence. An active model set
+    /// holding only generator-rule packs declares no API and therefore does
+    /// not count as published: proving a name absent against it flagged JDK
+    /// types in bare workspaces (#2678).
     fn is_published(&self) -> bool;
 
     /// What the published set says about the fully-qualified name `fqn`.

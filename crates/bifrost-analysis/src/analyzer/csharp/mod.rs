@@ -730,6 +730,31 @@ impl CSharpSource for CSharpAnalyzer {
         CSharpAnalyzer::global_using_namespaces(self, token)
     }
 
+    fn file_using_namespaces_of(&self, token: QueryToken<'_>, file: &ProjectFile) -> Vec<String> {
+        if let Some(cached) = self.memo_caches.file_using_namespaces.get(file) {
+            return (*cached).clone();
+        }
+        let namespaces = graph_support::file_using_namespaces(self, token, file);
+        self.memo_caches
+            .file_using_namespaces
+            .insert(file.clone(), Arc::new(namespaces.clone()));
+        namespaces
+    }
+
+    fn sorted_global_using_namespaces(&self) -> Vec<String> {
+        self.memo_caches
+            .sorted_global_using_namespaces
+            .get_or_init(|| {
+                let mut namespaces: Vec<_> = CSharpSource::global_using_namespaces(self)
+                    .iter()
+                    .cloned()
+                    .collect();
+                namespaces.sort();
+                namespaces
+            })
+            .clone()
+    }
+
     fn global_using_namespaces_limited(
         &self,
         limit: usize,
@@ -792,6 +817,15 @@ impl TestDetectionProvider for CSharpAnalyzer {}
 use crate::analyzer::CodeUnitIndex;
 
 impl CodeUnitIndex for CSharpAnalyzer {
+    /// Forwarded so the request-scoped memo on the inner analyzer answers
+    /// (#2679); the trait default would rebuild uncached per call.
+    fn class_range_index(
+        &self,
+        file: &ProjectFile,
+    ) -> std::sync::Arc<brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex> {
+        self.inner.class_range_index(file)
+    }
+
     fn enclosing_code_unit(
         &self,
         file: &ProjectFile,
@@ -1006,18 +1040,6 @@ impl IAnalyzer for CSharpAnalyzer {
 
     fn record_query_failure(&self, error: crate::analyzer::store::StoreError) {
         self.inner.record_query_failure(error);
-    }
-
-    fn begin_streaming_file_read(&self, file: &ProjectFile) {
-        self.inner.begin_streaming_file_read(file);
-    }
-
-    fn end_streaming_file_read(&self, file: &ProjectFile) {
-        self.inner.end_streaming_file_read(file);
-    }
-
-    fn release_streaming_readers(&self) {
-        self.inner.release_streaming_readers();
     }
 
     fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {

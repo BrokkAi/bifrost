@@ -592,6 +592,7 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                     generated_code_only: false,
                     review_required: false,
                 },
+                carried_sources: Vec::new(),
                 shards: vec![AuthoredShard {
                     id: "declarations.external".to_owned(),
                     activation: vec![ActivationSelector {

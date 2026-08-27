@@ -9,7 +9,6 @@ use crate::scala::graph_support::ScalaSource;
 use brokk_bifrost_core::analyzer::model::{
     ImportInfo, ScalaExportInfo, ScalaExportSelector, StructuredImportPath, StructuredImportScope,
 };
-use brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex;
 use brokk_bifrost_core::analyzer::{CodeUnit, CodeUnitIndex, ProjectFile};
 use tree_sitter::Node;
 
@@ -45,9 +44,7 @@ pub fn scala_enclosing_template_owner_fq_names(
     byte: usize,
 ) -> Vec<String> {
     let mut owners = Vec::new();
-    let mut current = ClassRangeIndex::build(index, file)
-        .enclosing_unit(byte)
-        .cloned();
+    let mut current = index.class_range_index(file).enclosing_unit(byte).cloned();
     while let Some(owner) = current {
         current = scala.structural_parent_of(&owner);
         if owner.is_class() {

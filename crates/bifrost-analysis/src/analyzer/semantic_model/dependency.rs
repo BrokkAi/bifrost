@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::CancellationToken;
 use crate::analyzer::canonical_hash::{CanonicalHasher, lower_hex_string};
@@ -15,6 +16,7 @@ use super::{
 };
 
 const DEPENDENCY_INPUT_DOMAIN: &[u8] = b"bifrost.semantic-pack.dependency-input.v1";
+const GENERATED_PRODUCTION_LOCK_RETRY: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DependencyArtifactRole {
@@ -988,21 +990,18 @@ pub fn prepare_dependency_semantic_packs(
             cancelled = true;
             break;
         }
-        match catalog.generated_production(&key) {
-            Ok(Some(production)) if production.completeness == Completeness::Complete => {
-                let activation_evidence = activation_evidence(dependency, &input_digest);
-                evidence.push(activation_evidence.clone());
-                packs.push(PreparedDependencyPack {
-                    dependency_id: dependency.id.clone(),
-                    completeness: production.completeness,
-                    production,
-                    status: DependencyPackPreparationStatus::Reused,
-                    evidence: activation_evidence,
-                });
-                profile.reused_packs += 1;
+        match reusable_generated_pack(catalog, &key, dependency, &input_digest) {
+            Ok(Some(prepared)) => {
+                record_reused_generated_pack(
+                    prepared,
+                    dependency,
+                    &mut diagnostics,
+                    &mut evidence,
+                    &mut packs,
+                    &mut profile,
+                );
                 continue;
             }
-            Ok(Some(_)) => {}
             Ok(None) => {}
             Err(error) => {
                 diagnostics.catalog(Some(&dependency.id), "catalog.lookup", error);
@@ -1014,8 +1013,61 @@ pub fn prepare_dependency_semantic_packs(
             cancelled = true;
             break;
         }
-        let production =
-            adapter.produce(dependency, &exact_artifacts, &limits.producer, cancellation);
+        let production_lock = match catalog.generated_production_lock(&key) {
+            Ok(lock) => lock,
+            Err(error) => {
+                diagnostics.catalog(Some(&dependency.id), "production.lock", error);
+                continue;
+            }
+        };
+        let lock_acquired = loop {
+            if is_cancelled(cancellation) {
+                cancelled = true;
+                break false;
+            }
+            match production_lock.try_acquire() {
+                Ok(true) => break true,
+                Ok(false) => std::thread::sleep(GENERATED_PRODUCTION_LOCK_RETRY),
+                Err(error) => {
+                    diagnostics.catalog(Some(&dependency.id), "production.lock", error);
+                    break false;
+                }
+            }
+        };
+        if !lock_acquired {
+            if cancelled {
+                break;
+            }
+            continue;
+        }
+
+        // Another process may have completed this exact production while this
+        // process waited for the key-specific lock.
+        match reusable_generated_pack(catalog, &key, dependency, &input_digest) {
+            Ok(Some(prepared)) => {
+                record_reused_generated_pack(
+                    prepared,
+                    dependency,
+                    &mut diagnostics,
+                    &mut evidence,
+                    &mut packs,
+                    &mut profile,
+                );
+                continue;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                diagnostics.catalog(Some(&dependency.id), "catalog.lookup", error);
+                continue;
+            }
+        }
+
+        let production = {
+            let _scope = crate::profiling::scope_with(|| {
+                format!("semantic_pack.produce[{}]", dependency.id)
+            });
+            adapter.produce(dependency, &exact_artifacts, &limits.producer, cancellation)
+        };
         let production_has_errors = production
             .diagnostics
             .iter()
@@ -1081,7 +1133,13 @@ pub fn prepare_dependency_semantic_packs(
             cancelled = true;
             break;
         }
-        let compiled = match compile_pack(&pack, &limits.compiler) {
+        let compiled_result = {
+            let _scope = crate::profiling::scope_with(|| {
+                format!("semantic_pack.compile[{}]", dependency.id)
+            });
+            compile_pack(&pack, &limits.compiler)
+        };
+        let compiled = match compiled_result {
             Ok(compiled) => compiled,
             Err(compile_diagnostics) => {
                 for diagnostic in compile_diagnostics {
@@ -1099,7 +1157,13 @@ pub fn prepare_dependency_semantic_packs(
             cancelled = true;
             break;
         }
-        match catalog.install_generated(&key, &compiled) {
+        let install = {
+            let _scope = crate::profiling::scope_with(|| {
+                format!("semantic_pack.install[{}]", dependency.id)
+            });
+            catalog.install_generated(&key, &compiled)
+        };
+        match install {
             Ok(installed) => {
                 let activation_evidence = activation_evidence(dependency, &input_digest);
                 evidence.push(activation_evidence.clone());
@@ -1145,6 +1209,45 @@ pub fn prepare_dependency_semantic_packs(
         cancelled,
         profile,
     }
+}
+
+fn record_reused_generated_pack(
+    prepared: PreparedDependencyPack,
+    dependency: &ResolvedDependency,
+    diagnostics: &mut BoundedDependencyDiagnostics,
+    evidence: &mut Vec<SemanticModelActivationEvidence>,
+    packs: &mut Vec<PreparedDependencyPack>,
+    profile: &mut DependencyPackPreparationProfile,
+) {
+    if prepared.completeness == Completeness::Partial {
+        diagnostics.error(
+            "production.partial",
+            Some(&dependency.id),
+            None,
+            "cached dependency production has partial semantic coverage",
+        );
+    }
+    evidence.push(prepared.evidence.clone());
+    packs.push(prepared);
+    profile.reused_packs += 1;
+}
+
+fn reusable_generated_pack(
+    catalog: &SemanticPackCatalog,
+    key: &GeneratedProductionKey,
+    dependency: &ResolvedDependency,
+    input_digest: &str,
+) -> Result<Option<PreparedDependencyPack>, CatalogError> {
+    let Some(production) = catalog.generated_production(key)? else {
+        return Ok(None);
+    };
+    Ok(Some(PreparedDependencyPack {
+        dependency_id: dependency.id.clone(),
+        completeness: production.completeness,
+        production,
+        status: DependencyPackPreparationStatus::Reused,
+        evidence: activation_evidence(dependency, input_digest),
+    }))
 }
 
 /// The evidence-only catalog query for one dependency, or `None` when the
@@ -1394,8 +1497,11 @@ fn artifact_kind_name(kind: ExternalArtifactKind) -> &'static str {
         ExternalArtifactKind::ScalaSourceJar => "scala_source_jar",
         ExternalArtifactKind::KotlinSourceJar => "kotlin_source_jar",
         ExternalArtifactKind::JdkSourceZip => "jdk_source_zip",
+        ExternalArtifactKind::JdkJmodSet => "jdk_jmod_set",
         ExternalArtifactKind::DotNetAssembly => "dotnet_assembly",
         ExternalArtifactKind::RustdocJson => "rustdoc_json",
+        ExternalArtifactKind::RustdocJsonSet => "rustdoc_json_set",
+        ExternalArtifactKind::TypeScriptLibrarySet => "typescript_library_set",
         ExternalArtifactKind::GoSourceSet => "go_source_set",
         ExternalArtifactKind::PythonStub => "python_stub",
         ExternalArtifactKind::PythonSource => "python_source",

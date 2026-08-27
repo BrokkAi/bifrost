@@ -854,6 +854,10 @@ fn resolution_from_matches(
 /// (`pkg.Type` and `pkg.Type.Type`). Prefer the type when both declarations are
 /// present, while leaving an explicitly repeated constructor selector and
 /// ambiguity between independently declared types untouched.
+///
+/// Kotlin and Scala index a synthetic owner-named primary constructor
+/// (`Owner.Owner`), so a default-package class is ambiguous with its own
+/// constructor on every spelling without this gate (#2658).
 fn prefer_types_over_their_owner_named_constructors(
     analyzer: &dyn IAnalyzer,
     matches: &mut BTreeMap<String, CodeUnit>,
@@ -871,7 +875,11 @@ fn prefer_types_over_their_owner_named_constructors(
         if !unit.is_function()
             || !matches!(
                 code_unit_language(unit),
-                Language::Java | Language::CSharp | Language::Cpp
+                Language::Java
+                    | Language::CSharp
+                    | Language::Cpp
+                    | Language::Kotlin
+                    | Language::Scala
             )
         {
             return true;

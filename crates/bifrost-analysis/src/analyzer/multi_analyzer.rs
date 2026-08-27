@@ -622,34 +622,18 @@ impl ImportAnalysisProvider for MultiAnalyzer {
     fn referencing_files_of_targets(
         &self,
         targets: &HashSet<ProjectFile>,
-        candidates: &[ProjectFile],
         cancellation: &crate::CancellationToken,
     ) -> HashSet<ProjectFile> {
-        let mut grouped: BTreeMap<Language, Vec<ProjectFile>> = BTreeMap::new();
-        for candidate in candidates {
-            grouped
-                .entry(self.dispatch_language(candidate))
-                .or_default()
-                .push(candidate.clone());
-        }
-
         let mut referencing = HashSet::default();
-        for (language, group) in grouped {
+        for provider in self
+            .delegates
+            .values()
+            .filter_map(AnalyzerDelegate::import_analysis_provider)
+        {
             if cancellation.is_cancelled() {
                 break;
             }
-            let Some(provider) = self
-                .delegates
-                .get(&language)
-                .and_then(AnalyzerDelegate::import_analysis_provider)
-            else {
-                continue;
-            };
-            referencing.extend(provider.referencing_files_of_targets(
-                targets,
-                &group,
-                cancellation,
-            ));
+            referencing.extend(provider.referencing_files_of_targets(targets, cancellation));
         }
         referencing
     }
@@ -1108,6 +1092,22 @@ impl CodeUnitIndex for MultiAnalyzer {
         }
     }
 
+    /// Routed to the owning delegate so its request-scoped memo answers
+    /// (#2679); the trait default on `self` would rebuild uncached per call.
+    fn class_range_index(
+        &self,
+        file: &ProjectFile,
+    ) -> Arc<brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex> {
+        match self.delegate_for_file(file) {
+            Some(delegate) => delegate.analyzer().class_range_index(file),
+            None => Arc::new(
+                brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex::from_class_spans(
+                    std::iter::empty(),
+                ),
+            ),
+        }
+    }
+
     fn materialization_records(
         &self,
         file: &ProjectFile,
@@ -1123,8 +1123,9 @@ impl CodeUnitIndex for MultiAnalyzer {
             .delegates
             .iter()
             .flat_map(|(language, delegate)| {
-                let _scope =
-                    crate::profiling::scope(format!("multi.definitions[{language:?}][{fq_name}]"));
+                let _scope = crate::profiling::scope_with(|| {
+                    format!("multi.definitions[{language:?}][{fq_name}]")
+                });
                 delegate.analyzer().definitions(fq_name)
             })
             .collect();
@@ -1424,24 +1425,6 @@ impl IAnalyzer for MultiAnalyzer {
                 })
                 .collect(),
         )
-    }
-
-    fn begin_streaming_file_read(&self, file: &ProjectFile) {
-        if let Some(delegate) = self.delegate_for_file(file) {
-            delegate.analyzer().begin_streaming_file_read(file);
-        }
-    }
-
-    fn end_streaming_file_read(&self, file: &ProjectFile) {
-        if let Some(delegate) = self.delegate_for_file(file) {
-            delegate.analyzer().end_streaming_file_read(file);
-        }
-    }
-
-    fn release_streaming_readers(&self) {
-        self.delegates
-            .values()
-            .for_each(|delegate| delegate.analyzer().release_streaming_readers());
     }
 
     /// The first delegate's cell — the same delegate `project()` answers from,

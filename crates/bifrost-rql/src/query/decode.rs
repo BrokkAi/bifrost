@@ -2,11 +2,12 @@ use super::ir::{
     ArityConstraint, BindingFilter, BindingOfOptions, BindingSeed, CallInputSelector,
     CallSiteTraversalFilter, CallTraversalFilter, CandidateFilter, CandidateOutcomeLabel,
     CodeQuery, CodeQueryPlan, CodeQueryPlanSource, CodeQueryResultDetail, CodeQuerySeed,
-    ControlRelationFilter, DEFAULT_LIMIT, DeclarationStateFilter, EdgeFilter, ExportFilter,
-    ExportSeed, FlowRelationFilter, GenerationSiteFilter, GenerationSiteSeed, HierarchyTraversal,
-    MAX_ARITY, MAX_BINDING_NAME_LENGTH, MAX_CAPTURE_LENGTH, MAX_ENVIRONMENT_FILTER_ENTRIES,
-    MAX_GLOB_LENGTH, MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH, MAX_KWARGS,
-    MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_OCCURRENCE_FILTER_ENTRIES, MAX_PATTERN_DEPTH,
+    ControlRelationFilter, DEFAULT_LIMIT, DeclarationStateFilter, DecoratorBindingFilter,
+    EdgeFilter, ExportFilter, ExportSeed, FlowRelationFilter, GenerationSiteFilter,
+    GenerationSiteSeed, HierarchyTraversal, JsxAttributeValueTraversal, MAX_ARITY,
+    MAX_BINDING_NAME_LENGTH, MAX_CAPTURE_LENGTH, MAX_DECORATOR_BINDING_FILTER_LENGTH,
+    MAX_ENVIRONMENT_FILTER_ENTRIES, MAX_GLOB_LENGTH, MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH,
+    MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_OCCURRENCE_FILTER_ENTRIES, MAX_PATTERN_DEPTH,
     MAX_PATTERN_NODES, MAX_QUERY_BRANCHES, MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES,
     MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS,
     OccurrenceFilter, OccurrenceSeed, PathFilter, PathSeed, Pattern, QueryError, QueryStep,
@@ -16,9 +17,9 @@ use super::ir::{
 };
 use super::schema::{
     ALL_QUERY_STEP_OPS, CodeQueryExecutionMode, PatternField, QueryField, QueryStepField,
-    StringPredicateField, call_traversal_completeness_from_label, reference_kind_from_label,
-    rql_schema_version_registry, usage_kind_from_label, usage_proof_from_label,
-    usage_surface_from_label,
+    StringPredicateField, call_traversal_completeness_from_label, jsx_element_identity_from_label,
+    reference_kind_from_label, rql_schema_version_registry, usage_kind_from_label,
+    usage_proof_from_label, usage_surface_from_label,
 };
 use brokk_bifrost_core::analyzer::Language;
 use brokk_bifrost_core::analyzer::structural::control_relation::{
@@ -726,6 +727,42 @@ pub(super) fn decode_binding_filter(
     })
 }
 
+pub(super) fn decode_decorator_binding_filter(
+    object: &Map<String, Value>,
+    path: &str,
+) -> Result<DecoratorBindingFilter, QueryError> {
+    reject_unknown_filter_fields(
+        object,
+        path,
+        &["module", "imported_name", "op"],
+        "decorator-binding",
+    )?;
+    let decode_exact = |field: &str| -> Result<Option<String>, QueryError> {
+        object
+            .get(field)
+            .map(|value| {
+                let field_path = child_path(path, field);
+                let text = value.as_str().ok_or_else(|| {
+                    QueryError::new(&field_path, "expected an exact string filter value")
+                })?;
+                if text.is_empty() || text.len() > MAX_DECORATOR_BINDING_FILTER_LENGTH {
+                    return Err(QueryError::new(
+                        &field_path,
+                        format!(
+                            "exact filter value must be between 1 and {MAX_DECORATOR_BINDING_FILTER_LENGTH} bytes"
+                        ),
+                    ));
+                }
+                Ok(text.to_owned())
+            })
+            .transpose()
+    };
+    Ok(DecoratorBindingFilter {
+        module: decode_exact("module")?,
+        imported_name: decode_exact("imported_name")?,
+    })
+}
+
 pub(super) fn decode_edge_filter(
     object: &Map<String, Value>,
     path: &str,
@@ -1233,6 +1270,7 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
             QueryStep::CallSitesTo(_) | QueryStep::CallSitesFrom(_)
         );
         let call_input = matches!(step, QueryStep::CallInput(_));
+        let jsx_attribute_value = matches!(step, QueryStep::JsxAttributeValue(_));
         let receiver = matches!(
             step,
             QueryStep::ReceiverTargets(_) | QueryStep::PointsTo(_) | QueryStep::MemberTargets(_)
@@ -1246,6 +1284,7 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
             QueryStep::OccurrencesOf(_) | QueryStep::OccurrencesIn(_)
         );
         let binding = matches!(step, QueryStep::BindingsIn(_));
+        let decorator_binding = matches!(step, QueryStep::DecoratorBindings(_));
         let candidate = matches!(step, QueryStep::CandidatesOf(_));
         let binding_of = matches!(step, QueryStep::BindingOf(_));
         let declaration_state = matches!(step, QueryStep::DeclarationStateOf(_));
@@ -1268,6 +1307,11 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::ParameterIndex
                     | QueryStepField::ParameterName,
                 ) if call_input => {}
+                Some(
+                    QueryStepField::Identity
+                    | QueryStepField::ElementName
+                    | QueryStepField::PropertyName,
+                ) if jsx_attribute_value => {}
                 Some(QueryStepField::Capture) if receiver => {}
                 Some(QueryStepField::ProtocolRef) if typestate => {}
                 Some(QueryStepField::PlanRef) if value_flow => {}
@@ -1283,6 +1327,8 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::BindingNames
                     | QueryStepField::BindingHoisting,
                 ) if binding => {}
+                Some(QueryStepField::DecoratorModule | QueryStepField::DecoratorImportedName)
+                    if decorator_binding => {}
                 Some(
                     QueryStepField::CandidateTiers
                     | QueryStepField::CandidateOutcomes
@@ -1326,6 +1372,9 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::Receiver
                     | QueryStepField::ParameterIndex
                     | QueryStepField::ParameterName
+                    | QueryStepField::Identity
+                    | QueryStepField::ElementName
+                    | QueryStepField::PropertyName
                     | QueryStepField::Capture
                     | QueryStepField::ProtocolRef
                     | QueryStepField::PlanRef
@@ -1338,6 +1387,8 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::BindingKinds
                     | QueryStepField::BindingNames
                     | QueryStepField::BindingHoisting
+                    | QueryStepField::DecoratorModule
+                    | QueryStepField::DecoratorImportedName
                     | QueryStepField::IncludeShadowed
                     | QueryStepField::CandidateTiers
                     | QueryStepField::CandidateOutcomes
@@ -1375,6 +1426,9 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
             };
         } else if binding {
             step = QueryStep::BindingsIn(decode_binding_filter(object, &entry_path)?);
+        } else if decorator_binding {
+            step =
+                QueryStep::DecoratorBindings(decode_decorator_binding_filter(object, &entry_path)?);
         } else if candidate {
             step = QueryStep::CandidatesOf(decode_candidate_filter(object, &entry_path)?);
         } else if declaration_state {
@@ -1660,6 +1714,34 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                 CallInputSelector::ParameterName(name.to_owned())
             };
             step = QueryStep::CallInput(selector);
+        } else if jsx_attribute_value {
+            let identity = object
+                .get("identity")
+                .map(|value| {
+                    let path = child_path(&entry_path, "identity");
+                    let label = value.as_str().ok_or_else(|| {
+                        QueryError::new(&path, "expected intrinsic, component, or unknown")
+                    })?;
+                    jsx_element_identity_from_label(label).ok_or_else(|| {
+                        QueryError::new(&path, "expected intrinsic, component, or unknown")
+                    })
+                })
+                .transpose()?;
+            let decode_name = |field: &str| {
+                object
+                    .get(field)
+                    .map(|value| {
+                        value.as_str().map(str::to_owned).ok_or_else(|| {
+                            QueryError::new(child_path(&entry_path, field), "expected a string")
+                        })
+                    })
+                    .transpose()
+            };
+            step = QueryStep::JsxAttributeValue(JsxAttributeValueTraversal {
+                identity,
+                element_name: decode_name("element_name")?,
+                property_name: decode_name("property_name")?,
+            });
         } else if receiver {
             let capture = object
                 .get("capture")
@@ -2213,7 +2295,18 @@ fn decode_role_fields(
                 Role::Module => pattern.module = Some(sub_pattern),
                 Role::Object => pattern.object = Some(sub_pattern),
                 Role::Field => pattern.field = Some(sub_pattern),
-                Role::Arg | Role::Kwarg | Role::Decorator => unreachable!("non-single role"),
+                Role::Iterable => pattern.iterable = Some(sub_pattern),
+                Role::Tag => pattern.tag = Some(sub_pattern),
+                Role::Value => pattern.value = Some(sub_pattern),
+                Role::Key => pattern.key = Some(sub_pattern),
+                Role::Arg
+                | Role::Kwarg
+                | Role::Decorator
+                | Role::Element
+                | Role::Attributes
+                | Role::Children => {
+                    unreachable!("non-single role")
+                }
             }
         }
     }
@@ -2242,6 +2335,9 @@ fn decode_role_fields(
             match role {
                 Role::Arg => pattern.args = patterns,
                 Role::Decorator => pattern.decorators = patterns,
+                Role::Element => pattern.elements = patterns,
+                Role::Attributes => pattern.attributes = patterns,
+                Role::Children => pattern.children = patterns,
                 Role::Callee
                 | Role::Receiver
                 | Role::Kwarg
@@ -2249,7 +2345,11 @@ fn decode_role_fields(
                 | Role::Right
                 | Role::Module
                 | Role::Object
-                | Role::Field => unreachable!("non-list role"),
+                | Role::Field
+                | Role::Iterable
+                | Role::Tag
+                | Role::Value
+                | Role::Key => unreachable!("non-list role"),
             }
         }
     }

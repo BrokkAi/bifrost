@@ -950,10 +950,10 @@ mod tests {
             },
             PolicySelectorPath::new(format!("/dependencies/match-endpoints/{id}/selector"))
                 .unwrap(),
-            SchemaVersionResolution {
+            ResolvedEndpointSelectorSchemas::Query(SchemaVersionResolution {
                 version: 2,
                 origin: SchemaVersionOrigin::Explicit,
-            },
+            }),
             ResolvedEndpointModel::new(
                 role,
                 id.to_string(),

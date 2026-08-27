@@ -126,7 +126,6 @@ export default defineConfig({
             { label: 'CI Gating with GitHub Actions', slug: 'ci-github-actions' },
             { label: 'Semantic-Model Packs', slug: 'semantic-model-packs' },
             { label: 'Agent Result Safety', slug: 'agent-result-safety' },
-            { label: 'Semantic Search', slug: 'semantic-search' },
             { label: 'JSON CodeQuery', slug: 'code-query-json' },
             { label: 'Explain and Profile', slug: 'code-query-explain-profile' },
             {

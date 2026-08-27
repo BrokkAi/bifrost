@@ -10,6 +10,7 @@ pub(crate) mod dependency_discovery;
 pub(crate) mod external;
 pub(crate) mod java_artifact;
 pub(crate) mod jdk_artifact;
+pub(crate) mod jmod_artifact;
 pub(crate) mod kotlin_artifact;
 pub(crate) mod realm_builder;
 pub(crate) mod scala_artifact;
@@ -53,7 +54,18 @@ pub(crate) struct JvmOverlayModel(
 
 impl JvmActiveSemanticModel for JvmOverlayModel {
     fn is_published(&self) -> bool {
-        self.0.is_some()
+        // Publication means a declaration surface, not merely an overlay: a
+        // bare JVM workspace activates generator-rule packs (e.g.
+        // `bifrost.scala.case-class`) whose overlay declares no API at all,
+        // and proving a name absent against that empty surface produced false
+        // unrecognized-symbol errors for JDK types (#2678). Java, Scala and
+        // Kotlin compile to one classpath, so a declaration surface published
+        // for any of the three realms is the shared external surface.
+        self.0.as_ref().is_some_and(|overlay| {
+            ["java", "scala", "kotlin"]
+                .iter()
+                .any(|language| overlay.publishes_declaration_surface_for(language))
+        })
     }
 
     fn qualified_name_disposition(&self, fqn: &str) -> JvmModelDisposition {

@@ -769,7 +769,7 @@ fn parse_token_tree_roles(
     }
     let fragment = source.get(open.end_byte()..close.start_byte())?;
     let tree = lexical_scope::parse_rust_tree(fragment)?;
-    let lexical_scope = RustLexicalScopeIndex::new(tree.root_node(), fragment);
+    let lexical_scope = lexical_scope::rust_lexical_scope_index(tree.root_node(), fragment);
     let mut roles = HashMap::default();
     let mut stack = vec![tree.root_node()];
     while let Some(parsed) = stack.pop() {
@@ -1306,7 +1306,8 @@ fn trait_visible_at_call_site(
     let Some(prepared) = rust.prepared_syntax(token, file) else {
         return false;
     };
-    let lexical_scope = RustLexicalScopeIndex::new(prepared.tree().root_node(), prepared.source());
+    let lexical_scope =
+        lexical_scope::rust_lexical_scope_index(prepared.tree().root_node(), prepared.source());
     names.into_iter().any(|name| {
         let root_shadowed = lexical_scope.name_bound_at(&name, reference_byte)
             || (lexical_scope.local_item_bound_at(&name, reference_byte)

@@ -3,6 +3,7 @@ mod storage;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, Weak};
@@ -24,6 +25,61 @@ use crate::analyzer::store::{
     AnalyzerStore, SemanticPackActivationSourceKind, SemanticPackActiveReference,
     SemanticPackActiveSet,
 };
+
+/// SQLite schema version used to isolate the generated default catalog from
+/// older binaries that cannot open a newer catalog.
+pub const CATALOG_SCHEMA_VERSION: i64 = db::CURRENT_CATALOG_VERSION;
+
+/// Cache-compatibility version for locally generated semantic packs.
+///
+/// Increment this whenever producer or compiler behavior can change the bytes
+/// or meaning of a generated pack without changing its other exact inputs.
+pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 1;
+pub const SEMANTIC_PACK_CACHE_ROOT_ENV: &str = "BIFROST_SEMANTIC_PACK_CACHE_ROOT";
+
+/// Resolve the generated catalog used when no explicit catalog is configured.
+/// By default this shares the analyzer cache's repository and linked-worktree
+/// scope. The semantic-pack-only override deliberately permits a host to share
+/// content-addressed productions without sharing analyzer databases.
+pub fn default_semantic_pack_catalog_root(workspace_root: &Path) -> PathBuf {
+    default_semantic_pack_catalog_root_with_override(
+        workspace_root,
+        std::env::var_os(SEMANTIC_PACK_CACHE_ROOT_ENV).filter(|value| !value.is_empty()),
+    )
+}
+
+fn default_semantic_pack_catalog_root_with_override(
+    workspace_root: &Path,
+    cache_root: Option<std::ffi::OsString>,
+) -> PathBuf {
+    cache_root
+        .map(PathBuf::from)
+        .unwrap_or_else(|| crate::gitblob::cache_dir_path(workspace_root))
+        .join(format!("semantic-pack-catalog.v{CATALOG_SCHEMA_VERSION}"))
+}
+
+/// Open the generated default catalog after applying the shared cache
+/// directory's creation and Git-ignore contract.
+pub fn open_default_semantic_pack_catalog(
+    workspace_root: &Path,
+    options: CatalogOptions,
+) -> Result<SemanticPackCatalog, CatalogError> {
+    let catalog_root = default_semantic_pack_catalog_root(workspace_root);
+    let cache_dir = crate::cache_db::prepare_cache_dir(
+        catalog_root
+            .parent()
+            .expect("the default semantic-pack catalog has a cache parent"),
+    )
+    .map_err(CatalogError::Integrity)?;
+    let directory_name = catalog_root
+        .file_name()
+        .expect("the default semantic-pack catalog has a directory name");
+    SemanticPackCatalog::open(
+        &cache_dir.join(directory_name),
+        CatalogOpenMode::ReadWrite,
+        options,
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CatalogOpenMode {
@@ -337,6 +393,24 @@ impl GeneratedProductionKey {
 
     pub fn source_id(&self) -> String {
         format!("production:{}", self.production_digest)
+    }
+}
+
+/// An acquired operating-system lock for one exact generated production.
+/// Dropping the file releases the lock, including after process termination.
+pub(crate) struct GeneratedProductionLock {
+    file: File,
+}
+
+impl GeneratedProductionLock {
+    pub(crate) fn try_acquire(&self) -> Result<bool, CatalogError> {
+        match self.file.try_lock() {
+            Ok(()) => Ok(true),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+            Err(std::fs::TryLockError::Error(error)) => {
+                Err(CatalogError::io("acquire generated-production lock", error))
+            }
+        }
     }
 }
 
@@ -734,6 +808,15 @@ impl SemanticPackCatalog {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub(crate) fn generated_production_lock(
+        &self,
+        key: &GeneratedProductionKey,
+    ) -> Result<GeneratedProductionLock, CatalogError> {
+        self.require_writable()?;
+        let file = storage::open_generated_production_lock(&self.root, key.production_digest())?;
+        Ok(GeneratedProductionLock { file })
     }
 
     /// Return the number of production catalog SQL statements issued by this instance.
@@ -2985,11 +3068,28 @@ fn generated_production_digest(
     producer_version: &str,
     schema_version: u32,
 ) -> String {
+    generated_production_digest_for_cache_version(
+        input_digest,
+        producer_name,
+        producer_version,
+        schema_version,
+        GENERATED_PRODUCTION_CACHE_VERSION,
+    )
+}
+
+fn generated_production_digest_for_cache_version(
+    input_digest: &str,
+    producer_name: &str,
+    producer_version: &str,
+    schema_version: u32,
+    cache_version: u32,
+) -> String {
     let mut hasher = CanonicalHasher::new(GENERATED_PRODUCTION_DOMAIN);
     hasher.field("input_digest", input_digest.as_bytes());
     hasher.field("producer_name", producer_name.as_bytes());
     hasher.field("producer_version", producer_version.as_bytes());
     hasher.field("schema_version", &schema_version.to_be_bytes());
+    hasher.field("cache_version", &cache_version.to_be_bytes());
     lower_hex_string(&hasher.finish())
 }
 
@@ -3521,5 +3621,57 @@ fn completeness_name(completeness: &super::Completeness) -> &'static str {
     match completeness {
         super::Completeness::Complete => "complete",
         super::Completeness::Partial => "partial",
+    }
+}
+
+#[cfg(test)]
+mod generated_production_cache_version_tests {
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    use super::{
+        CATALOG_SCHEMA_VERSION, default_semantic_pack_catalog_root_with_override,
+        generated_production_digest_for_cache_version,
+    };
+
+    #[test]
+    fn cache_version_separates_generated_production_identity() {
+        let input = "a".repeat(64);
+        let first = generated_production_digest_for_cache_version(
+            &input,
+            "fixture-producer",
+            "1.0.0",
+            1,
+            1,
+        );
+        let second = generated_production_digest_for_cache_version(
+            &input,
+            "fixture-producer",
+            "1.0.0",
+            1,
+            2,
+        );
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn explicit_cache_root_shares_generated_productions_across_workspaces() {
+        let cache_root = OsString::from("shared-semantic-packs");
+        let first = default_semantic_pack_catalog_root_with_override(
+            Path::new("workspace-a"),
+            Some(cache_root.clone()),
+        );
+        let second = default_semantic_pack_catalog_root_with_override(
+            Path::new("workspace-b"),
+            Some(cache_root),
+        );
+
+        assert_eq!(first, second);
+        assert_eq!(
+            first,
+            Path::new("shared-semantic-packs")
+                .join(format!("semantic-pack-catalog.v{CATALOG_SCHEMA_VERSION}"))
+        );
     }
 }

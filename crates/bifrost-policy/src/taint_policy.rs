@@ -105,8 +105,11 @@ pub(crate) enum TaintPolicyCompileError {
     },
     UnsupportedBinding(String),
     UnsupportedAuxiliarySemantics(&'static str),
-    EmptyCompiledSources,
-    EmptyCompiledSinks,
+    /// One or both endpoint sets bound no location in the scanned workspace.
+    /// The compile is not a failure: the run stays complete and vacuously
+    /// clean. The carried sets are what the run reports so a reader can tell a
+    /// vacuous verdict from a proven one (#2659).
+    EmptyCompiledEndpoints(EmptyEndpointSets),
     Model(String),
     Plan(String),
 }
@@ -153,11 +156,12 @@ impl fmt::Display for TaintPolicyCompileError {
                     "production taint {kind} lowering is not available"
                 )
             }
-            Self::EmptyCompiledSources => {
-                formatter.write_str("taint policy compiled to an empty source set")
-            }
-            Self::EmptyCompiledSinks => {
-                formatter.write_str("taint policy compiled to an empty sink set")
+            Self::EmptyCompiledEndpoints(empty) => {
+                write!(
+                    formatter,
+                    "taint policy compiled to an empty endpoint selection: {:?}",
+                    empty.named()
+                )
             }
             Self::Model(message) => write!(formatter, "taint model compilation failed: {message}"),
             Self::Plan(message) => write!(formatter, "taint plan compilation failed: {message}"),
@@ -195,9 +199,13 @@ enum TaintPolicyCompilation {
         /// must not report `Complete`.
         refusals: Vec<String>,
     },
+    /// A compile whose endpoint selection was empty, so there is nothing to
+    /// solve. The run is complete and clean, and `empty_endpoints` names the
+    /// sets that matched nothing so the report does not read as a proof.
     Clean {
         work: PolicyWorkReport,
         refusals: Vec<String>,
+        empty_endpoints: EmptyEndpointSets,
     },
 }
 
@@ -216,12 +224,26 @@ struct PreparedTaintPlan {
 /// reports a typed capability gap and names every refused row: reporting
 /// `Complete` would let a caller read "no finding" as proof about a site that
 /// was never analyzed (#2308).
-fn compiled_payload(work: PolicyWorkReport, refusals: Vec<String>) -> TaintProjectionPayload {
+///
+/// `empty_endpoints` is `Some` exactly when the compile produced no plan
+/// because an endpoint set bound nothing. That does not make the run
+/// incomplete -- there was nothing to analyze, and zero findings is the right
+/// answer -- but it is reported so a reader can tell a vacuous verdict from a
+/// proven one (#2659).
+fn compiled_payload(
+    policy_id: &PolicyId,
+    work: PolicyWorkReport,
+    refusals: Vec<String>,
+    empty_endpoints: Option<EmptyEndpointSets>,
+) -> TaintProjectionPayload {
+    let mut diagnostics = empty_endpoints
+        .map(|empty| empty_selection_diagnostics(policy_id, empty))
+        .unwrap_or_default();
     if refusals.is_empty() {
         return TaintProjectionPayload {
             projections: Vec::new(),
             completion: PolicyRunCompletion::Complete,
-            diagnostics: Vec::new(),
+            diagnostics,
             diagnostics_truncated: false,
             work,
             authored_arm_closures: Vec::new(),
@@ -230,20 +252,17 @@ fn compiled_payload(work: PolicyWorkReport, refusals: Vec<String>) -> TaintProje
     let completion =
         PolicyRunCompletion::inconclusive(vec![PolicyIncompleteReason::CapabilityIncomplete])
             .expect("one incomplete reason is canonical");
-    let diagnostics = refusals
-        .into_iter()
-        .filter_map(|message| {
-            PolicyDiagnostic::try_new(
-                PolicyDiagnosticCode::EvaluationFailure,
-                PolicyDiagnosticSeverity::Warning,
-                PolicyDiagnosticImpact::RunIncomplete,
-                message,
-                None,
-                Vec::new(),
-            )
-            .ok()
-        })
-        .collect();
+    diagnostics.extend(refusals.into_iter().filter_map(|message| {
+        PolicyDiagnostic::try_new(
+            PolicyDiagnosticCode::EvaluationFailure,
+            PolicyDiagnosticSeverity::Warning,
+            PolicyDiagnosticImpact::RunIncomplete,
+            message,
+            None,
+            Vec::new(),
+        )
+        .ok()
+    }));
     TaintProjectionPayload {
         projections: Vec::new(),
         completion,
@@ -252,6 +271,46 @@ fn compiled_payload(work: PolicyWorkReport, refusals: Vec<String>) -> TaintProje
         work,
         authored_arm_closures: Vec::new(),
     }
+}
+
+/// One advisory diagnostic per endpoint set that bound nothing (#2659).
+///
+/// The verdict stays `Complete` with zero findings, because zero findings over
+/// an empty selection is the correct answer. What the run must not do is look
+/// the same as a run that proved no flow between endpoints it actually found:
+/// #2659 saw one policy's kernel selectors name `dfb_source`/`dfb_sink` in a
+/// fixture that spells the methods differently, and the resulting clean report
+/// was read as a contradiction of a genuine `reached` verdict from a policy
+/// whose selectors matched. Both empty sets are named when both are empty.
+///
+/// The impact is `Advisory` and the severity `Note`: nothing about the run is
+/// incomplete, so downgrading the completion would make an honest negative
+/// unusable, which is the mistake
+/// `production_taint_balanced_negative_completes_without_findings` pins.
+fn empty_selection_diagnostics(
+    policy_id: &PolicyId,
+    empty: EmptyEndpointSets,
+) -> Vec<PolicyDiagnostic> {
+    empty
+        .named()
+        .into_iter()
+        .filter_map(|set| {
+            PolicyDiagnostic::try_new(
+                PolicyDiagnosticCode::EmptySelection,
+                PolicyDiagnosticSeverity::Note,
+                PolicyDiagnosticImpact::Advisory,
+                format!(
+                    "taint policy `{}` bound no {set} endpoint: its {set} selectors matched no \
+                     location in the scanned workspace, so this run reports zero findings \
+                     vacuously rather than proving that no flow exists",
+                    policy_id.as_str()
+                ),
+                None,
+                Vec::new(),
+            )
+            .ok()
+        })
+        .collect()
 }
 
 /// Render one diagnostic per refused selector row, naming the file, the row's
@@ -492,7 +551,10 @@ impl ProductionTaintPolicyEvaluator {
                     work,
                     refusals,
                 }) => {
-                    payloads.insert(policy_id.clone(), compiled_payload(work, refusals));
+                    payloads.insert(
+                        policy_id.clone(),
+                        compiled_payload(&policy_id, work, refusals, None),
+                    );
                     for compiled in roots {
                         metadata.insert(
                             compiled.internal_policy_id.clone(),
@@ -506,8 +568,14 @@ impl ProductionTaintPolicyEvaluator {
                         plans.push(compiled.plan);
                     }
                 }
-                Ok(TaintPolicyCompilation::Clean { work, refusals }) => {
-                    payloads.insert(policy_id, compiled_payload(work, refusals));
+                Ok(TaintPolicyCompilation::Clean {
+                    work,
+                    refusals,
+                    empty_endpoints,
+                }) => {
+                    let payload =
+                        compiled_payload(&policy_id, work, refusals, Some(empty_endpoints));
+                    payloads.insert(policy_id, payload);
                 }
                 Err(failure) => {
                     payloads.insert(policy_id, prepared_compile_failure_payload(*failure));
@@ -632,6 +700,49 @@ pub(crate) struct TaintPolicyCompiler<'a> {
     /// It is consulted only where the oracle relation retains no mapping, and
     /// computed once per pair because it costs one extra selector scan.
     named_actuals: HashMap<(PolicySelectorPath, String), NamedActualSpans>,
+    /// How many source and sink endpoint locations the compile bound, reported
+    /// on every taint run so a raw report says what the policy's endpoint
+    /// selectors actually matched in this workspace (#2659).
+    bound_endpoints: BoundEndpointCounts,
+}
+
+/// The number of endpoint locations one taint compile bound, per endpoint set.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct BoundEndpointCounts {
+    sources: usize,
+    sinks: usize,
+}
+
+/// Which endpoint set(s) of one taint policy bound no location at all (#2659).
+///
+/// A policy whose source or sink selectors match nothing compiles to an empty
+/// relation, and the solve over it is vacuously clean. The verdict is honest --
+/// there is no flow, because there is no endpoint -- but it is indistinguishable
+/// from a proven-clean run unless the report says the selection was empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EmptyEndpointSets {
+    sources: bool,
+    sinks: bool,
+}
+
+impl EmptyEndpointSets {
+    const fn any(self) -> bool {
+        self.sources || self.sinks
+    }
+
+    /// Every empty set, source before sink. Both are named when both are
+    /// empty: a reader repairing the policy needs the complete list, not the
+    /// first mistake the compiler happened to notice.
+    fn named(self) -> Vec<&'static str> {
+        let mut sets = Vec::new();
+        if self.sources {
+            sets.push("source");
+        }
+        if self.sinks {
+            sets.push("sink");
+        }
+        sets
+    }
 }
 
 type SelectedSite = super::selector_compiler::PolicySelectedSite;
@@ -854,6 +965,15 @@ struct DiscoveryMaterializationCache {
     /// hits, so `procedure_misses` counts only genuinely new procedures and the
     /// handle-identity component of it is zero.
     handle_identity_reuses: u64,
+    /// Per-artifact index from a procedure to the procedures it lexically
+    /// encloses, built once per artifact key (#2640).
+    lexical_children: HashMap<
+        SemanticArtifactKey,
+        HashMap<
+            brokk_bifrost_analysis::analyzer::semantic::ProcedureId,
+            Vec<brokk_bifrost_analysis::analyzer::semantic::ProcedureId>,
+        >,
+    >,
 }
 
 impl DiscoveryMaterializationCache {
@@ -879,6 +999,39 @@ impl DiscoveryMaterializationCache {
         canonical
             .procedure_handle(procedure.id())
             .expect("one artifact key denotes one procedure table in every materialization")
+    }
+
+    /// Every procedure `procedure` lexically encloses, as handles on
+    /// `procedure`'s own artifact instance.
+    ///
+    /// The index is built once per artifact key because a discovery asks this
+    /// of every procedure it visits, and rescanning the artifact's procedure
+    /// table on each visit is quadratic in the file's callable count.
+    fn lexical_children(&mut self, procedure: &ProcedureHandle) -> Vec<ProcedureHandle> {
+        let artifact = Arc::clone(procedure.artifact());
+        let index = self
+            .lexical_children
+            .entry(artifact.key().clone())
+            .or_insert_with(|| {
+                let mut index: HashMap<_, Vec<_>> = HashMap::new();
+                for child in artifact.procedures() {
+                    if let Some(parent) = child.lexical_parent() {
+                        index.entry(parent).or_default().push(child.id());
+                    }
+                }
+                index
+            });
+        let Some(children) = index.get(&procedure.id()) else {
+            return Vec::new();
+        };
+        children
+            .iter()
+            .map(|id| {
+                artifact
+                    .procedure_handle(*id)
+                    .expect("a live artifact owns each retained procedure")
+            })
+            .collect()
     }
 }
 
@@ -909,6 +1062,7 @@ impl<'a> TaintPolicyCompiler<'a> {
             formal_slot_names: HashMap::new(),
             syntax_trees: HashMap::new(),
             named_actuals: HashMap::new(),
+            bound_endpoints: BoundEndpointCounts::default(),
         }
     }
 
@@ -917,23 +1071,26 @@ impl<'a> TaintPolicyCompiler<'a> {
         policy: &LoadedPolicy,
         spec: &ResolvedTaintPolicySpec,
     ) -> Result<TaintPolicyCompilation, Box<TaintPolicyCompileFailure>> {
-        match self.compile_inner(policy, spec) {
+        let compiled = self.compile_inner(policy, spec);
+        // Every taint run reports what its endpoint selectors bound, so a raw
+        // report distinguishes a proven verdict from one taken over an empty
+        // relation without re-running the policy (#2659).
+        let mut work = self.selectors.work_report("taint");
+        record_endpoint_metrics(&mut work, self.bound_endpoints);
+        match compiled {
             Ok(compiled) => Ok(TaintPolicyCompilation::Plans {
                 roots: compiled,
-                work: self.selectors.work_report("taint"),
+                work,
                 refusals: refusal_messages(&self.refused_sites),
             }),
-            Err(
-                TaintPolicyCompileError::EmptyCompiledSources
-                | TaintPolicyCompileError::EmptyCompiledSinks,
-            ) => Ok(TaintPolicyCompilation::Clean {
-                work: self.selectors.work_report("taint"),
-                refusals: refusal_messages(&self.refused_sites),
-            }),
-            Err(error) => Err(Box::new(TaintPolicyCompileFailure {
-                error,
-                work: self.selectors.work_report("taint"),
-            })),
+            Err(TaintPolicyCompileError::EmptyCompiledEndpoints(empty_endpoints)) => {
+                Ok(TaintPolicyCompilation::Clean {
+                    work,
+                    refusals: refusal_messages(&self.refused_sites),
+                    empty_endpoints,
+                })
+            }
+            Err(error) => Err(Box::new(TaintPolicyCompileFailure { error, work })),
         }
     }
 
@@ -1025,11 +1182,19 @@ impl<'a> TaintPolicyCompiler<'a> {
                 }
             }
         }
-        if all_sources.is_empty() {
-            return Err(TaintPolicyCompileError::EmptyCompiledSources);
-        }
-        if all_sinks.is_empty() {
-            return Err(TaintPolicyCompileError::EmptyCompiledSinks);
+        self.bound_endpoints = BoundEndpointCounts {
+            sources: all_sources.len(),
+            sinks: all_sinks.len(),
+        };
+        // Both sets are tested before returning, so a policy whose source and
+        // sink selectors both match nothing reports both rather than only the
+        // first one the compiler happened to reach (#2659).
+        let empty = EmptyEndpointSets {
+            sources: all_sources.is_empty(),
+            sinks: all_sinks.is_empty(),
+        };
+        if empty.any() {
+            return Err(TaintPolicyCompileError::EmptyCompiledEndpoints(empty));
         }
 
         let mut stable_classes = spec
@@ -1358,24 +1523,69 @@ impl<'a> TaintPolicyCompiler<'a> {
             let named;
             let effective = match binding {
                 PolicyPort::ArgumentName { name } => {
-                    match self.resolve_named_argument(call, name, selector, &selection.file)? {
-                        NamedArgumentResolution::Bound(bound) => {
-                            named = PolicyPort::ArgumentIndex { index: bound.index };
-                            Some((&named, bound.proof, bound.completeness))
+                    if let Some(row) = selection.call_binding.as_ref() {
+                        if row.formal_name != *name {
+                            return Err(TaintPolicyCompileError::UnsupportedBinding(format!(
+                                "selected call-binding row maps formal `{}`, not requested formal `{name}`",
+                                row.formal_name
+                            )));
                         }
-                        NamedArgumentResolution::Unidentified(detail) => {
-                            self.refused_sites.push(RefusedCallSite {
-                                file: selection.file.clone(),
-                                span: selection.span.clone(),
-                                reason: RefusalReason::UnidentifiedFormal {
-                                    name: name.clone(),
-                                    detail,
-                                },
-                                procedures: vec![procedure.durable_key()],
-                            });
-                            None
+                        named = PolicyPort::ArgumentIndex {
+                            index: u32::try_from(row.actual_index).map_err(|_| {
+                                TaintPolicyCompileError::UnsupportedBinding(
+                                    "selected actual index does not fit the policy port".to_owned(),
+                                )
+                            })?,
+                        };
+                        Some((&named, ProofStatus::Proven, EvidenceCompleteness::Complete))
+                    } else {
+                        match self.resolve_named_argument(call, name, selector, &selection.file)? {
+                            NamedArgumentResolution::Bound(bound) => {
+                                named = PolicyPort::ArgumentIndex { index: bound.index };
+                                Some((&named, bound.proof, bound.completeness))
+                            }
+                            NamedArgumentResolution::Unidentified(detail) => {
+                                self.refused_sites.push(RefusedCallSite {
+                                    file: selection.file.clone(),
+                                    span: selection.span.clone(),
+                                    reason: RefusalReason::UnidentifiedFormal {
+                                        name: name.clone(),
+                                        detail,
+                                    },
+                                    procedures: vec![procedure.durable_key()],
+                                });
+                                None
+                            }
                         }
                     }
+                }
+                PolicyPort::ArgumentIndex { index }
+                    if selection.call_binding.as_ref().is_some_and(|row| {
+                        usize::try_from(*index).ok() != Some(row.formal_index)
+                    }) =>
+                {
+                    let row = selection
+                        .call_binding
+                        .as_ref()
+                        .expect("guard established relational call binding");
+                    return Err(TaintPolicyCompileError::UnsupportedBinding(format!(
+                        "selected call-binding row maps formal index {}, not requested formal index {index}",
+                        row.formal_index
+                    )));
+                }
+                PolicyPort::ArgumentIndex { .. } if selection.call_binding.as_ref().is_some() => {
+                    let row = selection
+                        .call_binding
+                        .as_ref()
+                        .expect("guard established relational call binding");
+                    named = PolicyPort::ArgumentIndex {
+                        index: u32::try_from(row.actual_index).map_err(|_| {
+                            TaintPolicyCompileError::UnsupportedBinding(
+                                "selected actual index does not fit the policy port".to_owned(),
+                            )
+                        })?,
+                    };
+                    Some((&named, ProofStatus::Proven, EvidenceCompleteness::Complete))
                 }
                 _ => Some((binding, ProofStatus::Proven, EvidenceCompleteness::Complete)),
             };
@@ -2053,6 +2263,27 @@ impl<'a> TaintPolicyCompiler<'a> {
                 input
             };
             snapshots.push(snapshot_input);
+
+            // A nested callable's body belongs to its enclosing procedure's
+            // analysis region even when no call in the region resolves to it
+            // (#2640). The forward closure over calls alone cannot reach a
+            // lambda, closure, Ruby block, or anonymous class body: the
+            // invocation that runs it dispatches on an interface method, a
+            // higher-order library callee, or a runtime block, never on the
+            // nested procedure's own declaration, so the nested body entered no
+            // region and a sink inside it was co-located with no source. The
+            // whole compile then declined with "no analysis root contains both
+            // a selected source and sink".
+            //
+            // Lexical containment answers this structurally: it needs no
+            // dispatch resolution, it is available in every language that
+            // lowers nested callables, and the parent links are validated
+            // acyclic, so the closure still terminates. Widening the region is
+            // also the right half to change -- the containment test below is
+            // durable-key membership and stays exact.
+            for child in cache.lexical_children(&procedure) {
+                pending.push(child);
+            }
 
             for call_row in procedure.semantics().call_sites() {
                 let call = procedure
@@ -2813,6 +3044,27 @@ fn solve_and_project_batch(
     public_findings.extend(projected_findings);
     retained_analyses.push(retained);
     Ok(())
+}
+
+/// Publish the compile's bound endpoint counts on the run's work report.
+///
+/// Reported unconditionally, including the zeros: a permanent zero is exactly
+/// the signal a reader of a raw benchmark artifact needs, because it says the
+/// policy's selectors bound nothing here rather than that the analysis found
+/// nothing (#2659).
+fn record_endpoint_metrics(work: &mut PolicyWorkReport, counts: BoundEndpointCounts) {
+    for (name, value) in [
+        ("taint.compiled_source_endpoints", counts.sources),
+        ("taint.compiled_sink_endpoints", counts.sinks),
+    ] {
+        increment_work_metric(
+            work,
+            name,
+            PolicyWorkUnit::Count,
+            u64::try_from(value).unwrap_or(u64::MAX),
+        )
+        .expect("two endpoint-count metrics fit the taint work report");
+    }
 }
 
 fn increment_work_metric(
@@ -3649,8 +3901,7 @@ fn prepared_compile_failure_payload(failure: TaintPolicyCompileFailure) -> Taint
         | TaintPolicyCompileError::SemanticProvider(_)
         | TaintPolicyCompileError::Model(_)
         | TaintPolicyCompileError::Plan(_) => None,
-        TaintPolicyCompileError::EmptyCompiledSources
-        | TaintPolicyCompileError::EmptyCompiledSinks => {
+        TaintPolicyCompileError::EmptyCompiledEndpoints(_) => {
             unreachable!("empty endpoint selections are handled as clean compilations")
         }
     };
@@ -3748,6 +3999,13 @@ fn select_call(
     procedures: &[ProcedureHandle],
     selection: &SelectedSite,
 ) -> Result<SelectedCallSites, TaintPolicyCompileError> {
+    let selected_call_span = selection
+        .call_binding
+        .as_ref()
+        .map_or(&selection.span, |binding| {
+            binding.assert_valid_identity();
+            &binding.call_span
+        });
     let mut candidates = Vec::new();
     for procedure in procedures {
         for call in procedure.semantics().call_sites() {
@@ -3757,9 +4015,9 @@ fn select_call(
                 .expect("validated semantic call has a source mapping");
             let span = mapping.locator.anchor().span();
             let call_range = span.start_byte() as usize..span.end_byte() as usize;
-            let exact = call_range == selection.span;
-            let enclosing =
-                call_range.start <= selection.span.start && call_range.end >= selection.span.end;
+            let exact = call_range == *selected_call_span;
+            let enclosing = call_range.start <= selected_call_span.start
+                && call_range.end >= selected_call_span.end;
             if exact || enclosing {
                 let handle = procedure
                     .call_site_handle(call.id)

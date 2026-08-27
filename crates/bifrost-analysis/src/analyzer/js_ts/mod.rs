@@ -24,8 +24,9 @@ use crate::analyzer::store::LimitedQueryRows;
 pub(crate) use brokk_bifrost_js_ts::imports::resolve_js_ts_module_specifier;
 pub(crate) use brokk_bifrost_js_ts::tsconfig::AliasResolver;
 pub use external::{
-    JsTsDependencyPackAdapter, TypeScriptDeclarationPackProducer,
-    resolve_js_ts_semantic_pack_dependencies,
+    JsTsDependencyPackAdapter, TYPESCRIPT_STDLIB_PACKAGE, TYPESCRIPT_STDLIB_VERSION,
+    TypeScriptDeclarationPackProducer, TypeScriptLibraryActivationOutcome,
+    resolve_js_ts_semantic_pack_dependencies, typescript_library_activation_evidence,
 };
 
 use crate::analyzer::cognitive_complexity;

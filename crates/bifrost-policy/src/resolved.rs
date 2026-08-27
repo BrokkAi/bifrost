@@ -71,14 +71,97 @@ pub enum SelectorOrigin {
     },
 }
 
-/// A typed query at its stable policy path after file loading and version resolution.
+/// The fully loaded selector body. A row selector retains the complete plan;
+/// it does not collapse its many query bindings into one compatibility query.
+#[derive(Debug, Clone)]
+pub enum ResolvedPolicySelectorKind {
+    Query {
+        schema_resolution: SchemaVersionResolution,
+        query: CodeQuery,
+    },
+    Rows {
+        plan: RowSelectorPlan,
+    },
+}
+
+/// A typed selector at its stable policy path after file loading and version
+/// resolution.
 #[derive(Debug, Clone)]
 pub struct ResolvedPolicySelector {
     pub path: PolicySelectorPath,
-    pub schema_resolution: SchemaVersionResolution,
-    pub query: CodeQuery,
+    pub kind: ResolvedPolicySelectorKind,
     pub semantic_hash: ResolvedSelectorSemanticHash,
     pub origin: SelectorOrigin,
+}
+
+/// One independently resolved query binding inside a row selector.
+#[derive(Debug, Clone)]
+pub struct ResolvedSelectorQueryBinding<'a> {
+    pub name: &'a RowBindingName,
+    pub path: String,
+    pub schema_resolution: SchemaVersionResolution,
+    pub query: &'a CodeQuery,
+}
+
+/// The schema identity of an endpoint selector without inventing a root query
+/// for a multi-binding row plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedEndpointSelectorSchemas {
+    Query(SchemaVersionResolution),
+    Rows(Vec<ResolvedEndpointRowBindingSchema>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedEndpointRowBindingSchema {
+    pub path: PolicySelectorPath,
+    pub resolution: SchemaVersionResolution,
+}
+
+impl ResolvedEndpointSelectorSchemas {
+    pub(crate) fn from_selector(selector: &ResolvedPolicySelector) -> Self {
+        if let Some((schema, _)) = selector.as_query() {
+            return Self::Query(*schema);
+        }
+        Self::Rows(
+            selector
+                .query_bindings()
+                .into_iter()
+                .map(|binding| ResolvedEndpointRowBindingSchema {
+                    path: PolicySelectorPath::new(&binding.path)
+                        .expect("resolved row binding selector path is valid"),
+                    resolution: binding.schema_resolution,
+                })
+                .collect(),
+        )
+    }
+
+    pub const fn as_query(&self) -> Option<SchemaVersionResolution> {
+        match self {
+            Self::Query(resolution) => Some(*resolution),
+            Self::Rows(_) => None,
+        }
+    }
+
+    pub fn as_rows(&self) -> Option<&[ResolvedEndpointRowBindingSchema]> {
+        match self {
+            Self::Query(_) => None,
+            Self::Rows(bindings) => Some(bindings),
+        }
+    }
+
+    pub fn same_effective_versions(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Query(left), Self::Query(right)) => left.version == right.version,
+            (Self::Rows(left), Self::Rows(right)) => {
+                left.len() == right.len()
+                    && left.iter().zip(right).all(|(left, right)| {
+                        left.path == right.path
+                            && left.resolution.version == right.resolution.version
+                    })
+            }
+            (Self::Query(_), Self::Rows(_)) | (Self::Rows(_), Self::Query(_)) => false,
+        }
+    }
 }
 
 impl ResolvedPolicySelector {
@@ -99,11 +182,96 @@ impl ResolvedPolicySelector {
             ResolvedSelectorSemanticHash::from_query(schema_resolution.version, &query);
         Ok(Self {
             path,
-            schema_resolution,
-            query,
+            kind: ResolvedPolicySelectorKind::Query {
+                schema_resolution,
+                query,
+            },
             semantic_hash,
             origin,
         })
+    }
+
+    pub fn try_new_rows(
+        path: PolicySelectorPath,
+        plan: RowSelectorPlan,
+        origin: SelectorOrigin,
+    ) -> Result<Self, LoadedModelError> {
+        if !plan.bindings.iter().any(|binding| {
+            matches!(
+                &binding.source,
+                RowBindingSource::Query(PolicySelector::Inline { .. })
+            )
+        }) {
+            return Err(LoadedModelError::InvalidResolvedModel {
+                reason: "row selector requires an inline query binding",
+            });
+        }
+        if plan.bindings.iter().any(|binding| {
+            matches!(
+                &binding.source,
+                RowBindingSource::Query(PolicySelector::File { .. } | PolicySelector::Rows { .. })
+            )
+        }) {
+            return Err(LoadedModelError::InvalidResolvedModel {
+                reason: "row selector query bindings must be inline",
+            });
+        }
+        let semantic_hash = ResolvedSelectorSemanticHash::from_rows(&plan);
+        Ok(Self {
+            path,
+            kind: ResolvedPolicySelectorKind::Rows { plan },
+            semantic_hash,
+            origin,
+        })
+    }
+
+    pub fn as_query(&self) -> Option<(&SchemaVersionResolution, &CodeQuery)> {
+        match &self.kind {
+            ResolvedPolicySelectorKind::Query {
+                schema_resolution,
+                query,
+            } => Some((schema_resolution, query)),
+            ResolvedPolicySelectorKind::Rows { .. } => None,
+        }
+    }
+
+    pub fn as_rows(&self) -> Option<&RowSelectorPlan> {
+        match &self.kind {
+            ResolvedPolicySelectorKind::Query { .. } => None,
+            ResolvedPolicySelectorKind::Rows { plan } => Some(plan),
+        }
+    }
+
+    /// Enumerate every query binding in authored order. Each query remains an
+    /// independently typed source; no row selector is reduced to a synthetic
+    /// compatibility query.
+    pub fn query_bindings(&self) -> Vec<ResolvedSelectorQueryBinding<'_>> {
+        let Some(plan) = self.as_rows() else {
+            return Vec::new();
+        };
+        plan.bindings
+            .iter()
+            .filter_map(|binding| {
+                let RowBindingSource::Query(PolicySelector::Inline { schema, query }) =
+                    &binding.source
+                else {
+                    return None;
+                };
+                Some(ResolvedSelectorQueryBinding {
+                    name: &binding.name,
+                    path: row_selector_binding_selector_path(self.path.as_str(), &binding.name),
+                    schema_resolution: *schema,
+                    query,
+                })
+            })
+            .collect()
+    }
+
+    pub fn query_schemas(&self) -> Vec<SchemaVersionResolution> {
+        self.query_bindings()
+            .into_iter()
+            .map(|binding| binding.schema_resolution)
+            .collect()
     }
 }
 
@@ -223,7 +391,7 @@ pub struct ResolvedEndpointDependency {
     pub(crate) identity: ResolvedEndpointIdentity,
     pub(crate) definition_schema: EndpointDefinitionSchemaResolution,
     pub(crate) selector_path: PolicySelectorPath,
-    pub(crate) selector_schema: SchemaVersionResolution,
+    pub(crate) selector_schemas: ResolvedEndpointSelectorSchemas,
     pub(crate) model: ResolvedEndpointModel,
     pub(crate) semantic_hash: EndpointSemanticHash,
     pub(crate) analysis_projection_hash: EndpointAnalysisProjectionHash,
@@ -236,7 +404,7 @@ impl ResolvedEndpointDependency {
         identity: ResolvedEndpointIdentity,
         definition_schema: EndpointDefinitionSchemaResolution,
         selector_path: PolicySelectorPath,
-        selector_schema: SchemaVersionResolution,
+        selector_schemas: ResolvedEndpointSelectorSchemas,
         model: ResolvedEndpointModel,
         semantic_hash: EndpointSemanticHash,
         analysis_projection_hash: EndpointAnalysisProjectionHash,
@@ -248,7 +416,7 @@ impl ResolvedEndpointDependency {
             identity,
             definition_schema,
             selector_path,
-            selector_schema,
+            selector_schemas,
             model,
             semantic_hash,
             analysis_projection_hash,
@@ -268,8 +436,8 @@ impl ResolvedEndpointDependency {
         &self.selector_path
     }
 
-    pub const fn selector_schema(&self) -> SchemaVersionResolution {
-        self.selector_schema
+    pub const fn selector_schemas(&self) -> &ResolvedEndpointSelectorSchemas {
+        &self.selector_schemas
     }
 
     pub fn model(&self) -> &ResolvedEndpointModel {
@@ -331,11 +499,12 @@ impl ResolvedEndpointDependency {
             selector,
             &model,
         );
+        let selector_schemas = ResolvedEndpointSelectorSchemas::from_selector(selector);
         Ok(Self::new(
             identity,
             definition_schema,
             selector.path.clone(),
-            selector.schema_resolution,
+            selector_schemas,
             model,
             semantic_hash,
             analysis_projection_hash,
@@ -377,6 +546,7 @@ impl ResolvedEndpointDependency {
             endpoint.definition.taint.clone(),
             supersedes,
         );
+        let selector_schemas = ResolvedEndpointSelectorSchemas::from_selector(selector);
         Ok(Self::new(
             ResolvedEndpointIdentity::MatchEndpoint {
                 endpoint_id: endpoint.definition.id.clone(),
@@ -385,7 +555,7 @@ impl ResolvedEndpointDependency {
                 resolution: endpoint.schema_resolution,
             },
             selector.path.clone(),
-            selector.schema_resolution,
+            selector_schemas,
             model,
             endpoint.semantic_hash,
             endpoint.analysis_projection_hash,
@@ -398,7 +568,7 @@ impl ResolvedEndpointDependency {
 pub struct ResolvedEndpointManifestEntry {
     pub identity: ResolvedEndpointIdentity,
     pub definition_schema: EndpointDefinitionSchemaResolution,
-    pub selector_schema: SchemaVersionResolution,
+    pub selector_schemas: ResolvedEndpointSelectorSchemas,
     pub semantic_hash: EndpointSemanticHash,
     pub analysis_projection_hash: EndpointAnalysisProjectionHash,
 }
@@ -408,7 +578,7 @@ impl From<&ResolvedEndpointDependency> for ResolvedEndpointManifestEntry {
         Self {
             identity: dependency.identity.clone(),
             definition_schema: dependency.definition_schema.clone(),
-            selector_schema: dependency.selector_schema,
+            selector_schemas: dependency.selector_schemas.clone(),
             semantic_hash: dependency.semantic_hash,
             analysis_projection_hash: dependency.analysis_projection_hash,
         }
@@ -1318,17 +1488,24 @@ fn validate_loaded_policy_model(
     resolved_typestate: Option<&ResolvedTypestatePolicySpec>,
 ) -> Result<(), LoadedModelError> {
     for selector in selectors {
-        if u64::from(selector.schema_resolution.version) != selector.query.schema_version {
-            return Err(LoadedModelError::SelectorSchemaMismatch {
-                path: selector.path.clone(),
-                resolution: selector.schema_resolution.version,
-                query: selector.query.schema_version,
-            });
-        }
-        let expected = ResolvedSelectorSemanticHash::from_query(
-            selector.schema_resolution.version,
-            &selector.query,
-        );
+        let expected = match &selector.kind {
+            ResolvedPolicySelectorKind::Query {
+                schema_resolution,
+                query,
+            } => {
+                if u64::from(schema_resolution.version) != query.schema_version {
+                    return Err(LoadedModelError::SelectorSchemaMismatch {
+                        path: selector.path.clone(),
+                        resolution: schema_resolution.version,
+                        query: query.schema_version,
+                    });
+                }
+                ResolvedSelectorSemanticHash::from_query(schema_resolution.version, query)
+            }
+            ResolvedPolicySelectorKind::Rows { plan } => {
+                ResolvedSelectorSemanticHash::from_rows(plan)
+            }
+        };
         if selector.semantic_hash != expected {
             return Err(LoadedModelError::SelectorHashMismatch {
                 path: selector.path.clone(),
@@ -1376,7 +1553,9 @@ fn validate_loaded_policy_model(
             .ok_or_else(|| LoadedModelError::MissingSelectorPath {
                 path: dependency.selector_path.clone(),
             })?;
-        if selector.schema_resolution.version != dependency.selector_schema.version {
+        if !ResolvedEndpointSelectorSchemas::from_selector(selector)
+            .same_effective_versions(&dependency.selector_schemas)
+        {
             return invalid("endpoint dependency selector schema does not match its selector");
         }
         for target in &dependency.model.supersedes {
@@ -1417,7 +1596,9 @@ fn validate_loaded_policy_model(
                 },
             )?;
             if dependency.definition_schema.version() != entry.definition_schema.version()
-                || dependency.selector_schema.version != entry.selector_schema.version
+                || !dependency
+                    .selector_schemas
+                    .same_effective_versions(&entry.selector_schemas)
                 || dependency.semantic_hash != entry.semantic_hash
                 || dependency.analysis_projection_hash != entry.analysis_projection_hash
             {
@@ -2529,8 +2710,11 @@ fn validate_authored_selector_resolution(
 ) -> Result<(), LoadedModelError> {
     match authored {
         PolicySelector::Inline { schema, query } => {
-            if resolved.schema_resolution.version != schema.version
-                || resolved.query.to_canonical_query_plan_json()
+            let Some((resolved_schema, resolved_query)) = resolved.as_query() else {
+                return invalid("resolved inline selector has a row-selector kind");
+            };
+            if resolved_schema.version != schema.version
+                || resolved_query.to_canonical_query_plan_json()
                     != query.to_canonical_query_plan_json()
                 || !matches!(resolved.origin, SelectorOrigin::Document { .. })
             {
@@ -2563,11 +2747,23 @@ fn validate_authored_selector_resolution(
                 brokk_bifrost_analysis::schema_version::SchemaVersionOrigin::ImplicitCompatible
             };
             let expected_version = document_authored_schema_version.or(*authored_schema_version);
-            if resolved.schema_resolution.origin != expected_origin
-                || expected_version
-                    .is_some_and(|version| version != resolved.schema_resolution.version)
+            let Some((resolved_schema, _)) = resolved.as_query() else {
+                return invalid("resolved file selector has a row-selector kind");
+            };
+            if resolved_schema.origin != expected_origin
+                || expected_version.is_some_and(|version| version != resolved_schema.version)
             {
                 return invalid("resolved file selector version precedence is inconsistent");
+            }
+        }
+        PolicySelector::Rows { plan } => {
+            if resolved
+                .as_rows()
+                .map(super::canonical::row_selector_plan_to_json)
+                != Some(super::canonical::row_selector_plan_to_json(plan))
+                || !matches!(resolved.origin, SelectorOrigin::Document { .. })
+            {
+                return invalid("resolved row selector differs from its authored plan");
             }
         }
     }

@@ -463,6 +463,14 @@ fn ensure_inline_selector(
                 path: path.as_str().to_string(),
             })
         }
+        PolicySelector::Rows { plan } => {
+            for binding in &plan.bindings {
+                if let RowBindingSource::Query(selector) = &binding.source {
+                    ensure_inline_selector(selector)?;
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -973,6 +981,7 @@ fn policy_assert_to_json(assertion: &PolicyAssert) -> Value {
         PolicyAssert::Resolution(assertion) => resolution_assert_to_json(assertion),
         PolicyAssert::BindingScope(assertion) => binding_scope_assert_to_json(assertion),
         PolicyAssert::ValueOrigin(assertion) => value_origin_assert_to_json(assertion),
+        PolicyAssert::OriginShape(assertion) => origin_shape_assert_to_json(assertion),
         PolicyAssert::Boundary(assertion) => boundary_assert_to_json(assertion),
         PolicyAssert::Generation(assertion) => generation_assert_to_json(assertion),
         PolicyAssert::DeclarationState(assertion) => declaration_state_assert_to_json(assertion),
@@ -1250,6 +1259,18 @@ fn binding_scope_assert_to_json(assertion: &BindingScopeAssert) -> Value {
     Value::Object(object)
 }
 
+fn origin_shape_assert_to_json(assertion: &OriginShapeAssert) -> Value {
+    let mut object = serde_json::Map::new();
+    insert(&mut object, "kind", json!("origin_shape"));
+    insert(&mut object, "id", json!(assertion.id.as_str()));
+    insert(&mut object, "at", json!(assertion.at));
+    insert(&mut object, "anchor", json!(assertion.anchor));
+    insert(&mut object, "role", json!(assertion.role.label()));
+    insert(&mut object, "shape", json!(assertion.shape.label()));
+    insert(&mut object, "max_elements", json!(assertion.max_elements));
+    Value::Object(object)
+}
+
 fn value_origin_assert_to_json(assertion: &ValueOriginAssert) -> Value {
     let mut object = serde_json::Map::new();
     insert(&mut object, "kind", json!("value_origin"));
@@ -1333,7 +1354,7 @@ fn policy_severity_to_json(severity: &PolicySeveritySpec) -> Value {
     }
 }
 
-fn selector_to_json(selector: &PolicySelector) -> Value {
+pub(crate) fn selector_to_json(selector: &PolicySelector) -> Value {
     match selector {
         PolicySelector::Inline { schema, query } => {
             json!({
@@ -1355,7 +1376,40 @@ fn selector_to_json(selector: &PolicySelector) -> Value {
             insert(&mut object, "path", json!(path.as_str()));
             Value::Object(object)
         }
+        PolicySelector::Rows { plan } => row_selector_plan_to_json(plan),
     }
+}
+
+pub(crate) fn row_selector_plan_to_json(plan: &RowSelectorPlan) -> Value {
+    let mut object = Map::new();
+    insert(
+        &mut object,
+        "bindings",
+        Value::Array(plan.bindings.iter().map(row_binding_to_json).collect()),
+    );
+    if !plan.derivations.is_empty() {
+        insert(
+            &mut object,
+            "derivations",
+            Value::Array(
+                plan.derivations
+                    .iter()
+                    .map(row_derivation_to_json)
+                    .collect(),
+            ),
+        );
+    }
+    if !plan.joins.is_empty() {
+        insert(
+            &mut object,
+            "joins",
+            Value::Array(plan.joins.iter().map(row_join_to_json).collect()),
+        );
+    }
+    insert(&mut object, "output", json!(plan.output.as_str()));
+    let mut tagged = tagged("rows");
+    insert(&mut tagged, "plan", Value::Object(object));
+    Value::Object(tagged)
 }
 
 fn endpoint_binding_to_json(binding: &PolicyEndpointBinding) -> Value {

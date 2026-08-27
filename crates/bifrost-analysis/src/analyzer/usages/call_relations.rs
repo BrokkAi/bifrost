@@ -1512,9 +1512,9 @@ fn python_receiver_resolves_to_class(
     if let Some(is_class) = cache.python_receiver_is_class.get(&key) {
         return *is_class;
     }
-    let is_class = analyzer
-        .indexed_source(file)
-        .map(Arc::<str>::from)
+    let source = analyzer.indexed_source(file).map(Arc::<str>::from);
+    let is_class = source
+        .clone()
         .and_then(|source| {
             resolve_definition_batch_with_source(
                 analyzer,
@@ -1551,9 +1551,70 @@ fn python_receiver_resolves_to_class(
                 Some(false)
             }
             _ => None,
+        })
+        .or_else(|| {
+            // The resolver adjudicates names. A receiver that is not a name --
+            // a call expression such as `make_store().put(key)` -- has no
+            // definition to look up, but its own syntax is the answer: a
+            // call's value is the callable's return value, an instance, never
+            // the class-reference spelling `Class.method(instance)` needs.
+            // Reaching this binding at all means the production resolver
+            // already attributed the member through that receiver's proven
+            // return type (#2495). The known boundary is a callable returning
+            // a class object, which is the same value-flow boundary as a
+            // local holding one.
+            python_receiver_is_call_expression(file, receiver, source.as_deref()).then_some(false)
         });
     cache.python_receiver_is_class.insert(key, is_class);
     is_class
+}
+
+/// Whether the receiver span is a call expression (possibly parenthesized) in
+/// the file's own tree. Answered from tree-sitter structure, never from text.
+fn python_receiver_is_call_expression(
+    file: &ProjectFile,
+    receiver: Range,
+    source: Option<&str>,
+) -> bool {
+    let Some(source) = source else {
+        return false;
+    };
+    let Some(tree) = parse_tree_for_language(file, Language::Python, source) else {
+        return false;
+    };
+    // Iterative descent to the smallest named node covering the receiver span.
+    let mut node = tree.root_node();
+    let mut smallest = None;
+    loop {
+        if node.is_named()
+            && node.start_byte() == receiver.start_byte
+            && node.end_byte() == receiver.end_byte
+        {
+            smallest = Some(node);
+        }
+        let mut descended = false;
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.start_byte() <= receiver.start_byte && receiver.end_byte <= child.end_byte() {
+                node = child;
+                descended = true;
+                break;
+            }
+        }
+        if !descended {
+            break;
+        }
+    }
+    let Some(mut node) = smallest else {
+        return false;
+    };
+    while node.kind() == "parenthesized_expression" {
+        let Some(inner) = node.named_child(0) else {
+            return false;
+        };
+        node = inner;
+    }
+    node.kind() == "call"
 }
 
 fn formal_slots_for_unit(

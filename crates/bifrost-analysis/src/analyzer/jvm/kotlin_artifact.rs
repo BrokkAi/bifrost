@@ -11,8 +11,8 @@ use crate::analyzer::semantic_model::{
     Completeness, ExactArtifact, ExternalArtifactKind, ExternalArtifactPackProducer, HierarchyFact,
     HierarchyKind, Locator, MemberFact, MemberIdentity, MemberKind, Parameter, Producer,
     ProducerDiagnostic, ProducerDiagnosticSeverity, Signature, StructuredTypeExpression, TypeFact,
-    TypeIdentity, TypeKind, TypeRef, Visibility, member_declaration_id, read_exact_artifact_while,
-    type_declaration_id,
+    TypeIdentity, TypeKind, TypeRef, Visibility, carried_source_paths, member_declaration_id,
+    read_exact_artifact_while, type_declaration_id,
 };
 use crate::analyzer::tree_sitter_analyzer::ParsedFile;
 use crate::analyzer::tree_walk::{first_named_child_of_kind, named_children};
@@ -1683,6 +1683,17 @@ fn finish(
     } else {
         Completeness::Partial
     };
+    // Every Source locator in these shards names an archive entry this
+    // producer parsed, so the pack carries them all.
+    let shards = vec![AuthoredShard {
+        id: "declarations.kotlin.external".to_owned(),
+        activation,
+        payload: AuthoredPayload::DeclarationFacts {
+            types,
+            members,
+            relations: Vec::new(),
+        },
+    }];
     ArtifactProduction {
         artifact_sha256: Some(digest.to_owned()),
         pack: Some(AuthoredSemanticModelPack {
@@ -1700,15 +1711,8 @@ fn finish(
             license: request.license.clone(),
             completeness,
             safety: request.safety.clone(),
-            shards: vec![AuthoredShard {
-                id: "declarations.kotlin.external".to_owned(),
-                activation,
-                payload: AuthoredPayload::DeclarationFacts {
-                    types,
-                    members,
-                    relations: Vec::new(),
-                },
-            }],
+            carried_sources: carried_source_paths(&shards),
+            shards,
         }),
         completeness,
         diagnostics,

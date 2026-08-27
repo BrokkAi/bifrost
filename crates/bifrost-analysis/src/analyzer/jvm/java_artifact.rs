@@ -5,8 +5,8 @@ use crate::analyzer::semantic_model::{
     ExactArtifact, ExternalArtifactKind, ExternalArtifactPackProducer, HierarchyFact,
     HierarchyKind, Locator, MemberFact, MemberIdentity, MemberKind, Parameter, Producer,
     ProducerDiagnostic, ProducerDiagnosticSeverity, Signature, TypeFact, TypeIdentity, TypeKind,
-    TypeRef, Visibility, WildcardVariance, member_declaration_id, read_exact_artifact_while,
-    type_declaration_id,
+    TypeRef, Visibility, WildcardVariance, carried_source_paths, member_declaration_id,
+    read_exact_artifact_while, type_declaration_id,
 };
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_jvm::java::declarations::{determine_package_name, node_text, parse_tree};
@@ -208,7 +208,10 @@ impl JavaJarPackProducer {
                 | ExternalArtifactKind::PythonSource
                 | ExternalArtifactKind::RubyGemArchive
                 | ExternalArtifactKind::ComposerPackageSourceSet
-                | ExternalArtifactKind::CppHeaderSourceSet => false,
+                | ExternalArtifactKind::CppHeaderSourceSet
+                | ExternalArtifactKind::JdkJmodSet
+                | ExternalArtifactKind::RustdocJsonSet
+                | ExternalArtifactKind::TypeScriptLibrarySet => false,
             };
             if !selected {
                 continue;
@@ -229,7 +232,10 @@ impl JavaJarPackProducer {
                 | ExternalArtifactKind::PythonSource
                 | ExternalArtifactKind::RubyGemArchive
                 | ExternalArtifactKind::ComposerPackageSourceSet
-                | ExternalArtifactKind::CppHeaderSourceSet => unreachable!(),
+                | ExternalArtifactKind::CppHeaderSourceSet
+                | ExternalArtifactKind::JdkJmodSet
+                | ExternalArtifactKind::RustdocJsonSet
+                | ExternalArtifactKind::TypeScriptLibrarySet => unreachable!(),
             };
             let next_total = total_bytes.saturating_add(entry.size());
             if entry.size() > entry_limit || next_total > MAX_TOTAL_ARCHIVE_BYTES {
@@ -296,7 +302,10 @@ impl JavaJarPackProducer {
                 | ExternalArtifactKind::PythonSource
                 | ExternalArtifactKind::RubyGemArchive
                 | ExternalArtifactKind::ComposerPackageSourceSet
-                | ExternalArtifactKind::CppHeaderSourceSet => unreachable!(),
+                | ExternalArtifactKind::CppHeaderSourceSet
+                | ExternalArtifactKind::JdkJmodSet
+                | ExternalArtifactKind::RustdocJsonSet
+                | ExternalArtifactKind::TypeScriptLibrarySet => unreachable!(),
             }
         }
         if request.artifact_kind == ExternalArtifactKind::JavaSourceJar {
@@ -356,7 +365,7 @@ impl JavaJarPackProducer {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ZipDirectoryStatus {
+pub(crate) enum ZipDirectoryStatus {
     Valid,
     Invalid,
     Exceeded,
@@ -366,7 +375,7 @@ pub(super) fn zip_directory_status(bytes: &[u8]) -> ZipDirectoryStatus {
     zip_directory_status_with_limits(bytes, MAX_ARCHIVE_ENTRIES, MAX_CENTRAL_DIRECTORY_BYTES)
 }
 
-pub(super) fn zip_directory_status_with_limits(
+pub(crate) fn zip_directory_status_with_limits(
     bytes: &[u8],
     max_entries: usize,
     max_directory_bytes: u64,
@@ -489,6 +498,17 @@ fn finish_production(
     } else {
         Completeness::Partial
     };
+    // Every Source locator in these shards names an archive entry this
+    // producer parsed, so the pack carries them all.
+    let shards = vec![AuthoredShard {
+        id: "declarations.external".to_owned(),
+        activation,
+        payload: AuthoredPayload::DeclarationFacts {
+            types,
+            members,
+            relations: Vec::new(),
+        },
+    }];
     ArtifactProduction {
         artifact_sha256: Some(artifact_sha256.to_owned()),
         pack: Some(AuthoredSemanticModelPack {
@@ -506,15 +526,8 @@ fn finish_production(
             license: request.license.clone(),
             completeness,
             safety: request.safety.clone(),
-            shards: vec![AuthoredShard {
-                id: "declarations.external".to_owned(),
-                activation,
-                payload: AuthoredPayload::DeclarationFacts {
-                    types,
-                    members,
-                    relations: Vec::new(),
-                },
-            }],
+            carried_sources: carried_source_paths(&shards),
+            shards,
         }),
         completeness,
         diagnostics,
@@ -1732,16 +1745,20 @@ enum ClassEntryResult {
 /// hierarchy, and written member names, so keeping this small view lets it
 /// consume the class entry it already read instead of producing a whole pack
 /// and parsing the class entry again.
-pub(super) struct JavaClassSurface {
+pub(crate) struct JavaClassSurface {
     pub(super) name: String,
     pub(super) package_name: String,
     pub(super) type_kind: TypeKind,
     pub(super) visibility: Visibility,
+    pub(super) is_abstract: bool,
+    pub(super) is_sealed: bool,
+    pub(super) type_parameters: Vec<String>,
     pub(super) hierarchy: Vec<HierarchyFact>,
+    pub(super) locator: Locator,
     pub(super) members: Vec<JavaClassSurfaceMember>,
 }
 
-pub(super) struct JavaClassSurfaceMember {
+pub(crate) struct JavaClassSurfaceMember {
     pub(super) name: String,
     pub(super) visibility: Visibility,
     /// The type the class file's member table writes as this member's return
@@ -1768,9 +1785,13 @@ pub(super) struct JavaClassSurfaceMember {
     /// `static final` external field indistinguishable from an ordinary
     /// mutable one to every caller of [`JavaClassSurface`].
     pub(super) member_kind: MemberKind,
+    pub(super) is_abstract: bool,
+    pub(super) is_virtual: bool,
+    pub(super) signature: Option<Signature>,
+    pub(super) locator: Locator,
 }
 
-pub(super) enum JavaClassSurfaceOutcome {
+pub(crate) enum JavaClassSurfaceOutcome {
     Declared(JavaClassSurface),
     Excluded,
     Skipped,
@@ -1782,7 +1803,7 @@ pub(super) enum JavaClassSurfaceOutcome {
 /// `remaining_records` is shared by the whole artifact, matching the limit
 /// used by full Java pack production. The caller applies its own member-surface
 /// budget when retaining the returned members.
-pub(super) fn class_surface(
+pub(crate) fn class_surface(
     jar_name: &str,
     class_entry: &str,
     bytes: &[u8],
@@ -1809,7 +1830,11 @@ pub(super) fn class_surface(
                 package_name: declaration.package_name,
                 type_kind: declaration.type_kind,
                 visibility: declaration.visibility,
+                is_abstract: declaration.is_abstract,
+                is_sealed: declaration.is_sealed,
+                type_parameters: declaration.type_parameters,
                 hierarchy: declaration.hierarchy,
+                locator: declaration.locator,
                 members: declaration
                     .members
                     .into_iter()
@@ -1818,7 +1843,14 @@ pub(super) fn class_surface(
                         visibility: member.visibility,
                         is_static: member.is_static,
                         member_kind: member.member_kind,
-                        returns: member.signature.and_then(|signature| signature.returns),
+                        returns: member
+                            .signature
+                            .as_ref()
+                            .and_then(|signature| signature.returns.clone()),
+                        is_abstract: member.is_abstract,
+                        is_virtual: member.is_virtual,
+                        signature: member.signature,
+                        locator: member.locator,
                     })
                     .collect(),
             })
@@ -1827,6 +1859,43 @@ pub(super) fn class_surface(
         ClassEntryResult::Skipped => JavaClassSurfaceOutcome::Skipped,
         ClassEntryResult::Invalid => JavaClassSurfaceOutcome::Invalid,
     }
+}
+
+/// Convert one parsed class surface into the same declaration facts emitted
+/// by the ordinary Java class-JAR producer. JMOD production uses this helper
+/// after reading a class entry from each module archive, so it does not need
+/// to parse class bytes a second time or maintain a parallel identity scheme.
+pub(crate) fn class_surface_facts(
+    surface: JavaClassSurface,
+    max_records: usize,
+    diagnostics: &mut BoundedProducerDiagnostics,
+) -> (Vec<TypeFact>, Vec<MemberFact>) {
+    let declaration = JavaApiType {
+        name: surface.name,
+        package_name: surface.package_name,
+        type_kind: surface.type_kind,
+        visibility: surface.visibility,
+        is_abstract: surface.is_abstract,
+        is_sealed: surface.is_sealed,
+        type_parameters: surface.type_parameters,
+        hierarchy: surface.hierarchy,
+        locator: surface.locator,
+        members: surface
+            .members
+            .into_iter()
+            .map(|member| JavaApiMember {
+                name: member.name,
+                member_kind: member.member_kind,
+                visibility: member.visibility,
+                is_static: member.is_static,
+                is_abstract: member.is_abstract,
+                is_virtual: member.is_virtual,
+                signature: member.signature,
+                locator: member.locator,
+            })
+            .collect(),
+    };
+    java_api_facts(vec![declaration], max_records, diagnostics)
 }
 
 fn class_api_type(

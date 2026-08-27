@@ -73,9 +73,9 @@ use brokk_bifrost_rql::structural::{
     OccurrenceTarget as InternalOccurrenceTarget, canonical_identity_of,
 };
 use brokk_bifrost_rql::{
-    BindingOfOptions, CandidateFilter, CodeQueryPlan, CodeQueryPlanSource, CodeQuerySeed,
-    GenerationSiteSeed, OccurrenceSeed, Pattern, QueryStep, SCHEMA_VERSION, ScopeSeed,
-    exact_path_globs,
+    ArityConstraint, BindingOfOptions, CandidateFilter, CodeQueryPlan, CodeQueryPlanSource,
+    CodeQuerySeed, GenerationSiteSeed, OccurrenceSeed, Pattern, QueryStep, SCHEMA_VERSION,
+    ScopeSeed, exact_path_globs,
 };
 use std::sync::Arc;
 
@@ -94,7 +94,7 @@ use super::definition::{
     CanonicalAssert, CvssEnvironmentalOrSupplementalMetric, CvssEvidenceScope, CvssMetric,
     CvssMetricValue, CvssSystemScope, CvssThreatMetric, DeclarationStateAssert, EdgeClassAssert,
     EdgeClassConstraint, EdgeParityAssert, EstablishmentRequirement, FindingSeverity,
-    FlowEstablishmentAssert, GenerationAssert, OccurrenceAssert, PolicyAnalysis,
+    FlowEstablishmentAssert, GenerationAssert, OccurrenceAssert, OriginShapeAssert, PolicyAnalysis,
     PolicyAnalysisType, PolicyAssert, PolicyId, PolicyLevel, PolicyMessageSpec, PolicySeveritySpec,
     ResolutionAssert, RoundTripAssert, RouteAssert, ValueOriginAssert,
 };
@@ -2233,10 +2233,17 @@ pub(crate) fn evaluate_match_policy_candidates(
             budget,
         );
     };
+    let Some((_, query)) = selector.as_query() else {
+        return failed_before_execution(
+            PolicyFailureReason::InvalidExecutionPlan,
+            "match policies require a query selector; row selectors are endpoint-only",
+            budget,
+        );
+    };
     evaluate_match_query_candidates(
         &policy.definition().metadata.id,
         analyzer,
-        &selector.query,
+        query,
         budget,
         cancellation,
     )
@@ -2262,6 +2269,7 @@ fn evaluate_match_query_candidates(
             | QueryValueKind::ProcedureEffect
             | QueryValueKind::CallableSignature
             | QueryValueKind::SignatureParameter
+            | QueryValueKind::DecoratedParameter
             | QueryValueKind::CallableApplicability
             | QueryValueKind::OverloadSelection
             | QueryValueKind::MemberSelection
@@ -2299,6 +2307,7 @@ fn evaluate_match_query_candidates(
             | QueryValueKind::ReferenceSite
             | QueryValueKind::CallSite
             | QueryValueKind::ExpressionSite
+            | QueryValueKind::JsxAttributeValue
             | QueryValueKind::Occurrence
             // A binding and a resolution candidate are both exact facts about
             // one source position, so a match policy listing suspicious
@@ -2794,6 +2803,45 @@ fn terminal_presentation(
             ProofState::Unproven,
             ProofReason::PartialWitness,
         ),
+        CodeQueryResultValue::DecoratedParameter { value } => {
+            let complete = value.terminal
+                && value.completion == "complete"
+                && value.coverage == "complete";
+            (
+                DetailedCodeQueryDomain::DecoratedParameter,
+                value.path.as_str(),
+                Some(value.range),
+                Vec::new(),
+                if complete {
+                    ProofState::Proven
+                } else {
+                    ProofState::Unproven
+                },
+                if complete {
+                    ProofReason::DirectStructuralMatch
+                } else {
+                    ProofReason::PartialWitness
+                },
+            )
+        }
+        CodeQueryResultValue::JsxAttributeValue { value } => {
+            let certainty = if value.coverage == "complete" {
+                Vec::new()
+            } else {
+                vec![CertaintyReason::analyzer_ambiguity(
+                    value.reason.unwrap_or("jsx-attribute-value-incomplete"),
+                )
+                .map_err(|_| ())?]
+            };
+            (
+                DetailedCodeQueryDomain::JsxAttributeValue,
+                value.path.as_str(),
+                Some(value.range),
+                certainty,
+                ProofState::Proven,
+                ProofReason::DirectStructuralMatch,
+            )
+        }
         CodeQueryResultValue::Procedure { .. }
         | CodeQueryResultValue::ProgramPoint { .. }
         | CodeQueryResultValue::ControlEdge { .. }
@@ -3172,6 +3220,51 @@ fn adapt_terminal_result(
             ))
         }
         (
+            CodeQueryResultValue::DecoratedParameter { value },
+            DetailedCodeQueryDomain::DecoratedParameter,
+            DetailedCodeQueryKey::DecoratedParameter { id, parameter_id },
+            DetailedCodeQueryProvenanceIdentities::None,
+        ) if value.path == expected_path.as_str()
+            && value.id == *id
+            && value.parameter_id == *parameter_id
+            && Some(value.range)
+                == location.region().map(|region| CodeQueryRange {
+                    start_line: region.start_line() as usize,
+                    start_column: region.start_column() as usize,
+                    end_line: region.end_line() as usize,
+                    end_column: region.end_column() as usize,
+                }) =>
+        {
+            Ok((
+                // The policy report has one source-backed terminal structural
+                // result shape. Preserve the decorated parameter's exact span as
+                // a structural match so matched-value binding can ask the semantic
+                // oracle for the corresponding parameter value.
+                PolicyQueryResultRef::StructuralMatch {
+                    kind: "parameter".to_owned(),
+                    location: location.clone(),
+                    identity: None,
+                },
+                false,
+            ))
+        }
+        (
+            CodeQueryResultValue::JsxAttributeValue { value },
+            DetailedCodeQueryDomain::JsxAttributeValue,
+            DetailedCodeQueryKey::JsxAttributeValue { id, ast_id },
+            DetailedCodeQueryProvenanceIdentities::Primary(_),
+        ) if value.path == expected_path.as_str() && value.id == *id && value.ast_id == *ast_id => {
+            Ok((
+                PolicyQueryResultRef::JsxAttributeValue {
+                    location: location.clone(),
+                    ast_id: ast_id.clone(),
+                    element_identity: value.element_identity.to_string(),
+                    coverage: value.coverage.to_string(),
+                },
+                value.coverage != "complete",
+            ))
+        }
+        (
             CodeQueryResultValue::Procedure { .. }
             | CodeQueryResultValue::ProgramPoint { .. }
             | CodeQueryResultValue::ControlEdge { .. }
@@ -3332,6 +3425,35 @@ fn adapt_provenance_ref(
             }
         }
         (
+            CodeQueryResultRef::DecoratedParameter {
+                path: public_path,
+                range,
+                id,
+                parameter_id,
+                ..
+            },
+            DetailedCodeQueryDomain::DecoratedParameter,
+            DetailedCodeQueryKey::DecoratedParameter {
+                id: detailed_id,
+                parameter_id: detailed_parameter_id,
+            },
+            DetailedCodeQueryProvenanceIdentities::None,
+        ) if public_path == path.as_str()
+            && id == detailed_id
+            && parameter_id == detailed_parameter_id
+            && Some(range) == display_range =>
+        {
+            PolicyQueryResultRef::StructuralMatch {
+                kind: "parameter".to_owned(),
+                location: policy_span_location(
+                    path,
+                    byte_span.as_ref().ok_or(())?,
+                    display_range.ok_or(())?,
+                )?,
+                identity: None,
+            }
+        }
+        (
             CodeQueryResultRef::Declaration {
                 path: public_path,
                 kind,
@@ -3480,6 +3602,38 @@ fn adapt_provenance_ref(
             }
         }
         (
+            CodeQueryResultRef::JsxAttributeValue {
+                id,
+                ast_id,
+                path: public_path,
+                range,
+                element_identity,
+                coverage,
+            },
+            DetailedCodeQueryDomain::JsxAttributeValue,
+            DetailedCodeQueryKey::JsxAttributeValue {
+                id: detailed_id,
+                ast_id: detailed_ast_id,
+            },
+            DetailedCodeQueryProvenanceIdentities::Primary(_),
+        ) if public_path == path.as_str()
+            && id == detailed_id
+            && ast_id == detailed_ast_id
+            && Some(range) == display_range =>
+        {
+            identity_uncertain = coverage != "complete";
+            PolicyQueryResultRef::JsxAttributeValue {
+                location: policy_span_location(
+                    path,
+                    byte_span.as_ref().ok_or(())?,
+                    display_range.ok_or(())?,
+                )?,
+                ast_id,
+                element_identity: element_identity.to_string(),
+                coverage: coverage.to_string(),
+            }
+        }
+        (
             CodeQueryResultRef::ReceiverAnalysis {
                 path: public_path,
                 range,
@@ -3572,6 +3726,7 @@ fn public_provenance_kind(value: &CodeQueryResultRef) -> &'static str {
         CodeQueryResultRef::ReferenceSite { .. } => "reference_site",
         CodeQueryResultRef::CallSite { .. } => "call_site",
         CodeQueryResultRef::ExpressionSite { .. } => "expression_site",
+        CodeQueryResultRef::JsxAttributeValue { .. } => "jsx_attribute_value",
         CodeQueryResultRef::ReceiverAnalysis { .. } => "receiver_analysis",
         CodeQueryResultRef::ReceiverOutcome { .. } => "receiver_outcome",
         CodeQueryResultRef::MemberSelection { .. } => "member_selection",
@@ -3589,6 +3744,7 @@ fn public_provenance_kind(value: &CodeQueryResultRef) -> &'static str {
         CodeQueryResultRef::ProcedureEffect { .. } => "procedure_effect",
         CodeQueryResultRef::CallableSignature { .. } => "callable_signature",
         CodeQueryResultRef::SignatureParameter { .. } => "signature_parameter",
+        CodeQueryResultRef::DecoratedParameter { .. } => "decorated_parameter",
         CodeQueryResultRef::CallableApplicability { .. } => "callable_applicability",
         CodeQueryResultRef::OverloadSelection { .. } => "overload_selection",
         CodeQueryResultRef::Occurrence { .. } => "occurrence",
@@ -3628,6 +3784,7 @@ fn public_provenance_path(value: &CodeQueryResultRef) -> &str {
         | CodeQueryResultRef::ReferenceSite { path, .. }
         | CodeQueryResultRef::CallSite { path, .. }
         | CodeQueryResultRef::ExpressionSite { path, .. }
+        | CodeQueryResultRef::JsxAttributeValue { path, .. }
         | CodeQueryResultRef::ReceiverAnalysis { path, .. }
         | CodeQueryResultRef::ReceiverOutcome { path, .. }
         | CodeQueryResultRef::ReceiverEvidence { path, .. }
@@ -3639,6 +3796,7 @@ fn public_provenance_path(value: &CodeQueryResultRef) -> &str {
         | CodeQueryResultRef::ProcedureEffect { path, .. }
         | CodeQueryResultRef::CallableSignature { path, .. }
         | CodeQueryResultRef::SignatureParameter { path, .. }
+        | CodeQueryResultRef::DecoratedParameter { path, .. }
         | CodeQueryResultRef::CallableApplicability { path, .. }
         | CodeQueryResultRef::OverloadSelection { path, .. }
         | CodeQueryResultRef::MemberSelection { path, .. }
@@ -3690,6 +3848,7 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         DetailedCodeQueryDomain::ReferenceSite => Some(MatchResultDomain::ReferenceSite),
         DetailedCodeQueryDomain::CallSite => Some(MatchResultDomain::CallSite),
         DetailedCodeQueryDomain::ExpressionSite => Some(MatchResultDomain::ExpressionSite),
+        DetailedCodeQueryDomain::JsxAttributeValue => Some(MatchResultDomain::JsxAttributeValue),
         DetailedCodeQueryDomain::File => Some(MatchResultDomain::File),
         DetailedCodeQueryDomain::Occurrence => Some(MatchResultDomain::Occurrence),
         DetailedCodeQueryDomain::LexicalScope => Some(MatchResultDomain::LexicalScope),
@@ -3703,6 +3862,10 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         DetailedCodeQueryDomain::ReferenceEdge => Some(MatchResultDomain::ReferenceEdge),
         DetailedCodeQueryDomain::QualifiedPath => Some(MatchResultDomain::QualifiedPath),
         DetailedCodeQueryDomain::PathSegment => Some(MatchResultDomain::PathSegment),
+        // DecoratedParameter is a typed structural projection anchored at its
+        // parameter node. Policy findings retain the existing structural
+        // terminal shape so matched-value can bind the exact source span.
+        DetailedCodeQueryDomain::DecoratedParameter => Some(MatchResultDomain::StructuralMatch),
         DetailedCodeQueryDomain::StateEvent
         | DetailedCodeQueryDomain::FlowRelation
         | DetailedCodeQueryDomain::ControlRelation
@@ -3775,6 +3938,10 @@ fn weak_finding_key(evidence: &DetailedCodeQueryEvidence) -> OpaqueFindingKey {
         }
         DetailedCodeQueryKey::TaintFinding { id } => {
             update_hash(&mut hasher, id.as_bytes());
+        }
+        DetailedCodeQueryKey::JsxAttributeValue { id, ast_id } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, ast_id.as_bytes());
         }
         DetailedCodeQueryKey::ProgramPoint { id, procedure_id }
         | DetailedCodeQueryKey::ControlEdge { id, procedure_id } => {
@@ -4001,6 +4168,10 @@ fn weak_finding_key(evidence: &DetailedCodeQueryEvidence) -> OpaqueFindingKey {
         DetailedCodeQueryKey::SignatureParameter { id, signature_id } => {
             update_hash(&mut hasher, id.as_bytes());
             update_hash(&mut hasher, signature_id.as_bytes());
+        }
+        DetailedCodeQueryKey::DecoratedParameter { id, parameter_id } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, parameter_id.as_bytes());
         }
         DetailedCodeQueryKey::CallArgument { id, group_id } => {
             update_hash(&mut hasher, id.as_bytes());
@@ -4245,6 +4416,9 @@ pub(super) fn incomplete_reason_for_code(code: &CodeQueryDiagnosticCode) -> Poli
         | CodeQueryDiagnosticCode::ReferenceTargetsAmbiguous
         | CodeQueryDiagnosticCode::UsesTargetsAmbiguous
         | CodeQueryDiagnosticCode::BroadQuery => PolicyIncompleteReason::PartialDiscovery,
+        CodeQueryDiagnosticCode::JsxProjectionIncomplete => {
+            PolicyIncompleteReason::PartialDiscovery
+        }
     }
 }
 

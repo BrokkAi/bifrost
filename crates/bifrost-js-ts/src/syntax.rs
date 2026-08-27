@@ -414,6 +414,9 @@ pub fn direct_property_definitions<'tree>(
             "shorthand_property_identifier" => {
                 direct_object_property_receiver(node, node, source, target_member)
             }
+            "method_definition" => node.child_by_field_name("name").and_then(|name| {
+                direct_object_property_receiver(node, name, source, target_member)
+            }),
             _ => None,
         };
         if let Some((receiver, property)) = receiver
@@ -1635,6 +1638,28 @@ relay();
                 .kind()
         );
         assert!(static_member_receiver(private_receiver, source).is_none());
+    }
+
+    #[test]
+    fn direct_property_definitions_include_object_method_shorthand() {
+        let source = "const Tools = { parse(value) { return value; } };";
+        let tree = parse_javascript(source);
+        let method = find_node(tree.root_node(), source, "parse(value) { return value; }");
+        let name = method.child_by_field_name("name").expect("method name");
+        let target_range = Range {
+            start_byte: name.start_byte(),
+            end_byte: name.end_byte(),
+            start_line: name.start_position().row,
+            end_line: name.end_position().row,
+        };
+
+        let definitions =
+            direct_property_definitions(tree.root_node(), source, &[target_range], "parse");
+
+        assert_eq!(definitions.len(), 1, "{definitions:#?}");
+        assert_eq!(slice(definitions[0].receiver.root, source), "Tools");
+        assert!(definitions[0].receiver.members.is_empty());
+        assert_eq!(definitions[0].property_range, target_range);
     }
 
     #[test]

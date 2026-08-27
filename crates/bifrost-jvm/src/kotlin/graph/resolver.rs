@@ -895,8 +895,11 @@ pub fn owner_declares_member(
 /// (`val v: Parent`), so a query for one is a type query, and a spelled name can
 /// *resolve* to one, so the name ladder has to count it as an existing type.
 /// Without this, a query for an alias would fall into the property arm and be
-/// answered by receiver typing, which an alias never has.
-fn is_kotlin_type_alias(graph: &KotlinGraphSource<'_>, unit: &CodeUnit) -> bool {
+/// answered by receiver typing, which an alias never has. The #1238 definition
+/// ladder in `brokk-bifrost-analysis` asks the same question through its
+/// `usages::kotlin_graph` wrapper (#2696), so this helper is shared rather
+/// than restated there.
+pub fn is_kotlin_type_alias(graph: &KotlinGraphSource<'_>, unit: &CodeUnit) -> bool {
     unit.is_field()
         && graph
             .type_alias

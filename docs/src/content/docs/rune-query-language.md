@@ -95,7 +95,7 @@ a quoted string is ordinary text, not a comment.
   (call :callee (name "eval"))) ; exclude generated paths in a real query
 ```
 
-Head symbols such as `call`, `function`, `class`, and `import` map to normalized structural kinds. Keyword fields such as `:callee`, `:args`, `:module`, and `:decorators` map to normalized roles.
+Head symbols such as `call`, `function`, `class`, and `import` map to normalized structural kinds. Keyword fields such as `:callee`, `:args`, `:module`, `:decorators`, `:iterable`, and `:elements` map to normalized roles.
 
 Predicate forms constrain fields on a pattern:
 

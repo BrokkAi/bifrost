@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "id": "bifrost.code-smells",
-  "version": "2.0.0",
+  "version": "2.2.0",
   "name": "Bifrost code smells",
   "description": "Curated structured RQLP checks for bug-prone and potentially expensive source patterns.",
   "policies": [
@@ -62,7 +62,7 @@
     {
       "path": "policies/regex-compile-in-loop.rqlp",
       "id": "bifrost.performance.regex-compile-in-loop",
-      "semantic_hash": "cf97c430a496547a9ffc0731e412d5426e2d5d39effa872c433cbc7dd3c61578",
+      "semantic_hash": "cb9b5314f1b50b94e60243d1be67167973800445ece29158efaf85953ba675b5",
       "category": "performance",
       "supported_languages": [
         "python",
@@ -82,7 +82,7 @@
     {
       "path": "policies/file-read-in-loop.rqlp",
       "id": "bifrost.performance.file-read-in-loop",
-      "semantic_hash": "a1d83845a9a14d26d5c9de154727ac2cd32ca81365d1111bf966e209b4ed89c9",
+      "semantic_hash": "4f0b625d3cdef7c80700d6e72e997428321ec4afacc99fe89a246169a4acb3f1",
       "category": "performance",
       "supported_languages": [
         "python",
@@ -94,7 +94,9 @@
       "required_capabilities": [
         "structural-match",
         "declaration-bounded-containment",
-        "normalized-call-roles"
+        "normalized-call-roles",
+        "lexical-environment",
+        "origin-shape-assertion"
       ],
       "severity_rationale": "Synchronous or whole-file reads inside a loop can multiply I/O and allocation cost.",
       "remediation": "Read once, stream or batch inputs, and cache loop-invariant content where semantics permit."
@@ -102,7 +104,7 @@
     {
       "path": "policies/serialization-in-loop.rqlp",
       "id": "bifrost.performance.serialization-in-loop",
-      "semantic_hash": "da0b97c9fccd69df43320804e18b2325952a603f136ad01af388816b2a49a4b4",
+      "semantic_hash": "46827db52fc424b572e7ce5ca1d4e92183f3a02852062ee3f61f0b1decfee08c",
       "category": "performance",
       "supported_languages": [
         "python",
@@ -122,7 +124,7 @@
     {
       "path": "policies/parsing-in-loop.rqlp",
       "id": "bifrost.performance.parsing-in-loop",
-      "semantic_hash": "b9a5b20ef0958dde7ee5b5065f825543b6de07fd75dbfd488c99d7a242b74695",
+      "semantic_hash": "1b5b748be4794ffb11a0924d228346c63403dc4e4dfade76ed93655f5cd469c4",
       "category": "performance",
       "supported_languages": [
         "python",
@@ -134,7 +136,9 @@
       "required_capabilities": [
         "structural-match",
         "declaration-bounded-containment",
-        "normalized-call-roles"
+        "normalized-call-roles",
+        "lexical-environment",
+        "origin-shape-assertion"
       ],
       "severity_rationale": "Parsing the same representation per iteration repeats validation, tokenization, and object construction.",
       "remediation": "Parse loop-invariant data once or use an incremental/batched parser for per-item input."
@@ -142,7 +146,7 @@
     {
       "path": "policies/database-call-in-loop.rqlp",
       "id": "bifrost.performance.database-call-in-loop",
-      "semantic_hash": "0c5648b25f7b2bbd8e3d3dc044530a749599d6154a05ffd50e777aa1cb501af8",
+      "semantic_hash": "d8bf2d58accabcbe3d7aa818befcaba8e6673b1a3e88dad8ce6f85664125160a",
       "category": "performance",
       "supported_languages": [
         "python",
@@ -161,7 +165,7 @@
     {
       "path": "policies/network-call-in-loop.rqlp",
       "id": "bifrost.performance.network-call-in-loop",
-      "semantic_hash": "fe1a532e1414f2ce515a5f80fd290f340676d320b9fb6909d822757fcb8d34ed",
+      "semantic_hash": "a9c51b5e2174fd0b0c857e8f5ca308244dd73be7dea795b8f744f30420a18b0d",
       "category": "performance",
       "supported_languages": [
         "python",
@@ -181,7 +185,7 @@
     {
       "path": "policies/subprocess-in-loop.rqlp",
       "id": "bifrost.performance.subprocess-in-loop",
-      "semantic_hash": "5edcae98680abb96e9a7a888e6dc574a5f07588348d0b3b71daed815f3dbd463",
+      "semantic_hash": "ccc37c69280619685934cd92c7f3b6a795d830b9b695a3d2885dd3a7eb53fed8",
       "category": "performance",
       "supported_languages": [
         "python",
@@ -218,7 +222,7 @@
     {
       "path": "policies/expensive-operation-in-nested-loop.rqlp",
       "id": "bifrost.performance.expensive-operation-in-nested-loop",
-      "semantic_hash": "df760c4255064035c9079548977b6cedb8032cd2c2d5f0af666fcca09b28ac1c",
+      "semantic_hash": "64230279b7ca5fc6dcf52b3b34d99a2b56eecedef3b6bca33d03fbcb0a68a591",
       "category": "performance",
       "supported_languages": [
         "python",

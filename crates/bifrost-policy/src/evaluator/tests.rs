@@ -1289,6 +1289,62 @@ export function invoke(service: Service) { service.run(); }
 }
 
 #[test]
+fn jsx_attribute_value_terminal_anchors_the_exact_policy_operand() {
+    let source = r#"const value = "unsafe";
+const view = <div dangerouslySetInnerHTML={{ __html: value }} />;
+"#;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    ProjectFile::new(root.clone(), "app.tsx")
+        .write(source)
+        .expect("write source");
+    let analyzer = TypescriptAnalyzer::from_project(TestProject::new(root, Language::TypeScript));
+    let query = CodeQuery::from_json(&json!({
+        "match": { "kind": "jsx_attribute", "name": "dangerouslySetInnerHTML" },
+        "steps": [{
+            "op": "jsx_attribute_value",
+            "identity": "intrinsic",
+            "property_name": "__html"
+        }],
+        "result_detail": "full"
+    }))
+    .expect("query");
+    let policy_id = PolicyId::new("test.jsx-operand-terminal").expect("policy id");
+
+    let evaluated = evaluate_match_query_candidates(
+        &policy_id,
+        &analyzer,
+        &query,
+        &PolicyBudget::default(),
+        None,
+    );
+
+    assert_eq!(
+        evaluated.completion,
+        PolicyRunCompletion::Complete,
+        "{evaluated:#?}"
+    );
+    assert_eq!(evaluated.candidates.len(), 1);
+    let candidate = &evaluated.candidates[0];
+    assert_eq!(
+        candidate.evidence.result_domain(),
+        MatchResultDomain::JsxAttributeValue
+    );
+    assert_eq!(
+        candidate.evidence.terminal().result_domain(),
+        Some(MatchResultDomain::JsxAttributeValue)
+    );
+    let expected_start = source.rfind("value").expect("value operand");
+    assert_eq!(
+        candidate
+            .location
+            .byte_span()
+            .map(|span| span.start()..span.end()),
+        Some(expected_start as u64..(expected_start + "value".len()) as u64)
+    );
+}
+
+#[test]
 fn direct_call_terminal_downgrades_proven_proof_when_caller_identity_is_unavailable() {
     let temp = tempfile::tempdir().expect("temp dir");
     let root = temp.path().canonicalize().expect("canonical root");

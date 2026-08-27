@@ -105,6 +105,25 @@ void test("registers distinct RQL, policy, and Rune IR languages", () => {
       title: "Bifrost: Show Rune IR"
     }
   );
+  assert.deepEqual(
+    manifest.contributes.commands.find(
+      (command) => command.command === "bifrost.suppressRqlPolicyFinding"
+    ),
+    {
+      command: "bifrost.suppressRqlPolicyFinding",
+      title: "Bifrost: Suppress finding..."
+    }
+  );
+  assert.deepEqual(
+    manifest.contributes.commands.find(
+      (command) => command.command === "bifrost.clearRqlPolicyResults"
+    ),
+    {
+      command: "bifrost.clearRqlPolicyResults",
+      title: "Bifrost: Clear Policy Results",
+      icon: "$(clear-all)"
+    }
+  );
   assert.deepEqual(manifest.contributes.menus["editor/title"], [
     {
       command: "bifrost.runRqlQuery",
@@ -117,11 +136,19 @@ void test("registers distinct RQL, policy, and Rune IR languages", () => {
       group: "navigation@1"
     }
   ]);
+  assert.deepEqual(manifest.contributes.menus["view/title"], [
+    {
+      command: "bifrost.clearRqlPolicyResults",
+      when: "view == bifrost.policyResults",
+      group: "navigation@1"
+    }
+  ]);
   assert.deepEqual(manifest.contributes.menus.commandPalette, [
     { command: "bifrost.runRqlQuery", when: "false" },
     { command: "bifrost.openRqlQueryResult", when: "false" },
     { command: "bifrost.runRqlPolicy", when: "resourceLangId == bifrost-rql-policy" },
     { command: "bifrost.openRqlPolicyFinding", when: "false" },
+    { command: "bifrost.suppressRqlPolicyFinding", when: "false" },
     { command: "bifrost.openRqlPolicyDisplayStep", when: "false" },
     { command: "bifrost.showRuneIr", when: runeIrSourceContext }
   ]);
@@ -129,6 +156,13 @@ void test("registers distinct RQL, policy, and Rune IR languages", () => {
     {
       command: "bifrost.showRuneIr",
       when: runeIrSourceContext,
+      group: "navigation@10"
+    }
+  ]);
+  assert.deepEqual(manifest.contributes.menus["view/item/context"], [
+    {
+      command: "bifrost.suppressRqlPolicyFinding",
+      when: "view == bifrost.policyResults && viewItem == bifrost.policyFindingSuppressible",
       group: "navigation@10"
     }
   ]);

@@ -88,6 +88,11 @@ pub enum JsTsModuleEvidence {
 /// state that has not been retained is a typed incomplete outcome, never an
 /// error and never a reason to go and look.
 pub trait JsTsExternalSurfaceEvidence {
+    /// Whether the retained declaration surface proves a global ambient name.
+    fn classify_global_name(&self, _name: &str) -> bool {
+        false
+    }
+
     /// Whether the retained surface of `module_specifier` exports `name`.
     fn classify_exported_name(
         &self,
@@ -196,6 +201,7 @@ pub fn collect_js_ts_semantic_diagnostics(
         line_starts: &line_starts,
         known_imports,
         same_file_declarations,
+        evidence,
         report,
         errors: 0,
     };
@@ -473,6 +479,7 @@ struct JsTsDiagnosticCollector<'a> {
     line_starts: &'a [usize],
     known_imports: HashSet<String>,
     same_file_declarations: HashSet<String>,
+    evidence: &'a dyn JsTsExternalSurfaceEvidence,
     report: SemanticDiagnosticReport,
     errors: usize,
 }
@@ -591,6 +598,11 @@ impl JsTsDiagnosticCollector<'_> {
             // already stands for the module.
             self.report
                 .push_resolved(range, BoundaryStatus::WorkspaceLocal);
+            return;
+        }
+        if self.evidence.classify_global_name(text) {
+            self.report
+                .push_resolved(range, BoundaryStatus::ExternalIndexed);
             return;
         }
         self.report.push_absent(

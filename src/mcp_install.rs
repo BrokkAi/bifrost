@@ -11,7 +11,7 @@ use serde_json::{Map, Value, json};
 use tempfile::NamedTempFile;
 
 const SERVER_NAME: &str = "brokk";
-const TOOLSETS: &str = "core|nlp";
+const TOOLSETS: &str = "core";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Host {
@@ -422,7 +422,7 @@ mod tests {
                 "--",
                 "/opt/bifrost/bin/bifrost",
                 "--mcp",
-                "core|nlp",
+                "core",
             ])
         );
         assert_eq!(
@@ -438,7 +438,7 @@ mod tests {
                 "--",
                 "/opt/bifrost/bin/bifrost",
                 "--mcp",
-                "core|nlp",
+                "core",
             ])
         );
         assert_eq!(
@@ -451,7 +451,7 @@ mod tests {
                 "--",
                 "/opt/bifrost/bin/bifrost",
                 "--mcp",
-                "core|nlp",
+                "core",
             ])
         );
         assert_eq!(
@@ -463,7 +463,7 @@ mod tests {
                 "--",
                 "/opt/bifrost/bin/bifrost",
                 "--mcp",
-                "core|nlp",
+                "core",
             ])
         );
         assert_eq!(
@@ -476,7 +476,7 @@ mod tests {
                 "/opt/bifrost/bin/bifrost",
                 "--args",
                 "--mcp",
-                "core|nlp",
+                "core",
             ])
         );
     }

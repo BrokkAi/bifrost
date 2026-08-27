@@ -816,7 +816,16 @@ fn callable_shape<'tree>(
             is_static,
             is_synthetic: synthetic,
             invocation: immediate,
-            ..ProcedureProperties::default()
+            // A lambda or block body is not a named member of anything, so no
+            // later declaration can redefine or override the callable this
+            // literal names: its dispatch is closed. Every other Ruby callable
+            // stays Open -- a `def`, including a top-level one, can be
+            // reopened, and a method can be overridden by a subclass or a
+            // prepended module.
+            dispatch_extensibility: match kind {
+                ProcedureKind::Lambda | ProcedureKind::Closure => DispatchExtensibility::Closed,
+                _ => DispatchExtensibility::Open,
+            },
         },
         attach_lexical_parent: attach,
     })

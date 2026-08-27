@@ -844,13 +844,6 @@ pub fn summarize_files(analyzer: &dyn IAnalyzer, files: Vec<ProjectFile>) -> Sum
     summarize_files_with_cancellation(analyzer, files, None)
 }
 
-pub fn summary_block_for_file(
-    analyzer: &dyn IAnalyzer,
-    file: &ProjectFile,
-) -> Option<SummaryBlock> {
-    summary_block_for_file_with_cancellation(analyzer, file, None)
-}
-
 fn summary_block_for_file_with_cancellation(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
@@ -1388,7 +1381,7 @@ pub(super) fn validate_most_relevant_files_params(
     Ok(())
 }
 
-pub fn summary_block_for_code_unit(
+fn summary_block_for_code_unit(
     analyzer: &dyn IAnalyzer,
     code_unit: &CodeUnit,
 ) -> Option<SummaryBlock> {

@@ -755,6 +755,40 @@ jobs:
     permissions:
       contents: read
 
+  announce-discord:
+    name: announce release on Discord
+    # a665ea699 added this announcement; 64d5667b3 dropped it while rewriting
+    # this workflow to promote qualified artifacts, and nothing noticed because
+    # the script survived the change. v0.10.4, v0.10.5, and v0.10.6 all
+    # published silently.
+    #
+    # Gated exactly like post-release-smoke: announcing a release whose npm or
+    # crate publication failed is worse than announcing nothing.
+    needs: [release-context, release, publish-crate-facade, publish-wheels, publish-npm, publish-agent-plugin, publish-pi-package, publish-vscode, publish-open-vsx]
+    if: ${{ always() && needs.release.result == 'success' && needs.publish-crate-facade.result == 'success' && needs.publish-wheels.result == 'success' && needs.publish-npm.result == 'success' && needs.publish-agent-plugin.result == 'success' && needs.publish-pi-package.result == 'success' && needs.publish-vscode.result == 'success' && needs.publish-open-vsx.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout exact release commit
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.release-context.outputs.commit }}
+
+      - name: Announce release on Discord
+        # The release is already published and verified by this point, so a
+        # webhook outage must not fail it.
+        continue-on-error: true
+        env:
+          DISCORD_RELEASE_WEBHOOK_URL: ${{ secrets.DISCORD_RELEASE_WEBHOOK_URL }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.release-context.outputs.tag }}
+        shell: bash
+        run: bash scripts/public/announce-discord-release.sh
+
   publish-crate-core:
     name: publish core crate
     needs: [release-context, promote-qualification]
@@ -920,7 +954,7 @@ jobs:
 
   publish-crate-rql:
     name: publish RQL crate
-    needs: [release-context, promote-qualification, publish-crate-flow, publish-crate-nlp]
+    needs: [release-context, promote-qualification, publish-crate-flow]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}
@@ -982,22 +1016,6 @@ jobs:
       qualification_manifest_sha256: ${{ needs.promote-qualification.outputs.manifest_sha256 }}
     permissions: { contents: read, actions: read, id-token: write }
 
-  publish-crate-nlp:
-    name: publish nlp crate
-    needs: [release-context, promote-qualification, publish-crate-analysis]
-    uses: ./.github/workflows/publish-crate.yml
-    with:
-      tag: ${{ needs.release-context.outputs.tag }}
-      version: ${{ needs.release-context.outputs.version }}
-      commit: ${{ needs.release-context.outputs.commit }}
-      package: brokk-bifrost-nlp
-      qualification_run_id: ${{ needs.promote-qualification.outputs.run_id }}
-      qualification_run_attempt: ${{ needs.promote-qualification.outputs.run_attempt }}
-      qualification_artifact_id: ${{ needs.promote-qualification.outputs.artifact_id }}
-      qualification_artifact_digest: ${{ needs.promote-qualification.outputs.artifact_digest }}
-      qualification_manifest_sha256: ${{ needs.promote-qualification.outputs.manifest_sha256 }}
-    permissions: { contents: read, actions: read, id-token: write }
-
   publish-crate-runtime:
     name: publish runtime crate
     needs: [release-context, promote-qualification, publish-crate-policy]
@@ -1016,7 +1034,7 @@ jobs:
 
   publish-crate-semantic-packs:
     name: publish semantic packs crate
-    needs: [release-context, promote-qualification, publish-crate-flow, publish-crate-nlp]
+    needs: [release-context, promote-qualification, publish-crate-flow]
     uses: ./.github/workflows/publish-crate.yml
     with:
       tag: ${{ needs.release-context.outputs.tag }}

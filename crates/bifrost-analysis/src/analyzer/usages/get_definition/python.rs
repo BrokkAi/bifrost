@@ -14,8 +14,10 @@ use crate::analyzer::{
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
 use brokk_bifrost_python::bindings::{
-    PythonLexicalNameResolution, python_unambiguous_module_class_binding_bounded,
+    PythonLexicalNameResolution, python_comprehension_binds_name_at,
+    python_type_parameter_binds_name_at, python_unambiguous_module_class_binding_bounded,
 };
+use brokk_bifrost_python::diagnostics::is_python_builtin_or_constant;
 use brokk_bifrost_python::graph::resolver::annotation_reference_candidates_at_focus;
 use brokk_bifrost_python::imports::{
     PythonImportBinding, python_import_bindings_from_tree, resolve_python_relative_module,
@@ -1102,7 +1104,6 @@ fn python_bound_type_for_identifier(
             depth + 1,
         );
     }
-
     let body = function.child_by_field_name("body")?;
     let mut best: Option<Node<'_>> = None;
     let mut stack = vec![body];
@@ -1504,6 +1505,12 @@ pub(super) fn resolve_python(
             format!("`{}` is not a Python reference site", site.text),
         );
     }
+    if python_type_parameter_binds_name_at(&site.text, node, source) {
+        return no_definition(
+            "local_variable_reference",
+            format!("`{}` is a local Python type parameter", site.text),
+        );
+    }
     if let Some(candidates) = python_annotation_focus_candidates(
         analyzer,
         py,
@@ -1578,7 +1585,8 @@ pub(super) fn resolve_python(
                     format!("`{object_text}` is a local Python value"),
                 );
             }
-            if python_unresolved_import_boundary(
+            if let Some(import_target) = python_unresolved_import_boundary(
+                py,
                 file,
                 analyzer,
                 token,
@@ -1597,7 +1605,7 @@ pub(super) fn resolve_python(
                         )
                     },
                     format!(
-                        "`{object_text}.{attribute_text}` crosses a Python import boundary not indexed in this workspace"
+                        "`{object_text}.{attribute_text}` crosses a Python import boundary through `{import_target}` that is not indexed in this workspace"
                     ),
                     "no_indexed_definition",
                     format!(
@@ -1676,6 +1684,28 @@ pub(super) fn resolve_python(
                 if !candidates.is_empty() {
                     return candidates_outcome(candidates);
                 }
+                if let Some(import_target) =
+                    python_unresolved_import_boundary(py, file, analyzer, token, text, None)
+                {
+                    return gated_boundary(
+                        || {
+                            python_import_binding_is_workspace_internal(
+                                py, token, support, file, text, None,
+                            )
+                        },
+                        format!(
+                            "`{text}` crosses a Python import boundary through `{import_target}` that is not indexed in this workspace"
+                        ),
+                        "no_indexed_definition",
+                        format!("`{text}` did not resolve to an indexed Python definition"),
+                    );
+                }
+                if is_python_builtin_or_constant(text) {
+                    return no_definition(
+                        PREDECLARED_SYMBOL_REFERENCE_DIAGNOSTIC_KIND,
+                        format!("`{text}` is supplied by the Python runtime"),
+                    );
+                }
                 if let Some(module) = ctx.namespace.get(text) {
                     return python_module_outcome(py, support, module, text);
                 }
@@ -1699,7 +1729,15 @@ pub(super) fn resolve_python(
                     return candidates_outcome(candidates);
                 }
             }
-            if python_unresolved_import_boundary(file, analyzer, token, text, None) {
+            if is_python_builtin_or_constant(text) {
+                return no_definition(
+                    PREDECLARED_SYMBOL_REFERENCE_DIAGNOSTIC_KIND,
+                    format!("`{text}` is supplied by the Python runtime"),
+                );
+            }
+            if let Some(import_target) =
+                python_unresolved_import_boundary(py, file, analyzer, token, text, None)
+            {
                 return gated_boundary(
                     || {
                         python_import_binding_is_workspace_internal(
@@ -1707,7 +1745,7 @@ pub(super) fn resolve_python(
                         )
                     },
                     format!(
-                        "`{text}` crosses a Python import boundary not indexed in this workspace"
+                        "`{text}` crosses a Python import boundary through `{import_target}` that is not indexed in this workspace"
                     ),
                     "no_indexed_definition",
                     format!("`{text}` did not resolve to an indexed Python definition"),
@@ -1897,6 +1935,14 @@ fn python_visible_module_binding_candidates(
                     candidates.extend(imported);
                 }
                 if !resolved {
+                    if let Some(fqn) = context.named.get(name) {
+                        let imported =
+                            resolve_fqn_candidates(py, fqn, |candidate| support.fqn(candidate));
+                        if !imported.is_empty() {
+                            candidates.extend(imported);
+                            continue;
+                        }
+                    }
                     let fqn = if module.ends_with('.') {
                         format!("{module}{imported_name}")
                     } else {
@@ -2014,19 +2060,20 @@ fn python_same_file_candidates_for_binding_event(
         return Vec::new();
     };
     let reference_path = python_conditional_branch_path(node);
+    let event_path = event_visible_from
+        .checked_sub(1)
+        .and_then(|start| root.named_descendant_for_byte_range(start, event_visible_from))
+        .map(python_conditional_branch_path)
+        .unwrap_or_default();
     visible
         .into_iter()
         .filter(|candidate| {
             analyzer.ranges(candidate).iter().any(|range| {
                 range.end_byte == anchor_end
-                    && root
-                        .named_descendant_for_byte_range(range.start_byte, range.end_byte)
-                        .is_some_and(|declaration| {
-                            python_conditional_paths_are_compatible(
-                                &reference_path,
-                                &python_conditional_branch_path(declaration),
-                            )
-                        })
+                    && ((candidate.is_function()
+                        && range.start_byte <= node.start_byte()
+                        && node.end_byte() <= range.end_byte)
+                        || python_conditional_paths_are_compatible(&reference_path, &event_path))
             })
         })
         .collect()
@@ -3082,34 +3129,66 @@ fn python_self_receiver_type(
 }
 
 fn python_unresolved_import_boundary(
+    py: &PythonAnalyzer,
     file: &ProjectFile,
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
     local: &str,
     attribute: Option<&str>,
-) -> bool {
-    let Some(provider) = analyzer.import_analysis_provider() else {
-        return false;
-    };
+) -> Option<String> {
+    let provider = analyzer.import_analysis_provider()?;
     for import in provider.import_info_of(token, file) {
         let alias_or_identifier = import.alias.as_deref().or(import.identifier.as_deref());
-        if alias_or_identifier == Some(local) {
-            return provider
+        if alias_or_identifier == Some(local)
+            && provider
                 .imported_code_units_of(file)
                 .iter()
-                .all(|unit| unit.identifier() != local);
+                .all(|unit| unit.identifier() != local)
+        {
+            return Some(python_import_boundary_target(
+                py, token, file, local, attribute,
+            ));
         }
         if let Some(attribute) = attribute
             && import.identifier.as_deref() == Some(attribute)
             && import.alias.as_deref().unwrap_or(attribute) == attribute
-        {
-            return provider
+            && provider
                 .imported_code_units_of(file)
                 .iter()
-                .all(|unit| unit.identifier() != attribute);
+                .all(|unit| unit.identifier() != attribute)
+        {
+            return Some(python_import_boundary_target(
+                py,
+                token,
+                file,
+                local,
+                Some(attribute),
+            ));
         }
     }
-    false
+    None
+}
+
+fn python_import_boundary_target(
+    py: &PythonAnalyzer,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+    local: &str,
+    attribute: Option<&str>,
+) -> String {
+    let binder = py.import_binder_of(token, file);
+    binder
+        .bindings
+        .get(local)
+        .or_else(|| attribute.and_then(|attribute| binder.bindings.get(attribute)))
+        .map(|binding| {
+            binding
+                .namespace_imported_module
+                .as_deref()
+                .unwrap_or(binding.module_specifier.as_str())
+                .to_string()
+        })
+        .unwrap_or_else(|| local.to_string())
 }
 
 /// True when the name is bound by an import whose *target module* the workspace
@@ -3142,6 +3221,9 @@ fn python_import_binding_is_workspace_internal(
 }
 
 fn python_name_shadowed_at(name: &str, reference: Node<'_>, source: &str) -> bool {
+    if python_comprehension_binds_name_at(name, reference, source) {
+        return true;
+    }
     let mut current = reference;
     while let Some(parent) = current.parent() {
         current = parent;

@@ -28,6 +28,7 @@
 //! `SHA256SUMS`, and is validated by `verify` so pack completeness converges
 //! release over release.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::fs::{self, File};
@@ -42,10 +43,12 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{
     CompiledSemanticModelPack, CompilerOptions, Completeness, DecodeLimits, DurablePackSource,
     DurablePackSourceKind, ExactArtifact, ExternalArtifactKind, PackExtractionAccounting,
     PackExtractionGap, ProducerDiagnostic, ProducerDiagnosticSeverity, Provenance,
-    ResolvedActiveSemanticModels, Safety, SemanticModelActivationEvidence,
-    SemanticModelActivationRequest, SemanticModelResolutionOutcome, SemanticPackCatalog,
-    compile_pack, decode_manifest, decode_shard_for_manifest, pack_rejects_are_warning_only,
-    read_exact_artifact, read_exact_source_set, resolve_active_semantic_models,
+    ResolvedActiveSemanticModels, Safety, SemanticModelActivationControl,
+    SemanticModelActivationEvidence, SemanticModelActivationRequest, SemanticModelControlAction,
+    SemanticModelControlScope, SemanticModelPackSelector, SemanticModelResolutionOutcome,
+    SemanticPackCatalog, compile_pack, decode_manifest, decode_shard_for_manifest,
+    pack_rejects_are_warning_only, read_exact_artifact, read_exact_source_set,
+    resolve_active_semantic_models,
 };
 use brokk_bifrost_analysis::analyzer::{
     CSharpAssemblyPackProducer, ComposerPackagePackProducer, ComposerPinnedAutoloadRule,
@@ -54,13 +57,20 @@ use brokk_bifrost_analysis::analyzer::{
     PythonArtifactPackProducer, RubyGemArchivePackProducer, RustdocJsonPackProducer,
     ScalaSourceJarPackProducer, TypeScriptDeclarationPackProducer,
 };
-use semver::Version;
+use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
 pub const PACK_SPEC_SCHEMA_VERSION: u32 = 1;
 pub const RELEASE_BUNDLE_SCHEMA_VERSION: u32 = 1;
+
+fn current_release_generator() -> ReleaseGenerator {
+    ReleaseGenerator {
+        name: "brokk-bifrost-semantic-packs".to_owned(),
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+    }
+}
 
 /// Bounds for pinned source-set inputs, matching the workspace dependency
 /// scanner's `DependencyPackLimits` defaults.
@@ -104,8 +114,15 @@ pub enum PinnedPackKind {
     JavaSourceJar,
     JavaClassJar,
     TypeScriptDeclarationFile,
+    TypeScriptLibrarySet {
+        manifest: String,
+        libraries: Vec<PinnedTypeScriptLibrary>,
+    },
     DotNetAssembly,
     RustdocJson,
+    RustdocJsonSet {
+        crates: Vec<PinnedRustdocCrate>,
+    },
     /// One pinned Python stub tree. The generate artifact argument names the
     /// tree root directory; `stubs` lists the pinned `.pyi` files relative to
     /// that root. The pinned artifact digest is the canonical source-set
@@ -148,6 +165,20 @@ pub enum PinnedPackKind {
 #[serde(deny_unknown_fields)]
 pub struct PinnedNpmDeclaration {
     pub module: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PinnedTypeScriptLibrary {
+    pub name: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PinnedRustdocCrate {
+    pub name: String,
     pub path: String,
 }
 
@@ -212,8 +243,10 @@ impl PinnedPackKind {
             Self::JavaSourceJar => ExternalArtifactKind::JavaSourceJar,
             Self::JavaClassJar => ExternalArtifactKind::JavaClassJar,
             Self::TypeScriptDeclarationFile => ExternalArtifactKind::TypeScriptDeclarationFile,
+            Self::TypeScriptLibrarySet { .. } => ExternalArtifactKind::TypeScriptLibrarySet,
             Self::DotNetAssembly => ExternalArtifactKind::DotNetAssembly,
             Self::RustdocJson => ExternalArtifactKind::RustdocJson,
+            Self::RustdocJsonSet { .. } => ExternalArtifactKind::RustdocJsonSet,
             Self::PythonStub { .. } => ExternalArtifactKind::PythonStub,
             Self::NpmPackage { .. } => ExternalArtifactKind::NpmPackageManifest,
             Self::GoModule { .. } => ExternalArtifactKind::GoSourceSet,
@@ -463,10 +496,7 @@ pub fn generate_release_bundle(
     }
     fs::create_dir_all(output_root)
         .map_err(|error| BundleError::new(format!("create {}: {error}", output_root.display())))?;
-    let generator = ReleaseGenerator {
-        name: "brokk-bifrost-semantic-packs".to_owned(),
-        version: env!("CARGO_PKG_VERSION").to_owned(),
-    };
+    let generator = current_release_generator();
     let mut packs = Vec::with_capacity(inputs.len());
     let mut measurements = Vec::with_capacity(inputs.len());
     let mut rejects = Vec::with_capacity(inputs.len());
@@ -583,17 +613,17 @@ fn generate_one(
         &cancellation,
         &artifact,
     );
-    if production.artifact_sha256.as_deref() != Some(spec.artifact.sha256.as_str()) {
-        return Err(BundleError::new(
-            "producer did not retain the pinned artifact identity",
-        ));
-    }
     let authored = production.pack.as_ref().ok_or_else(|| {
         BundleError::new(format!(
             "pack production failed: {}",
             render_diagnostics(&production.diagnostics)
         ))
     })?;
+    if production.artifact_sha256.as_deref() != Some(spec.artifact.sha256.as_str()) {
+        return Err(BundleError::new(
+            "producer did not retain the pinned artifact identity",
+        ));
+    }
     let compiled = compile_pack(authored, &CompilerOptions::default()).map_err(|diagnostics| {
         BundleError::new(format!("pack compilation failed: {diagnostics:#?}"))
     })?;
@@ -720,6 +750,20 @@ fn read_pinned_artifact(
                 limits,
             )
         }
+        PinnedPackKind::TypeScriptLibrarySet {
+            manifest,
+            libraries,
+        } => {
+            let mut relative_paths = vec![PathBuf::from(manifest)];
+            relative_paths.extend(libraries.iter().map(|library| PathBuf::from(&library.path)));
+            read_exact_source_set(
+                artifact_path,
+                &relative_paths,
+                MAX_SOURCE_SET_FILES,
+                MAX_SOURCE_SET_PATH_DEPTH,
+                limits,
+            )
+        }
         PinnedPackKind::GoModule { packages } => {
             let relative_paths = packages
                 .iter()
@@ -737,6 +781,19 @@ fn read_pinned_artifact(
             let relative_paths = rules
                 .iter()
                 .flat_map(|rule| rule.files().iter().map(PathBuf::from))
+                .collect::<Vec<_>>();
+            read_exact_source_set(
+                artifact_path,
+                &relative_paths,
+                MAX_SOURCE_SET_FILES,
+                MAX_SOURCE_SET_PATH_DEPTH,
+                limits,
+            )
+        }
+        PinnedPackKind::RustdocJsonSet { crates } => {
+            let relative_paths = crates
+                .iter()
+                .map(|crate_spec| PathBuf::from(&crate_spec.path))
                 .collect::<Vec<_>>();
             read_exact_source_set(
                 artifact_path,
@@ -784,6 +841,23 @@ fn produce_pinned_pack(
         }
         PinnedPackKind::TypeScriptDeclarationFile => TypeScriptDeclarationPackProducer
             .produce_loaded_artifact(request, limits, cancellation, artifact),
+        PinnedPackKind::TypeScriptLibrarySet {
+            manifest,
+            libraries,
+        } => {
+            let libraries = libraries
+                .iter()
+                .map(|library| (library.name.clone(), library.path.clone()))
+                .collect::<Vec<_>>();
+            TypeScriptDeclarationPackProducer.produce_loaded_library_set(
+                request,
+                limits,
+                cancellation,
+                artifact,
+                manifest,
+                &libraries,
+            )
+        }
         PinnedPackKind::DotNetAssembly => CSharpAssemblyPackProducer.produce_loaded_artifact(
             request,
             limits,
@@ -792,6 +866,19 @@ fn produce_pinned_pack(
         ),
         PinnedPackKind::RustdocJson => {
             RustdocJsonPackProducer.produce_loaded_artifact(request, limits, cancellation, artifact)
+        }
+        PinnedPackKind::RustdocJsonSet { crates } => {
+            let crates = crates
+                .iter()
+                .map(|crate_spec| (crate_spec.name.clone(), crate_spec.path.clone()))
+                .collect::<Vec<_>>();
+            RustdocJsonPackProducer.produce_loaded_source_set(
+                request,
+                limits,
+                cancellation,
+                artifact,
+                &crates,
+            )
         }
         PinnedPackKind::PythonStub { .. } => PythonArtifactPackProducer.produce_loaded_source_set(
             request,
@@ -940,6 +1027,66 @@ fn validate_spec(spec: &PinnedPackSpec, spec_path: &Path) -> Result<(), BundleEr
             }
         }
     }
+    if let PinnedPackKind::TypeScriptLibrarySet {
+        manifest,
+        libraries,
+    } = &spec.kind
+    {
+        require_safe_relative(Path::new(manifest))?;
+        if libraries.is_empty() {
+            return Err(BundleError::new(format!(
+                "spec {} must list at least one pinned TypeScript library file",
+                spec_path.display()
+            )));
+        }
+        let mut names = BTreeSet::new();
+        let mut paths = BTreeSet::new();
+        for library in libraries {
+            if library.name.trim().is_empty()
+                || !library
+                    .name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'.')
+            {
+                return Err(BundleError::new(format!(
+                    "spec {} pins a TypeScript library with a non-canonical name {}",
+                    spec_path.display(),
+                    library.name
+                )));
+            }
+            if !names.insert(library.name.clone()) {
+                return Err(BundleError::new(format!(
+                    "spec {} lists duplicate TypeScript library name {}",
+                    spec_path.display(),
+                    library.name
+                )));
+            }
+            let library_path = Path::new(&library.path);
+            require_safe_relative(library_path)?;
+            if !paths.insert(library.path.clone()) {
+                return Err(BundleError::new(format!(
+                    "spec {} lists duplicate TypeScript library path {}",
+                    spec_path.display(),
+                    library.path
+                )));
+            }
+            let canonical_name = library_path
+                .parent()
+                .filter(|parent| *parent == Path::new("lib"))
+                .and_then(|_| library_path.file_name())
+                .and_then(|file_name| file_name.to_str())
+                .and_then(|file_name| file_name.strip_prefix("lib."))
+                .and_then(|file_name| file_name.strip_suffix(".d.ts"));
+            if canonical_name != Some(library.name.as_str()) {
+                return Err(BundleError::new(format!(
+                    "spec {} TypeScript library {} does not match its canonical path {}",
+                    spec_path.display(),
+                    library.name,
+                    library.path
+                )));
+            }
+        }
+    }
     if let PinnedPackKind::GoModule { packages } = &spec.kind {
         if packages.is_empty() {
             return Err(BundleError::new(format!(
@@ -1008,6 +1155,31 @@ fn validate_spec(spec: &PinnedPackSpec, spec_path: &Path) -> Result<(), BundleEr
             }
         }
     }
+    if let PinnedPackKind::RustdocJsonSet { crates } = &spec.kind {
+        if crates.is_empty() {
+            return Err(BundleError::new(format!(
+                "spec {} must list at least one pinned rustdoc JSON crate",
+                spec_path.display()
+            )));
+        }
+        for crate_spec in crates {
+            if crate_spec.name.trim().is_empty() {
+                return Err(BundleError::new(format!(
+                    "spec {} pins a rustdoc JSON crate with no crate name",
+                    spec_path.display()
+                )));
+            }
+            let crate_path = Path::new(&crate_spec.path);
+            require_safe_relative(crate_path)?;
+            if !crate_spec.path.ends_with(".json") {
+                return Err(BundleError::new(format!(
+                    "spec {} pins non-JSON rustdoc source {}; every pinned crate must be a .json file",
+                    spec_path.display(),
+                    crate_spec.path
+                )));
+            }
+        }
+    }
     if spec.measurement_queries.is_empty() {
         return Err(BundleError::new(format!(
             "spec {} must name at least one representative lookup",
@@ -1036,8 +1208,15 @@ fn validate_spec(spec: &PinnedPackSpec, spec_path: &Path) -> Result<(), BundleEr
             ));
         }
     }
+    let mut notice_paths = BTreeSet::new();
     for notice in &spec.notices {
         require_safe_relative(Path::new(notice))?;
+        if !notice_paths.insert(notice) {
+            return Err(BundleError::new(format!(
+                "spec {} lists duplicate notice source path {notice}",
+                spec_path.display()
+            )));
+        }
     }
     for selector in [
         spec.measurement_activation.package.as_ref(),
@@ -1163,21 +1342,56 @@ fn measure_runtime(
         )
         .map_err(|error| BundleError::new(format!("install measurement pack: {error}")))?;
     let selector = &spec.measurement_activation;
-    let request = SemanticModelActivationRequest {
-        bifrost_version: env!("CARGO_PKG_VERSION")
-            .parse()
-            .expect("crate package version is valid semver"),
-        evidence: vec![SemanticModelActivationEvidence {
+    let target_evidence = if selector.targets.is_empty() {
+        vec![None]
+    } else {
+        selector.targets.iter().cloned().map(Some).collect()
+    };
+    let configuration_evidence = if selector.configurations.is_empty() {
+        vec![None]
+    } else {
+        selector.configurations.iter().cloned().map(Some).collect()
+    };
+    let evidence = target_evidence
+        .into_iter()
+        .flat_map(|target| {
+            configuration_evidence
+                .iter()
+                .cloned()
+                .map(move |configuration| (target.clone(), configuration))
+        })
+        .map(|(target, configuration)| SemanticModelActivationEvidence {
             language: compiled.manifest.language.clone(),
             ecosystem: compiled.manifest.ecosystem.clone(),
             package: selector.package.as_ref().map(catalog_coordinate),
             module: selector.module.as_ref().map(catalog_coordinate),
             toolchain: selector.toolchain.as_ref().map(catalog_coordinate),
-            target: selector.targets.first().cloned(),
-            configuration: selector.configurations.first().cloned(),
+            target,
+            configuration,
             artifact_sha256: Some(spec.artifact.sha256.clone()),
+        })
+        .collect();
+    let request = SemanticModelActivationRequest {
+        bifrost_version: env!("CARGO_PKG_VERSION")
+            .parse()
+            .expect("crate package version is valid semver"),
+        evidence,
+        controls: vec![SemanticModelActivationControl {
+            scope: SemanticModelControlScope::Workspace,
+            action: SemanticModelControlAction::Enable,
+            selector: SemanticModelPackSelector {
+                pack_id: spec.pack_id.clone(),
+                version: Some(
+                    VersionReq::parse(&format!("={}", spec.pack_version)).map_err(|error| {
+                        BundleError::new(format!(
+                            "invalid pinned pack version {}: {error}",
+                            spec.pack_version
+                        ))
+                    })?,
+                ),
+                manifest_digest: Some(compiled.manifest.content_sha256.clone()),
+            },
         }],
-        controls: Vec::new(),
         limits: Default::default(),
     };
     let started = Instant::now();
@@ -1271,7 +1485,7 @@ fn lookup_record_count(active: &ResolvedActiveSemanticModels, query: &PinnedLook
 }
 
 pub fn verify_release_bundle(output_root: &Path) -> Result<ReleaseBundle, BundleError> {
-    let index_path = output_root.join("index.json");
+    let index_path = safe_asset_path(output_root, Path::new("index.json"))?;
     let index_bytes = fs::read(&index_path)
         .map_err(|error| BundleError::new(format!("read {}: {error}", index_path.display())))?;
     let index: ReleaseBundleIndex = serde_json::from_slice(&index_bytes)
@@ -1282,12 +1496,18 @@ pub fn verify_release_bundle(output_root: &Path) -> Result<ReleaseBundle, Bundle
             index.schema_version
         )));
     }
+    if index.generator != current_release_generator() {
+        return Err(BundleError::new(format!(
+            "release bundle generator {:?} is not the current generator {:?}",
+            index.generator,
+            current_release_generator()
+        )));
+    }
+    ensure_unique_pack_identities(&index.packs)?;
     verify_checksums(output_root, &index)?;
     let rejects = verify_rejects(output_root, &index)?;
-    let measurements_path = output_root.join("measurements.json");
-    if measurements_path.exists() {
-        verify_measurements(&measurements_path, &index)?;
-    }
+    let measurements_path = safe_asset_path(output_root, Path::new("measurements.json"))?;
+    verify_measurements(&measurements_path, &index)?;
     let limits = DecodeLimits::default();
     for pack in &index.packs {
         let manifest_bytes = verify_asset(output_root, &pack.manifest)?;
@@ -1337,11 +1557,225 @@ pub fn verify_release_bundle(output_root: &Path) -> Result<ReleaseBundle, Bundle
                 BundleError::new(format!("decode shard {}: {error}", descriptor.shard_id))
             })?;
         }
+        if pack.notices.is_empty() {
+            return Err(BundleError::new(format!(
+                "release pack {}@{} must include at least one license or notice asset",
+                pack.pack_id, pack.pack_version
+            )));
+        }
+        validate_release_notices(&pack.notices)?;
         for notice in &pack.notices {
             verify_asset(output_root, &notice.asset)?;
         }
     }
     Ok(ReleaseBundle { index, rejects })
+}
+
+/// Merge independently generated, fully verified release bundles into one
+/// deterministic bundle. Every source bundle is verified before any output is
+/// written; content-addressed assets may be shared only when their bytes are
+/// identical.
+pub fn merge_release_bundles(
+    output_root: &Path,
+    input_roots: &[PathBuf],
+) -> Result<ReleaseBundle, BundleError> {
+    if input_roots.is_empty() {
+        return Err(BundleError::new(
+            "at least one input release bundle is required",
+        ));
+    }
+    let generator = current_release_generator();
+    let mut packs = Vec::new();
+    let mut rejects = Vec::new();
+    let mut measurements = Vec::new();
+    let mut assets = BTreeMap::<String, Vec<u8>>::new();
+    let mut identities = BTreeSet::new();
+
+    // Verify every input and retain all source bytes before touching the
+    // output. The output must be a new or empty directory, so a stale or
+    // source bundle file can never be retained accidentally.
+    prepare_merge_output(output_root, input_roots)?;
+    for input_root in input_roots {
+        let bundle = verify_release_bundle(input_root)?;
+        if bundle.index.generator != generator {
+            return Err(BundleError::new(format!(
+                "input bundle {} uses incompatible generator {:?}",
+                input_root.display(),
+                bundle.index.generator
+            )));
+        }
+        let input_measurements =
+            read_measurements(&input_root.join("measurements.json"), &bundle.index)?;
+        for pack in &bundle.index.packs {
+            let identity = (pack.pack_id.clone(), pack.pack_version.clone());
+            if !identities.insert(identity.clone()) {
+                return Err(BundleError::new(format!(
+                    "duplicate release pack {}@{} across input bundles",
+                    identity.0, identity.1
+                )));
+            }
+            collect_asset(input_root, &mut assets, &pack.manifest)?;
+            for shard in &pack.shards {
+                collect_asset(input_root, &mut assets, &shard.asset)?;
+            }
+            for notice in &pack.notices {
+                collect_asset(input_root, &mut assets, &notice.asset)?;
+            }
+        }
+        packs.extend(bundle.index.packs);
+        rejects.extend(bundle.rejects.packs);
+        measurements.extend(input_measurements.packs);
+    }
+
+    packs.sort_unstable_by(|left, right| {
+        (&left.pack_id, &left.pack_version).cmp(&(&right.pack_id, &right.pack_version))
+    });
+    rejects.sort_unstable_by(|left, right| {
+        (&left.pack_id, &left.pack_version).cmp(&(&right.pack_id, &right.pack_version))
+    });
+    measurements.sort_unstable_by(|left, right| {
+        (&left.pack_id, &left.pack_version).cmp(&(&right.pack_id, &right.pack_version))
+    });
+    for pack in &mut packs {
+        pack.shards
+            .sort_unstable_by(|left, right| left.shard_id.cmp(&right.shard_id));
+        pack.notices
+            .sort_unstable_by(|left, right| left.source_path.cmp(&right.source_path));
+    }
+
+    let index = ReleaseBundleIndex {
+        schema_version: RELEASE_BUNDLE_SCHEMA_VERSION,
+        generator: generator.clone(),
+        packs,
+    };
+    let rejects = ReleaseBundleRejects {
+        schema_version: RELEASE_BUNDLE_SCHEMA_VERSION,
+        generator: generator.clone(),
+        packs: rejects,
+    };
+    let measurements = ReleaseBundleMeasurements {
+        schema_version: RELEASE_BUNDLE_SCHEMA_VERSION,
+        generator,
+        packs: measurements,
+    };
+
+    fs::create_dir_all(output_root)
+        .map_err(|error| BundleError::new(format!("create {}: {error}", output_root.display())))?;
+    for (path, bytes) in assets {
+        write_content_addressed(output_root, &path, &bytes)?;
+    }
+    write_new_or_identical(output_root, Path::new("index.json"), &json_bytes(&index)?)?;
+    write_new_or_identical(
+        output_root,
+        Path::new("rejects.json"),
+        &json_bytes(&rejects)?,
+    )?;
+    write_new_or_identical(
+        output_root,
+        Path::new("measurements.json"),
+        &json_bytes(&measurements)?,
+    )?;
+    write_checksums(output_root, &index)?;
+    verify_release_bundle(output_root)
+}
+
+fn collect_asset(
+    input_root: &Path,
+    assets: &mut BTreeMap<String, Vec<u8>>,
+    asset: &ReleaseAsset,
+) -> Result<(), BundleError> {
+    let bytes = verify_asset(input_root, asset)?;
+    if let Some(existing) = assets.get(&asset.path) {
+        if existing != &bytes {
+            return Err(BundleError::new(format!(
+                "conflicting bytes for release asset {}",
+                asset.path
+            )));
+        }
+    } else {
+        assets.insert(asset.path.clone(), bytes);
+    }
+    Ok(())
+}
+
+fn prepare_merge_output(output_root: &Path, input_roots: &[PathBuf]) -> Result<(), BundleError> {
+    reject_symlink_components(output_root, None)?;
+    let metadata = match fs::symlink_metadata(output_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(BundleError::new(format!(
+                "inspect merge output {}: {error}",
+                output_root.display()
+            )));
+        }
+    };
+    if !metadata.is_dir() {
+        return Err(BundleError::new(format!(
+            "merge output {} must be a directory",
+            output_root.display()
+        )));
+    }
+    if fs::read_dir(output_root)
+        .map_err(|error| BundleError::new(format!("read merge output: {error}")))?
+        .next()
+        .is_some()
+    {
+        return Err(BundleError::new(
+            "merge output must be a new or empty directory",
+        ));
+    }
+    let output = fs::canonicalize(output_root)
+        .map_err(|error| BundleError::new(format!("resolve merge output: {error}")))?;
+    for input_root in input_roots {
+        let input = fs::canonicalize(input_root).map_err(|error| {
+            BundleError::new(format!(
+                "resolve input bundle {}: {error}",
+                input_root.display()
+            ))
+        })?;
+        if input == output {
+            return Err(BundleError::new(
+                "merge output must not be one of the input bundle directories",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_release_notices(notices: &[ReleaseNotice]) -> Result<(), BundleError> {
+    let mut seen = BTreeSet::new();
+    for pair in notices.windows(2) {
+        if pair[0].source_path >= pair[1].source_path {
+            return Err(BundleError::new(
+                "release notice source paths must be unique and in canonical order",
+            ));
+        }
+    }
+    for notice in notices {
+        require_safe_relative(Path::new(&notice.source_path))?;
+        if !seen.insert(&notice.source_path) {
+            return Err(BundleError::new(format!(
+                "release notice source path is duplicated: {}",
+                notice.source_path
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_unique_pack_identities(packs: &[ReleasePack]) -> Result<(), BundleError> {
+    let mut identities = BTreeSet::new();
+    for pack in packs {
+        let identity = (pack.pack_id.clone(), pack.pack_version.clone());
+        if !identities.insert(identity.clone()) {
+            return Err(BundleError::new(format!(
+                "duplicate release pack {}@{}",
+                identity.0, identity.1
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Read and cross-check the structured extraction burn-down report.
@@ -1352,7 +1786,7 @@ fn verify_rejects(
     output_root: &Path,
     index: &ReleaseBundleIndex,
 ) -> Result<ReleaseBundleRejects, BundleError> {
-    let rejects_path = output_root.join("rejects.json");
+    let rejects_path = safe_asset_path(output_root, Path::new("rejects.json"))?;
     let rejects_bytes = fs::read(&rejects_path)
         .map_err(|error| BundleError::new(format!("read {}: {error}", rejects_path.display())))?;
     let rejects: ReleaseBundleRejects = serde_json::from_slice(&rejects_bytes)
@@ -1490,7 +1924,7 @@ pub fn install_release_bundle(
 }
 
 fn verify_checksums(output_root: &Path, index: &ReleaseBundleIndex) -> Result<(), BundleError> {
-    let checksum_path = output_root.join("SHA256SUMS");
+    let checksum_path = safe_asset_path(output_root, Path::new("SHA256SUMS"))?;
     let checksum_text = fs::read_to_string(&checksum_path)
         .map_err(|error| BundleError::new(format!("read {}: {error}", checksum_path.display())))?;
     let mut actual_paths = Vec::new();
@@ -1499,8 +1933,8 @@ fn verify_checksums(output_root: &Path, index: &ReleaseBundleIndex) -> Result<()
             BundleError::new(format!("invalid SHA256SUMS line {}", line_number + 1))
         })?;
         validate_sha256("checksum", sha256)?;
-        require_safe_relative(Path::new(path))?;
-        let (actual_sha256, _) = sha256_file(&output_root.join(path))?;
+        let asset_path = safe_asset_path(output_root, Path::new(path))?;
+        let (actual_sha256, _) = sha256_file(&asset_path)?;
         if actual_sha256 != sha256 {
             return Err(BundleError::new(format!(
                 "checksum for {path} does not match SHA256SUMS"
@@ -1519,8 +1953,8 @@ fn verify_checksums(output_root: &Path, index: &ReleaseBundleIndex) -> Result<()
 
 fn verify_asset(output_root: &Path, asset: &ReleaseAsset) -> Result<Vec<u8>, BundleError> {
     let relative = Path::new(&asset.path);
-    require_safe_relative(relative)?;
-    let bytes = fs::read(output_root.join(relative))
+    let path = safe_asset_path(output_root, relative)?;
+    let bytes = fs::read(path)
         .map_err(|error| BundleError::new(format!("read asset {}: {error}", asset.path)))?;
     if bytes.len() as u64 != asset.bytes || sha256_bytes(&bytes) != asset.sha256 {
         return Err(BundleError::new(format!(
@@ -1535,7 +1969,27 @@ fn verify_measurements(
     measurements_path: &Path,
     index: &ReleaseBundleIndex,
 ) -> Result<(), BundleError> {
-    let measurements_bytes = fs::read(measurements_path).map_err(|error| {
+    read_measurements(measurements_path, index).map(|_| ())
+}
+
+fn read_measurements(
+    measurements_path: &Path,
+    index: &ReleaseBundleIndex,
+) -> Result<ReleaseBundleMeasurements, BundleError> {
+    let root = measurements_path.parent().ok_or_else(|| {
+        BundleError::new(format!(
+            "measurements path has no root: {}",
+            measurements_path.display()
+        ))
+    })?;
+    let relative = measurements_path.file_name().ok_or_else(|| {
+        BundleError::new(format!(
+            "measurements path has no file name: {}",
+            measurements_path.display()
+        ))
+    })?;
+    let safe_path = safe_asset_path(root, Path::new(relative))?;
+    let measurements_bytes = fs::read(&safe_path).map_err(|error| {
         BundleError::new(format!("read {}: {error}", measurements_path.display()))
     })?;
     let measurements: ReleaseBundleMeasurements = serde_json::from_slice(&measurements_bytes)
@@ -1572,14 +2026,24 @@ fn verify_measurements(
                     || measurement.record_count
                         != pack.shards.iter().map(|shard| shard.records).sum::<u64>()
                     || measurement.completeness != pack.completeness
+                    || measurement.lookups.is_empty()
                     || measurement.lookups.iter().any(|lookup| lookup.records == 0)
+                    || measurement
+                        .lookups
+                        .iter()
+                        .enumerate()
+                        .any(|(index, lookup)| {
+                            measurement.lookups[index + 1..]
+                                .iter()
+                                .any(|other| other.query == lookup.query)
+                        })
             })
     {
         return Err(BundleError::new(
             "release measurements do not match the indexed packs",
         ));
     }
-    Ok(())
+    Ok(measurements)
 }
 
 fn write_content_addressed(
@@ -1588,7 +2052,6 @@ fn write_content_addressed(
     bytes: &[u8],
 ) -> Result<(), BundleError> {
     let path = Path::new(relative);
-    require_safe_relative(path)?;
     write_new_or_identical(output_root, path, bytes)
 }
 
@@ -1597,8 +2060,7 @@ fn write_new_or_identical(
     relative: &Path,
     bytes: &[u8],
 ) -> Result<(), BundleError> {
-    require_safe_relative(relative)?;
-    let path = output_root.join(relative);
+    let path = safe_asset_path(output_root, relative)?;
     match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             return Err(BundleError::new(format!(
@@ -1673,8 +2135,7 @@ fn write_new_or_identical(
 }
 
 fn write_replace(output_root: &Path, relative: &Path, bytes: &[u8]) -> Result<(), BundleError> {
-    require_safe_relative(relative)?;
-    let path = output_root.join(relative);
+    let path = safe_asset_path(output_root, relative)?;
     let parent = path.parent().expect("relative output has a parent");
     let mut temporary = NamedTempFile::new_in(parent).map_err(|error| {
         BundleError::new(format!(
@@ -1703,7 +2164,8 @@ fn write_checksums(output_root: &Path, index: &ReleaseBundleIndex) -> Result<(),
     let paths = release_asset_paths(index);
     let mut output = String::new();
     for path in paths {
-        let (sha256, _) = sha256_file(&output_root.join(&path))?;
+        let asset_path = safe_asset_path(output_root, Path::new(&path))?;
+        let (sha256, _) = sha256_file(&asset_path)?;
         output.push_str(&sha256);
         output.push_str("  ");
         output.push_str(&path);
@@ -1713,6 +2175,9 @@ fn write_checksums(output_root: &Path, index: &ReleaseBundleIndex) -> Result<(),
 }
 
 fn release_asset_paths(index: &ReleaseBundleIndex) -> Vec<String> {
+    // Measurements are required and structurally verified, but intentionally
+    // remain outside the reproducibility checksum because they contain wall-
+    // clock observations from each generation run.
     let mut paths = vec!["index.json".to_owned(), "rejects.json".to_owned()];
     for pack in &index.packs {
         paths.push(pack.manifest.path.clone());
@@ -1734,6 +2199,68 @@ fn require_safe_relative(path: &Path) -> Result<(), BundleError> {
             "release paths must be relative and contain no traversal: {}",
             path.display()
         )));
+    }
+    Ok(())
+}
+
+fn safe_asset_path(root: &Path, relative: &Path) -> Result<PathBuf, BundleError> {
+    require_safe_relative(relative)?;
+    reject_symlink_components(root, Some(relative))?;
+    let path = root.join(relative);
+    if path.exists() {
+        let resolved_root = fs::canonicalize(root).map_err(|error| {
+            BundleError::new(format!(
+                "resolve release output root {}: {error}",
+                root.display()
+            ))
+        })?;
+        let resolved_path = fs::canonicalize(&path).map_err(|error| {
+            BundleError::new(format!("resolve release asset {}: {error}", path.display()))
+        })?;
+        if !resolved_path.starts_with(&resolved_root) {
+            return Err(BundleError::new(format!(
+                "release asset resolves outside the output root: {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(path)
+}
+
+fn reject_symlink_components(root: &Path, relative: Option<&Path>) -> Result<(), BundleError> {
+    if let Ok(metadata) = fs::symlink_metadata(root)
+        && metadata.file_type().is_symlink()
+    {
+        return Err(BundleError::new(format!(
+            "refusing symbolic-link release output root {}",
+            root.display()
+        )));
+    }
+    let Some(relative) = relative else {
+        return Ok(());
+    };
+    let mut path = root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            unreachable!("require_safe_relative validates release paths first")
+        };
+        path.push(component);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(BundleError::new(format!(
+                    "refusing symbolic-link release asset component {}",
+                    path.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(BundleError::new(format!(
+                    "inspect release asset component {}: {error}",
+                    path.display()
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -2077,6 +2604,329 @@ mod tests {
             1
         );
         assert_eq!(active.types_named("collections.deque").records.len(), 1);
+    }
+
+    #[test]
+    fn typescript_library_set_authoring_uses_manifest_and_library_mapping() {
+        let fixture = tempdir().unwrap();
+        let root = fixture.path().join("typescript-7.0.2");
+        fs::create_dir_all(root.join("lib")).unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"typescript","version":"7.0.2","license":"Apache-2.0"}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("lib/lib.es5.d.ts"),
+            "interface Array<T> { length: number; }\n",
+        )
+        .unwrap();
+        fs::write(fixture.path().join("NOTICE.txt"), "fixture notice\n").unwrap();
+        let libraries = vec![PinnedTypeScriptLibrary {
+            name: "es5".to_owned(),
+            path: "lib/lib.es5.d.ts".to_owned(),
+        }];
+        let artifact = read_exact_source_set(
+            &root,
+            &[
+                PathBuf::from("package.json"),
+                PathBuf::from("lib/lib.es5.d.ts"),
+            ],
+            MAX_SOURCE_SET_FILES,
+            MAX_SOURCE_SET_PATH_DEPTH,
+            &ArtifactProducerLimits::default(),
+        )
+        .unwrap();
+        let pinned = pinned_spec(
+            "typescript-library-fixture",
+            "7.0.2",
+            "npm",
+            PinnedPackKind::TypeScriptLibrarySet {
+                manifest: "package.json".to_owned(),
+                libraries,
+            },
+            PinnedArtifact {
+                file_name: "typescript-7.0.2".to_owned(),
+                sha256: artifact.sha256().to_owned(),
+                url: Some("https://example.invalid/typescript-7.0.2".to_owned()),
+                container: None,
+            },
+            "typescript",
+            "typescript",
+            vec![PinnedLookupQuery::Type {
+                name: "Array".to_owned(),
+            }],
+        );
+        let request = ArtifactProductionRequest {
+            path: root,
+            artifact_kind: pinned.kind.artifact_kind(),
+            pack_id: pinned.pack_id,
+            pack_version: pinned.pack_version,
+            ecosystem: pinned.ecosystem,
+            compatibility: pinned.compatibility,
+            activation: pinned.activation,
+            provenance: pinned.provenance,
+            license: pinned.license,
+            safety: pinned.safety,
+        };
+        let production = produce_pinned_pack(
+            &pinned.kind,
+            &request,
+            &ArtifactProducerLimits::default(),
+            &CancellationToken::default(),
+            &artifact,
+        );
+        assert_eq!(production.completeness, Completeness::Complete);
+        assert!(production.diagnostics.is_empty());
+        let pack = production.pack.expect("TypeScript library pack");
+        assert_eq!(pack.language, "typescript");
+        assert_eq!(pack.shards.len(), 1);
+        assert_eq!(pack.shards[0].id, "declarations.typescript.lib.es5");
+    }
+
+    #[test]
+    fn reviewed_typescript_measurement_enables_all_selected_configuration_shards() {
+        let fixture = tempdir().unwrap();
+        let root = fixture.path().join("typescript-7.0.2");
+        fs::create_dir_all(root.join("lib")).unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"typescript","version":"7.0.2","license":"Apache-2.0"}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("lib/lib.es2020.d.ts"),
+            "interface Promise<T> { then(): void; }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("lib/lib.dom.d.ts"),
+            "interface Document { title: string; }\n",
+        )
+        .unwrap();
+        fs::write(fixture.path().join("NOTICE.txt"), "fixture notice\n").unwrap();
+        let relative_paths = [
+            PathBuf::from("package.json"),
+            PathBuf::from("lib/lib.es2020.d.ts"),
+            PathBuf::from("lib/lib.dom.d.ts"),
+        ];
+        let artifact_sha256 = read_exact_source_set(
+            &root,
+            &relative_paths,
+            MAX_SOURCE_SET_FILES,
+            MAX_SOURCE_SET_PATH_DEPTH,
+            &ArtifactProducerLimits::default(),
+        )
+        .unwrap()
+        .sha256()
+        .to_owned();
+        let mut pinned = pinned_spec(
+            "typescript-measurement-fixture",
+            "7.0.2",
+            "npm",
+            PinnedPackKind::TypeScriptLibrarySet {
+                manifest: "package.json".to_owned(),
+                libraries: vec![
+                    PinnedTypeScriptLibrary {
+                        name: "es2020".to_owned(),
+                        path: "lib/lib.es2020.d.ts".to_owned(),
+                    },
+                    PinnedTypeScriptLibrary {
+                        name: "dom".to_owned(),
+                        path: "lib/lib.dom.d.ts".to_owned(),
+                    },
+                ],
+            },
+            PinnedArtifact {
+                file_name: "typescript-7.0.2".to_owned(),
+                sha256: artifact_sha256,
+                url: Some("https://example.invalid/typescript-7.0.2".to_owned()),
+                container: None,
+            },
+            "typescript",
+            "typescript",
+            vec![
+                PinnedLookupQuery::Type {
+                    name: "Promise".to_owned(),
+                },
+                PinnedLookupQuery::Type {
+                    name: "Document".to_owned(),
+                },
+            ],
+        );
+        pinned.safety.review_required = true;
+        pinned.activation[0].configurations = vec![
+            "typescript-lib:es2020".to_owned(),
+            "typescript-lib:dom".to_owned(),
+        ];
+        pinned.measurement_activation.configurations = vec![
+            "typescript-lib:es2020".to_owned(),
+            "typescript-lib:dom".to_owned(),
+        ];
+        let spec = fixture.path().join("typescript.json");
+        fs::write(&spec, serde_json::to_vec_pretty(&pinned).unwrap()).unwrap();
+        let bundle = generate_release_bundle(
+            &fixture.path().join("bundle"),
+            &[BundleInput {
+                spec_path: spec,
+                artifact_path: root,
+            }],
+        )
+        .unwrap();
+        assert_eq!(bundle.index.packs.len(), 1);
+        let measurements = serde_json::from_slice::<ReleaseBundleMeasurements>(
+            &fs::read(fixture.path().join("bundle/measurements.json")).unwrap(),
+        )
+        .unwrap();
+        let measurements = &measurements.packs[0];
+        assert_eq!(measurements.lookups.len(), 2);
+        assert!(measurements.lookups.iter().all(|lookup| lookup.records > 0));
+    }
+
+    #[test]
+    fn typescript_library_set_validation_requires_canonical_unique_names_and_paths() {
+        let fixture = tempdir().unwrap();
+        let artifact = PinnedArtifact {
+            file_name: "typescript.tgz".to_owned(),
+            sha256: "a".repeat(64),
+            url: Some("https://example.invalid/typescript.tgz".to_owned()),
+            container: None,
+        };
+        let make_spec = |libraries| {
+            pinned_spec(
+                "typescript-validation",
+                "7.0.2",
+                "npm",
+                PinnedPackKind::TypeScriptLibrarySet {
+                    manifest: "package.json".to_owned(),
+                    libraries,
+                },
+                artifact.clone(),
+                "typescript",
+                "typescript",
+                vec![PinnedLookupQuery::Type {
+                    name: "Array".to_owned(),
+                }],
+            )
+        };
+        let error = validate_spec(
+            &make_spec(vec![PinnedTypeScriptLibrary {
+                name: "ES5".to_owned(),
+                path: "lib/lib.es5.d.ts".to_owned(),
+            }]),
+            fixture.path().join("uppercase.json").as_path(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("non-canonical name"), "{error}");
+
+        let error = validate_spec(
+            &make_spec(vec![PinnedTypeScriptLibrary {
+                name: "dom".to_owned(),
+                path: "lib/lib.es5.d.ts".to_owned(),
+            }]),
+            fixture.path().join("mismatch.json").as_path(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("does not match"), "{error}");
+
+        let duplicate = PinnedTypeScriptLibrary {
+            name: "es5".to_owned(),
+            path: "lib/lib.es5.d.ts".to_owned(),
+        };
+        let error = validate_spec(
+            &make_spec(vec![duplicate.clone(), duplicate]),
+            fixture.path().join("duplicate.json").as_path(),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("duplicate TypeScript library"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn checked_in_typescript_and_rust_specs_parse_through_release_tooling() {
+        let semantic_packs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../semantic-packs");
+        for ecosystem in ["typescript", "rust"] {
+            let directory = semantic_packs.join(ecosystem);
+            let mut paths = fs::read_dir(&directory)
+                .unwrap_or_else(|error| panic!("read {}: {error}", directory.display()))
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| {
+                    path.extension().and_then(|extension| extension.to_str()) == Some("json")
+                })
+                .collect::<Vec<_>>();
+            paths.sort();
+            assert!(!paths.is_empty(), "no checked-in {ecosystem} specs found");
+            let specs = paths
+                .into_iter()
+                .map(|path| {
+                    let bytes = fs::read(&path).unwrap();
+                    let spec: PinnedPackSpec = serde_json::from_slice(&bytes)
+                        .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
+                    (path, spec)
+                })
+                .collect::<Vec<_>>();
+            for (path, spec) in specs {
+                validate_spec(&spec, &path)
+                    .unwrap_or_else(|error| panic!("validate {}: {error}", path.display()));
+            }
+        }
+    }
+
+    #[test]
+    fn rustdoc_json_set_authoring_routes_to_source_set_producer() {
+        let fixture = tempdir().unwrap();
+        let root = fixture.path().join("rustdoc");
+        fs::create_dir_all(&root).unwrap();
+        // This is intentionally the smallest malformed document: the
+        // source-set producer must report a rustdoc parse diagnostic rather
+        // than the old authoring.unsupported_artifact_kind placeholder.
+        fs::write(root.join("core.json"), r#"{"format_version":60}"#).unwrap();
+        fs::write(fixture.path().join("NOTICE.txt"), "fixture notice\n").unwrap();
+        let crates = vec![PinnedRustdocCrate {
+            name: "core".to_owned(),
+            path: "core.json".to_owned(),
+        }];
+        let artifact_sha256 = read_exact_source_set(
+            &root,
+            &[PathBuf::from("core.json")],
+            MAX_SOURCE_SET_FILES,
+            MAX_SOURCE_SET_PATH_DEPTH,
+            &ArtifactProducerLimits::default(),
+        )
+        .unwrap()
+        .sha256()
+        .to_owned();
+        let spec = fixture.path().join("rustdoc.json");
+        let pinned = pinned_spec(
+            "rustdoc-json-fixture",
+            "1.100.0-nightly",
+            "cargo",
+            PinnedPackKind::RustdocJsonSet { crates },
+            PinnedArtifact {
+                file_name: "rustdoc".to_owned(),
+                sha256: artifact_sha256,
+                url: Some("https://example.invalid/rustdoc".to_owned()),
+                container: None,
+            },
+            "rust",
+            "rust",
+            vec![PinnedLookupQuery::Type {
+                name: "core.Option".to_owned(),
+            }],
+        );
+        fs::write(&spec, serde_json::to_vec_pretty(&pinned).unwrap()).unwrap();
+        let error = generate_release_bundle(
+            &fixture.path().join("bundle"),
+            &[BundleInput {
+                spec_path: spec,
+                artifact_path: root,
+            }],
+        )
+        .unwrap_err();
+        assert!(!error.to_string().contains("unsupported_artifact_kind"));
+        assert!(error.to_string().contains("rust.rustdoc"), "{error}");
     }
 
     #[test]
@@ -2602,6 +3452,210 @@ mod tests {
         fs::create_dir_all(fixture.path().join("notices")).unwrap();
         fs::write(fixture.path().join(&asset.path), b"tampered").unwrap();
         assert!(verify_asset(fixture.path(), &asset).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verifier_rejects_symlink_asset_components() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempdir().unwrap();
+        let outside = fixture.path().join("outside.txt");
+        fs::write(&outside, b"expected").unwrap();
+        fs::create_dir_all(fixture.path().join("notices")).unwrap();
+        symlink(&outside, fixture.path().join("notices/example.txt")).unwrap();
+        let asset = ReleaseAsset {
+            path: "notices/example.txt".to_owned(),
+            sha256: sha256_bytes(b"expected"),
+            bytes: 8,
+        };
+        let error = verify_asset(fixture.path(), &asset).unwrap_err();
+        assert!(error.to_string().contains("symbolic-link"), "{error}");
+
+        fs::remove_file(fixture.path().join("notices/example.txt")).unwrap();
+        fs::remove_dir(fixture.path().join("notices")).unwrap();
+        symlink(
+            fixture.path().join("outside-dir"),
+            fixture.path().join("notices"),
+        )
+        .unwrap();
+        let error = verify_asset(fixture.path(), &asset).unwrap_err();
+        assert!(error.to_string().contains("symbolic-link"), "{error}");
+    }
+
+    #[test]
+    fn release_notice_validation_rejects_unsafe_duplicate_and_unsorted_sources() {
+        let asset = ReleaseAsset {
+            path: "notices/example.txt".to_owned(),
+            sha256: sha256_bytes(b"notice"),
+            bytes: 6,
+        };
+        let notice = |source_path: &str| ReleaseNotice {
+            source_path: source_path.to_owned(),
+            asset: asset.clone(),
+        };
+        assert!(validate_release_notices(&[notice("../NOTICE.txt")]).is_err());
+        assert!(validate_release_notices(&[notice("z.txt"), notice("a.txt")]).is_err());
+        assert!(validate_release_notices(&[notice("NOTICE.txt"), notice("NOTICE.txt")]).is_err());
+    }
+
+    #[test]
+    fn merge_release_bundles_is_sorted_deterministic_and_fail_closed() {
+        let fixture = tempdir().unwrap();
+        fs::write(fixture.path().join("NOTICE.txt"), "fixture notice\n").unwrap();
+
+        let scala_artifact = fixture.path().join("scala.jar");
+        write_zip(
+            &scala_artifact,
+            &[("scala/Core.scala", "package scala\ntrait Any\n")],
+        );
+        let (scala_sha256, _) = sha256_file(&scala_artifact).unwrap();
+        let scala_spec = fixture.path().join("scala.json");
+        fs::write(
+            &scala_spec,
+            serde_json::to_vec_pretty(&pinned_spec(
+                "scala-merge-fixture",
+                "2.13.16",
+                "maven",
+                PinnedPackKind::ScalaSourceJar,
+                PinnedArtifact {
+                    file_name: "scala.jar".to_owned(),
+                    sha256: scala_sha256,
+                    url: Some("https://example.invalid/scala.jar".to_owned()),
+                    container: None,
+                },
+                "scala",
+                "org.scala-lang:scala-library",
+                vec![PinnedLookupQuery::Type {
+                    name: "scala.Any".to_owned(),
+                }],
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let java_artifact = fixture.path().join("java.jar");
+        write_zip(
+            &java_artifact,
+            &[(
+                "fixture/Widget.java",
+                "package fixture; public class Widget {}\n",
+            )],
+        );
+        let (java_sha256, _) = sha256_file(&java_artifact).unwrap();
+        let java_spec = fixture.path().join("java.json");
+        fs::write(
+            &java_spec,
+            serde_json::to_vec_pretty(&pinned_spec(
+                "java-merge-fixture",
+                "1.0.0",
+                "maven",
+                PinnedPackKind::JavaSourceJar,
+                PinnedArtifact {
+                    file_name: "java.jar".to_owned(),
+                    sha256: java_sha256,
+                    url: Some("https://example.invalid/java.jar".to_owned()),
+                    container: None,
+                },
+                "jdk",
+                "fixture:java",
+                vec![PinnedLookupQuery::Type {
+                    name: "fixture.Widget".to_owned(),
+                }],
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let scala_bundle = fixture.path().join("scala-bundle");
+        generate_release_bundle(
+            &scala_bundle,
+            &[BundleInput {
+                spec_path: scala_spec,
+                artifact_path: scala_artifact,
+            }],
+        )
+        .unwrap();
+        let java_bundle = fixture.path().join("java-bundle");
+        generate_release_bundle(
+            &java_bundle,
+            &[BundleInput {
+                spec_path: java_spec,
+                artifact_path: java_artifact,
+            }],
+        )
+        .unwrap();
+
+        let merged = fixture.path().join("merged");
+        let merged_bundle =
+            merge_release_bundles(&merged, &[java_bundle.clone(), scala_bundle.clone()]).unwrap();
+        assert_eq!(
+            merged_bundle
+                .index
+                .packs
+                .iter()
+                .map(|pack| pack.pack_id.as_str())
+                .collect::<Vec<_>>(),
+            ["java-merge-fixture", "scala-merge-fixture"]
+        );
+        let measurements: ReleaseBundleMeasurements =
+            serde_json::from_slice(&fs::read(merged.join("measurements.json")).unwrap()).unwrap();
+        assert_eq!(
+            measurements
+                .packs
+                .iter()
+                .map(|pack| pack.pack_id.as_str())
+                .collect::<Vec<_>>(),
+            ["java-merge-fixture", "scala-merge-fixture"]
+        );
+        assert_eq!(verify_release_bundle(&merged).unwrap(), merged_bundle);
+
+        let stale = fixture.path().join("stale");
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(stale.join("old.txt"), b"stale").unwrap();
+        let error = merge_release_bundles(&stale, &[java_bundle.clone(), scala_bundle.clone()])
+            .unwrap_err();
+        assert!(error.to_string().contains("new or empty"), "{error}");
+
+        let mut empty_measurements: ReleaseBundleMeasurements =
+            serde_json::from_slice(&fs::read(merged.join("measurements.json")).unwrap()).unwrap();
+        empty_measurements.packs[0].lookups.clear();
+        fs::write(
+            merged.join("measurements.json"),
+            json_bytes(&empty_measurements).unwrap(),
+        )
+        .unwrap();
+        let error = verify_release_bundle(&merged).unwrap_err();
+        assert!(error.to_string().contains("measurements"), "{error}");
+
+        let repeat = fixture.path().join("merged-repeat");
+        merge_release_bundles(&repeat, &[scala_bundle.clone(), java_bundle.clone()]).unwrap();
+        assert_eq!(
+            fs::read(merged.join("index.json")).unwrap(),
+            fs::read(repeat.join("index.json")).unwrap()
+        );
+        assert_eq!(
+            fs::read(merged.join("rejects.json")).unwrap(),
+            fs::read(repeat.join("rejects.json")).unwrap()
+        );
+        assert_eq!(
+            fs::read(merged.join("SHA256SUMS")).unwrap(),
+            fs::read(repeat.join("SHA256SUMS")).unwrap()
+        );
+
+        let duplicate = fixture.path().join("duplicate");
+        let error =
+            merge_release_bundles(&duplicate, &[scala_bundle.clone(), scala_bundle.clone()])
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("duplicate release pack"),
+            "{error}"
+        );
+
+        fs::remove_file(java_bundle.join("measurements.json")).unwrap();
+        assert!(verify_release_bundle(&java_bundle).is_err());
+        fs::write(scala_bundle.join("SHA256SUMS"), b"tampered\n").unwrap();
+        assert!(verify_release_bundle(&scala_bundle).is_err());
     }
 
     fn write_zip(path: &Path, entries: &[(&str, &str)]) {

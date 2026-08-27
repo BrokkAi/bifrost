@@ -5,6 +5,7 @@ import test from "node:test";
 import {
   confirmReleaseVersion,
   normalizeReleaseTag,
+  THIRD_PARTY_SEMANTIC_PACK_SPECS,
   readCargoVersion,
   syncBifrostDependencyVersions,
   syncCitationVersion,
@@ -12,11 +13,22 @@ import {
   validateWorkspaceVersionInheritance,
 } from "./release-version.mjs";
 
+test("release inputs include every pinned third-party semantic-pack ecosystem", () => {
+  assert.deepEqual(THIRD_PARTY_SEMANTIC_PACK_SPECS, [
+    "semantic-packs/jvm/temurin-jdk-21.0.8+9.json",
+    "semantic-packs/jvm/kotlin-stdlib-2.2.20.json",
+    "semantic-packs/jvm/scala-library-2.13.16.json",
+    "semantic-packs/python/typeshed-stdlib-2026.8.8.json",
+    "semantic-packs/typescript/typescript-7.0.2.json",
+    "semantic-packs/rust/rust-stdlib-nightly-2026-08-24.json",
+  ]);
+});
+
 test("synchronizes exact internal Bifrost dependency versions", () => {
   const manifest = [
     '[dependencies]',
     'brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.21" }',
-    'brokk-bifrost-nlp = { path = "../bifrost-nlp", version = "=0.8.21", optional = true }',
+    'brokk-bifrost-policy = { path = "../bifrost-policy", version = "=0.8.21", optional = true }',
     'tree-sitter-java = "0.23.5"',
   ].join("\n");
 
@@ -25,7 +37,7 @@ test("synchronizes exact internal Bifrost dependency versions", () => {
     [
       '[dependencies]',
       'brokk-bifrost-core = { path = "../bifrost-core", version = "=0.8.22" }',
-      'brokk-bifrost-nlp = { path = "../bifrost-nlp", version = "=0.8.22", optional = true }',
+      'brokk-bifrost-policy = { path = "../bifrost-policy", version = "=0.8.22", optional = true }',
       'tree-sitter-java = "0.23.5"',
     ].join("\n"),
   );

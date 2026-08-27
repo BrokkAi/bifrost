@@ -160,6 +160,8 @@ pub struct CodeQueryBinding {
 pub struct CodeQueryImportBinder {
     pub local_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub imported_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub alias: Option<String>,
     /// Empty when the adapter records no parser-derived import path. That is a
     /// stated gap, not a claim that the import has no target.

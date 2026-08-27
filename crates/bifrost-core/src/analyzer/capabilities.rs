@@ -30,8 +30,7 @@ pub trait ImportAnalysisProvider: CapabilityProvider + Send + Sync {
     fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>>;
     fn referencing_files_of(&self, file: &ProjectFile) -> HashSet<ProjectFile>;
 
-    /// Return the union of files that reference any `target`, restricted to
-    /// the caller's candidate universe.
+    /// Return the union of workspace files that reference any `target`.
     ///
     /// A depth-bounded caller already knows both sets and must not be forced to
     /// initialize a provider's whole-workspace reverse index once per target.
@@ -41,20 +40,14 @@ pub trait ImportAnalysisProvider: CapabilityProvider + Send + Sync {
     fn referencing_files_of_targets(
         &self,
         targets: &HashSet<ProjectFile>,
-        candidates: &[ProjectFile],
         cancellation: &CancellationToken,
     ) -> HashSet<ProjectFile> {
-        let candidate_set: HashSet<ProjectFile> = candidates.iter().cloned().collect();
         let mut referencing = HashSet::default();
         for target in targets {
             if cancellation.is_cancelled() {
                 break;
             }
-            referencing.extend(
-                self.referencing_files_of(target)
-                    .into_iter()
-                    .filter(|file| candidate_set.contains(file)),
-            );
+            referencing.extend(self.referencing_files_of(target));
         }
         referencing
     }

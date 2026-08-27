@@ -1673,6 +1673,22 @@ fn jsts_exact_local_dotted_candidates(
     if candidates_with_definitions.is_empty() {
         return None;
     }
+    let definition_may_follow_reference = binding_scope.is_some_and(|binding_scope| {
+        jsts_enclosing_function_or_program_scope(ctx.root, ctx.before_byte).is_some_and(
+            |execution_scope| {
+                execution_scope.kind() != "program"
+                    && lexical_bindings.binding_scope_at(ctx.receiver, execution_scope.start_byte())
+                        == Some(binding_scope)
+                    && !lexical_bindings
+                        .binding_identifier_ranges_at(ctx.receiver, ctx.before_byte)
+                        .iter()
+                        .any(|range| {
+                            execution_scope.start_byte() <= range.start_byte
+                                && range.end_byte <= execution_scope.end_byte()
+                        })
+            },
+        )
+    });
     let reference_fallback_scope = binding_scope
         .is_none()
         .then(|| jsts_reference_fallback_scope(focused, ctx.root));
@@ -1711,12 +1727,42 @@ fn jsts_exact_local_dotted_candidates(
                                     )) == reference_fallback_scope
                             }
                         }
-                        && definition.property_range.end_byte <= ctx.before_byte
+                        && (definition.property_range.end_byte <= ctx.before_byte
+                            || (definition_may_follow_reference
+                                && jsts_is_object_literal_property_definition(
+                                    ctx.root,
+                                    &definition.property_range,
+                                )))
                 })
                 .then_some(candidate)
         })
         .collect();
     Some(candidates)
+}
+
+/// Whether a direct property definition is part of an object literal rather
+/// than a later assignment. A nested function or method can capture an outer
+/// binding whose object literal is initialized later in source order; an
+/// assignment after a read in the same execution scope remains order-sensitive.
+fn jsts_is_object_literal_property_definition(root: Node<'_>, range: &Range) -> bool {
+    let Some(mut node) = smallest_named_node_covering(root, range.start_byte, range.end_byte)
+    else {
+        return false;
+    };
+    while !matches!(
+        node.kind(),
+        "pair" | "shorthand_property_identifier" | "method_definition"
+    ) {
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        if matches!(parent.kind(), "assignment_expression" | "program") {
+            return false;
+        }
+        node = parent;
+    }
+    node.parent()
+        .is_some_and(|parent| parent.kind() == "object")
 }
 
 /// Keeps only declaration candidates that share the reference receiver's

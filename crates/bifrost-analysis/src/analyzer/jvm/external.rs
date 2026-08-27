@@ -6,6 +6,7 @@ use crate::analyzer::jvm::java_artifact::{
 use crate::analyzer::jvm::jdk_artifact::{
     JdkSourceArchivePackProducer, detect_jdk_source_archive_layout,
 };
+use crate::analyzer::jvm::jmod_artifact::JdkJmodSetPackProducer;
 use crate::analyzer::jvm::kotlin_artifact::KotlinSourceJarPackProducer;
 use crate::analyzer::jvm::scala_artifact::ScalaSourceJarPackProducer;
 use crate::analyzer::semantic_model::{
@@ -52,6 +53,7 @@ const MAX_TOTAL_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_TOTAL_INDEX_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_ANALYZER_SOURCE_TYPES: usize = 4_096;
+const MAX_JDK_JMOD_FILES: usize = 512;
 /// The most member declarations one indexed artifact may contribute to the
 /// external member surface (#1900).
 ///
@@ -539,22 +541,113 @@ fn discover_jdk_semantic_pack_dependencies(
         let source = [home.join("lib").join("src.zip"), home.join("src.zip")]
             .into_iter()
             .find(|path| path.is_file());
-        let dependency = resolved_jdk_dependency(version.clone(), source);
+        let dependency = if let Some(source) = source {
+            resolved_jdk_dependency(version.clone(), Some(source))
+        } else if configured {
+            match discover_jdk_jmods(&home) {
+                Ok(Some(relative_paths)) => {
+                    resolved_jdk_jmod_dependency(version.clone(), home, relative_paths)
+                }
+                Ok(None) => resolved_jdk_dependency(version.clone(), None),
+                Err(message) => {
+                    discovery.diagnostics.push(DependencyPackDiagnostic {
+                        severity: if configured {
+                            DependencyPackDiagnosticSeverity::Error
+                        } else {
+                            DependencyPackDiagnosticSeverity::Warning
+                        },
+                        code: "jdk.jmods.invalid".to_owned(),
+                        dependency_id: Some(format!("jdk:{version}")),
+                        location: Some(home.to_string_lossy().into_owned()),
+                        message,
+                    });
+                    resolved_jdk_dependency(version.clone(), None)
+                }
+            }
+        } else {
+            // Automatic JAVA_HOME discovery supplies exact toolchain evidence
+            // for a released source-derived pack. Parsing a full binary JDK is
+            // an explicit local-production opt-in through `jdk_homes`; doing
+            // it implicitly would block ordinary Java workspace readiness.
+            resolved_jdk_dependency(version.clone(), None)
+        };
         match dependency_by_version.entry(version) {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(discovery.dependencies.len());
                 discovery.dependencies.push(dependency);
             }
-            std::collections::hash_map::Entry::Occupied(entry)
-                if discovery.dependencies[*entry.get()].artifacts.is_empty()
-                    && !dependency.artifacts.is_empty() =>
-            {
-                discovery.dependencies[*entry.get()] = dependency;
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                let existing = &discovery.dependencies[*entry.get()];
+                if jdk_dependency_priority(&dependency) > jdk_dependency_priority(existing) {
+                    discovery.dependencies[*entry.get()] = dependency;
+                }
             }
-            std::collections::hash_map::Entry::Occupied(_) => {}
         }
     }
     discovery
+}
+
+fn jdk_dependency_priority(dependency: &ResolvedDependency) -> u8 {
+    if dependency
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.kind == ExternalArtifactKind::JdkSourceZip)
+    {
+        2
+    } else if dependency
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.kind == ExternalArtifactKind::JdkJmodSet)
+    {
+        1
+    } else {
+        0
+    }
+}
+
+fn discover_jdk_jmods(home: &Path) -> Result<Option<Vec<PathBuf>>, String> {
+    let jmods = home.join("jmods");
+    let metadata = match fs::symlink_metadata(&jmods) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("could not inspect JDK jmods directory: {error}")),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("JDK jmods path is not a real directory".to_owned());
+    }
+    let mut paths = Vec::new();
+    let mut entries_seen = 0usize;
+    let entries = fs::read_dir(&jmods)
+        .map_err(|error| format!("could not read JDK jmods directory: {error}"))?;
+    for entry in entries {
+        entries_seen = entries_seen.saturating_add(1);
+        if entries_seen > MAX_JDK_JMOD_FILES {
+            return Err(format!(
+                "JDK jmods directory contains more than {MAX_JDK_JMOD_FILES} bounded entries"
+            ));
+        }
+        let entry = entry.map_err(|error| format!("could not read JDK jmod entry: {error}"))?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".jmod") {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("could not inspect JDK jmod {name}: {error}"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            continue;
+        }
+        paths.push(PathBuf::from("jmods").join(name));
+    }
+    paths.sort_unstable();
+    if paths.len() > MAX_JDK_JMOD_FILES {
+        return Err(format!(
+            "JDK jmods directory contains more than {MAX_JDK_JMOD_FILES} bounded archives"
+        ));
+    }
+    Ok((!paths.is_empty()).then_some(paths))
 }
 
 fn read_jdk_release_version(home: &Path) -> Result<Version, String> {
@@ -630,6 +723,21 @@ fn resolved_jdk_dependency(
         scope: DependencyScope::Unknown,
         declared_by: None,
     }
+}
+
+fn resolved_jdk_jmod_dependency(
+    version: Version,
+    home: PathBuf,
+    relative_paths: Vec<PathBuf>,
+) -> ResolvedDependency {
+    let mut dependency = resolved_jdk_dependency(version, None);
+    dependency.artifacts = vec![ResolvedDependencyArtifact::source_set(
+        DependencyArtifactRole::Binary,
+        ExternalArtifactKind::JdkJmodSet,
+        home,
+        relative_paths,
+    )];
+    dependency
 }
 
 impl DependencyPackAdapter for JvmDependencyPackAdapter {
@@ -712,6 +820,12 @@ impl DependencyPackAdapter for JvmDependencyPackAdapter {
                         Err(diagnostic) => ArtifactProduction::failed(diagnostic, limits),
                     }
                 }
+                ExternalArtifactKind::JdkJmodSet => JdkJmodSetPackProducer.produce_loaded_artifact(
+                    &artifact_request,
+                    limits,
+                    cancellation,
+                    artifact.exact(),
+                ),
                 kind => ArtifactProduction::failed(
                     ProducerDiagnostic {
                         severity: ProducerDiagnosticSeverity::Error,
@@ -1806,8 +1920,9 @@ impl JvmExternalDeclarationIndex {
 /// `index_source_jar`) over an ordinary Maven/Gradle dependency's resolved
 /// jar(s).
 ///
-/// A JDK dependency's own artifact is a `src.zip`
-/// (`ExternalArtifactKind::JdkSourceZip`, built by [`resolved_jdk_dependency`]
+/// A JDK dependency's own artifact is a `src.zip` or JMOD source set
+/// (`ExternalArtifactKind::JdkSourceZip`/`JdkJmodSet`, built by
+/// [`resolved_jdk_dependency`]
 /// from `JAVA_HOME`/`jdk_homes`), and this function excludes it
 /// unconditionally. This is deliberate, not an oversight, for two independent
 /// reasons:
@@ -1838,11 +1953,12 @@ impl JvmExternalDeclarationIndex {
 /// `TypeFact`/`MemberFact` shards (`apply_java_type_fact` already exists for
 /// half of that), not a change to this filter.
 fn jvm_artifact_from_dependency(dependency: &ResolvedDependency) -> Option<ResolvedJvmArtifact> {
-    if dependency
-        .artifacts
-        .iter()
-        .any(|artifact| artifact.kind == ExternalArtifactKind::JdkSourceZip)
-    {
+    if dependency.artifacts.iter().any(|artifact| {
+        matches!(
+            artifact.kind,
+            ExternalArtifactKind::JdkSourceZip | ExternalArtifactKind::JdkJmodSet
+        )
+    }) {
         return None;
     }
     let binary = dependency
@@ -3636,11 +3752,153 @@ mod tests {
     }
 
     #[test]
-    fn java_home_without_sources_produces_exact_evidence_for_prebuilt_selection() {
+    fn jdk_home_prefers_sources_and_falls_back_to_one_exact_jmod_source_set() {
+        use crate::analyzer::JvmStandardLibraryDiscoveryConfig;
+        use crate::analyzer::semantic_model::{
+            CatalogOptions, DependencyPackPreparationStatus, SemanticPackCatalog,
+            prepare_dependency_semantic_packs,
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let relative_home = PathBuf::from("toolchains").join("jdk-21");
+        let home = root.path().join(&relative_home);
+        fs::create_dir_all(home.join("jmods")).unwrap();
+        fs::write(home.join("release"), "JAVA_VERSION=\"21.0.8\"\n").unwrap();
+        let class = test_class_file_bytes(&TestClassFile {
+            internal_name: "java/lang/Object",
+            super_internal_name: "java/lang/Object",
+            methods: &[],
+            private_nested: false,
+        });
+        write_zip_entries(
+            &home.join("jmods/java.base.jmod"),
+            &[
+                (
+                    "classes/module-info.class",
+                    &crate::analyzer::jvm::jmod_artifact::test_module_info_class_bytes(&[
+                        "java/lang",
+                    ]),
+                ),
+                ("classes/java/lang/Object.class", &class),
+            ],
+        );
+        let project = TestProject::new(root.path(), Language::Java);
+        let config = JvmAnalyzerConfig {
+            dependency_discovery: crate::analyzer::JvmDependencyDiscoveryConfig {
+                mode: JvmDependencyDiscoveryMode::Disabled,
+                ..Default::default()
+            },
+            standard_library_discovery: JvmStandardLibraryDiscoveryConfig {
+                jdk_homes: vec![relative_home],
+                discover_java_home: false,
+            },
+            ..JvmAnalyzerConfig::default()
+        };
+        let limits = DependencyPackLimits::default();
+        let discovered = resolve_jvm_semantic_pack_dependencies(&config, &project, &limits, None);
+        assert!(discovered.complete, "{:#?}", discovered.diagnostics);
+        assert_eq!(discovered.dependencies.len(), 1);
+        assert_eq!(discovered.dependencies[0].artifacts.len(), 1);
+        assert_eq!(
+            discovered.dependencies[0].artifacts[0].kind,
+            ExternalArtifactKind::JdkJmodSet
+        );
+        assert_eq!(
+            discovered.dependencies[0].artifacts[0].path(),
+            fs::canonicalize(&home).unwrap()
+        );
+
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let prepared = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &discovered.dependencies,
+            &limits,
+            None,
+        );
+        assert!(prepared.complete, "{:#?}", prepared.diagnostics);
+        assert_eq!(prepared.packs.len(), 1);
+        assert_eq!(
+            prepared.packs[0].status,
+            DependencyPackPreparationStatus::Generated
+        );
+
+        // Adding a source archive must preserve the existing source-first
+        // preference even when JMODs are present in the same approved home.
+        fs::create_dir_all(home.join("lib")).unwrap();
+        write_zip_entries(
+            &home.join("lib/src.zip"),
+            &[
+                (
+                    "java.base/module-info.java",
+                    b"module java.base { exports java.lang; }",
+                ),
+                (
+                    "java.base/java/lang/Object.java",
+                    b"package java.lang; public class Object {}",
+                ),
+            ],
+        );
+        let source_discovered = discover_jdk_semantic_pack_dependencies(&config, root.path(), None);
+        assert_eq!(
+            source_discovered.dependencies[0].artifacts[0].kind,
+            ExternalArtifactKind::JdkSourceZip
+        );
+        assert_eq!(
+            source_discovered.dependencies[0].artifacts[0].path(),
+            fs::canonicalize(home.join("lib/src.zip")).unwrap()
+        );
+    }
+
+    #[test]
+    fn missing_jmod_after_discovery_is_an_honest_preparation_failure() {
+        use crate::analyzer::JvmStandardLibraryDiscoveryConfig;
+        use crate::analyzer::semantic_model::{
+            CatalogOptions, SemanticPackCatalog, prepare_dependency_semantic_packs,
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("jdk");
+        fs::create_dir_all(home.join("jmods")).unwrap();
+        fs::write(home.join("release"), "JAVA_VERSION=\"21.0.8\"\n").unwrap();
+        fs::write(home.join("jmods/java.base.jmod"), b"not a jmod").unwrap();
+        let config = JvmAnalyzerConfig {
+            standard_library_discovery: JvmStandardLibraryDiscoveryConfig {
+                jdk_homes: vec![home.clone()],
+                discover_java_home: false,
+            },
+            ..JvmAnalyzerConfig::default()
+        };
+        let project = TestProject::new(root.path(), Language::Java);
+        let limits = DependencyPackLimits::default();
+        let discovered = resolve_jvm_semantic_pack_dependencies(&config, &project, &limits, None);
+        assert_eq!(discovered.dependencies.len(), 1);
+        fs::remove_file(home.join("jmods/java.base.jmod")).unwrap();
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let prepared = prepare_dependency_semantic_packs(
+            &catalog,
+            &JvmDependencyPackAdapter,
+            &discovered.dependencies,
+            &limits,
+            None,
+        );
+        assert!(!prepared.complete);
+        assert!(prepared.packs.is_empty());
+        assert!(
+            prepared
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.code == "artifact.metadata" })
+        );
+    }
+
+    #[test]
+    fn automatic_java_home_with_only_jmods_uses_prebuilt_selection() {
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("portable-jdk-home");
-        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(home.join("jmods")).unwrap();
         fs::write(home.join("release"), "JAVA_VERSION=\"21.0.8\"\n").unwrap();
+        fs::write(home.join("jmods/java.base.jmod"), b"exact binary input").unwrap();
         let config = JvmAnalyzerConfig::default();
 
         let discovered = discover_jdk_semantic_pack_dependencies(

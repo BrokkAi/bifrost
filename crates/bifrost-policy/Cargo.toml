@@ -12,9 +12,9 @@ publish = true
 name = "brokk_bifrost_policy"
 
 [dependencies]
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.10.6" }
-brokk-bifrost-flow = { path = "../bifrost-flow", version = "=0.10.6" }
-brokk-bifrost-rql = { path = "../bifrost-rql", version = "=0.10.6" }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.10.7" }
+brokk-bifrost-flow = { path = "../bifrost-flow", version = "=0.10.7" }
+brokk-bifrost-rql = { path = "../bifrost-rql", version = "=0.10.7" }
 cap-std = { version = "4.0.2", default-features = false }
 chrono = { version = "0.4.44", default-features = false, features = ["clock", "std"] }
 cvss = { version = "2.2.0", default-features = false, features = ["std", "v3", "v4"] }
@@ -28,7 +28,7 @@ tree-sitter = "0.25.10"
 url = { version = "2.5.8", default-features = false, features = ["std"] }
 
 [dev-dependencies]
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.10.6", features = ["test-support"] }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.10.7", features = ["test-support"] }
 tempfile = "3.23.0"
 
 # Unix: the RQLP directory loader's symlink/permission tests inspect raw modes.

@@ -43,7 +43,7 @@ pub fn first_precise<T: Clone + Eq + Hash>(
 /// unqualified / `this` / `self` reference to its enclosing class. Sources the
 /// analyzer's own fqns, so nested classes resolve to whatever fqn the analyzer
 /// emits.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ClassRangeIndex {
     ranges: Vec<(usize, usize, CodeUnit, String)>,
 }
@@ -64,7 +64,7 @@ impl ClassRangeIndex {
         Self { ranges }
     }
 
-    pub fn build(index: &dyn CodeUnitIndex, file: &ProjectFile) -> Self {
+    pub fn build<I: CodeUnitIndex + ?Sized>(index: &I, file: &ProjectFile) -> Self {
         Self::from_class_spans(
             index
                 .declarations(file)

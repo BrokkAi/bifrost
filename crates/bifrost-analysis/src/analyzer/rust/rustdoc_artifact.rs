@@ -15,12 +15,13 @@ use crate::analyzer::semantic_model::{
     ExactArtifact, ExternalArtifactKind, ExternalArtifactPackProducer, HierarchyFact,
     HierarchyKind, Locator, MemberFact, MemberIdentity, MemberKind, Parameter, Producer,
     ProducerDiagnostic, ProducerDiagnosticSeverity, RelationFact, RelationKind, Signature,
-    TypeFact, TypeIdentity, TypeKind, TypeRef, Visibility, member_declaration_id,
+    TypeFact, TypeIdentity, TypeKind, TypeRef, Visibility, WildcardVariance, member_declaration_id,
     read_exact_artifact_while, type_declaration_id,
 };
 use crate::hash::{HashMap, HashSet};
 
 const ARTIFACT_LOCATOR_PATH: &str = "rustdoc/api.json";
+const RUSTDOC_FORMAT_VERSION: u32 = 61;
 const MAX_MODEL_NAME_BYTES: usize = 16 * 1024;
 const MAX_TOTAL_MODEL_NAME_BYTES: usize = 64 * 1024 * 1024;
 
@@ -103,6 +104,100 @@ impl RustdocJsonPackProducer {
         }
         produce_loaded_document(request, limits, cancellation, artifact)
     }
+
+    /// Produce one declaration pack from an explicitly named set of rustdoc
+    /// JSON documents. The source-set reader has already authenticated the
+    /// paths and bytes; this method only decodes the retained entries and
+    /// combines their typed facts. `crates` is `(crate name, relative path)`
+    /// in the pinned source-set specification.
+    pub fn produce_loaded_source_set(
+        &self,
+        request: &ArtifactProductionRequest,
+        limits: &ArtifactProducerLimits,
+        cancellation: Option<&CancellationToken>,
+        artifact: &ExactArtifact,
+        crates: &[(String, String)],
+    ) -> ArtifactProduction {
+        if request.artifact_kind != ExternalArtifactKind::RustdocJsonSet {
+            return failed(
+                limits,
+                "rust.rustdoc.wrong_artifact_kind",
+                "Rust rustdoc source-set producer requires a rustdoc_json_set artifact",
+            );
+        }
+        if crates.is_empty() {
+            return failed(
+                limits,
+                "rust.rustdoc.empty_source_set",
+                "Rust rustdoc source set must contain at least one crate",
+            );
+        }
+        if artifact.bytes().len() as u64 > limits.max_artifact_bytes {
+            return failed(
+                limits,
+                "limit.artifact_bytes",
+                format!("exact artifact exceeds {} bytes", limits.max_artifact_bytes),
+            );
+        }
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return failed(
+                limits,
+                "artifact.cancelled",
+                "rustdoc source-set production was cancelled",
+            );
+        }
+
+        let mut ordered = crates.to_vec();
+        ordered.sort();
+        if ordered.windows(2).any(|entries| {
+            entries[0] == entries[1] || entries[0].0 == entries[1].0 || entries[0].1 == entries[1].1
+        }) {
+            return failed(
+                limits,
+                "rust.rustdoc.duplicate_source",
+                "Rust rustdoc source set contains a duplicate crate name or source path",
+            );
+        }
+        let entries = artifact
+            .source_entries()
+            .iter()
+            .map(|entry| (entry.relative_path().to_owned(), entry.bytes()))
+            .collect::<RandomHashMap<_, _>>();
+        let mut productions = Vec::with_capacity(ordered.len());
+        for (crate_name, path) in &ordered {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return failed(
+                    limits,
+                    "artifact.cancelled",
+                    "rustdoc source-set production was cancelled",
+                );
+            }
+            let Some(bytes) = entries.get(path) else {
+                return failed(
+                    limits,
+                    "rust.rustdoc.source_missing",
+                    format!("rustdoc source set does not contain {path}"),
+                );
+            };
+            let consumed = productions
+                .iter()
+                .map(production_record_count)
+                .sum::<usize>();
+            let remaining = limits.max_records.saturating_sub(consumed);
+            let mut production = produce_loaded_json_document(
+                request,
+                limits,
+                cancellation,
+                artifact.sha256(),
+                Some(crate_name),
+                Some(path),
+                bytes,
+            );
+            limit_production_records(&mut production, remaining, limits);
+            productions.push(production);
+        }
+        merge_source_set_productions(request, limits, artifact.sha256(), productions)
+    }
 }
 
 fn produce_loaded_document(
@@ -111,7 +206,27 @@ fn produce_loaded_document(
     cancellation: Option<&CancellationToken>,
     artifact: &ExactArtifact,
 ) -> ArtifactProduction {
-    let envelope: RustdocVersionEnvelope = match serde_json::from_slice(artifact.bytes()) {
+    produce_loaded_json_document(
+        request,
+        limits,
+        cancellation,
+        artifact.sha256(),
+        None,
+        None,
+        artifact.bytes(),
+    )
+}
+
+fn produce_loaded_json_document(
+    request: &ArtifactProductionRequest,
+    limits: &ArtifactProducerLimits,
+    cancellation: Option<&CancellationToken>,
+    artifact_sha256: &str,
+    expected_crate: Option<&str>,
+    source_relative_path: Option<&str>,
+    bytes: &[u8],
+) -> ArtifactProduction {
+    let envelope: RustdocVersionEnvelope = match serde_json::from_slice(bytes) {
         Ok(envelope) => envelope,
         Err(error) => {
             return failed(
@@ -121,18 +236,17 @@ fn produce_loaded_document(
             );
         }
     };
-    if envelope.format_version != rustdoc_types::FORMAT_VERSION {
+    if envelope.format_version != RUSTDOC_FORMAT_VERSION {
         return failed(
             limits,
             "rust.rustdoc.unsupported_version",
             format!(
                 "rustdoc JSON format {} is unsupported; this producer accepts {}",
-                envelope.format_version,
-                rustdoc_types::FORMAT_VERSION
+                envelope.format_version, RUSTDOC_FORMAT_VERSION
             ),
         );
     }
-    let document: RustdocCrate = match serde_json::from_slice(artifact.bytes()) {
+    let document: RustdocCrate = match serde_json::from_slice(bytes) {
         Ok(document) => document,
         Err(error) => {
             return failed(
@@ -140,10 +254,14 @@ fn produce_loaded_document(
                 "rust.rustdoc.invalid_json",
                 format!(
                     "could not decode rustdoc JSON format {}: {error}",
-                    rustdoc_types::FORMAT_VERSION
+                    RUSTDOC_FORMAT_VERSION
                 ),
             );
         }
+    };
+    let document_limits = ArtifactProducerLimits {
+        max_records: limits.max_records.max(document.index.len()),
+        ..*limits
     };
     let requested_versions = request
         .activation
@@ -179,7 +297,204 @@ fn produce_loaded_document(
             ),
         );
     }
-    produce_document(request, limits, artifact.sha256(), &document, cancellation)
+    produce_document(
+        request,
+        &document_limits,
+        artifact_sha256,
+        &document,
+        cancellation,
+        expected_crate,
+        source_relative_path,
+    )
+}
+
+fn limit_production_records(
+    production: &mut ArtifactProduction,
+    max_records: usize,
+    limits: &ArtifactProducerLimits,
+) {
+    let Some(pack) = production.pack.as_mut() else {
+        return;
+    };
+    let Some(shard) = pack.shards.first_mut() else {
+        return;
+    };
+    let AuthoredPayload::DeclarationFacts {
+        types,
+        members,
+        relations,
+    } = &mut shard.payload
+    else {
+        return;
+    };
+    let original_count = types.len() + members.len() + relations.len();
+    if original_count <= max_records {
+        return;
+    }
+    types.truncate(max_records);
+    let remaining = max_records.saturating_sub(types.len());
+    members.truncate(remaining);
+    let remaining = remaining.saturating_sub(members.len());
+    relations.truncate(remaining);
+    production.completeness = Completeness::Partial;
+    let diagnostic = ProducerDiagnostic {
+        severity: ProducerDiagnosticSeverity::Warning,
+        code: "limit.records".to_owned(),
+        location: None,
+        declaration: None,
+        message: format!("source set stopped after {max_records} aggregate records"),
+    };
+    if production.diagnostics.len() < limits.max_diagnostics {
+        production.diagnostics.push(diagnostic);
+    } else {
+        production.suppressed_diagnostics = production.suppressed_diagnostics.saturating_add(1);
+    }
+}
+
+fn production_record_count(production: &ArtifactProduction) -> usize {
+    production
+        .pack
+        .as_ref()
+        .and_then(|pack| pack.shards.first())
+        .and_then(|shard| match &shard.payload {
+            AuthoredPayload::DeclarationFacts {
+                types,
+                members,
+                relations,
+            } => Some(types.len() + members.len() + relations.len()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+fn merge_source_set_productions(
+    request: &ArtifactProductionRequest,
+    limits: &ArtifactProducerLimits,
+    artifact_sha256: &str,
+    productions: Vec<ArtifactProduction>,
+) -> ArtifactProduction {
+    let mut diagnostics = Vec::new();
+    let mut suppressed_diagnostics = 0_usize;
+    let mut types = Vec::new();
+    let mut members = Vec::new();
+    let mut relations = Vec::new();
+    let mut completeness = Completeness::Complete;
+    for production in productions {
+        completeness = if production.completeness == Completeness::Complete {
+            completeness
+        } else {
+            Completeness::Partial
+        };
+        for diagnostic in production.diagnostics {
+            if diagnostics.len() < limits.max_diagnostics {
+                diagnostics.push(diagnostic);
+            } else {
+                suppressed_diagnostics = suppressed_diagnostics.saturating_add(1);
+            }
+        }
+        suppressed_diagnostics =
+            suppressed_diagnostics.saturating_add(production.suppressed_diagnostics);
+        let Some(pack) = production.pack else {
+            continue;
+        };
+        let Some(shard) = pack.shards.into_iter().next() else {
+            completeness = Completeness::Partial;
+            continue;
+        };
+        let AuthoredPayload::DeclarationFacts {
+            types: shard_types,
+            members: shard_members,
+            relations: shard_relations,
+        } = shard.payload
+        else {
+            completeness = Completeness::Partial;
+            continue;
+        };
+        types.extend(shard_types);
+        members.extend(shard_members);
+        relations.extend(shard_relations);
+    }
+    if types.is_empty() {
+        if diagnostics.len() < limits.max_diagnostics {
+            diagnostics.push(ProducerDiagnostic {
+                severity: ProducerDiagnosticSeverity::Error,
+                code: "rust.rustdoc.no_external_declarations".to_owned(),
+                location: None,
+                declaration: None,
+                message: "rustdoc source set contains no externally visible Rust declarations"
+                    .to_owned(),
+            });
+        } else {
+            suppressed_diagnostics = suppressed_diagnostics.saturating_add(1);
+        }
+        completeness = Completeness::Partial;
+    }
+    let mut seen_type_ids: RandomHashSet<String> = RandomHashSet::default();
+    types.retain(|fact| seen_type_ids.insert(fact.id.clone()));
+    let mut seen_member_ids: RandomHashSet<String> = RandomHashSet::default();
+    members.retain(|fact| seen_member_ids.insert(fact.id.clone()));
+    let mut seen_relation_ids: RandomHashSet<String> = RandomHashSet::default();
+    relations.retain(|fact| seen_relation_ids.insert(fact.id.clone()));
+    types.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
+    members.sort_by(|left, right| {
+        left.owner
+            .cmp(&right.owner)
+            .then(left.name.cmp(&right.name))
+            .then(left.id.cmp(&right.id))
+    });
+    relations.sort_by(|left, right| {
+        (&left.from, &left.to, left.relation_kind as u8, &left.id).cmp(&(
+            &right.from,
+            &right.to,
+            right.relation_kind as u8,
+            &right.id,
+        ))
+    });
+    if diagnostics.is_empty()
+        && suppressed_diagnostics == 0
+        && completeness == Completeness::Complete
+    {
+        completeness = Completeness::Complete;
+    } else {
+        completeness = Completeness::Partial;
+    }
+    let mut activation = request.activation.clone();
+    for selector in &mut activation {
+        selector.artifact_sha256 = Some(artifact_sha256.to_owned());
+    }
+    let pack = (!types.is_empty()).then(|| AuthoredSemanticModelPack {
+        schema_version: crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
+        pack_id: request.pack_id.clone(),
+        version: request.pack_version.clone(),
+        producer: Producer {
+            name: "bifrost-rustdoc-json".to_owned(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+        },
+        language: "rust".to_owned(),
+        ecosystem: request.ecosystem.clone(),
+        compatibility: request.compatibility.clone(),
+        provenance: request.provenance.clone(),
+        license: request.license.clone(),
+        completeness,
+        safety: request.safety.clone(),
+        carried_sources: Vec::new(),
+        shards: vec![AuthoredShard {
+            id: "declarations.rust.external".to_owned(),
+            activation,
+            payload: AuthoredPayload::DeclarationFacts {
+                types,
+                members,
+                relations,
+            },
+        }],
+    });
+    ArtifactProduction {
+        artifact_sha256: Some(artifact_sha256.to_owned()),
+        pack,
+        completeness,
+        diagnostics,
+        suppressed_diagnostics,
+    }
 }
 
 fn produce_document(
@@ -188,6 +503,8 @@ fn produce_document(
     artifact_sha256: &str,
     document: &RustdocCrate,
     cancellation: Option<&CancellationToken>,
+    expected_crate: Option<&str>,
+    source_relative_path: Option<&str>,
 ) -> ArtifactProduction {
     let mut diagnostics = BoundedProducerDiagnostics::new(limits);
     let Some(root) = document.index.get(&document.root) else {
@@ -220,12 +537,15 @@ fn produce_document(
             diagnostics,
         );
     }
-    let requested_crates = request
+    let mut requested_crates = request
         .activation
         .iter()
         .filter_map(|selector| selector.module.as_ref())
         .map(|module| module.name.replace('-', "_"))
         .collect::<RandomHashSet<_>>();
+    if let Some(expected_crate) = expected_crate {
+        requested_crates.insert(expected_crate.replace('-', "_"));
+    }
     let root_name = root
         .name
         .as_deref()
@@ -446,7 +766,7 @@ fn produce_document(
             aliases: Vec::new(),
             extension_surfaces: Vec::new(),
             guard: None,
-            locator: locator(name),
+            locator: locator(source_relative_path.unwrap_or(ARTIFACT_LOCATOR_PATH), name),
         });
         push_generic_relations(id, generics, document, &type_ids, &mut relations);
         if let ItemEnum::TypeAlias(alias) = &item.inner {
@@ -627,7 +947,10 @@ fn produce_document(
             extension_receiver_constraints: Vec::new(),
             aliases: Vec::new(),
             guard: None,
-            locator: locator(&format!("{path}#{member_id}")),
+            locator: locator(
+                source_relative_path.unwrap_or(ARTIFACT_LOCATOR_PATH),
+                &format!("{path}#{member_id}"),
+            ),
         });
     }
 
@@ -943,8 +1266,28 @@ fn generic_names(generics: &Generics) -> Vec<String> {
     generics
         .params
         .iter()
+        .filter(|param| {
+            matches!(
+                param.kind,
+                rustdoc_types::GenericParamDefKind::Type {
+                    is_synthetic: false,
+                    ..
+                } | rustdoc_types::GenericParamDefKind::Const { .. }
+            )
+        })
         .map(|param| param.name.clone())
         .collect()
+}
+
+fn rust_parameter_name(name: &str) -> Option<String> {
+    let mut characters = name.chars();
+    let first = characters.next()?;
+    if name == "_" || !(first == '_' || first.is_alphabetic()) {
+        return None;
+    }
+    characters
+        .all(|character| character == '_' || character.is_alphanumeric())
+        .then(|| name.to_owned())
 }
 
 fn member_kind(inner: &ItemEnum) -> Option<MemberKind> {
@@ -973,7 +1316,7 @@ fn member_signature(
                 .inputs
                 .iter()
                 .map(|(name, ty)| Parameter {
-                    name: Some(name.clone()),
+                    name: rust_parameter_name(name),
                     r#type: rust_type_ref(ty, document, type_ids, limits, diagnostics, 0),
                     optional: false,
                     variadic: false,
@@ -1118,8 +1461,19 @@ fn rust_type_ref(
         Type::ResolvedPath(path) => {
             path_type_ref(path, document, type_ids, limits, diagnostics, next)
         }
-        Type::Generic(name) => TypeRef::TypeParameter { name: name.clone() },
+        // rustdoc can emit generic binders from an enclosing trait or impl
+        // that are not present in the projected declaration's signature.
+        // Preserve the uncertainty without producing an invalid pack whose
+        // type parameter references cannot be resolved by the compiler.
+        Type::Generic(_) => TypeRef::Wildcard {
+            variance: WildcardVariance::Any,
+            bound: None,
+        },
         Type::Primitive(name) => named_type(name),
+        Type::Tuple(elements) if elements.is_empty() => TypeRef::Wildcard {
+            variance: WildcardVariance::Any,
+            bound: None,
+        },
         Type::Tuple(elements) => TypeRef::Tuple {
             elements: elements
                 .iter()
@@ -1154,7 +1508,7 @@ fn rust_type_ref(
                 .inputs
                 .iter()
                 .map(|(name, ty)| Parameter {
-                    name: (!name.is_empty()).then(|| name.clone()),
+                    name: rust_parameter_name(name),
                     r#type: rust_type_ref(ty, document, type_ids, limits, diagnostics, next),
                     optional: false,
                     variadic: false,
@@ -1174,33 +1528,14 @@ fn rust_type_ref(
         Type::Pat { type_, .. } => {
             rust_type_ref(type_, document, type_ids, limits, diagnostics, next)
         }
-        Type::DynTrait(dyn_trait) => named_type(
-            &dyn_trait
-                .traits
-                .iter()
-                .map(|trait_| normalized_path(&trait_.trait_, document))
-                .collect::<Vec<_>>()
-                .join(" + "),
-        ),
-        Type::ImplTrait(bounds) => named_type(
-            &bounds
-                .iter()
-                .filter_map(|bound| match bound {
-                    GenericBound::TraitBound { trait_, .. } => {
-                        Some(normalized_path(trait_, document))
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join(" + "),
-        ),
-        Type::QualifiedPath {
-            name, self_type, ..
-        } => named_type(&format!(
-            "{}.{}",
-            rendered_type_name(self_type, document),
-            name
-        )),
+        // DeclarationFacts cannot encode Rust existential/trait-object bounds
+        // or associated projections without inventing one qualified-name
+        // string. Preserve that uncertainty explicitly instead of emitting
+        // Rust syntax (which is not a declaration identifier) as a name.
+        Type::DynTrait(_) | Type::ImplTrait(_) | Type::QualifiedPath { .. } => TypeRef::Wildcard {
+            variance: WildcardVariance::Any,
+            bound: None,
+        },
         Type::Infer => named_type("_"),
     }
 }
@@ -1293,25 +1628,6 @@ fn normalized_path(path: &RustdocPath, document: &RustdocCrate) -> String {
         .unwrap_or_else(|| path.path.replace("::", "."))
 }
 
-fn rendered_type_name(ty: &Type, document: &RustdocCrate) -> String {
-    match ty {
-        Type::ResolvedPath(path) => normalized_path(path, document),
-        Type::Generic(name) | Type::Primitive(name) => name.clone(),
-        Type::BorrowedRef { type_, .. } | Type::RawPointer { type_, .. } => {
-            rendered_type_name(type_, document)
-        }
-        Type::Slice(type_) | Type::Array { type_, .. } | Type::Pat { type_, .. } => {
-            rendered_type_name(type_, document)
-        }
-        Type::QualifiedPath {
-            name, self_type, ..
-        } => {
-            format!("{}.{}", rendered_type_name(self_type, document), name)
-        }
-        _ => "_".to_owned(),
-    }
-}
-
 fn resolved_type_name(ty: &Type, document: &RustdocCrate) -> Option<String> {
     match ty {
         Type::ResolvedPath(path) => Some(normalized_path(path, document)),
@@ -1342,9 +1658,9 @@ fn semantic_visibility(visibility: &RustVisibility) -> Visibility {
     }
 }
 
-fn locator(symbol: &str) -> Locator {
+fn locator(path: &str, symbol: &str) -> Locator {
     Locator::Artifact {
-        path: ARTIFACT_LOCATOR_PATH.to_owned(),
+        path: path.to_owned(),
         symbol: symbol.to_owned(),
     }
 }
@@ -1788,6 +2104,7 @@ fn finish(
             license: request.license.clone(),
             completeness,
             safety: request.safety.clone(),
+            carried_sources: Vec::new(),
             shards: vec![AuthoredShard {
                 id: "declarations.rust.external".to_owned(),
                 activation,
@@ -1823,6 +2140,8 @@ fn failed(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
     use rustdoc_types::{
         Abi, Function, FunctionHeader, FunctionSignature, GenericParamDef, GenericParamDefKind,
@@ -1832,7 +2151,7 @@ mod tests {
 
     use crate::analyzer::semantic_model::{
         ActivationSelector, Compatibility, CompilerOptions, NameSelector, Provenance, Safety,
-        compile_pack,
+        compile_pack, read_exact_source_set,
     };
 
     fn item(id: u32, name: Option<&str>, visibility: RustVisibility, inner: ItemEnum) -> Item {
@@ -2089,8 +2408,21 @@ mod tests {
                 triple: "x86_64-unknown-linux-gnu".to_owned(),
                 target_features: Vec::new(),
             },
-            format_version: rustdoc_types::FORMAT_VERSION,
+            format_version: RUSTDOC_FORMAT_VERSION,
         }
+    }
+
+    fn write_crate_document(root: &Path, crate_name: &str) {
+        let mut document = document(false);
+        document.index.get_mut(&document.root).unwrap().name = Some(crate_name.to_owned());
+        for summary in document.paths.values_mut() {
+            summary.path[0] = crate_name.to_owned();
+        }
+        fs::write(
+            root.join(format!("{crate_name}.json")),
+            serde_json::to_vec(&document).unwrap(),
+        )
+        .unwrap();
     }
 
     fn request(path: std::path::PathBuf) -> ArtifactProductionRequest {
@@ -2125,6 +2457,121 @@ mod tests {
                 review_required: false,
             },
         }
+    }
+
+    #[test]
+    fn rustdoc_source_set_merges_crate_qualified_declarations() {
+        let root = tempfile::tempdir().unwrap();
+        for crate_name in ["core", "alloc", "std"] {
+            write_crate_document(root.path(), crate_name);
+        }
+        let relative_paths = ["core.json", "alloc.json", "std.json"]
+            .into_iter()
+            .map(std::path::PathBuf::from)
+            .collect::<Vec<_>>();
+        let artifact = read_exact_source_set(
+            root.path(),
+            &relative_paths,
+            3,
+            8,
+            &ArtifactProducerLimits::default(),
+        )
+        .unwrap();
+        let mut request = request(root.path().join("stdlib"));
+        request.artifact_kind = ExternalArtifactKind::RustdocJsonSet;
+        request.activation[0].package = None;
+        request.activation[0].module = None;
+        let crates = [
+            ("core".to_owned(), "core.json".to_owned()),
+            ("alloc".to_owned(), "alloc.json".to_owned()),
+            ("std".to_owned(), "std.json".to_owned()),
+        ];
+
+        let production = RustdocJsonPackProducer.produce_loaded_source_set(
+            &request,
+            &ArtifactProducerLimits::default(),
+            None,
+            &artifact,
+            &crates,
+        );
+
+        assert_eq!(production.completeness, Completeness::Complete);
+        let pack = production.pack.expect("source set should produce one pack");
+        assert!(pack.carried_sources.is_empty());
+        let AuthoredPayload::DeclarationFacts { types, .. } = &pack.shards[0].payload else {
+            panic!("Rustdoc source set must produce declaration facts");
+        };
+        assert!(types.iter().any(|fact| fact.name == "core.Widget"));
+        assert!(types.iter().any(|fact| fact.name == "alloc.Widget"));
+        assert!(types.iter().any(|fact| fact.name == "std.Widget"));
+        for fact in types {
+            let Locator::Artifact { path, .. } = &fact.locator else {
+                panic!("Rustdoc declarations must retain their source-relative locator");
+            };
+            assert_eq!(
+                path.as_str(),
+                format!("{}.json", fact.name.split('.').next().unwrap())
+            );
+        }
+        assert_eq!(pack.shards.len(), 1);
+        assert_eq!(
+            pack.shards[0].activation[0].artifact_sha256.as_deref(),
+            Some(artifact.sha256())
+        );
+    }
+
+    #[test]
+    fn rustdoc_source_set_applies_one_aggregate_record_budget() {
+        let root = tempfile::tempdir().unwrap();
+        for crate_name in ["core", "alloc", "std"] {
+            write_crate_document(root.path(), crate_name);
+        }
+        let relative_paths = ["core.json", "alloc.json", "std.json"]
+            .into_iter()
+            .map(std::path::PathBuf::from)
+            .collect::<Vec<_>>();
+        let artifact = read_exact_source_set(
+            root.path(),
+            &relative_paths,
+            3,
+            8,
+            &ArtifactProducerLimits::default(),
+        )
+        .unwrap();
+        let mut request = request(root.path().join("stdlib"));
+        request.artifact_kind = ExternalArtifactKind::RustdocJsonSet;
+        request.activation[0].package = None;
+        request.activation[0].module = None;
+        let crates = [
+            ("core".to_owned(), "core.json".to_owned()),
+            ("alloc".to_owned(), "alloc.json".to_owned()),
+            ("std".to_owned(), "std.json".to_owned()),
+        ];
+        let limits = ArtifactProducerLimits {
+            max_records: 2,
+            ..ArtifactProducerLimits::default()
+        };
+
+        let production = RustdocJsonPackProducer
+            .produce_loaded_source_set(&request, &limits, None, &artifact, &crates);
+        let pack = production
+            .pack
+            .expect("source set should produce a partial pack");
+        let AuthoredPayload::DeclarationFacts {
+            types,
+            members,
+            relations,
+        } = &pack.shards[0].payload
+        else {
+            panic!("Rustdoc source set must produce declaration facts");
+        };
+        assert!(types.len() + members.len() + relations.len() <= limits.max_records);
+        assert!(
+            production
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "limit.records")
+        );
     }
 
     #[test]
@@ -2187,6 +2634,55 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_generics_and_unrepresentable_rust_types_remain_honest() {
+        let generics = Generics {
+            params: vec![
+                GenericParamDef {
+                    name: "T".to_owned(),
+                    kind: GenericParamDefKind::Type {
+                        bounds: Vec::new(),
+                        default: None,
+                        is_synthetic: false,
+                    },
+                },
+                GenericParamDef {
+                    name: "impl FnOnce(T) -> T".to_owned(),
+                    kind: GenericParamDefKind::Type {
+                        bounds: Vec::new(),
+                        default: None,
+                        is_synthetic: true,
+                    },
+                },
+            ],
+            where_predicates: Vec::new(),
+        };
+        assert_eq!(generic_names(&generics), ["T"]);
+        assert_eq!(rust_parameter_name("value").as_deref(), Some("value"));
+        assert_eq!(rust_parameter_name("_"), None);
+        assert_eq!(rust_parameter_name("(left, right)"), None);
+        assert_eq!(rust_parameter_name("&self"), None);
+
+        let document = document(false);
+        let limits = ArtifactProducerLimits::default();
+        let mut diagnostics = BoundedProducerDiagnostics::new(&limits);
+        let projected = rust_type_ref(
+            &Type::ImplTrait(Vec::new()),
+            &document,
+            &HashMap::default(),
+            &limits,
+            &mut diagnostics,
+            0,
+        );
+        assert!(matches!(
+            projected,
+            TypeRef::Wildcard {
+                variance: WildcardVariance::Any,
+                bound: None
+            }
+        ));
+    }
+
+    #[test]
     fn blanket_impl_is_an_explicit_partial_outcome() {
         let file = tempfile::NamedTempFile::new().unwrap();
         fs::write(file.path(), serde_json::to_vec(&document(true)).unwrap()).unwrap();
@@ -2210,7 +2706,7 @@ mod tests {
         fs::write(
             file.path(),
             serde_json::to_vec(&serde_json::json!({
-                "format_version": rustdoc_types::FORMAT_VERSION + 1
+                "format_version": RUSTDOC_FORMAT_VERSION + 1
             }))
             .unwrap(),
         )

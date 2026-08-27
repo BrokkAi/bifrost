@@ -223,6 +223,7 @@ impl CodeQueryRowField {
 /// mints bare strings at a render site, the exact literal set is recorded
 /// beside that site and re-exported here rather than restated.
 mod value_domain {
+    use super::super::super::decorator_binding;
     use super::{NormalizedKind, ReceiverQueryOperation, UsageHitKind};
     use crate::analyzer::CodeUnitType;
     use crate::analyzer::semantic::CandidateCoverage;
@@ -297,6 +298,13 @@ mod value_domain {
         "numeric_literal",
         "boolean_literal",
         "null_literal",
+        "collection_literal",
+        "jsx_element",
+        "jsx_attribute",
+        "jsx_spread_attribute",
+        "object_property",
+        "computed_property",
+        "spread_element",
         "return",
         "throw",
         "catch",
@@ -305,6 +313,7 @@ mod value_domain {
         "for_loop",
         "while_loop",
         "decorator",
+        "parameter",
         "block",
         "field",
         "module",
@@ -329,6 +338,9 @@ mod value_domain {
     pub(super) const REFERENCE_KIND: &[&str] = brokk_bifrost_rql::schema::REFERENCE_KIND_LABELS;
     pub(super) const CALL_SYNTAX_KIND: &[&str] = render::CALL_SYNTAX_KIND_LABELS;
     pub(super) const EXPRESSION_INPUT_KIND: &[&str] = render::EXPRESSION_INPUT_KIND_LABELS;
+    pub(super) const JSX_ELEMENT_IDENTITY: &[&str] = &["intrinsic", "component", "unknown"];
+    pub(super) const JSX_ATTRIBUTE_KIND: &[&str] = &["jsx_attribute", "jsx_spread_attribute"];
+    pub(super) const JSX_VALUE_COVERAGE: &[&str] = &["complete", "incomplete"];
 
     pub(super) const RECEIVER_ANALYSIS_KIND: &[&str] = ReceiverQueryOperation::LABELS;
     pub(super) const RECEIVER_OUTCOME: &[&str] = render::RECEIVER_OUTCOME_LABELS;
@@ -370,6 +382,10 @@ mod value_domain {
     pub(super) const EFFECT_COVERAGE: &[&str] = EffectCoverage::LABELS;
 
     pub(super) const SIGNATURE_COVERAGE: &[&str] = SignatureCoverage::LABELS;
+    pub(super) const DECORATOR_BINDING_STATUS: &[&str] = decorator_binding::BINDING_STATUS;
+    pub(super) const DECORATOR_COMPLETION: &[&str] = decorator_binding::COMPLETION;
+    pub(super) const DECORATOR_COVERAGE: &[&str] = decorator_binding::COVERAGE;
+    pub(super) const DECORATOR_BOUNDARY: &[&str] = BoundaryStatus::LABELS;
     pub(super) const DECLARATION_ROLE: &[&str] = DeclarationRole::LABELS;
     pub(super) const RECEIVER_CONTRACT: &[&str] = ReceiverContract::LABELS;
     pub(super) const APPLICABILITY_VERDICT: &[&str] = ApplicabilityVerdict::LABELS;
@@ -822,6 +838,23 @@ detailed_row_domains! {
                     CodeQueryRowField::optional("parameter_name", Scalar::String),
         ],
     },
+    JsxAttributeValue => "jsx_attribute_value" {
+        display_range: |value| Some(value.range),
+        identities: Primary,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("ast_id", Scalar::StableId),
+                    CodeQueryRowField::required_enum("element_identity", value_domain::JSX_ELEMENT_IDENTITY),
+                    CodeQueryRowField::optional("element_name", Scalar::String),
+                    CodeQueryRowField::required_enum("attribute_kind", value_domain::JSX_ATTRIBUTE_KIND),
+                    CodeQueryRowField::optional("attribute_name", Scalar::String),
+                    CodeQueryRowField::optional("property_name", Scalar::String),
+                    CodeQueryRowField::required_enum("coverage", value_domain::JSX_VALUE_COVERAGE),
+                    CodeQueryRowField::optional("reason", Scalar::String),
+                    CodeQueryRowField::optional("component_id", Scalar::DeclarationIdentity),
+                    CodeQueryRowField::optional("attribute_target_id", Scalar::DeclarationIdentity),
+        ],
+    },
     ReceiverAnalysis => "receiver_analysis" {
         display_range: |value| Some(value.range),
         identities: None,
@@ -1042,6 +1075,42 @@ detailed_row_domains! {
                     CodeQueryRowField::optional("declared_type", Scalar::String),
                     CodeQueryRowField::optional("optional", Scalar::Boolean),
                     CodeQueryRowField::optional("repeated", Scalar::Boolean),
+        ],
+    },
+    DecoratedParameter => "decorated_parameter" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("parameter_id", Scalar::StableId),
+                    CodeQueryRowField::optional("decorator_id", Scalar::StableId),
+                    CodeQueryRowField::required_enum("language", value_domain::LANGUAGE),
+                    CodeQueryRowField::optional("owner_id", Scalar::StableId),
+                    CodeQueryRowField::optional("procedure_id", Scalar::StableId),
+                    CodeQueryRowField::optional("parameter_ordinal", Scalar::Integer),
+                    CodeQueryRowField::optional("port_id", Scalar::StableId),
+                    CodeQueryRowField::required("decorator_name", Scalar::String),
+                    CodeQueryRowField::optional("local_name", Scalar::String),
+                    CodeQueryRowField::optional("imported_name", Scalar::String),
+                    CodeQueryRowField::optional("module", Scalar::String),
+                    CodeQueryRowField::required_enum(
+                        "binding_status",
+                        value_domain::DECORATOR_BINDING_STATUS
+                    ),
+                    CodeQueryRowField::required_enum(
+                        "boundary",
+                        value_domain::DECORATOR_BOUNDARY
+                    ),
+                    CodeQueryRowField::required_enum(
+                        "completion",
+                        value_domain::DECORATOR_COMPLETION
+                    ),
+                    CodeQueryRowField::required_enum(
+                        "coverage",
+                        value_domain::DECORATOR_COVERAGE
+                    ),
+                    CodeQueryRowField::optional("reason", Scalar::String),
+                    CodeQueryRowField::required("terminal", Scalar::Boolean),
         ],
     },
     CallableApplicability => "callable_applicability" {
@@ -1824,6 +1893,43 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::ExpressionSite { value }, "parameter_name") => {
             value.parameter_name.as_deref().map(Scalar::String)
         }
+        (CodeQueryResultValue::JsxAttributeValue { value }, "id") => {
+            Some(Scalar::StableId(&value.id))
+        }
+        (CodeQueryResultValue::JsxAttributeValue { value }, "ast_id") => {
+            Some(Scalar::StableId(&value.ast_id))
+        }
+        (CodeQueryResultValue::JsxAttributeValue { value }, "element_identity") => {
+            Some(Scalar::ConstrainedEnum(value.element_identity))
+        }
+        (CodeQueryResultValue::JsxAttributeValue { value }, "element_name") => {
+            value.element_name.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::JsxAttributeValue { value }, "attribute_kind") => {
+            Some(Scalar::ConstrainedEnum(value.attribute_kind))
+        }
+        (CodeQueryResultValue::JsxAttributeValue { value }, "attribute_name") => {
+            value.attribute_name.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::JsxAttributeValue { value }, "property_name") => {
+            value.property_name.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::JsxAttributeValue { value }, "coverage") => {
+            Some(Scalar::ConstrainedEnum(value.coverage))
+        }
+        (CodeQueryResultValue::JsxAttributeValue { value }, "reason") => {
+            value.reason.map(Scalar::String)
+        }
+        (CodeQueryResultValue::JsxAttributeValue { value }, "component_id") => value
+            .component
+            .as_ref()
+            .and_then(|target| target.id.as_deref())
+            .map(Scalar::DeclarationIdentity),
+        (CodeQueryResultValue::JsxAttributeValue { value }, "attribute_target_id") => value
+            .attribute_target
+            .as_ref()
+            .and_then(|target| target.id.as_deref())
+            .map(Scalar::DeclarationIdentity),
         (CodeQueryResultValue::ReceiverAnalysis { value }, "analysis_kind") => {
             Some(Scalar::ConstrainedEnum(value.analysis_kind))
         }
@@ -2024,6 +2130,60 @@ fn project_code_query_row_field<'a>(
         }
         (CodeQueryResultValue::SignatureParameter { value }, "repeated") => {
             value.repeated.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::DecoratedParameter { value }, "id") => {
+            Some(Scalar::StableId(&value.id))
+        }
+        (CodeQueryResultValue::DecoratedParameter { value }, "parameter_id") => {
+            Some(Scalar::StableId(&value.parameter_id))
+        }
+        (CodeQueryResultValue::DecoratedParameter { value }, "decorator_id") => {
+            value.decorator_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::DecoratedParameter { value }, "language") => {
+            Some(Scalar::ConstrainedEnum(value.language))
+        }
+        (CodeQueryResultValue::DecoratedParameter { value }, "owner_id") => {
+            value.owner_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::DecoratedParameter { value }, "procedure_id") => {
+            value.procedure_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::DecoratedParameter { value }, "parameter_ordinal") => value
+            .parameter_ordinal
+            .map(|ordinal| Scalar::Integer(ordinal as u64)),
+        (CodeQueryResultValue::DecoratedParameter { value }, "port_id") => {
+            value.port_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::DecoratedParameter { value }, "decorator_name") => {
+            Some(Scalar::String(&value.decorator_name))
+        }
+        (CodeQueryResultValue::DecoratedParameter { value }, "local_name") => {
+            value.local_name.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::DecoratedParameter { value }, "imported_name") => {
+            value.imported_name.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::DecoratedParameter { value }, "module") => {
+            value.module.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::DecoratedParameter { value }, "binding_status") => {
+            Some(Scalar::ConstrainedEnum(value.binding_status))
+        }
+        (CodeQueryResultValue::DecoratedParameter { value }, "boundary") => {
+            Some(Scalar::ConstrainedEnum(value.boundary))
+        }
+        (CodeQueryResultValue::DecoratedParameter { value }, "completion") => {
+            Some(Scalar::ConstrainedEnum(value.completion))
+        }
+        (CodeQueryResultValue::DecoratedParameter { value }, "coverage") => {
+            Some(Scalar::ConstrainedEnum(value.coverage))
+        }
+        (CodeQueryResultValue::DecoratedParameter { value }, "reason") => {
+            value.reason.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::DecoratedParameter { value }, "terminal") => {
+            Some(Scalar::Boolean(value.terminal))
         }
         (CodeQueryResultValue::CallBinding { value }, "id") => Some(Scalar::StableId(&value.id)),
         (CodeQueryResultValue::CallBinding { value }, "site_id") => {
@@ -2987,6 +3147,10 @@ pub enum DetailedCodeQueryKey {
         parameter_index: Option<u32>,
         parameter_name: Option<String>,
     },
+    JsxAttributeValue {
+        id: String,
+        ast_id: String,
+    },
     ReceiverAnalysis {
         analysis_kind: String,
         outcome: String,
@@ -3057,6 +3221,10 @@ pub enum DetailedCodeQueryKey {
     SignatureParameter {
         id: String,
         signature_id: String,
+    },
+    DecoratedParameter {
+        id: String,
+        parameter_id: String,
     },
     MemberSelection {
         id: String,
@@ -3342,6 +3510,7 @@ fn detailed_semantic_identity(
         | CodeQueryResultValue::ReferenceSite { .. }
         | CodeQueryResultValue::CallSite { .. }
         | CodeQueryResultValue::ExpressionSite { .. }
+        | CodeQueryResultValue::JsxAttributeValue { .. }
         | CodeQueryResultValue::ReceiverAnalysis { .. }
         | CodeQueryResultValue::ReceiverOutcome { .. }
         | CodeQueryResultValue::ReceiverEvidence { .. }
@@ -3357,6 +3526,7 @@ fn detailed_semantic_identity(
         | CodeQueryResultValue::ProcedureEffect { .. }
         | CodeQueryResultValue::CallableSignature { .. }
         | CodeQueryResultValue::SignatureParameter { .. }
+        | CodeQueryResultValue::DecoratedParameter { .. }
         | CodeQueryResultValue::CallableApplicability { .. }
         | CodeQueryResultValue::OverloadSelection { .. }
         | CodeQueryResultValue::MemberSelection { .. }
@@ -3430,6 +3600,7 @@ fn semantic_wire_id(key: &DetailedCodeQueryKey) -> Option<&str> {
         | DetailedCodeQueryKey::ReferenceSite { .. }
         | DetailedCodeQueryKey::CallSite { .. }
         | DetailedCodeQueryKey::ExpressionSite { .. }
+        | DetailedCodeQueryKey::JsxAttributeValue { .. }
         | DetailedCodeQueryKey::ReceiverAnalysis { .. }
         | DetailedCodeQueryKey::ReceiverOutcome { .. }
         | DetailedCodeQueryKey::ReceiverEvidence { .. }
@@ -3445,6 +3616,7 @@ fn semantic_wire_id(key: &DetailedCodeQueryKey) -> Option<&str> {
         | DetailedCodeQueryKey::ProcedureEffect { .. }
         | DetailedCodeQueryKey::CallableSignature { .. }
         | DetailedCodeQueryKey::SignatureParameter { .. }
+        | DetailedCodeQueryKey::DecoratedParameter { .. }
         | DetailedCodeQueryKey::CallableApplicability { .. }
         | DetailedCodeQueryKey::OverloadSelection { .. }
         | DetailedCodeQueryKey::MemberSelection { .. }

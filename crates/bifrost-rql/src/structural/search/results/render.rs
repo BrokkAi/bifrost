@@ -19,6 +19,7 @@ impl CodeQueryResult {
                 | CodeQueryResultValue::ReferenceSite { .. }
                 | CodeQueryResultValue::CallSite { .. }
                 | CodeQueryResultValue::ExpressionSite { .. }
+                | CodeQueryResultValue::JsxAttributeValue { .. }
                 | CodeQueryResultValue::ReceiverAnalysis { .. }
                 | CodeQueryResultValue::ReceiverOutcome { .. }
                 | CodeQueryResultValue::ReceiverEvidence { .. }
@@ -30,6 +31,7 @@ impl CodeQueryResult {
                 | CodeQueryResultValue::ProcedureEffect { .. }
                 | CodeQueryResultValue::CallableSignature { .. }
                 | CodeQueryResultValue::SignatureParameter { .. }
+                | CodeQueryResultValue::DecoratedParameter { .. }
                 | CodeQueryResultValue::CallableApplicability { .. }
                 | CodeQueryResultValue::OverloadSelection { .. }
                 | CodeQueryResultValue::MemberSelection { .. }
@@ -245,6 +247,17 @@ impl CodeQueryResult {
                             value.input_kind,
                             value.text,
                             value.callee_fq_name
+                        ));
+                    }
+                    CodeQueryResultValue::JsxAttributeValue { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [jsx attribute value; {}; {}] `{}`\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.element_identity,
+                            value.coverage,
+                            value.text
                         ));
                     }
                     CodeQueryResultValue::ReceiverAnalysis { value } => {
@@ -515,6 +528,27 @@ impl CodeQueryResult {
                                 ""
                             },
                             value.signature_id
+                        ));
+                    }
+                    CodeQueryResultValue::DecoratedParameter { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [decorated parameter; {}; {}; {}] `{}` ordinal={}{}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.binding_status,
+                            value.boundary,
+                            value.completion,
+                            value.decorator_name,
+                            value.parameter_ordinal.map_or_else(
+                                || "unknown".to_string(),
+                                |ordinal| ordinal.to_string()
+                            ),
+                            value
+                                .module
+                                .as_deref()
+                                .map(|module| format!("; module={module}"))
+                                .unwrap_or_default(),
                         ));
                     }
                     CodeQueryResultValue::OverloadSelection { value } => {

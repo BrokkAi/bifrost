@@ -197,7 +197,7 @@ fn binding_query<'a>(
         .resolved_selectors()
         .iter()
         .find(|selector| selector.path.as_str() == path)
-        .map(|selector| &selector.query)
+        .and_then(|selector| selector.as_query().map(|(_, query)| query))
         .ok_or_else(|| ExplainError::BindingSelectorUnavailable {
             binding: binding.name.as_str().to_string(),
         })

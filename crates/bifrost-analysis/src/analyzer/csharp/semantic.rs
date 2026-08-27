@@ -20,7 +20,7 @@ use crate::analyzer::{CSharpAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_core::analyzer::tree_walk::ParentIndex;
 
-const ADAPTER_VERSION: &[u8] = b"csharp-value-semantics-v3";
+const ADAPTER_VERSION: &[u8] = b"csharp-value-semantics-v6";
 
 impl_program_semantics_provider!(CSharpAnalyzer, CSharpSemanticLowerer);
 
@@ -75,6 +75,7 @@ impl ProgramSemanticsLowerer for CSharpSemanticLowerer {
             specs,
             static_callable_returns,
             type_receiver_shadows,
+            member_declarations,
         } = procedure_inventory;
         lower_procedure_batch(
             &specs,
@@ -87,6 +88,7 @@ impl ProgramSemanticsLowerer for CSharpSemanticLowerer {
                     spec,
                     &static_callable_returns,
                     &type_receiver_shadows,
+                    &member_declarations,
                     staged_budget,
                     cancellation,
                 )
@@ -123,6 +125,14 @@ fn csharp_capabilities() -> SemanticCapabilities {
         SemanticCapability::LocalFlow,
         SemanticCapability::ParameterFlow,
         SemanticCapability::ReceiverFlow,
+        // Partial, not complete: a write through a field, static, or indexer
+        // target becomes a `MemoryStore` against a structured location, but
+        // whether that location is the *declared* member is only known when
+        // this file can resolve the base's type, so an unresolved occurrence
+        // still publishes its own location-subject gap (#2661).
+        SemanticCapability::FieldMemory,
+        SemanticCapability::StaticMemory,
+        SemanticCapability::IndexMemory,
         SemanticCapability::Captures,
         SemanticCapability::NonLocalControl,
         SemanticCapability::ResourceManagement,
@@ -150,14 +160,43 @@ struct ProcedureSpec<'tree> {
     callable: Node<'tree>,
 }
 
+/// One member -- a method, a field, or a property -- named by the type that
+/// declares it. The namespace is part of the key because two namespaces may
+/// each declare a `Config` with a `Value` member and they are not the same
+/// member.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct StaticCallableKey {
+struct TypeMemberKey {
     namespace: Box<[Box<str>]>,
     owner: Box<str>,
     name: Box<str>,
 }
 
-type StaticCallableReturnTypes = HashMap<StaticCallableKey, Option<Box<str>>>;
+type StaticCallableReturnTypes = HashMap<TypeMemberKey, Option<Box<str>>>;
+
+/// One field or property declaration, as the enumeration pass sees it.
+///
+/// `anchor` is the declaration's own source anchor, which is what makes two
+/// occurrences of the same member in different procedures agree on one
+/// [`MemoryLocationKind`] identity rather than each minting its own.
+#[derive(Debug, Clone)]
+struct MemberDeclaration {
+    anchor: SourceAnchor,
+    is_static: bool,
+    /// The member's declared type spelling, when this file knows it.
+    ///
+    /// This is what lets a write through the member ask the same
+    /// identity-preservation question a local declaration asks, instead of
+    /// declining every member assignment's result on principle (#2661).
+    type_spelling: Option<Box<str>>,
+}
+
+/// Declared fields and properties, keyed by owning type and member name.
+///
+/// A `None` value records a name that more than one declaration in this file
+/// claims. Such a name resolves to no single anchor, so an occurrence of it
+/// must decline rather than pick one arbitrarily -- the same collapse
+/// [`StaticCallableReturnTypes`] performs for an overloaded static method.
+type MemberDeclarations = HashMap<TypeMemberKey, Option<MemberDeclaration>>;
 
 #[derive(Debug, Default)]
 struct TypeReceiverShadows {
@@ -171,6 +210,7 @@ struct ProcedureInventory<'tree> {
     specs: Vec<ProcedureSpec<'tree>>,
     static_callable_returns: StaticCallableReturnTypes,
     type_receiver_shadows: TypeReceiverShadowIndex,
+    member_declarations: MemberDeclarations,
 }
 
 type ProcedureEnumeration<'tree> = ProcedureInventoryOutcome<ProcedureInventory<'tree>>;
@@ -194,6 +234,7 @@ fn enumerate_procedures<'tree>(
     let mut specs = Vec::new();
     let mut static_callable_returns = StaticCallableReturnTypes::default();
     let mut type_receiver_shadows = TypeReceiverShadowIndex::default();
+    let mut member_declarations = MemberDeclarations::default();
     let root_path = file_scoped_namespace_path(prepared.source(), root, &mut inventory)?;
     let mut stack = vec![ProcedureEnumerationFrame {
         node: root,
@@ -235,6 +276,7 @@ fn enumerate_procedures<'tree>(
             frame.node,
             prepared.source(),
         );
+        record_member_declarations(&mut member_declarations, frame.node, prepared.source());
 
         let mut child_parent = frame.lexical_parent;
         if let Some((kind, segment_kind, body, properties)) =
@@ -281,6 +323,7 @@ fn enumerate_procedures<'tree>(
         specs,
         static_callable_returns,
         type_receiver_shadows,
+        member_declarations,
     }))
 }
 
@@ -393,8 +436,8 @@ fn record_static_callable_return_type(
     let return_type = callable
         .child_by_field_name("returns")
         .or_else(|| callable.child_by_field_name("type"))
-        .and_then(|return_type| intrinsic_type_identity(return_type, source));
-    let key = StaticCallableKey {
+        .and_then(|return_type| declared_type_spelling(return_type, source));
+    let key = TypeMemberKey {
         namespace: enclosing_namespace_path(source, callable),
         owner,
         name,
@@ -405,6 +448,86 @@ fn record_static_callable_return_type(
         }
         std::collections::hash_map::Entry::Vacant(entry) => {
             entry.insert(return_type);
+        }
+    }
+}
+
+/// Index the fields and properties a type declares, so that an occurrence of
+/// one can name the *declaration's* anchor rather than its own (#2661).
+///
+/// Two reads of `this.value` in different procedures must agree that they name
+/// one location; anchoring each to its own occurrence would make them two.
+///
+/// A nested type is indexed like any other. The key carries only the innermost
+/// type name, so a nested `Inner` and a top-level `Inner` in the same namespace
+/// share one key -- but the duplicate collapse below already turns that into a
+/// decline, which is the honest answer and a strictly better one than refusing
+/// every nested type outright. Refusing them was how a `sealed class Holder`
+/// nested in a static host ended up with each occurrence of `h.Tainted`
+/// anchored to itself, so a store and a later load named two locations that
+/// only looked alike and no heap fact could ever connect them (#2661).
+fn record_member_declarations(members: &mut MemberDeclarations, node: Node<'_>, source: &str) {
+    let names = match node.kind() {
+        "field_declaration" | "event_field_declaration" => named_children(node)
+            .into_iter()
+            .filter(|child| child.kind() == "variable_declaration")
+            .flat_map(named_children)
+            .filter(|child| child.kind() == "variable_declarator")
+            .filter_map(|declarator| {
+                declarator
+                    .child_by_field_name("name")
+                    .or_else(|| first_runtime_named_child(declarator))
+            })
+            .collect::<Vec<_>>(),
+        "property_declaration" | "event_declaration" => {
+            node.child_by_field_name("name").into_iter().collect()
+        }
+        _ => return,
+    };
+    if names.is_empty() {
+        return;
+    }
+    let Some(owner_node) = enclosing_type_node(node) else {
+        return;
+    };
+    let Some(owner) = declaration_container_name(source, owner_node) else {
+        return;
+    };
+    // A `const` member is class-wide storage exactly as a `static` one is; C#
+    // simply implies the modifier rather than requiring it.
+    let is_static = has_modifier(source, node, "static") || has_modifier(source, node, "const");
+    // A field declares its type on the inner `variable_declaration`; a
+    // property declares it on the declaration itself.
+    let type_spelling = named_children(node)
+        .into_iter()
+        .find(|child| child.kind() == "variable_declaration")
+        .and_then(|declaration| declaration.child_by_field_name("type"))
+        .or_else(|| node.child_by_field_name("type"))
+        .and_then(|type_node| declared_type_spelling(type_node, source));
+    let namespace = enclosing_namespace_path(source, node);
+    for name_node in names {
+        let Some(name) = nonempty_node_text(source, name_node) else {
+            continue;
+        };
+        let Ok(anchor) = source_anchor(name_node, 0) else {
+            continue;
+        };
+        let key = TypeMemberKey {
+            namespace: namespace.clone(),
+            owner: owner.clone(),
+            name: Box::from(name),
+        };
+        match members.entry(key) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Some(MemberDeclaration {
+                    anchor,
+                    is_static,
+                    type_spelling: type_spelling.clone(),
+                }));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.insert(None);
+            }
         }
     }
 }
@@ -717,6 +840,13 @@ struct LoweringContext<'tree, 'targets> {
     prepared: &'tree PreparedSyntaxTree,
     static_callable_returns: &'targets StaticCallableReturnTypes,
     type_receiver_shadows: &'targets TypeReceiverShadowIndex,
+    member_declarations: &'targets MemberDeclarations,
+    /// One value per distinct constant subscript spelling in this procedure.
+    ///
+    /// An element location is identified by its base and index *values*, so
+    /// two occurrences of `values[0]` must share one index value or they
+    /// address two different elements. Java canonicalizes the same way.
+    constant_index_values: HashMap<Box<str>, ValueId>,
     callable_type_parameters: HashSet<Box<str>>,
     session: ProcedureLoweringSession<'targets>,
     expression_values: HashMap<usize, ValueId>,
@@ -725,6 +855,15 @@ struct LoweringContext<'tree, 'targets> {
     locals: HashMap<Box<str>, Vec<LocalBinding>>,
     receiver: Option<ValueId>,
     cleanups: Vec<CleanupRegion<'tree>>,
+}
+
+/// One structured heap location an access expression names, together with
+/// whether this file proved which declaration it addresses.
+#[derive(Debug, Clone, Copy)]
+struct MemoryTarget {
+    location: MemoryLocationId,
+    kind: MemoryAccessKind,
+    resolved: bool,
 }
 
 struct LocalBinding {
@@ -741,6 +880,7 @@ fn lower_procedure<'tree, 'targets>(
     spec: &ProcedureSpec<'tree>,
     static_callable_returns: &'targets StaticCallableReturnTypes,
     type_receiver_shadows: &'targets TypeReceiverShadowIndex,
+    member_declarations: &'targets MemberDeclarations,
     budget: &'targets SemanticBudget,
     cancellation: &'targets CancellationToken,
 ) -> Result<(ProcedureSemanticsParts, SemanticWork), CSharpLoweringError> {
@@ -765,6 +905,8 @@ fn lower_procedure<'tree, 'targets>(
         prepared,
         static_callable_returns,
         type_receiver_shadows,
+        member_declarations,
+        constant_index_values: HashMap::default(),
         callable_type_parameters: callable_type_parameter_names(spec.callable, prepared.source()),
         session,
         expression_values: HashMap::default(),
@@ -1015,7 +1157,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             let type_identity = (!slot.receiver)
                 .then(|| node.child_by_field_name("type"))
                 .flatten()
-                .and_then(|type_node| intrinsic_type_identity(type_node, self.prepared.source()));
+                .and_then(|type_node| declared_type_spelling(type_node, self.prepared.source()));
             for name in slot.names {
                 if let Some(type_identity) = &type_identity {
                     self.parameter_types
@@ -1079,9 +1221,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let type_identity = node
                     .parent()
                     .and_then(|declaration| declaration.child_by_field_name("type"))
-                    .filter(|type_node| type_node.kind() != "implicit_type")
                     .and_then(|type_node| {
-                        intrinsic_type_identity(type_node, self.prepared.source())
+                        declared_type_spelling(type_node, self.prepared.source())
                     });
                 self.locals
                     .entry(text.into())
@@ -1274,7 +1415,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             let value =
                 self.expression_value(builder, *initializer, expression_value_kind(*initializer))?;
             let identity_conversion = declared_type.is_some_and(|declared_type| {
-                self.local_initializer_has_identity_conversion(declared_type, *initializer)
+                declared_type.kind() == "implicit_type"
+                    || self.identity_is_preserved(
+                        declared_type_spelling(declared_type, self.prepared.source()).as_deref(),
+                        *initializer,
+                    )
             });
             if identity_conversion {
                 self.append_effect(
@@ -1317,59 +1462,526 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         Ok(())
     }
 
-    fn local_initializer_has_identity_conversion(
-        &self,
-        declared_type: Node<'tree>,
-        initializer: Node<'tree>,
-    ) -> bool {
-        if declared_type.kind() == "implicit_type"
-            || initializer.kind() == "implicit_object_creation_expression"
-        {
+    /// Whether carrying `value` into a target declared as `declared` keeps the
+    /// value's own identity, instead of possibly running a user-defined
+    /// implicit conversion first (#2661).
+    ///
+    /// C# lets any type declare `implicit operator T(S)`, and such an operator
+    /// is ordinary user code that returns whatever it likes -- `Service s =
+    /// source;` can bind `s` to an object that the initializer never named.
+    /// Connecting the two unconditionally would relabel the pre-conversion
+    /// allocation as the declared type, so the connection is made only when
+    /// this file proves that no conversion can intervene.
+    ///
+    /// `declared` is the target's declared type spelling, or `None` when this
+    /// file does not know it. `None` proves nothing on its own; an expression
+    /// that constructs its own value still needs no proof, because there is no
+    /// prior identity for a conversion to replace.
+    fn identity_is_preserved(&self, declared: Option<&str>, value: Node<'tree>) -> bool {
+        if expression_constructs_its_value(value.kind()) {
+            return true;
+        }
+        // `new()` is target-typed: it constructs the declared type itself.
+        if value.kind() == "implicit_object_creation_expression" {
+            return true;
+        }
+        // A built-in operation computes a fresh value of a predefined type.
+        // There is no prior object identity for a conversion to replace, and
+        // no user-defined conversion can target a predefined type, so
+        // `int computed = (value * 3) + 7;` needs no further proof (#2661).
+        if self.operation_is_builtin(value) {
             return true;
         }
         let source = self.prepared.source();
-        let Some(declared_identity) = intrinsic_type_identity(declared_type, source) else {
-            return initializer.kind() == "object_creation_expression"
-                && initializer
-                    .child_by_field_name("type")
-                    .is_some_and(|created_type| {
-                        super::csharp_type_node_identity(created_type, source)
-                            == super::csharp_type_node_identity(declared_type, source)
-                    });
+        let Some(declared) = declared else {
+            return false;
         };
-        match initializer.kind() {
-            "identifier" => node_text(source, initializer)
-                .and_then(|name| self.binding_type_at(name, initializer.start_byte()))
-                .is_some_and(|source_identity| source_identity == declared_identity.as_ref()),
+        match value.kind() {
+            "object_creation_expression" | "array_creation_expression" => value
+                .child_by_field_name("type")
+                .and_then(|created| declared_type_spelling(created, source))
+                .is_some_and(|created| created.as_ref() == declared),
+            "identifier" => node_text(source, value)
+                .and_then(|name| self.binding_type_at(name, value.start_byte()))
+                .is_some_and(|bound| bound == declared),
             "invocation_expression" => self
-                .static_invocation_return_type(initializer)
-                .is_some_and(|return_type| return_type == declared_identity.as_ref()),
-            "object_creation_expression" => {
-                initializer
-                    .child_by_field_name("type")
-                    .is_some_and(|created_type| {
-                        intrinsic_type_identity(created_type, source)
-                            .is_some_and(|created_identity| created_identity == declared_identity)
-                    })
-            }
+                .static_invocation_return_type(value)
+                .is_some_and(|returned| returned == declared),
             _ => false,
         }
     }
 
     fn static_invocation_return_type(&self, invocation: Node<'tree>) -> Option<&str> {
         let key = static_invocation_key(invocation, self.prepared.source())?;
-        if self.local_at(&key.owner, invocation.start_byte()).is_some()
-            || self.parameters.contains_key(&key.owner)
-            || self.callable_type_parameters.contains(&key.owner)
-            || receiver_name_is_lexically_shadowed(
-                invocation,
-                &key.owner,
-                self.type_receiver_shadows,
-            )
-        {
+        // An unqualified callee is shadowed by a same-named local, parameter,
+        // or local function holding a delegate, exactly as a receiver name is
+        // shadowed by a same-named value.
+        for name in [&key.owner, &key.name] {
+            if self.local_at(name, invocation.start_byte()).is_some()
+                || self.parameters.contains_key(name.as_ref())
+                || self.callable_type_parameters.contains(name.as_ref())
+            {
+                return None;
+            }
+        }
+        if receiver_name_is_lexically_shadowed(invocation, &key.owner, self.type_receiver_shadows) {
             return None;
         }
         self.static_callable_returns.get(&key)?.as_deref()
+    }
+
+    /// Whether an expression provably denotes a value of a predefined type.
+    ///
+    /// This is a proof, not a guess: every branch either reads a declared type
+    /// spelling this file recorded, or is a literal whose type the grammar
+    /// fixes. An expression this cannot account for answers `false`, so an
+    /// unknown type is never mistaken for a predefined one.
+    fn expression_is_predefined(&self, node: Node<'tree>) -> bool {
+        match node.kind() {
+            kind if literal_is_predefined(kind) => true,
+            "parenthesized_expression" | "checked_expression" => {
+                first_runtime_named_child(node).is_some_and(|inner| {
+                    // A parenthesized group denotes exactly its inner value.
+                    self.expression_is_predefined(inner)
+                })
+            }
+            "identifier" => node_text(self.prepared.source(), node)
+                .and_then(|name| self.binding_type_at(name, node.start_byte()))
+                .is_some_and(csharp_predefined_type),
+            "invocation_expression" => self
+                .static_invocation_return_type(node)
+                .is_some_and(csharp_predefined_type),
+            "cast_expression" => node
+                .child_by_field_name("type")
+                .and_then(|target| declared_type_spelling(target, self.prepared.source()))
+                .is_some_and(|target| csharp_predefined_type(&target)),
+            // A built-in operation over predefined operands is itself
+            // predefined, which is what lets `(value * 3) + 7` compose.
+            "binary_expression" | "prefix_unary_expression" | "postfix_unary_expression" => {
+                self.operation_is_builtin(node)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether an operator expression provably runs the language's own
+    /// operator rather than a user-defined `operator` declaration (#2661).
+    ///
+    /// C# lets a type declare `public static T operator +(T, T)`, which is
+    /// ordinary user code returning whatever it likes. Connecting an operand
+    /// to such a result would republish the operand's object as the result --
+    /// the same unsoundness a user-defined implicit conversion causes for a
+    /// local initializer, and the points-to trace follows `ValueFlow` edges
+    /// regardless of their kind. Operator overloading is impossible when every
+    /// operand is of a predefined type, so that is the proof required here.
+    ///
+    /// An increment or decrement is excluded: it also writes its operand, and
+    /// that write is not represented yet.
+    fn operation_is_builtin(&self, node: Node<'tree>) -> bool {
+        // Only an operator expression asks this question. Without the kind
+        // check every node with predefined-typed children answered "built-in",
+        // and `slot = ref other` fabricated value flow into an alias rebind.
+        if !matches!(
+            node.kind(),
+            "binary_expression" | "prefix_unary_expression" | "postfix_unary_expression"
+        ) {
+            return false;
+        }
+        if is_update_expression(node) {
+            return false;
+        }
+        let operands = runtime_expression_children(node);
+        !operands.is_empty()
+            && operands
+                .iter()
+                .all(|operand| self.expression_is_predefined(*operand))
+    }
+
+    /// The abstract location an access expression names, when this file can
+    /// structure it (#2661).
+    ///
+    /// A member or element target is a write to a *location*, not to a value,
+    /// so it publishes a `MemoryStore` and deliberately carries no
+    /// `Assignment` or `ValueFlow` edge. That separation is what keeps the
+    /// user-defined-conversion problem out of the heap stratum: the backward
+    /// points-to trace in `workspace_oracle/heap.rs` follows only value edges,
+    /// so a store cannot republish a pre-conversion allocation as the member's
+    /// content the way an unguarded local assignment would. The identity
+    /// question `identity_is_preserved` answers for a local therefore does not
+    /// need re-asking here -- it is answered by construction.
+    fn memory_access_target(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        access: Node<'tree>,
+    ) -> Result<Option<MemoryTarget>, CSharpLoweringError> {
+        match access.kind() {
+            "member_access_expression" => self.member_location(builder, point, access),
+            "element_access_expression" => self.element_location(builder, point, access),
+            _ => Ok(None),
+        }
+    }
+
+    fn member_location(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        access: Node<'tree>,
+    ) -> Result<Option<MemoryTarget>, CSharpLoweringError> {
+        let (Some(base), Some(name_node)) = (
+            access.child_by_field_name("expression"),
+            access.child_by_field_name("name"),
+        ) else {
+            return Ok(None);
+        };
+        let Some(name) =
+            nonempty_node_text(self.prepared.source(), name_node).map(Box::<str>::from)
+        else {
+            return Ok(None);
+        };
+        let declaration = self
+            .access_owner_type(base)
+            .and_then(|owner| self.member_declaration_for(&owner, &name, access));
+        let member = self.member_locator(name_node, declaration.as_ref())?;
+        // A `static` or `const` member is one class-wide slot, addressed by
+        // nothing: it has no base object for a `Field` location to name.
+        if declaration
+            .as_ref()
+            .is_some_and(|declaration| declaration.is_static)
+        {
+            let location = self.session.add_memory_location(
+                builder,
+                point,
+                MemoryLocationKind::Static { member },
+            )?;
+            return Ok(Some(MemoryTarget {
+                location,
+                kind: MemoryAccessKind::Static,
+                resolved: true,
+            }));
+        }
+        // Without a base value this is not an instance access at all -- it is
+        // a member of a type this file could not resolve. Inventing a base
+        // object would invent an aliasing fact, so decline.
+        let Some(base_value) = self.access_base_value(builder, base)? else {
+            return Ok(None);
+        };
+        let location = self.session.add_memory_location(
+            builder,
+            point,
+            MemoryLocationKind::Field {
+                base: base_value,
+                member,
+            },
+        )?;
+        Ok(Some(MemoryTarget {
+            location,
+            kind: MemoryAccessKind::Field,
+            resolved: declaration.is_some(),
+        }))
+    }
+
+    fn element_location(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        access: Node<'tree>,
+    ) -> Result<Option<MemoryTarget>, CSharpLoweringError> {
+        let Some(base) = access.child_by_field_name("expression") else {
+            return Ok(None);
+        };
+        let Some(base_value) = self.access_base_value(builder, base)? else {
+            return Ok(None);
+        };
+        // One subscript is the element's own index. A multi-dimensional or
+        // named subscript names no single index expression, so the location
+        // stays index-less rather than adopting the first argument as if it
+        // were the whole address.
+        let subscripts = access
+            .child_by_field_name("subscript")
+            .map(named_children)
+            .unwrap_or_default();
+        let subscript = match subscripts.as_slice() {
+            [only] => call_argument_value(*only),
+            _ => None,
+        };
+        let index = match subscript {
+            Some(value) => Some(self.subscript_value(builder, value)?),
+            None => None,
+        };
+        let location = self.session.add_memory_location(
+            builder,
+            point,
+            MemoryLocationKind::Index {
+                base: base_value,
+                index,
+            },
+        )?;
+        Ok(Some(MemoryTarget {
+            location,
+            kind: MemoryAccessKind::Index,
+            // An array element access runs no user code: C# arrays have no
+            // user-declarable indexer, so a provably-array base addresses the
+            // element directly. Any other base may resolve to a user-defined
+            // `this[...]` accessor pair, and nothing here proves which one
+            // runs.
+            //
+            // The index must also be a constant. A location is identified by
+            // its index *value*, and only a constant subscript is
+            // canonicalized to one value across occurrences -- so claiming
+            // resolution for `values[i]` would let a store and a load address
+            // two different elements while publishing no decline, and the
+            // solver would read that disconnection as a proven absence rather
+            // than as missing information. A confident wrong answer is worse
+            // than an honest partial.
+            resolved: self.base_is_array(base)
+                && subscript.is_some_and(|subscript| {
+                    matches!(
+                        expression_value_kind(subscript),
+                        SemanticValueKind::Constant
+                    )
+                }),
+        }))
+    }
+
+    /// The value a subscript denotes, canonicalized when it is a constant so
+    /// that every occurrence of `values[0]` names one element location.
+    fn subscript_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+    ) -> Result<ValueId, CSharpLoweringError> {
+        let kind = expression_value_kind(node);
+        if kind != SemanticValueKind::Constant {
+            return self.expression_value(builder, node, kind);
+        }
+        let Some(text) = node_text(self.prepared.source(), node) else {
+            return self.expression_value(builder, node, kind);
+        };
+        if let Some(value) = self.constant_index_values.get(text).copied() {
+            self.expression_values.insert(node.id(), value);
+            return Ok(value);
+        }
+        let value = self.expression_value(builder, node, kind)?;
+        self.constant_index_values.insert(text.into(), value);
+        Ok(value)
+    }
+
+    /// Whether an access base provably denotes an array.
+    ///
+    /// [`declared_type_spelling`] keeps array ranks precisely so this question
+    /// can be answered from a declared type: `int[]` and `int` are distinct
+    /// spellings there, though `csharp_type_node_identity` collapses them.
+    fn base_is_array(&self, base: Node<'tree>) -> bool {
+        match base.kind() {
+            "identifier" => node_text(self.prepared.source(), base)
+                .and_then(|name| self.binding_type_at(name, base.start_byte()))
+                .is_some_and(|declared| declared.ends_with("[]")),
+            "array_creation_expression" | "implicit_array_creation_expression" => true,
+            _ => false,
+        }
+    }
+
+    /// The value an access is addressed through, or `None` when the base names
+    /// a type rather than an object.
+    fn access_base_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        base: Node<'tree>,
+    ) -> Result<Option<ValueId>, CSharpLoweringError> {
+        if matches!(base.kind(), "this" | "base") {
+            return Ok(self.receiver);
+        }
+        if base.kind() == "identifier"
+            && let Some(name) = node_text(self.prepared.source(), base)
+            && self.local_at(name, base.start_byte()).is_none()
+            && !self.parameters.contains_key(name)
+        {
+            return Ok(None);
+        }
+        self.expression_value(builder, base, expression_value_kind(base))
+            .map(Some)
+    }
+
+    /// The type that declares the member an access names, when this file knows
+    /// it: the enclosing type for `this`, a value's declared type spelling for
+    /// an instance access, or the identifier itself for a static one.
+    fn access_owner_type(&self, base: Node<'tree>) -> Option<Box<str>> {
+        if matches!(base.kind(), "this" | "base") {
+            return enclosing_type_node(base)
+                .and_then(|owner| declaration_container_name(self.prepared.source(), owner));
+        }
+        if base.kind() != "identifier" {
+            return None;
+        }
+        let name = node_text(self.prepared.source(), base)?;
+        if let Some(declared) = self.binding_type_at(name, base.start_byte()) {
+            return Some(Box::from(declared));
+        }
+        if self.local_at(name, base.start_byte()).is_some() || self.parameters.contains_key(name) {
+            // A value in scope whose declared type this file does not know.
+            // Its members belong to some type, but not to a named one.
+            return None;
+        }
+        Some(Box::from(name))
+    }
+
+    fn member_declaration_for(
+        &self,
+        owner: &str,
+        name: &str,
+        access: Node<'tree>,
+    ) -> Option<MemberDeclaration> {
+        let key = TypeMemberKey {
+            namespace: enclosing_namespace_path(self.prepared.source(), access),
+            owner: Box::from(owner),
+            name: Box::from(name),
+        };
+        self.member_declarations.get(&key)?.clone()
+    }
+
+    /// The declared type an assignment target holds, when this file knows it.
+    ///
+    /// A member target reads its own declaration's type; an element target
+    /// reads the array's element type, which is the base spelling with one
+    /// rank removed. This is what lets a write through a location ask the same
+    /// identity-preservation question a local declaration asks, rather than
+    /// declining every such assignment's result on principle (#2661).
+    fn assignment_target_type(&self, target: Node<'tree>) -> Option<Box<str>> {
+        match target.kind() {
+            "member_access_expression" => {
+                let base = target.child_by_field_name("expression")?;
+                let name = nonempty_node_text(
+                    self.prepared.source(),
+                    target.child_by_field_name("name")?,
+                )?;
+                let owner = self.access_owner_type(base)?;
+                self.member_declaration_for(&owner, name, target)?
+                    .type_spelling
+            }
+            "element_access_expression" => {
+                let base = target.child_by_field_name("expression")?;
+                let declared = match base.kind() {
+                    "identifier" => {
+                        let name = node_text(self.prepared.source(), base)?;
+                        self.binding_type_at(name, base.start_byte())?
+                    }
+                    _ => return None,
+                };
+                declared.strip_suffix("[]").map(Box::<str>::from)
+            }
+            _ => None,
+        }
+    }
+
+    /// Anchor a member location to its *declaration* when one is known, so two
+    /// occurrences of the same member agree on one identity, and to the
+    /// occurrence otherwise.
+    fn member_locator(
+        &self,
+        occurrence: Node<'tree>,
+        declaration: Option<&MemberDeclaration>,
+    ) -> Result<SemanticLocator, CSharpLoweringError> {
+        let anchor = match declaration {
+            Some(declaration) => declaration.anchor,
+            None => source_anchor(occurrence, 0).map_err(CSharpLoweringError::Invalid)?,
+        };
+        let procedure = self.session.locator();
+        Ok(SemanticLocator::new(
+            procedure.mount(),
+            procedure.path().clone(),
+            procedure.language(),
+            procedure.declaration().clone(),
+            SemanticRole::MemoryLocation,
+            anchor,
+        ))
+    }
+
+    /// Publish a read of a member or an element as a `MemoryLoad` into the
+    /// access's own value, when the location can be structured.
+    ///
+    /// The load is the read-side symmetry of [`Self::emit_memory_store`]: a
+    /// member's identity is a location, not a value, so a read of one is a
+    /// load from that location rather than a value edge from a binding.
+    fn emit_memory_load(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        access: Node<'tree>,
+    ) -> Result<(), CSharpLoweringError> {
+        let Some(load) = self.memory_access_target(builder, point, access)? else {
+            return Ok(());
+        };
+        let result = self.expression_value(builder, access, expression_value_kind(access))?;
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::MemoryLoad {
+                kind: load.kind,
+                location: load.location,
+                result,
+            },
+        )?;
+        self.add_memory_identity_gap(builder, point, load)
+    }
+
+    fn emit_memory_store(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        store: MemoryTarget,
+        value: ValueId,
+    ) -> Result<(), CSharpLoweringError> {
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::MemoryStore {
+                kind: store.kind,
+                location: store.location,
+                value,
+            },
+        )?;
+        self.add_memory_identity_gap(builder, point, store)
+    }
+
+    /// Publish the location's own identity gap when the occurrence was
+    /// structured but its declaration was not resolved.
+    ///
+    /// The subject is the location, not the point: a
+    /// [`SemanticGapSubject::MemoryLocation`] carries `MEMORY` impact and
+    /// leaves the value stratum alone, which is the whole reason the heap
+    /// stratum is separate from it.
+    fn add_memory_identity_gap(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        store: MemoryTarget,
+    ) -> Result<(), CSharpLoweringError> {
+        if store.resolved {
+            return Ok(());
+        }
+        let (capability, detail) = match store.kind {
+            MemoryAccessKind::Index => (
+                SemanticCapability::IndexMemory,
+                "indexed access is structured, but the indexer and element identity are not resolved",
+            ),
+            MemoryAccessKind::Static => (
+                SemanticCapability::StaticMemory,
+                "static member access is structured, but its declaration identity is not resolved",
+            ),
+            _ => (
+                SemanticCapability::FieldMemory,
+                "field or property access is structured, but its declaration identity is not resolved",
+            ),
+        };
+        self.add_gap(
+            builder,
+            point,
+            SemanticGapSubject::MemoryLocation(store.location),
+            capability,
+            SemanticGapKind::Unknown,
+            detail,
+        )
     }
 
     fn assignment_expression(
@@ -1384,15 +1996,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let left = required_field(node, "left")?;
         let right = required_field(node, "right")?;
         let terminal = self.point(builder, node, Vec::new())?;
+        let value = self.expression_value(builder, right, expression_value_kind(right))?;
         let result = self.expression_value(builder, node, expression_value_kind(node))?;
-        self.add_gap(
-            builder,
-            terminal,
-            SemanticGapSubject::Value(result),
-            SemanticCapability::Values,
-            SemanticGapKind::Unknown,
-            "C# assignment result identity is unavailable until implicit conversion resolution is available",
-        )?;
 
         let evaluations = if left.kind() == "identifier" {
             let name = node_text(self.prepared.source(), left).ok_or_else(|| {
@@ -1400,26 +2005,109 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             })?;
             let local = self.local_at(name, left.start_byte());
             let target = local.or_else(|| self.parameters.get(name).copied());
+            // The declared type of the assignment target decides whether a
+            // user-defined implicit conversion can intervene, the same
+            // question a declaration with an initializer asks (#2661).
+            let preserved =
+                self.identity_is_preserved(self.binding_type_at(name, left.start_byte()), right);
             if let Some(target) = target {
+                if preserved {
+                    let kind = if local.is_some() {
+                        ValueFlowKind::Local
+                    } else {
+                        ValueFlowKind::Parameter
+                    };
+                    self.append_effect(
+                        builder,
+                        terminal,
+                        SemanticEffect::Assignment { target, value },
+                    )?;
+                    self.append_effect(
+                        builder,
+                        terminal,
+                        SemanticEffect::ValueFlow {
+                            kind,
+                            source: value,
+                            target,
+                        },
+                    )?;
+                } else {
+                    self.add_gap(
+                        builder,
+                        terminal,
+                        SemanticGapSubject::Value(target),
+                        SemanticCapability::Values,
+                        SemanticGapKind::Unknown,
+                        "C# assignment target identity is unavailable until implicit conversion resolution is available",
+                    )?;
+                }
+            }
+            // The value of an assignment expression is the value that was
+            // assigned, once no conversion can have replaced it.
+            if preserved {
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::Assignment {
+                        target: result,
+                        value,
+                    },
+                )?;
+            } else {
                 self.add_gap(
                     builder,
                     terminal,
-                    SemanticGapSubject::Value(target),
+                    SemanticGapSubject::Value(result),
                     SemanticCapability::Values,
                     SemanticGapKind::Unknown,
-                    "C# assignment target identity is unavailable until implicit conversion resolution is available",
+                    "C# assignment result identity is unavailable until implicit conversion resolution is available",
                 )?;
             }
             vec![right]
         } else {
-            self.add_gap(
-                builder,
-                terminal,
-                SemanticGapSubject::Point,
-                SemanticCapability::Assignments,
-                SemanticGapKind::Unsupported,
-                "property, field, index, tuple, or ref assignment targets are not yet lowered into memory flow",
-            )?;
+            // The value of an assignment expression is the value assigned,
+            // and a write through a location asks the same conversion
+            // question a local declaration asks -- against the *member's*
+            // declared type (#2661). Declining it unconditionally published a
+            // `Values`/`Unknown` gap on a result that a statement-level write
+            // never even reads, and that gap alone opened the whole
+            // procedure's value-flow snapshot, so no heap fact downstream of
+            // it could be proven complete.
+            if self.identity_is_preserved(self.assignment_target_type(left).as_deref(), right) {
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::Assignment {
+                        target: result,
+                        value,
+                    },
+                )?;
+            } else {
+                self.add_gap(
+                    builder,
+                    terminal,
+                    SemanticGapSubject::Value(result),
+                    SemanticCapability::Values,
+                    SemanticGapKind::Unknown,
+                    "C# assignment result identity is unavailable until implicit conversion resolution is available",
+                )?;
+            }
+            // A member or element target writes a location, so it becomes a
+            // `MemoryStore` against a structured location (#2661). Whatever
+            // this cannot structure -- a tuple, a deconstruction, a `ref`
+            // target -- keeps the blanket decline it always had.
+            if let Some(store) = self.memory_access_target(builder, terminal, left)? {
+                self.emit_memory_store(builder, terminal, store, value)?;
+            } else {
+                self.add_gap(
+                    builder,
+                    terminal,
+                    SemanticGapSubject::Point,
+                    SemanticCapability::Assignments,
+                    SemanticGapKind::Unsupported,
+                    "tuple, deconstruction, and ref assignment targets are not yet lowered into memory flow",
+                )?;
+            }
             self.add_gap(
                 builder,
                 terminal,
@@ -2295,6 +2983,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 // without making the already-evaluated receiver incomplete.
                 let terminal = self.point(builder, node, Vec::new())?;
                 self.implicit_exception_gap(builder, terminal, node)?;
+                // A read of a member or an element loads from a location
+                // (#2661). A write target and a method group are not reads at
+                // all: the target's own store already represents the write,
+                // and `obj.Method()` names a method group whose call site the
+                // invocation already publishes.
+                if !access_is_write_target(node) && !access_is_call_target(node) {
+                    self.emit_memory_load(builder, terminal, node)?;
+                }
                 self.edge(builder, terminal, next)?;
                 let children = runtime_expression_children(node);
                 self.schedule_expressions(
@@ -2329,6 +3025,40 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 )?;
                 let children = runtime_expression_children(node);
                 self.schedule_expressions(builder, entry, &children, next, scope, stack)
+            }
+            // An operator over predefined operands runs the language's own
+            // operator, so its result derives from its operands and the flow
+            // is publishable (#2661). An operator that could resolve to a
+            // user-defined `operator` declaration keeps its decline, because
+            // such a declaration returns whatever it likes.
+            "binary_expression" | "prefix_unary_expression" | "postfix_unary_expression"
+                if self.operation_is_builtin(node) =>
+            {
+                let children = runtime_expression_children(node);
+                let terminal = self.point(builder, node, Vec::new())?;
+                let result = self.expression_value(builder, node, expression_value_kind(node))?;
+                let operands = children
+                    .iter()
+                    .map(|child| {
+                        self.expression_value(builder, *child, expression_value_kind(*child))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.session
+                    .append_language_defined_value_flows(builder, terminal, operands, result)?;
+                if operation_can_throw_implicitly(node) {
+                    // Integral division by zero and checked-context overflow
+                    // still throw. Neither embeds an operand value.
+                    self.implicit_exception_gap(builder, terminal, node)?;
+                }
+                self.edge(builder, terminal, next)?;
+                self.schedule_expressions(
+                    builder,
+                    entry,
+                    &children,
+                    EdgeTarget::normal(terminal),
+                    scope,
+                    stack,
+                )
             }
             "assignment_expression"
             | "binary_expression"
@@ -4023,23 +4753,45 @@ fn variable_declarator_initializer(declarator: Node<'_>) -> Option<Node<'_>> {
         })
 }
 
-fn static_invocation_key(invocation: Node<'_>, source: &str) -> Option<StaticCallableKey> {
+/// The `(namespace, owner, method)` key an invocation names, when the owner is
+/// spelled by a type name or implied by the enclosing type.
+///
+/// An unqualified call (`Relay(value)`) names a member of the type that
+/// lexically encloses it, which is the same owner
+/// [`record_static_callable_return_type`] indexes; before #2661 only the
+/// explicitly qualified `Owner.Relay(value)` spelling produced a key, so a
+/// sibling static call resolved to nothing at all.
+fn static_invocation_key(invocation: Node<'_>, source: &str) -> Option<TypeMemberKey> {
     let function = invocation.child_by_field_name("function")?;
-    if function.kind() != "member_access_expression" {
-        return None;
-    }
-    let receiver = csharp_call_receiver(function)?;
-    if receiver.kind() != "identifier" {
-        return None;
-    }
-    let name = function.child_by_field_name("name")?;
-    let member = super::csharp_member_name(name)?;
+    let (owner, name_node) = match function.kind() {
+        "member_access_expression" => {
+            let receiver = csharp_call_receiver(function)?;
+            if receiver.kind() != "identifier" {
+                return None;
+            }
+            (
+                Box::<str>::from(nonempty_node_text(source, receiver)?),
+                function.child_by_field_name("name")?,
+            )
+        }
+        "identifier" | "generic_name" => {
+            let owner_node = enclosing_type_node(invocation)?;
+            // The index itself only records members of top-level types, so a
+            // nested owner can never match one of its keys.
+            if enclosing_type_node(owner_node).is_some() {
+                return None;
+            }
+            (declaration_container_name(source, owner_node)?, function)
+        }
+        _ => return None,
+    };
+    let member = super::csharp_member_name(name_node)?;
     if member.explicit_generic_arity.is_some() {
         return None;
     }
-    Some(StaticCallableKey {
+    Some(TypeMemberKey {
         namespace: enclosing_namespace_path(source, invocation),
-        owner: Box::from(nonempty_node_text(source, receiver)?),
+        owner,
         name: Box::from(nonempty_node_text(source, member.identifier)?),
     })
 }
@@ -4162,11 +4914,58 @@ fn enclosing_type_node(node: Node<'_>) -> Option<Node<'_>> {
     None
 }
 
-fn intrinsic_type_identity(node: Node<'_>, source: &str) -> Option<Box<str>> {
-    (node.kind() == "predefined_type")
-        .then(|| super::csharp_type_node_identity(node, source))
-        .filter(|identity| !identity.is_empty())
-        .map(Box::<str>::from)
+/// The declared spelling of a type node, array ranks included.
+///
+/// `csharp_type_node_identity` unwraps an `array_type` to its element type, so
+/// `int[]` and `int` share a spelling there. That collapse is wrong for the
+/// value-identity question this module asks -- assigning an `int` to an
+/// `int[]` is not an identity-preserving initialization -- so the ranks are
+/// restored here. `var` names no declared type at all and yields `None`.
+fn declared_type_spelling(node: Node<'_>, source: &str) -> Option<Box<str>> {
+    if node.kind() == "implicit_type" {
+        return None;
+    }
+    let identity = super::csharp_type_node_identity(node, source);
+    if identity.is_empty() {
+        return None;
+    }
+    let mut ranks = String::new();
+    let mut current = node;
+    while current.kind() == "array_type" {
+        ranks.push_str("[]");
+        let Some(inner) = current.child_by_field_name("type") else {
+            break;
+        };
+        current = inner;
+    }
+    Some(format!("{identity}{ranks}").into_boxed_str())
+}
+
+/// Whether an expression constructs its own value rather than naming one that
+/// already exists.
+///
+/// Such an expression has no prior object identity for a user-defined
+/// conversion to replace, so carrying it into a declared local is always an
+/// identity-preserving initialization. `null` and `default` are deliberately
+/// absent: both already publish their own value-identity gap, and neither can
+/// carry a value worth connecting.
+fn expression_constructs_its_value(kind: &str) -> bool {
+    matches!(
+        kind,
+        "integer_literal"
+            | "real_literal"
+            | "string_literal"
+            | "raw_string_literal"
+            | "verbatim_string_literal"
+            | "character_literal"
+            | "boolean_literal"
+            | "interpolated_string_expression"
+            | "implicit_array_creation_expression"
+            | "implicit_stackalloc_expression"
+            | "anonymous_object_creation_expression"
+            | "lambda_expression"
+            | "anonymous_method_expression"
+    )
 }
 
 fn is_intrinsic_object_construction(node: Node<'_>, source: &str) -> bool {
@@ -4310,6 +5109,33 @@ fn call_function_requires_evaluation(function: Node<'_>) -> bool {
     )
 }
 
+/// Whether an access expression is the target being written rather than a
+/// value being read.
+///
+/// An assignment target is still scheduled as a child expression, so without
+/// this a write would publish both its store and a spurious load of the very
+/// location it overwrites. A compound assignment genuinely reads as well as
+/// writes, but it represents neither yet, so it is excluded here too rather
+/// than publishing half of the pair.
+fn access_is_write_target(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        is_update_expression(parent)
+            || (parent.kind() == "assignment_expression"
+                && parent.child_by_field_name("left") == Some(node))
+    })
+}
+
+/// Whether an access expression names the callee of an invocation.
+///
+/// `obj.Method()` reads no member: `Method` is a method group, and the call
+/// site the invocation publishes already represents it.
+fn access_is_call_target(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        parent.kind() == "invocation_expression"
+            && parent.child_by_field_name("function") == Some(node)
+    })
+}
+
 fn is_simple_assignment(node: Node<'_>) -> bool {
     node.child_by_field_name("operator")
         .is_some_and(|operator| operator.kind() == "=")
@@ -4322,6 +5148,55 @@ fn is_update_expression(node: Node<'_>) -> bool {
     ) && node
         .child_by_field_name("operator")
         .is_some_and(|operator| matches!(operator.kind(), "++" | "--"))
+}
+
+/// Whether a type spelling names one of C#'s predefined types.
+///
+/// These are the types no user code can extend: a program cannot declare
+/// `operator +` on `int`, nor an `implicit operator int`'s counterpart that
+/// would change what an `int`-typed expression denotes. That closure is what
+/// makes an operation over them provably built-in (#2661).
+///
+/// `string` and `object` are included deliberately. Both are sealed against
+/// user-defined *operators* on the type itself, and `+` over `string` is the
+/// language's own concatenation.
+fn csharp_predefined_type(spelling: &str) -> bool {
+    matches!(
+        spelling,
+        "bool"
+            | "byte"
+            | "char"
+            | "decimal"
+            | "double"
+            | "float"
+            | "int"
+            | "long"
+            | "nint"
+            | "nuint"
+            | "object"
+            | "sbyte"
+            | "short"
+            | "string"
+            | "uint"
+            | "ulong"
+            | "ushort"
+            | "void"
+    )
+}
+
+/// Whether an expression's value is a literal of a predefined type.
+fn literal_is_predefined(kind: &str) -> bool {
+    matches!(
+        kind,
+        "integer_literal"
+            | "real_literal"
+            | "string_literal"
+            | "raw_string_literal"
+            | "verbatim_string_literal"
+            | "character_literal"
+            | "boolean_literal"
+            | "interpolated_string_expression"
+    )
 }
 
 fn may_invoke_user_code(node: Node<'_>) -> bool {

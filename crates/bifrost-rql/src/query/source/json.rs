@@ -1291,6 +1291,10 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
         let call_step = matches!(op_label, Some("callers" | "callees"));
         let call_site_step = matches!(op_label, Some("call_sites_to" | "call_sites_from"));
         let call_input_step = op_label == Some("call_input");
+        let jsx_attribute_value_step = matches!(
+            op_label,
+            Some("jsx_attribute_value" | "jsx-attribute-value")
+        );
         let receiver_step = matches!(
             op_label,
             Some("receiver_targets" | "points_to" | "member_targets")
@@ -1301,6 +1305,7 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
         let witness_step = op_label == Some("witness");
         let occurrence_step = matches!(op_label, Some("occurrences_of" | "occurrences_in"));
         let binding_step = op_label == Some("bindings_in");
+        let decorator_binding_step = op_label == Some("decorator_bindings");
         let candidate_step = op_label == Some("candidates_of");
         let binding_of_step = op_label == Some("binding_of");
         let state_event_step = op_label == Some("state_events_of");
@@ -1316,6 +1321,9 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
         let mut seen_receiver = false;
         let mut seen_parameter_index = false;
         let mut seen_parameter_name = false;
+        let mut seen_jsx_identity = false;
+        let mut seen_jsx_element_name = false;
+        let mut seen_jsx_property_name = false;
         let mut seen_capture = false;
         let mut seen_protocol_ref = false;
         let mut seen_plan_ref = false;
@@ -1324,6 +1332,7 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
         let mut seen_max_bytes = false;
         let mut seen_occurrence_axes = HashSet::new();
         let mut seen_environment_axes = HashSet::new();
+        let mut seen_decorator_binding_fields = HashSet::new();
         let mut seen_flow_state_axes = HashSet::new();
         let mut transitive_range = None;
         for (key, child) in object {
@@ -1467,6 +1476,62 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
                 }
                 continue;
             }
+            if jsx_attribute_value_step {
+                let jsx_field = match field {
+                    Some(
+                        inner @ (QueryStepField::Identity
+                        | QueryStepField::ElementName
+                        | QueryStepField::PropertyName),
+                    ) => Some(inner),
+                    _ => None,
+                };
+                if let Some(jsx_field) = jsx_field {
+                    analysis.add_help(key.range(), jsx_field.signature(), jsx_field.description());
+                    let seen = match jsx_field {
+                        QueryStepField::Identity => &mut seen_jsx_identity,
+                        QueryStepField::ElementName => &mut seen_jsx_element_name,
+                        QueryStepField::PropertyName => &mut seen_jsx_property_name,
+                        _ => unreachable!("jsx field matched above"),
+                    };
+                    if *seen {
+                        analysis.error(
+                            key.range(),
+                            "duplicate-property",
+                            format!("duplicate property '{}'", jsx_field.label()),
+                        );
+                    }
+                    *seen = true;
+                    match jsx_field {
+                        QueryStepField::Identity => {
+                            let Some(label) = child.as_string() else {
+                                require_json_string(child, analysis);
+                                continue;
+                            };
+                            if jsx_element_identity_from_label(label).is_none() {
+                                add_spelling_error(
+                                    analysis,
+                                    child.range(),
+                                    "unknown-value",
+                                    format!("unknown identity value {label:?}"),
+                                    label,
+                                    jsx_element_identity_labels()
+                                        .into_iter()
+                                        .map(|value| (value.to_string(), value.to_string())),
+                                    |suggestion| {
+                                        serde_json::to_string(suggestion)
+                                            .expect("suggestions are JSON strings")
+                                    },
+                                );
+                            }
+                        }
+                        QueryStepField::ElementName | QueryStepField::PropertyName => {
+                            require_json_string(child, analysis);
+                        }
+                        _ => unreachable!("jsx field matched above"),
+                    }
+                    continue;
+                }
+            }
             if field == Some(QueryStepField::Capture) && receiver_step {
                 analysis.add_help(
                     key.range(),
@@ -1585,6 +1650,40 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
                         }
                     }
                     None => require_json_string(child, analysis),
+                }
+                continue;
+            }
+            if let Some(
+                decorator_field @ (QueryStepField::DecoratorModule
+                | QueryStepField::DecoratorImportedName),
+            ) = field
+                && decorator_binding_step
+            {
+                analysis.add_help(
+                    key.range(),
+                    decorator_field.signature(),
+                    decorator_field.description(),
+                );
+                if !seen_decorator_binding_fields.insert(decorator_field) {
+                    analysis.error(
+                        key.range(),
+                        "duplicate-property",
+                        format!("duplicate property '{}'", decorator_field.label()),
+                    );
+                }
+                let Some(value) = child.as_string() else {
+                    require_json_string(child, analysis);
+                    continue;
+                };
+                if value.is_empty() || value.len() > MAX_DECORATOR_BINDING_FILTER_LENGTH {
+                    analysis.error(
+                        child.range(),
+                        "wrong-value-shape",
+                        format!(
+                            "{} must be between 1 and {MAX_DECORATOR_BINDING_FILTER_LENGTH} bytes",
+                            decorator_field.label()
+                        ),
+                    );
                 }
                 continue;
             }
@@ -1737,6 +1836,13 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
                                         | QueryStepField::ParameterIndex
                                         | QueryStepField::ParameterName
                                 ))
+                            || (jsx_attribute_value_step
+                                && matches!(
+                                    candidate,
+                                    QueryStepField::Identity
+                                        | QueryStepField::ElementName
+                                        | QueryStepField::PropertyName
+                                ))
                             || (receiver_step && **candidate == QueryStepField::Capture)
                             || (typestate_step && **candidate == QueryStepField::ProtocolRef)
                             || (value_flow_step && **candidate == QueryStepField::PlanRef)
@@ -1759,6 +1865,12 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
                                     QueryStepField::BindingKinds
                                         | QueryStepField::BindingNames
                                         | QueryStepField::BindingHoisting
+                                ))
+                            || (decorator_binding_step
+                                && matches!(
+                                    candidate,
+                                    QueryStepField::DecoratorModule
+                                        | QueryStepField::DecoratorImportedName
                                 ))
                             || (candidate_step
                                 && matches!(

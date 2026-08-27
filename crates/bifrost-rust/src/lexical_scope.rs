@@ -82,6 +82,63 @@ static RUST_TREES: OnceLock<Cache<Arc<str>, Option<Tree>>> = OnceLock::new();
 static RUST_TREE_PARSES: AtomicUsize = AtomicUsize::new(0);
 static RUST_TREE_PARSE_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 static RUST_TREE_PARSED_BYTES: AtomicUsize = AtomicUsize::new(0);
+static RUST_SCOPE_INDEXES: OnceLock<Cache<Arc<str>, Arc<RustLexicalScopeIndex>>> = OnceLock::new();
+static RUST_SCOPE_INDEX_BUILDS: AtomicUsize = AtomicUsize::new(0);
+
+fn rust_scope_index_cache() -> &'static Cache<Arc<str>, Arc<RustLexicalScopeIndex>> {
+    RUST_SCOPE_INDEXES.get_or_init(|| {
+        Cache::builder()
+            .max_capacity(RUST_TREE_CACHE_SOURCE_BUDGET_BYTES)
+            .weigher(|key: &Arc<str>, _value: &Arc<RustLexicalScopeIndex>| {
+                key.len().min(u32::MAX as usize) as u32
+            })
+            .build()
+    })
+}
+
+/// The [`RustLexicalScopeIndex`] for `source`, memoized on the exact source
+/// bytes like [`parse_rust_tree`].
+///
+/// Building the index walks the whole file tree. The definition resolvers ask
+/// a shadowing question once per reference site, and each ask rebuilt the
+/// index from scratch, so resolving every occurrence of a file — the unified
+/// reference engine's `usage_graph` shape — walked the file once per
+/// occurrence. On `analyze_diff` endpoint graphs over Rust workspaces that
+/// quadratic blowup did not finish inside a five-minute budget (public
+/// issue #11). The index is a pure function of the source bytes, so the memo
+/// is observationally identical, and the weighted cache ages stale entries
+/// out exactly like the parse memo above.
+///
+/// `root` must be the root node of a parse of exactly `source` — the same
+/// contract every existing caller already satisfied, asserted here because a
+/// mismatched pair would poison the memo for that source text.
+pub fn rust_lexical_scope_index(root: Node<'_>, source: &str) -> Arc<RustLexicalScopeIndex> {
+    // The root node of a parse spans first token to last token, so only
+    // parentlessness and the source bound are checkable here.
+    debug_assert!(
+        root.parent().is_none() && root.end_byte() <= source.len(),
+        "rust_lexical_scope_index needs the whole-source parse root: root spans {}..{} over {} source bytes",
+        root.start_byte(),
+        root.end_byte(),
+        source.len(),
+    );
+    let cache = rust_scope_index_cache();
+    if let Some(cached) = cache.get(source) {
+        return cached;
+    }
+    RUST_SCOPE_INDEX_BUILDS.fetch_add(1, Ordering::Relaxed);
+    let index = Arc::new(RustLexicalScopeIndex::new(root, source));
+    cache.insert(Arc::from(source), Arc::clone(&index));
+    index
+}
+
+/// Number of lexical scope indexes actually built since the last reset — the
+/// complexity signal for the once-per-occurrence rebuild regression (public
+/// issue #11), analogous to the parse counters above.
+#[cfg(any(test, feature = "test-support"))]
+pub fn rust_scope_index_build_count_for_test() -> usize {
+    RUST_SCOPE_INDEX_BUILDS.load(Ordering::Relaxed)
+}
 
 fn rust_tree_cache() -> &'static Cache<Arc<str>, Option<Tree>> {
     RUST_TREES.get_or_init(|| {
@@ -175,6 +232,10 @@ pub fn reset_rust_tree_parse_counters_for_test() {
     RUST_TREE_PARSES.store(0, Ordering::Relaxed);
     RUST_TREE_PARSE_REQUESTS.store(0, Ordering::Relaxed);
     RUST_TREE_PARSED_BYTES.store(0, Ordering::Relaxed);
+    RUST_SCOPE_INDEX_BUILDS.store(0, Ordering::Relaxed);
+    // Concurrent tests share the process-wide memo, so a build-count pin must
+    // start from a cold cache for its own distinct sources.
+    rust_scope_index_cache().invalidate_all();
 }
 
 pub fn insert_rust_import_binding(binder: &mut ImportBinder, import: &ImportInfo) {
@@ -276,6 +337,85 @@ pub fn insert_rust_import_binding(binder: &mut ImportBinder, import: &ImportInfo
     );
 }
 
+/// One `use` declaration with the ranges that gate its visibility and its
+/// parsed imports, in source-traversal order.
+struct RustUseStatement {
+    imports: Vec<ImportInfo>,
+    mod_range: Option<(usize, usize)>,
+    scope_range: Option<(usize, usize)>,
+}
+
+static RUST_USE_STATEMENTS: OnceLock<Cache<Arc<str>, Arc<Vec<RustUseStatement>>>> = OnceLock::new();
+
+fn rust_use_statement_cache() -> &'static Cache<Arc<str>, Arc<Vec<RustUseStatement>>> {
+    RUST_USE_STATEMENTS.get_or_init(|| {
+        Cache::builder()
+            .max_capacity(RUST_TREE_CACHE_SOURCE_BUDGET_BYTES)
+            .weigher(|key: &Arc<str>, _value: &Arc<Vec<RustUseStatement>>| {
+                key.len().min(u32::MAX as usize) as u32
+            })
+            .build()
+    })
+}
+
+/// Every `use` declaration in `source` with its visibility-gating ranges,
+/// memoized on the exact source bytes like [`parse_rust_tree`] and
+/// [`rust_lexical_scope_index`].
+///
+/// A binder's visibility filter is a pure function of the reference's
+/// enclosing `mod` range and scope containment, so per-reference binder
+/// questions filter this index instead of re-walking the file and re-parsing
+/// each visible `use` per ask — the second whole-file-per-occurrence cost in
+/// the public issue #11 `analyze_diff` profile. `root` must be the root node
+/// of a parse of exactly `source`, as for [`rust_lexical_scope_index`].
+fn rust_use_statements(root: Node<'_>, source: &str) -> Arc<Vec<RustUseStatement>> {
+    debug_assert!(
+        root.parent().is_none() && root.end_byte() <= source.len(),
+        "rust_use_statements needs the whole-source parse root",
+    );
+    let cache = rust_use_statement_cache();
+    if let Some(cached) = cache.get(source) {
+        return cached;
+    }
+    let mut statements = Vec::new();
+    // The same source-order traversal as `collect_visible_use_statements`,
+    // minus its byte-position pruning: a pruned-away subtree can only hold
+    // statements the visibility filter rejects, so filtering this complete
+    // index reproduces the pruned walk's output exactly.
+    let mut stack = vec![(root, None, None)];
+    while let Some((node, mod_range, scope_range)) = stack.pop() {
+        if node.kind() == "use_declaration" {
+            statements.push(RustUseStatement {
+                imports: rust_imports_from_use_declaration(node, source),
+                mod_range,
+                scope_range,
+            });
+            continue;
+        }
+        let child_mod_range = if node.kind() == "mod_item" {
+            Some((node.start_byte(), node.end_byte()))
+        } else {
+            mod_range
+        };
+        let child_scope_range = if lexical_scope_kind(node.kind()) {
+            Some((node.start_byte(), node.end_byte()))
+        } else {
+            scope_range
+        };
+        let mut cursor = node.walk();
+        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(
+            children
+                .into_iter()
+                .rev()
+                .map(|child| (child, child_mod_range, child_scope_range)),
+        );
+    }
+    let statements = Arc::new(statements);
+    cache.insert(Arc::from(source), Arc::clone(&statements));
+    statements
+}
+
 pub fn visible_import_binder_at(source: &str, reference_byte: usize) -> ImportBinder {
     let Some(tree) = parse_rust_tree(source) else {
         return ImportBinder::empty();
@@ -309,16 +449,23 @@ pub fn visible_import_binders_with_scopes_in_tree(
     source: &str,
     reference_byte: usize,
 ) -> Vec<(usize, ImportBinder)> {
-    let mut imports = Vec::new();
-    collect_visible_use_statements(root, reference_byte, &mut imports);
+    let reference_mod_range = enclosing_mod_item_range_at(root, reference_byte);
     let mut by_scope: HashMap<(usize, usize), ImportBinder> = HashMap::default();
-    for visible_use in imports {
-        let scope = visible_use
+    for statement in rust_use_statements(root, source).iter() {
+        if !use_statement_visible_at(
+            reference_byte,
+            reference_mod_range,
+            statement.mod_range,
+            statement.scope_range,
+        ) {
+            continue;
+        }
+        let scope = statement
             .scope_range
             .unwrap_or((root.start_byte(), root.end_byte()));
         let binder = by_scope.entry(scope).or_default();
-        for import in rust_imports_from_use_declaration(visible_use.node, source) {
-            insert_rust_import_binding(binder, &import);
+        for import in &statement.imports {
+            insert_rust_import_binding(binder, import);
         }
     }
     let mut binders: Vec<_> = by_scope.into_iter().collect();
@@ -381,78 +528,22 @@ pub fn visible_import_binder_in_tree(
     source: &str,
     reference_byte: usize,
 ) -> ImportBinder {
-    let mut binder = ImportBinder::empty();
-    let mut imports = Vec::new();
-    collect_visible_use_statements(root, reference_byte, &mut imports);
-    for import in imports
-        .into_iter()
-        .flat_map(|visible_use| rust_imports_from_use_declaration(visible_use.node, source))
-    {
-        insert_rust_import_binding(&mut binder, &import);
-    }
-    binder
-}
-
-fn collect_visible_use_statements<'tree>(
-    root: Node<'tree>,
-    reference_byte: usize,
-    out: &mut Vec<VisibleUse<'tree>>,
-) -> usize {
-    // The reference's own enclosing `mod` item is invariant across every
-    // candidate use declaration, and locating it walks down from the root.
-    // Recomputing it per candidate made a file's import binder quadratic in
-    // its use count, which is what the #1451 scan profile sat in once the
-    // store reads were gone.
     let reference_mod_range = enclosing_mod_item_range_at(root, reference_byte);
-    // Module and block items are visible throughout their enclosing lexical
-    // scope, so inspect every direct item along the reference's scope chain.
-    // Imports inside sibling functions, blocks, impls, traits, and modules
-    // cannot be visible and their subtrees may be skipped entirely.
-    let mut visited = 0;
-    let mut stack = vec![(root, None, None)];
-    while let Some((node, mod_range, scope_range)) = stack.pop() {
-        visited += 1;
-        if node.kind() == "use_declaration" {
-            if use_statement_visible_at(reference_byte, reference_mod_range, mod_range, scope_range)
-            {
-                out.push(VisibleUse { node, scope_range });
-            }
+    let mut binder = ImportBinder::empty();
+    for statement in rust_use_statements(root, source).iter() {
+        if !use_statement_visible_at(
+            reference_byte,
+            reference_mod_range,
+            statement.mod_range,
+            statement.scope_range,
+        ) {
             continue;
         }
-
-        let child_mod_range = if node.kind() == "mod_item" {
-            Some((node.start_byte(), node.end_byte()))
-        } else {
-            mod_range
-        };
-        let child_scope_range = if lexical_scope_kind(node.kind()) {
-            Some((node.start_byte(), node.end_byte()))
-        } else {
-            scope_range
-        };
-        let mut cursor = node.walk();
-        let children = node
-            .named_children(&mut cursor)
-            .filter(|child| {
-                !lexical_scope_kind(child.kind()) || contains_byte(*child, reference_byte)
-            })
-            .collect::<Vec<_>>();
-        // Preserve the source-order traversal used by the former recursive
-        // implementation so duplicate invalid imports retain deterministic
-        // last-write behavior in the best-effort binder.
-        stack.extend(
-            children
-                .into_iter()
-                .rev()
-                .map(|child| (child, child_mod_range, child_scope_range)),
-        );
+        for import in &statement.imports {
+            insert_rust_import_binding(&mut binder, import);
+        }
     }
-    visited
-}
-
-struct VisibleUse<'tree> {
-    node: Node<'tree>,
-    scope_range: Option<(usize, usize)>,
+    binder
 }
 
 fn use_statement_visible_at(
@@ -512,7 +603,7 @@ pub fn name_shadowed_in_tree(
     name: &str,
     reference_byte: usize,
 ) -> bool {
-    RustLexicalScopeIndex::new(root, source).name_bound_at(name, reference_byte)
+    rust_lexical_scope_index(root, source).name_bound_at(name, reference_byte)
 }
 
 #[derive(Clone, Copy)]
@@ -1140,32 +1231,27 @@ mod selected {
         let reference_byte = source.find("marker").expect("reference marker");
         let tree = parse_rust_tree_uncached(&source).expect("parse Rust fixture");
         let root = tree.root_node();
-        let mut imports = Vec::new();
-        let visited = collect_visible_use_statements(root, reference_byte, &mut imports);
-        let snippets = imports
-            .iter()
-            .map(|visible_use| &source[visible_use.node.byte_range()])
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            snippets,
-            [
-                "use crate::ModuleWide;",
-                "use crate::Local;",
-                "use crate::TrailingModuleWide;"
-            ]
+        let binder = visible_import_binder_in_tree(root, &source, reference_byte);
+        let visible: Vec<&str> = ["ModuleWide", "Local", "TrailingModuleWide"]
+            .into_iter()
+            .filter(|name| binder.bindings.contains_key(*name))
+            .collect();
+        assert_eq!(visible, ["ModuleWide", "Local", "TrailingModuleWide"]);
+        assert!(
+            !binder.bindings.contains_key("SiblingOnly")
+                && !binder.bindings.contains_key("Hidden0"),
+            "imports in sibling scopes must not be visible: {:?}",
+            binder.bindings.keys().collect::<Vec<_>>()
         );
 
-        let mut all_nodes = vec![root];
-        let mut total_named_nodes = 0;
-        while let Some(node) = all_nodes.pop() {
-            total_named_nodes += 1;
-            let mut cursor = node.walk();
-            all_nodes.extend(node.named_children(&mut cursor));
-        }
+        // The statement index behind the binder is memoized on the source
+        // bytes: a second question about the same source must reuse it rather
+        // than re-walking the file (public issue #11).
+        let first = rust_use_statements(root, &source);
+        let second = rust_use_statements(root, &source);
         assert!(
-            visited * 4 < total_named_nodes,
-            "reference-scoped traversal visited {visited} of {total_named_nodes} named nodes"
+            Arc::ptr_eq(&first, &second),
+            "expected the use-statement index to be shared across asks"
         );
     }
 

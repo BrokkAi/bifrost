@@ -1812,17 +1812,22 @@ func rangeSelfBinder(x []int) int {
         );
     }
 
-    /// Go declares no field-memory capability, so the property axis is
-    /// reported unsupported rather than silently empty.
+    const CPP_LOCAL_BINDER: &str = r#"
+int local_binder(int x) {
+    int total = 0;
+    return total + x;
+}
+"#;
+
+    /// A language whose adapter declares no field-memory capability reports
+    /// the property axis unsupported rather than silently empty. (Go carried
+    /// this pin until #2662 gave it field memory, and Rust until #2667.)
     #[test]
     fn a_language_without_field_memory_reports_the_property_axis_unsupported() {
-        let fixture = Fixture::new(
-            Language::Go,
-            &[("go.mod", GO_MOD), ("app.go", GO_RANGE_SELF_BINDER)],
-        );
-        let state = fixture.state(1);
+        let fixture = Fixture::new(Language::Cpp, &[("src/main.cpp", CPP_LOCAL_BINDER)]);
+        let state = fixture.state(0);
         let derivation = procedure_containing(&state, |event| {
-            spelling(GO_RANGE_SELF_BINDER, event) == "total := 0"
+            spelling(CPP_LOCAL_BINDER, event).contains("total")
         });
         assert!(
             derivation.completeness.reasons().contains(

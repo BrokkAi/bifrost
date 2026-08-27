@@ -347,7 +347,10 @@ impl StructuralSpec for CppStructuralSpec {
     }
 
     fn supports_role(&self, role: Role) -> bool {
-        !matches!(role, Role::Kwarg | Role::Decorator)
+        !matches!(
+            role,
+            Role::Kwarg | Role::Decorator | Role::Iterable | Role::Element
+        )
     }
 
     fn call_site_context(&self, root: Node<'_>, source: &str) -> CallSiteContext {

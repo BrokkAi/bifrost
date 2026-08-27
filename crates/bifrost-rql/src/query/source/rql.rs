@@ -588,6 +588,7 @@ fn validate_wrapper(
             validate_call_wrapper(form, args, query, analysis)
         }
         RqlForm::CallInput => validate_call_input_wrapper(args, query, analysis),
+        RqlForm::JsxAttributeValue => validate_jsx_attribute_value_wrapper(args, query, analysis),
         RqlForm::ReceiverTargets | RqlForm::PointsTo | RqlForm::MemberTargets => {
             validate_receiver_wrapper(form, args, query, analysis)
         }
@@ -621,6 +622,16 @@ fn validate_wrapper(
             EnvironmentOptionKind::BindingOf,
             analysis,
         ),
+        RqlForm::DecoratorBindings => {
+            if args.is_empty() {
+                analysis.error(
+                    head_range.clone(),
+                    "wrong-value-shape",
+                    "decorator-bindings expects option/value pairs followed by a query",
+                );
+            }
+            validate_decorator_binding_options(&args[..args.len().saturating_sub(1)], analysis);
+        }
         RqlForm::DeclarationStateOf => validate_environment_options(
             form,
             &args[..args.len().saturating_sub(1)],
@@ -793,6 +804,97 @@ fn validate_segments_of_options(args: &[Expr], analysis: &mut Analysis) {
                 ":resolved must be true when present",
             );
         }
+    }
+}
+
+fn validate_jsx_attribute_value_wrapper(args: &[Expr], query: &Expr, analysis: &mut Analysis) {
+    let options = &args[..args.len().saturating_sub(1)];
+    if !options.len().is_multiple_of(2) {
+        analysis.error(
+            options
+                .last()
+                .map_or_else(|| query.range.clone(), |arg| arg.range.clone()),
+            "wrong-value-shape",
+            "jsx-attribute-value expects option/value pairs followed by a query",
+        );
+        return;
+    }
+    let accepted = QueryStepOp::JsxAttributeValue
+        .options()
+        .iter()
+        .flat_map(|option| option.rql_labels().iter().copied())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut seen = HashSet::new();
+    for pair in options.chunks_exact(2) {
+        let Some(label) = pair[0].as_symbol() else {
+            analysis.error(
+                pair[0].range.clone(),
+                "unknown-property",
+                "jsx-attribute-value option names must be keywords",
+            );
+            continue;
+        };
+        let Some(option) = QueryStepOp::JsxAttributeValue.option_for_rql_label(label) else {
+            analysis.error(
+                pair[0].range.clone(),
+                "unknown-property",
+                format!("unknown jsx-attribute-value option '{label}'; expected {accepted}"),
+            );
+            continue;
+        };
+        if !seen.insert(option.field()) {
+            analysis.error(
+                pair[0].range.clone(),
+                "duplicate-property",
+                format!("duplicate property '{}'", option.field().label()),
+            );
+        }
+        analysis.add_help(
+            pair[0].range.clone(),
+            option.field().signature(),
+            option.field().description(),
+        );
+        match option.field() {
+            QueryStepField::Identity => {
+                let Some(label) = pair[1].as_symbol().or_else(|| pair[1].as_string()) else {
+                    analysis.error(
+                        pair[1].range.clone(),
+                        "wrong-value-shape",
+                        "identity must be intrinsic, component, or unknown",
+                    );
+                    continue;
+                };
+                if jsx_element_identity_from_label(label).is_none() {
+                    analysis.error(
+                        pair[1].range.clone(),
+                        "unknown-value",
+                        "identity must be intrinsic, component, or unknown",
+                    );
+                }
+            }
+            QueryStepField::ElementName | QueryStepField::PropertyName => {
+                if pair[1]
+                    .as_symbol()
+                    .or_else(|| pair[1].as_string())
+                    .is_none()
+                {
+                    analysis.error(
+                        pair[1].range.clone(),
+                        "wrong-value-shape",
+                        format!("{} must be a name string or symbol", option.field().label()),
+                    );
+                }
+            }
+            _ => unreachable!("jsx-attribute-value registry contains only its three options"),
+        }
+    }
+    if args.is_empty() {
+        analysis.error(
+            query.range.clone(),
+            "wrong-value-shape",
+            "jsx-attribute-value expects a query",
+        );
     }
 }
 
@@ -1010,6 +1112,78 @@ fn validate_environment_options(
                 }
                 None => {}
             }
+        }
+    }
+}
+
+fn validate_decorator_binding_options(options: &[Expr], analysis: &mut Analysis) {
+    if !options.len().is_multiple_of(2) {
+        analysis.error(
+            options
+                .last()
+                .expect("an odd option count has a last element")
+                .range
+                .clone(),
+            "wrong-value-shape",
+            "decorator-bindings expects :module and :imported-name option/value pairs followed by a query",
+        );
+        return;
+    }
+    let mut seen = HashSet::new();
+    for pair in options.chunks_exact(2) {
+        let Some(label) = pair[0].as_symbol() else {
+            analysis.error(
+                pair[0].range.clone(),
+                "unknown-property",
+                "decorator-binding filter option names must be keywords",
+            );
+            continue;
+        };
+        let Some(option) = DECORATOR_BINDING_STEP_OPTIONS
+            .iter()
+            .copied()
+            .find(|option| option.accepts_rql_label(label))
+        else {
+            analysis.error(
+                pair[0].range.clone(),
+                "unknown-property",
+                "decorator-bindings accepts only :module and :imported-name",
+            );
+            continue;
+        };
+        let field = option.field();
+        if !seen.insert(field) {
+            analysis.error(
+                pair[0].range.clone(),
+                "duplicate-property",
+                format!("duplicate decorator-binding filter option '{label}'"),
+            );
+            continue;
+        }
+        analysis.add_help(
+            pair[0].range.clone(),
+            field.signature(),
+            field.description(),
+        );
+        let text = match &pair[1].kind {
+            ExprKind::String(text) | ExprKind::Symbol(text) => text,
+            _ => {
+                analysis.error(
+                    pair[1].range.clone(),
+                    "wrong-value-shape",
+                    format!("{label} requires an exact string value"),
+                );
+                continue;
+            }
+        };
+        if text.is_empty() || text.len() > MAX_DECORATOR_BINDING_FILTER_LENGTH {
+            analysis.error(
+                pair[1].range.clone(),
+                "wrong-value-shape",
+                format!(
+                    "{label} must be between 1 and {MAX_DECORATOR_BINDING_FILTER_LENGTH} bytes"
+                ),
+            );
         }
     }
 }
@@ -1962,7 +2136,8 @@ fn validate_property_value(
         | super::schema::ValueShape::GenerationInputList
         | super::schema::ValueShape::ExportFormList
         | super::schema::ValueShape::ExportNameList
-        | super::schema::ValueShape::DeclarationOriginList => {
+        | super::schema::ValueShape::DeclarationOriginList
+        | super::schema::ValueShape::JsxElementIdentity => {
             unreachable!("unsupported value shape for an RQL pattern property")
         }
     }

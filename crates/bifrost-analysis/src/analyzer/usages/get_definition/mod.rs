@@ -5,10 +5,10 @@ use crate::analyzer::lexical_definitions::{
 use crate::analyzer::structural::resolution::{BoundaryStatus, PrecedenceTier, RejectionReason};
 use crate::analyzer::usages::common::namespace_prefixes;
 use crate::analyzer::usages::cpp_graph::{
-    CallArityEvidence, CppBareCallTargetResolution, CppBlockUsingCallTargetResolution,
-    CppDesignatedInitializerOwner, CppDispatch, CppLexicalScopeResolution,
-    CppLexicalTypeResolution, CppTargetKind, CppTemplateResolutionError, CppVisibilityIndex,
-    cpp_argument_children, cpp_constructor_type_node, cpp_designated_initializer_owner,
+    CppBareCallTargetResolution, CppBlockUsingCallTargetResolution, CppDesignatedInitializerOwner,
+    CppDispatch, CppLexicalScopeResolution, CppLexicalTypeResolution, CppTargetKind,
+    CppTemplateResolutionError, CppVisibilityIndex, cpp_argument_children,
+    cpp_constructor_type_node, cpp_designated_initializer_owner,
     cpp_enclosing_lexical_scope_components, cpp_field_declared_type_binding, cpp_first_type_child,
     cpp_function_return_type_text, cpp_initialized_effective_using_imports,
     cpp_is_declaration_name, cpp_is_declarator_node, cpp_name_for, cpp_reference_fqn_candidates,
@@ -18,12 +18,16 @@ use crate::analyzer::usages::cpp_graph::{
     extract_variable_name, is_globally_qualified_cpp_name, normalize_cpp_type_text,
 };
 use crate::analyzer::usages::csharp_graph::{
-    csharp_argument_count, csharp_extension_invocation_return_type_fq_name,
-    csharp_first_type_child, csharp_is_declaration_name, csharp_is_type_reference_node,
+    csharp_argument_count, csharp_collection_target_element_type_node,
+    csharp_extension_invocation_return_type_fq_name, csharp_first_type_child,
+    csharp_is_declaration_name, csharp_is_type_reference_node,
+    csharp_member_declared_collection_element_type_fq_name,
+    csharp_member_declared_collection_element_type_fq_name_in_session,
     csharp_member_declared_type_fq_name, csharp_method_return_type_fq_name_for_arity,
     csharp_node_text, csharp_object_created_type, csharp_object_creation_assignment_target,
-    csharp_object_initializer_for_label, csharp_object_initializer_owner_type_node,
-    csharp_reference_type_text, csharp_visible_extension_method_candidates,
+    csharp_object_creation_collection_target, csharp_object_initializer_for_label,
+    csharp_object_initializer_owner_type_node, csharp_reference_type_text,
+    csharp_type_parameter_shadows_reference, csharp_visible_extension_method_candidates,
     member_access_name as csharp_member_access_name,
     member_access_receiver as csharp_member_access_receiver, seed_csharp_bindings_before,
 };
@@ -106,6 +110,7 @@ use brokk_bifrost_ruby::graph::syntax::{
     method_receiver_mode as ruby_method_receiver_mode, node_text as ruby_node_text,
     symbol_or_string_value as ruby_symbol_or_string_value,
 };
+use moka::sync::Cache;
 pub(crate) use rust::{
     AnalyzerRustDefinitionProvider, RustMacroMatcherCandidateGate, RustTypeLookupCache,
     ingest_file_macro_matcher_roles, resolve_rust_bounded,
@@ -1191,7 +1196,7 @@ impl<'a> DefinitionBatchContext<'a> {
         if let Some(index) = self.cpp_class_ranges.get(file) {
             return Arc::clone(index);
         }
-        let index = Arc::new(ClassRangeIndex::build(self.analyzer, file));
+        let index = self.analyzer.class_range_index(file);
         self.cpp_class_ranges
             .insert(file.clone(), Arc::clone(&index));
         #[cfg(test)]
@@ -1609,6 +1614,59 @@ fn fields_contain_focus(access: Node<'_>, fields: &[&str], focus: Node<'_>) -> b
 pub(super) fn node_contains_focus(node: Node<'_>, focus: Node<'_>) -> bool {
     node.id() == focus.id()
         || (node.start_byte() <= focus.start_byte() && focus.end_byte() <= node.end_byte())
+}
+
+/// A whole-file parse memoized on the exact source bytes, the issue #1219
+/// `parse_rust_tree` pattern generalized for the other language resolvers
+/// (#2679).
+///
+/// The definition resolvers re-parse files the batch caches cannot reach:
+/// Java re-parses the file it is resolving in once per local-type candidate,
+/// Kotlin re-parses every declaring file it inspects once per occurrence, and
+/// Go re-parses package variable files per selector chain. A parse is a pure
+/// function of the source bytes, so the memo is observationally identical,
+/// and the byte-weighted cache ages stale sources out exactly like the Rust
+/// tree memo in `bifrost-rust`.
+///
+/// One memo per language: source bytes alone must never answer for a
+/// different grammar's parse.
+pub(super) struct TreeParseMemo {
+    cache: OnceLock<Cache<Arc<str>, Option<Tree>>>,
+}
+
+const TREE_PARSE_MEMO_SOURCE_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
+
+impl TreeParseMemo {
+    pub(super) const fn new() -> Self {
+        Self {
+            cache: OnceLock::new(),
+        }
+    }
+
+    fn cache(&self) -> &Cache<Arc<str>, Option<Tree>> {
+        self.cache.get_or_init(|| {
+            Cache::builder()
+                .max_capacity(TREE_PARSE_MEMO_SOURCE_BUDGET_BYTES)
+                .weigher(|key: &Arc<str>, _value: &Option<Tree>| {
+                    key.len().min(u32::MAX as usize) as u32
+                })
+                .build()
+        })
+    }
+
+    pub(super) fn parse(
+        &self,
+        source: &str,
+        parse: impl FnOnce(&str) -> Option<Tree>,
+    ) -> Option<Tree> {
+        let cache = self.cache();
+        if let Some(tree) = cache.get(source) {
+            return tree;
+        }
+        let tree = parse(source);
+        cache.insert(Arc::from(source), tree.clone());
+        tree
+    }
 }
 
 /// Parse `source` under the grammar registered for `language`.
@@ -2690,5 +2748,157 @@ mod tests {
                 && second_batch_classifications <= 10,
             "provider-backed alias classification must scale with named requests, not {UNRELATED_DECLARATIONS} unrelated visible declarations: first={first_batch_classifications}, second={second_batch_classifications}"
         );
+    }
+
+    #[test]
+    fn cpp_complete_visible_types_skip_global_fqn_reconciliation() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Cpp,
+            &[
+                (
+                    "types.hpp",
+                    "struct CompleteClass { int value; };\nusing CompleteAlias = CompleteClass;\n",
+                ),
+                (
+                    "consumer.cpp",
+                    "#include \"types.hpp\"\nCompleteClass object;\nCompleteAlias alias;\n",
+                ),
+            ],
+        );
+        let analyzer =
+            resolve_analyzer::<CppAnalyzer>(fixture.analyzer.analyzer()).expect("C++ analyzer");
+        let file = ProjectFile::new(fixture.project_root(), "consumer.cpp");
+        let source = file.read_to_string().expect("consumer source");
+        analyzer.reset_reconcile_counts_for_test();
+        let requests = ["CompleteClass", "CompleteAlias"]
+            .into_iter()
+            .map(|name| {
+                let start_byte = source.rfind(name).expect("type reference");
+                DefinitionLookupRequest {
+                    file: file.clone(),
+                    line: None,
+                    column: None,
+                    start_byte: Some(start_byte),
+                    end_byte: Some(start_byte + name.len()),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let outcomes = resolve_navigation_batch_with_source(
+            fixture.analyzer.analyzer(),
+            requests,
+            file,
+            Arc::from(source),
+            NavigationOperation::Definition,
+        );
+
+        assert!(outcomes.iter().all(|outcome| {
+            outcome.status == DefinitionLookupStatus::Resolved && !outcome.targets.is_empty()
+        }));
+        assert_eq!(
+            analyzer.reconcile_candidate_scan_count_for_test(),
+            0,
+            "complete visible classes and aliases must not enter global FQN reconciliation"
+        );
+    }
+
+    #[test]
+    fn cpp_visible_forward_declaration_still_finds_external_definition() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Cpp,
+            &[
+                ("forward.hpp", "struct Forward;\n"),
+                ("definition.cpp", "struct Forward { int value; };\n"),
+                (
+                    "consumer.cpp",
+                    "#include \"forward.hpp\"\nForward *pointer;\n",
+                ),
+            ],
+        );
+        let analyzer =
+            resolve_analyzer::<CppAnalyzer>(fixture.analyzer.analyzer()).expect("C++ analyzer");
+        let file = ProjectFile::new(fixture.project_root(), "consumer.cpp");
+        let source = file.read_to_string().expect("consumer source");
+        let start_byte = source.rfind("Forward").expect("forward reference");
+        analyzer.reset_reconcile_counts_for_test();
+
+        let outcome = resolve_navigation_batch_with_source(
+            fixture.analyzer.analyzer(),
+            vec![DefinitionLookupRequest {
+                file: file.clone(),
+                line: None,
+                column: None,
+                start_byte: Some(start_byte),
+                end_byte: Some(start_byte + "Forward".len()),
+            }],
+            file,
+            Arc::from(source),
+            NavigationOperation::Definition,
+        )
+        .remove(0);
+
+        assert_eq!(outcome.status, DefinitionLookupStatus::Resolved);
+        assert!(outcome.targets.iter().any(|target| {
+            target
+                .code_unit
+                .source()
+                .rel_path()
+                .ends_with("definition.cpp")
+        }));
+        assert!(
+            analyzer.reconcile_candidate_scan_count_for_test() > 0,
+            "a forward-only visible declaration must retain the global definition fallback"
+        );
+    }
+
+    #[test]
+    fn cpp_complete_visible_redeclarations_stay_collapsed_and_bounded() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Cpp,
+            &[
+                ("left.hpp", "struct Duplicate { int left; };\n"),
+                ("right.hpp", "struct Duplicate { int right; };\n"),
+                (
+                    "consumer.cpp",
+                    "#include \"left.hpp\"\n#include \"right.hpp\"\nDuplicate value;\n",
+                ),
+            ],
+        );
+        let analyzer =
+            resolve_analyzer::<CppAnalyzer>(fixture.analyzer.analyzer()).expect("C++ analyzer");
+        let file = ProjectFile::new(fixture.project_root(), "consumer.cpp");
+        let source = file.read_to_string().expect("consumer source");
+        let start_byte = source.rfind("Duplicate").expect("ambiguous reference");
+        analyzer.reset_reconcile_counts_for_test();
+
+        let request = DefinitionLookupRequest {
+            file: file.clone(),
+            line: None,
+            column: None,
+            start_byte: Some(start_byte),
+            end_byte: Some(start_byte + "Duplicate".len()),
+        };
+        let definition = resolve_navigation_batch_with_source(
+            fixture.analyzer.analyzer(),
+            vec![request.clone()],
+            file.clone(),
+            Arc::from(source.clone()),
+            NavigationOperation::Definition,
+        )
+        .remove(0);
+        let declaration = resolve_navigation_batch_with_source(
+            fixture.analyzer.analyzer(),
+            vec![request],
+            file,
+            Arc::from(source),
+            NavigationOperation::Declaration,
+        )
+        .remove(0);
+
+        assert_eq!(definition.status, DefinitionLookupStatus::Ambiguous);
+        assert_eq!(definition.targets.len(), 2);
+        assert_eq!(declaration.status, DefinitionLookupStatus::Ambiguous);
+        assert_eq!(declaration.targets.len(), 2);
+        assert_eq!(analyzer.reconcile_candidate_scan_count_for_test(), 0);
     }
 }

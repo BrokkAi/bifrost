@@ -638,11 +638,19 @@ fn sorted_manifests(
     Ok(manifests.into_iter().map(|(_, value)| value).collect())
 }
 
-fn resolved_selector_to_json(selector: &ResolvedPolicySelector) -> Value {
-    json!({
-        "schema_version": selector.schema_resolution.version,
-        "query": selector.query.to_canonical_query_plan_json(),
-    })
+pub(crate) fn resolved_selector_to_json(selector: &ResolvedPolicySelector) -> Value {
+    match &selector.kind {
+        ResolvedPolicySelectorKind::Query {
+            schema_resolution,
+            query,
+        } => json!({
+            "schema_version": schema_resolution.version,
+            "query": query.to_canonical_query_plan_json(),
+        }),
+        ResolvedPolicySelectorKind::Rows { plan } => {
+            super::canonical::row_selector_plan_to_json(plan)
+        }
+    }
 }
 
 fn resolved_catalog_identity_to_json(catalog: &ResolvedCatalogIdentity) -> Value {
@@ -654,14 +662,15 @@ fn resolved_catalog_identity_to_json(catalog: &ResolvedCatalogIdentity) -> Value
 }
 
 fn resolved_endpoint_dependency_to_json(dependency: &ResolvedEndpointDependency) -> Value {
-    json!({
+    let mut value = json!({
         "identity": resolved_endpoint_identity_to_json(&dependency.identity),
         "definition_schema_version": dependency.definition_schema.version(),
-        "selector_schema_version": dependency.selector_schema.version,
         "model": resolved_endpoint_model_to_json(&dependency.model),
         "semantic_hash": dependency.semantic_hash.to_string(),
         "analysis_projection_hash": dependency.analysis_projection_hash.to_string(),
-    })
+    });
+    insert_selector_schemas(&mut value, &dependency.selector_schemas);
+    value
 }
 
 fn resolved_endpoint_model_to_json(model: &ResolvedEndpointModel) -> Value {
@@ -693,13 +702,44 @@ fn resolved_manifest_to_json(manifest: &ResolvedMatchDirectoryManifest) -> Value
 }
 
 fn resolved_manifest_entry_to_json(entry: &ResolvedEndpointManifestEntry) -> Value {
-    json!({
+    let mut value = json!({
         "identity": resolved_endpoint_identity_to_json(&entry.identity),
         "definition_schema_version": entry.definition_schema.version(),
-        "selector_schema_version": entry.selector_schema.version,
         "semantic_hash": entry.semantic_hash.to_string(),
         "analysis_projection_hash": entry.analysis_projection_hash.to_string(),
-    })
+    });
+    insert_selector_schemas(&mut value, &entry.selector_schemas);
+    value
+}
+
+fn insert_selector_schemas(value: &mut Value, schemas: &ResolvedEndpointSelectorSchemas) {
+    let object = value
+        .as_object_mut()
+        .expect("resolved endpoint projection is an object");
+    match schemas {
+        ResolvedEndpointSelectorSchemas::Query(resolution) => {
+            object.insert(
+                "selector_schema_version".to_owned(),
+                json!(resolution.version),
+            );
+        }
+        ResolvedEndpointSelectorSchemas::Rows(bindings) => {
+            object.insert(
+                "selector_schemas".to_owned(),
+                Value::Array(
+                    bindings
+                        .iter()
+                        .map(|binding| {
+                            json!({
+                                "path": binding.path.as_str(),
+                                "schema_version": binding.resolution.version,
+                            })
+                        })
+                        .collect(),
+                ),
+            );
+        }
+    }
 }
 
 fn precedence_to_json(precedence: &PolicyPrecedenceManifest) -> Value {

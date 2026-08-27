@@ -57,6 +57,160 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ordinary_macro_resolution_selects_the_definition_after_undef() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let source = "#define VALUE 1\nint first[VALUE];\n#undef VALUE\n#define VALUE 2\nint second[VALUE];\n";
+        fs::write(root.join("temporal.c"), source).expect("write temporal fixture");
+        let file = ProjectFile::new(root.clone(), "temporal.c");
+        let cpp = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
+            root,
+            crate::analyzer::Language::Cpp,
+        ));
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&cpp);
+        let token = query_scope.token();
+        let graph = CppGraphSource::from_source(&cpp, token);
+        let visibility =
+            VisibilityIndex::build(&cpp, token, &graph, &HashSet::from_iter([file.clone()]));
+        let prepared = cpp
+            .prepared_syntax(token, &file)
+            .expect("prepared temporal source");
+
+        let reference = source.rfind("VALUE").expect("later reference");
+        let node = prepared
+            .tree()
+            .root_node()
+            .descendant_for_byte_range(reference, reference + "VALUE".len())
+            .expect("later macro node");
+        let OrdinaryMacroReferenceResolution::Resolved(target) =
+            visibility.resolve_ordinary_macro_reference(&graph, &file, node, prepared.source())
+        else {
+            panic!("later macro reference must resolve");
+        };
+
+        assert_eq!(target.signature(), Some("#define VALUE 2"));
+        assert_eq!(cpp.ranges(&target)[0].start_line, 4);
+    }
+
+    #[test]
+    fn ordinary_macro_resolution_evaluates_exact_integer_conditions() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let source = "#define BITS 5\n#define LIMIT ((1U << BITS) - 1)\n#define VALUE (16 + 3)\n#if VALUE > LIMIT\n#define SELECTED VALUE\n#else\n#define SELECTED LIMIT\n#endif\nint selected[SELECTED];\n#if CONFIG_VALUE > LIMIT\n#define UNKNOWN 1\n#else\n#define UNKNOWN 2\n#endif\nint unknown[UNKNOWN];\n";
+        fs::write(root.join("integer-condition.c"), source).expect("write integer fixture");
+        let file = ProjectFile::new(root.clone(), "integer-condition.c");
+        let cpp = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
+            root,
+            crate::analyzer::Language::Cpp,
+        ));
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&cpp);
+        let token = query_scope.token();
+        let graph = CppGraphSource::from_source(&cpp, token);
+        let visibility =
+            VisibilityIndex::build(&cpp, token, &graph, &HashSet::from_iter([file.clone()]));
+        let prepared = cpp
+            .prepared_syntax(token, &file)
+            .expect("prepared integer source");
+        let resolve = |name: &str, start: usize| {
+            let node = prepared
+                .tree()
+                .root_node()
+                .descendant_for_byte_range(start, start + name.len())
+                .expect("macro reference node");
+            visibility.resolve_ordinary_macro_reference(&graph, &file, node, prepared.source())
+        };
+
+        let selected_start = source.rfind("SELECTED").expect("selected reference");
+        let OrdinaryMacroReferenceResolution::Resolved(selected) =
+            resolve("SELECTED", selected_start)
+        else {
+            panic!("decidable integer branch must resolve");
+        };
+        assert_eq!(selected.signature(), Some("#define SELECTED LIMIT"));
+
+        let unknown_start = source.rfind("UNKNOWN").expect("unknown reference");
+        assert!(matches!(
+            resolve("UNKNOWN", unknown_start),
+            OrdinaryMacroReferenceResolution::Ambiguous
+        ));
+    }
+
+    #[test]
+    fn ordinary_macro_resolution_deduplicates_one_physical_c_definition() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let source = "#define NUMPRI 5\nint pending[NUMPRI];\n";
+        fs::write(root.join("duplicate-reading.c"), source).expect("write macro fixture");
+        let file = ProjectFile::new(root.clone(), "duplicate-reading.c");
+        let cpp = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
+            root,
+            crate::analyzer::Language::Cpp,
+        ));
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&cpp);
+        let token = query_scope.token();
+        let graph = CppGraphSource::from_source(&cpp, token);
+        let visibility =
+            VisibilityIndex::build(&cpp, token, &graph, &HashSet::from_iter([file.clone()]));
+        let candidates = visibility
+            .visible_identifier_candidates(&file, "NUMPRI")
+            .filter(|candidate| candidate.is_macro())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            candidates.len(),
+            1,
+            "the C and C++ readings of one physical directive must publish one candidate"
+        );
+
+        let prepared = cpp
+            .prepared_syntax(token, &file)
+            .expect("prepared macro source");
+        let reference = source.rfind("NUMPRI").expect("macro reference");
+        let node = prepared
+            .tree()
+            .root_node()
+            .descendant_for_byte_range(reference, reference + "NUMPRI".len())
+            .expect("macro reference node");
+        let OrdinaryMacroReferenceResolution::Resolved(target) =
+            visibility.resolve_ordinary_macro_reference(&graph, &file, node, prepared.source())
+        else {
+            panic!("one physical macro definition must resolve once");
+        };
+        assert_eq!(target.signature(), Some("#define NUMPRI 5"));
+    }
+
+    #[test]
+    fn unresolved_conditional_local_include_taints_an_earlier_macro() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let source = "#define NUMPRI 5\n#if UNKNOWN_BACKEND\n#include \"missing-backend.c\"\n#endif\nint pending[NUMPRI];\n";
+        fs::write(root.join("missing-include.c"), source).expect("write include fixture");
+        let file = ProjectFile::new(root.clone(), "missing-include.c");
+        let cpp = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
+            root,
+            crate::analyzer::Language::Cpp,
+        ));
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&cpp);
+        let token = query_scope.token();
+        let graph = CppGraphSource::from_source(&cpp, token);
+        let visibility =
+            VisibilityIndex::build(&cpp, token, &graph, &HashSet::from_iter([file.clone()]));
+        let prepared = cpp
+            .prepared_syntax(token, &file)
+            .expect("prepared include source");
+        let reference = source.rfind("NUMPRI").expect("macro reference");
+        let node = prepared
+            .tree()
+            .root_node()
+            .descendant_for_byte_range(reference, reference + "NUMPRI".len())
+            .expect("macro reference node");
+
+        assert!(matches!(
+            visibility.resolve_ordinary_macro_reference(&graph, &file, node, prepared.source()),
+            OrdinaryMacroReferenceResolution::Ambiguous
+        ));
+    }
+
     fn template_parameter(
         name: &str,
         variadic: bool,
@@ -608,6 +762,550 @@ ABSL_NAMESPACE_END
         assert_eq!(
             candidate_sources(&right),
             HashSet::from_iter([right_header])
+        );
+    }
+
+    #[test]
+    fn bounded_visibility_does_not_hydrate_unreachable_same_name_donors() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        fs::create_dir_all(root.join("unreachable")).expect("create donor directory");
+        fs::write(
+            root.join("consumer.cpp"),
+            "#include \"aggregator.h\"\n#include \"reachable.h\"\nCollision value;\n",
+        )
+        .expect("write consumer");
+        fs::write(root.join("reachable.h"), "struct Collision {};\n")
+            .expect("write reachable declaration");
+        let mut aggregator = String::new();
+        for index in 0..64 {
+            aggregator.push_str(&format!("#include \"noise_{index}.h\"\n"));
+            fs::write(
+                root.join(format!("noise_{index}.h")),
+                format!("struct Unrelated{index} {{}};\n"),
+            )
+            .expect("write reachable unrelated declaration");
+        }
+        fs::write(root.join("aggregator.h"), aggregator).expect("write include aggregator");
+        for index in 0..16 {
+            fs::write(
+                root.join(format!("unreachable/collision_{index}.h")),
+                "struct Collision {};\n",
+            )
+            .expect("write unreachable declaration");
+        }
+
+        let cpp = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
+            root.clone(),
+            crate::analyzer::Language::Cpp,
+        ));
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&cpp);
+        let query_token = query_scope.token();
+        let consumer = ProjectFile::new(root, "consumer.cpp");
+        cpp.reset_full_hydration_count_for_test();
+        let visibility = VisibilityIndex::build(
+            &cpp,
+            query_token,
+            &CppGraphSource::from_source(&cpp, query_token),
+            &HashSet::from_iter([consumer.clone()]),
+        );
+        let candidates = visibility
+            .visible_identifier_candidates(&consumer, "Collision")
+            .collect::<Vec<_>>();
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].source().rel_path().to_string_lossy(),
+            "reachable.h"
+        );
+        let hydration_count = cpp.full_hydration_count_for_test();
+        assert!(
+            hydration_count <= 2,
+            "building one root may prepare the root and selected reachable declaration syntax, but reachable unrelated declarations and unreachable same-name donors must not be hydrated; observed {hydration_count} full hydrations"
+        );
+    }
+
+    #[test]
+    fn bounded_visibility_batches_many_names_from_one_donor_read() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let mut declarations = String::new();
+        let mut uses = String::from("#include \"types.h\"\n");
+        for index in 0..32 {
+            declarations.push_str(&format!("struct Selected{index} {{}};\n"));
+            uses.push_str(&format!("Selected{index} value_{index};\n"));
+        }
+        fs::write(root.join("types.h"), declarations).expect("write selected declarations");
+        fs::write(root.join("consumer.cpp"), uses).expect("write consumer");
+        let cpp = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
+            root.clone(),
+            crate::analyzer::Language::Cpp,
+        ));
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&cpp);
+        let query_token = query_scope.token();
+        let consumer = ProjectFile::new(root, "consumer.cpp");
+        reset_bounded_visibility_declaration_read_count_for_test();
+        let visibility = VisibilityIndex::build(
+            &cpp,
+            query_token,
+            &CppGraphSource::from_source(&cpp, query_token),
+            &HashSet::from_iter([consumer.clone()]),
+        );
+
+        assert_eq!(
+            visibility
+                .visible_identifier_candidates(&consumer, "Selected31")
+                .count(),
+            1
+        );
+        assert_eq!(
+            bounded_visibility_declaration_read_count_for_test(),
+            2,
+            "the root is read once and all 32 names from types.h share one donor read"
+        );
+    }
+
+    #[test]
+    fn bounded_visibility_ignores_ordinary_identifiers_in_selected_function_bodies() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        fs::write(
+            root.join("public.h"),
+            "struct Public { void method() { helper(); } };\n",
+        )
+        .expect("write selected declaration");
+        fs::write(root.join("donor.h"), "void helper();\n").expect("write reachable donor");
+        fs::write(
+            root.join("consumer.cpp"),
+            "#include \"public.h\"\n#include \"donor.h\"\nPublic value;\n",
+        )
+        .expect("write consumer");
+        let cpp = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
+            root.clone(),
+            crate::analyzer::Language::Cpp,
+        ));
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&cpp);
+        let query_token = query_scope.token();
+        let consumer = ProjectFile::new(root, "consumer.cpp");
+        reset_bounded_visibility_declaration_read_count_for_test();
+        let visibility = VisibilityIndex::build(
+            &cpp,
+            query_token,
+            &CppGraphSource::from_source(&cpp, query_token),
+            &HashSet::from_iter([consumer.clone()]),
+        );
+
+        assert_eq!(
+            visibility
+                .visible_identifier_candidates(&consumer, "Public")
+                .count(),
+            1
+        );
+        assert_eq!(
+            bounded_visibility_declaration_read_count_for_test(),
+            2,
+            "an ordinary callee inside a selected function body must not trigger a donor declaration read"
+        );
+    }
+
+    #[test]
+    fn bounded_visibility_retains_included_alias_rhs_type() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        fs::write(
+            root.join("types.h"),
+            "struct Hidden {};\nusing Public = Hidden;\n",
+        )
+        .expect("write types header");
+        fs::write(
+            root.join("consumer.cpp"),
+            "#include \"types.h\"\nPublic value;\n",
+        )
+        .expect("write consumer");
+        let cpp = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
+            root.clone(),
+            crate::analyzer::Language::Cpp,
+        ));
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&cpp);
+        let query_token = query_scope.token();
+        let consumer = ProjectFile::new(root, "consumer.cpp");
+        let visibility = VisibilityIndex::build(
+            &cpp,
+            query_token,
+            &CppGraphSource::from_source(&cpp, query_token),
+            &HashSet::from_iter([consumer.clone()]),
+        );
+        let hidden = visibility
+            .visible_identifier_candidates(&consumer, "Hidden")
+            .next()
+            .expect("alias RHS type remains visible");
+        assert!(
+            visibility.parser_alias_name_may_resolve_to_target(&consumer, "Public", hidden,),
+            "an encountered parser alias must still resolve to its target"
+        );
+    }
+
+    #[test]
+    fn bounded_visibility_retains_included_member_field_type() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        fs::write(
+            root.join("types.h"),
+            "struct Hidden {};\nstruct Holder { Hidden field; };\n",
+        )
+        .expect("write types header");
+        fs::write(
+            root.join("consumer.cpp"),
+            "#include \"types.h\"\nHolder holder;\nauto value = holder.field;\n",
+        )
+        .expect("write consumer");
+        let cpp = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
+            root.clone(),
+            crate::analyzer::Language::Cpp,
+        ));
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&cpp);
+        let query_token = query_scope.token();
+        let consumer = ProjectFile::new(root, "consumer.cpp");
+        let visibility = VisibilityIndex::build(
+            &cpp,
+            query_token,
+            &CppGraphSource::from_source(&cpp, query_token),
+            &HashSet::from_iter([consumer.clone()]),
+        );
+
+        assert!(visibility.resolve_type(&consumer, "Hidden").is_some());
+    }
+
+    #[test]
+    fn type_visibility_builds_macro_environment_only_for_guard_evidence() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let consumer = ProjectFile::new(root.clone(), "consumer.cpp");
+        fs::write(root.join("types.h"), "struct Direct {};\n").expect("write type declarations");
+        let source = "#include \"types.h\"\nDirect direct_value;\n#if FEATURE\nstruct Guarded {};\nGuarded guarded_same_branch;\n#else\nGuarded guarded_other_branch;\n#endif\n";
+        fs::write(root.join("consumer.cpp"), source).expect("write consumer");
+        let cpp = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
+            root,
+            crate::analyzer::Language::Cpp,
+        ));
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&cpp);
+        let query_token = query_scope.token();
+        let visibility = VisibilityIndex::build(
+            &cpp,
+            query_token,
+            &CppGraphSource::from_source(&cpp, query_token),
+            &HashSet::from_iter([consumer.clone()]),
+        );
+        let prepared = cpp
+            .prepared_syntax(query_token, &consumer)
+            .expect("prepared consumer");
+        let reference_node = |needle: &str| {
+            let start = source.find(needle).expect("reference spelling");
+            let type_len = needle.find(' ').unwrap_or(needle.len());
+            prepared
+                .tree()
+                .root_node()
+                .descendant_for_byte_range(start, start + type_len)
+                .expect("reference node")
+        };
+        let direct = visibility
+            .visible_identifier_candidates(&consumer, "Direct")
+            .next()
+            .expect("direct candidate");
+        let guarded = visibility
+            .visible_identifier_candidates(&consumer, "Guarded")
+            .next()
+            .expect("guarded candidate");
+
+        visibility
+            .macro_environment_request_count
+            .store(0, Ordering::Relaxed);
+        assert!(visibility.external_type_candidate_visible_in_context(
+            &CppGraphSource::from_source(&cpp, query_token),
+            &consumer,
+            direct,
+            reference_node("Direct"),
+        ));
+        assert_eq!(
+            visibility
+                .macro_environment_request_count
+                .load(Ordering::Relaxed),
+            0,
+            "an unguarded declaration reached by an unconditional include must not hydrate the macro environment"
+        );
+
+        assert!(visibility.external_type_candidate_visible_in_context(
+            &CppGraphSource::from_source(&cpp, query_token),
+            &consumer,
+            guarded,
+            reference_node("Guarded guarded_same_branch"),
+        ));
+        assert!(!visibility.external_type_candidate_visible_in_context(
+            &CppGraphSource::from_source(&cpp, query_token),
+            &consumer,
+            guarded,
+            reference_node("Guarded guarded_other_branch"),
+        ));
+        assert_eq!(
+            visibility
+                .macro_environment_request_count
+                .load(Ordering::Relaxed),
+            1,
+            "only the matching guarded branch needs macro-environment validation"
+        );
+    }
+
+    #[test]
+    fn compile_proven_include_guard_skips_reference_macro_environment() {
+        fn run_case(
+            database: Option<&str>,
+            prefix: &str,
+            expected: bool,
+            expected_requests: usize,
+        ) {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let root = temp.path().canonicalize().expect("canonical temp dir");
+            let consumer = ProjectFile::new(root.clone(), "consumer.c");
+            fs::write(root.join("guarded.h"), "struct Selected {};\n")
+                .expect("write guarded declaration");
+            let source = format!(
+                "{prefix}#if defined(DRIVER)\n#include \"guarded.h\"\n#endif\nSelected value;\n"
+            );
+            fs::write(root.join("consumer.c"), &source).expect("write consumer");
+            if let Some(database) = database {
+                fs::write(root.join("compile_commands.json"), database)
+                    .expect("write compile database");
+            }
+            let cpp = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
+                root,
+                crate::analyzer::Language::Cpp,
+            ));
+            let query_scope = crate::analyzer::AnalyzerQueryScope::new(&cpp);
+            let query_token = query_scope.token();
+            let visibility = VisibilityIndex::build(
+                &cpp,
+                query_token,
+                &CppGraphSource::from_source(&cpp, query_token),
+                &HashSet::from_iter([consumer.clone()]),
+            );
+            let candidate = visibility
+                .visible_identifier_candidates(&consumer, "Selected")
+                .next()
+                .expect("selected candidate");
+            let prepared = cpp
+                .prepared_syntax(query_token, &consumer)
+                .expect("prepared consumer");
+            let start = source.rfind("Selected").expect("type reference");
+            let reference = prepared
+                .tree()
+                .root_node()
+                .descendant_for_byte_range(start, start + "Selected".len())
+                .expect("type node");
+            visibility
+                .macro_environment_request_count
+                .store(0, Ordering::Relaxed);
+            if expected && expected_requests == 0 {
+                assert!(
+                    !visibility.compile_proven_guards(&consumer).is_empty(),
+                    "compile database define must reach the consumer"
+                );
+            }
+
+            let actual = visibility.external_type_candidate_visible_in_context(
+                &CppGraphSource::from_source(&cpp, query_token),
+                &consumer,
+                candidate,
+                reference,
+            );
+            assert_eq!(
+                actual,
+                expected,
+                "database={} prefix={prefix:?}",
+                database.is_some()
+            );
+            assert_eq!(
+                visibility
+                    .macro_environment_request_count
+                    .load(Ordering::Relaxed),
+                expected_requests,
+                "source={source}"
+            );
+        }
+
+        const DATABASE: &str = r#"[{"directory":".","file":"consumer.c","arguments":["cc","-DDRIVER","-c","consumer.c"]}]"#;
+        run_case(Some(DATABASE), "", true, 0);
+        run_case(None, "", false, 0);
+        const CANCELLED_DATABASE: &str = r#"[{"directory":".","file":"consumer.c","arguments":["cc","-DDRIVER","-UDRIVER","-c","consumer.c"]}]"#;
+        run_case(Some(CANCELLED_DATABASE), "", false, 0);
+    }
+
+    #[test]
+    fn compile_proven_driver_disambiguates_conditional_type_headers() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let consumer = ProjectFile::new(root.clone(), "consumer.c");
+        fs::write(root.join("rgb.h"), "struct DriverType { int rgb; };\n")
+            .expect("write RGB declaration");
+        fs::write(root.join("mono.h"), "struct DriverType { int mono; };\n")
+            .expect("write mono declaration");
+        let source = "#if defined(RGB_DRIVER)\n#include \"rgb.h\"\n#elif defined(MONO_DRIVER)\n#include \"mono.h\"\n#endif\nDriverType value;\n";
+        fs::write(root.join("consumer.c"), source).expect("write consumer");
+        fs::write(
+            root.join("compile_commands.json"),
+            r#"[{"directory":".","file":"consumer.c","arguments":["cc","-DRGB_DRIVER","-c","consumer.c"]}]"#,
+        )
+        .expect("write compile database");
+        let cpp = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
+            root,
+            crate::analyzer::Language::Cpp,
+        ));
+        let query_scope = crate::analyzer::AnalyzerQueryScope::new(&cpp);
+        let query_token = query_scope.token();
+        let visibility = VisibilityIndex::build(
+            &cpp,
+            query_token,
+            &CppGraphSource::from_source(&cpp, query_token),
+            &HashSet::from_iter([consumer.clone()]),
+        );
+        let prepared = cpp
+            .prepared_syntax(query_token, &consumer)
+            .expect("prepared consumer");
+        let start = source.rfind("DriverType").expect("type reference");
+        let reference = prepared
+            .tree()
+            .root_node()
+            .descendant_for_byte_range(start, start + "DriverType".len())
+            .expect("type node");
+        let candidates = visibility
+            .visible_identifier_candidates(&consumer, "DriverType")
+            .collect::<Vec<_>>();
+        assert_eq!(candidates.len(), 2);
+        let rgb = candidates
+            .iter()
+            .find(|candidate| candidate.source().rel_path().ends_with("rgb.h"))
+            .expect("RGB candidate");
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.source().rel_path().ends_with("mono.h"))
+        );
+
+        visibility
+            .macro_environment_request_count
+            .store(0, Ordering::Relaxed);
+        assert!(
+            !visibility.compile_proven_guards(&consumer).is_empty(),
+            "RGB compile define must reach the consumer"
+        );
+        assert!(visibility.external_type_candidate_visible_in_context(
+            &CppGraphSource::from_source(&cpp, query_token),
+            &consumer,
+            rgb,
+            reference,
+        ));
+        assert_eq!(
+            visibility
+                .macro_environment_request_count
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert!(matches!(
+            visibility.resolve_type_components_lexically_for_forward(
+                &CppGraphSource::from_source(&cpp, query_token),
+                &consumer,
+                &["DriverType".to_string()],
+                false,
+                &[],
+            ),
+            LexicalTypeResolution::Resolved { .. }
+        ));
+    }
+
+    #[test]
+    fn raw_reference_guards_gate_macro_environment_hydration() {
+        fn run_case(
+            source: &str,
+            expected: bool,
+            expected_requests: usize,
+            expected_projection_builds: usize,
+        ) {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let root = temp.path().canonicalize().expect("canonical temp dir");
+            let consumer = ProjectFile::new(root.clone(), "consumer.c");
+            fs::write(root.join("guarded.h"), "struct Selected {};\n")
+                .expect("write guarded declaration");
+            fs::write(root.join("consumer.c"), source).expect("write consumer");
+            let cpp = CppAnalyzer::from_project(crate::analyzer::TestProject::new(
+                root,
+                crate::analyzer::Language::Cpp,
+            ));
+            let query_scope = crate::analyzer::AnalyzerQueryScope::new(&cpp);
+            let query_token = query_scope.token();
+            let visibility = VisibilityIndex::build(
+                &cpp,
+                query_token,
+                &CppGraphSource::from_source(&cpp, query_token),
+                &HashSet::from_iter([consumer.clone()]),
+            );
+            let candidate = visibility
+                .visible_identifier_candidates(&consumer, "Selected")
+                .next()
+                .expect("selected candidate");
+            let prepared = cpp
+                .prepared_syntax(query_token, &consumer)
+                .expect("prepared consumer");
+            let start = source.rfind("Selected").expect("type reference");
+            let reference = prepared
+                .tree()
+                .root_node()
+                .descendant_for_byte_range(start, start + "Selected".len())
+                .expect("type node");
+            visibility
+                .macro_environment_request_count
+                .store(0, Ordering::Relaxed);
+
+            assert_eq!(
+                visibility.external_type_candidate_visible_in_context(
+                    &CppGraphSource::from_source(&cpp, query_token),
+                    &consumer,
+                    candidate,
+                    reference,
+                ),
+                expected
+            );
+            assert_eq!(
+                visibility
+                    .macro_environment_request_count
+                    .load(Ordering::Relaxed),
+                expected_requests,
+                "source={source}"
+            );
+            assert_eq!(
+                visibility
+                    .conditional_include_projection_work_counts_for_test()
+                    .0,
+                expected_projection_builds,
+                "raw-incompatible paths must not materialize the full conditional include index; source={source}"
+            );
+        }
+
+        run_case(
+            "#ifdef DRIVER\n#include \"guarded.h\"\n#endif\n#ifdef OTHER\nSelected value;\n#endif\n",
+            false,
+            0,
+            0,
+        );
+        run_case(
+            "#ifdef DRIVER\n#include \"guarded.h\"\nSelected value;\n#endif\n",
+            true,
+            1,
+            1,
+        );
+        run_case(
+            "#define DRIVER 1\n#ifdef DRIVER\n#include \"guarded.h\"\n#endif\n#undef DRIVER\n#ifdef DRIVER\nSelected value;\n#endif\n",
+            false,
+            1,
+            0,
         );
     }
 

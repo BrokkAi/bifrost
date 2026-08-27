@@ -88,16 +88,10 @@ checksum-pinned resolution before starting an MCP host. Both commands accept
 `--json`. If preparation changes the available binary, start a fresh host task
 so the MCP tool list is negotiated again.
 
-## Optional Semantic Model
-
-Semantic search is off by default and requires the `nlp` feature. `BIFROST_EMBED_MODEL_ID` selects an explicit Hugging Face model. Otherwise, Bifrost selects `brokkai/Muninn` with an accelerator and `brokkai/Muninn-small` without one. The Hugging Face cache downloads missing configuration, tokenizer, metadata, and weight files. Set `BIFROST_EMBED_MODEL_DIR` to an approved local model directory for an offline or pre-audited setup.
-
-The PyTorch sidecar receives code chunks for local embedding inference. It is a child process, not a hosted embedding API. Accelerator and device environment variables affect local execution, not the MCP/model-host boundary.
-
 ## Deployment Checklist
 
 - Pin and verify the effective Bifrost binary and workspace root.
-- Decide whether launcher and semantic-model downloads are allowed.
+- Decide whether launcher downloads are allowed.
 - Treat `.bifrost/cache/bifrost_cache.v<N>.db`, host transcripts, and model-provider logs as repository-sensitive artifacts.
 - Configure repository exclusions and request path filters, but do not mistake filters for process isolation.
 - Inspect representative tool output before granting an agent access; source excerpts can leave the local process through the host.

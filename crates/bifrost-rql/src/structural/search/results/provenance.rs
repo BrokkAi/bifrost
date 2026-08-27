@@ -129,6 +129,14 @@ pub enum CodeQueryResultRef {
         #[serde(skip_serializing_if = "Option::is_none")]
         parameter_name: Option<String>,
     },
+    JsxAttributeValue {
+        id: String,
+        ast_id: String,
+        path: String,
+        range: CodeQueryRange,
+        element_identity: &'static str,
+        coverage: &'static str,
+    },
     ReceiverAnalysis {
         path: String,
         range: CodeQueryRange,
@@ -250,6 +258,19 @@ pub enum CodeQueryResultRef {
         path: String,
         range: CodeQueryRange,
         parameter_index: usize,
+    },
+    DecoratedParameter {
+        id: String,
+        parameter_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        decorator_id: Option<String>,
+        path: String,
+        range: CodeQueryRange,
+        decorator_range: CodeQueryRange,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parameter_ordinal: Option<usize>,
+        binding_status: &'static str,
+        coverage: &'static str,
     },
     CallableApplicability {
         id: String,

@@ -31,6 +31,7 @@ pub mod diagnostics;
 pub mod external_surface;
 pub mod graph;
 pub mod graph_support;
+pub mod phpdoc;
 pub mod queries;
 pub mod structural;
 pub mod test_detection;

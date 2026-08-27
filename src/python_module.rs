@@ -36,7 +36,7 @@ impl SearchToolsNativeSession {
         }
         let root = PathBuf::from(root);
         let service = py
-            .allow_threads(move || {
+            .detach(move || {
                 if let Some(sources) = sources {
                     create_scoped_service(root, &sources, revision.as_deref())
                 } else if manual {
@@ -52,7 +52,7 @@ impl SearchToolsNativeSession {
     fn call_tool_json(&self, py: Python<'_>, name: &str, arguments_json: &str) -> PyResult<String> {
         let name = name.to_owned();
         let arguments_json = arguments_json.to_owned();
-        let result = py.allow_threads(|| self.inner.call_tool_json(&name, &arguments_json));
+        let result = py.detach(|| self.inner.call_tool_json(&name, &arguments_json));
 
         match result {
             Ok(payload) => Ok(payload),
@@ -69,7 +69,7 @@ impl SearchToolsNativeSession {
     ) -> PyResult<String> {
         let name = name.to_owned();
         let arguments_json = arguments_json.to_owned();
-        let result = py.allow_threads(|| {
+        let result = py.detach(|| {
             self.inner.call_tool_payload_json(
                 &name,
                 &arguments_json,
@@ -90,9 +90,9 @@ impl SearchToolsNativeSession {
     }
 
     /// Force a git-reachability GC of the unified cache and block until done.
-    /// Releases the GIL while waiting; not for the retrieval path.
+    /// Detaches from the Python interpreter while waiting; not for the retrieval path.
     fn gc(&self, py: Python<'_>) -> PyResult<()> {
-        py.allow_threads(|| self.inner.request_cache_gc())
+        py.detach(|| self.inner.request_cache_gc())
             .map_err(service_error_to_py)
     }
 }
@@ -107,18 +107,13 @@ fn service_error_to_py(err: SearchToolsServiceError) -> PyErr {
 }
 
 #[pyfunction]
-#[pyo3(signature = (toolset="core", render_line_numbers=true, git_repo=true))]
-fn tool_descriptors_json(
-    toolset: &str,
-    render_line_numbers: bool,
-    git_repo: bool,
-) -> PyResult<String> {
+#[pyo3(signature = (toolset="core", render_line_numbers=true))]
+fn tool_descriptors_json(toolset: &str, render_line_numbers: bool) -> PyResult<String> {
     let spec = resolve_server_spec_for_render_options(
         toolset,
         McpRenderOptions {
             render_line_numbers,
         },
-        git_repo,
     )
     .map_err(PyValueError::new_err)?;
     serde_json::to_string(&spec.tool_descriptors)

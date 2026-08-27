@@ -17,10 +17,9 @@ Use the narrowest tool that directly answers the question:
 | “Who references this exact symbol?” | `scan_usages_by_reference` or `scan_usages_by_location` | Resolves a known declaration to reference sites from a symbol or source location. |
 | “What is the workspace caller/callee graph?” | `usage_graph` | Returns the existing whole-workspace resolved usage graph. |
 | “Which code has this shape, enclosing declaration, import/type relationship, or procedure-local control-flow relationship?” | `query_code` | Matches normalized kinds and applies typed structural and semantic steps. |
-| “Which code is conceptually about retry policy?” | `semantic_search` | Retrieves code by meaning rather than exact structure. |
 | “Where does this literal text occur?” | `search_file_contents` | Searches source text without structural interpretation. |
 
-Start with `search_symbols` or the mode-appropriate scan-usages tool when you already know the symbol. Use `query_code` when the shape matters more than symbol identity. A useful workflow is to capture structural candidates with `query_code`, then pass their locations or enclosing symbols to the more semantic tools.
+Start with `search_symbols` or the mode-appropriate scan-usages tool when you already know the symbol. Use `query_code` when the shape matters more than symbol identity. A useful workflow is to capture structural candidates with `query_code`, then pass their locations or enclosing symbols to exact navigation tools.
 
 ## Rune IR
 

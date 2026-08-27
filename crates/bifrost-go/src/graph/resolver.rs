@@ -76,7 +76,11 @@ impl GoProjectGraph {
     /// `package_name` half of the analyzer's `CodeUnit::fq_name()` so the inverted
     /// scan's callee fqns line up with the graph's nodes.
     pub fn package_name_of(&self, file: &ProjectFile) -> Option<String> {
-        self.edge_index.package_name_of(file)
+        self.edge_index.package_name_of(file).or_else(|| {
+            self.parsed
+                .get(file)
+                .map(|parsed| parsed.package_name.clone())
+        })
     }
 
     pub fn namespace_packages(&self, file: &ProjectFile) -> NamespacePackages {
@@ -274,28 +278,41 @@ impl GoEdgeIndex {
                 let Some(identity) = identity else {
                     continue;
                 };
-                let Some(nominal) = identity.nominal_name() else {
-                    continue;
-                };
-                let candidate_fqns: Vec<String> = match nominal.path() {
-                    [name] => vec![format!("{}.{}", fact.package, name)],
-                    [qualifier, name] => self
-                        .namespace_packages_by_file
-                        .get(&fact.file)
-                        .and_then(|(packages, _)| packages.get(qualifier))
-                        .map(|packages| {
-                            packages
-                                .iter()
-                                .map(|package| format!("{package}.{name}"))
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                    _ => Vec::new(),
-                };
-                for candidate in candidate_fqns {
-                    let candidate = self.resolve_type_alias(&candidate);
-                    if self.non_alias_type_fqns.contains(&candidate) {
-                        owners.push(candidate);
+                let mut pending = vec![(fact.clone(), identity)];
+                let mut visited = HashSet::default();
+                while let Some((fact, identity)) = pending.pop() {
+                    let Some(nominal) = identity.nominal_name() else {
+                        continue;
+                    };
+                    let candidate_fqns: Vec<String> = match nominal.path() {
+                        [name] => vec![format!("{}.{}", fact.package, name)],
+                        [qualifier, name] => self
+                            .namespace_packages_by_file
+                            .get(&fact.file)
+                            .and_then(|(packages, _)| packages.get(qualifier))
+                            .map(|packages| {
+                                packages
+                                    .iter()
+                                    .map(|package| format!("{package}.{name}"))
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                        _ => Vec::new(),
+                    };
+                    for candidate in candidate_fqns {
+                        let candidate = self.resolve_type_alias(&candidate);
+                        if !visited.insert(candidate.clone()) {
+                            continue;
+                        }
+                        if self.non_alias_type_fqns.contains(&candidate) {
+                            owners.push(candidate.clone());
+                        }
+                        if let Some(next_facts) = self.underlying_types_by_fqn.get(&candidate) {
+                            pending.extend(next_facts.iter().cloned().map(|next| {
+                                let identity = next.identity.clone();
+                                (next, identity)
+                            }));
+                        }
                     }
                 }
             }
@@ -2135,11 +2152,11 @@ fn same_go_package(graph: &GoProjectGraph, left: &ProjectFile, right: &ProjectFi
     if left.parent() != right.parent() {
         return false;
     }
-    let Some(left_parsed) = graph.parsed.get(left) else {
+    let Some(left_package) = graph.package_name_of(left) else {
         return false;
     };
-    let Some(right_parsed) = graph.parsed.get(right) else {
+    let Some(right_package) = graph.package_name_of(right) else {
         return false;
     };
-    left_parsed.package_name == right_parsed.package_name
+    left_package == right_package
 }

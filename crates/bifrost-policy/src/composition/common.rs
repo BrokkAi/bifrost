@@ -394,14 +394,8 @@ impl EndpointUniverse {
                         .cmp(&definition_resolution_key(&right.definition_schema))
                 })
                 .then_with(|| {
-                    (
-                        left.selector_schema.version,
-                        origin_rank(left.selector_schema.origin),
-                    )
-                        .cmp(&(
-                            right.selector_schema.version,
-                            origin_rank(right.selector_schema.origin),
-                        ))
+                    selector_schema_key(&left.selector_schemas)
+                        .cmp(&selector_schema_key(&right.selector_schemas))
                 })
                 .then_with(|| left.selector_path.cmp(&right.selector_path))
         });
@@ -422,7 +416,9 @@ impl EndpointUniverse {
                 // compose idempotently when the semantic hashes agree.
                 if existing.definition_schema.version() != dependency.definition_schema.version()
                     || existing.selector_path != dependency.selector_path
-                    || existing.selector_schema.version != dependency.selector_schema.version
+                    || !existing
+                        .selector_schemas
+                        .same_effective_versions(&dependency.selector_schemas)
                     || existing.model != dependency.model
                 {
                     return Err(CompositionError::EndpointHashCollision {
@@ -579,7 +575,9 @@ impl EndpointUniverse {
                         })?;
                         if dependency.definition_schema.version()
                             != entry.definition_schema.version()
-                            || dependency.selector_schema.version != entry.selector_schema.version
+                            || !dependency
+                                .selector_schemas
+                                .same_effective_versions(&entry.selector_schemas)
                             || dependency.semantic_hash != entry.semantic_hash
                             || dependency.analysis_projection_hash != entry.analysis_projection_hash
                         {
@@ -695,6 +693,32 @@ fn origin_rank(origin: SchemaVersionOrigin) -> u8 {
         SchemaVersionOrigin::Explicit => 0,
         SchemaVersionOrigin::ReferencedDocumentExplicit => 1,
         SchemaVersionOrigin::ImplicitCompatible => 2,
+    }
+}
+
+fn selector_schema_key(schemas: &ResolvedEndpointSelectorSchemas) -> (u8, Vec<(String, u32, u8)>) {
+    match schemas {
+        ResolvedEndpointSelectorSchemas::Query(resolution) => (
+            0,
+            vec![(
+                String::new(),
+                resolution.version,
+                origin_rank(resolution.origin),
+            )],
+        ),
+        ResolvedEndpointSelectorSchemas::Rows(bindings) => (
+            1,
+            bindings
+                .iter()
+                .map(|binding| {
+                    (
+                        binding.path.as_str().to_owned(),
+                        binding.resolution.version,
+                        origin_rank(binding.resolution.origin),
+                    )
+                })
+                .collect(),
+        ),
     }
 }
 
@@ -1017,10 +1041,10 @@ mod tests {
                 "/dependencies/match-endpoints/{endpoint_id}/selector"
             ))
             .unwrap(),
-            SchemaVersionResolution {
+            ResolvedEndpointSelectorSchemas::Query(SchemaVersionResolution {
                 version: 2,
                 origin: selector_origin,
-            },
+            }),
             ResolvedEndpointModel::new(
                 EndpointRole::Source,
                 endpoint_id.to_string(),
@@ -1067,7 +1091,11 @@ mod tests {
         };
         assert_eq!(resolution.origin, SchemaVersionOrigin::Explicit);
         assert_eq!(
-            dependency.selector_schema.origin,
+            dependency
+                .selector_schemas
+                .as_query()
+                .expect("test dependency uses a query selector")
+                .origin,
             SchemaVersionOrigin::Explicit
         );
     }

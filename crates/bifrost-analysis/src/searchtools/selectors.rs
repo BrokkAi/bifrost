@@ -716,26 +716,67 @@ pub(super) fn exact_then_fuzzy_codeunit_resolution(
 /// top-level namesake anywhere in the workspace, and members are invisible
 /// to the exact/short-name stages (their short names are owner-qualified),
 /// so an in-file member was hidden whenever a same-named top-level symbol
-/// existed elsewhere — `path#terminal` reported not_found on the very file
+/// existed elsewhere -- `path#terminal` reported not_found on the very file
 /// it named (issue #1056). Scoping every stage to the anchor file resolves
 /// members by terminal name while preserving top-level-wins priority within
 /// the file; `path#qualified` behavior is unchanged.
+///
+/// A *bare* terminal lookup runs the member-aware stage first (#1057). When
+/// the anchor file holds both a top-level declaration whose fully qualified
+/// name *is* that terminal and a member whose terminal identifier equals it --
+/// angular's `src/ng/parse.js`, with a free `function ifDefined` and
+/// `ASTCompiler.prototype.ifDefined` -- taking the exact hit unconditionally
+/// reproduced, scoped to one file, the stage-1 blindness the unanchored bare
+/// route fixed: the member was silently invisible while the qualified spelling
+/// answered with it.
+///
+/// Reporting ambiguity for every such collision is not available either. The
+/// selector this surface prints for the top-level candidate is `path#fq_name`,
+/// and that candidate's fully qualified name *is* the bare terminal, so the
+/// printed selector is byte-identical to the input: the report would offer
+/// itself as its own recovery and the declaration would have no working
+/// spelling at all. A printed selector is a promise (#1056, #1057), so the
+/// input must resolve the candidate it names exactly -- the same exact-fq-wins
+/// rule the C# arity-display collision already follows.
+///
+/// The carve-out is therefore scoped to exactly that forced case: when one
+/// in-file candidate's fully qualified name equals the input's lookup, resolve
+/// it. When no candidate is named exactly -- Go, whose module-path fq names
+/// are never a bare terminal, or two same-named members -- every candidate
+/// keeps a selector distinct from the input and the ambiguity report stands.
+/// Unanchored bare spellings are untouched and stay Ambiguous over the whole
+/// set, which is what keeps the set-aside declaration discoverable. Qualified
+/// anchored spellings keep exact-first, which is what #2451 asked for.
 pub(super) fn anchor_scoped_codeunit_resolution(
     analyzer: &dyn IAnalyzer,
     anchor: &str,
     lookup: &str,
 ) -> CodeUnitResolution {
-    let exact: Vec<_> = resolve_codeunit_exact(analyzer, lookup)
-        .into_iter()
-        .filter(|unit| rel_path_string(unit.source()) == anchor)
-        .collect();
-    if !exact.is_empty() {
-        return CodeUnitResolution::Resolved(exact);
+    let in_anchor = |unit: &CodeUnit| rel_path_string(unit.source()) == anchor;
+    if !is_bare_symbol_query(analyzer, lookup) {
+        let exact: Vec<_> = resolve_codeunit_exact(analyzer, lookup)
+            .into_iter()
+            .filter(in_anchor)
+            .collect();
+        if !exact.is_empty() {
+            return CodeUnitResolution::Resolved(exact);
+        }
     }
 
-    resolve_codeunit_fuzzy_with(analyzer, lookup, |unit| {
-        rel_path_string(unit.source()) == anchor
-    })
+    let resolution = resolve_codeunit_fuzzy_with(analyzer, lookup, in_anchor);
+    let CodeUnitResolution::Ambiguous(candidates) = resolution else {
+        return resolution;
+    };
+    let lookup = lookup.trim();
+    let named: Vec<_> = candidates
+        .iter()
+        .filter(|unit| unit.fq_name() == lookup)
+        .cloned()
+        .collect();
+    if named.is_empty() {
+        return CodeUnitResolution::Ambiguous(candidates);
+    }
+    CodeUnitResolution::Resolved(named)
 }
 
 /// Resolve a symbol input into one selectable definition group. A file anchor

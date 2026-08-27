@@ -146,8 +146,9 @@ pub use java::JavaAnalyzer;
 pub use javascript::JavascriptAnalyzer;
 pub(crate) use js_ts::{AliasResolver, resolve_js_ts_module_specifier};
 pub use js_ts::{
-    JsTsDependencyPackAdapter, TypeScriptDeclarationPackProducer,
-    resolve_js_ts_semantic_pack_dependencies,
+    JsTsDependencyPackAdapter, TYPESCRIPT_STDLIB_PACKAGE, TYPESCRIPT_STDLIB_VERSION,
+    TypeScriptDeclarationPackProducer, TypeScriptLibraryActivationOutcome,
+    resolve_js_ts_semantic_pack_dependencies, typescript_library_activation_evidence,
 };
 pub use jvm::external::{JvmDependencyPackAdapter, resolve_jvm_semantic_pack_dependencies};
 pub use jvm::java_artifact::JavaJarPackProducer;
@@ -212,8 +213,9 @@ pub use rust::{
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use rust::{
-    reset_rust_tree_parse_counters_for_test, rust_tree_parse_count_for_test,
-    rust_tree_parse_request_count_for_test, rust_tree_parsed_bytes_for_test,
+    reset_rust_tree_parse_counters_for_test, rust_scope_index_build_count_for_test,
+    rust_tree_parse_count_for_test, rust_tree_parse_request_count_for_test,
+    rust_tree_parsed_bytes_for_test,
 };
 pub use scala::ScalaAnalyzer;
 pub use source_content::SourceContent;

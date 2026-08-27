@@ -385,8 +385,8 @@ pub fn run_code_query_repl(root: PathBuf) -> Result<(), String> {
 
 struct LazySearchService {
     root: PathBuf,
-    service: Option<SearchToolsService>,
     initialize: fn(PathBuf) -> Result<SearchToolsService, String>,
+    service: Option<SearchToolsService>,
 }
 
 impl LazySearchService {
@@ -394,15 +394,18 @@ impl LazySearchService {
         Self {
             root,
             service: None,
-            initialize: SearchToolsService::new_without_semantic_index,
+            initialize: SearchToolsService::new,
         }
     }
 
     fn scripted(root: PathBuf) -> Self {
         Self {
             root,
-            service: None,
+            // Piped input defines the complete lifetime of this process. There
+            // is no later edit for a filesystem watcher to observe, and native
+            // watcher teardown can otherwise delay process exit after :quit.
             initialize: SearchToolsService::new_manual_persisted,
+            service: None,
         }
     }
 
@@ -1238,6 +1241,24 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         value.input_kind
                     ));
                 }
+                CodeQueryResultValue::JsxAttributeValue { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let text = sanitize_terminal_text(&value.text);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} `{}` ({}; {})\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(
+                            Style::new().fg(Color::Blue),
+                            "JSX attribute value:",
+                            use_color
+                        ),
+                        text,
+                        value.element_identity,
+                        value.coverage
+                    ));
+                }
                 CodeQueryResultValue::ReceiverAnalysis { value } => {
                     let path = sanitize_terminal_text(&value.path);
                     let text = sanitize_terminal_text(&value.text);
@@ -1647,6 +1668,87 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                             .unwrap_or_default(),
                         signature_id,
                     ));
+                }
+                CodeQueryResultValue::DecoratedParameter { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let parameter_id = sanitize_terminal_text(&value.parameter_id);
+                    let decorator_id = value
+                        .decorator_id
+                        .as_deref()
+                        .map(sanitize_terminal_text)
+                        .unwrap_or_else(|| "unknown".to_owned());
+                    let decorator_name = sanitize_terminal_text(&value.decorator_name);
+                    let owner_id = value
+                        .owner_id
+                        .as_deref()
+                        .map(sanitize_terminal_text)
+                        .unwrap_or_else(|| "unknown".to_owned());
+                    let procedure_id = value
+                        .procedure_id
+                        .as_deref()
+                        .map(sanitize_terminal_text)
+                        .unwrap_or_else(|| "unknown".to_owned());
+                    let ordinal = value
+                        .parameter_ordinal
+                        .map_or_else(|| "unknown".to_owned(), |ordinal| ordinal.to_string());
+                    let port_id = value
+                        .port_id
+                        .as_deref()
+                        .map(sanitize_terminal_text)
+                        .unwrap_or_else(|| "unknown".to_owned());
+                    let local_name = value
+                        .local_name
+                        .as_deref()
+                        .map(sanitize_terminal_text)
+                        .unwrap_or_else(|| "unknown".to_owned());
+                    let imported_name = value
+                        .imported_name
+                        .as_deref()
+                        .map(sanitize_terminal_text)
+                        .unwrap_or_else(|| "unknown".to_owned());
+                    let module = value
+                        .module
+                        .as_deref()
+                        .map(sanitize_terminal_text)
+                        .unwrap_or_else(|| "unknown".to_owned());
+                    let reason = value
+                        .reason
+                        .as_deref()
+                        .map(|reason| format!(" reason={}", sanitize_terminal_text(reason)))
+                        .unwrap_or_default();
+                    out.push_str(&format!(
+                        "{}:{}:{}-{}:{}\n  {} {} decorator={} at {}:{}-{}:{}\n  owner={} procedure={} ordinal={} port={} module={} imported={} local={} binding={} boundary={} completion={} coverage={} terminal={}{}\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        value.range.end_line,
+                        value.range.end_column,
+                        paint(
+                            Style::new().fg(Color::Blue),
+                            "decorated parameter:",
+                            use_color,
+                        ),
+                        paint(Style::new().bold(), &parameter_id, use_color),
+                        decorator_name,
+                        value.decorator_range.start_line,
+                        value.decorator_range.start_column,
+                        value.decorator_range.end_line,
+                        value.decorator_range.end_column,
+                        owner_id,
+                        procedure_id,
+                        ordinal,
+                        port_id,
+                        module,
+                        imported_name,
+                        local_name,
+                        value.binding_status,
+                        value.boundary,
+                        value.completion,
+                        value.coverage,
+                        value.terminal,
+                        reason,
+                    ));
+                    out.push_str(&format!("  decorator id={}\n", decorator_id));
                 }
                 CodeQueryResultValue::Occurrence { value } => {
                     let path = sanitize_terminal_text(&value.path);
@@ -2365,7 +2467,9 @@ fn balanced_delimiters(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brokk_bifrost::rql::{CodeQueryCapture, CodeQueryResultItem};
+    use brokk_bifrost::rql::{
+        CodeQueryCapture, CodeQueryDecoratedParameter, CodeQueryRange, CodeQueryResultItem,
+    };
 
     #[test]
     fn code_query_repl_loads_sexp_with_human_summary() {
@@ -2406,8 +2510,7 @@ mod tests {
     fn code_query_repl_runs_explain_and_profile_modes() {
         let temp = tempfile::tempdir().expect("temp dir");
         fs::write(temp.path().join("app.py"), "class App:\n    pass\n").expect("write source");
-        let service = SearchToolsService::new_without_semantic_index(temp.path().to_path_buf())
-            .expect("search service");
+        let service = SearchToolsService::new(temp.path().to_path_buf()).expect("search service");
         let mut session = ReplSession::new();
 
         let (_, loaded) = session.process_line("(explain (class :name \"App\"))", None);
@@ -2742,6 +2845,75 @@ mod tests {
             output.contains("  capture: $callee = `probe` line 260"),
             "{output}"
         );
+    }
+
+    #[test]
+    fn code_query_repl_renders_decorated_parameter_identity_and_ranges() {
+        let output = render_code_query_repl_output(
+            &CodeQueryResult {
+                results: vec![CodeQueryResultItem {
+                    value: CodeQueryResultValue::DecoratedParameter {
+                        value: Box::new(CodeQueryDecoratedParameter {
+                            id: "decorated-parameter".to_owned(),
+                            parameter_id: "parameter".to_owned(),
+                            decorator_id: Some("decorator".to_owned()),
+                            path: "src/controller.ts".to_owned(),
+                            language: "typescript",
+                            range: CodeQueryRange {
+                                start_line: 10,
+                                start_column: 19,
+                                end_line: 10,
+                                end_column: 41,
+                            },
+                            decorator_range: CodeQueryRange {
+                                start_line: 10,
+                                start_column: 19,
+                                end_line: 10,
+                                end_column: 32,
+                            },
+                            owner_id: Some("Controller.handle".to_owned()),
+                            procedure_id: Some("procedure".to_owned()),
+                            parameter_ordinal: Some(1),
+                            port_id: Some("procedure:parameter:1".to_owned()),
+                            decorator_name: "Query".to_owned(),
+                            local_name: Some("NestQuery".to_owned()),
+                            imported_name: Some("Query".to_owned()),
+                            module: Some("@nestjs/common".to_owned()),
+                            binding_status: "resolved",
+                            boundary: "external",
+                            completion: "complete",
+                            coverage: "complete",
+                            reason: None,
+                            terminal: true,
+                        }),
+                    },
+                    provenance: Vec::new(),
+                    provenance_truncated: false,
+                }],
+                truncated: false,
+                diagnostics: Vec::new(),
+            },
+            false,
+        );
+
+        assert!(output.contains("src/controller.ts:10:19-10:41"), "{output}");
+        assert!(
+            output.contains("decorated parameter: parameter decorator=Query at 10:19-10:32",),
+            "{output}"
+        );
+        assert!(
+            output.contains(
+                "owner=Controller.handle procedure=procedure ordinal=1 port=procedure:parameter:1"
+            ),
+            "{output}"
+        );
+        assert!(
+            output.contains(
+                "module=@nestjs/common imported=Query local=NestQuery binding=resolved boundary=external completion=complete coverage=complete terminal=true"
+            ),
+            "{output}"
+        );
+        assert!(output.contains("decorator id=decorator"), "{output}");
     }
 
     #[test]

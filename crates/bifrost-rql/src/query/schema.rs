@@ -35,8 +35,8 @@ use brokk_bifrost_core::schema_version::{
 use std::sync::OnceLock;
 
 use super::ir::{
-    CandidateOutcomeLabel, MAX_CAPTURE_LENGTH, MAX_KWARG_NAME_LENGTH, SCHEMA_VERSION,
-    UNATTRIBUTED_TIER_LABEL,
+    CandidateOutcomeLabel, JsxElementIdentity, MAX_CAPTURE_LENGTH, MAX_KWARG_NAME_LENGTH,
+    SCHEMA_VERSION, UNATTRIBUTED_TIER_LABEL,
 };
 
 /// The single RQL schema version. The pre-1.0 lineage (versions 2 through 13,
@@ -135,6 +135,7 @@ pub enum ValueShape {
     RewriteOutcomeList,
     ControlRelationKindList,
     ControlExitPartitionList,
+    JsxElementIdentity,
 }
 
 impl ValueShape {
@@ -208,6 +209,7 @@ impl ValueShape {
             Self::RewriteOutcomeList => "converged, cycle, or exceeded-budget",
             Self::ControlRelationKindList => "one or more control relations",
             Self::ControlExitPartitionList => "one or more control exit partitions",
+            Self::JsxElementIdentity => "intrinsic, component, or unknown",
         }
     }
 
@@ -395,6 +397,10 @@ macro_rules! query_step_ops {
                 matches!(self, Self::BindingsIn)
             }
 
+            pub fn allows_decorator_binding_options(self) -> bool {
+                matches!(self, Self::DecoratorBindings)
+            }
+
             pub fn allows_candidate_options(self) -> bool {
                 matches!(self, Self::CandidatesOf)
             }
@@ -454,7 +460,7 @@ query_step_ops! {
     ValueFlow { label: "value_flow", signature: "procedure -> flow_endpoint", description: "Run one registered diagnostic-neutral value-flow plan for the exact procedure root.", semantic: [Procedures, ValueFlow] }
     Taint { label: "taint", signature: "procedure -> taint_finding", description: "Project findings retained by one host-registered production taint result for the exact procedure root.", semantic: [Procedures, Taint] }
     Witness { label: "witness", signature: "typestate_finding|flow_endpoint -> typestate_witness|flow_witness", description: "Project bounded retained evidence from each typestate finding or reached flow endpoint without rerunning analysis." }
-    FileOf { label: "file_of", signature: "structural_match|declaration|procedure|program_point|control_edge|typestate_finding|typestate_witness|flow_endpoint|flow_witness|taint_finding|reference_site|call_site|expression_site|receiver_analysis|call_shape|call_argument_group|call_argument|call_binding|call_effect|procedure_effect|callable_signature|signature_parameter|callable_applicability|overload_selection|dispatch_outcome|dispatch_target|member_family|member_family_edge|state_event -> file", description: "Map structural matches, declarations, procedures, program points, control edges, typestate findings, typestate witnesses, flow endpoints, flow witnesses, taint findings, reference sites, call sites, expression sites, receiver analyses, call-shape rows, callable-signature rows, callable-applicability rows, overload-selection rows, dispatch rows, method-family rows, or state-event rows to their workspace files." }
+    FileOf { label: "file_of", signature: "structural_match|declaration|procedure|program_point|control_edge|typestate_finding|typestate_witness|flow_endpoint|flow_witness|taint_finding|reference_site|call_site|expression_site|jsx_attribute_value|receiver_analysis|receiver_outcome|receiver_evidence|call_shape|call_argument_group|call_argument|call_binding|call_effect|procedure_effect|callable_signature|signature_parameter|decorated_parameter|callable_applicability|overload_selection|dispatch_outcome|dispatch_target|member_family|member_family_edge|state_event -> file", description: "Map structural matches, declarations, procedures, program points, control edges, typestate findings, typestate witnesses, flow endpoints, flow witnesses, taint findings, reference sites, call sites, expression sites, exact JSX attribute operands, receiver analyses, receiver outcomes, receiver evidence, call-shape rows, callable-signature rows, decorated-parameter rows, callable-applicability rows, overload-selection rows, dispatch rows, method-family rows, or state-event rows to their workspace files." }
     ImportsOf { label: "imports_of", signature: "file -> file", description: "Traverse one direct project-local import edge forward." }
     ImportersOf { label: "importers_of", signature: "file -> file", description: "Traverse one direct project-local import edge backward." }
     Supertypes { label: "supertypes", signature: "declaration -> declaration", description: "Traverse indexed supertypes from supported type declarations." }
@@ -469,6 +475,7 @@ query_step_ops! {
     CallSitesTo { label: "call_sites_to", signature: "declaration -> call_site", description: "Return structured call sites whose resolved callee is each input declaration." }
     CallSitesFrom { label: "call_sites_from", signature: "declaration -> call_site", description: "Return structured call sites lexically owned by each input declaration." }
     CallInput { label: "call_input", signature: "call_site -> expression_site", description: "Project one direct receiver or formal-parameter input from each call site." }
+    JsxAttributeValue { label: "jsx_attribute_value", signature: "structural_match -> jsx_attribute_value", description: "Project the exact normalized expression operand of JSX attributes, with intrinsic/component/unknown element identity and explicit incompleteness for unresolved semantic cases." }
     ReceiverTargets { label: "receiver_targets", signature: "structural_match|reference_site|call_site|expression_site|occurrence -> receiver_analysis", description: "Analyze a bounded receiver value using adapter-provided structured facts." }
     PointsTo { label: "points_to", signature: "structural_match|reference_site|expression_site|occurrence -> receiver_analysis", description: "Analyze bounded value provenance using adapter-provided structured facts." }
     MemberTargets { label: "member_targets", signature: "structural_match|reference_site|occurrence -> receiver_analysis", description: "Resolve exact member declarations through bounded structured receiver facts." }
@@ -482,6 +489,7 @@ query_step_ops! {
     CallBindings { label: "call_bindings", signature: "call_shape -> call_binding", description: "Project the normalized actual-to-formal binding rows of each call shape: one row per written actual, carrying the call-shape argument identity it binds, the formal ordinal and name it was bound to, the binding kind, this row's mapping status, and the whole call's partition coverage. Beside them, a row for each fact no written actual accounts for: the receiver the call is made against, an argument the language supplies with no syntax, and a formal that no actual passed but whose declaration carries a default. Coverage describes the written actuals alone. The semantic dispatch identity, proof, completeness, and candidate coverage are carried from the same bounded dispatch answer as dispatch_targets; a source declaration is only an optional materialized view. At least one row per call shape, so an unreadable shape, an unresolved or ambiguous callee, unrecorded formals, or a call that binds nothing each state that instead of answering empty. The callee is the one the production definition resolver binds; no overload is re-decided here.", semantic: [Procedures, Dispatch] }
     CallableSignature { label: "callable_signature", signature: "declaration -> callable_signature", description: "Project the mandatory callable-signature rows of each declaration from the persisted signature contract: one row per persisted signature entry, so an overload set separates into one row per overload." }
     SignatureParameters { label: "signature_parameters", signature: "callable_signature -> signature_parameter", description: "Project the ordered declared parameter rows of each callable signature." }
+    DecoratorBindings { label: "decorator_bindings", signature: "structural_match -> decorated_parameter", description: "Project one typed decorator-binding row for each decorator applied to a parameter match. Semantic parameter identity is used when available; otherwise the row retains a syntax-derived ordinal and deterministic port with explicitly incomplete coverage." }
     CallableApplicability { label: "callable_applicability", signature: "occurrence -> callable_applicability", description: "Project one applicability row per candidate callable the production resolver considered for each reference occurrence: the verdict, the typed callable rejection reason when inapplicable, the precedence tier, and whether the resolver bound it. A candidate the resolver refused stays visible with its reason, so a losing overload is evidence rather than an absence." }
     OverloadSelection { label: "overload_selection", signature: "occurrence -> overload_selection", description: "Project the mandatory overload-selection summary row for each reference occurrence: resolved_unique, ambiguous, unresolved, or unknown_shape, with the verdict counts it was computed from. Exactly one row per occurrence, and candidate order can never influence it -- zero applicable candidates stay unresolved and several equal winners stay ambiguous." }
     MemberSelection { label: "member_selection", signature: "occurrence -> member_selection", description: "Project the mandatory member-selection summary row for each reference occurrence, from the production resolver's own candidate trace." }
@@ -679,6 +687,7 @@ macro_rules! rql_forms {
                     | Self::CallSitesTo
                     | Self::CallSitesFrom
                     | Self::CallInput
+                    | Self::JsxAttributeValue
                     | Self::ReceiverTargets
                     | Self::PointsTo
                     | Self::MemberTargets
@@ -692,6 +701,7 @@ macro_rules! rql_forms {
                     | Self::ProcedureEffects
                     | Self::CallableSignature
                     | Self::SignatureParameters
+                    | Self::DecoratorBindings
                     | Self::CallableApplicability
                     | Self::OverloadSelection
                     | Self::MemberSelection
@@ -1056,6 +1066,14 @@ rql_forms! {
         description: (QueryStepOp::CallInput),
         step: CallInput,
     }
+    JsxAttributeValue {
+        labels: ["jsx-attribute-value", "jsx_attribute_value"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(jsx-attribute-value [:identity intrinsic|component|unknown] [:element-name name] [:property-name name] query)",
+        description: (QueryStepOp::JsxAttributeValue),
+        step: JsxAttributeValue,
+    }
     ReceiverTargets {
         labels: ["receiver-targets", "receiver_targets"],
         class: Wrapper,
@@ -1159,6 +1177,14 @@ rql_forms! {
         signature: "(signature-parameters query)",
         description: (QueryStepOp::SignatureParameters),
         step: SignatureParameters,
+    }
+    DecoratorBindings {
+        labels: ["decorator-bindings", "decorator_bindings"],
+        class: Wrapper,
+        shape: Query,
+        signature: "(decorator-bindings [:module module] [:imported-name name] query)",
+        description: (QueryStepOp::DecoratorBindings),
+        step: DecoratorBindings,
     }
     CallableApplicability {
         labels: ["callable-applicability", "callable_applicability"],
@@ -1575,7 +1601,7 @@ rql_forms! {
         class: Predicate,
         shape: Arity,
         signature: "(arity count | :min count :max count)",
-        description: "Match a call by its positional argument count: an exact count, or inclusive :min/:max bounds.",
+        description: "Match a call by its positional argument count, or a collection literal by its element count: an exact count, or inclusive :min/:max bounds.",
     }
     Visibility {
         labels: ["visibility"],
@@ -1698,7 +1724,7 @@ rql_properties! {
         labels: ["arity"],
         shape: Arity,
         signature: ":arity count",
-        description: "Match a call by its exact positional argument count.",
+        description: "Match a call by its exact positional argument count, or a collection literal by its exact element count.",
     }
     Visibility {
         labels: ["visibility"],
@@ -1821,6 +1847,9 @@ json_fields! {
     Receiver { label: "receiver", shape: TrueBoolean, signature: "\"receiver\": true", description: "Select the explicit base or receiver expression of a call site." }
     ParameterIndex { label: "parameter_index", shape: NonNegativeInteger, signature: "\"parameter_index\": non-negative integer", description: "Select a zero-based formal parameter slot, excluding receiver-bound parameters." }
     ParameterName { label: "parameter_name", shape: ParameterName, signature: "\"parameter_name\": \"name\"", description: "Select a formal parameter slot by its declared name." }
+    Identity { label: "identity", shape: JsxElementIdentity, signature: "\"identity\": \"intrinsic\" | \"component\" | \"unknown\"", description: "Restrict JSX value rows to one semantic element identity." }
+    ElementName { label: "element_name", shape: String, signature: "\"element_name\": \"name\"", description: "Restrict JSX value rows to one exact unqualified element tag name." }
+    PropertyName { label: "property_name", shape: String, signature: "\"property_name\": \"name\"", description: "Restrict JSX value rows to one exact JSX attribute or object-property name." }
     Capture { label: "capture", shape: CaptureName, signature: "\"capture\": \"declared_name\"", description: "Analyze every unique range bound to a declared positive structural capture." }
     ProtocolRef { label: "protocol_ref", shape: ProtocolRef, signature: "\"protocol_ref\": \"namespace:name\"", description: "Select one host-registered compiled protocol and binding plan." }
     PlanRef { label: "plan_ref", shape: ValueFlowPlanRef, signature: "\"plan_ref\": \"namespace:name\"", description: "Select one host-registered immutable value-flow plan." }
@@ -1833,6 +1862,8 @@ json_fields! {
     BindingKinds { label: "kind", shape: BindingKindList, signature: "\"kind\": [\"local\", ...]", description: "Restrict binding rows to one or more binder kinds." }
     BindingNames { label: "name", shape: BindingNameList, signature: "\"name\": [\"rows\", ...]", description: "Restrict binding rows to one or more exact bound names." }
     BindingHoisting { label: "hoisting", shape: HoistingClassList, signature: "\"hoisting\": [\"scope_wide\", ...]", description: "Restrict binding rows to one or more hoisting classes." }
+    DecoratorModule { label: "module", shape: String, signature: "\"module\": \"@scope/package\"", description: "Restrict decorator-binding rows to one exact imported module target." }
+    DecoratorImportedName { label: "imported_name", shape: String, signature: "\"imported_name\": \"Query\"", description: "Restrict decorator-binding rows to one exact imported symbol name." }
     IncludeShadowed { label: "include_shadowed", shape: TrueBoolean, signature: "\"include_shadowed\": true", description: "Also return the bindings the binding-of answer shadows, instead of the winner alone." }
     Resolved { label: "resolved", shape: TrueBoolean, signature: "\"resolved\": true", description: "Derive each path segment's own prefix resolution so rows carry a status, targets, and a resolution-decided namespace." }
     CandidateTiers { label: "tier", shape: PrecedenceTierList, signature: "\"tier\": [\"lexical_binding\", \"unattributed\", ...]", description: "Restrict candidate rows to one or more precedence tiers, or to rows whose seam named none." }
@@ -1938,6 +1969,17 @@ const TAINT_STEP_OPTIONS: &[QueryStepOption] = &[QueryStepOption::required(
     QueryStepField::TaintRef,
     &[":taint-ref", ":taint_ref"],
 )];
+const JSX_ATTRIBUTE_VALUE_STEP_OPTIONS: &[QueryStepOption] = &[
+    QueryStepOption::optional(QueryStepField::Identity, &[":identity"]),
+    QueryStepOption::optional(
+        QueryStepField::ElementName,
+        &[":element-name", ":element_name"],
+    ),
+    QueryStepOption::optional(
+        QueryStepField::PropertyName,
+        &[":property-name", ":property_name"],
+    ),
+];
 const WITNESS_STEP_OPTIONS: &[QueryStepOption] = &[
     QueryStepOption::optional(QueryStepField::MaxSteps, &[":max-steps"]),
     QueryStepOption::optional(QueryStepField::MaxBytes, &[":max-bytes"]),
@@ -1965,6 +2007,15 @@ pub const BINDING_STEP_OPTIONS: &[QueryStepOption] = &[
     QueryStepOption::optional(QueryStepField::BindingKinds, &[":kind", ":kinds"]),
     QueryStepOption::optional(QueryStepField::BindingNames, &[":name", ":names"]),
     QueryStepOption::optional(QueryStepField::BindingHoisting, &[":hoisting"]),
+];
+
+/// Exact identity options of the `decorator-bindings` step.
+pub const DECORATOR_BINDING_STEP_OPTIONS: &[QueryStepOption] = &[
+    QueryStepOption::optional(QueryStepField::DecoratorModule, &[":module"]),
+    QueryStepOption::optional(
+        QueryStepField::DecoratorImportedName,
+        &[":imported-name", ":imported_name"],
+    ),
 ];
 
 /// Options of the `candidates-of` step (#1474).
@@ -2092,9 +2143,11 @@ impl QueryStepOp {
             Self::Typestate => TYPESTATE_STEP_OPTIONS,
             Self::ValueFlow => VALUE_FLOW_STEP_OPTIONS,
             Self::Taint => TAINT_STEP_OPTIONS,
+            Self::JsxAttributeValue => JSX_ATTRIBUTE_VALUE_STEP_OPTIONS,
             Self::Witness => WITNESS_STEP_OPTIONS,
             Self::OccurrencesOf | Self::OccurrencesIn => OCCURRENCE_STEP_OPTIONS,
             Self::BindingsIn => BINDING_STEP_OPTIONS,
+            Self::DecoratorBindings => DECORATOR_BINDING_STEP_OPTIONS,
             Self::CandidatesOf => CANDIDATE_STEP_OPTIONS,
             Self::BindingOf => BINDING_OF_STEP_OPTIONS,
             Self::DeclarationStateOf => DECLARATION_STATE_STEP_OPTIONS,
@@ -2332,6 +2385,17 @@ pub fn usage_proof_label(proof: UsageProof) -> &'static str {
     }
 }
 
+pub fn jsx_element_identity_labels() -> Vec<&'static str> {
+    JsxElementIdentity::ALL
+        .iter()
+        .map(|identity| identity.label())
+        .collect()
+}
+
+pub fn jsx_element_identity_from_label(label: &str) -> Option<JsxElementIdentity> {
+    JsxElementIdentity::from_label(label)
+}
+
 pub fn usage_proof_from_label(label: &str) -> Option<UsageProof> {
     match label {
         "proven" => Some(UsageProof::Proven),
@@ -2397,7 +2461,7 @@ json_fields! {
     Text { label: "text", shape: RegexPredicate, signature: "\"text\": { \"regex\": \"pattern\" }", description: "Match the node's source text with a regular expression." }
     BooleanValue { label: "boolean_value", shape: Boolean, signature: "\"boolean_value\": true | false", description: "Match a boolean literal by its normalized language-neutral value." }
     Capture { label: "capture", shape: String, signature: "\"capture\": \"label\"", description: "Capture the matching node under a result label." }
-    Arity { label: "arity", shape: Arity, signature: "\"arity\": count | { \"min\": count, \"max\": count }", description: "Match a call by its positional argument count: an exact count, or inclusive min/max bounds." }
+    Arity { label: "arity", shape: Arity, signature: "\"arity\": count | { \"min\": count, \"max\": count }", description: "Match a call by its positional argument count, or a collection literal by its element count: an exact count, or inclusive min/max bounds." }
     Visibility { label: "visibility", shape: DeclaredVisibilityList, signature: "\"visibility\": \"public\" | [\"public\", \"protected\", ...]", description: "Match a callable declaration by the visibility its adapter recorded from modifiers." }
     ParameterType { label: "parameter_type", shape: StringPredicate, signature: "\"parameter_type\": \"exact\" | { \"regex\": \"pattern\" }", description: "Match a callable that has a parameter whose recorded type spelling satisfies this predicate. The spelling is a discriminator, not a resolved type identity." }
     Has { label: "has", shape: Pattern, signature: "\"has\": { pattern }", description: "Require a matching descendant." }

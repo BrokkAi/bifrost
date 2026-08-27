@@ -25,6 +25,7 @@ use brokk_bifrost_cpp::graph::resolver::{
 };
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 struct PreparedCppFile {
     prepared: Arc<PreparedSyntaxTree>,
@@ -228,6 +229,14 @@ impl CppQueryResolver<'_> {
         token: QueryToken<'_>,
         overloads: &[CodeUnit],
     ) -> Vec<CodeUnit> {
+        let report_stats = std::env::var_os("BIFROST_CPP_VISIBILITY_STATS").is_some();
+        let started = Instant::now();
+        if report_stats {
+            eprintln!(
+                "BIFROST_CPP_SITE_EQUIVALENTS_STATS status=started targets={}",
+                overloads.len()
+            );
+        }
         let mut equivalents: Vec<CodeUnit> = Vec::new();
         for overload in overloads {
             for equivalent in self.cpp.site_equivalent_units(token, overload) {
@@ -235,6 +244,14 @@ impl CppQueryResolver<'_> {
                     equivalents.push(equivalent);
                 }
             }
+        }
+        if report_stats {
+            eprintln!(
+                "BIFROST_CPP_SITE_EQUIVALENTS_STATS status=completed targets={} equivalents={} elapsed_ms={}",
+                overloads.len(),
+                equivalents.len(),
+                started.elapsed().as_millis(),
+            );
         }
         equivalents
     }
@@ -341,11 +358,47 @@ impl CppQueryResolver<'_> {
             if scan_scope.is_cancelled() || *state.limit_exceeded {
                 break;
             }
+            let report_stats = std::env::var_os("BIFROST_CPP_VISIBILITY_STATS").is_some();
+            let prepare_started = Instant::now();
+            if report_stats {
+                eprintln!(
+                    "BIFROST_CPP_INVERSE_PREPARE_STATS status=started file={}",
+                    file.rel_path().display(),
+                );
+            }
             let Some(prepared) = prepare_file(self.cpp, token, &file) else {
                 continue;
             };
+            if report_stats {
+                eprintln!(
+                    "BIFROST_CPP_INVERSE_PREPARE_STATS status=syntax_prepared file={} source_bytes={} has_error={} elapsed_ms={}",
+                    file.rel_path().display(),
+                    prepared.source().len(),
+                    prepared.tree().root_node().has_error(),
+                    prepare_started.elapsed().as_millis(),
+                );
+            }
+            let sentinel_started = Instant::now();
+            if report_stats {
+                eprintln!(
+                    "BIFROST_CPP_SENTINEL_RECOVERY_STATS status=started file={} source_bytes={} has_error={}",
+                    file.rel_path().display(),
+                    prepared.source().len(),
+                    prepared.tree().root_node().has_error(),
+                );
+            }
             let recovered_sentinel_classes =
                 cpp_sentinel_recovered_classes(prepared.tree().root_node(), prepared.source());
+            if report_stats {
+                eprintln!(
+                    "BIFROST_CPP_SENTINEL_RECOVERY_STATS status=completed file={} source_bytes={} has_error={} recovered={} elapsed_ms={}",
+                    file.rel_path().display(),
+                    prepared.source().len(),
+                    prepared.tree().root_node().has_error(),
+                    recovered_sentinel_classes.len(),
+                    sentinel_started.elapsed().as_millis(),
+                );
+            }
             let class_range_cell = OnceLock::new();
             if let Some(class_ranges) = self.class_ranges.get(&file).cloned() {
                 assert!(
@@ -396,6 +449,15 @@ impl CppQueryResolver<'_> {
                 if scan_scope.is_cancelled() {
                     break 'files;
                 }
+                let started = Instant::now();
+                if report_stats {
+                    eprintln!(
+                        "BIFROST_CPP_INVERSE_FILE_STATS status=started file={} source_bytes={} target={}",
+                        file.rel_path().display(),
+                        prepared_file.prepared.source().len(),
+                        spec.target.fq_name(),
+                    );
+                }
                 #[cfg(any(test, feature = "test-support"))]
                 self.cpp.record_target_spec_scan_for_test();
                 let class_ranges = spec.type_scan_key().and_then(|_| {
@@ -426,6 +488,18 @@ impl CppQueryResolver<'_> {
                     &target_group,
                     &mut state,
                 );
+                if report_stats {
+                    eprintln!(
+                        "BIFROST_CPP_INVERSE_FILE_STATS status=completed file={} source_bytes={} target={} raw_matches={} hits={} unproven={} elapsed_ms={}",
+                        file.rel_path().display(),
+                        prepared_file.prepared.source().len(),
+                        spec.target.fq_name(),
+                        *state.raw_match_count,
+                        state.hits.len(),
+                        state.unproven_hits.len(),
+                        started.elapsed().as_millis(),
+                    );
+                }
                 if *state.limit_exceeded {
                     break 'files;
                 }

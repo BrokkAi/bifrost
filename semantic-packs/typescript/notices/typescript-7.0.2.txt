@@ -1,0 +1,13 @@
+TypeScript 7.0.2 standard-library declarations
+
+The declaration data is derived from the official TypeScript 7.0.2 npm
+package and its official platform companion package. Both are distributed
+under the Apache License, Version 2.0. The upstream companion notice includes
+the third-party DefinitelyTyped and Unicode notices; this pack retains that
+notice as part of the pinned acquisition input.
+
+Project: https://github.com/microsoft/TypeScript
+Compiler package: https://registry.npmjs.org/typescript/-/typescript-7.0.2.tgz
+Declaration package: https://registry.npmjs.org/@typescript/typescript-linux-x64/-/typescript-linux-x64-7.0.2.tgz
+License: https://www.apache.org/licenses/LICENSE-2.0
+Pinned version: 7.0.2

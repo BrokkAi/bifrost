@@ -78,6 +78,7 @@ pub(super) fn apply_plan_step(
                     | PipelineValue::ReferenceSite(_)
                     | PipelineValue::CallSite(_)
                     | PipelineValue::ExpressionSite(_)
+                    | PipelineValue::JsxAttributeValue(_)
                     | PipelineValue::ReceiverAnalysis(_)
                     | PipelineValue::ReceiverOutcome(_)
                     | PipelineValue::ReceiverEvidence(_)
@@ -89,6 +90,7 @@ pub(super) fn apply_plan_step(
                     | PipelineValue::ProcedureEffect(_)
                     | PipelineValue::CallableSignature(_)
                     | PipelineValue::SignatureParameter(_)
+                    | PipelineValue::DecoratedParameter(_)
                     | PipelineValue::CallableApplicability(_)
                     | PipelineValue::OverloadSelection(_)
                     | PipelineValue::MemberSelection(_)
@@ -158,6 +160,7 @@ pub(super) fn apply_plan_step(
                                 | PipelineValue::ReferenceSite(_)
                                 | PipelineValue::CallSite(_)
                                 | PipelineValue::ExpressionSite(_)
+                                | PipelineValue::JsxAttributeValue(_)
                                 | PipelineValue::ReceiverAnalysis(_)
                                 | PipelineValue::ReceiverOutcome(_)
                                 | PipelineValue::ReceiverEvidence(_)
@@ -169,6 +172,7 @@ pub(super) fn apply_plan_step(
                                 | PipelineValue::ProcedureEffect(_)
                                 | PipelineValue::CallableSignature(_)
                                 | PipelineValue::SignatureParameter(_)
+                                | PipelineValue::DecoratedParameter(_)
                                 | PipelineValue::CallableApplicability(_)
                                 | PipelineValue::OverloadSelection(_)
                                 | PipelineValue::MemberSelection(_)
@@ -250,6 +254,7 @@ pub(super) fn apply_plan_step(
                         | PipelineValue::ReferenceSite(_)
                         | PipelineValue::CallSite(_)
                         | PipelineValue::ExpressionSite(_)
+                        | PipelineValue::JsxAttributeValue(_)
                         | PipelineValue::ReceiverAnalysis(_)
                         | PipelineValue::ReceiverOutcome(_)
                         | PipelineValue::ReceiverEvidence(_)
@@ -261,6 +266,7 @@ pub(super) fn apply_plan_step(
                         | PipelineValue::ProcedureEffect(_)
                         | PipelineValue::CallableSignature(_)
                         | PipelineValue::SignatureParameter(_)
+                        | PipelineValue::DecoratedParameter(_)
                         | PipelineValue::CallableApplicability(_)
                         | PipelineValue::OverloadSelection(_)
                         | PipelineValue::MemberSelection(_)
@@ -1034,6 +1040,9 @@ pub(super) fn apply_pipeline_step(
             continue;
         }
         let expansions = match (&row.value, step) {
+            (PipelineValue::StructuralMatch(seed), QueryStep::JsxAttributeValue(filter)) => {
+                jsx::jsx_attribute_value_expansions(analyzer, seed, filter, diagnostics)
+            }
             (PipelineValue::StructuralMatch(seed), QueryStep::ProcedureOf) => {
                 let declaration =
                     exact_callable_declaration_value(analyzer, seed, &mut enclosing_declarations);
@@ -1355,6 +1364,9 @@ pub(super) fn apply_pipeline_step(
                 vec![pipeline_expansion(PipelineValue::File(
                     value.file().clone(),
                 ))]
+            }
+            (PipelineValue::DecoratedParameter(value), QueryStep::FileOf) => {
+                vec![pipeline_expansion(PipelineValue::File(value.file.clone()))]
             }
             (PipelineValue::CallShape(value), QueryStep::FileOf) => {
                 vec![pipeline_expansion(PipelineValue::File(
@@ -1760,6 +1772,45 @@ pub(super) fn apply_pipeline_step(
                     cache_profile,
                     &mut row_exhausted,
                 )
+            }
+            (PipelineValue::StructuralMatch(seed), QueryStep::DecoratorBindings(filter)) => {
+                let expansions = decorator_binding::expansions_for_seed(
+                    analyzer,
+                    seed,
+                    &mut enclosing_declarations,
+                    semantic.as_mut(),
+                );
+                if expansions.iter().any(|expansion| {
+                    matches!(
+                        &expansion.value,
+                        PipelineValue::DecoratedParameter(value)
+                            if value.row.completion != "complete"
+                                || value.row.coverage != "complete"
+                    )
+                }) {
+                    diagnostics.push(CodeQueryDiagnostic {
+                        code: CodeQueryDiagnosticCode::EnvironmentDerivationIncomplete,
+                        impact: CodeQueryDiagnosticImpact::Incomplete,
+                        branch: Vec::new(),
+                        language: seed.language.config_label(),
+                        message: "decorator_bindings retained one or more parameter rows whose decorator binding or parameter-port identity is incomplete".to_string(),
+                    });
+                }
+                expansions
+                    .into_iter()
+                    .filter(|expansion| match &expansion.value {
+                        PipelineValue::DecoratedParameter(value) => {
+                            filter
+                                .module
+                                .as_deref()
+                                .is_none_or(|module| value.row.module.as_deref() == Some(module))
+                                && filter.imported_name.as_deref().is_none_or(|imported_name| {
+                                    value.row.imported_name.as_deref() == Some(imported_name)
+                                })
+                        }
+                        _ => true,
+                    })
+                    .collect()
             }
             (PipelineValue::CallSite(site), QueryStep::CallShape) => {
                 call_shape::call_shape_expansions_for_input(

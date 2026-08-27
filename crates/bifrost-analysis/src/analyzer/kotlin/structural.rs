@@ -33,7 +33,14 @@ mod structural_spec_tests {
 
     #[test]
     fn kotlin_supports_every_role_including_keyword_arguments() {
+        use crate::analyzer::structural::kinds::Role;
         for &role in crate::analyzer::structural::kinds::ALL_ROLES {
+            // #2647: the iterable/element roles are refused until the Kotlin
+            // adapter extracts them.
+            if matches!(role, Role::Iterable | Role::Element) {
+                assert!(!KOTLIN_STRUCTURAL_SPEC.supports_role(role));
+                continue;
+            }
             assert!(
                 KOTLIN_STRUCTURAL_SPEC.supports_role(role),
                 "Kotlin should model {role:?}"

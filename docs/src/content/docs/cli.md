@@ -101,13 +101,23 @@ with evaluation options.
 passing a diagnostic-neutral `(endpoint ...)` as a root is a status-2 report.
 Policies may still load endpoints and saved `.rql` selectors as explicit
 dependencies. The one-shot CLI starts with empty catalog and endpoint
-registries. A catalog-backed policy requires a library embedding which
-explicitly populated `TaintCatalogRegistry`. A policy that uses only
+registries. A workspace semantic-pack policy uses the shared
+`.bifrost/packs.json` contract: an absent document selects compatible
+dependency packs for languages present in the workspace, a configured document
+selects its named ecosystems, and an empty `ecosystems` array explicitly
+disables that route. A configured catalog is workspace-relative; without one,
+activation is ephemeral. Activation never downloads packs or dependencies, and
+compatibility and `review_required` gates remain authoritative. A catalog-backed
+policy requires a library embedding which explicitly populated
+`TaintCatalogRegistry`. A policy that uses only
 `(match-endpoints :ids [...])` also requires an embedding to pre-register those
 endpoint IDs; in a normal CLI run, the same policy can discover endpoints
 through a `match-directory` closure before selecting exact IDs. The CLI does
-not scan for workspace policies, endpoints, or catalogs on its own. Built-in
-policies are selected only through the explicit selectors above.
+not scan for workspace policies or endpoint catalogs on its own;
+`.bifrost/packs.json` is the explicit shared semantic-pack configuration.
+Built-in policies are selected only through the explicit selectors above.
+Policy reports include dependency activation mode and the decisions that
+explain selected, missing, incompatible, disabled, or incomplete packs.
 
 By default, policy evaluation reads `.bifrost/suppressions.json` beneath the
 workspace root. Pass `--suppressions-file reviews/accepted.json` to select one
@@ -241,9 +251,9 @@ preserves finding identity, locations, witnesses, and completeness across all
 three report formats. Taint resolves typed endpoint bindings, batches compatible
 source/sink demand, runs the production data-flow engine, and projects one
 retained report. Source-backed analysis works in the ordinary CLI; external
-procedure summaries require an embedding that supplies an explicit
-semantic-model catalog and activation request. See [Data Flow, Taint, and
-Typestate](/data-flow-and-typestate/) and [Static-Analysis
+procedure summaries can use the shared workspace pack activation contract, with
+an embedding still able to supply an explicit semantic-model catalog and
+activation request. See [Data Flow, Taint, and Typestate](/data-flow-and-typestate/) and [Static-Analysis
 Policies](/static-analysis-policies/) for execution boundaries, endpoint
 composition, completeness, finding identity, and CVSS rules.
 
@@ -274,8 +284,6 @@ Tools whose normal MCP response is text-only return only:
 ```
 
 Use the MCP page as the catalog for what each tool does. Use `bifrost --help <tool>` for the exact input schema accepted by the installed binary.
-
-`semantic_search` follows the same build and runtime rules in CLI tool mode as it does through MCP: Bifrost must be built with the `nlp` feature, semantic indexing must be enabled for the session, and the active root must be a git repository.
 
 ## Limit the Workspace
 
@@ -323,6 +331,6 @@ the ranking without allowing them to consume the result limit.
 
 Run `bifrost --install` to register a user-level MCP server named `brokk` with
 installed Codex, Claude Code, OpenCode, Kimi Code, Hermes, and Oh My Pi clients.
-The action registers the current executable with `--mcp core|nlp`. It
+The action registers the current executable with `--mcp core`. It
 does not install skills, instruction files, host applications, or the original
 Pi extension. See [Install Bifrost](/install/#connect-coding-hosts) for details.

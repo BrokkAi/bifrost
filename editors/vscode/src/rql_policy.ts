@@ -1,6 +1,7 @@
 import { RQL_POLICY_LANGUAGE_ID } from "./rql_validation";
 
 export const RUN_RQL_POLICY_METHOD = "bifrost/runPolicy";
+export const PREPARE_POLICY_SUPPRESSION_METHOD = "bifrost/preparePolicySuppression";
 export const SUPPORTED_POLICY_REPORT_SCHEMA_VERSION = 5;
 export const SUPPORTED_POLICY_DISPLAY_PATH_SCHEMA_VERSION = 1;
 
@@ -8,6 +9,7 @@ export interface RqlPolicyDocument {
   languageId: string;
   uri: string;
   text: string;
+  version?: number;
 }
 
 export interface PolicyDisplayRegion {
@@ -53,6 +55,8 @@ export type PolicyRunCompletion =
 export interface PolicyFinding {
   id: string;
   policy_id: string;
+  identity_stability: "strong" | "weak";
+  policy_hash: string;
   severity: string;
   message: string;
   primary: PolicySourceLocation;
@@ -91,18 +95,70 @@ export interface PolicySuppressionReview extends PolicySuppressionDecision {
     | "policy_incomplete";
   temporal_state: "current" | "expired";
   policy_hash_state: "matching" | "drifted" | "unknown";
+  orphan_state: "resolved" | "orphaned" | "path_not_analyzed" | "path_unrecorded";
   applied: boolean;
-  stale: boolean;
   result_omitted: boolean;
+  rekey_candidates?: string[];
 }
 
 export interface PolicyReportEvaluation {
   evaluation_date: string;
-  suppression_path: string;
-  suppression_document_state: "not_evaluated" | "not_found" | "loaded" | "invalid";
+  suppression_sources: PolicySuppressionSourceState[];
   scope_path: string;
-  scope_document_state: "not_evaluated" | "not_found" | "loaded" | "invalid";
+  scope_document_state: PolicyDocumentState;
 }
+
+export type PolicyDocumentState = "not_evaluated" | "not_found" | "loaded" | "invalid";
+
+export interface PolicySuppressionSourceState {
+  path: string;
+  state: PolicyDocumentState;
+}
+
+export type PolicySuppressionDestination = "public" | "private" | "local";
+
+export interface PolicySuppressionAuthoringParams {
+  reportRootUri: string;
+  policyDocumentUri: string;
+  policyDocumentVersion?: number | null;
+  finding: {
+    policyId: string;
+    findingId: string;
+    path: string;
+    identityStability: "strong";
+    policyHash: string;
+    sourceUri?: string;
+    sourceVersion?: number | null;
+  };
+  destination: PolicySuppressionDestination;
+  evaluationDate: string;
+  reason?: string;
+  acceptedBy?: string;
+  expiresAt?: string;
+}
+
+export interface PolicySuppressionAuthoringResponse {
+  documentUri: string;
+  expectedVersion: number | null;
+  expectedText?: string | null;
+  content: string;
+  create: boolean;
+  sourcePreconditions: PolicySuppressionSourcePrecondition[];
+}
+
+export interface PolicySuppressionSourcePrecondition {
+  path: string;
+  uri: string;
+  exists: boolean;
+  expectedVersion: number | null;
+  expectedText?: string | null;
+}
+
+const POLICY_SUPPRESSION_SOURCE_PATHS = new Set([
+  ".bifrost/suppressions.json",
+  ".bifrost/suppressions.private.json",
+  ".bifrost/suppressions.local.json"
+]);
 
 export interface PolicyExecutionMetadata {
   total_elapsed_ms: number;
@@ -291,6 +347,39 @@ export class PolicyRunTracker {
   }
 }
 
+export class ExpectedPolicySuppressionWrite {
+  private expected: { uri: string; content: string } | undefined;
+
+  expect(uri: string, content: string): void {
+    this.expected = { uri, content: normalizePolicySuppressionContent(content) };
+  }
+
+  isPending(uri: string): boolean {
+    return this.expected?.uri === uri;
+  }
+
+  observe(uri: string, content: string): boolean {
+    if (this.expected?.uri !== uri) {
+      return false;
+    }
+    if (this.expected.content === normalizePolicySuppressionContent(content)) {
+      return true;
+    }
+    this.expected = undefined;
+    return false;
+  }
+
+  clear(uri: string): void {
+    if (this.expected?.uri === uri) {
+      this.expected = undefined;
+    }
+  }
+}
+
+function normalizePolicySuppressionContent(content: string): string {
+  return content.replace(/\r\n?/g, "\n");
+}
+
 export function isRqlPolicyResponse(value: unknown): value is RqlPolicyResponse {
   if (
     !isRecord(value) ||
@@ -382,7 +471,7 @@ export function policyReportCompletedWithoutFindings(report: PolicyReport): bool
 
 export function policySuppressionAuditSummary(reviews: readonly PolicySuppressionReview[]): string {
   const applied = reviews.filter((review) => review.applied).length;
-  const stale = reviews.filter((review) => review.stale).length;
+  const orphaned = reviews.filter((review) => review.orphan_state === "orphaned").length;
   const expired = reviews.filter((review) => review.temporal_state === "expired").length;
   const drifted = reviews.filter((review) => review.policy_hash_state === "drifted").length;
   const unproven = reviews.filter((review) =>
@@ -393,7 +482,7 @@ export function policySuppressionAuditSummary(reviews: readonly PolicySuppressio
   const omitted = reviews.filter((review) => review.result_omitted).length;
   return [
     `${applied} applied`,
-    stale > 0 ? `${stale} stale` : undefined,
+    orphaned > 0 ? `${orphaned} orphaned` : undefined,
     expired > 0 ? `${expired} expired` : undefined,
     drifted > 0 ? `${drifted} drifted` : undefined,
     unproven > 0 ? `${unproven} unproven` : undefined,
@@ -401,6 +490,138 @@ export function policySuppressionAuditSummary(reviews: readonly PolicySuppressio
   ]
     .filter((part): part is string => part !== undefined)
     .join(" · ");
+}
+
+/** Return the ordered suppression source union from the current report. */
+export function policySuppressionSources(
+  evaluation: PolicyReportEvaluation
+): readonly PolicySuppressionSourceState[] {
+  return evaluation.suppression_sources;
+}
+
+/**
+ * Policy reports are authoring inputs only while their identity is strong and
+ * the retained result has not been made stale by a newer run or workspace
+ * change. The server repeats these checks before creating the edit.
+ */
+export function isPolicyFindingSuppressible(finding: PolicyFinding, stale = false): boolean {
+  return (
+    !stale &&
+    finding.suppression === null &&
+    finding.identity_stability === "strong" &&
+    finding.id.length > 0 &&
+    finding.policy_id.length > 0 &&
+    typeof finding.policy_hash === "string" &&
+    finding.policy_hash.length > 0 &&
+    finding.primary.path.length > 0
+  );
+}
+
+/**
+ * Check that a suppression target still belongs to the live published run.
+ * The generation and object identity prevent cached tree items or command
+ * arguments from authoring against a later policy/source revision.
+ */
+export function isCurrentPolicyFinding(
+  finding: PolicyFinding,
+  findingGeneration: number | undefined,
+  currentGeneration: number,
+  liveStale: boolean,
+  currentFinding: PolicyFinding | undefined
+): boolean {
+  return (
+    !liveStale &&
+    findingGeneration !== undefined &&
+    findingGeneration === currentGeneration &&
+    currentFinding === finding &&
+    isPolicyFindingSuppressible(finding)
+  );
+}
+
+/** Normalize the optional reason prompt according to project policy. */
+export function normalizeSuppressionReason(
+  value: string | undefined,
+  requireReason: boolean
+): string | undefined {
+  const trimmed = value?.trim() ?? "";
+  if (trimmed.length > 0) {
+    return trimmed;
+  }
+  return requireReason ? undefined : "unspecified";
+}
+
+export function isPolicySuppressionDestination(
+  value: unknown
+): value is PolicySuppressionDestination {
+  return value === "public" || value === "private" || value === "local";
+}
+
+export function decodePolicySuppressionAuthoringResponse(
+  value: unknown
+): PolicySuppressionAuthoringResponse | undefined {
+  if (
+    !isRecord(value) ||
+    typeof value.documentUri !== "string" ||
+    (value.expectedVersion !== null && !isNonNegativeInteger(value.expectedVersion)) ||
+    (value.expectedText !== undefined &&
+      value.expectedText !== null &&
+      typeof value.expectedText !== "string") ||
+    typeof value.content !== "string" ||
+    typeof value.create !== "boolean" ||
+    !hasCompletePolicySuppressionSourcePreconditions(value.sourcePreconditions)
+  ) {
+    return undefined;
+  }
+  return {
+    documentUri: value.documentUri,
+    expectedVersion: value.expectedVersion,
+    expectedText: value.expectedText,
+    content: value.content,
+    create: value.create,
+    sourcePreconditions: value.sourcePreconditions
+  };
+}
+
+export function hasCompletePolicySuppressionSourcePreconditions(
+  value: unknown
+): value is PolicySuppressionSourcePrecondition[] {
+  if (
+    !Array.isArray(value) ||
+    value.length !== 3 ||
+    !value.every(isPolicySuppressionSourcePrecondition)
+  ) {
+    return false;
+  }
+  const paths = new Set(value.map((source) => source.path));
+  const uris = new Set(value.map((source) => source.uri));
+  return (
+    paths.size === value.length &&
+    uris.size === value.length &&
+    value.every((source) => POLICY_SUPPRESSION_SOURCE_PATHS.has(source.path))
+  );
+}
+
+export function isPolicySuppressionSourcePrecondition(
+  value: unknown
+): value is PolicySuppressionSourcePrecondition {
+  if (
+    !isRecord(value) ||
+    typeof value.path !== "string" ||
+    value.path.length === 0 ||
+    typeof value.uri !== "string" ||
+    value.uri.length === 0 ||
+    typeof value.exists !== "boolean" ||
+    (value.expectedVersion !== null && !isNonNegativeInteger(value.expectedVersion)) ||
+    (value.expectedText !== undefined &&
+      value.expectedText !== null &&
+      typeof value.expectedText !== "string")
+  ) {
+    return false;
+  }
+  return value.exists
+    ? typeof value.expectedText === "string"
+    : value.expectedVersion === null &&
+        (value.expectedText === undefined || value.expectedText === null);
 }
 
 export function policyRunDiagnosticCodeLabel(code: PolicyRunDiagnosticCode): string {
@@ -525,6 +746,8 @@ function isPolicyFinding(value: unknown): value is PolicyFinding {
     isRecord(value) &&
     typeof value.id === "string" &&
     typeof value.policy_id === "string" &&
+    (value.identity_stability === "strong" || value.identity_stability === "weak") &&
+    typeof value.policy_hash === "string" &&
     typeof value.severity === "string" &&
     typeof value.message === "string" &&
     (value.display_path === undefined || isPolicyDisplayPath(value.display_path)) &&
@@ -601,14 +824,18 @@ function isPolicyReportEvaluation(value: unknown): value is PolicyReportEvaluati
   return (
     isRecord(value) &&
     isPolicyDate(value.evaluation_date) &&
-    typeof value.suppression_path === "string" &&
-    isPolicyDocumentState(value.suppression_document_state) &&
+    Array.isArray(value.suppression_sources) &&
+    value.suppression_sources.every(isPolicySuppressionSourceState) &&
     typeof value.scope_path === "string" &&
     isPolicyDocumentState(value.scope_document_state)
   );
 }
 
-function isPolicyDocumentState(value: unknown): boolean {
+function isPolicySuppressionSourceState(value: unknown): value is PolicySuppressionSourceState {
+  return isRecord(value) && typeof value.path === "string" && isPolicyDocumentState(value.state);
+}
+
+function isPolicyDocumentState(value: unknown): value is PolicyDocumentState {
   return (
     value === "not_evaluated" || value === "not_found" || value === "loaded" || value === "invalid"
   );
@@ -686,9 +913,15 @@ function isPolicySuppressionReview(value: unknown): value is PolicySuppressionRe
     (value.policy_hash_state === "matching" ||
       value.policy_hash_state === "drifted" ||
       value.policy_hash_state === "unknown") &&
+    (value.orphan_state === "resolved" ||
+      value.orphan_state === "orphaned" ||
+      value.orphan_state === "path_not_analyzed" ||
+      value.orphan_state === "path_unrecorded") &&
     typeof value.applied === "boolean" &&
-    typeof value.stale === "boolean" &&
-    typeof value.result_omitted === "boolean"
+    typeof value.result_omitted === "boolean" &&
+    (value.rekey_candidates === undefined ||
+      (Array.isArray(value.rekey_candidates) &&
+        value.rekey_candidates.every((candidate) => typeof candidate === "string")))
   );
 }
 

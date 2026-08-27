@@ -22,8 +22,6 @@ Index a project once, then ask fast structural questions:
 - **Usages and call graph:** scan references to a symbol, or build the
   whole-workspace caller/callee graph (feed it to PageRank for a code map).
 - **Most-relevant files:** rank the files most related to one or more seed files.
-- **Semantic search:** find code by meaning, using ONNX embeddings and a
-  cross-encoder reranker (opt-in).
 
 ## Quick start
 
@@ -77,8 +75,6 @@ exposes:
 | `rename_symbol(path, *, line=..., column=..., new_name=...)` | Return a non-mutating edit plan for a symbol rename. |
 | `usage_graph(*, include_tests=False, paths=None)` | Whole-workspace caller/callee graph; each edge carries its `{path, line}` call sites. |
 | `most_relevant_files(seed_files, *, limit=20, ...)` | Rank files related to seed files. Each result carries a `test` verdict (`test`, `test_support`, `production`, `ambiguous`); filter locally to drop tests, and raise `limit` to cover what you drop. |
-| `semantic_search(query, *, k=10)` | Meaning-based code search (opt-in). |
-| `semantic_search_status()` | Report whether the semantic index is ready. |
 | `refresh()` | Force a full re-index (recovery escape hatch). |
 | `update_paths(paths)` | Incrementally re-analyze specific paths (with `manual=True`). |
 | `activate_workspace(path)` / `get_active_workspace()` | Switch / read the active workspace root. |
@@ -198,18 +194,6 @@ is the canonical reference:
 | Positional arguments | `args` patterns match positional arguments in order as a subsequence; v2 does not require exact positions or arity. |
 | Typed pipelines | Declaration, hierarchy, and ownership steps preserve exact indexed identities; import steps follow direct workspace file edges and may be repeated; schema-v3 CFG steps expose source-backed procedure-local points and explicit one-hop edges. |
 | Unsupported capabilities | Queries against unsupported normalized kinds or roles return diagnostics instead of silently pretending the language can answer them. |
-
-## Semantic search
-
-`semantic_search(...)` searches code by meaning rather than name and returns the
-two retrieval legs directly: a function-oriented dense vector ranking over
-function-level chunks, plus a file-oriented co-edit ranking. It searches code,
-not prose.
-
-It is opt-in. Set `BIFROST_SEMANTIC_INDEX=auto` to enable background indexing;
-the models load via ONNX and download from the HuggingFace hub on first use. The
-[semantic search docs](https://bifrost.brokk.ai/semantic-search/) list
-every environment override.
 
 ## License
 

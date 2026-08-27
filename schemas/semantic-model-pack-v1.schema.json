@@ -3,6 +3,13 @@
   "title": "AuthoredSemanticModelPack",
   "type": "object",
   "properties": {
+    "carried_sources": {
+      "description": "The producer's explicit claim that it read and parsed each of these\nrelative source paths from a sources artifact while generating the pack\n(#2613). A consumer uses the inventory to distinguish a `Locator::Source`\npath the pack carries -- a legitimate authored navigation target -- from\nan upstream path the pack merely names, which must render as a durable\n`bifrost-model://` location instead.\n\nEntries are canonical relative slash-separated paths in strictly\nascending order. Serialized only when non-empty, so adding the field\nleaves the manifest bytes and digests of every pack that does not carry\nsources unchanged -- the same discipline `declared_effects` uses.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
     "compatibility": {
       "$ref": "#/$defs/Compatibility"
     },

@@ -3,11 +3,12 @@ use crate::graph::hits::{push_hit, push_self_receiver_hit, push_unproven_hit};
 use crate::graph::resolver::{
     TargetKind, TargetSpec, UnqualifiedMethodGroupResolution,
     applicable_member_candidates_for_owner, argument_count, binding_scope_node,
-    class_unit_for_fq_name, enclosing_declared_type, extension_visibility_site_key,
-    first_type_child, is_type_reference_node, member_name_is_locally_bound,
-    nearest_member_candidates_for_owner, node_text, normalize_type_text,
-    object_initializer_for_label, object_initializer_owner_type_node, receiver_targets_owner,
-    reference_type_text, resolve_arity_free_type_fq_name_at, resolve_type_fq_name_at,
+    class_unit_for_fq_name, collection_target_element_type_node, enclosing_declared_type,
+    extension_visibility_site_key, first_type_child, is_type_reference_node,
+    member_name_is_locally_bound, nearest_member_candidates_for_owner, node_text,
+    normalize_type_text, object_creation_collection_target, object_initializer_for_label,
+    object_initializer_owner_type_node, receiver_targets_owner, reference_type_text,
+    resolve_arity_free_type_fq_name_at, resolve_type_fq_name_at,
     resolve_unqualified_method_group_for_owner, resolves_to_target, resolves_to_target_at,
     same_node, seed_visible_bindings_at, type_identity_matches,
     unqualified_member_has_local_binding, unqualified_member_has_structured_shadow,
@@ -18,11 +19,12 @@ use crate::graph_support::{self, CSharpSource};
 use crate::hierarchy;
 use crate::syntax::{
     CSharpNamedArgumentLabel, csharp_attribute_terminal_name, csharp_attribute_type_names,
-    csharp_conditional_member_access, csharp_constant_pattern_type_candidate,
-    csharp_implicit_accessor_value, csharp_local_binder_name, csharp_member_access_type_receiver,
-    csharp_member_name, csharp_named_argument_label, csharp_nameof_type_candidates,
-    csharp_relational_generic_call, csharp_relational_generic_call_for_argument,
-    csharp_type_leftmost_identifier, csharp_type_reference_root, csharp_type_terminal_identifier,
+    csharp_cast_relational_generic_call_for_name, csharp_conditional_member_access,
+    csharp_constant_pattern_type_candidate, csharp_implicit_accessor_value,
+    csharp_local_binder_name, csharp_member_access_type_receiver, csharp_member_name,
+    csharp_named_argument_label, csharp_nameof_type_candidates, csharp_relational_generic_call,
+    csharp_relational_generic_call_for_argument, csharp_type_leftmost_identifier,
+    csharp_type_reference_root, csharp_type_terminal_identifier,
     csharp_unqualified_invocation_for_name,
 };
 use brokk_bifrost_core::analyzer::common::is_unparseable_source;
@@ -41,6 +43,14 @@ use std::sync::Arc;
 use tree_sitter::{Node, Tree};
 
 pub struct ScanState<'a> {
+    pub max_usages: usize,
+    pub hits: &'a mut BTreeSet<UsageHit>,
+    pub unproven_hits: &'a mut BTreeSet<UsageHit>,
+    pub limit_exceeded: &'a mut bool,
+}
+
+pub struct BatchScanState<'a> {
+    pub spec: &'a TargetSpec,
     pub max_usages: usize,
     pub hits: &'a mut BTreeSet<UsageHit>,
     pub unproven_hits: &'a mut BTreeSet<UsageHit>,
@@ -109,7 +119,42 @@ pub fn scan_prepared_file(
         class_ranges: prepared.class_ranges.clone(),
         using_aliases: &prepared.using_aliases,
     };
-    scan_node(prepared.tree.root_node(), token, &mut ctx);
+    scan_nodes(
+        prepared.tree.root_node(),
+        token,
+        std::slice::from_mut(&mut ctx),
+    );
+}
+
+pub fn scan_prepared_file_batch<'a>(
+    csharp: &'a dyn CSharpSource,
+    token: QueryToken<'_>,
+    graph: &'a CSharpGraphSource<'a>,
+    file: &'a ProjectFile,
+    prepared: &'a PreparedCSharpFile,
+    scans: &'a mut [BatchScanState<'a>],
+) {
+    let mut contexts: Vec<_> = scans
+        .iter_mut()
+        .map(|scan| ScanCtx {
+            csharp,
+            graph,
+            file,
+            source: &prepared.source,
+            line_starts: &prepared.line_starts,
+            spec: scan.spec,
+            hits: &mut *scan.hits,
+            unproven_hits: &mut *scan.unproven_hits,
+            max_usages: scan.max_usages,
+            limit_exceeded: &mut *scan.limit_exceeded,
+            enclosing_cache: HashMap::default(),
+            nearest_member_target_cache: HashMap::default(),
+            extension_target_cache: HashMap::default(),
+            class_ranges: prepared.class_ranges.clone(),
+            using_aliases: &prepared.using_aliases,
+        })
+        .collect();
+    scan_nodes(prepared.tree.root_node(), token, &mut contexts);
 }
 
 pub(super) struct ScanCtx<'a> {
@@ -149,26 +194,162 @@ enum TypeCandidateRole {
     Receiver,
 }
 
-fn scan_node(node: Node<'_>, token: QueryToken<'_>, ctx: &mut ScanCtx<'_>) {
-    if *ctx.limit_exceeded {
-        return;
-    }
-
-    match ctx.spec.kind {
-        TargetKind::Type => scan_type_reference(node, token, ctx),
-        TargetKind::Constructor => scan_constructor_reference(node, token, ctx),
-        TargetKind::Method | TargetKind::Field => {
-            scan_member_reference(node, token, ctx);
-            scan_unqualified_member_reference(node, token, ctx);
+fn scan_nodes<'tree>(root: Node<'tree>, token: QueryToken<'_>, contexts: &mut [ScanCtx<'_>]) {
+    let mut contexts_by_name: HashMap<String, Vec<usize>> = HashMap::default();
+    let mut alias_fallback_contexts = Vec::new();
+    if contexts.len() > 1 {
+        for (index, ctx) in contexts.iter().enumerate() {
+            contexts_by_name
+                .entry(ctx.spec.member_name.clone())
+                .or_default()
+                .push(index);
+            if matches!(ctx.spec.kind, TargetKind::Type | TargetKind::Constructor) {
+                alias_fallback_contexts.push(index);
+            }
         }
     }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        scan_node(child, token, ctx);
-        if *ctx.limit_exceeded {
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        let context_indexes = if contexts.len() == 1 {
+            vec![0]
+        } else {
+            batch_context_indexes_for_node(
+                node,
+                contexts[0].source,
+                contexts[0].using_aliases,
+                &contexts_by_name,
+                &alias_fallback_contexts,
+            )
+        };
+        for context_index in context_indexes {
+            let ctx = &mut contexts[context_index];
+            if *ctx.limit_exceeded {
+                continue;
+            }
+            match ctx.spec.kind {
+                TargetKind::Type => scan_type_reference(node, token, ctx),
+                TargetKind::Constructor => scan_constructor_reference(node, token, ctx),
+                TargetKind::Method | TargetKind::Field => {
+                    scan_member_reference(node, token, ctx);
+                    scan_unqualified_member_reference(node, token, ctx);
+                }
+            }
+        }
+        if contexts.iter().all(|ctx| *ctx.limit_exceeded) {
             return;
         }
+        let mut cursor = node.walk();
+        let children: Vec<_> = node.named_children(&mut cursor).collect();
+        pending.extend(children.into_iter().rev());
+    }
+}
+
+fn batch_context_indexes_for_node(
+    node: Node<'_>,
+    source: &str,
+    using_aliases: &HashMap<String, String>,
+    contexts_by_name: &HashMap<String, Vec<usize>>,
+    alias_fallback_contexts: &[usize],
+) -> Vec<usize> {
+    let mut names = Vec::new();
+
+    if node.kind() == "identifier" {
+        let name = node_text(node, source).to_string();
+        if !name.is_empty() {
+            names.push(name);
+        }
+    }
+    match node.kind() {
+        "member_access_expression" => {
+            if let Some(name) = member_access_name(node).and_then(csharp_member_name) {
+                let name = node_text(name.identifier, source).to_string();
+                if !name.is_empty() && !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+        "conditional_access_expression" => {
+            if let Some(access) = csharp_conditional_member_access(node)
+                && let Some(name) = csharp_member_name(access.name)
+            {
+                let name = node_text(name.identifier, source).to_string();
+                if !name.is_empty() && !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+        "object_creation_expression" => {
+            if let Some(type_node) = node
+                .child_by_field_name("type")
+                .or_else(|| first_type_child(node))
+            {
+                push_batch_type_candidate_name(&mut names, type_node, source);
+            }
+        }
+        "attribute" => {
+            if let Some(name) = node.child_by_field_name("name")
+                && let Some(raw) = csharp_attribute_terminal_name(name, source)
+            {
+                let terminal = raw.strip_prefix('@').unwrap_or(raw);
+                let exact = terminal.to_string();
+                if !names.contains(&exact) {
+                    names.push(exact);
+                }
+                let shorthand = format!("{terminal}Attribute");
+                if !names.contains(&shorthand) {
+                    names.push(shorthand);
+                }
+            }
+        }
+        _ => {}
+    }
+    if let Some(candidate) = csharp_constant_pattern_type_candidate(node) {
+        push_batch_type_candidate_name(&mut names, candidate, source);
+    }
+    if let Some(receiver) = csharp_member_access_type_receiver(node) {
+        push_batch_type_candidate_name(&mut names, receiver, source);
+    }
+    if let Some((operand, qualified_owner)) = csharp_nameof_type_candidates(node, source) {
+        push_batch_type_candidate_name(&mut names, operand, source);
+        if let Some(owner) = qualified_owner {
+            push_batch_type_candidate_name(&mut names, owner, source);
+        }
+    }
+    if let Some(type_root) = csharp_type_reference_root(node)
+        && same_node(type_root, node)
+        && !is_declaration_name(type_root)
+    {
+        push_batch_type_candidate_name(&mut names, type_root, source);
+    }
+
+    let alias_seen = names.iter().any(|name| using_aliases.contains_key(name));
+    let mut indexes = Vec::new();
+    for name in names {
+        if let Some(matching) = contexts_by_name.get(&name) {
+            for index in matching {
+                if !indexes.contains(index) {
+                    indexes.push(*index);
+                }
+            }
+        }
+    }
+    if alias_seen {
+        for index in alias_fallback_contexts {
+            if !indexes.contains(index) {
+                indexes.push(*index);
+            }
+        }
+    }
+    indexes
+}
+
+fn push_batch_type_candidate_name(names: &mut Vec<String>, candidate: Node<'_>, source: &str) {
+    let Some(terminal) = csharp_type_terminal_identifier(candidate) else {
+        return;
+    };
+    let name = normalize_type_text(node_text(terminal, source));
+    if !name.is_empty() && !names.contains(&name) {
+        names.push(name);
     }
 }
 
@@ -676,13 +857,13 @@ fn scan_unqualified_member_reference(node: Node<'_>, token: QueryToken<'_>, ctx:
         return;
     }
     match ctx.spec.kind {
-        TargetKind::Method if csharp_unqualified_invocation_for_name(node).is_some() => {
-            let (invocation, explicit_generic_arity) =
-                csharp_unqualified_invocation_for_name(node).expect("call shape was checked");
+        TargetKind::Method if unqualified_call_shape(node, ctx.source).is_some() => {
+            let (call_arity, explicit_generic_arity) =
+                unqualified_call_shape(node, ctx.source).expect("call shape was checked");
             match unqualified_method_call_resolution(
                 node,
                 token,
-                invocation,
+                call_arity,
                 explicit_generic_arity,
                 ctx,
             ) {
@@ -804,6 +985,15 @@ fn scan_unqualified_member_reference(node: Node<'_>, token: QueryToken<'_>, ctx:
     }
 }
 
+fn unqualified_call_shape(node: Node<'_>, source: &str) -> Option<(usize, Option<usize>)> {
+    if let Some((invocation, explicit_generic_arity)) = csharp_unqualified_invocation_for_name(node)
+    {
+        return Some((argument_count(invocation, source), explicit_generic_arity));
+    }
+    csharp_cast_relational_generic_call_for_name(node)
+        .map(|call| (call.call_arity, Some(call.explicit_generic_arity)))
+}
+
 pub(super) fn is_unqualified_method_group_value(node: Node<'_>, source: &str) -> bool {
     if node.kind() != "identifier"
         || is_declaration_name(node)
@@ -921,7 +1111,7 @@ fn is_delegate_binary_operand(current: Node<'_>, parent: Node<'_>) -> bool {
 fn unqualified_method_call_resolution(
     node: Node<'_>,
     token: QueryToken<'_>,
-    invocation: Node<'_>,
+    call_arity: usize,
     explicit_generic_arity: Option<usize>,
     ctx: &mut ScanCtx<'_>,
 ) -> TargetMemberResolution {
@@ -934,7 +1124,7 @@ fn unqualified_method_call_resolution(
     if ctx
         .spec
         .callable_arity
-        .is_some_and(|arity| !arity.accepts(argument_count(invocation, ctx.source)))
+        .is_some_and(|arity| !arity.accepts(call_arity))
     {
         // A signature-specific target is incompatible, but FQN-grouped callers
         // still need conservative cross-overload evidence rather than a proof of
@@ -960,7 +1150,7 @@ fn unqualified_method_call_resolution(
     else {
         return TargetMemberResolution::NotFound;
     };
-    let call_arity = Some(argument_count(invocation, ctx.source));
+    let call_arity = Some(call_arity);
     let direct = receiver_fqn_target_member_resolution(
         &owner.fq_name(),
         token,
@@ -1106,7 +1296,11 @@ fn object_initializer_label_owner_resolution(
     let Some(initializer) = object_initializer_for_label(node) else {
         return LabelOwnerResolution::NotLabel;
     };
-    let Some(type_node) = object_initializer_owner_type_node(initializer) else {
+    let type_node = object_initializer_owner_type_node(initializer).or_else(|| {
+        let target = object_creation_collection_target(initializer)?;
+        collection_target_element_type_node(target, ctx.source)
+    });
+    let Some(type_node) = type_node else {
         return LabelOwnerResolution::Unknown;
     };
     let Some(receiver_fqn) = resolve_type_fq_name_at(
@@ -1178,6 +1372,7 @@ pub fn is_declaration_name(node: Node<'_>) -> bool {
             | "record_struct_declaration"
             | "method_declaration"
             | "local_function_statement"
+            | "delegate_declaration"
             | "constructor_declaration"
             | "property_declaration"
             | "variable_declarator"

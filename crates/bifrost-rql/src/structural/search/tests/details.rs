@@ -1,5 +1,109 @@
 use super::*;
 
+/// Parameter decorator rows keep the decorator application anchored to its
+/// parameter while resolving aliased imports structurally. A same-named
+/// decoy remains a separate binding, so policies can select the module target
+/// without relying on the local spelling (#2644).
+#[test]
+fn decorated_parameter_rows_expose_aliased_import_identity_and_near_miss() {
+    let source = r#"
+import { Query as NestQuery } from "@nestjs/common";
+import { Query as DecoyQuery } from "./decoy";
+
+class Controller {
+    method(@NestQuery() @DecoyQuery() @Unknown() value: string, other: string) {}
+}
+"#;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().canonicalize().expect("canonical root");
+    ProjectFile::new(root.clone(), PathBuf::from("app.ts"))
+        .write(source)
+        .expect("write TypeScript source");
+    let workspace = WorkspaceAnalyzer::build_ephemeral(
+        Arc::new(TestProject::new(root, Language::TypeScript)),
+        AnalyzerConfig::default(),
+    )
+    .expect("ephemeral TypeScript workspace should build");
+    let query = CodeQuery::from_json(&json!({
+        "match": { "kind": "parameter" },
+        "steps": [{ "op": "decorator_bindings" }],
+        "result_detail": "full"
+    }))
+    .expect("decorator binding query");
+
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    assert_eq!(result.results.len(), 3, "{}", result.render_text());
+    let rows = result
+        .results
+        .iter()
+        .map(|item| match &item.value {
+            CodeQueryResultValue::DecoratedParameter { value } => value,
+            other => panic!("expected decorated parameter row, got {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    let nest = rows
+        .iter()
+        .find(|row| row.module.as_deref() == Some("@nestjs/common"))
+        .expect("aliased NestQuery row");
+    let decoy = rows
+        .iter()
+        .find(|row| row.module.as_deref() == Some("./decoy"))
+        .expect("same-named decoy row");
+    assert_eq!(nest.decorator_name, "NestQuery");
+    assert_eq!(nest.imported_name.as_deref(), Some("Query"));
+    assert_eq!(nest.binding_status, "imported");
+    assert_eq!(decoy.decorator_name, "DecoyQuery");
+    assert_eq!(decoy.imported_name.as_deref(), Some("Query"));
+    assert_eq!(decoy.binding_status, "imported");
+    let unknown = rows
+        .iter()
+        .find(|row| row.decorator_name == "Unknown")
+        .expect("unresolved decorator row");
+    assert_eq!(unknown.binding_status, "unresolved");
+    assert_eq!(unknown.completion, "incomplete");
+    assert_eq!(unknown.coverage, "partial");
+    assert!(unknown.reason.is_some());
+    assert_eq!(nest.parameter_id, decoy.parameter_id);
+    assert_ne!(nest.decorator_id, decoy.decorator_id);
+    assert_eq!(nest.range.start_line, nest.range.end_line);
+    assert_eq!(nest.range.start_column, nest.decorator_range.start_column);
+    assert!(nest.range.end_column > nest.decorator_range.end_column);
+    assert!(decoy.decorator_range.start_column > nest.decorator_range.start_column);
+    assert!(rows.iter().all(|row| row.decorator_id.is_some()));
+    assert!(rows.iter().all(|row| row.parameter_ordinal.is_some()));
+    assert!(rows.iter().all(|row| row.port_id.is_some()));
+
+    let filtered_query = CodeQuery::from_json(&json!({
+        "match": { "kind": "parameter" },
+        "steps": [{
+            "op": "decorator_bindings",
+            "module": "@nestjs/common",
+            "imported_name": "Query"
+        }]
+    }))
+    .expect("exact identity filter query");
+    let filtered = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &filtered_query,
+    );
+    assert_eq!(filtered.results.len(), 1, "{}", filtered.render_text());
+    assert!(matches!(
+        filtered.completion(),
+        CodeQueryCompletion::Incomplete { .. }
+    ));
+    let filtered_row = match &filtered.results[0].value {
+        CodeQueryResultValue::DecoratedParameter { value } => value,
+        other => panic!("expected decorated parameter row, got {other:?}"),
+    };
+    assert_eq!(filtered_row.module.as_deref(), Some("@nestjs/common"));
+    assert_eq!(filtered_row.imported_name.as_deref(), Some("Query"));
+}
+
 #[test]
 fn detailed_execution_aligns_evidence_hashes_owners_and_direct_work() {
     let source = r#"export function handler(input: string) {

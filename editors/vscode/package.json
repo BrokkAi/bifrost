@@ -2,9 +2,9 @@
   "name": "bifrost-vscode",
   "displayName": "Bifrost: Multi-Language LSP & MCP Server",
   "description": "Tree-sitter-backed code intelligence for definitions, references, symbols, hierarchy, rename, diagnostics, and MCP workflows.",
-  "version": "0.10.6",
+  "version": "0.10.7",
   "bifrost": {
-    "binaryVersion": "0.10.6",
+    "binaryVersion": "0.10.7",
     "minimumBinaryVersion": "0.10.3",
     "allowPrerelease": false,
     "archiveSha256": {
@@ -223,6 +223,11 @@
           "type": "boolean",
           "default": false,
           "description": "Publish Bifrost unrecognized-symbol diagnostics. This experimental lint is disabled by default because it can report false positives."
+        },
+        "bifrost.requireSuppressionReason": {
+          "type": "boolean",
+          "default": false,
+          "description": "Require a nonblank reason when authoring a Bifrost policy suppression. Workspace settings can make this project policy strict."
         }
       }
     },
@@ -252,6 +257,11 @@
         "title": "Bifrost: Show Output"
       },
       {
+        "command": "bifrost.clearRqlPolicyResults",
+        "title": "Bifrost: Clear Policy Results",
+        "icon": "$(clear-all)"
+      },
+      {
         "command": "bifrost.runRqlQuery",
         "title": "Bifrost: Run RQL Query",
         "icon": "$(play)"
@@ -268,6 +278,10 @@
       {
         "command": "bifrost.openRqlPolicyFinding",
         "title": "Bifrost: Open RQL Policy Finding"
+      },
+      {
+        "command": "bifrost.suppressRqlPolicyFinding",
+        "title": "Bifrost: Suppress finding..."
       },
       {
         "command": "bifrost.openRqlPolicyDisplayStep",
@@ -319,6 +333,10 @@
           "when": "false"
         },
         {
+          "command": "bifrost.suppressRqlPolicyFinding",
+          "when": "false"
+        },
+        {
           "command": "bifrost.openRqlPolicyDisplayStep",
           "when": "false"
         },
@@ -339,10 +357,24 @@
           "group": "navigation@1"
         }
       ],
+      "view/title": [
+        {
+          "command": "bifrost.clearRqlPolicyResults",
+          "when": "view == bifrost.policyResults",
+          "group": "navigation@1"
+        }
+      ],
       "editor/context": [
         {
           "command": "bifrost.showRuneIr",
           "when": "resourceLangId == java || resourceLangId == javascript || resourceLangId == javascriptreact || resourceLangId == typescript || resourceLangId == typescriptreact || resourceLangId == rust || resourceLangId == go || resourceLangId == python || resourceLangId == c || resourceLangId == cpp || resourceLangId == csharp || resourceLangId == php || resourceLangId == scala || resourceLangId == kotlin || resourceLangId == ruby",
+          "group": "navigation@10"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "bifrost.suppressRqlPolicyFinding",
+          "when": "view == bifrost.policyResults && viewItem == bifrost.policyFindingSuppressible",
           "group": "navigation@10"
         }
       ]

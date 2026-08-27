@@ -1003,16 +1003,25 @@ fn source_ranges_for_code_unit(
     code_unit: &CodeUnit,
     render_cache: &mut SourceRenderCache,
 ) -> Vec<Range> {
+    // The unit's own recorded ranges are the floor for every unit, function or
+    // not. A function additionally unions the ranges of its same-name siblings
+    // in the same file (a C++ header declaration and its body definition), but
+    // that union is an addition, never a replacement: `definitions()` matches
+    // on `in_declarations` alone, so a unit the resolver reached through the
+    // wider `(in_declarations OR in_definition_lookup)` membership -- a JS
+    // member assignment whose receiver is a local binding, such as
+    // `angular.mock.$LogProvider` inside an IIFE -- has no row there at all.
+    // Deriving its ranges only from `definitions()` rendered nothing, so a
+    // selector the resolver had just printed answered not_found (#1057).
+    let mut ranges = analyzer.ranges(code_unit);
     if !code_unit.is_function() {
-        return analyzer.ranges(code_unit);
+        return ranges;
     }
 
     let fq_name = code_unit.fq_name();
     if let Some(ranges_by_source) = render_cache.function_ranges_by_name.get(&fq_name) {
-        return ranges_by_source
-            .get(code_unit.source())
-            .cloned()
-            .unwrap_or_default();
+        extend_with_sibling_ranges(&mut ranges, ranges_by_source, code_unit.source());
+        return ranges;
     }
 
     // A broad macro or function name can resolve to many files. Collect each
@@ -1026,14 +1035,24 @@ fn source_ranges_for_code_unit(
             .or_default()
             .extend(analyzer.ranges(&candidate));
     }
-    let ranges = ranges_by_source
-        .get(code_unit.source())
-        .cloned()
-        .unwrap_or_default();
+    extend_with_sibling_ranges(&mut ranges, &ranges_by_source, code_unit.source());
     render_cache
         .function_ranges_by_name
         .insert(fq_name, ranges_by_source);
     ranges
+}
+
+/// Append this file's same-name declaration ranges to the unit's own. The sole
+/// caller sorts and dedups by `(start_byte, end_byte)` before rendering, so the
+/// overlap between the two sets needs no handling here.
+fn extend_with_sibling_ranges(
+    ranges: &mut Vec<Range>,
+    ranges_by_source: &HashMap<ProjectFile, Vec<Range>>,
+    source: &ProjectFile,
+) {
+    if let Some(siblings) = ranges_by_source.get(source) {
+        ranges.extend(siblings.iter().copied());
+    }
 }
 
 fn source_blocks_for_code_unit_with_cache(

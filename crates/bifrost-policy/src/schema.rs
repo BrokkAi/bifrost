@@ -132,6 +132,10 @@ impl OwnerApplicability {
     pub const POLICY_FLOW: Self = Self::new(DocumentOwners::POLICY, AnalysisOwners::FLOW);
     pub const POLICY_TAINT_OR_FLOW: Self =
         Self::new(DocumentOwners::POLICY, AnalysisOwners::TAINT_OR_FLOW);
+    /// Reusable endpoint documents have no analysis discriminator, while
+    /// policy documents may use the row selector only for taint or flow.
+    pub const ENDPOINT_OR_POLICY_TAINT_OR_FLOW: Self =
+        Self::new(DocumentOwners::BOTH, AnalysisOwners::TAINT_OR_FLOW);
     pub const POLICY_TAINT_TYPESTATE_OR_FLOW: Self = Self::new(
         DocumentOwners::POLICY,
         AnalysisOwners::TAINT_TYPESTATE_OR_FLOW,
@@ -240,6 +244,7 @@ policy_records! {
     Policy { labels: ["policy"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ALL, signature: "(policy [:schema-version N] :id ID :name NAME :message MESSAGE :severity SEVERITY :analysis ANALYSIS ...)", description: "Define one executable static-analysis policy." }
     Endpoint { labels: ["endpoint"], layout: KeywordPairs, owner: OwnerApplicability::ENDPOINT, signature: "(endpoint [:schema-version N] :id ID :name NAME :display-name TEXT :role source|sink ...)", description: "Define one diagnostic-neutral reusable source or sink endpoint." }
     Analysis { labels: ["analysis"], layout: Mixed, owner: OwnerApplicability::POLICY_ALL, signature: "(analysis :type match|taint|typestate|assertion|flow ...)", description: "Select and configure exactly one policy analysis kind." }
+    RowSelector { labels: ["row-selector"], layout: Mixed, owner: OwnerApplicability::ENDPOINT_OR_POLICY_TAINT_OR_FLOW, signature: "(row-selector :output NAME (bind|filter|project|join|call|call-argument) ...)", description: "Select one bounded typed relational endpoint relation from exact call and binding rows." }
     Bind { labels: ["bind"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(bind :name NAME (:query SELECTOR | :from NAME :step STEP))", description: "Bind one named typed row relation from a CodeQuery or an earlier binding expansion." }
     Filter { labels: ["filter"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(filter :over NAME :where ((BINDING.FIELD OP VALUE)...))", description: "Narrow one named row relation to the rows that satisfy every listed typed predicate. The relation keeps its name and its columns; only its rows change." }
     Project { labels: ["project"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(project :name NEW :from NAME :columns (BINDING.FIELD|(BINDING.FIELD NEW-FIELD)...))", description: "Publish a new named row relation holding chosen, optionally renamed, columns of an existing one. The projected relation takes the place of the one it reads." }
@@ -254,6 +259,7 @@ policy_records! {
     AssertResolution { labels: ["assert-resolution"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-resolution :id ID :at CAPTURE :role ROLE :expect-tier TIER [:at-least true|false] [:forbid-tier TIER] [:require-unique true|false])", description: "Require the resolver's selected candidate for one captured reference to sit at, or above, one precedence tier." }
     AssertBindingScope { labels: ["assert-binding-scope"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-binding-scope :id ID :at CAPTURE :role ROLE :declared inside|outside :relative-to CAPTURE)", description: "Require the binding of one captured reference to be declared inside or outside a second captured node." }
     AssertValueOrigin { labels: ["assert-value-origin"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-value-origin :id ID :at CAPTURE :role ROLE :established inside|outside :relative-to CAPTURE)", description: "Require the value read at one captured reference to be established -- by its binding's declaring scope, or by an assignment reaching that binding -- inside or outside a second captured node." }
+    AssertOriginShape { labels: ["assert-origin-shape"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-origin-shape :id ID :at LOOP_CAPTURE :anchor CAPTURE :role ROLE :shape collection-literal :max-elements N)", description: "Require the captured loop's iterated expression to provably originate from a collection literal with at most N elements. Inverted polarity: anything short of positive proof -- a loop with no iterated expression in evidence, no lexical binding, no establishing initializer, or a non-qualifying initializer -- violates and keeps the finding, which anchors at the anchor capture." }
     AssertBoundary { labels: ["assert-boundary"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-boundary :id ID :at CAPTURE :role ROLE :forbid-fallback-past external_declared_unindexed|external_unknown)", description: "Forbid a name-only fallback selection once resolution reached or passed one authoritative boundary." }
     AssertGeneration { labels: ["assert-generation"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-generation :id ID :at CAPTURE [:kind KIND] [:cardinality (exactly N)] [:forbid-dynamic true|false])", description: "Require one captured generation site to materialize an exact generated set, optionally forbidding dynamic inputs." }
     AssertDeclarationState { labels: ["assert-declaration-state"], layout: KeywordPairs, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(assert-declaration-state :id ID :at CAPTURE [:origin ORIGIN] [:declaration-only true|false] [:config-gated true|false])", description: "Require one captured declaration's state row to carry an expected origin, declaration-only flag, or configuration gate." }
@@ -527,6 +533,7 @@ macro_rules! value_shapes {
                     Self::GenerationKind => Some(AtomDomain::GenerationKind),
                     Self::DeclarationOrigin => Some(AtomDomain::DeclarationOrigin),
                     Self::DeclaredContainment => Some(AtomDomain::DeclaredContainment),
+                    Self::OriginShape => Some(AtomDomain::OriginShape),
                     Self::BoundaryStrength => Some(AtomDomain::BoundaryStrength),
                     Self::UsageSurface => Some(AtomDomain::UsageSurface),
                     Self::EdgeClassAxis => Some(AtomDomain::EdgeClassAxis),
@@ -540,7 +547,8 @@ macro_rules! value_shapes {
                     | Self::AssertCardinality
                     | Self::AssertEntries
                     | Self::EdgeClassValues
-                    | Self::AssertionPlanEntries => None,
+                    | Self::AssertionPlanEntries
+                    | Self::RowSelectorEntries => None,
                     Self::SchemaVersion
                     | Self::PolicyId
                     | Self::EndpointId
@@ -641,7 +649,11 @@ macro_rules! value_shapes {
                     Self::Message => &[PolicyRecord::GeneratedMessage],
                     Self::Severity => &[PolicyRecord::CvssSeverity],
                     Self::FixedOrUnratedSeverity => &[],
-                    Self::Selector => &[PolicyRecord::Rql, PolicyRecord::RqlFile],
+                    Self::Selector => &[
+                        PolicyRecord::Rql,
+                        PolicyRecord::RqlFile,
+                        PolicyRecord::RowSelector,
+                    ],
                     Self::EndpointBinding
                     | Self::PolicyPort
                     | Self::TypestateBinding
@@ -729,6 +741,7 @@ macro_rules! value_shapes {
                         PolicyRecord::AssertResolution,
                         PolicyRecord::AssertBindingScope,
                         PolicyRecord::AssertValueOrigin,
+                        PolicyRecord::AssertOriginShape,
                         PolicyRecord::AssertBoundary,
                         PolicyRecord::AssertGeneration,
                         PolicyRecord::AssertDeclarationState,
@@ -751,6 +764,14 @@ macro_rules! value_shapes {
                         PolicyRecord::RowAssert,
                         PolicyRecord::RowAssertSelectedInWinningTier,
                     ],
+                    Self::RowSelectorEntries => &[
+                        PolicyRecord::Bind,
+                        PolicyRecord::Filter,
+                        PolicyRecord::Project,
+                        PolicyRecord::Join,
+                        PolicyRecord::CallArgument,
+                        PolicyRecord::Call,
+                    ],
                     Self::RowAggregates => &[PolicyRecord::Aggregate],
                     Self::AssertCardinality => &[
                         PolicyRecord::CardinalityExactly,
@@ -765,6 +786,7 @@ macro_rules! value_shapes {
                     | Self::GenerationKind
                     | Self::DeclarationOrigin
                     | Self::DeclaredContainment
+                    | Self::OriginShape
                     | Self::BoundaryStrength
                     | Self::UsageSurface
                     | Self::EdgeClassAxis
@@ -867,6 +889,7 @@ value_shapes! {
     DeclarationOrigin => "parsed, generated, or recovered",
     RouteHop => "one identity route hop kind from the analyzer registry",
     DeclaredContainment => "inside or outside",
+    OriginShape => "collection-literal",
     BoundaryStrength => "external_declared_unindexed or external_unknown",
     UsageSurface => "external-usages or lsp-references",
     EdgeClassAxis => "relation, usage, site-class, or kind",
@@ -875,6 +898,7 @@ value_shapes! {
     EdgeClassValues => "one or more classification labels of the constrained axis",
     AssertEntries => "assert records",
     AssertionPlanEntries => "bind, filter, project, join, group, call-argument, call, relational assert, and assert-selected-in-winning-tier records",
+    RowSelectorEntries => "bind, filter, project, join, call-argument, and call records",
     RowAggregates => "aggregate records",
     RowName => "a bounded row binding, group, or aggregate name",
     RowFieldRef => "a binding.field row reference",
@@ -1108,6 +1132,8 @@ policy_fields! {
     AnalysisSubject { record: Analysis, labels: ["subject"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":subject (rql ...)|(rql-file ...)", description: "Select the subject nodes each specialized assertion is evaluated at; required with :asserts." }
     AnalysisAsserts { record: Analysis, labels: ["asserts"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: ValueMultiplicity::sequence(1, 64), shape: AssertEntries, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":asserts [(assert ...)...]", description: "Declare specialized occurrence, resolution, route, or identity invariants; required with :subject." }
     AnalysisPlanEntries { record: Analysis, labels: [], placement: FieldPlacement::VariadicPositional, required: Optional, multiplicity: ValueMultiplicity::sequence(1, 64), shape: AssertionPlanEntries, owner: OwnerApplicability::POLICY_ASSERTION, signature: "(bind|filter|project|join|group|assert ...)...", description: "Declare a bounded source-ordered relational assertion plan." }
+    RowSelectorOutput { record: RowSelector, labels: ["output"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: RowName, owner: OwnerApplicability::ENDPOINT_OR_POLICY_TAINT_OR_FLOW, signature: ":output NAME", description: "Name the live relation consumed as the endpoint selection output." }
+    RowSelectorEntries { record: RowSelector, labels: [], placement: FieldPlacement::VariadicPositional, required: Required, multiplicity: ValueMultiplicity::sequence(1, 64), shape: RowSelectorEntries, owner: OwnerApplicability::ENDPOINT_OR_POLICY_TAINT_OR_FLOW, signature: "(bind|filter|project|join|call|call-argument ...)...", description: "Declare source-ordered typed bindings and derivations for one endpoint selector." }
     AnalysisSelector { record: Analysis, labels: ["selector"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: Selector, owner: OwnerApplicability::POLICY_MATCH, signature: ":selector (rql ...)|(rql-file ...)", description: "Select positive location-bearing match results." }
     AnalysisMode { record: Analysis, labels: ["mode"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: TaintMode, owner: OwnerApplicability::POLICY_TAINT_TYPESTATE_OR_FLOW, signature: ":mode may", description: "Select the schema-version-1 may analysis mode." }
     AnalysisCallModeling { record: Analysis, labels: ["call-modeling"], placement: FieldPlacement::Keyword, required: Optional, multiplicity: SCALAR, shape: CallModelingSpec, owner: OwnerApplicability::POLICY_TAINT_TYPESTATE_OR_FLOW, signature: ":call-modeling (call-modeling :unmodeled paranoid|optimistic|require-model)", description: "Choose fallback behavior for unmodeled calls; omission defaults to paranoid." }
@@ -1386,6 +1412,12 @@ policy_fields! {
     ValueOriginAssertRole { record: AssertValueOrigin, labels: ["role"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: OccurrenceRole, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":role ROLE", description: "Name the reference-class occurrence role being reached from; capability reporting narrows to exactly this role." }
     ValueOriginEstablished { record: AssertValueOrigin, labels: ["established"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: DeclaredContainment, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":established inside|outside", description: "Require the value's origin -- its binding's declaring scope, or an assignment reaching that binding -- to be contained, or not contained, in the related capture." }
     ValueOriginRelativeTo { record: AssertValueOrigin, labels: ["relative-to"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: CaptureName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":relative-to CAPTURE", description: "Name the second subject capture whose node interval the value origins are compared against." }
+    OriginShapeAssertId { record: AssertOriginShape, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":id \"assert-id\"", description: "Set the stable assertion identity used by finding anchors and messages." }
+    OriginShapeAssertAt { record: AssertOriginShape, labels: ["at"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: CaptureName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":at CAPTURE", description: "Name the captured loop whose iterated expression's origin shape is asserted about. The loop joins to its iterated expression internally; a loop that does not iterate an expression in evidence (a while loop, a counting for) violates rather than abstaining." }
+    OriginShapeAssertAnchor { record: AssertOriginShape, labels: ["anchor"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: CaptureName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":anchor CAPTURE", description: "Name the capture the finding anchors to, so two subject matches sharing one iterated expression stay distinct findings. Must be bound by every selector alternative." }
+    OriginShapeAssertRole { record: AssertOriginShape, labels: ["role"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: OccurrenceRole, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":role ROLE", description: "Name the reference-class occurrence role the origin join reads from; capability reporting narrows to exactly this role." }
+    OriginShapeAssertShape { record: AssertOriginShape, labels: ["shape"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: OriginShape, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":shape collection-literal", description: "Name the required origin shape. The only shape today is collection-literal: an array, list, set, dictionary, or tuple display literal." }
+    OriginShapeAssertMaxElements { record: AssertOriginShape, labels: ["max-elements"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: PositiveInteger, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":max-elements N", description: "Bound the qualifying literal's element count. A literal with more elements does not satisfy the assert." }
     BoundaryAssertId { record: AssertBoundary, labels: ["id"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: LocalEntryId, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":id \"assert-id\"", description: "Set the stable assertion identity used by finding anchors and messages." }
     BoundaryAssertAt { record: AssertBoundary, labels: ["at"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: CaptureName, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":at CAPTURE", description: "Name the subject capture whose reference the candidate rows are joined to." }
     BoundaryAssertRole { record: AssertBoundary, labels: ["role"], placement: FieldPlacement::Keyword, required: Required, multiplicity: SCALAR, shape: OccurrenceRole, owner: OwnerApplicability::POLICY_ASSERTION, signature: ":role ROLE", description: "Name the reference-class occurrence role being resolved; capability reporting narrows to exactly this role." }
@@ -1512,6 +1544,7 @@ pub enum AtomDomain {
     GenerationKind,
     DeclarationOrigin,
     DeclaredContainment,
+    OriginShape,
     BoundaryStrength,
     UsageSurface,
     EdgeClassAxis,
@@ -1680,6 +1713,7 @@ atom_values! {
     TierNameOnlyFallback { domain: PrecedenceTier, spellings: ["name_only_fallback"], owner: OwnerApplicability::POLICY_ASSERTION, description: "A selection made by bare-name scan after structured routes were available." }
     DeclaredInside { domain: DeclaredContainment, spellings: ["inside"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The declaring scope is contained in the named capture." }
     DeclaredOutside { domain: DeclaredContainment, spellings: ["outside"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The declaring scope is not contained in the named capture." }
+    OriginShapeCollectionLiteral { domain: OriginShape, spellings: ["collection-literal"], owner: OwnerApplicability::POLICY_ASSERTION, description: "A collection display literal: an array, list, set, dictionary, or tuple literal." }
     BoundaryDeclaredUnindexed { domain: BoundaryStrength, spellings: ["external_declared_unindexed"], owner: OwnerApplicability::POLICY_ASSERTION, description: "The lookup reached an external root the build declares but nothing indexed." }
     SurfaceExternalUsages { domain: UsageSurface, spellings: ["external-usages", "external_usages"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Compare only edges the external-usage surface counts." }
     SurfaceLspReferences { domain: UsageSurface, spellings: ["lsp-references", "lsp_references"], owner: OwnerApplicability::POLICY_ASSERTION, description: "Compare every editor-visible edge, imports and self receivers included." }

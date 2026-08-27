@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "pack_id": "bifrost.rust-stdlib",
+  "pack_version": "1.100.0-nightly",
+  "ecosystem": "cargo",
+  "kind": {
+    "artifact_kind": "rustdoc_json_set",
+    "crates": [
+      {"name": "alloc", "path": "alloc.json"},
+      {"name": "core", "path": "core.json"},
+      {"name": "std", "path": "std.json"}
+    ]
+  },
+  "artifact": {
+    "file_name": "rust-docs-json-nightly-2026-08-24",
+    "sha256": "c7ef5e3d3c34f267d81d2c06f1d5cacced6abdfd59e51e5b8467529600ef5bce",
+    "url": "https://static.rust-lang.org/dist/2026-08-24/rust-docs-json-nightly-x86_64-unknown-linux-gnu.tar.xz",
+    "container": null
+  },
+  "compatibility": {
+    "bifrost": ">=0.10.5, <1.0.0",
+    "toolchains": [
+      {"name": "rust", "requirement": "=1.100.0-nightly"}
+    ]
+  },
+  "activation": [
+    {
+      "toolchain": {"name": "rust", "version": "=1.100.0-nightly"},
+      "targets": [],
+      "configurations": []
+    }
+  ],
+  "provenance": {
+    "source": "https://static.rust-lang.org/dist/2026-08-24/rust-docs-json-nightly-x86_64-unknown-linux-gnu.tar.xz",
+    "revision": "fb6531d550e0075b9eb9a51464f404805eec87d9"
+  },
+  "license": "MIT OR Apache-2.0",
+  "safety": {
+    "generated_code_only": true,
+    "review_required": true
+  },
+  "notices": [
+    "notices/rust-stdlib-nightly-2026-08-24.txt"
+  ],
+  "measurement_activation": {
+    "toolchain": {"name": "rust", "version": "=1.100.0-nightly"},
+    "targets": [],
+    "configurations": []
+  },
+  "measurement_queries": [
+    {"kind": "type", "name": "core.option.Option"},
+    {"kind": "type", "name": "alloc.vec.Vec"},
+    {"kind": "type", "name": "std.path.Path"}
+  ]
+}

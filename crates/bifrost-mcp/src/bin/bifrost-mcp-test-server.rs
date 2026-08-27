@@ -1,5 +1,5 @@
 use brokk_bifrost_mcp::mcp_common::McpRenderOptions;
-use brokk_bifrost_mcp::mcp_registry::{resolve_server_spec_for_render_options, workspace_is_git};
+use brokk_bifrost_mcp::mcp_registry::resolve_server_spec_for_render_options;
 use brokk_bifrost_mcp::rmcp_host::run_stdio_server_with_build_identity;
 use std::env;
 use std::path::PathBuf;
@@ -45,7 +45,6 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Arguments, Strin
                 );
             }
             "--no-line-numbers" => parsed.render_options.render_line_numbers = false,
-            "--force-semantic-cpu" => unsafe { env::set_var("BIFROST_FORCE_SEMANTIC_CPU", "1") },
             unknown => return Err(format!("unknown argument `{unknown}`")),
         }
     }
@@ -59,8 +58,7 @@ fn run(arguments: Arguments) -> Result<(), String> {
     } else {
         None
     };
-    let git_repo = initial_root.as_deref().is_none_or(workspace_is_git);
-    let spec = resolve_server_spec_for_render_options(mode, arguments.render_options, git_repo)?;
+    let spec = resolve_server_spec_for_render_options(mode, arguments.render_options)?;
     run_stdio_server_with_build_identity(
         initial_root,
         arguments.render_options,

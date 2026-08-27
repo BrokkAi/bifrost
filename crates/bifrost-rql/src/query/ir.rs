@@ -54,6 +54,8 @@ pub const MAX_OCCURRENCE_FILTER_ENTRIES: usize = 32;
 pub const MAX_ENVIRONMENT_FILTER_ENTRIES: usize = 32;
 /// Upper bound on the length of one `:name` entry of a binding filter.
 pub const MAX_BINDING_NAME_LENGTH: usize = 256;
+/// Upper bound on one exact decorator-binding identity filter value.
+pub const MAX_DECORATOR_BINDING_FILTER_LENGTH: usize = 4096;
 /// The single supported CodeQuery/RQL schema version. The pre-1.0 lineage of
 /// auto-compatible versions was collapsed to 1; a new version is minted only
 /// when an existing query stops parsing or changes meaning.
@@ -83,6 +85,12 @@ pub enum QueryValueKind {
     ReferenceSite,
     CallSite,
     ExpressionSite,
+    /// The exact normalized operand selected from a JSX attribute value.
+    ///
+    /// This is deliberately distinct from [`StructuralMatch`]: the terminal
+    /// source range is the expression operand, not the enclosing attribute,
+    /// which lets policy adapters use the row as a sink subject.
+    JsxAttributeValue,
     ReceiverAnalysis,
     ReceiverOutcome,
     ReceiverEvidence,
@@ -94,6 +102,7 @@ pub enum QueryValueKind {
     ProcedureEffect,
     CallableSignature,
     SignatureParameter,
+    DecoratedParameter,
     CallableApplicability,
     OverloadSelection,
     MemberSelection,
@@ -139,6 +148,7 @@ impl QueryValueKind {
             Self::ReferenceSite => "reference_site",
             Self::CallSite => "call_site",
             Self::ExpressionSite => "expression_site",
+            Self::JsxAttributeValue => "jsx_attribute_value",
             Self::ReceiverAnalysis => "receiver_analysis",
             Self::ReceiverOutcome => "receiver_outcome",
             Self::ReceiverEvidence => "receiver_evidence",
@@ -150,6 +160,7 @@ impl QueryValueKind {
             Self::ProcedureEffect => "procedure_effect",
             Self::CallableSignature => "callable_signature",
             Self::SignatureParameter => "signature_parameter",
+            Self::DecoratedParameter => "decorated_parameter",
             Self::CallableApplicability => "callable_applicability",
             Self::OverloadSelection => "overload_selection",
             Self::MemberSelection => "member_selection",
@@ -311,6 +322,42 @@ pub struct ReceiverTraversalFilter {
     pub capture: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsxElementIdentity {
+    Intrinsic,
+    Component,
+    Unknown,
+}
+
+impl JsxElementIdentity {
+    pub const ALL: [Self; 3] = [Self::Intrinsic, Self::Component, Self::Unknown];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Intrinsic => "intrinsic",
+            Self::Component => "component",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "intrinsic" => Some(Self::Intrinsic),
+            "component" => Some(Self::Component),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+}
+
+/// Filters for the typed JSX value projection.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct JsxAttributeValueTraversal {
+    pub identity: Option<JsxElementIdentity>,
+    pub element_name: Option<String>,
+    pub property_name: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypestateTraversal {
     pub protocol_ref: ProtocolRef,
@@ -375,6 +422,7 @@ pub enum QueryStep {
     CallSitesTo(CallSiteTraversalFilter),
     CallSitesFrom(CallSiteTraversalFilter),
     CallInput(CallInputSelector),
+    JsxAttributeValue(JsxAttributeValueTraversal),
     ReceiverTargets(ReceiverTraversalFilter),
     PointsTo(ReceiverTraversalFilter),
     MemberTargets(ReceiverTraversalFilter),
@@ -388,6 +436,7 @@ pub enum QueryStep {
     ProcedureEffects,
     CallableSignature,
     SignatureParameters,
+    DecoratorBindings(DecoratorBindingFilter),
     CallableApplicability,
     OverloadSelection,
     MemberSelection,
@@ -464,6 +513,22 @@ pub struct BindingFilter {
     pub kinds: Vec<BindingKind>,
     pub names: Vec<String>,
     pub hoisting: Vec<HoistingClass>,
+}
+
+/// Exact imported-module and imported-symbol filters for decorator-binding
+/// rows. These are deliberately scalar exact strings: a policy needs to name
+/// the resolved import identity, not approximate it with a local alias or a
+/// second predicate dialect.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DecoratorBindingFilter {
+    pub module: Option<String>,
+    pub imported_name: Option<String>,
+}
+
+impl DecoratorBindingFilter {
+    pub fn is_empty(&self) -> bool {
+        self.module.is_none() && self.imported_name.is_none()
+    }
 }
 
 impl BindingFilter {
@@ -879,6 +944,7 @@ impl QueryStep {
             Self::CallSitesTo(_) => QueryStepOp::CallSitesTo,
             Self::CallSitesFrom(_) => QueryStepOp::CallSitesFrom,
             Self::CallInput(_) => QueryStepOp::CallInput,
+            Self::JsxAttributeValue(_) => QueryStepOp::JsxAttributeValue,
             Self::ReceiverTargets(_) => QueryStepOp::ReceiverTargets,
             Self::PointsTo(_) => QueryStepOp::PointsTo,
             Self::MemberTargets(_) => QueryStepOp::MemberTargets,
@@ -892,6 +958,7 @@ impl QueryStep {
             Self::ProcedureEffects => QueryStepOp::ProcedureEffects,
             Self::CallableSignature => QueryStepOp::CallableSignature,
             Self::SignatureParameters => QueryStepOp::SignatureParameters,
+            Self::DecoratorBindings(_) => QueryStepOp::DecoratorBindings,
             Self::CallableApplicability => QueryStepOp::CallableApplicability,
             Self::OverloadSelection => QueryStepOp::OverloadSelection,
             Self::MemberSelection => QueryStepOp::MemberSelection,
@@ -967,6 +1034,9 @@ impl QueryStep {
                 Some(Self::CallSitesFrom(CallSiteTraversalFilter::default()))
             }
             QueryStepOp::CallInput => Some(Self::CallInput(CallInputSelector::Receiver)),
+            QueryStepOp::JsxAttributeValue => Some(Self::JsxAttributeValue(
+                JsxAttributeValueTraversal::default(),
+            )),
             QueryStepOp::ReceiverTargets => {
                 Some(Self::ReceiverTargets(ReceiverTraversalFilter::default()))
             }
@@ -984,6 +1054,9 @@ impl QueryStep {
             QueryStepOp::ProcedureEffects => Some(Self::ProcedureEffects),
             QueryStepOp::CallableSignature => Some(Self::CallableSignature),
             QueryStepOp::SignatureParameters => Some(Self::SignatureParameters),
+            QueryStepOp::DecoratorBindings => {
+                Some(Self::DecoratorBindings(DecoratorBindingFilter::default()))
+            }
             QueryStepOp::CallableApplicability => Some(Self::CallableApplicability),
             QueryStepOp::OverloadSelection => Some(Self::OverloadSelection),
             QueryStepOp::MemberSelection => Some(Self::MemberSelection),
@@ -1073,6 +1146,7 @@ impl QueryStep {
                 | QueryValueKind::ReferenceSite
                 | QueryValueKind::CallSite
                 | QueryValueKind::ExpressionSite
+                | QueryValueKind::JsxAttributeValue
                 | QueryValueKind::ReceiverAnalysis
                 | QueryValueKind::ReceiverOutcome
                 | QueryValueKind::ReceiverEvidence
@@ -1084,6 +1158,7 @@ impl QueryStep {
                 | QueryValueKind::ProcedureEffect
                 | QueryValueKind::CallableSignature
                 | QueryValueKind::SignatureParameter
+                | QueryValueKind::DecoratedParameter
                 | QueryValueKind::CallableApplicability
                 | QueryValueKind::OverloadSelection
                 | QueryValueKind::MemberSelection
@@ -1118,6 +1193,9 @@ impl QueryStep {
                 Some(QueryValueKind::CallSite)
             }
             (Self::CallInput(_), QueryValueKind::CallSite) => Some(QueryValueKind::ExpressionSite),
+            (Self::JsxAttributeValue(_), QueryValueKind::StructuralMatch) => {
+                Some(QueryValueKind::JsxAttributeValue)
+            }
             (
                 Self::ReceiverTargets(_),
                 QueryValueKind::StructuralMatch
@@ -1167,6 +1245,9 @@ impl QueryStep {
             }
             (Self::SignatureParameters, QueryValueKind::CallableSignature) => {
                 Some(QueryValueKind::SignatureParameter)
+            }
+            (Self::DecoratorBindings(_), QueryValueKind::StructuralMatch) => {
+                Some(QueryValueKind::DecoratedParameter)
             }
             (Self::CallableApplicability, QueryValueKind::Occurrence) => {
                 Some(QueryValueKind::CallableApplicability)
@@ -1320,7 +1401,7 @@ pub(super) fn validate_query_steps(
             QueryStep::Taint(_) => "procedure",
             QueryStep::Witness(_) => "typestate_finding or flow_endpoint",
             QueryStep::FileOf => {
-                "structural_match, declaration, procedure, program_point, control_edge, typestate_finding, typestate_witness, flow_endpoint, flow_witness, taint_finding, reference_site, call_site, expression_site, receiver_analysis, receiver_outcome, receiver_evidence, occurrence, lexical_scope, or binding"
+                "structural_match, declaration, procedure, program_point, control_edge, typestate_finding, typestate_witness, flow_endpoint, flow_witness, taint_finding, reference_site, call_site, expression_site, jsx_attribute_value, receiver_analysis, receiver_outcome, receiver_evidence, occurrence, lexical_scope, or binding"
             }
             QueryStep::ImportsOf | QueryStep::ImportersOf => "file",
             QueryStep::Supertypes(_)
@@ -1333,6 +1414,7 @@ pub(super) fn validate_query_steps(
             | QueryStep::CallSitesTo(_)
             | QueryStep::CallSitesFrom(_) => "declaration",
             QueryStep::CallInput(_) => "call_site",
+            QueryStep::JsxAttributeValue(_) => "structural_match",
             QueryStep::ReceiverTargets(_) => {
                 "structural_match, reference_site, call_site, expression_site, or occurrence"
             }
@@ -1349,6 +1431,7 @@ pub(super) fn validate_query_steps(
             QueryStep::ProcedureEffects => "declaration",
             QueryStep::CallableSignature => "declaration",
             QueryStep::SignatureParameters => "callable_signature",
+            QueryStep::DecoratorBindings(_) => "structural_match",
             QueryStep::CallableApplicability | QueryStep::OverloadSelection => "occurrence",
             QueryStep::MemberSelection => "occurrence",
             QueryStep::DispatchOutcome | QueryStep::DispatchTargets => {
@@ -1927,9 +2010,10 @@ pub struct Pattern {
     /// Exact language-neutral value of a normalized boolean literal. This is
     /// semantic fact data, not a symbol name or a source-text predicate.
     pub boolean_value: Option<bool>,
-    /// Constraint on the matched call's positional argument count. `None`
-    /// leaves arity unconstrained. Meaningful on `call` facts, whose `args`
-    /// role edges carry the count; a fact without argument edges has arity 0.
+    /// Constraint on the matched fact's positional-child count. `None`
+    /// leaves arity unconstrained. Meaningful on `call` facts (`args` role
+    /// edges) and `collection_literal` facts (`elements` role edges, #2647);
+    /// a fact with neither edge family has arity 0.
     pub arity: Option<ArityConstraint>,
     /// Recorded modifier visibility of a callable declaration. Empty means
     /// unconstrained. A fact matches when its adapter-recorded visibility is
@@ -1961,6 +2045,21 @@ pub struct Pattern {
     pub decorators: Vec<Pattern>,
     pub object: Option<Box<Pattern>>,
     pub field: Option<Box<Pattern>>,
+    /// The expression a for-each loop iterates.
+    pub iterable: Option<Box<Pattern>>,
+    /// Each listed pattern must match some element of a collection literal;
+    /// matches must appear in element order but need not be contiguous.
+    pub elements: Vec<Pattern>,
+    /// The tag expression of a JSX element.
+    pub tag: Option<Box<Pattern>>,
+    /// Named and spread JSX attributes in source order.
+    pub attributes: Vec<Pattern>,
+    /// Source children of a JSX element in source order.
+    pub children: Vec<Pattern>,
+    /// The exact value expression of an attribute or object property.
+    pub value: Option<Box<Pattern>>,
+    /// The static key of an object property.
+    pub key: Option<Box<Pattern>>,
 }
 
 impl Pattern {
@@ -1998,7 +2097,16 @@ impl Pattern {
             Role::Module => self.module.as_deref(),
             Role::Object => self.object.as_deref(),
             Role::Field => self.field.as_deref(),
-            Role::Arg | Role::Kwarg | Role::Decorator => None,
+            Role::Iterable => self.iterable.as_deref(),
+            Role::Tag => self.tag.as_deref(),
+            Role::Value => self.value.as_deref(),
+            Role::Key => self.key.as_deref(),
+            Role::Arg
+            | Role::Kwarg
+            | Role::Decorator
+            | Role::Element
+            | Role::Attributes
+            | Role::Children => None,
         }
     }
 
@@ -2006,6 +2114,9 @@ impl Pattern {
         match role {
             Role::Arg => &self.args,
             Role::Decorator => &self.decorators,
+            Role::Element => &self.elements,
+            Role::Attributes => &self.attributes,
+            Role::Children => &self.children,
             Role::Callee
             | Role::Receiver
             | Role::Kwarg
@@ -2013,7 +2124,11 @@ impl Pattern {
             | Role::Right
             | Role::Module
             | Role::Object
-            | Role::Field => &[],
+            | Role::Field
+            | Role::Iterable
+            | Role::Tag
+            | Role::Value
+            | Role::Key => &[],
         }
     }
 

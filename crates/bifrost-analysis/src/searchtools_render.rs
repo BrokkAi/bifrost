@@ -28,10 +28,6 @@ pub trait RenderText {
     fn render_text(&self, options: RenderOptions) -> String;
 }
 
-// `impl RenderText for SemanticSearchResult` lives in brokk-bifrost-nlp, next to
-// the type it renders: the orphan rule requires the impl to sit in whichever of
-// the two crates it can see, and only the nlp crate depends on this one.
-
 impl RenderText for SearchSymbolsResult {
     fn render_text(&self, options: RenderOptions) -> String {
         // The cap is enforced before ranking, so a tripped request has no files

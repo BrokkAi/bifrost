@@ -22,7 +22,6 @@ const CRATE_PACKAGES = [
   "brokk-bifrost-flow",
   "brokk-bifrost-rql",
   "brokk-bifrost-policy",
-  "brokk-bifrost-nlp",
   "brokk-bifrost-runtime",
   "brokk-bifrost-semantic-packs",
   "brokk-bifrost-mcp",

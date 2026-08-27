@@ -56,7 +56,7 @@ entire `config` value):
 ```
 
 Recognized keys: `root`, `toolsets` (a Bifrost toolset expression such as
-`symbol|extended` or `core|nlp`), `serverName` (default `bifrost`; changes the
+`symbol|extended` or `core`), `serverName` (default `bifrost`; changes the
 `mcp__<serverName>__` tool prefix), `toolCallTimeoutMs` (default 240000, sized
 for first-call binary download and analyzer warm-up), `env` (extra environment
 variables for the server subprocess), and `failOnStartupError`.

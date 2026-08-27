@@ -5,6 +5,107 @@ analysis behavior, integrations, and release artifacts. It is curated from the
 complete private release range because the public open-core repository is a
 projection and its commit history does not contain every source commit.
 
+## [0.10.7] - 2026-08-27
+
+### Changed
+
+- Generated dependency semantic-model packs now persist in a versioned,
+  repository-scoped catalog, allowing CLI, MCP, LSP, Python, and policy hosts
+  to reuse locally built packs across sessions.
+- Upgraded the native Python extension to PyO3 0.29.2 and adopted its
+  interpreter-detachment API, removing the known upstream soundness defects
+  from the shipped binding dependency.
+- Removed the optional NLP and embedding-based semantic-search stack, including
+  its Cargo feature and crate, MCP toolset, Python API, model sidecars, and
+  accelerator controls. Structured semantic analysis, semantic-model packs,
+  and seed-based relevant-file ranking remain available.
+- Structural queries can now address a for-each loop's iterated expression
+  (`iterable` role), collection display literals (`collection_literal`, a
+  `literal` subtype), and their entries (`elements` role, counted by the
+  `arity` predicate) in JavaScript, TypeScript, Python, Java, and Rust.
+- Added the `assert-origin-shape` policy assertion: a review-prompt policy can
+  withdraw a finding when the enclosing loop's iterated expression provably
+  resolves to a small collection literal, and keeps it in every unproven case.
+  `bifrost.code-smells` 2.2.0 applies it to `file-read-in-loop` and
+  `parsing-in-loop`, so loops over small fixed literal collections -- the
+  dominant accepted-suppression cluster -- stop reporting.
+- Demoted the built-in `bifrost.code-smells` loop-containment family (file
+  reads, parsing, serialization, regex compilation, subprocess launches,
+  network and database calls in a loop, and the nested-loop variant) from
+  `warning` to `note` (pack 2.1.0). These policies are review prompts that
+  cannot prove per-iteration cost, so they no longer fail a
+  `--fail-on warning` gate; `--fail-on note` restores the stricter behavior.
+- Semantic-model packs now record which source paths their producer actually
+  parsed from a sources artifact, and navigation uses that inventory: a
+  dependency source the pack carries stays an authored navigation target, while
+  a source path a pack merely names without carrying it resolves to the durable
+  `bifrost-model://` identity instead of an unopenable external path. The field
+  is additive, so existing packs keep their bytes and digests; packs published
+  before it exist fall back to the model URI for out-of-workspace sources.
+- Scala value-flow and taint analysis now decides the object, field, alias, and
+  array strata. Member and element assignments lower into real heap stores and
+  loads with resolved member identities, a class's primary constructor
+  publishes the stores for the members it initializes, `new Array[T](n)` is an
+  allocation rather than an unresolvable call, and a single typed `catch` arm
+  binds the thrown value to its parameter. Together with the relay and
+  control-transfer repairs in the same series -- proven identity returns,
+  language-defined operators, `var` reassignment, and two-armed `if` values --
+  Scala reaches the same decided answers on these shapes that Java and Go
+  already gave, instead of reporting them as open.
+- Scala now folds a constant `if` condition to its taken arm and publishes the
+  guard fact, and a `while` loop whose counter is provably below a literal
+  bound on entry routes straight into its first iteration. A branch guarded by
+  `if (false)` and a value overwritten by a provably entered loop no longer
+  report taint that no execution can carry.
+- Rust value-flow and taint analysis now decides direct calls and returns,
+  constant branches, local assignments, and single-selector field and array
+  stores and loads when their targets are structurally known. Array literals
+  now carry allocation identities, allowing a later write to one exact element
+  to replace the element's prior value instead of conservatively retaining it.
+
+### Fixed
+
+- C and C++ procedure value-flow snapshots now complete for ordinary scalar
+  code instead of reporting a blanket unknown. The C-family adapter treats
+  by-value transfers as exact wherever the language guarantees it (all of C,
+  and C++ scalar types; C++ class-typed copies keep their conservative gap),
+  models taint through arithmetic, unary, and cast expressions, folds constant
+  branch conditions and literal-bounded counted-loop entries with published
+  guard facts, and publishes evaluation-order and initializer gaps only where
+  the order or transfer is genuinely unmodeled. C++ calls that elide a
+  defaulted argument now carry an explicit unsupported-binding gap. On the
+  DataFlowBench C taint kernel this moves decided core assertions from 2 to 28
+  of 48 with no wrong decisions; the remaining incompleteness is the
+  undeclared struct, pointer, and array memory model and function-pointer
+  dispatch.
+- Fixed the 0.10.6 `analyze_diff` performance regression on Rust workspaces:
+  reference resolution rebuilt a whole-file lexical scope index for every
+  occurrence it inspected, so review-sized Rust diffs no longer completed
+  within practical time budgets. The index is now memoized per distinct source,
+  and both diff endpoints share the memo.
+- Extended that per-occurrence rebuild fix across the other languages'
+  reference resolution: the per-file enclosing-class index is now built at
+  most once per request instead of once per occurrence (previously rebuilt
+  inside per-import and per-preceding-binding loops in Scala, and per
+  occurrence in C#, PHP, and C++), whole-file re-parses during Java, Kotlin,
+  Go, and PHP resolution are memoized per distinct source, Scala's bulk
+  call-site fast path now reuses the shared lookup and import context instead
+  of rebuilding them per occurrence, and C# memoizes its per-file and
+  workspace `using` namespace sets. This addresses the corresponding
+  `scan_usages`, `dead_code_smells`, and `analyze_diff` slowdowns on
+  non-Rust workspaces.
+- A one-shot `--tool` run now detects that its parent process died, cancels
+  the in-flight analysis, and exits, instead of surviving as an orphan
+  consuming a full core after the caller's timeout kill.
+- Bound persisted workspace queries to immutable worktree revisions, preserving
+  retained-analyzer results across concurrent worktree publication and avoiding
+  large temporary candidate tables during Java reverse-reference analysis.
+- Python call binding now handles a method invoked on a call result when the
+  receiver's return type proves the target, so calls such as
+  `make_store().put(key)` bind receiver, positional, and defaulted formals
+  without falling back to `receiver_binding_unsupported`. Unresolved and
+  spread-argument cases retain their explicit incomplete outcomes.
+
 ## [0.10.6] - 2026-08-25
 
 ### Added
@@ -31,6 +132,10 @@ projection and its commit history does not contain every source commit.
 
 ### Changed
 
+- Made compatible discovered semantic packs activate by default across CLI,
+  MCP, and LSP policy hosts, with one workspace configuration and attributable
+  activation state in policy reports; an explicit empty ecosystem list
+  disables ambient activation without fabricating external declarations.
 - Split flow solvers and RQL execution into dedicated public crates, reducing
   analyzer coupling while preserving the facade query API and wire formats.
 - Made reusable flow caches explicitly owned by each logical workspace so MCP,

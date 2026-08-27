@@ -749,6 +749,82 @@ fn capture_slot_requires_a_subject_specific_binding_gap() {
 }
 
 #[test]
+fn one_point_publishes_one_gap_per_scoped_fact() {
+    let key = key();
+    let mut procedure = minimal_procedure(&key, ProcedureId::new(0), "one_fact", 1);
+    let point = ProgramPointId::new(0);
+    let source = SourceMappingId::new(0);
+    let evidence = EvidenceId::new(0);
+    for (id, capability) in [
+        (SemanticGapId::new(0), SemanticCapability::Calls),
+        (SemanticGapId::new(1), SemanticCapability::Calls),
+    ] {
+        procedure.gaps.push(SemanticGap {
+            id,
+            point,
+            subject: SemanticGapSubject::Point,
+            capability,
+            impacts: SemanticGapImpacts::for_gap(capability, SemanticGapSubject::Point),
+            kind: SemanticGapKind::Unknown,
+            budget: None,
+            discharge: SemanticGapDischarge::None,
+            detail: "implicit runtime behavior is not lowered".into(),
+            source,
+            evidence,
+        });
+    }
+    let mut events = procedure.points[0].events.to_vec();
+    events.extend([
+        SemanticEvent::new(
+            SemanticEffect::Gap {
+                gap: SemanticGapId::new(0),
+            },
+            source,
+            evidence,
+        ),
+        SemanticEvent::new(
+            SemanticEffect::Gap {
+                gap: SemanticGapId::new(1),
+            },
+            source,
+            evidence,
+        ),
+    ]);
+    procedure.points[0].events = events.into_boxed_slice();
+
+    let error = SemanticArtifact::try_new(
+        key.clone(),
+        capabilities(&[
+            SemanticCapability::Calls,
+            SemanticCapability::ResourceManagement,
+        ]),
+        vec![procedure.clone()],
+    )
+    .expect_err("two rows for the same point, subject, and capability are not a coherent report");
+    assert_eq!(error.kind(), SemanticIrErrorKind::GapContract);
+    assert!(
+        error.detail().contains("duplicates the same scoped fact"),
+        "unexpected duplicate-gap detail: {}",
+        error.detail()
+    );
+
+    procedure.gaps[1].capability = SemanticCapability::ResourceManagement;
+    procedure.gaps[1].impacts = SemanticGapImpacts::for_gap(
+        SemanticCapability::ResourceManagement,
+        SemanticGapSubject::Point,
+    );
+    SemanticArtifact::try_new(
+        key,
+        capabilities(&[
+            SemanticCapability::Calls,
+            SemanticCapability::ResourceManagement,
+        ]),
+        vec![procedure],
+    )
+    .expect("distinct capabilities at one point remain distinct scoped facts");
+}
+
+#[test]
 fn receiver_capture_requires_a_receiver_value() {
     let key = key();
     let mut outer = minimal_procedure(&key, ProcedureId::new(0), "outer", 1);

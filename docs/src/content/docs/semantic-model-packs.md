@@ -30,6 +30,41 @@ literals, declared scalar captures, ordered concatenation, and named ASCII case
 transforms. Procedure summaries are bounded typed records, not executable
 models or source-text matching rules.
 
+## Workspace pack activation
+
+The CLI policy runner, MCP host, and LSP host share one workspace activation
+contract: `.bifrost/packs.json`. The document is optional and, when present,
+must use schema version `1`:
+
+```json
+{
+  "schema_version": 1,
+  "catalog": ".bifrost/semantic-pack-catalog",
+  "ecosystems": ["jvm", "python"],
+  "enable": ["org.example:jdk-21"]
+}
+```
+
+`catalog` is a workspace-relative catalog directory. Omitting it stores locally
+generated packs in the repository's versioned `.bifrost/cache` catalog, shared
+with linked worktrees and relocated by the normal Bifrost cache environment
+overrides. Set `BIFROST_SEMANTIC_PACK_CACHE_ROOT` to a writable machine-local
+directory when independent repositories should share the same
+content-addressed generated productions. A cold cache still generates each
+pack from the exact local artifact; later sessions reuse that verified
+production. Bifrost never downloads packs or dependencies as part of
+activation. `ecosystems` names the dependency ecosystems to discover, and may
+be an empty array to explicitly disable ambient dependency-pack activation.
+When the document is absent, the shared host path selects every ecosystem that
+serves a language present in the workspace. An explicit `enable` entry can
+satisfy a pack's `review_required` gate; it cannot bypass compatibility checks.
+
+Policy reports expose whether dependency activation was `default`,
+`configured`, or `disabled`, together with the selected, missing,
+incompatible, version-mismatched, rejected, or otherwise incomplete decisions
+that explain the result. Activation failures and incomplete runtime state stay
+typed and attributable; they are not converted into a clean negative.
+
 ## Authoring and review tools
 
 Build the authoring binary with the `release-tooling` feature. It extends the
@@ -168,9 +203,9 @@ These hosts run the reviewed workspace route:
 | `bifrost --policy-file` | every policy run, including the diff base, when the directory exists | a `workspace-model-load-failed` report diagnostic and exit 2 |
 | The MCP host | at workspace bind, with `BIFROST_WORKSPACE_SEMANTIC_MODELS=on` | the bind fails with the source path named |
 
-The LSP host does not run this route. It activates dependency packs through
-its own background scheduler, which reads `.bifrost/packs.json` for the
-ecosystems and the catalog only.
+The LSP host does not run this reviewed workspace-model route. It shares the
+same `.bifrost/packs.json` dependency-pack activation contract as the CLI and
+MCP hosts through its background scheduler.
 
 A pack that declares `safety.review_required` stays inert on every host until
 an `enable` control names its pack id. `bifrost --policy-file` reads that list
@@ -653,8 +688,9 @@ lookup/production/compile/install boundary. Missing, unreadable, malformed,
 unsupported, cancelled, or over-budget inputs remain explicit partial
 coverage; they never become an authoritative empty result. The returned
 profile separates artifacts and bytes read from reused and generated packs.
-Partial generated packs are reproduced instead of reused so their bounded,
-actionable coverage diagnostics are reconstructed for every caller.
+Partial generated packs are reused because identical inputs to a deterministic
+producer cannot improve their coverage. Reuse reports an actionable partial
+coverage diagnostic instead of rerunning the producer.
 
 `DependencyPackPreparationOutcome::compose_activation_request` merges exact
 successful evidence into a host-owned activation request. It returns no

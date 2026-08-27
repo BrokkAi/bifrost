@@ -33,7 +33,7 @@ use crate::analyzer::lexical_definitions::{
 use crate::analyzer::semantic::LengthDelimitedDigest;
 use crate::analyzer::semantic_model::{
     SemanticModelCallableDisposition, SemanticModelCallableIncompleteReason,
-    SemanticModelCallableKey,
+    SemanticModelCallableKey, SemanticModelCompleteness,
 };
 use crate::analyzer::usages::call_binding::{
     CallBindingCoverage, CallBindingMapping, CallBindingReport, CallBindingRow, CallBindingTarget,
@@ -268,6 +268,52 @@ fn model_call_binding(
     }
 }
 
+enum SourceTargetModelProvenance {
+    Absent,
+    Exact { model_id: String, pack_id: String },
+    Incomplete,
+}
+
+fn model_provenance_for_source_target(
+    analyzer: &dyn IAnalyzer,
+    target: &CodeUnit,
+) -> SourceTargetModelProvenance {
+    let Some(overlay) = analyzer.semantic_model_overlay() else {
+        return SourceTargetModelProvenance::Absent;
+    };
+    let Some(key) =
+        crate::analyzer::usages::effects::modeled_procedure_key_for_unit(analyzer, target)
+    else {
+        return SourceTargetModelProvenance::Absent;
+    };
+    let matched = overlay.callable_for_target(SemanticModelCallableKey::new(
+        &key.language,
+        &key.owner,
+        &key.member,
+        key.has_receiver,
+        key.parameter_count,
+    ));
+    let Some(symbol) = matched.unique() else {
+        return match matched.disposition {
+            SemanticModelCallableDisposition::Empty => SourceTargetModelProvenance::Absent,
+            SemanticModelCallableDisposition::Unique => unreachable!("unique match has a record"),
+            SemanticModelCallableDisposition::Conflict
+            | SemanticModelCallableDisposition::Incomplete(_) => {
+                SourceTargetModelProvenance::Incomplete
+            }
+        };
+    };
+    if symbol.provenance.ambiguous
+        || symbol.provenance.completeness != SemanticModelCompleteness::Complete
+    {
+        return SourceTargetModelProvenance::Incomplete;
+    }
+    SourceTargetModelProvenance::Exact {
+        model_id: symbol.id.clone(),
+        pack_id: symbol.provenance.pack_id.clone(),
+    }
+}
+
 /// Derive a stable RQL signature identity from the model symbol identity and
 /// its structured signature. The signature is serialized as structured data;
 /// no display spelling or source-text parsing participates in this join.
@@ -373,6 +419,29 @@ pub(super) fn call_binding_expansions(
         });
     let mut model_id = None;
     let mut pack_id = None;
+    if dispatch.is_exact()
+        && let Some(source_target) = source_target.as_ref()
+    {
+        match model_provenance_for_source_target(analyzer, source_target) {
+            SourceTargetModelProvenance::Absent => {}
+            SourceTargetModelProvenance::Exact {
+                model_id: resolved_model_id,
+                pack_id: resolved_pack_id,
+            } => {
+                model_id = Some(resolved_model_id);
+                pack_id = Some(resolved_pack_id);
+            }
+            SourceTargetModelProvenance::Incomplete => {
+                diagnostics.push(CodeQueryDiagnostic {
+                    code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                    impact: CodeQueryDiagnosticImpact::Incomplete,
+                    branch: Vec::new(),
+                    language: crate::analyzer::common::language_for_file(&file).config_label(),
+                    message: "call_bindings found incomplete or conflicting semantic-model provenance for an exact source target".to_owned(),
+                });
+            }
+        }
+    }
     if source_target.is_none()
         && let Some((answer, arm)) = dispatch_answer.as_ref().and_then(|answer| {
             (answer.outcome == "resolved"

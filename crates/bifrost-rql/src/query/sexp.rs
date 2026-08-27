@@ -1,8 +1,8 @@
-use super::ir::{CodeQuery, CodeQueryResultDetail};
+use super::ir::{CodeQuery, CodeQueryResultDetail, MAX_DECORATOR_BINDING_FILTER_LENGTH};
 use super::schema::{
-    BINDING_OF_STEP_OPTIONS, CodeQueryExecutionMode, QueryStepField, QueryStepOp, RqlForm,
-    RqlFormClass, RqlProperty, SCOPE_SEED_RQL_LABELS, ScopeFilterField,
-    binding_option_for_rql_label, candidate_option_for_rql_label,
+    BINDING_OF_STEP_OPTIONS, CodeQueryExecutionMode, DECORATOR_BINDING_STEP_OPTIONS,
+    QueryStepField, QueryStepOp, RqlForm, RqlFormClass, RqlProperty, SCOPE_SEED_RQL_LABELS,
+    ScopeFilterField, binding_option_for_rql_label, candidate_option_for_rql_label,
     declaration_state_option_for_rql_label, export_field_for_rql_label,
     generation_site_field_for_rql_label, occurrence_option_for_rql_label,
     resolve_rql_schema_version,
@@ -696,6 +696,62 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                 .push(Value::Object(step));
             Ok(Some(Value::Object(query)))
         }
+        RqlForm::JsxAttributeValue => {
+            if items.len() < 2 || !(items.len() - 2).is_multiple_of(2) {
+                return Err(lower_error(
+                    expr,
+                    format!("({head} ...) expects option/value pairs followed by a query"),
+                ));
+            }
+            let query_expr = items.last().expect("jsx wrapper has a query");
+            let mut query = query_object(query_expr)?;
+            let mut step = Map::new();
+            step.insert(
+                "op".to_string(),
+                Value::String(QueryStepOp::JsxAttributeValue.label().to_string()),
+            );
+            for pair in items[1..items.len() - 1].chunks_exact(2) {
+                let key = pair[0].as_symbol().ok_or_else(|| {
+                    lower_error(
+                        &pair[0],
+                        format!("({head} ...) option names must be symbols"),
+                    )
+                })?;
+                let option = QueryStepOp::JsxAttributeValue
+                    .option_for_rql_label(key)
+                    .ok_or_else(|| {
+                        lower_error(
+                            &pair[0],
+                            format!(
+                                "({head} ...) accepts :identity, :element-name, and :property-name"
+                            ),
+                        )
+                    })?;
+                let field = option.field().label();
+                let value = match option.field() {
+                    QueryStepField::Identity => {
+                        Value::String(symbol_or_string(&pair[1])?.replace('-', "_"))
+                    }
+                    QueryStepField::ElementName | QueryStepField::PropertyName => {
+                        Value::String(symbol_or_string(&pair[1])?)
+                    }
+                    _ => unreachable!("jsx wrapper registry contains only its three options"),
+                };
+                if step.insert(field.to_string(), value).is_some() {
+                    return Err(lower_error(
+                        &pair[0],
+                        format!("({head} ...) repeats option {key}"),
+                    ));
+                }
+            }
+            query
+                .entry("steps".to_string())
+                .or_insert_with(|| Value::Array(Vec::new()))
+                .as_array_mut()
+                .ok_or_else(|| lower_error(expr, "internal error: steps must be an array"))?
+                .push(Value::Object(step));
+            Ok(Some(Value::Object(query)))
+        }
         RqlForm::ReceiverTargets | RqlForm::PointsTo | RqlForm::MemberTargets => {
             let (query_expr, capture) = match items.len() {
                 2 => (&items[1], None),
@@ -779,6 +835,21 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                 .ok_or_else(|| lower_error(expr, "internal error: steps must be an array"))?
                 .push(json!({ "op": op }));
             Ok(Some(Value::Object(query)))
+        }
+        RqlForm::DecoratorBindings => {
+            if items.len() < 2 || !(items.len() - 2).is_multiple_of(2) {
+                return Err(lower_error(
+                    expr,
+                    format!("({head} ...) expects option/value pairs followed by a query"),
+                ));
+            }
+            let mut step =
+                decorator_binding_filter_to_json(expr, head, &items[1..items.len() - 1])?;
+            step.insert(
+                "op".to_string(),
+                Value::String(QueryStepOp::DecoratorBindings.label().to_string()),
+            );
+            append_step(expr, &items[items.len() - 1], step)
         }
         RqlForm::Supertypes | RqlForm::Subtypes => {
             let (query_expr, option) = match items.len() {
@@ -1341,6 +1412,41 @@ impl EnvironmentFilterKind {
     }
 }
 
+fn decorator_binding_filter_to_json(
+    _expr: &Expr,
+    head: &str,
+    options: &[Expr],
+) -> LowerResult<Map<String, Value>> {
+    let mut object = Map::new();
+    for pair in options.chunks_exact(2) {
+        let key = pair[0].as_symbol().ok_or_else(|| {
+            lower_error(
+                &pair[0],
+                format!("({head} ...) option names must be symbols"),
+            )
+        })?;
+        let option = DECORATOR_BINDING_STEP_OPTIONS
+            .iter()
+            .copied()
+            .find(|option| option.accepts_rql_label(key))
+            .ok_or_else(|| {
+                lower_error(
+                    &pair[0],
+                    format!("({head} ...) accepts only :module and :imported-name"),
+                )
+            })?;
+        let value = symbol_or_string(&pair[1])?;
+        if value.is_empty() || value.len() > MAX_DECORATOR_BINDING_FILTER_LENGTH {
+            return Err(lower_error(
+                &pair[1],
+                format!("{key} must be between 1 and {MAX_DECORATOR_BINDING_FILTER_LENGTH} bytes"),
+            ));
+        }
+        insert_unique(&mut object, option.field().label(), Value::String(value)).at(&pair[0])?;
+    }
+    Ok(object)
+}
+
 /// Lower the `:kind`/`:name`/`:hoisting`/`:tier`/`:outcome`/`:boundary`/
 /// `:include-shadowed` option pairs into the canonical filter object.
 ///
@@ -1623,6 +1729,7 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::CallSitesTo
         | RqlForm::CallSitesFrom
         | RqlForm::CallInput
+        | RqlForm::JsxAttributeValue
         | RqlForm::ReceiverTargets
         | RqlForm::PointsTo
         | RqlForm::MemberTargets
@@ -1636,6 +1743,7 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::ProcedureEffects
         | RqlForm::CallableSignature
         | RqlForm::SignatureParameters
+        | RqlForm::DecoratorBindings
         | RqlForm::CallableApplicability
         | RqlForm::OverloadSelection
         | RqlForm::MemberSelection

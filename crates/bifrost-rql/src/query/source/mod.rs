@@ -8,16 +8,18 @@ use json::analyze_json_with_schema_registry;
 use rql::{analyze_rql, validate_rql_query};
 use shared::*;
 
-use super::ir::MAX_BINDING_NAME_LENGTH;
+use super::ir::{MAX_BINDING_NAME_LENGTH, MAX_DECORATOR_BINDING_FILTER_LENGTH};
 use super::schema;
 use super::schema::{
     ALL_PATTERN_FIELDS, ALL_QUERY_FIELDS, ALL_QUERY_STEP_FIELDS, ALL_QUERY_STEP_OPS, ALL_RQL_FORMS,
     ALL_RQL_PROPERTIES, ALL_STRING_PREDICATE_FIELDS, BINDING_OF_STEP_OPTIONS,
-    CodeQueryExecutionMode, PatternField, QueryField, QueryStepField, QueryStepOp, RqlForm,
-    RqlFormClass, RqlProperty, SCOPE_SEED_RQL_LABELS, ScopeFilterField, StringPredicateField,
-    binding_option_for_rql_label, candidate_option_for_rql_label, constrained_step_option_labels,
+    CodeQueryExecutionMode, DECORATOR_BINDING_STEP_OPTIONS, PatternField, QueryField,
+    QueryStepField, QueryStepOp, RqlForm, RqlFormClass, RqlProperty, SCOPE_SEED_RQL_LABELS,
+    ScopeFilterField, StringPredicateField, binding_option_for_rql_label,
+    candidate_option_for_rql_label, constrained_step_option_labels,
     declaration_state_option_for_rql_label, environment_filter_labels, export_field_for_rql_label,
-    generation_site_field_for_rql_label, occurrence_filter_labels, occurrence_option_for_rql_label,
+    generation_site_field_for_rql_label, jsx_element_identity_from_label,
+    jsx_element_identity_labels, occurrence_filter_labels, occurrence_option_for_rql_label,
     reference_kind_from_label, rql_schema_version_registry, usage_kind_from_label,
     usage_proof_from_label, usage_surface_from_label,
 };

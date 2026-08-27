@@ -8,7 +8,6 @@ use chrono::{Datelike, Utc};
 #[path = "bifrost/code_query_repl.rs"]
 mod code_query_repl;
 
-use brokk_bifrost::ToolOutput;
 use brokk_bifrost::lsp::run_lsp_stdio_server;
 use brokk_bifrost::mcp_common::McpRenderOptions;
 use brokk_bifrost::mcp_install::install_mcp_hosts;
@@ -32,6 +31,7 @@ use brokk_bifrost::rmcp_host::{
 use brokk_bifrost::scoped_project::create_cli_tool_service;
 use brokk_bifrost::searchtools_render::RenderOptions;
 use brokk_bifrost::tool_arguments::normalize_tool_arguments_for_cli;
+use brokk_bifrost::{CancellationToken, ToolOutput};
 use code_query_repl::run_code_query_repl;
 use serde_json::{Value, json};
 use tempfile::NamedTempFile;
@@ -206,7 +206,6 @@ fn run_inner(
     let mut query_file: Option<String> = None;
     let mut render_options = McpRenderOptions::default();
     let mut no_line_numbers_seen = false;
-    let mut force_semantic_cpu_seen = false;
     let mut policy_files = Vec::new();
     let mut policy_selection = BuiltInPolicySelection::default();
     let mut list_policies = false;
@@ -497,12 +496,6 @@ fn run_inner(
                 no_line_numbers_seen = true;
                 render_options.render_line_numbers = false;
             }
-            "--force-semantic-cpu" => {
-                force_semantic_cpu_seen = true;
-                // Lets semantic_search run (and be advertised) on hosts without a
-                // CUDA/Metal accelerator. Consumed via env by the registry + service.
-                unsafe { env::set_var("BIFROST_FORCE_SEMANTIC_CPU", "1") };
-            }
             "--help" | "-h" => {
                 // Optional positional topic: `--help <tool>` shows that tool's
                 // description and parameters. Ignore a following flag.
@@ -544,12 +537,11 @@ fn run_inner(
             || run_repl
             || mcp_mode.is_some()
             || no_line_numbers_seen
-            || force_semantic_cpu_seen
             || diff_snapshot_object_dir.is_some()
             || install
         {
             return Err(
-                "policy options cannot be combined with --install, --query-file, --tool, --args, --sources, --mcp, --lsp, or --repl, --no-line-numbers, --force-semantic-cpu, or --diff-snapshot-object-dir"
+                "policy options cannot be combined with --install, --query-file, --tool, --args, --sources, --mcp, --lsp, or --repl, --no-line-numbers, or --diff-snapshot-object-dir"
                     .to_string(),
             );
         }
@@ -692,7 +684,6 @@ fn run_inner(
             || diff_snapshot_object_dir.is_some()
             || query_file.is_some()
             || no_line_numbers_seen
-            || force_semantic_cpu_seen
         {
             return Err("--install cannot be combined with other options".to_string());
         }
@@ -789,19 +780,7 @@ fn run_inner(
     } else {
         None
     };
-    // A rootless MCP server does not know whether the client-selected root will
-    // be a Git repository yet. Advertise the potential NLP surface up front;
-    // runtime availability is checked after roots negotiation.
-    let git_repo = if named_workspaces.is_empty() {
-        initial_root
-            .as_deref()
-            .is_none_or(brokk_bifrost::mcp_registry::workspace_is_git)
-    } else {
-        named_workspaces
-            .iter()
-            .any(|workspace| brokk_bifrost::mcp_registry::workspace_is_git(&workspace.root))
-    };
-    let spec = resolve_server_spec_for_render_options(mode, render_options, git_repo)?;
+    let spec = resolve_server_spec_for_render_options(mode, render_options)?;
     let diff_snapshot_object_dir = diff_snapshot_object_dir
         .map(validate_diff_snapshot_object_dir)
         .transpose()?;
@@ -1370,6 +1349,37 @@ fn render_policy_report<W: Write>(
     }
 }
 
+/// Cancel this one-shot run, and eventually exit, when the parent process
+/// dies — public issue #11.
+///
+/// The npm launcher forwards catchable signals, but a kill-on-drop SIGKILL of
+/// the launcher delivers nothing here and orphans this process mid-analysis:
+/// observed as a native `analyze_diff` burning a full core for over an hour
+/// after its caller timed out. Reparenting is the reliable, signal-free
+/// indicator of parent death on Unix, so poll it. Stdin EOF is not usable as
+/// the signal because a detached caller may hand this process `/dev/null`.
+/// After cancelling, allow a bounded grace for the cooperative walks to
+/// unwind, then exit: an orphaned one-shot has no reader left for its stdout.
+#[cfg(unix)]
+fn spawn_orphan_watchdog(cancellation: CancellationToken) {
+    let initial_parent = unsafe { libc::getppid() };
+    std::thread::Builder::new()
+        .name("orphan-watchdog".into())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                if unsafe { libc::getppid() } != initial_parent {
+                    eprintln!("bifrost: parent process exited; cancelling one-shot tool run");
+                    cancellation.cancel();
+                    std::thread::sleep(std::time::Duration::from_secs(20));
+                    eprintln!("bifrost: exiting after the orphaned-run grace period");
+                    std::process::exit(3);
+                }
+            }
+        })
+        .expect("spawn orphan watchdog");
+}
+
 fn run_tool(
     root: PathBuf,
     tool_name: &str,
@@ -1388,13 +1398,17 @@ fn run_tool(
         Some(dir) => service.with_diff_snapshot_object_dir(dir),
         None => service,
     };
+    let cancellation = CancellationToken::new();
+    #[cfg(unix)]
+    spawn_orphan_watchdog(cancellation.clone());
     let output = service
-        .call_tool_output(
+        .call_tool_output_with_cancellation(
             tool_name,
             arguments,
             RenderOptions {
                 render_line_numbers: render_options.render_line_numbers,
             },
+            Some(&cancellation),
         )
         .map_err(|err| err.to_string())?;
 
@@ -1419,10 +1433,6 @@ fn run_tool(
 }
 
 fn print_help(topic: Option<&str>) -> Result<(), String> {
-    // Help reflects the tools this binary actually advertises (same surface as
-    // tools/list). `semantic_search` therefore appears only in an nlp-enabled
-    // build whose host can run the embedder; the shipped CLI is built without
-    // the nlp feature, so it never advertises it.
     match topic {
         Some(name) => print_tool_help(name),
         None => {
@@ -1525,14 +1535,13 @@ OPTIONS:
                            --accept-current, --evaluation-date, --diff-base, --verbose, or --color
     --output PATH          Atomically write policy output to PATH instead of stdout
     --no-line-numbers      Render source output without leading line numbers
-    --force-semantic-cpu   Allow semantic_search without a CUDA/Metal accelerator (run the embedder on CPU)
     -h, --help [TOOL]      Show this help, or a single tool's description and parameters
     -V, --version          Show version and exit
         --build-identity   Show the exact embedded source identity and exit
 
 MCP TOOLSETS (--mcp):
     searchtools   every toolset below
-    core          symbol + workspace + nlp (the set agents typically connect to)
+    core          symbol + workspace (the set agents typically connect to)
 "#;
     print!("{top}");
 

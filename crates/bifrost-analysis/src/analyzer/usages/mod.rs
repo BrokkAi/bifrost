@@ -20,7 +20,7 @@ pub mod callable_signature;
 mod candidates;
 pub(crate) mod common;
 pub mod cpp_graph;
-pub(crate) mod csharp_graph;
+pub mod csharp_graph;
 pub mod effects;
 pub(crate) mod file_usage_graph;
 mod finder;

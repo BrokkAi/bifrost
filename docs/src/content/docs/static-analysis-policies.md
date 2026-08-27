@@ -89,6 +89,34 @@ JavaScript, each with positive and near-miss fixtures. The worked rule below is
 its shipped source. The other in-loop prompts stay deliberately naive pending
 the same treatment for their argument forms.
 
+Pack version 2.1 moves the eight remaining in-loop review prompts -- regular
+expression compilation, file reads, serialization, parsing, database calls,
+network calls, subprocess launches, and expensive operations beneath nested
+loops -- from `warning` to `note`. Their messages begin "Review whether ..."
+because lexical containment cannot prove that the operation repeats per
+iteration or that the loop is hot, and a prompt that declines to claim
+run-time cost should not fail a build as though it had proved one. With the
+default `--fail-on warning` threshold these prompts now surface without
+gating; pass `--fail-on note` to restore the stricter gate. Policies that
+substantiate their claim keep `warning`: `loop-invariant-sort` proves value
+origin, and the correctness rules are not review prompts.
+
+Pack version 2.2 gives `file-read-in-loop` and `parsing-in-loop` the
+"same treatment" the 2.0 note promised: both become assertion policies whose
+`assert-origin-shape` withdraws the prompt when the enclosing for-each loop's
+iterated expression provably resolves to a collection literal with at most
+eight elements. The bound came from triaging this repository's own accepted
+suppressions, where release scripts loop over module-level lists of two to
+seven known file names. The proof is deliberately narrow: it covers
+declarator-established bindings -- JS/TS `const`/`let`/`var`, Rust `let`,
+Java local declarators -- and every establishing initializer must qualify, so
+a literal later reassigned from a call still reports. Loops whose iterated
+value is out of evidence keep reporting: while and counting loops, call
+results, parameters, Java fields, and Python names bound only by assignment,
+which carry no lexical-binding rows in Python's scope-categorical model. A
+Rust `[value; length]` repeat array never qualifies because its run-time size
+is not its spelled element count.
+
 Use `bifrost --list-policies` or MCP `list_policies` to inspect the exact catalog
 in the running build. Select it with `--policy-pack bifrost.code-smells`, a
 `--policy-category`, or a stable `--policy-id`; MCP `run_policy` exposes the same
@@ -150,7 +178,7 @@ note: policy bifrost.security.dynamic-eval inferred policy schema 1 and RQL sche
 [warning]  app.py:2:12
     Dynamic evaluation is forbidden
 
-summary: 1 active finding; 0 suppressed findings; 1 complete policy run
+summary: 1 active finding; 0 suppressed findings; dependency packs: mode default; complete; ecosystems python; 1 complete policy run
 ```
 
 </details>
@@ -1388,7 +1416,7 @@ feed one activation, so a workspace can use either or both:
 | Route | Location | Opt-in | Activated by |
 | --- | --- | --- | --- |
 | Reviewed workspace models | `.bifrost/semantic-models/*.json` and `*.yaml` | the directory exists | `bifrost --policy-file`, and the MCP host with `BIFROST_WORKSPACE_SEMANTIC_MODELS=on` |
-| Installed catalog | the catalog `.bifrost/packs.json` names | the document exists | `bifrost --policy-file`, the LSP host, and the MCP host |
+| Installed catalog | the catalog `.bifrost/packs.json` names | the document configures ecosystems; an absent document uses the ambient default | `bifrost --policy-file`, the LSP host, and the MCP host |
 
 Use the reviewed workspace route for a model you write and check in beside your
 policies. Put the file in `.bifrost/semantic-models/`, commit it, and
@@ -1396,9 +1424,12 @@ policies. Put the file in `.bifrost/semantic-models/`, commit it, and
 install. Reference policy B runs this way, and
 `policy_substrate_p0_cli.rs` pins the outcome.
 
-Use the installed catalog for a pack that ships with a dependency. The packs
-document names the catalog and the dependency ecosystems the workspace opts
-into, and its activation evidence comes from dependency discovery.
+Use the installed catalog for a pack that ships with a dependency. The shared
+packs document names the catalog and dependency ecosystems, while an absent
+document uses an ephemeral catalog and the ecosystems serving languages in the
+workspace. An empty `ecosystems` array explicitly disables that route.
+Activation evidence comes from dependency discovery and remains subject to
+compatibility and review gates.
 
 Three rules keep the reviewed route honest.
 
@@ -1936,13 +1967,23 @@ Repeat `--policy-file` to produce one deterministic combined report. Choose
 `human`, `json`, or `sarif`; use `--output report.sarif` for synchronized,
 same-directory atomic replacement instead of stdout.
 
-The one-shot CLI starts with empty catalog and endpoint registries. A policy
-which names a machine catalog must be loaded through an embedding that
-explicitly populated `TaintCatalogRegistry`. A policy which uses only
+The one-shot CLI starts with empty catalog and endpoint registries. A workspace
+semantic-pack policy uses the shared `.bifrost/packs.json` contract: an absent
+document selects compatible dependency packs for languages present in the
+workspace, a configured document selects its named ecosystems, and an empty
+`ecosystems` array explicitly disables that route. A configured catalog is
+workspace-relative; without one, activation is ephemeral. Activation never
+downloads packs or dependencies, and compatibility and `review_required` gates
+remain authoritative. A policy which names a machine catalog must be loaded
+through an embedding that explicitly populated `TaintCatalogRegistry`. A
+policy which uses only
 `(match-endpoints :ids [...])` likewise needs an embedding to pre-register those
 endpoint IDs. In an ordinary CLI run, the same policy can instead discover its
 closed endpoint set through `(match-directory ...)` and then select exact IDs
-from that set. The CLI does not guess paths or scan ambient directories.
+from that set. The CLI does not guess paths or scan ambient directories beyond
+this explicit workspace document. Reports expose the dependency activation mode
+and the individual decisions, including missing, incompatible, disabled, or
+incomplete activation.
 
 | Status | Meaning |
 | --- | --- |
@@ -1959,7 +2000,8 @@ discovery, semantic uncertainty, unmodeled call boundaries, and witness
 truncation remain visible in run/finding completeness instead of becoming clean
 zero-results. Source-backed taint works without external models. An embedding
 must explicitly supply and activate a semantic-model catalog when external
-procedure summaries are required.
+procedure summaries are required outside the shared workspace activation
+contract.
 
 See [CLI](/cli/#static-analysis-policies) for option interactions and
 [Reproduce an Analysis](/reproduce-analysis/) for the artifacts to preserve.

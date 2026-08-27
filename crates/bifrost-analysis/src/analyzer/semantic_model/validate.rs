@@ -137,6 +137,20 @@ impl Validator {
                 format!("invalid SPDX expression: {error}"),
             );
         }
+        if pack
+            .carried_sources
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        {
+            self.error(
+                "carried_sources.unsorted",
+                "$.carried_sources",
+                "carried sources must be unique ascending paths",
+            );
+        }
+        for (index, path) in pack.carried_sources.iter().enumerate() {
+            self.locator_path(&format!("$.carried_sources[{index}]"), path);
+        }
         if pack.shards.len() > self.limits.max_shards {
             self.error(
                 "limit.shards",
@@ -258,7 +272,12 @@ impl Validator {
             self.stable_component(&format!("{path}.targets[{index}]"), target);
         }
         for (index, configuration) in selector.configurations.iter().enumerate() {
-            self.stable_component(&format!("{path}.configurations[{index}]"), configuration);
+            let configuration_path = format!("{path}.configurations[{index}]");
+            if configuration.starts_with("typescript-lib:") {
+                self.text(&configuration_path, configuration);
+            } else {
+                self.stable_component(&configuration_path, configuration);
+            }
         }
         if let Some(digest) = &selector.artifact_sha256
             && !is_lower_sha256(digest)
@@ -1738,21 +1757,8 @@ impl Validator {
     }
 
     fn locator_path(&mut self, path: &str, value: &str) {
-        use std::path::{Component, Path};
-
         self.text(path, value);
-        if has_portable_windows_path_prefix(value)
-            || value.contains('\\')
-            || Path::new(value).components().any(|component| {
-                matches!(
-                    component,
-                    Component::Prefix(_)
-                        | Component::RootDir
-                        | Component::ParentDir
-                        | Component::CurDir
-                )
-            })
-        {
+        if !is_canonical_relative_path(value) {
             self.error(
                 "locator.invalid_path",
                 path,
@@ -1856,4 +1862,23 @@ fn capture_cardinality_name(cardinality: CaptureCardinality) -> &'static str {
         CaptureCardinality::Many => "many",
         CaptureCardinality::Group => "group",
     }
+}
+
+/// The path shape every pack locator and carried-source entry must have: a
+/// relative, canonical, slash-separated path with no prefix, root, `.`/`..`
+/// component, or backslash.
+pub(crate) fn is_canonical_relative_path(value: &str) -> bool {
+    use std::path::{Component, Path};
+
+    !(has_portable_windows_path_prefix(value)
+        || value.contains('\\')
+        || Path::new(value).components().any(|component| {
+            matches!(
+                component,
+                Component::Prefix(_)
+                    | Component::RootDir
+                    | Component::ParentDir
+                    | Component::CurDir
+            )
+        }))
 }

@@ -211,6 +211,14 @@ fn kotlin_capabilities() -> SemanticCapabilities {
         SemanticCapability::CallableReferences,
         SemanticCapability::DeferredExecution,
         SemanticCapability::NonLocalControl,
+        // `Partial` states the exact limit: every decision the condition
+        // lowering reaches gets a row, but only a constant boolean -- through
+        // any number of `!` and parenthesis wrappers -- is normalized, and
+        // everything else is recorded `Opaque`. Conditional edges the adapter
+        // synthesizes outside condition lowering, such as the safe-call and
+        // elvis null gates and the `for` header's exit test, publish no guard
+        // row at all (#2443).
+        SemanticCapability::GuardFacts,
     ] {
         builder = builder.partial(capability);
     }
@@ -228,15 +236,11 @@ fn kotlin_capabilities() -> SemanticCapabilities {
     //   is an ordinary stdlib higher-order call, already represented as a call
     //   site plus a lambda procedure, so claiming partial resource management
     //   would describe a construct the language does not have.
-    // * `GuardFacts` — this adapter normalizes no branch conditions, so an
-    //   empty `guard_facts` table means "this language publishes no guard
-    //   facts" rather than "this procedure has no decision" (#2443).
     for capability in [
         SemanticCapability::AsyncSuspendResume,
         SemanticCapability::GeneratorSuspension,
         SemanticCapability::ConcurrentSpawn,
         SemanticCapability::ResourceManagement,
-        SemanticCapability::GuardFacts,
     ] {
         builder = builder.unsupported(capability);
     }

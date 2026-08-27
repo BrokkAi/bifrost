@@ -20,7 +20,7 @@ use crate::analyzer::tree_sitter_analyzer::{
 use crate::analyzer::{DispatchExtensibility, Language, ProjectFile, RustAnalyzer};
 use crate::hash::{HashMap, HashSet};
 
-const ADAPTER_VERSION: &[u8] = b"rust-value-semantics-v4";
+const ADAPTER_VERSION: &[u8] = b"rust-value-semantics-v6";
 
 impl_program_semantics_provider!(RustAnalyzer, RustSemanticLowerer);
 
@@ -71,13 +71,18 @@ impl ProgramSemanticsLowerer for RustSemanticLowerer {
                 }
             };
 
+        // One file prescan, shared by every procedure: what this file states
+        // about its own functions' return types, its struct declarations, and
+        // which of those structs run no destructor.
+        let facts = rust_file_facts(prepared);
+
         lower_procedure_batch(
             &specs,
             initial_work,
             budget,
             cancellation,
             |spec, staged_budget, cancellation| {
-                lower_procedure(prepared, spec, staged_budget, cancellation)
+                lower_procedure(prepared, &facts, spec, staged_budget, cancellation)
             },
         )
     }
@@ -117,13 +122,22 @@ fn rust_capabilities() -> SemanticCapabilities {
         SemanticCapability::DeferredExecution,
         SemanticCapability::NonLocalControl,
         SemanticCapability::ResourceManagement,
+        // Partial: a field or element store and load is lowered into a real
+        // memory row whenever the place is a single selector or a single
+        // constant index over a value this procedure can name (#2667). A
+        // dereference target, a destructuring target, a dynamic index, and a
+        // field whose declaring struct this file does not state each publish
+        // their own gap instead.
+        SemanticCapability::FieldMemory,
+        SemanticCapability::IndexMemory,
     ] {
         builder = builder.partial(capability);
     }
-    // Explicitly unsupported: this adapter normalizes no branch conditions, so
-    // an empty `guard_facts` table means "this language publishes no guard
-    // facts" rather than "this procedure has no decision" (#2443).
-    builder = builder.unsupported(SemanticCapability::GuardFacts);
+    // Partial: this adapter normalizes exactly one condition shape, a literal
+    // `true` or `false`, and publishes nothing for any other decision. An
+    // absent guard row therefore means "not normalized here", never "this
+    // procedure has no decision" (#2443).
+    builder = builder.partial(SemanticCapability::GuardFacts);
     builder.build()
 }
 
@@ -423,9 +437,34 @@ struct LoweringContext<'tree, 'targets> {
     parameters: HashMap<Box<str>, ValueId>,
     locals: HashMap<Box<str>, Vec<LocalBinding>>,
     definitely_non_dropping: HashSet<ValueId>,
+    /// What this file states about its own functions, structs, and destructors.
+    facts: &'targets RustFileFacts,
+    /// The struct or array shape each value provably holds, which is what lets
+    /// a field or index place name a memory location this procedure owns.
+    value_shapes: HashMap<ValueId, RustValueShape>,
+    /// The fallback memory-location identity for a field whose declaring
+    /// struct this file does not state, interned once per name per procedure
+    /// so a store and a load of the same name still meet.
+    field_locators: HashMap<Box<str>, SemanticLocator>,
+    /// One value per distinct constant index text, so `values[0]` written and
+    /// `values[0]` read name the same index value.
+    constant_index_values: HashMap<Box<str>, ValueId>,
     parameter_cleanup_required: bool,
     receiver: Option<ValueId>,
     next_cleanup_region: usize,
+}
+
+/// The shape a value provably holds, as far as one file can state it.
+///
+/// Only two shapes matter to the heap stratum: a value of a struct this file
+/// declares, whose field declarations then identify a `Field` location and
+/// prove the projection needs no user `Deref`; and a fixed-size array, whose
+/// subscript is the language's own indexing rather than an `Index`
+/// implementation. Anything else has no shape here and keeps its gaps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RustValueShape {
+    Struct(Box<str>),
+    Array { primitive_elements: bool },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -439,6 +478,7 @@ struct LocalBinding {
 
 fn lower_procedure<'tree>(
     prepared: &'tree PreparedSyntaxTree,
+    facts: &RustFileFacts,
     spec: &ProcedureSpec<'tree>,
     budget: &SemanticBudget,
     cancellation: &CancellationToken,
@@ -467,6 +507,10 @@ fn lower_procedure<'tree>(
         parameters: HashMap::default(),
         locals: HashMap::default(),
         definitely_non_dropping: HashSet::default(),
+        facts,
+        value_shapes: HashMap::default(),
+        field_locators: HashMap::default(),
+        constant_index_values: HashMap::default(),
         parameter_cleanup_required: rust_parameters_may_require_drop(spec.callable),
         receiver: None,
         next_cleanup_region: 0,
@@ -645,6 +689,19 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             if rust_parameter_is_definitely_non_dropping(node) {
                 self.definitely_non_dropping.insert(value);
             }
+            // The declared parameter type states the shape directly. A
+            // receiver declares none, so it takes the shape of the type its
+            // enclosing `impl` block names.
+            let declared_shape = if slot.receiver {
+                rust_impl_self_type(callable)
+                    .and_then(|ty| rust_declared_type_shape(self.source, ty))
+            } else {
+                node.child_by_field_name("type")
+                    .and_then(|ty| rust_declared_type_shape(self.source, ty))
+            };
+            if let Some(shape) = declared_shape {
+                self.value_shapes.insert(value, shape);
+            }
             for name in slot.names {
                 self.parameters.insert(name.into_boxed_str(), value);
             }
@@ -691,11 +748,65 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         scope_end,
                         value,
                     });
+                // The declared type states the shape when there is one;
+                // otherwise the initializer does. The walk is preorder, so a
+                // local this initializer names was already classified, which
+                // is what lets `let alias = &original;` take `original`'s own
+                // struct shape.
+                if let Some(shape) = node
+                    .child_by_field_name("type")
+                    .and_then(|ty| rust_declared_type_shape(self.source, ty))
+                    .or_else(|| {
+                        node.child_by_field_name("value")
+                            .and_then(|initializer| self.expression_shape(initializer))
+                    })
+                {
+                    self.value_shapes.insert(value, shape);
+                }
+                // An explicit primitive annotation decides the question on its
+                // own; otherwise the initializer has to prove it. The walk is
+                // preorder, so a local this initializer names was already
+                // classified.
+                if node
+                    .child_by_field_name("type")
+                    .is_some_and(|ty| ty.kind() == "primitive_type")
+                    || node
+                        .child_by_field_name("value")
+                        .is_some_and(|initializer| {
+                            self.expression_is_definitely_non_dropping(initializer)
+                        })
+                {
+                    self.definitely_non_dropping.insert(value);
+                }
+            }
+            // A `for` pattern binds a local too. Without it the loop variable
+            // resolved to nothing inside the body, so an element read there
+            // began a fresh unrelated value.
+            if node.kind() == "for_expression"
+                && let Some(pattern) = node.child_by_field_name("pattern")
+                && let Some(name) = identity_binding_identifier(pattern)
+                && let Some(text) = node_text(self.source, name)
+                && let Some(body) = node.child_by_field_name("body")
+            {
+                let metadata = self.value_mapping(builder, name)?;
+                let value = self.session.add_value_with_metadata(
+                    builder,
+                    metadata,
+                    SemanticValueKind::Local,
+                )?;
+                self.locals
+                    .entry(text.into())
+                    .or_default()
+                    .push(LocalBinding {
+                        declaration_start: name.start_byte(),
+                        visible_from: body.start_byte(),
+                        scope_start: body.start_byte(),
+                        scope_end: body.end_byte(),
+                        value,
+                    });
                 if node
                     .child_by_field_name("value")
-                    .is_some_and(|initializer| {
-                        self.expression_is_definitely_non_dropping(initializer)
-                    })
+                    .is_some_and(rust_iteration_element_is_definitely_non_dropping)
                 {
                     self.definitely_non_dropping.insert(value);
                 }
@@ -730,19 +841,430 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .map(|binding| binding.value)
     }
 
-    fn expression_is_definitely_non_dropping(&self, node: Node<'_>) -> bool {
-        if matches!(expression_value_kind(node), SemanticValueKind::Constant) {
-            return true;
-        }
-        let Some(name) = (node.kind() == "identifier")
-            .then(|| node_text(self.source, node))
-            .flatten()
-        else {
-            return false;
+    /// The shape this expression's value provably holds.
+    ///
+    /// A reference is transparent on purpose: Rust auto-dereferences a
+    /// reference to a struct, so `holder.value` and `alias.value` project the
+    /// same field of the same struct type, and `&` is the language's own
+    /// borrow rather than a user `Deref` implementation.
+    fn expression_shape(&self, node: Node<'_>) -> Option<RustValueShape> {
+        // A borrow, a parenthesis chain, and an access path are all unbounded
+        // in source, so the walk down to the root is a loop and the selectors
+        // it collected are applied afterwards rather than by recursion.
+        let mut selectors = Vec::new();
+        let mut current = node;
+        let root = loop {
+            match current.kind() {
+                "identifier" | "self" => {
+                    let name = node_text(self.source, current)?;
+                    let value = self
+                        .local_at(name, current.start_byte())
+                        .or_else(|| self.parameters.get(name).copied())?;
+                    break self.value_shapes.get(&value).cloned()?;
+                }
+                "parenthesized_expression" | "reference_expression" => {
+                    current = first_named_child(current)?;
+                }
+                "field_expression" => {
+                    selectors.push(node_text(
+                        self.source,
+                        current.child_by_field_name("field")?,
+                    )?);
+                    current = current.child_by_field_name("value")?;
+                }
+                "struct_expression" => {
+                    break rust_declared_type_shape(
+                        self.source,
+                        current.child_by_field_name("name")?,
+                    )?;
+                }
+                "array_expression" => {
+                    break RustValueShape::Array {
+                        primitive_elements: runtime_expression_children(current)
+                            .into_iter()
+                            .all(|element| self.expression_is_definitely_non_dropping(element)),
+                    };
+                }
+                _ => return None,
+            }
         };
-        self.local_at(name, node.start_byte())
-            .or_else(|| self.parameters.get(name).copied())
-            .is_some_and(|value| self.definitely_non_dropping.contains(&value))
+        let mut shape = root;
+        for selector in selectors.into_iter().rev() {
+            let RustValueShape::Struct(owner) = shape else {
+                return None;
+            };
+            shape = self
+                .facts
+                .struct_fields
+                .get(&(owner, selector.into()))?
+                .as_ref()?
+                .shape
+                .clone()?;
+        }
+        Some(shape)
+    }
+
+    /// What this file declares about the field `base.field` names, when the
+    /// base's shape picks exactly one struct declaration.
+    fn field_declaration(&self, base: Node<'_>, field: Node<'_>) -> Option<RustFieldDeclaration> {
+        let RustValueShape::Struct(name) = self.expression_shape(base)? else {
+            return None;
+        };
+        let field = node_text(self.source, field)?;
+        self.facts
+            .struct_fields
+            .get(&(name, field.into()))
+            .cloned()
+            .flatten()
+    }
+
+    /// Whether a field expression denotes no runtime memory location.
+    ///
+    /// One shape reads like a field access but is not one: a method call's
+    /// callee (`receiver.method(...)`), whose selection the call site already
+    /// models. Minting a `Field` location for it would publish an
+    /// undischargeable field-memory gap on syntax that holds nothing.
+    fn field_denotes_no_location(&self, node: Node<'tree>) -> bool {
+        let mut current = node;
+        while let Some(parent) = current.parent() {
+            match parent.kind() {
+                "generic_function" => current = parent,
+                "call_expression" => return field_matches(parent, "function", current),
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// Whether reading or writing this place runs only the language's own
+    /// projection.
+    ///
+    /// A field of a struct this file declares is a direct projection: no
+    /// autoderef step past a user `Deref`, and no `DerefMut` on the write
+    /// side. A subscript of a fixed-size array is the language's own indexing,
+    /// not an `Index` or `IndexMut` implementation. Any other place keeps the
+    /// `Calls` gap that says an implicit trait method may run here.
+    fn place_access_is_language_defined(&self, place: Node<'_>) -> bool {
+        match place.kind() {
+            "field_expression" => place
+                .child_by_field_name("value")
+                .zip(place.child_by_field_name("field"))
+                .and_then(|(base, field)| self.field_declaration(base, field))
+                .is_some(),
+            "index_expression" => {
+                let children = runtime_expression_children(place);
+                let [base, _] = children.as_slice() else {
+                    return false;
+                };
+                matches!(
+                    self.expression_shape(*base),
+                    Some(RustValueShape::Array { .. })
+                )
+            }
+            _ => false,
+        }
+    }
+
+    /// The memory-location identity of `base.field`, and whether it is the
+    /// field's own declaration.
+    ///
+    /// When this file does not state the declaration -- an unresolved base
+    /// shape, an imported struct, a name two structs share -- the locator
+    /// falls back to one interned per field name per procedure. That fallback
+    /// still lets a store and a load of one name meet, which anchoring each
+    /// occurrence separately would silently prevent, and the caller publishes
+    /// a field-identity gap for it.
+    fn memory_member_locator(
+        &mut self,
+        base: Node<'tree>,
+        field: Node<'tree>,
+    ) -> Result<(SemanticLocator, bool), RustLoweringError> {
+        let name = node_text(self.source, field);
+        let declaration = self.field_declaration(base, field);
+        if let Some(name) = name
+            && declaration.is_none()
+            && let Some(locator) = self.field_locators.get(name)
+        {
+            return Ok((locator.clone(), false));
+        }
+        let anchor = match declaration {
+            Some(ref declaration) => declaration.anchor,
+            None => source_anchor(field, 0).map_err(RustLoweringError::Invalid)?,
+        };
+        let procedure = self.session.locator();
+        let locator = SemanticLocator::new(
+            procedure.mount(),
+            procedure.path().clone(),
+            procedure.language(),
+            procedure.declaration().clone(),
+            SemanticRole::MemoryLocation,
+            anchor,
+        );
+        if declaration.is_none()
+            && let Some(name) = name
+        {
+            self.field_locators.insert(name.into(), locator.clone());
+        }
+        Ok((locator, declaration.is_some()))
+    }
+
+    fn add_field_identity_gap(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        location: MemoryLocationId,
+    ) -> Result<(), RustLoweringError> {
+        self.session.add_gap_with_impacts(
+            builder,
+            point,
+            SemanticGapSubject::MemoryLocation(location),
+            SemanticCapability::FieldMemory,
+            SemanticGapImpacts::single(SemanticGapImpact::HeapRead)
+                .with(SemanticGapImpact::HeapWrite)
+                .with(SemanticGapImpact::Aliasing),
+            SemanticGapKind::Unknown,
+            "Rust field occurrence is structured, but its struct declaration identity is not yet resolved",
+        )?;
+        Ok(())
+    }
+
+    /// The index value of `base[index]`, when the index is a constant.
+    ///
+    /// A store and a load meet on an exact index only when both name the same
+    /// value, so one value is interned per distinct index text. A non-constant
+    /// index has no proven identity here and yields `None`, which the caller
+    /// turns into an `Any` index plus an index-memory gap.
+    fn index_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+    ) -> Result<Option<ValueId>, RustLoweringError> {
+        if !matches!(expression_value_kind(node), SemanticValueKind::Constant) {
+            return Ok(None);
+        }
+        let Some(text) = node_text(self.source, node) else {
+            return Ok(None);
+        };
+        if let Some(value) = self.constant_index_values.get(text) {
+            let value = *value;
+            self.expression_values.insert(node.id(), value);
+            return Ok(Some(value));
+        }
+        let value = self.expression_value(builder, node, SemanticValueKind::Constant)?;
+        self.constant_index_values.insert(text.into(), value);
+        Ok(Some(value))
+    }
+
+    fn add_dynamic_index_gap(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        location: MemoryLocationId,
+    ) -> Result<(), RustLoweringError> {
+        self.session.add_gap_with_impacts(
+            builder,
+            point,
+            SemanticGapSubject::MemoryLocation(location),
+            SemanticCapability::IndexMemory,
+            SemanticGapImpacts::single(SemanticGapImpact::HeapRead)
+                .with(SemanticGapImpact::HeapWrite)
+                .with(SemanticGapImpact::Aliasing),
+            SemanticGapKind::Unsupported,
+            "Rust dynamic index identity is not proven",
+        )?;
+        Ok(())
+    }
+
+    /// Whether this expression names storage this procedure already holds,
+    /// rather than producing a fresh temporary.
+    ///
+    /// An identifier qualifies only when it resolves to a local or a
+    /// parameter. A bare path that names a unit struct or a constant --
+    /// `Guard`, `None` -- is spelled the same way and produces a new value, so
+    /// borrowing it does extend a temporary's lifetime.
+    fn is_place(&self, node: Node<'_>) -> bool {
+        let mut current = node;
+        loop {
+            match current.kind() {
+                "identifier" | "self" => {
+                    let Some(name) = node_text(self.source, current) else {
+                        return false;
+                    };
+                    return self
+                        .local_at(name, current.start_byte())
+                        .or_else(|| self.parameters.get(name).copied())
+                        .is_some();
+                }
+                "field_expression" => {
+                    let Some(base) = current.child_by_field_name("value") else {
+                        return false;
+                    };
+                    current = base;
+                }
+                "index_expression" | "parenthesized_expression" => {
+                    let Some(inner) = first_named_child(current) else {
+                        return false;
+                    };
+                    current = inner;
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    /// Whether this expression's value provably owns no `Drop`.
+    ///
+    /// A literal, a binding already proven non-dropping, a borrow of a place,
+    /// an operator applied to non-dropping operands, a cast to a primitive, a
+    /// call to a same-file `fn` with a primitive return type, an array or
+    /// struct literal whose parts are themselves proven, and a read of a
+    /// primitive field or element all produce a value that runs no destructor.
+    /// Anything else answers `false`, which keeps the drop-omission gaps.
+    ///
+    /// The walk is an explicit worklist rather than recursion: operator nesting
+    /// in a source file is unbounded.
+    fn expression_is_definitely_non_dropping(&self, node: Node<'_>) -> bool {
+        let mut pending = vec![node];
+        while let Some(node) = pending.pop() {
+            if matches!(expression_value_kind(node), SemanticValueKind::Constant) {
+                continue;
+            }
+            match node.kind() {
+                "identifier" => {
+                    let proven = node_text(self.source, node)
+                        .and_then(|name| {
+                            self.local_at(name, node.start_byte())
+                                .or_else(|| self.parameters.get(name).copied())
+                        })
+                        .is_some_and(|value| self.definitely_non_dropping.contains(&value));
+                    if !proven {
+                        return false;
+                    }
+                }
+                // Borrowing a place -- a local, a field, an element -- owns
+                // nothing and extends nothing: the referent already lives as
+                // long as whatever binds it, and its own binding answers the
+                // drop question. Borrowing anything else produces a temporary
+                // whose lifetime the borrow extends to the end of the
+                // enclosing block, so `&Guard::new()` does run a `Drop` there
+                // and keeps the gaps.
+                "reference_expression" => {
+                    if !first_named_child(node).is_some_and(|operand| self.is_place(operand)) {
+                        return false;
+                    }
+                }
+                "binary_expression" | "unary_expression" | "parenthesized_expression" => {
+                    let operands = runtime_expression_children(node);
+                    if operands.is_empty() {
+                        return false;
+                    }
+                    pending.extend(operands);
+                }
+                "type_cast_expression" => {
+                    if !node
+                        .child_by_field_name("type")
+                        .is_some_and(|ty| ty.kind() == "primitive_type")
+                    {
+                        return false;
+                    }
+                }
+                // An array owns whatever its elements own and nothing else:
+                // `[T; N]` has no user `Drop` implementation of its own.
+                "array_expression" => {
+                    pending.extend(runtime_expression_children(node));
+                }
+                // A struct literal of a struct this file proves plain: every
+                // field is a primitive or another plain struct, and this file
+                // states no `impl Drop` for it.
+                "struct_expression" => {
+                    let plain = node
+                        .child_by_field_name("name")
+                        .filter(|name| name.kind() == "type_identifier")
+                        .and_then(|name| node_text(self.source, name))
+                        .is_some_and(|name| self.facts.plain_structs.contains(name));
+                    if !plain {
+                        return false;
+                    }
+                    pending.extend(runtime_expression_children(node));
+                }
+                // The initializer list itself carries no value; what it holds
+                // are the field values, and those decide.
+                "field_initializer_list"
+                | "field_initializer"
+                | "shorthand_field_initializer"
+                | "base_field_initializer" => {
+                    pending.extend(runtime_expression_children(node));
+                }
+                // Reading a field or an element whose declared type is a
+                // primitive produces a primitive.
+                "field_expression" => {
+                    let primitive = node
+                        .child_by_field_name("value")
+                        .zip(node.child_by_field_name("field"))
+                        .and_then(|(base, field)| self.field_declaration(base, field))
+                        .is_some_and(|declaration| declaration.primitive);
+                    if !primitive {
+                        return false;
+                    }
+                }
+                "index_expression" => {
+                    let children = runtime_expression_children(node);
+                    let [base, _] = children.as_slice() else {
+                        return false;
+                    };
+                    if !matches!(
+                        self.expression_shape(*base),
+                        Some(RustValueShape::Array {
+                            primitive_elements: true
+                        })
+                    ) {
+                        return false;
+                    }
+                }
+                "call_expression" => {
+                    let primitive_result = node
+                        .child_by_field_name("function")
+                        .filter(|function| function.kind() == "identifier")
+                        .and_then(|function| node_text(self.source, function))
+                        .and_then(|name| self.facts.primitive_return_functions.get(name))
+                        .copied()
+                        .unwrap_or(false);
+                    if !primitive_result {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// Whether writing over this assignment target can run a destructor.
+    ///
+    /// Assignment drops the value it replaces. When the target is a binding
+    /// this procedure already proved holds no `Drop`, or a field or element
+    /// whose declared type is a primitive, nothing is dropped, and the
+    /// drop-omission gaps would be claiming a cleanup that cannot happen. Any
+    /// other target -- a dereference, a destructuring pattern, a name this
+    /// procedure does not bind -- keeps them.
+    fn assignment_replaces_droppable_value(&self, left: Node<'_>) -> bool {
+        match left.kind() {
+            "identifier" => {
+                let Some(name) = node_text(self.source, left) else {
+                    return true;
+                };
+                self.local_at(name, left.start_byte())
+                    .or_else(|| self.parameters.get(name).copied())
+                    .is_none_or(|target| !self.definitely_non_dropping.contains(&target))
+            }
+            // Overwriting a field or an element whose declared type is a
+            // primitive drops nothing: a primitive is `Copy` and cannot
+            // implement `Drop`.
+            "field_expression" | "index_expression" => {
+                !self.expression_is_definitely_non_dropping(left)
+            }
+            _ => true,
+        }
     }
 
     fn let_declaration_may_require_drop(&self, node: Node<'_>) -> bool {
@@ -944,6 +1466,26 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let decision = self.point(builder, node, Vec::new())?;
                 self.edge(builder, decision, when_true)?;
                 self.edge(builder, decision, when_false)?;
+                // A literal condition fixes its outcome at compile time. Both
+                // arms stay represented -- the dead one still holds call sites
+                // and declarations a consumer asks about -- and the guard row
+                // is what tells a solver which of them cannot execute.
+                if let Some(value) = rust_constant_condition(node) {
+                    let arm = |target: EdgeTarget| {
+                        Some(GuardArm {
+                            target_point: target.point,
+                            kind: target.kind,
+                        })
+                    };
+                    self.session.add_guard_fact(
+                        builder,
+                        decision,
+                        GuardPredicate::ConstantBoolean { value },
+                        None,
+                        arm(when_true),
+                        arm(when_false),
+                    )?;
+                }
                 stack.push(Work::Expression {
                     node,
                     entry,
@@ -1128,21 +1670,30 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         point: ProgramPointId,
         context: &str,
     ) -> Result<(), RustLoweringError> {
-        for (capability, detail) in [
+        for (capability, kind, detail) in [
             (
                 SemanticCapability::CleanupControlFlow,
+                SemanticGapKind::Unknown,
                 "implicit Drop order and cleanup routing are not lowered",
             ),
             (
                 SemanticCapability::ResourceManagement,
+                SemanticGapKind::Unknown,
                 "resource release depends on inferred types and Drop implementations",
             ),
             (
                 SemanticCapability::Calls,
+                SemanticGapKind::Unknown,
                 "implicit Drop::drop invocations are not emitted as fabricated call sites",
             ),
+            // The unwind edge a panicking destructor would take is simply not
+            // lowered, which is `Unsupported` rather than `Unknown`: it is the
+            // exact shape the shared implicit-abort discharge closes when no
+            // handler or cleanup body runs user code (#1952). Stating it as
+            // `Unknown` made every Rust snapshot uncertain forever.
             (
                 SemanticCapability::ExceptionalControlFlow,
+                SemanticGapKind::Unsupported,
                 "destructor unwinding and destructor panic routing are not lowered",
             ),
         ] {
@@ -1151,7 +1702,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 point,
                 SemanticGapSubject::Point,
                 capability,
-                SemanticGapKind::Unknown,
+                kind,
                 &format!("{context}; {detail}"),
             )?;
         }
@@ -1218,14 +1769,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         if let Some(alternative) = alternative {
             let success = self.point(builder, node, Vec::new())?;
             let alternative_entry = self.point(builder, alternative, Vec::new())?;
-            self.add_gap(
-                builder,
-                binding,
-                SemanticGapSubject::Point,
-                SemanticCapability::NormalControlFlow,
-                SemanticGapKind::Unknown,
-                "let-else pattern matching and binding details require value refinement",
-            )?;
+            // No control-flow gap: the matched and diverging successors are
+            // both represented as edges below. What the pattern binds is a
+            // value question, already published by the `LocalFlow` gap above
+            // for any pattern this adapter does not lower as identity flow.
             self.edge(
                 builder,
                 binding,
@@ -1273,7 +1820,24 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ) -> Result<(), RustLoweringError> {
         match node.kind() {
             "call_expression" => self.call_expression(builder, node, entry, next, scope, stack),
-            "struct_expression" => self.struct_expression(builder, node, entry, next, scope, stack),
+            "struct_expression" => self.allocation_expression(
+                builder,
+                node,
+                AllocationKind::Object,
+                entry,
+                next,
+                scope,
+                stack,
+            ),
+            "array_expression" => self.allocation_expression(
+                builder,
+                node,
+                AllocationKind::Array,
+                entry,
+                next,
+                scope,
+                stack,
+            ),
             "assignment_expression" => {
                 self.assignment_expression(builder, node, entry, next, scope, stack)
             }
@@ -1325,6 +1889,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
             "binary_expression" if rust_boolean_operator(node).is_some() => {
                 let merge = self.point(builder, node, Vec::new())?;
+                // Both arms of the short circuit reconvene here, and the
+                // boolean this expression produces derives from whichever
+                // operands were evaluated to reach it.
+                let result = self.expression_value(builder, node, expression_value_kind(node))?;
+                let operands = runtime_expression_children(node)
+                    .into_iter()
+                    .map(|child| {
+                        self.expression_value(builder, child, expression_value_kind(child))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.session
+                    .append_language_defined_value_flows(builder, merge, operands, result)?;
                 self.edge(builder, merge, next)?;
                 stack.push(Work::Condition {
                     node,
@@ -1340,6 +1916,20 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     scope,
                 });
                 Ok(())
+            }
+            "binary_expression" | "unary_expression" => {
+                self.operator_expression(builder, node, entry, next, scope, stack)
+            }
+            "field_expression"
+                if !self.field_denotes_no_location(node) && !is_rust_assignment_target(node) =>
+            {
+                self.field_load(builder, node, entry, next, scope, stack)
+            }
+            "index_expression"
+                if !is_rust_assignment_target(node)
+                    && runtime_expression_children(node).len() == 2 =>
+            {
+                self.index_load(builder, node, entry, next, scope, stack)
             }
             kind if implicit_runtime_call_reason(kind).is_some() => {
                 self.implicit_call_expression(builder, node, entry, next, scope, stack)
@@ -1396,10 +1986,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn struct_expression(
+    fn allocation_expression(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
         node: Node<'tree>,
+        kind: AllocationKind,
         entry: ProgramPointId,
         next: EdgeTarget,
         scope: ScopeFrameId,
@@ -1408,7 +1999,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let terminal = self.point(builder, node, Vec::new())?;
         let result = self.expression_value(builder, node, SemanticValueKind::Temporary)?;
         self.session
-            .add_allocation(builder, terminal, result, AllocationKind::Object)?;
+            .add_allocation(builder, terminal, result, kind)?;
         self.edge(builder, terminal, next)?;
         let children = runtime_expression_children(node);
         self.schedule_expressions(
@@ -1471,7 +2062,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     "assignment target does not name a represented Rust local or parameter",
                 )?;
             }
-            self.add_drop_omission_gaps(builder, terminal, "assignment may replace a live value")?;
+            if self.assignment_replaces_droppable_value(left) {
+                self.add_drop_omission_gaps(
+                    builder,
+                    terminal,
+                    "assignment may replace a live value",
+                )?;
+            }
             self.edge(builder, terminal, next)?;
             stack.push(Work::Expression {
                 node: right,
@@ -1482,29 +2079,129 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             return Ok(());
         }
 
-        self.add_gap(
-            builder,
-            terminal,
-            SemanticGapSubject::Point,
-            SemanticCapability::Assignments,
-            SemanticGapKind::Unsupported,
-            "field, index, dereferenced, and destructuring Rust assignment targets are not yet lowered into memory flow",
-        )?;
-        self.add_gap(
-            builder,
-            terminal,
-            SemanticGapSubject::Point,
-            SemanticCapability::Calls,
-            SemanticGapKind::Unknown,
-            "Rust place assignment may invoke custom DerefMut, IndexMut, or Drop behavior",
-        )?;
-        self.add_drop_omission_gaps(builder, terminal, "assignment may replace a live value")?;
+        // A single field or index target is a real store into memory. The
+        // target's own base is still evaluated, but the target node itself is
+        // never scheduled as an expression: reading it would publish a load of
+        // the location this statement writes.
+        let place = matches!(left.kind(), "field_expression" | "index_expression")
+            .then_some(left)
+            .filter(|place| {
+                place.kind() != "field_expression" || !self.field_denotes_no_location(*place)
+            });
+        let evaluations = if let Some(place) = place {
+            let value = self.expression_value(builder, right, expression_value_kind(right))?;
+            let mut evaluations = vec![right];
+            match place.kind() {
+                "field_expression" => {
+                    let base = required_field(place, "value")?;
+                    let field = required_field(place, "field")?;
+                    let base_value =
+                        self.expression_value(builder, base, expression_value_kind(base))?;
+                    let (member, resolved) = self.memory_member_locator(base, field)?;
+                    let location = self.session.add_memory_location(
+                        builder,
+                        terminal,
+                        MemoryLocationKind::Field {
+                            base: base_value,
+                            member,
+                        },
+                    )?;
+                    if !resolved {
+                        self.add_field_identity_gap(builder, terminal, location)?;
+                    }
+                    self.append_effect(
+                        builder,
+                        terminal,
+                        SemanticEffect::MemoryStore {
+                            kind: MemoryAccessKind::Field,
+                            location,
+                            value,
+                        },
+                    )?;
+                    evaluations.insert(0, base);
+                }
+                _ => {
+                    let children = runtime_expression_children(place);
+                    let [base, index_node] = children.as_slice() else {
+                        return Err(RustLoweringError::Invalid(
+                            "Rust index place does not have a base and an index".into(),
+                        ));
+                    };
+                    let base_value =
+                        self.expression_value(builder, *base, expression_value_kind(*base))?;
+                    let index = self.index_value(builder, *index_node)?;
+                    let location = self.session.add_memory_location(
+                        builder,
+                        terminal,
+                        MemoryLocationKind::Index {
+                            base: base_value,
+                            index,
+                        },
+                    )?;
+                    if index.is_none() {
+                        self.add_dynamic_index_gap(builder, terminal, location)?;
+                    }
+                    self.append_effect(
+                        builder,
+                        terminal,
+                        SemanticEffect::MemoryStore {
+                            kind: MemoryAccessKind::Index,
+                            location,
+                            value,
+                        },
+                    )?;
+                    evaluations.insert(0, *index_node);
+                    evaluations.insert(0, *base);
+                }
+            }
+            evaluations
+        } else {
+            self.add_gap(
+                builder,
+                terminal,
+                SemanticGapSubject::Point,
+                SemanticCapability::Assignments,
+                SemanticGapKind::Unsupported,
+                "dereferenced, destructuring, and call-selector Rust assignment targets are not yet lowered into memory flow",
+            )?;
+            runtime_expression_children(node)
+        };
+        // One scoped fact per point: the place-evaluation traits a field, index,
+        // or dereference target may invoke are reported alongside the drop
+        // omissions this same terminal already publishes rather than as a
+        // second Point/Calls row. A place whose access is the language's own
+        // projection, replacing a value that provably owns no `Drop`, invokes
+        // neither and publishes nothing.
+        if !self.place_access_is_language_defined(left)
+            || self.assignment_replaces_droppable_value(left)
+        {
+            self.add_drop_omission_gaps(
+                builder,
+                terminal,
+                "place assignment may invoke custom DerefMut or IndexMut behavior and may replace a live value",
+            )?;
+        } else if left.kind() == "index_expression" {
+            // The abort edge an out-of-range index would take is not lowered.
+            // `Unsupported` on a `Point` subject is the exact shape the shared
+            // implicit-abort discharge closes when no handler or cleanup body
+            // runs user code (#1952). A place that also publishes the
+            // drop-omission family already carries this exact scoped fact in
+            // that family's own `ExceptionalControlFlow` row, and #2638's
+            // contract allows only one row per (point, subject, capability).
+            self.add_gap(
+                builder,
+                terminal,
+                SemanticGapSubject::Point,
+                SemanticCapability::ExceptionalControlFlow,
+                SemanticGapKind::Unsupported,
+                "an index store may abort on an out-of-range index; that abort edge is not lowered",
+            )?;
+        }
         self.edge(builder, terminal, next)?;
-        let children = runtime_expression_children(node);
         self.schedule_expressions(
             builder,
             entry,
-            &children,
+            &evaluations,
             EdgeTarget::normal(terminal),
             scope,
             stack,
@@ -1533,6 +2230,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 value: source,
             },
         )?;
+        // Parenthesizing a value, or taking a reference to it, does not change
+        // what the value is. The assignment alone records only that the write
+        // happened; this flow records that the result *is* the operand.
+        self.append_effect(
+            builder,
+            terminal,
+            SemanticEffect::ValueFlow {
+                kind: ValueFlowKind::Local,
+                source,
+                target,
+            },
+        )?;
         self.edge(builder, terminal, next)?;
         stack.push(Work::Expression {
             node: value,
@@ -1556,14 +2265,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ) -> Result<(), RustLoweringError> {
         let terminal = self.point(builder, node, Vec::new())?;
         let target = self.expression_value(builder, node, expression_value_kind(node))?;
-        self.add_gap(
-            builder,
-            terminal,
-            SemanticGapSubject::Value(target),
-            SemanticCapability::Values,
-            SemanticGapKind::Unsupported,
-            "Rust cast result identity is not propagated across conversion semantics",
-        )?;
+        // A cast changes a value's type, never where its data came from. The
+        // result therefore derives from the operand rather than keeping the
+        // operand's identity, which is exactly a language-defined flow. Ending
+        // the operand's history here instead published a gap the conversion
+        // does not actually have.
+        let source = self.expression_value(builder, value, expression_value_kind(value))?;
+        self.session
+            .append_language_defined_value_flows(builder, terminal, [source], target)?;
         self.edge(builder, terminal, next)?;
         stack.push(Work::Expression {
             node: value,
@@ -1572,6 +2281,201 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             scope,
         });
         Ok(())
+    }
+
+    /// An operator application: `a + b`, `!flag`, `*handle`.
+    ///
+    /// The operator's result derives from every operand it evaluates. Without
+    /// that flow an arithmetic or comparison step silently ended the value's
+    /// history, which is what left every computed Rust tail expression
+    /// unknown.
+    #[allow(clippy::too_many_arguments)]
+    fn operator_expression(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RustLoweringError> {
+        let terminal = self.point(builder, node, Vec::new())?;
+        let result = self.expression_value(builder, node, expression_value_kind(node))?;
+        let children = runtime_expression_children(node);
+        let operands = children
+            .iter()
+            .map(|child| self.expression_value(builder, *child, expression_value_kind(*child)))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.session
+            .append_language_defined_value_flows(builder, terminal, operands, result)?;
+        self.add_gap(
+            builder,
+            terminal,
+            SemanticGapSubject::Point,
+            SemanticCapability::Calls,
+            SemanticGapKind::Unknown,
+            implicit_runtime_call_reason(node.kind())
+                .expect("operator expressions carry an implicit-call reason"),
+        )?;
+        if rust_operation_can_abort(node) {
+            self.add_gap(
+                builder,
+                terminal,
+                SemanticGapSubject::Point,
+                SemanticCapability::ExceptionalControlFlow,
+                SemanticGapKind::Unsupported,
+                "arithmetic overflow, division by zero, or an invalid dereference may abort here; that abort edge is not lowered",
+            )?;
+        }
+        self.edge(builder, terminal, next)?;
+        self.schedule_expressions(
+            builder,
+            entry,
+            &children,
+            EdgeTarget::normal(terminal),
+            scope,
+            stack,
+        )
+    }
+
+    /// `base.field` read as a value: a load from the field's own location.
+    #[allow(clippy::too_many_arguments)]
+    fn field_load(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RustLoweringError> {
+        let base = required_field(node, "value")?;
+        let field = required_field(node, "field")?;
+        let access = self.point(builder, node, Vec::new())?;
+        let result = self.expression_value(builder, node, expression_value_kind(node))?;
+        let base_value = self.expression_value(builder, base, expression_value_kind(base))?;
+        let (member, resolved) = self.memory_member_locator(base, field)?;
+        let location = self.session.add_memory_location(
+            builder,
+            access,
+            MemoryLocationKind::Field {
+                base: base_value,
+                member,
+            },
+        )?;
+        if !resolved {
+            self.add_field_identity_gap(builder, access, location)?;
+        }
+        self.append_effect(
+            builder,
+            access,
+            SemanticEffect::MemoryLoad {
+                kind: MemoryAccessKind::Field,
+                location,
+                result,
+            },
+        )?;
+        // Projecting a field of a struct this file declares is the language's
+        // own projection: no autoderef step reaches a user `Deref`, and the
+        // projection itself cannot abort. Any other base keeps both claims.
+        if !self.place_access_is_language_defined(node) {
+            self.add_gap(
+                builder,
+                access,
+                SemanticGapSubject::Point,
+                SemanticCapability::Calls,
+                SemanticGapKind::Unknown,
+                "field projection may require implicit autoderef operations that are not emitted as call sites",
+            )?;
+            self.add_gap(
+                builder,
+                access,
+                SemanticGapSubject::Point,
+                SemanticCapability::ExceptionalControlFlow,
+                SemanticGapKind::Unsupported,
+                "an implicit Rust autoderef may abort here; that abort edge is not lowered",
+            )?;
+        }
+        self.edge(builder, access, next)?;
+        self.schedule_expressions(
+            builder,
+            entry,
+            &[base],
+            EdgeTarget::normal(access),
+            scope,
+            stack,
+        )
+    }
+
+    /// `base[index]` read as a value: a load from the element's own location.
+    #[allow(clippy::too_many_arguments)]
+    fn index_load(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        entry: ProgramPointId,
+        next: EdgeTarget,
+        scope: ScopeFrameId,
+        stack: &mut Vec<Work<'tree>>,
+    ) -> Result<(), RustLoweringError> {
+        let children = runtime_expression_children(node);
+        let [base, index_node] = children.as_slice() else {
+            return Err(RustLoweringError::Invalid(
+                "Rust index expression does not have a base and an index".into(),
+            ));
+        };
+        let access = self.point(builder, node, Vec::new())?;
+        let result = self.expression_value(builder, node, expression_value_kind(node))?;
+        let base_value = self.expression_value(builder, *base, expression_value_kind(*base))?;
+        let index = self.index_value(builder, *index_node)?;
+        let location = self.session.add_memory_location(
+            builder,
+            access,
+            MemoryLocationKind::Index {
+                base: base_value,
+                index,
+            },
+        )?;
+        if index.is_none() {
+            self.add_dynamic_index_gap(builder, access, location)?;
+        }
+        self.append_effect(
+            builder,
+            access,
+            SemanticEffect::MemoryLoad {
+                kind: MemoryAccessKind::Index,
+                location,
+                result,
+            },
+        )?;
+        if !self.place_access_is_language_defined(node) {
+            self.add_gap(
+                builder,
+                access,
+                SemanticGapSubject::Point,
+                SemanticCapability::Calls,
+                SemanticGapKind::Unknown,
+                "indexing may invoke Index or IndexMut implicitly; no fabricated trait call site is emitted",
+            )?;
+        }
+        // Built in or not, an index read may abort on an out-of-range index.
+        self.add_gap(
+            builder,
+            access,
+            SemanticGapSubject::Point,
+            SemanticCapability::ExceptionalControlFlow,
+            SemanticGapKind::Unsupported,
+            "indexing may abort on an out-of-range index; that abort edge is not lowered",
+        )?;
+        self.edge(builder, access, next)?;
+        self.schedule_expressions(
+            builder,
+            entry,
+            &children,
+            EdgeTarget::normal(access),
+            scope,
+            stack,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1595,18 +2499,26 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             SemanticGapKind::Unknown,
             reason,
         )?;
-        self.add_gap(
-            builder,
-            boundary,
-            SemanticGapSubject::Point,
-            SemanticCapability::ExceptionalControlFlow,
-            SemanticGapKind::Unknown,
-            "implicit Rust trait operations or built-in checks may panic, but their exceptional behavior is not refined",
-        )?;
+        if rust_operation_can_abort(node) {
+            // Not lowering the abort edge is `Unsupported`, the shape the
+            // shared implicit-abort discharge closes; an operation that cannot
+            // abort publishes nothing at all.
+            self.add_gap(
+                builder,
+                boundary,
+                SemanticGapSubject::Point,
+                SemanticCapability::ExceptionalControlFlow,
+                SemanticGapKind::Unsupported,
+                "an implicit Rust built-in check may abort here; that abort edge is not lowered",
+            )?;
+        }
         if matches!(
             node.kind(),
             "assignment_expression" | "compound_assignment_expr"
-        ) {
+        ) && node
+            .child_by_field_name("left")
+            .is_none_or(|left| self.assignment_replaces_droppable_value(left))
+        {
             self.add_gap(
                 builder,
                 boundary,
@@ -1731,14 +2643,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .filter(|child| child.kind() == "match_arm")
             .collect::<Vec<_>>();
         let decision = self.point(builder, node, Vec::new())?;
-        self.add_gap(
-            builder,
-            decision,
-            SemanticGapSubject::Point,
-            SemanticCapability::NormalControlFlow,
-            SemanticGapKind::Unknown,
-            "match pattern selection and binding depend on runtime values; represented case edges are a conservative choice set",
-        )?;
+        // No point-wide control-flow gap: every arm gets a case edge below and
+        // the last arm's guard-false edge continues past the match, so the
+        // represented successor set is a superset of the real one. What a
+        // selected pattern *binds* is still unknown, and that is published per
+        // arm, on the value it binds.
         if arms.is_empty() {
             self.edge(builder, decision, next)?;
         } else {
@@ -1751,8 +2660,26 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let mut arm_scopes = Vec::with_capacity(arms.len());
-            for candidate in &candidates {
+            for (index, candidate) in candidates.iter().enumerate() {
                 arm_scopes.push(self.push_cleanup_scope(builder, scope)?);
+                // Only an arm that actually binds a name introduces a value
+                // whose identity and drop obligation are unresolved. A literal
+                // or wildcard arm introduces neither.
+                let binds = arms[index]
+                    .child_by_field_name("pattern")
+                    .is_some_and(rust_pattern_binds_value);
+                if !binds {
+                    continue;
+                }
+                let bound = self.value(builder, *candidate, SemanticValueKind::Local)?;
+                self.add_gap(
+                    builder,
+                    *candidate,
+                    SemanticGapSubject::Value(bound),
+                    SemanticCapability::Values,
+                    SemanticGapKind::Unknown,
+                    "what a selected Rust match pattern binds depends on the scrutinee's runtime shape",
+                )?;
                 self.add_drop_omission_gaps(
                     builder,
                     *candidate,
@@ -1937,11 +2864,37 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             },
         );
         let body_scope = self.push_cleanup_scope(builder, loop_scope)?;
-        self.add_drop_omission_gaps(
-            builder,
-            body_entry,
-            "the per-iteration for-pattern value may require implicit Drop after the selected iteration",
-        )?;
+        // The element the pattern binds is a value of this procedure like any
+        // other: it derives from the iterable. Publishing that element-of
+        // relation is what carries a tainted collection into a loop body.
+        let pattern = node.child_by_field_name("pattern");
+        let element = pattern
+            .and_then(identity_binding_identifier)
+            .and_then(|name| {
+                node_text(self.source, name)
+                    .and_then(|text| self.local_declaration_value(text, name.start_byte()))
+            });
+        if let Some(element) = element {
+            let iterable_value =
+                self.expression_value(builder, iterable, expression_value_kind(iterable))?;
+            self.session.append_language_defined_value_flows(
+                builder,
+                body_entry,
+                [iterable_value],
+                element,
+            )?;
+        }
+        // A pattern that binds a primitive element runs no destructor, exactly
+        // as for a `let`.
+        let element_may_drop =
+            element.is_none_or(|element| !self.definitely_non_dropping.contains(&element));
+        if element_may_drop {
+            self.add_drop_omission_gaps(
+                builder,
+                body_entry,
+                "the per-iteration for-pattern value may require implicit Drop after the selected iteration",
+            )?;
+        }
         self.add_gap(
             builder,
             test,
@@ -1950,14 +2903,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             SemanticGapKind::Unknown,
             "IntoIterator conversion and Iterator::next are implicit calls not emitted as fabricated call sites",
         )?;
-        self.add_gap(
-            builder,
-            test,
-            SemanticGapSubject::Point,
-            SemanticCapability::NormalControlFlow,
-            SemanticGapKind::Unknown,
-            "iterator exhaustion and per-iteration pattern binding require type and value refinement",
-        )?;
+        // No `NormalControlFlow` gap: both successors of the exhaustion test
+        // are represented below, so claiming the loop's control flow is
+        // unknown over-states what is missing.
         self.edge(
             builder,
             test,
@@ -1983,10 +2931,21 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             },
             scope: body_scope,
         });
+        // When the iterable provably yields at least one element, the first
+        // iteration enters the body without consulting the exhaustion test.
+        // Routing the entry through the test instead would keep a
+        // zero-iteration path that this loop does not have, and a kill inside
+        // the body would then look avoidable. Java's counted `for` states the
+        // same fact through `for_condition_starts_true`.
+        let first_iteration = if rust_iteration_yields_an_element(iterable, self.source) {
+            EdgeTarget::normal(body_entry)
+        } else {
+            EdgeTarget::normal(test)
+        };
         stack.push(Work::Expression {
             node: iterable,
             entry,
-            next: EdgeTarget::normal(test),
+            next: first_iteration,
             scope,
         });
         Ok(())
@@ -2101,14 +3060,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let branch = self.point(builder, node, Vec::new())?;
         let residual = self.point(builder, node, Vec::new())?;
         let residual_value = self.value(builder, residual, SemanticValueKind::Return)?;
-        self.add_gap(
-            builder,
-            branch,
-            SemanticGapSubject::Point,
-            SemanticCapability::NormalControlFlow,
-            SemanticGapKind::Unknown,
-            "the Try branch chosen by ? depends on the operand value and Try implementation",
-        )?;
+        // No control-flow gap: both Try outcomes -- continue with the value,
+        // or return the residual -- are represented as edges below, so the
+        // successor set is complete. Which one runs is a value question, and
+        // the unlowered `Try::branch` and `FromResidual` calls below already
+        // state that the value question is open.
         self.add_gap(
             builder,
             branch,
@@ -2488,8 +3444,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 invoke,
                 SemanticGapSubject::Point,
                 SemanticCapability::ExceptionalControlFlow,
-                SemanticGapKind::Unknown,
-                "implicit method receiver adjustments may panic, but their exceptional behavior is not refined",
+                SemanticGapKind::Unsupported,
+                "implicit method receiver adjustments may abort; that abort edge is not lowered",
             )?;
         }
 
@@ -2690,21 +3646,28 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "{} lexical scope(s) with possible implicit Drop are exited by this abrupt completion",
                 route.cleanups().len()
             );
-            for (capability, reason) in [
+            for (capability, kind, reason) in [
                 (
                     SemanticCapability::CleanupControlFlow,
+                    SemanticGapKind::Unknown,
                     "implicit Drop order and cleanup routing are not lowered",
                 ),
                 (
                     SemanticCapability::ResourceManagement,
+                    SemanticGapKind::Unknown,
                     "RAII resource release depends on inferred local types and Drop implementations",
                 ),
                 (
                     SemanticCapability::Calls,
+                    SemanticGapKind::Unknown,
                     "implicit Drop::drop invocations are not emitted as fabricated call sites",
                 ),
+                // As in `add_drop_omission_gaps`: an unlowered destructor
+                // unwind edge is `Unsupported`, the shape the shared
+                // implicit-abort discharge can close.
                 (
                     SemanticCapability::ExceptionalControlFlow,
+                    SemanticGapKind::Unsupported,
                     "destructor unwinding and destructor panic routing are not lowered",
                 ),
             ] {
@@ -2713,7 +3676,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     from,
                     SemanticGapSubject::Point,
                     capability,
-                    SemanticGapKind::Unknown,
+                    kind,
                     &format!("{detail}; {reason}"),
                 )?;
             }
@@ -2894,6 +3857,37 @@ fn identity_binding_identifier(mut pattern: Node<'_>) -> Option<Node<'_>> {
     }
 }
 
+/// Whether this pattern introduces a binding.
+///
+/// A bare `identifier` in pattern position binds; a path that names a variant
+/// or constant reaches the tree as the `type` field of a struct or
+/// tuple-struct pattern, or as a `scoped_identifier`, and binds nothing. A
+/// unit variant written bare (`None`) is indistinguishable from a binding in
+/// the syntax alone and is counted as binding, which only adds a gap.
+fn rust_pattern_binds_value(pattern: Node<'_>) -> bool {
+    let mut pending = vec![pattern];
+    while let Some(current) = pending.pop() {
+        match current.kind() {
+            "identifier" => return true,
+            "scoped_identifier" => continue,
+            _ => {}
+        }
+        // A `match_pattern`'s `condition` is a guard expression, not a pattern,
+        // and a struct or tuple-struct pattern's `type` names the variant.
+        let excluded = ["type", "condition"]
+            .into_iter()
+            .filter_map(|field| current.child_by_field_name(field))
+            .map(|node| node.id())
+            .collect::<Vec<_>>();
+        pending.extend(
+            named_children(current)
+                .into_iter()
+                .filter(|child| !excluded.contains(&child.id())),
+        );
+    }
+    false
+}
+
 fn rust_local_scope(node: Node<'_>) -> Option<(usize, usize)> {
     let mut parent = node.parent();
     while let Some(candidate) = parent {
@@ -2927,20 +3921,363 @@ fn expression_value_kind(node: Node<'_>) -> SemanticValueKind {
     }
 }
 
+/// Whether this expression's lowering already publishes where its value came
+/// from, so a tail-expression return needs no value-refinement gap.
 fn rust_expression_has_direct_value_evidence(node: Node<'_>) -> bool {
     matches!(
         node.kind(),
         "call_expression"
             | "struct_expression"
+            | "array_expression"
             | "parenthesized_expression"
             | "reference_expression"
+            | "binary_expression"
+            | "unary_expression"
+            | "type_cast_expression"
     ) || is_runtime_leaf(node.kind())
+}
+
+/// A declared type that proves the value it describes owns no `Drop`.
+///
+/// A reference never runs a destructor when it goes out of scope, and a
+/// primitive (`i32`, `bool`, `char`, ...) is `Copy` and cannot implement
+/// `Drop`. Both facts are read from the declared type node, never from the
+/// spelling of the source text.
+fn rust_type_is_definitely_non_dropping(ty: Node<'_>) -> bool {
+    matches!(ty.kind(), "reference_type" | "primitive_type")
+}
+
+/// The shape a declared type states, read from the type node itself.
+///
+/// A reference is transparent for the same reason it is in `expression_shape`:
+/// `&Holder` and `&mut Holder` both project `Holder`'s own fields.
+fn rust_declared_type_shape(source: &str, ty: Node<'_>) -> Option<RustValueShape> {
+    let mut current = ty;
+    loop {
+        match current.kind() {
+            "type_identifier" => {
+                return node_text(source, current).map(|name| RustValueShape::Struct(name.into()));
+            }
+            "reference_type" => current = current.child_by_field_name("type")?,
+            "array_type" => {
+                return Some(RustValueShape::Array {
+                    primitive_elements: current
+                        .child_by_field_name("element")
+                        .is_some_and(|element| element.kind() == "primitive_type"),
+                });
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// The `Self` type of the `impl` block this callable is declared in.
+/// Whether this expression is written by the assignment that contains it.
+///
+/// A write target is not a read. The lowered store replaces its own evaluation
+/// list so the target node is never scheduled, but a compound assignment --
+/// whose update this adapter does not lower -- still schedules its place, and
+/// minting a `MemoryLoad` there would publish a read of the very location the
+/// statement overwrites.
+fn is_rust_assignment_target(node: Node<'_>) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            "parenthesized_expression" => current = parent,
+            "assignment_expression" | "compound_assignment_expr" => {
+                return field_matches(parent, "left", current);
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// The `Self` type of the `impl` block this callable is declared in.
+fn rust_impl_self_type(callable: Node<'_>) -> Option<Node<'_>> {
+    let mut current = callable;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "impl_item" {
+            return parent.child_by_field_name("type");
+        }
+        if is_rust_nested_execution_boundary(parent) {
+            return None;
+        }
+        current = parent;
+    }
+    None
 }
 
 fn rust_parameter_is_definitely_non_dropping(node: Node<'_>) -> bool {
     node.child_by_field_name("type")
-        .is_some_and(|ty| ty.kind() == "reference_type")
-        || node.kind() == "reference_type"
+        .is_some_and(rust_type_is_definitely_non_dropping)
+        || rust_type_is_definitely_non_dropping(node)
+}
+
+/// What one struct declaration in this file states about one of its fields.
+#[derive(Debug, Clone)]
+struct RustFieldDeclaration {
+    /// The field's own `field_identifier`, which is the identity two
+    /// occurrences of that field must agree on to name one memory location.
+    anchor: SourceAnchor,
+    /// Whether the declared field type is a primitive, so overwriting the
+    /// field drops nothing.
+    primitive: bool,
+    /// The shape the declared field type states, which is what lets a nested
+    /// access path resolve its next selector.
+    shape: Option<RustValueShape>,
+}
+
+/// Everything one Rust file states that every procedure lowered from it reads.
+///
+/// All three tables are file-scoped by construction: this adapter lowers one
+/// file at a time and never consults another. That is the same posture the
+/// Python adapter's `instance_field_proofs` takes, and it is stated here so a
+/// reader does not mistake any of these for a whole-crate proof.
+struct RustFileFacts {
+    /// Same-file `fn` names whose declared return type is a primitive.
+    primitive_return_functions: HashMap<Box<str>, bool>,
+    /// Every `(struct, field)` this file declares. `None` marks a pair the
+    /// file states more than once, which no longer picks a declaration.
+    struct_fields: HashMap<(Box<str>, Box<str>), Option<RustFieldDeclaration>>,
+    /// Structs this file declares whose values provably run no destructor:
+    /// every field is a primitive or another such struct, the struct takes no
+    /// type parameters, and this file states no `impl Drop` for it.
+    plain_structs: HashSet<Box<str>>,
+}
+
+fn rust_file_facts(prepared: &PreparedSyntaxTree) -> RustFileFacts {
+    let source = prepared.source();
+    let mut primitive_return_functions: HashMap<Box<str>, bool> = HashMap::default();
+    let mut struct_fields: HashMap<(Box<str>, Box<str>), Option<RustFieldDeclaration>> =
+        HashMap::default();
+    // Every struct this file declares, with the field types it states, plus
+    // the names this file declares more than once and the names it implements
+    // `Drop` for. Both disqualify a struct from the plainness fixpoint below.
+    let mut declared_fields: HashMap<Box<str>, Vec<Node<'_>>> = HashMap::default();
+    let mut disqualified: HashSet<Box<str>> = HashSet::default();
+    let mut every_struct_drops = false;
+    let mut stack = vec![prepared.tree().root_node()];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "function_item" => {
+                if let Some(name) = node
+                    .child_by_field_name("name")
+                    .and_then(|name| node_text(source, name))
+                {
+                    let primitive = node
+                        .child_by_field_name("return_type")
+                        .is_some_and(|ty| ty.kind() == "primitive_type");
+                    primitive_return_functions
+                        .entry(name.into())
+                        .and_modify(|agreed| *agreed = *agreed && primitive)
+                        .or_insert(primitive);
+                }
+            }
+            "struct_item" => {
+                if let Some(name) = node
+                    .child_by_field_name("name")
+                    .and_then(|name| node_text(source, name))
+                {
+                    let fields = node
+                        .child_by_field_name("body")
+                        .filter(|body| body.kind() == "field_declaration_list")
+                        .map(named_children)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|child| child.kind() == "field_declaration")
+                        .collect::<Vec<_>>();
+                    for field in &fields {
+                        let Some(field_name) = field
+                            .child_by_field_name("name")
+                            .and_then(|name| node_text(source, name))
+                        else {
+                            continue;
+                        };
+                        let declaration = field
+                            .child_by_field_name("name")
+                            .and_then(|name| source_anchor(name, 0).ok())
+                            .map(|anchor| RustFieldDeclaration {
+                                anchor,
+                                primitive: field
+                                    .child_by_field_name("type")
+                                    .is_some_and(|ty| ty.kind() == "primitive_type"),
+                                shape: field
+                                    .child_by_field_name("type")
+                                    .and_then(|ty| rust_declared_type_shape(source, ty)),
+                            });
+                        match struct_fields.entry((name.into(), field_name.into())) {
+                            std::collections::hash_map::Entry::Vacant(entry) => {
+                                entry.insert(declaration);
+                            }
+                            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                                entry.insert(None);
+                            }
+                        }
+                    }
+                    if node.child_by_field_name("type_parameters").is_some()
+                        || declared_fields.insert(name.into(), fields).is_some()
+                    {
+                        disqualified.insert(name.into());
+                    }
+                }
+            }
+            "impl_item" => {
+                let implements_drop = node
+                    .child_by_field_name("trait")
+                    .and_then(|declared| node_text(source, declared))
+                    .is_some_and(|declared| declared.trim_end_matches('>').ends_with("Drop"));
+                if implements_drop {
+                    match node
+                        .child_by_field_name("type")
+                        .filter(|declared| declared.kind() == "type_identifier")
+                        .and_then(|declared| node_text(source, declared))
+                    {
+                        Some(name) => {
+                            disqualified.insert(name.into());
+                        }
+                        // A `Drop` implementation whose subject is not a plain
+                        // name -- a generic instantiation, a path, a tuple --
+                        // names a type this prescan does not identify, so no
+                        // struct in this file keeps its plainness proof.
+                        None => every_struct_drops = true,
+                    }
+                }
+            }
+            _ => {}
+        }
+        stack.extend(named_children(node));
+    }
+
+    // A struct is plain when every field is a primitive or another plain
+    // struct. The fixpoint grows the proven set until it stops changing, which
+    // terminates because the set only grows and is bounded by the file's
+    // declarations. A cyclic `struct A { b: B }`/`struct B { a: A }` is
+    // impossible in Rust without indirection, and indirection is not a
+    // primitive type, so a cycle simply never enters the set.
+    let mut plain_structs: HashSet<Box<str>> = HashSet::default();
+    if !every_struct_drops {
+        loop {
+            let mut grew = false;
+            for (name, fields) in &declared_fields {
+                if disqualified.contains(name) || plain_structs.contains(name) {
+                    continue;
+                }
+                let plain = fields.iter().all(|field| {
+                    field.child_by_field_name("type").is_some_and(|ty| {
+                        ty.kind() == "primitive_type"
+                            || node_text(source, ty)
+                                .is_some_and(|declared| plain_structs.contains(declared))
+                    })
+                });
+                if plain {
+                    plain_structs.insert(name.clone());
+                    grew = true;
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+    }
+
+    RustFileFacts {
+        primitive_return_functions,
+        struct_fields,
+        plain_structs,
+    }
+}
+
+/// Whether iterating this expression yields elements that own no `Drop`.
+///
+/// A range is the case that decides: `Range<T>` implements `Iterator` only for
+/// `T: Step`, and every `Step` type is a `Copy` primitive (an integer or
+/// `char`). Iterating any other expression yields elements of a type this
+/// adapter cannot see, so it answers `false`.
+fn rust_iteration_element_is_definitely_non_dropping(iterable: Node<'_>) -> bool {
+    iterable.kind() == "range_expression"
+}
+
+/// The outcome a literal branch condition fixes, when it is literal.
+///
+/// `if true` and `if false` -- and the same wrapped in parentheses -- decide
+/// their branch at compile time.
+fn rust_constant_condition(condition: Node<'_>) -> Option<bool> {
+    let mut cursor = condition;
+    loop {
+        match cursor.kind() {
+            "true" => return Some(true),
+            "false" => return Some(false),
+            // `boolean_literal` wraps the `true`/`false` keyword, which the
+            // grammar spells as an anonymous token.
+            "boolean_literal" => cursor = cursor.child(0)?,
+            "parenthesized_expression" => cursor = first_named_child(cursor)?,
+            _ => return None,
+        }
+    }
+}
+
+/// Whether iterating this expression provably yields at least one element.
+///
+/// Only a literal integer range answers `true`: `0..3` has three elements and
+/// `0..=3` has four, both known from the two literal bounds and the range
+/// operator. A suffixed or separated literal (`3u32`, `1_000`) does not parse
+/// here and answers `false`, which only keeps a zero-iteration path the loop
+/// may not have.
+fn rust_iteration_yields_an_element(iterable: Node<'_>, source: &str) -> bool {
+    if iterable.kind() != "range_expression" || iterable.child_count() != 3 {
+        return false;
+    }
+    let literal = |index: usize| {
+        iterable
+            .child(index)
+            .filter(|node| node.kind() == "integer_literal")
+            .and_then(|node| node_text(source, node))
+            .and_then(|text| text.parse::<i128>().ok())
+    };
+    let (Some(start), Some(end)) = (literal(0), literal(2)) else {
+        return false;
+    };
+    match iterable.child(1).map(|operator| operator.kind()) {
+        Some("..") => start < end,
+        Some("..=") => start <= end,
+        _ => false,
+    }
+}
+
+/// Whether this operator can abort the procedure.
+///
+/// Rust arithmetic aborts on overflow in a debug profile and on division by
+/// zero in every profile; a shift aborts when the amount exceeds the operand
+/// width; a dereference aborts on an invalid pointer. Comparison, boolean,
+/// bitwise, and negation-free operators cannot. The operator is read from the
+/// node, not matched against source text.
+fn rust_operation_can_abort(node: Node<'_>) -> bool {
+    match node.kind() {
+        "binary_expression" => node
+            .child_by_field_name("operator")
+            .is_some_and(|operator| {
+                matches!(operator.kind(), "+" | "-" | "*" | "/" | "%" | "<<" | ">>")
+            }),
+        // `unary_expression` spells its operator as an anonymous first child.
+        "unary_expression" => node
+            .child(0)
+            .is_some_and(|operator| matches!(operator.kind(), "-" | "*")),
+        "compound_assignment_expr" => {
+            node.child_by_field_name("operator")
+                .is_some_and(|operator| {
+                    matches!(
+                        operator.kind(),
+                        "+=" | "-=" | "*=" | "/=" | "%=" | "<<=" | ">>="
+                    )
+                })
+        }
+        // Indexing aborts on an out-of-range index, and a field projection
+        // reaches its field through an autoderef chain whose `Deref`
+        // implementation this adapter has not resolved and cannot rule out.
+        "index_expression" | "field_expression" => true,
+        _ => false,
+    }
 }
 
 fn rust_parameters_may_require_drop(callable: Node<'_>) -> bool {
@@ -3117,6 +4454,7 @@ fn is_runtime_container(kind: &str) -> bool {
             | "struct_expression"
             | "field_initializer_list"
             | "field_initializer"
+            | "shorthand_field_initializer"
             | "base_field_initializer"
             | "arguments"
     )

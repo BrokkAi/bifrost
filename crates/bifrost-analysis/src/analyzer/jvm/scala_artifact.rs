@@ -13,7 +13,8 @@ use crate::analyzer::semantic_model::{
     Completeness, ExactArtifact, ExternalArtifactKind, ExternalArtifactPackProducer, HierarchyFact,
     HierarchyKind, Locator, MemberFact, MemberIdentity, MemberKind, Parameter, Producer,
     ProducerDiagnostic, ProducerDiagnosticSeverity, Signature, TypeFact, TypeIdentity, TypeKind,
-    TypeRef, Visibility, member_declaration_id, read_exact_artifact_while, type_declaration_id,
+    TypeRef, Visibility, carried_source_paths, member_declaration_id, read_exact_artifact_while,
+    type_declaration_id,
 };
 use crate::analyzer::tree_sitter_analyzer::ParsedFile;
 use crate::analyzer::{CodeUnit, ProjectFile};
@@ -787,6 +788,17 @@ fn finish_production(
     } else {
         Completeness::Partial
     };
+    // Every Source locator in these shards names an archive entry this
+    // producer parsed, so the pack carries them all.
+    let shards = vec![AuthoredShard {
+        id: "declarations.scala.external".to_owned(),
+        activation,
+        payload: AuthoredPayload::DeclarationFacts {
+            types,
+            members,
+            relations: Vec::new(),
+        },
+    }];
     ArtifactProduction {
         artifact_sha256: Some(artifact_sha256.to_owned()),
         pack: Some(AuthoredSemanticModelPack {
@@ -804,15 +816,8 @@ fn finish_production(
             license: request.license.clone(),
             completeness,
             safety: request.safety.clone(),
-            shards: vec![AuthoredShard {
-                id: "declarations.scala.external".to_owned(),
-                activation,
-                payload: AuthoredPayload::DeclarationFacts {
-                    types,
-                    members,
-                    relations: Vec::new(),
-                },
-            }],
+            carried_sources: carried_source_paths(&shards),
+            shards,
         }),
         completeness,
         diagnostics,

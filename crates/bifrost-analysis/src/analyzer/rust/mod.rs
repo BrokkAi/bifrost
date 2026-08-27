@@ -94,8 +94,9 @@ use brokk_bifrost_rust::hierarchy::RustHierarchyIndex;
 pub(crate) use brokk_bifrost_rust::hierarchy::canonical_rust_hierarchy_type;
 #[cfg(any(test, feature = "test-support"))]
 pub use brokk_bifrost_rust::lexical_scope::{
-    reset_rust_tree_parse_counters_for_test, rust_tree_parse_count_for_test,
-    rust_tree_parse_request_count_for_test, rust_tree_parsed_bytes_for_test,
+    reset_rust_tree_parse_counters_for_test, rust_scope_index_build_count_for_test,
+    rust_tree_parse_count_for_test, rust_tree_parse_request_count_for_test,
+    rust_tree_parsed_bytes_for_test,
 };
 pub use brokk_bifrost_rust::usage::RustReferenceNamespace;
 use brokk_bifrost_rust::usage::RustSymbolNamespace;
@@ -898,6 +899,15 @@ impl TestDetectionProvider for RustAnalyzer {}
 use crate::analyzer::CodeUnitIndex;
 
 impl CodeUnitIndex for RustAnalyzer {
+    /// Forwarded so the request-scoped memo on the inner analyzer answers
+    /// (#2679); the trait default would rebuild uncached per call.
+    fn class_range_index(
+        &self,
+        file: &ProjectFile,
+    ) -> std::sync::Arc<brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex> {
+        self.inner.class_range_index(file)
+    }
+
     fn enclosing_code_unit(
         &self,
         file: &ProjectFile,
@@ -1096,18 +1106,6 @@ impl IAnalyzer for RustAnalyzer {
 
     fn record_query_failure(&self, error: crate::analyzer::store::StoreError) {
         self.inner.record_query_failure(error);
-    }
-
-    fn begin_streaming_file_read(&self, file: &ProjectFile) {
-        self.inner.begin_streaming_file_read(file);
-    }
-
-    fn end_streaming_file_read(&self, file: &ProjectFile) {
-        self.inner.end_streaming_file_read(file);
-    }
-
-    fn release_streaming_readers(&self) {
-        self.inner.release_streaming_readers();
     }
 
     fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {

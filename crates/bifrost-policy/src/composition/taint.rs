@@ -828,10 +828,10 @@ mod tests {
                 entry_id.as_str()
             ))
             .unwrap(),
-            SchemaVersionResolution {
+            ResolvedEndpointSelectorSchemas::Query(SchemaVersionResolution {
                 version: SCHEMA_VERSION as u32,
                 origin: SchemaVersionOrigin::Explicit,
-            },
+            }),
             model,
             EndpointSemanticHash::from_bytes([seed; 32]),
             EndpointAnalysisProjectionHash::from_bytes([seed.wrapping_add(64); 32]),

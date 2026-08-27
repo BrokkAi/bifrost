@@ -114,32 +114,127 @@ fn port_endpoint(endpoint: &ValueFlowEndpoint, expected: ProcedurePortKind) -> b
     matches!(endpoint, ValueFlowEndpoint::Port(port) if port.kind() == expected)
 }
 
-/// Whether a memory access names an index location.
+/// Where one value's defining event took it from.
 ///
-/// #2453: a subscript is not an identity the analysis can prove apart across
-/// accesses, so an index access publishes its *container* alongside the exact
-/// element it names -- the array reads out of, and writes into, one smashed
-/// cell. When the access-path resolver walked the subscripted expression back
-/// to an origin that a value or a port carries, that container is a value or a
-/// port endpoint rather than a location, so this is the one memory-access shape
-/// whose relation endpoint may be something other than a location.
-///
-/// Field accesses are deliberately excluded. Smashing indices does not change
-/// what a member selector proves, and a field access that published its base
-/// this way would silently make the whole object one cell.
-fn memory_access_is_indexed(
-    procedure: &ProcedureHandle,
-    location: crate::analyzer::semantic::MemoryLocationId,
-) -> bool {
-    procedure
-        .semantics()
-        .memory_location(location)
-        .is_some_and(|row| {
-            matches!(
-                row.kind,
-                crate::analyzer::semantic::MemoryLocationKind::Index { .. }
-            )
-        })
+/// This mirrors `workspace_oracle::value_flow::LoadOrigin`, which the minting
+/// side's access-path resolver walks, and merges a value more than one event
+/// defines differently to `Ambiguous` by the same rule. The two must answer
+/// the same question about the same chain: what the resolver saw is exactly
+/// what decides which relations get minted, so what this layer accepts has to
+/// be derived from the same walk.
+#[derive(PartialEq, Eq)]
+enum ValueOrigin {
+    Copy(ValueId),
+    Load(crate::analyzer::semantic::MemoryLocationId),
+    Ambiguous,
+}
+
+/// The resolved access chain behind each memory location this procedure names,
+/// derived once and asked about many times.
+struct MemoryAccessChains {
+    origins: std::collections::HashMap<ValueId, ValueOrigin>,
+}
+
+impl MemoryAccessChains {
+    /// Read every value's defining copy or load off one pass over this
+    /// procedure's events, the way the minting side derives the same map
+    /// before it resolves any access path.
+    fn derive(procedure: &ProcedureHandle) -> Self {
+        let mut origins: std::collections::HashMap<ValueId, ValueOrigin> =
+            std::collections::HashMap::new();
+        for point in procedure.semantics().points() {
+            for event in &point.events {
+                let defined = match event.effect {
+                    SemanticEffect::Assignment { target, value }
+                    | SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::Local,
+                        target,
+                        source: value,
+                    } => (target, ValueOrigin::Copy(value)),
+                    SemanticEffect::MemoryLoad {
+                        location, result, ..
+                    } => (result, ValueOrigin::Load(location)),
+                    _ => continue,
+                };
+                origins
+                    .entry(defined.0)
+                    .and_modify(|existing| {
+                        if *existing != defined.1 {
+                            *existing = ValueOrigin::Ambiguous;
+                        }
+                    })
+                    .or_insert(defined.1);
+            }
+        }
+        Self { origins }
+    }
+
+    /// Whether a memory access resolves through an index selector.
+    ///
+    /// #2453: a subscript is not an identity the analysis can prove apart
+    /// across accesses, so an index access publishes its *container* alongside
+    /// the exact element it names -- the array reads out of, and writes into,
+    /// one smashed cell. When the access-path resolver walked the subscripted
+    /// expression back to an origin that a value or a port carries, that
+    /// container is a value or a port endpoint rather than a location, so this
+    /// is the one memory-access shape whose relation endpoint may be something
+    /// other than a location.
+    ///
+    /// The question is asked of the whole resolved access chain, not only of
+    /// the accessed location's own row, because that is the chain the minting
+    /// side resolved. `items[0].value` lowers to a `t = items[0]` load followed
+    /// by a `t.value` load, so the field access's own row is a `Field`, while
+    /// the path the resolver produced for it is `items` with `[0]` then
+    /// `.value` on top and therefore mints the array as a container endpoint. A
+    /// field selector above an index selector still permits the container
+    /// endpoint: the cell that was smashed is the array, not the object the
+    /// element holds.
+    ///
+    /// A chain with no index selector answers `false`, which leaves field
+    /// sensitivity exactly as it was. Smashing indices does not change what a
+    /// member selector proves, and a purely field-rooted access that published
+    /// its base this way would silently make the whole object one cell.
+    fn is_indexed(
+        &self,
+        procedure: &ProcedureHandle,
+        location: crate::analyzer::semantic::MemoryLocationId,
+    ) -> bool {
+        use crate::analyzer::semantic::MemoryLocationKind;
+
+        let mut current = location;
+        let mut visited_locations = std::collections::HashSet::new();
+        let mut visited_values = std::collections::HashSet::new();
+        loop {
+            if !visited_locations.insert(current) {
+                return false;
+            }
+            let Some(row) = procedure.semantics().memory_location(current) else {
+                return false;
+            };
+            let base = match row.kind {
+                MemoryLocationKind::Index { .. } => return true,
+                MemoryLocationKind::Field { base, .. } => base,
+                MemoryLocationKind::Static { .. }
+                | MemoryLocationKind::LexicalCell { .. }
+                | MemoryLocationKind::Capture { .. } => return false,
+            };
+            // Walk the base back through the unconditional copies that define
+            // it, exactly as `walk_value_origin` does, and continue the chain
+            // at the location its defining load read.
+            let mut value = base;
+            let loaded = loop {
+                match self.origins.get(&value) {
+                    Some(ValueOrigin::Copy(next)) if visited_values.insert(value) => value = *next,
+                    Some(ValueOrigin::Load(location)) => break Some(*location),
+                    Some(ValueOrigin::Copy(_) | ValueOrigin::Ambiguous) | None => break None,
+                }
+            };
+            let Some(loaded) = loaded else {
+                return false;
+            };
+            current = loaded;
+        }
+    }
 }
 
 /// Whether a relation is the container collapse a whole-value read publishes
@@ -158,10 +253,15 @@ fn is_container_collapse(relation: &ValueFlowRelation, defined: ValueId) -> bool
         && value_endpoint(&relation.target, defined)
 }
 
+/// `chains` is derived on the first access shape that needs it and reused for
+/// every later relation. Deriving it walks the whole procedure, which most
+/// snapshots never need: only a memory access whose relation endpoint is not a
+/// location asks this question.
 fn relation_matches_event(
     procedure: &ProcedureHandle,
     relation: &ValueFlowRelation,
     effect: &SemanticEffect,
+    chains: &mut Option<MemoryAccessChains>,
 ) -> bool {
     match effect {
         SemanticEffect::Assignment { target, value } => {
@@ -255,7 +355,9 @@ fn relation_matches_event(
         } => {
             (relation.kind == ValueFlowRelationKind::MemoryLoad
                 && (matches!(&relation.source, ValueFlowEndpoint::Location(_))
-                    || memory_access_is_indexed(procedure, *location))
+                    || chains
+                        .get_or_insert_with(|| MemoryAccessChains::derive(procedure))
+                        .is_indexed(procedure, *location))
                 && value_endpoint(&relation.target, *result))
                 || is_container_collapse(relation, *result)
         }
@@ -265,7 +367,9 @@ fn relation_matches_event(
             relation.kind == ValueFlowRelationKind::MemoryStore
                 && value_endpoint(&relation.source, *value)
                 && (matches!(&relation.target, ValueFlowEndpoint::Location(_))
-                    || memory_access_is_indexed(procedure, *location))
+                    || chains
+                        .get_or_insert_with(|| MemoryAccessChains::derive(procedure))
+                        .is_indexed(procedure, *location))
         }
         SemanticEffect::CaptureBind { capture } => {
             procedure.semantics().capture(*capture).is_some_and(|row| {
@@ -470,6 +574,7 @@ impl ValueFlowSnapshot {
             context: context.clone(),
         };
         let mut seen = std::collections::HashSet::new();
+        let mut chains = None;
         let first = relations.first().map(|relation| &relation.id);
         for relation in &relations {
             require_same_procedure(relation.point.procedure(), &procedure)?;
@@ -487,7 +592,7 @@ impl ValueFlowSnapshot {
                 .events
                 .get(relation.event_index as usize)
                 .ok_or(OracleContractError::InvalidRelationIdentity)?;
-            if !relation_matches_event(&procedure, relation, &event.effect) {
+            if !relation_matches_event(&procedure, relation, &event.effect, &mut chains) {
                 return Err(OracleContractError::InvalidRelationIdentity);
             }
             if relation.id.owner() != &owner

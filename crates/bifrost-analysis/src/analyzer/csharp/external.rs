@@ -1290,6 +1290,7 @@ impl CSharpAssemblyPackProducer {
             license: request.license.clone(),
             completeness,
             safety: request.safety.clone(),
+            carried_sources: Vec::new(),
             shards: vec![AuthoredShard {
                 id: "declarations.external".to_owned(),
                 activation,

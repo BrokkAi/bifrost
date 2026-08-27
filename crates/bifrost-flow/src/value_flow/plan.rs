@@ -586,6 +586,11 @@ pub enum ValueFlowIncompleteCause {
         call: CallSiteHandle,
         callee: ProcedureHandle,
     },
+    /// A source or sink was observed in a procedure this plan mounts but the
+    /// solve cannot enter (#2640).
+    UnenteredProcedure {
+        procedure: ProcedureHandle,
+    },
     SourceEvidence {
         point: ProgramPointHandle,
     },
@@ -600,6 +605,7 @@ impl ValueFlowIncompleteCause {
             Self::Snapshot { status, .. } | Self::CallBinding { status, .. } => Some(*status),
             Self::SnapshotCoverage { .. }
             | Self::CallBindingCoverage { .. }
+            | Self::UnenteredProcedure { .. }
             | Self::SourceEvidence { .. }
             | Self::SinkEvidence { .. } => None,
         }
@@ -607,7 +613,9 @@ impl ValueFlowIncompleteCause {
 
     pub fn procedure(&self) -> &ProcedureHandle {
         match self {
-            Self::Snapshot { procedure, .. } | Self::SnapshotCoverage { procedure } => procedure,
+            Self::Snapshot { procedure, .. }
+            | Self::SnapshotCoverage { procedure }
+            | Self::UnenteredProcedure { procedure } => procedure,
             Self::CallBinding { callee, .. } | Self::CallBindingCoverage { callee, .. } => callee,
             Self::SourceEvidence { point } | Self::SinkEvidence { point } => point.procedure(),
         }
@@ -619,6 +627,7 @@ impl ValueFlowIncompleteCause {
             Self::SnapshotCoverage { .. } => "procedure value-flow coverage",
             Self::CallBinding { .. } => "call binding",
             Self::CallBindingCoverage { .. } => "call binding coverage",
+            Self::UnenteredProcedure { .. } => "procedure entry",
             Self::SourceEvidence { .. } => "source evidence",
             Self::SinkEvidence { .. } => "sink evidence",
         }
@@ -1016,17 +1025,47 @@ impl ValueFlowPlan {
                 .and_modify(|value| *value &= complete)
                 .or_insert(complete);
         }
+        // The procedures the solve can actually visit (#2640). An IDE solve
+        // seeds at the root's entry point and reaches every other procedure
+        // through a mounted call binding's flow rules, so a mounted procedure
+        // that is neither the root nor any binding's callee holds no reachable
+        // program point. A region mounts such a procedure when it is lexically
+        // part of the region but nothing in the region dispatches to it: a
+        // lambda, closure, or block body whose invocation resolves to an
+        // interface method or a runtime block rather than to the body itself.
+        // Before nested bodies were mounted, every snapshot was the root or
+        // some binding's callee, so this set changes nothing for the plans that
+        // already existed.
+        //
+        // Membership is durable identity -- artifact key plus procedure ID --
+        // not handle identity, because a binding's callee handle comes from the
+        // oracle and a snapshot's procedure handle from discovery, and the two
+        // can name one procedure through two materializations of its file
+        // (#2289). Comparing handles would then read a genuinely entered
+        // procedure as unreachable and abstain a decidable region.
+        let entered = std::iter::once(&root)
+            .chain(binding_pairs.iter().map(|(_, callee)| callee))
+            .map(ProcedureHandle::durable_key)
+            .collect::<HashSet<_>>();
         let mut snapshot_discoveries = Vec::with_capacity(snapshots.len());
         for input in &snapshots {
             validate_mount(input.value().procedure(), mount)?;
+            // An unentered procedure's own input quality cannot change a
+            // verdict, because no point in it is reachable. Its relations still
+            // mount, but it opens no discovery here; otherwise a lambda with an
+            // unlowered construct would abstain a region that never runs it.
+            // What the region must not do is decide an endpoint bound inside
+            // one, and the source and sink loops below catch exactly that.
+            let entered_procedure = entered.contains(&input.value().procedure().durable_key());
             // A snapshot left Unknown only by call-target refinement gaps is
             // answered by this plan's own complete resolutions and bindings of
             // exactly those calls (#1952): the refinement the gaps demand has
             // been performed, so the input does not open discovery. Residual
             // refinement calls without a complete binding stay open here and
             // may still be closed by a fully modeled execution boundary.
-            let discovery = if input.status().is_complete()
-                && input.value().coverage() == CandidateCoverage::Exhaustive
+            let discovery = if !entered_procedure
+                || (input.status().is_complete()
+                    && input.value().coverage() == CandidateCoverage::Exhaustive)
             {
                 SnapshotDiscovery::Complete
             } else if matches!(input.status(), SemanticInputStatus::Unknown)
@@ -1044,7 +1083,7 @@ impl ValueFlowPlan {
             };
             let refined = discovery == SnapshotDiscovery::Complete && !input.status().is_complete();
             let complete = discovery == SnapshotDiscovery::Complete;
-            if !refined {
+            if entered_procedure && !refined {
                 discovery_status = discovery_status.merge(input.status());
             }
             if first_incomplete_cause.is_none() && !complete {
@@ -1098,40 +1137,51 @@ impl ValueFlowPlan {
                 append_binding_carriers(binding, &mut carrier_candidates)?;
             }
         }
+        // An endpoint observed in a procedure the solve cannot enter was not
+        // analyzed: a sink there can never report, and calling the region clean
+        // would claim a verdict for a site the solve never visited (#2640).
         for source in &sources {
             validate_event(source.point(), source.carrier(), mount)?;
-            if first_incomplete_cause.is_none()
-                && !(matches!(source.proof(), ProofStatus::Proven)
-                    && matches!(source.completeness(), EvidenceCompleteness::Complete))
-            {
-                first_incomplete_cause = Some(ValueFlowIncompleteCause::SourceEvidence {
-                    point: source.point().clone(),
-                });
-            }
-            let complete = matches!(source.proof(), ProofStatus::Proven)
+            let evidence_complete = matches!(source.proof(), ProofStatus::Proven)
                 && matches!(source.completeness(), EvidenceCompleteness::Complete);
+            let entered_procedure = entered.contains(&source.point().procedure().durable_key());
+            if first_incomplete_cause.is_none() {
+                if !evidence_complete {
+                    first_incomplete_cause = Some(ValueFlowIncompleteCause::SourceEvidence {
+                        point: source.point().clone(),
+                    });
+                } else if !entered_procedure {
+                    first_incomplete_cause = Some(ValueFlowIncompleteCause::UnenteredProcedure {
+                        procedure: source.point().procedure().clone(),
+                    });
+                }
+            }
+            let complete = evidence_complete && entered_procedure;
             non_snapshot_discovery_complete &= complete;
             discovery_complete &= complete;
-            structural_discovery_complete &= matches!(source.proof(), ProofStatus::Proven)
-                && matches!(source.completeness(), EvidenceCompleteness::Complete);
+            structural_discovery_complete &= evidence_complete;
             carrier_candidates.push(source.carrier().clone());
         }
         for sink in &sinks {
             validate_event(sink.point(), sink.carrier(), mount)?;
-            if first_incomplete_cause.is_none()
-                && !(matches!(sink.proof(), ProofStatus::Proven)
-                    && matches!(sink.completeness(), EvidenceCompleteness::Complete))
-            {
-                first_incomplete_cause = Some(ValueFlowIncompleteCause::SinkEvidence {
-                    point: sink.point().clone(),
-                });
-            }
-            let complete = matches!(sink.proof(), ProofStatus::Proven)
+            let evidence_complete = matches!(sink.proof(), ProofStatus::Proven)
                 && matches!(sink.completeness(), EvidenceCompleteness::Complete);
+            let entered_procedure = entered.contains(&sink.point().procedure().durable_key());
+            if first_incomplete_cause.is_none() {
+                if !evidence_complete {
+                    first_incomplete_cause = Some(ValueFlowIncompleteCause::SinkEvidence {
+                        point: sink.point().clone(),
+                    });
+                } else if !entered_procedure {
+                    first_incomplete_cause = Some(ValueFlowIncompleteCause::UnenteredProcedure {
+                        procedure: sink.point().procedure().clone(),
+                    });
+                }
+            }
+            let complete = evidence_complete && entered_procedure;
             non_snapshot_discovery_complete &= complete;
             discovery_complete &= complete;
-            structural_discovery_complete &= matches!(sink.proof(), ProofStatus::Proven)
-                && matches!(sink.completeness(), EvidenceCompleteness::Complete);
+            structural_discovery_complete &= evidence_complete;
             carrier_candidates.push(sink.carrier().clone());
         }
         if relation_count > limits.max_relations {

@@ -27,8 +27,6 @@ from .models import (
     RenameSymbolResult,
     CodeQueryResponse,
     SearchFileContentsResult,
-    SemanticSearchResult,
-    SemanticSearchStatus,
     ScanUsagesResult,
     SearchSymbolsResult,
     SkimFilesResult,
@@ -596,22 +594,6 @@ class SearchToolsClient:
             rendered_text=payload.rendered_text,
         )
 
-    def semantic_search(self, query: str, *, k: int = 10) -> SemanticSearchResult:
-        payload = self._call_tool_payload(
-            "semantic_search",
-            {"query": query, "k": k},
-        )
-        return SemanticSearchResult.from_dict(
-            payload.structured,
-            render_line_numbers=self._render_line_numbers,
-            rendered_text=payload.rendered_text,
-        )
-
-    def semantic_search_status(self) -> SemanticSearchStatus:
-        return SemanticSearchStatus.from_dict(
-            self._call_tool("semantic_search_status", {})
-        )
-
     def usage_graph(
         self,
         *,
@@ -1105,13 +1087,12 @@ def tool_descriptors(
     toolset: str = "core",
     *,
     render_line_numbers: bool = True,
-    git_repo: bool = True,
     library_path: Path | str | None = None,
 ) -> list[dict[str, Any]]:
     native = _load_native_module(
         Path(library_path).expanduser().resolve() if library_path is not None else None
     )
-    payload = native.tool_descriptors_json(toolset, render_line_numbers, git_repo)
+    payload = native.tool_descriptors_json(toolset, render_line_numbers)
     decoded = json.loads(payload)
     if not isinstance(decoded, list):
         raise SearchToolsError("Native tool descriptor call did not return a JSON array")

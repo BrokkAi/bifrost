@@ -61,7 +61,6 @@ export const RELEASED_CARGO_MANIFESTS = [
   "crates/bifrost-analysis/Cargo.toml",
   "crates/bifrost-flow/Cargo.toml",
   "crates/bifrost-rql/Cargo.toml",
-  "crates/bifrost-nlp/Cargo.toml",
   "crates/bifrost-policy/Cargo.toml",
   "crates/bifrost-runtime/Cargo.toml",
   "crates/bifrost-mcp/Cargo.toml",
@@ -74,6 +73,8 @@ export const THIRD_PARTY_SEMANTIC_PACK_SPECS = [
   "semantic-packs/jvm/kotlin-stdlib-2.2.20.json",
   "semantic-packs/jvm/scala-library-2.13.16.json",
   "semantic-packs/python/typeshed-stdlib-2026.8.8.json",
+  "semantic-packs/typescript/typescript-7.0.2.json",
+  "semantic-packs/rust/rust-stdlib-nightly-2026-08-24.json",
 ];
 
 export const BIFROST_OWNED_SEMANTIC_PACK_SPECS = [

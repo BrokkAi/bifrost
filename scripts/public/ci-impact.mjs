@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-export const SCHEMA_VERSION = "1";
+export const SCHEMA_VERSION = "2";
 
 export const COMPONENTS = Object.freeze([
   "dependency_licenses",
@@ -14,6 +14,10 @@ export const COMPONENTS = Object.freeze([
   "pi_package",
   "rust",
   "python",
+  "semantic_pack_jvm",
+  "semantic_pack_python",
+  "semantic_pack_typescript",
+  "semantic_pack_rust",
   "rql_runtime",
   "mcp_contract",
   "lsp_contract",
@@ -36,6 +40,102 @@ const EDITOR_COMPONENTS = new Set(["vscode"]);
 const PLUGIN_COMPONENTS = new Set(["pi_package", "agent_plugin"]);
 const RUST_COMPONENTS = new Set(["rust"]);
 const PYTHON_COMPONENTS = new Set(["python"]);
+const JVM_LANGUAGE_COMPONENTS = new Set(["rust", "semantic_pack_jvm"]);
+const JS_TS_LANGUAGE_COMPONENTS = new Set(["rust", "semantic_pack_typescript"]);
+const PYTHON_LANGUAGE_COMPONENTS = new Set(["rust", "semantic_pack_python"]);
+const RUST_LANGUAGE_COMPONENTS = new Set(["rust", "semantic_pack_rust"]);
+const SEMANTIC_PACK_SOURCE_COMPONENTS = new Set([
+  "rust",
+  "semantic_pack_jvm",
+  "semantic_pack_python",
+  "semantic_pack_typescript",
+  "semantic_pack_rust",
+]);
+const PINNED_SEMANTIC_PACK_PATHS = [
+  {
+    prefixes: ["semantic-packs/jvm/"],
+    paths: ["scripts/public/build-pinned-jvm-semantic-packs.sh"],
+    components: new Set(["semantic_pack_jvm"]),
+    reason: "pinned JVM semantic-pack input or builder",
+  },
+  {
+    prefixes: ["semantic-packs/python/"],
+    paths: ["scripts/public/build-pinned-python-semantic-packs.sh"],
+    components: new Set(["semantic_pack_python"]),
+    reason: "pinned Python semantic-pack input or builder",
+  },
+  {
+    prefixes: ["semantic-packs/typescript/"],
+    paths: ["scripts/public/build-pinned-typescript-semantic-packs.sh"],
+    components: new Set(["semantic_pack_typescript"]),
+    reason: "pinned TypeScript semantic-pack input or builder",
+  },
+  {
+    prefixes: ["semantic-packs/rust/"],
+    paths: ["scripts/public/build-pinned-rust-semantic-packs.sh"],
+    components: new Set(["semantic_pack_rust"]),
+    reason: "pinned Rust semantic-pack input or builder",
+  },
+];
+const EXTRACTED_LANGUAGE_PATHS = [
+  {
+    prefixes: [
+      "crates/bifrost-jvm/src/",
+      "crates/bifrost-jvm/resources/",
+      "crates/bifrost-analysis/src/analyzer/jvm/",
+    ],
+    components: JVM_LANGUAGE_COMPONENTS,
+    reason: "JVM language crate source or resources",
+  },
+  {
+    prefixes: [
+      "crates/bifrost-js-ts/src/",
+      "crates/bifrost-js-ts/resources/",
+      "crates/bifrost-analysis/src/analyzer/js_ts/",
+    ],
+    components: JS_TS_LANGUAGE_COMPONENTS,
+    reason: "JavaScript/TypeScript language crate source or resources",
+  },
+  {
+    prefixes: [
+      "crates/bifrost-python/src/",
+      "crates/bifrost-python/resources/",
+      "crates/bifrost-analysis/src/analyzer/python/",
+    ],
+    components: PYTHON_LANGUAGE_COMPONENTS,
+    reason: "Python language crate source or resources",
+  },
+  {
+    prefixes: [
+      "crates/bifrost-rust/src/",
+      "crates/bifrost-rust/resources/",
+      "crates/bifrost-analysis/src/analyzer/rust/",
+    ],
+    components: RUST_LANGUAGE_COMPONENTS,
+    reason: "Rust language crate source or resources",
+  },
+  {
+    prefixes: [
+      "crates/bifrost-cpp/src/",
+      "crates/bifrost-cpp/resources/",
+      "crates/bifrost-csharp/src/",
+      "crates/bifrost-csharp/resources/",
+      "crates/bifrost-go/src/",
+      "crates/bifrost-go/resources/",
+      "crates/bifrost-php/src/",
+      "crates/bifrost-php/resources/",
+      "crates/bifrost-ruby/src/",
+      "crates/bifrost-ruby/resources/",
+    ],
+    components: RUST_COMPONENTS,
+    reason: "extracted language crate source or resources",
+  },
+  {
+    prefixes: ["crates/bifrost-analysis/src/analyzer/semantic_model/"],
+    components: SEMANTIC_PACK_SOURCE_COMPONENTS,
+    reason: "shared semantic-pack producer source",
+  },
+];
 const PYTHON_BINDING_COMPONENTS = new Set(["python", "rust"]);
 const RQL_TEST_COMPONENTS = new Set([...RQL_COMPONENTS, "rust"]);
 const MCP_TEST_COMPONENTS = new Set([...MCP_COMPONENTS, "rust"]);
@@ -134,7 +234,6 @@ function isRustPath(path) {
     "crates/bifrost-analysis/src/",
     "crates/bifrost-core/src/",
     "crates/bifrost-flow/src/",
-    "crates/bifrost-nlp/src/",
     "crates/bifrost-policy/src/",
     "crates/bifrost-rql/src/",
     "crates/bifrost-semantic-packs/src/",
@@ -143,40 +242,14 @@ function isRustPath(path) {
   ]);
 }
 
-// The `nlp` Cargo feature uniquely compiles the semantic-search stack: the
-// bifrost-nlp crate, the `cfg(feature = "nlp")` code in bifrost-mcp and the
-// facade, and the semantic/persistence test suites. A change to any of these
-// can break the `--features nlp` build without breaking the featureless build,
-// so the per-push Linux tier must build with nlp when one is touched. Changes
-// elsewhere in the analyzer compile featureless on push and are covered by the
-// unconditional full-nlp hourly and nightly tiers, so they do not force the
-// expensive nlp build on every commit.
-function isNlpPath(path) {
-  return (
-    startsWithAny(path, [
-      "crates/bifrost-nlp/",
-      "tests/suite_semantic/",
-      "tests/suite_persistence/",
-    ]) ||
-    [
-      "src/lib.rs",
-      "src/bin/chunk_probe.rs",
-      "src/bin/embed_probe.rs",
-      "src/bin/embed_seq_probe.rs",
-      "src/bin/semantic_extraction_profile.rs",
-      "src/bin/semantic_index_profile.rs",
-      "crates/bifrost-mcp/src/lib.rs",
-      "crates/bifrost-mcp/src/mcp_nlp.rs",
-      "crates/bifrost-mcp/src/mcp_registry.rs",
-      "crates/bifrost-mcp/src/searchtools_service.rs",
-      "crates/bifrost-mcp/tests/bifrost_mcp_server.rs",
-      "crates/bifrost-mcp/Cargo.toml",
-      "tests/nlp_semantic_search_models.rs",
-      "tests/suite_symbols/searchtools_service.rs",
-      "Cargo.toml",
-      "Cargo.lock",
-    ].includes(path)
+function classifyPinnedSemanticPackPath(path) {
+  return PINNED_SEMANTIC_PACK_PATHS.find(
+    ({ prefixes = [], paths = [] }) => paths.includes(path) || startsWithAny(path, prefixes),
   );
+}
+
+function classifyExtractedLanguagePath(path) {
+  return EXTRACTED_LANGUAGE_PATHS.find(({ prefixes }) => startsWithAny(path, prefixes));
 }
 
 function isDocumentationPath(path) {
@@ -200,6 +273,26 @@ function classifyPath(path) {
       components: NO_COMPONENTS,
       documentation: true,
       reason: "documentation-only surface",
+    };
+  }
+  if (path.startsWith("crates/bifrost-semantic-packs/src/")) {
+    return {
+      components: SEMANTIC_PACK_SOURCE_COMPONENTS,
+      reason: "semantic-pack compiler or runtime source",
+    };
+  }
+  const pinnedSemanticPack = classifyPinnedSemanticPackPath(path);
+  if (pinnedSemanticPack) {
+    return {
+      components: pinnedSemanticPack.components,
+      reason: pinnedSemanticPack.reason,
+    };
+  }
+  const extractedLanguage = classifyExtractedLanguagePath(path);
+  if (extractedLanguage) {
+    return {
+      components: extractedLanguage.components,
+      reason: extractedLanguage.reason,
     };
   }
   if (path === "scripts/fixtures/mcp/codex-sandbox-state-handshake.json") {
@@ -269,28 +362,8 @@ function fullDecision(reason, changedPaths) {
   };
 }
 
-// The nlp build variant is orthogonal to which component jobs run: it decides
-// only whether the per-push Linux job compiles `--features nlp`. It defaults to
-// required whenever we cannot trust the change set (merge queue, a failed diff,
-// or an event we do not compute paths for) and is skipped only when a reliable
-// diff contains no nlp-relevant path.
-function nlpRequired({ eventName, changedPaths = [], diffFailed = false }) {
-  if (eventName === "merge_group") {
-    return true;
-  }
-  if (diffFailed) {
-    return true;
-  }
-  if (eventName !== "push" && eventName !== "pull_request") {
-    return true;
-  }
-  return changedPaths.some(isNlpPath);
-}
-
 export function classifyChangeSet(input) {
-  const decision = classifyComponents(input);
-  decision.nlp = nlpRequired(input);
-  return decision;
+  return classifyComponents(input);
 }
 
 function classifyComponents({ eventName, ref = "", changedPaths = [], diffFailed = false }) {
@@ -366,7 +439,6 @@ function writeOutputs(outputPath, decision) {
   for (const component of COMPONENTS) {
     lines.push(`${component}=${decision.selected.has(component)}`);
   }
-  lines.push(`nlp=${decision.nlp}`);
   appendFileSync(outputPath, `${lines.join("\n")}\n`);
 }
 
@@ -382,7 +454,6 @@ function writeSummary(summaryPath, decision) {
     "",
     `Schema version: \`${decision.schemaVersion}\`  `,
     `Mode: \`${decision.mode}\`  `,
-    `NLP build (per-push Linux tier): \`${decision.nlp ? "required" : "skipped"}\`  `,
     `Selected checks: ${selected.length === 0 ? "always-on baseline only" : selected.map((name) => `\`${name}\``).join(", ")}`,
     "",
     "| Changed path | Decision |",
@@ -397,10 +468,8 @@ function main() {
   const options = parseArgs(process.argv.slice(2));
   let changedPaths = [];
   let diffFailed = false;
-  // Pull requests select their component matrix from the diff; master pushes
-  // still run the full component matrix, but the diff drives the per-push nlp
-  // build gate. For a push, --base is the prior commit (github.event.before);
-  // an unreachable base fails the diff and conservatively forces the nlp build.
+  // Pull requests select their component matrix from the diff. For a push,
+  // --base is the prior commit (github.event.before).
   if (options.event === "pull_request" || options.event === "push") {
     ({ changedPaths, diffFailed } = changedPathsFromGit(options.base, options.head));
   }

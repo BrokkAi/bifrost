@@ -5,8 +5,11 @@
     "schema_version": 5,
     "evaluation": {
       "evaluation_date": "2026-08-14",
-      "suppression_path": ".bifrost/suppressions.json",
-      "suppression_document_state": "not_found",
+      "suppression_sources": [
+        { "path": ".bifrost/suppressions.json", "state": "not_found" },
+        { "path": ".bifrost/suppressions.private.json", "state": "not_found" },
+        { "path": ".bifrost/suppressions.local.json", "state": "not_found" }
+      ],
       "scope_path": ".bifrost/policy-scope.json",
       "scope_document_state": "not_found"
     },
@@ -36,7 +39,9 @@
         "findings": [
           {
             "id": "425b4f5b4f05e18d456fe4ed70575ac1b65457489baa93cb2828dfd4b4c463c5",
+            "identity_stability": "strong",
             "policy_id": "demo.taint.user-input-to-eval",
+            "policy_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "severity": "warning",
             "message": "Attacker-controlled input reaches eval",
             "primary": {

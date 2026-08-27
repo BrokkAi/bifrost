@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -11,7 +11,7 @@ use crate::CancellationToken;
 use crate::analyzer::semantic_model::{
     ActivationSelector, ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest,
     AuthoredPayload, AuthoredSemanticModelPack, AuthoredShard, BoundedProducerDiagnostics,
-    CatalogCoordinate, Compatibility, Completeness, DependencyArtifactRole,
+    CatalogCoordinate, Compatibility, Completeness, DeclarationGuard, DependencyArtifactRole,
     DependencyDiscoveryOutcome, DependencyDiscoveryProfile, DependencyPackAdapter,
     DependencyPackDiagnostic, DependencyPackDiagnosticSeverity, DependencyPackLimits,
     DependencyPackProduction, DependencyProvenance, ExactArtifact, ExactDependencyArtifact,
@@ -19,12 +19,65 @@ use crate::analyzer::semantic_model::{
     MemberFact, MemberIdentity, MemberKind, NameSelector, Parameter, Producer, ProducerDiagnostic,
     ProducerDiagnosticSeverity, Provenance, ResolvedDependency, ResolvedDependencyArtifact, Safety,
     SemanticModelActivationEvidence, Signature, TypeFact, TypeIdentity, TypeKind, TypeRef,
-    Visibility, member_declaration_id, read_exact_artifact_while, type_declaration_id,
+    Visibility, carried_source_paths, member_declaration_id, read_exact_artifact_while,
+    type_declaration_id,
 };
 use crate::analyzer::topology::DependencyScope;
 use crate::analyzer::{JsTsDependencyDiscoveryConfig, Project};
 use crate::hash::HashMap;
 use brokk_bifrost_js_ts::model::node_text;
+use brokk_bifrost_js_ts::tsconfig::{
+    TypeScriptLibrarySelection, canonical_library_name, effective_library_selection_for_config,
+    typescript_library_activation_closure,
+};
+
+pub const TYPESCRIPT_STDLIB_PACKAGE: &str = "typescript";
+pub const TYPESCRIPT_STDLIB_VERSION: &str = "7.0.2";
+
+/// Built-in TypeScript activation evidence derived from one effective
+/// `tsconfig` selection. Every row is exact about the pinned npm package and
+/// carries one canonical `typescript-lib:<name>` configuration identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeScriptLibraryActivationOutcome {
+    pub selection: TypeScriptLibrarySelection,
+    pub evidence: Vec<SemanticModelActivationEvidence>,
+    pub diagnostics: Vec<String>,
+}
+
+pub fn typescript_library_activation_evidence(
+    config_path: &Path,
+    canonical_root: &Path,
+) -> TypeScriptLibraryActivationOutcome {
+    let selection = effective_library_selection_for_config(config_path, canonical_root);
+    let evidence = if selection.is_complete() {
+        typescript_library_activation_closure(selection.libraries())
+            .iter()
+            .map(|library| SemanticModelActivationEvidence {
+                language: "typescript".to_owned(),
+                ecosystem: "npm".to_owned(),
+                package: Some(CatalogCoordinate {
+                    name: TYPESCRIPT_STDLIB_PACKAGE.to_owned(),
+                    version: Some(
+                        Version::parse(TYPESCRIPT_STDLIB_VERSION)
+                            .expect("pinned TypeScript version is valid"),
+                    ),
+                }),
+                module: None,
+                toolchain: None,
+                target: None,
+                configuration: Some(format!("typescript-lib:{library}")),
+                artifact_sha256: None,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    TypeScriptLibraryActivationOutcome {
+        diagnostics: selection.diagnostics().to_vec(),
+        selection,
+        evidence,
+    }
+}
 
 #[derive(Debug)]
 struct NpmDiagnostic {
@@ -436,6 +489,17 @@ impl TypeScriptDeclarationPackProducer {
         } else {
             Completeness::Partial
         };
+        // Every Source locator in these shards names a declaration module this
+        // producer read and parsed, so the pack carries them all.
+        let shards = vec![AuthoredShard {
+            id: "declarations.typescript.external".to_owned(),
+            activation,
+            payload: AuthoredPayload::DeclarationFacts {
+                types,
+                members,
+                relations: Vec::new(),
+            },
+        }];
         ArtifactProduction {
             artifact_sha256: Some(artifact.sha256().to_owned()),
             pack: has_declarations.then(|| AuthoredSemanticModelPack {
@@ -453,20 +517,454 @@ impl TypeScriptDeclarationPackProducer {
                 license: request.license.clone(),
                 completeness,
                 safety: request.safety.clone(),
-                shards: vec![AuthoredShard {
-                    id: "declarations.typescript.external".to_owned(),
-                    activation,
-                    payload: AuthoredPayload::DeclarationFacts {
-                        types,
-                        members,
-                        relations: Vec::new(),
-                    },
-                }],
+                carried_sources: carried_source_paths(&shards),
+                shards,
             }),
             completeness,
             diagnostics,
             suppressed_diagnostics,
         }
+    }
+
+    /// Produce one shard per canonical TypeScript built-in library from the
+    /// exact `package.json` + `lib/*.d.ts` source set used by the pinned pack.
+    ///
+    /// Built-in declarations are ambient globals rather than npm modules. Each
+    /// file is therefore collected in the global scope, and each shard carries
+    /// a `typescript-lib:<canonical>` configuration selector so the workspace
+    /// can activate precisely the effective `tsconfig` library set.
+    pub fn produce_loaded_library_set(
+        &self,
+        request: &ArtifactProductionRequest,
+        limits: &ArtifactProducerLimits,
+        cancellation: Option<&CancellationToken>,
+        artifact: &ExactArtifact,
+        manifest_path: &str,
+        libraries: &[(String, String)],
+    ) -> ArtifactProduction {
+        if request.artifact_kind != ExternalArtifactKind::TypeScriptLibrarySet {
+            return failed_loaded_production(
+                "artifact.kind",
+                "TypeScript library source-set producer requires a typescript_library_set artifact",
+                artifact.sha256(),
+                limits,
+            );
+        }
+        let mut diagnostics = BoundedProducerDiagnostics::new(limits);
+        let mut suppressed_diagnostics = 0usize;
+        let Some(manifest) = artifact
+            .source_entries()
+            .iter()
+            .find(|entry| entry.relative_path() == manifest_path)
+        else {
+            diagnostics.error(
+                "typescript.package.manifest_missing",
+                Some(manifest_path.to_owned()),
+                "pinned TypeScript source set does not contain package.json",
+            );
+            let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
+            return ArtifactProduction {
+                artifact_sha256: Some(artifact.sha256().to_owned()),
+                pack: None,
+                completeness: Completeness::Partial,
+                diagnostics,
+                suppressed_diagnostics,
+            };
+        };
+        if let Err(message) = validate_typescript_manifest(manifest.bytes()) {
+            diagnostics.error(
+                "typescript.package.identity",
+                Some(manifest_path.to_owned()),
+                message,
+            );
+            let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
+            return ArtifactProduction {
+                artifact_sha256: Some(artifact.sha256().to_owned()),
+                pack: None,
+                completeness: Completeness::Partial,
+                diagnostics,
+                suppressed_diagnostics,
+            };
+        }
+
+        let mut names = libraries
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        if names.windows(2).any(|pair| pair[0] == pair[1]) {
+            diagnostics.error(
+                "typescript.library.duplicate",
+                None,
+                "pinned TypeScript source set contains a duplicate canonical library",
+            );
+        }
+        let mut references_by_library = BTreeMap::<String, Vec<String>>::new();
+        for (library_name, declaration_path) in libraries {
+            let Some(entry) = artifact
+                .source_entries()
+                .iter()
+                .find(|entry| entry.relative_path() == declaration_path)
+            else {
+                continue;
+            };
+            let Ok(source) = std::str::from_utf8(entry.bytes()) else {
+                continue;
+            };
+            let mut tree_parser = Parser::new();
+            tree_parser
+                .set_language(&tree_sitter_typescript::LANGUAGE_TSX.into())
+                .expect("tree-sitter TypeScript language must load");
+            let Some(tree) = tree_parser.parse(source, None) else {
+                continue;
+            };
+            if tree.root_node().has_error() {
+                continue;
+            }
+            let mut references = Vec::new();
+            for reference in triple_slash_library_references(tree.root_node(), source) {
+                if let TripleSlashLibraryReference::Known(name) = reference {
+                    references.push(name);
+                }
+            }
+            references.sort_unstable();
+            references.dedup();
+            references_by_library.insert(library_name.clone(), references);
+        }
+        let mut shards = Vec::new();
+        let mut seen_paths = BTreeSet::new();
+        let mut remaining_records = limits.max_records;
+        for (library_name, declaration_path) in libraries {
+            let path_name = Path::new(declaration_path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix("lib."))
+                .and_then(canonical_library_name);
+            if canonical_library_name(library_name) != Some(library_name.clone())
+                || path_name.as_deref() != Some(library_name.as_str())
+            {
+                diagnostics.error(
+                    "typescript.library.identity",
+                    Some(declaration_path.clone()),
+                    format!(
+                        "library {library_name} is not a canonical TypeScript 7.0.2 declaration identity"
+                    ),
+                );
+                continue;
+            }
+            if !seen_paths.insert(declaration_path.clone()) {
+                diagnostics.error(
+                    "typescript.library.duplicate_path",
+                    Some(declaration_path.clone()),
+                    "pinned TypeScript source set contains a duplicate declaration path",
+                );
+                continue;
+            }
+            if cancelled(cancellation) {
+                diagnostics.error(
+                    "artifact.cancelled",
+                    Some(declaration_path.clone()),
+                    "TypeScript library source-set production was cancelled",
+                );
+                break;
+            }
+            let Some(entry) = artifact
+                .source_entries()
+                .iter()
+                .find(|entry| entry.relative_path() == declaration_path)
+            else {
+                diagnostics.error(
+                    "typescript.library.missing",
+                    Some(declaration_path.clone()),
+                    "pinned TypeScript library declaration is missing",
+                );
+                continue;
+            };
+            let Ok(source) = std::str::from_utf8(entry.bytes()) else {
+                diagnostics.error(
+                    "typescript.declaration.encoding",
+                    Some(declaration_path.clone()),
+                    "TypeScript library declaration is not valid UTF-8",
+                );
+                continue;
+            };
+            let mut tree_parser = Parser::new();
+            tree_parser
+                .set_language(&tree_sitter_typescript::LANGUAGE_TSX.into())
+                .expect("tree-sitter TypeScript language must load");
+            let Some(tree) = tree_parser.parse(source, None) else {
+                diagnostics.error(
+                    "typescript.declaration.parse",
+                    Some(declaration_path.clone()),
+                    "TypeScript library declaration could not be parsed",
+                );
+                continue;
+            };
+            if tree.root_node().has_error() && has_unrecoverable_typescript_errors(tree.root_node())
+            {
+                diagnostics.error(
+                    "typescript.declaration.parse",
+                    Some(declaration_path.clone()),
+                    "TypeScript library declaration contains malformed or unsupported syntax",
+                );
+                continue;
+            }
+            let references = triple_slash_library_references(tree.root_node(), source);
+            for reference in references {
+                match reference {
+                    TripleSlashLibraryReference::Known(reference) => {
+                        if !libraries.iter().any(|(name, _)| name == &reference) {
+                            diagnostics.error(
+                                "typescript.library.reference_missing",
+                                Some(declaration_path.clone()),
+                                format!(
+                                    "library {library_name} references unpinned built-in library {reference}"
+                                ),
+                            );
+                        }
+                    }
+                    TripleSlashLibraryReference::Unknown(reference) => diagnostics.error(
+                        "typescript.library.reference_unknown",
+                        Some(declaration_path.clone()),
+                        format!(
+                            "library {library_name} references unknown built-in library {reference}"
+                        ),
+                    ),
+                    TripleSlashLibraryReference::Malformed(message) => diagnostics.error(
+                        "typescript.library.reference_malformed",
+                        Some(declaration_path.clone()),
+                        format!(
+                            "library {library_name} has malformed triple-slash reference: {message}"
+                        ),
+                    ),
+                }
+            }
+            if remaining_records == 0 {
+                diagnostics.warning(
+                    "limit.records",
+                    Some(declaration_path.clone()),
+                    format!(
+                        "TypeScript library source set exhausted the {} record budget",
+                        limits.max_records
+                    ),
+                );
+                break;
+            }
+            let mut library_limits = *limits;
+            library_limits.max_records = remaining_records;
+            let mut collector = DeclarationCollector::new(
+                source,
+                declaration_path.clone(),
+                format!("global.{library_name}"),
+                &library_limits,
+                cancellation,
+                BoundedProducerDiagnostics::new(limits),
+            );
+            collector.collect_global(tree.root_node());
+            let DeclarationCollector {
+                mut types,
+                mut members,
+                diagnostics: collector_diagnostics,
+                cancelled: collector_cancelled,
+                remaining_records: collector_remaining_records,
+                ..
+            } = collector;
+            remaining_records = collector_remaining_records;
+            let (collector_diagnostics, collector_suppressed) = collector_diagnostics.finish();
+            suppressed_diagnostics = suppressed_diagnostics.saturating_add(collector_suppressed);
+            for diagnostic in collector_diagnostics {
+                match diagnostic.severity {
+                    ProducerDiagnosticSeverity::Warning => diagnostics.warning(
+                        diagnostic.code,
+                        diagnostic.location,
+                        diagnostic.message,
+                    ),
+                    ProducerDiagnosticSeverity::Error => {
+                        diagnostics.error(diagnostic.code, diagnostic.location, diagnostic.message)
+                    }
+                }
+            }
+            if collector_cancelled {
+                diagnostics.error(
+                    "artifact.cancelled",
+                    Some(declaration_path.clone()),
+                    "TypeScript library source-set production was cancelled",
+                );
+                break;
+            }
+            types.sort_unstable_by(|left, right| {
+                (&left.name, &left.id).cmp(&(&right.name, &right.id))
+            });
+            members.sort_unstable_by(|left, right| {
+                (&left.owner, &left.name, &left.id).cmp(&(&right.owner, &right.name, &right.id))
+            });
+            members.dedup_by(|left, right| left.id == right.id);
+            let mut activation = request.activation.clone();
+            if activation.is_empty() {
+                activation.push(ActivationSelector {
+                    package: None,
+                    module: None,
+                    toolchain: None,
+                    targets: Vec::new(),
+                    configurations: Vec::new(),
+                    artifact_sha256: None,
+                });
+            }
+            for selector in &mut activation {
+                selector.package = Some(NameSelector {
+                    name: TYPESCRIPT_STDLIB_PACKAGE.to_owned(),
+                    version: Some(format!("={TYPESCRIPT_STDLIB_VERSION}")),
+                });
+                selector.configurations = library_activation_configurations(
+                    library_name,
+                    libraries,
+                    &references_by_library,
+                );
+                // Runtime discovery intentionally emits no local artifact. The
+                // installed pinned pack must therefore match package/version
+                // and `typescript-lib:<name>` evidence alone.
+                selector.artifact_sha256 = None;
+            }
+            shards.push(AuthoredShard {
+                id: format!("declarations.typescript.lib.{library_name}"),
+                activation,
+                payload: AuthoredPayload::DeclarationFacts {
+                    types,
+                    members,
+                    relations: Vec::new(),
+                },
+            });
+        }
+        shards.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+        consolidate_library_shards(&mut shards, &mut diagnostics);
+        if shards.is_empty() {
+            diagnostics.error(
+                "typescript.library.no_declarations",
+                None,
+                "pinned TypeScript library source set produced no declaration shards",
+            );
+        }
+        let (diagnostics, own_suppressed_diagnostics) = diagnostics.finish();
+        suppressed_diagnostics = suppressed_diagnostics.saturating_add(own_suppressed_diagnostics);
+        let completeness = if diagnostics.is_empty() && suppressed_diagnostics == 0 {
+            Completeness::Complete
+        } else {
+            Completeness::Partial
+        };
+        ArtifactProduction {
+            artifact_sha256: Some(artifact.sha256().to_owned()),
+            pack: (!shards.is_empty()).then(|| AuthoredSemanticModelPack {
+                schema_version: crate::analyzer::semantic_model::SEMANTIC_MODEL_SCHEMA_VERSION,
+                pack_id: request.pack_id.clone(),
+                version: request.pack_version.clone(),
+                producer: Producer {
+                    name: "bifrost-typescript-declaration".to_owned(),
+                    version: env!("CARGO_PKG_VERSION").to_owned(),
+                },
+                language: "typescript".to_owned(),
+                ecosystem: request.ecosystem.clone(),
+                compatibility: request.compatibility.clone(),
+                provenance: request.provenance.clone(),
+                license: request.license.clone(),
+                completeness,
+                safety: request.safety.clone(),
+                carried_sources: carried_source_paths(&shards),
+                shards,
+            }),
+            completeness,
+            diagnostics,
+            suppressed_diagnostics,
+        }
+    }
+}
+
+fn consolidate_library_shards(
+    shards: &mut [AuthoredShard],
+    diagnostics: &mut BoundedProducerDiagnostics,
+) {
+    let mut canonical = BTreeMap::<String, (usize, TypeFact)>::new();
+    let mut configurations = BTreeMap::<String, BTreeSet<String>>::new();
+    for (shard_index, shard) in shards.iter().enumerate() {
+        let AuthoredPayload::DeclarationFacts { types, .. } = &shard.payload else {
+            continue;
+        };
+        let shard_configurations = shard
+            .activation
+            .iter()
+            .flat_map(|selector| selector.configurations.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        for incoming in types {
+            configurations
+                .entry(incoming.name.clone())
+                .or_default()
+                .extend(shard_configurations.iter().cloned());
+            let Some((owner, existing)) = canonical.get_mut(&incoming.name) else {
+                canonical.insert(incoming.name.clone(), (shard_index, incoming.clone()));
+                continue;
+            };
+            if existing.type_kind != incoming.type_kind {
+                diagnostics.error(
+                    "typescript.declaration.incompatible_merge",
+                    None,
+                    format!(
+                        "library shards disagree on the TypeScript declaration kind of {}",
+                        incoming.name
+                    ),
+                );
+                continue;
+            }
+            for relation in &incoming.hierarchy {
+                if !existing.hierarchy.contains(relation) {
+                    existing.hierarchy.push(relation.clone());
+                }
+            }
+            for alias in &incoming.aliases {
+                if !existing.aliases.contains(alias) {
+                    existing.aliases.push(alias.clone());
+                }
+            }
+            for surface in &incoming.extension_surfaces {
+                if !existing.extension_surfaces.contains(surface) {
+                    existing.extension_surfaces.push(surface.clone());
+                }
+            }
+            existing.guard = DeclarationGuard::union(existing.guard.take(), incoming.guard.clone());
+            if existing.type_parameters.is_empty() {
+                existing.type_parameters = incoming.type_parameters.clone();
+            }
+            if existing.underlying_type.is_none() {
+                existing.underlying_type = incoming.underlying_type.clone();
+            }
+            *owner = (*owner).min(shard_index);
+        }
+    }
+
+    let mut seen_members = BTreeSet::new();
+    for (shard_index, shard) in shards.iter_mut().enumerate() {
+        let AuthoredPayload::DeclarationFacts { types, members, .. } = &mut shard.payload else {
+            continue;
+        };
+        types.retain(|type_fact| {
+            canonical
+                .get(&type_fact.name)
+                .is_some_and(|(owner, _)| *owner == shard_index)
+        });
+        for type_fact in types.iter_mut() {
+            if let Some((_, merged)) = canonical.get(&type_fact.name) {
+                *type_fact = merged.clone();
+            }
+        }
+        let shard_configurations = types
+            .iter()
+            .flat_map(|type_fact| configurations.get(&type_fact.name).into_iter().flatten())
+            .cloned()
+            .collect::<Vec<_>>();
+        if !shard_configurations.is_empty() {
+            for selector in &mut shard.activation {
+                selector.configurations = shard_configurations.clone();
+            }
+        }
+        members.retain(|member| seen_members.insert(member.id.clone()));
     }
 }
 
@@ -492,7 +990,7 @@ fn parse_and_collect_declarations(
 ) -> DeclarationCollectionOutcome {
     let mut parser = Parser::new();
     parser
-        .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+        .set_language(&tree_sitter_typescript::LANGUAGE_TSX.into())
         .expect("tree-sitter TypeScript language must load");
     let Some(tree) = parser.parse(source, None) else {
         diagnostics.error(
@@ -507,7 +1005,7 @@ fn parse_and_collect_declarations(
             cancelled: false,
         };
     };
-    if tree.root_node().has_error() {
+    if tree.root_node().has_error() && has_unrecoverable_typescript_errors(tree.root_node()) {
         diagnostics.error(
             "typescript.declaration.parse",
             Some(diagnostic_path.to_owned()),
@@ -580,6 +1078,141 @@ fn validate_npm_manifest(bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_typescript_manifest(bytes: &[u8]) -> Result<(), String> {
+    let manifest: Value = serde_json::from_slice(bytes)
+        .map_err(|error| format!("manifest is not valid JSON: {error}"))?;
+    let name = manifest.get("name").and_then(Value::as_str);
+    if name != Some(TYPESCRIPT_STDLIB_PACKAGE) {
+        return Err("pinned library manifest must name the typescript package".to_owned());
+    }
+    let version = manifest.get("version").and_then(Value::as_str);
+    if version != Some(TYPESCRIPT_STDLIB_VERSION) {
+        return Err("pinned library manifest must be TypeScript version 7.0.2".to_owned());
+    }
+    if manifest.get("license").and_then(Value::as_str) != Some("Apache-2.0") {
+        return Err("pinned library manifest must carry the Apache-2.0 license".to_owned());
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TripleSlashLibraryReference {
+    Known(String),
+    Unknown(String),
+    Malformed(String),
+}
+
+/// Read triple-slash `lib` references from parsed comment nodes. The small
+/// directive parser accepts the whitespace forms TypeScript permits, while
+/// keeping ordinary comments and non-`lib` directives out of the result.
+fn triple_slash_library_references(
+    root: Node<'_>,
+    source: &str,
+) -> Vec<TripleSlashLibraryReference> {
+    let mut references = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "comment" {
+            let text = node_text(node, source).trim();
+            if let Some(directive) = text.strip_prefix("///")
+                && let Some(reference) = parse_triple_slash_library_directive(directive)
+            {
+                references.push(reference);
+            }
+        }
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    references
+}
+
+fn parse_triple_slash_library_directive(text: &str) -> Option<TripleSlashLibraryReference> {
+    let start = text.find("<reference")? + "<reference".len();
+    let Some(end) = text[start..].find('>').map(|offset| offset + start) else {
+        return Some(TripleSlashLibraryReference::Malformed(
+            "reference directive has no closing `>`".to_owned(),
+        ));
+    };
+    let mut content = text[start..end].trim();
+    if content.ends_with('/') {
+        content = content[..content.len() - 1].trim_end();
+    }
+    let lib_start = content.find("lib")?;
+    let after_name = &content[lib_start + 3..];
+    if after_name
+        .chars()
+        .next()
+        .is_some_and(|character| !character.is_ascii_whitespace() && character != '=')
+    {
+        return Some(TripleSlashLibraryReference::Malformed(
+            "malformed lib attribute name".to_owned(),
+        ));
+    }
+    let Some(equals) = after_name.find('=') else {
+        return Some(TripleSlashLibraryReference::Malformed(
+            "lib attribute has no `=`".to_owned(),
+        ));
+    };
+    let mut value = after_name[equals + 1..].trim_start();
+    let Some(quote) = value.as_bytes().first().copied() else {
+        return Some(TripleSlashLibraryReference::Malformed(
+            "lib attribute has no value".to_owned(),
+        ));
+    };
+    if quote != b'"' && quote != b'\'' {
+        return Some(TripleSlashLibraryReference::Malformed(
+            "lib attribute must use a quoted value".to_owned(),
+        ));
+    }
+    value = &value[1..];
+    let Some(end_quote) = value.find(quote as char) else {
+        return Some(TripleSlashLibraryReference::Malformed(
+            "lib attribute has no closing quote".to_owned(),
+        ));
+    };
+    let raw = value[..end_quote].trim();
+    if raw.is_empty() {
+        return Some(TripleSlashLibraryReference::Malformed(
+            "lib attribute is empty".to_owned(),
+        ));
+    }
+    match canonical_library_name(raw) {
+        Some(name) => Some(TripleSlashLibraryReference::Known(name)),
+        None => Some(TripleSlashLibraryReference::Unknown(raw.to_owned())),
+    }
+}
+
+fn library_activation_configurations(
+    library_name: &str,
+    libraries: &[(String, String)],
+    references_by_library: &BTreeMap<String, Vec<String>>,
+) -> Vec<String> {
+    let mut configurations = BTreeSet::new();
+    for (candidate, _) in libraries {
+        let mut stack = vec![candidate.as_str()];
+        let mut visited = BTreeSet::new();
+        while let Some(current) = stack.pop() {
+            if !visited.insert(current) {
+                continue;
+            }
+            if current == library_name {
+                configurations.insert(format!("typescript-lib:{candidate}"));
+                break;
+            }
+            if let Some(references) = references_by_library.get(current) {
+                stack.extend(references.iter().map(String::as_str));
+            }
+        }
+    }
+    if configurations.is_empty() {
+        configurations.insert(format!("typescript-lib:{library_name}"));
+    }
+    configurations.into_iter().collect()
+}
+
 impl DependencyPackAdapter for JsTsDependencyPackAdapter {
     fn adapter_name(&self) -> &str {
         "bifrost-js-ts-dependency"
@@ -597,6 +1230,19 @@ impl DependencyPackAdapter for JsTsDependencyPackAdapter {
     }
 
     fn can_produce(&self, dependency: &ResolvedDependency) -> bool {
+        if dependency.evidence.language == "typescript"
+            && dependency.evidence.ecosystem == "npm"
+            && dependency.evidence.package.as_ref().is_some_and(|package| {
+                package.name == TYPESCRIPT_STDLIB_PACKAGE
+                    && package.version.as_ref().is_some_and(|version| {
+                        version == &Version::parse(TYPESCRIPT_STDLIB_VERSION).expect("valid pin")
+                    })
+            })
+            && dependency.artifacts.len() == 1
+            && dependency.artifacts[0].kind == ExternalArtifactKind::TypeScriptLibrarySet
+        {
+            return true;
+        }
         dependency.evidence.language == "typescript"
             && dependency.evidence.ecosystem == "npm"
             && dependency.artifacts.len() == 2
@@ -617,6 +1263,61 @@ impl DependencyPackAdapter for JsTsDependencyPackAdapter {
         limits: &ArtifactProducerLimits,
         cancellation: Option<&CancellationToken>,
     ) -> DependencyPackProduction {
+        if dependency
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.kind == ExternalArtifactKind::TypeScriptLibrarySet)
+        {
+            if artifacts.len() != 1
+                || artifacts[0].kind() != ExternalArtifactKind::TypeScriptLibrarySet
+            {
+                return dependency_failure(
+                    "artifact.count",
+                    "TypeScript library production requires exactly one pinned source set",
+                );
+            }
+            let source_set = &artifacts[0];
+            let mut libraries = source_set
+                .source_entries()
+                .iter()
+                .filter(|entry| entry.relative_path() != "package.json")
+                .filter_map(|entry| {
+                    let file_name = Path::new(entry.relative_path())
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .and_then(|name| name.strip_prefix("lib."))?;
+                    let name = canonical_library_name(file_name)?;
+                    // TypeScript ships compatibility aliases such as
+                    // lib.es6.d.ts alongside the canonical lib.es2015.d.ts.
+                    // Keep one pinned identity and reject aggregate aliases
+                    // that would otherwise create duplicate shards.
+                    (file_name == format!("{name}.d.ts"))
+                        .then(|| (name, entry.relative_path().to_owned()))
+                })
+                .collect::<Vec<_>>();
+            libraries.sort_unstable();
+            if libraries.is_empty() {
+                return dependency_failure(
+                    "typescript.library.empty",
+                    "TypeScript library source set contains no lib/*.d.ts declarations",
+                );
+            }
+            let mut request = typescript_library_production_request(dependency);
+            request.path = source_set.path().to_owned();
+            let production = TypeScriptDeclarationPackProducer.produce_loaded_library_set(
+                &request,
+                limits,
+                cancellation,
+                source_set.exact(),
+                "package.json",
+                &libraries,
+            );
+            return DependencyPackProduction {
+                pack: production.pack,
+                diagnostics: production.diagnostics,
+                suppressed_diagnostics: production.suppressed_diagnostics,
+            };
+        }
         let Some(declaration) = artifacts.iter().find(|artifact| {
             artifact.role() == DependencyArtifactRole::Declarations
                 && artifact.kind() == ExternalArtifactKind::TypeScriptDeclarationFile
@@ -677,6 +1378,7 @@ struct DeclarationCollector<'source, 'cancel> {
     remaining_records: usize,
     cancelled: bool,
     record_limit_hit: bool,
+    global_scope: bool,
 }
 
 #[derive(Clone)]
@@ -720,6 +1422,7 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
             remaining_records: limits.max_records,
             cancelled: false,
             record_limit_hit: false,
+            global_scope: false,
         }
     }
 
@@ -767,6 +1470,16 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
                 ),
             );
         }
+    }
+
+    /// Collect a `lib.*.d.ts` file in the ambient global scope.  Built-in
+    /// libraries declare names such as `Array` and `Document` directly; they
+    /// must not acquire the synthetic source-file module prefix used for npm
+    /// modules.  The small synthetic `global` owner remains only to give
+    /// top-level members a stable owner identity.
+    fn collect_global(&mut self, root: Node<'_>) {
+        self.global_scope = true;
+        self.collect(root);
     }
 
     fn visit<'tree>(
@@ -861,7 +1574,7 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
         let Some(short_name) = field_text(node, "name", self.source) else {
             return;
         };
-        let name = format!("{owner_name}.{short_name}");
+        let name = self.qualified_name(owner_name, &short_name);
         let kind = match node.kind() {
             "interface_declaration" => TypeKind::Interface,
             "enum_declaration" => TypeKind::Enum,
@@ -912,7 +1625,10 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
             return;
         };
         let short_name = raw_name.trim_matches(['\'', '"']);
-        let name = if short_name == self.root_module_name || short_name.starts_with('@') {
+        let name = if (self.global_scope && owner_name == self.root_module_name)
+            || short_name == self.root_module_name
+            || short_name.starts_with('@')
+        {
             short_name.to_owned()
         } else {
             format!("{owner_name}.{short_name}")
@@ -935,6 +1651,14 @@ impl<'source, 'cancel> DeclarationCollector<'source, 'cancel> {
                     ambient: true,
                 });
             }
+        }
+    }
+
+    fn qualified_name(&self, owner_name: &str, short_name: &str) -> String {
+        if self.global_scope && owner_name == self.root_module_name {
+            short_name.to_owned()
+        } else {
+            format!("{owner_name}.{short_name}")
         }
     }
 
@@ -1396,7 +2120,9 @@ fn type_ref(node: Node<'_>, source: &str, remaining_depth: usize) -> TypeRef {
             .map(|element| TypeRef::Array {
                 element: Box::new(type_ref(element, source, remaining_depth - 1)),
             })
-            .unwrap_or_else(|| named_type("unknown[]".to_owned())),
+            .unwrap_or_else(|| TypeRef::Array {
+                element: Box::new(named_type("unknown".to_owned())),
+            }),
         "tuple_type" => {
             let mut cursor = node.walk();
             TypeRef::Tuple {
@@ -1420,9 +2146,16 @@ fn type_ref(node: Node<'_>, source: &str, remaining_depth: usize) -> TypeRef {
             }
         }
         "generic_type" => {
-            let name = node
+            let name_node = node
                 .child_by_field_name("name")
-                .or_else(|| node.named_child(0))
+                .or_else(|| node.named_child(0));
+            let name = name_node
+                .filter(|name| {
+                    matches!(
+                        name.kind(),
+                        "type_identifier" | "identifier" | "nested_type_identifier"
+                    )
+                })
                 .map(|name| node_text(name, source).trim().to_owned())
                 .filter(|name| !name.is_empty())
                 .unwrap_or_else(|| "unknown".to_owned());
@@ -1442,22 +2175,26 @@ fn type_ref(node: Node<'_>, source: &str, remaining_depth: usize) -> TypeRef {
                 nullable: false,
             }
         }
-        "type_identifier"
-        | "identifier"
-        | "nested_type_identifier"
-        | "predefined_type"
-        | "literal_type"
+        "type_identifier" | "identifier" | "nested_type_identifier" | "predefined_type" => {
+            named_type(node_text(node, source).trim().to_owned())
+        }
+        "literal_type"
         | "object_type"
         | "union_type"
         | "intersection_type"
         | "indexed_access_type"
         | "lookup_type"
-        | "type_query" => named_type(node_text(node, source).trim().to_owned()),
-        _ => named_type(node_text(node, source).trim().to_owned()),
+        | "type_query" => named_type("unknown".to_owned()),
+        _ => named_type("unknown".to_owned()),
     }
 }
 
 fn named_type(name: String) -> TypeRef {
+    let name = if name.is_empty() || name.chars().any(char::is_whitespace) {
+        "unknown".to_owned()
+    } else {
+        name
+    };
     TypeRef::Named {
         name,
         arguments: Vec::new(),
@@ -1511,6 +2248,17 @@ fn finish_typescript_production(
         Completeness::Partial
     };
     let has_declarations = types.len() > 1 || !members.is_empty();
+    // Every Source locator in these shards names a declaration module this
+    // producer read and parsed, so the pack carries them all.
+    let shards = vec![AuthoredShard {
+        id: "declarations.typescript.external".to_owned(),
+        activation,
+        payload: AuthoredPayload::DeclarationFacts {
+            types,
+            members,
+            relations: Vec::new(),
+        },
+    }];
     ArtifactProduction {
         artifact_sha256: Some(artifact_sha256.to_owned()),
         pack: has_declarations.then(|| AuthoredSemanticModelPack {
@@ -1528,15 +2276,8 @@ fn finish_typescript_production(
             license: request.license.clone(),
             completeness,
             safety: request.safety.clone(),
-            shards: vec![AuthoredShard {
-                id: "declarations.typescript.external".to_owned(),
-                activation,
-                payload: AuthoredPayload::DeclarationFacts {
-                    types,
-                    members,
-                    relations: Vec::new(),
-                },
-            }],
+            carried_sources: carried_source_paths(&shards),
+            shards,
         }),
         completeness,
         diagnostics,
@@ -1598,6 +2339,47 @@ fn js_ts_dependency_production_request(
         safety: Safety {
             generated_code_only: false,
             review_required: false,
+        },
+    }
+}
+
+fn typescript_library_production_request(
+    dependency: &ResolvedDependency,
+) -> ArtifactProductionRequest {
+    ArtifactProductionRequest {
+        path: PathBuf::new(),
+        artifact_kind: ExternalArtifactKind::TypeScriptLibrarySet,
+        pack_id: "bifrost.typescript-stdlib".to_owned(),
+        pack_version: TYPESCRIPT_STDLIB_VERSION.to_owned(),
+        ecosystem: "npm".to_owned(),
+        compatibility: Compatibility {
+            bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
+            toolchains: Vec::new(),
+        },
+        activation: vec![ActivationSelector {
+            package: Some(NameSelector {
+                name: TYPESCRIPT_STDLIB_PACKAGE.to_owned(),
+                version: Some(format!("={TYPESCRIPT_STDLIB_VERSION}")),
+            }),
+            module: None,
+            toolchain: None,
+            targets: Vec::new(),
+            configurations: dependency
+                .evidence
+                .configuration
+                .clone()
+                .into_iter()
+                .collect(),
+            artifact_sha256: None,
+        }],
+        provenance: Provenance {
+            source: "official TypeScript npm package".to_owned(),
+            revision: Some(TYPESCRIPT_STDLIB_VERSION.to_owned()),
+        },
+        license: "Apache-2.0".to_owned(),
+        safety: Safety {
+            generated_code_only: false,
+            review_required: true,
         },
     }
 }
@@ -1735,6 +2517,71 @@ fn resolve_locked_package(
             "npm.package.name_mismatch",
             format!("installed package name {name} does not match locked name {locked_name}"),
         ));
+    }
+
+    if name == TYPESCRIPT_STDLIB_PACKAGE && version_text == TYPESCRIPT_STDLIB_VERSION {
+        let config_path = lockfile
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("tsconfig.json");
+        let activation = typescript_library_activation_evidence(
+            &config_path,
+            lockfile.parent().unwrap_or_else(|| Path::new(".")),
+        );
+        if !activation.selection.is_complete() || activation.evidence.is_empty() {
+            return Err(failure(
+                "typescript.library.activation",
+                activation.diagnostics.join("; "),
+            ));
+        }
+        let provenance = vec![
+            DependencyProvenance {
+                key: "lockfile_format".to_owned(),
+                value: "npm-packages-v2".to_owned(),
+            },
+            DependencyProvenance {
+                key: "lockfile_entry".to_owned(),
+                value: lock_path.to_owned(),
+            },
+            DependencyProvenance {
+                key: "package".to_owned(),
+                value: name.to_owned(),
+            },
+            DependencyProvenance {
+                key: "version".to_owned(),
+                value: version_text.to_owned(),
+            },
+        ];
+        let selected_libraries = activation.selection.libraries().to_vec();
+        return Ok(selected_libraries
+            .into_iter()
+            .map(|library| {
+                let evidence = SemanticModelActivationEvidence {
+                    language: "typescript".to_owned(),
+                    ecosystem: "npm".to_owned(),
+                    package: Some(CatalogCoordinate {
+                        name: TYPESCRIPT_STDLIB_PACKAGE.to_owned(),
+                        version: Some(version.clone()),
+                    }),
+                    module: None,
+                    toolchain: None,
+                    target: None,
+                    configuration: Some(format!("typescript-lib:{library}")),
+                    artifact_sha256: None,
+                };
+                ResolvedDependency {
+                    id: format!(
+                        "npm:{name}@{version_text}:{}",
+                        evidence.configuration.as_deref().unwrap_or("stdlib")
+                    ),
+                    evidence,
+                    provenance: provenance.clone(),
+                    artifacts: Vec::new(),
+                    scope: DependencyScope::Unknown,
+                    declared_by: None,
+                }
+            })
+            .collect());
     }
 
     let entries = declaration_entries(name, &manifest, &canonical_package)
@@ -2085,6 +2932,47 @@ fn cancelled(cancellation: Option<&CancellationToken>) -> bool {
     cancellation.is_some_and(CancellationToken::is_cancelled)
 }
 
+/// tree-sitter-typescript 0.23 reports the `in keyof readonly T[]` form used
+/// by TypeScript's standard library mapped properties as an ERROR child of a
+/// computed property name, although the surrounding declaration tree is
+/// complete and structurally traversable. Keep malformed trees error-grade;
+/// recover only this known grammar gap.
+fn has_unrecoverable_typescript_errors(root: Node<'_>) -> bool {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if (node.is_error() || node.is_missing())
+            && !is_known_typescript_computed_property_error(node)
+        {
+            return true;
+        }
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
+    false
+}
+
+fn is_known_typescript_computed_property_error(node: Node<'_>) -> bool {
+    if !node.is_error()
+        || node.named_child_count() != 1
+        || !node
+            .parent()
+            .is_some_and(|parent| parent.kind() == "computed_property_name")
+    {
+        return false;
+    }
+    let Some(readonly_type) = node.named_child(0) else {
+        return false;
+    };
+    readonly_type.kind() == "readonly_type"
+        && readonly_type.named_child_count() == 1
+        && readonly_type
+            .named_child(0)
+            .is_some_and(|child| child.kind() == "array_type")
+}
+
 fn cancelled_outcome() -> DependencyDiscoveryOutcome {
     DependencyDiscoveryOutcome {
         dependencies: Vec::new(),
@@ -2105,6 +2993,8 @@ fn cancelled_outcome() -> DependencyDiscoveryOutcome {
 #[cfg(test)]
 mod producer_tests {
     use super::*;
+    use crate::analyzer::semantic_model::compile_pack;
+    use crate::analyzer::semantic_model::read_exact_source_set;
 
     const DECLARATIONS: &str = r#"
 export interface Widget<T> extends Base<T> {
@@ -2244,6 +3134,380 @@ declare namespace HiddenSpace { interface Widget { hidden: true } }
             production.diagnostics[0].code,
             "typescript.declaration.no_external_declarations"
         );
+    }
+
+    #[test]
+    fn typescript_error_recovery_is_limited_to_computed_property_names() {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TSX.into())
+            .expect("tree-sitter TypeScript language must load");
+        let library_declaration = "interface Symbol { readonly [Symbol.unscopables]: { [K in keyof readonly any[]]?: boolean; }; }";
+        let library_tree = parser
+            .parse(library_declaration, None)
+            .expect("parse standard-library declaration");
+        assert!(library_tree.root_node().has_error());
+        assert!(!has_unrecoverable_typescript_errors(
+            library_tree.root_node()
+        ));
+
+        let malformed_tree = parser
+            .parse("interface {", None)
+            .expect("parse malformed declaration");
+        assert!(malformed_tree.root_node().has_error());
+        assert!(has_unrecoverable_typescript_errors(
+            malformed_tree.root_node()
+        ));
+    }
+
+    #[test]
+    fn library_source_set_emits_global_shards_and_requires_reference_closure() {
+        let root = tempfile::tempdir().expect("library source root");
+        std::fs::create_dir_all(root.path().join("lib")).unwrap();
+        std::fs::write(
+            root.path().join("package.json"),
+            r#"{"name":"typescript","version":"7.0.2","license":"Apache-2.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("lib/lib.es5.d.ts"),
+            "/// <reference lib=\"dom\" />\ninterface Array<T> { length: number }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("lib/lib.dom.d.ts"),
+            "interface Array<T> { length: number }\ninterface Document { title: string }\n",
+        )
+        .unwrap();
+        let artifact = read_exact_source_set(
+            root.path(),
+            &[
+                PathBuf::from("package.json"),
+                PathBuf::from("lib/lib.dom.d.ts"),
+                PathBuf::from("lib/lib.es5.d.ts"),
+            ],
+            32,
+            16,
+            &ArtifactProducerLimits::default(),
+        )
+        .unwrap();
+        let mut request = request(PathBuf::new());
+        request.artifact_kind = ExternalArtifactKind::TypeScriptLibrarySet;
+        request.activation.clear();
+        let production = TypeScriptDeclarationPackProducer.produce_loaded_library_set(
+            &request,
+            &ArtifactProducerLimits::default(),
+            None,
+            &artifact,
+            "package.json",
+            &[
+                ("es5".to_owned(), "lib/lib.es5.d.ts".to_owned()),
+                ("dom".to_owned(), "lib/lib.dom.d.ts".to_owned()),
+            ],
+        );
+        assert_eq!(
+            production.completeness,
+            Completeness::Complete,
+            "{:#?}",
+            production.diagnostics
+        );
+        let pack = production.pack.expect("built-in library pack");
+        compile_pack(&pack, &Default::default()).expect("multi-library augmentation pack");
+        assert_eq!(
+            pack.carried_sources,
+            ["lib/lib.dom.d.ts", "lib/lib.es5.d.ts"]
+        );
+        assert_eq!(pack.shards.len(), 2);
+        let es5 = pack
+            .shards
+            .iter()
+            .find(|shard| shard.id.ends_with(".es5"))
+            .expect("es5 shard");
+        let AuthoredPayload::DeclarationFacts { types, .. } = &es5.payload else {
+            panic!("declaration facts expected");
+        };
+        assert!(!types.iter().any(|fact| fact.name == "global.Array"));
+        assert!(pack.shards.iter().any(|shard| {
+            matches!(&shard.payload, AuthoredPayload::DeclarationFacts { types, .. }
+                if types.iter().any(|fact| fact.name == "Array"))
+        }));
+        assert_eq!(es5.activation[0].configurations, ["typescript-lib:es5"]);
+        assert_eq!(
+            es5.activation[0]
+                .package
+                .as_ref()
+                .unwrap()
+                .version
+                .as_deref(),
+            Some("=7.0.2")
+        );
+    }
+
+    #[test]
+    fn library_source_set_rejects_missing_triple_slash_reference() {
+        let root = tempfile::tempdir().expect("library source root");
+        std::fs::create_dir_all(root.path().join("lib")).unwrap();
+        std::fs::write(
+            root.path().join("package.json"),
+            r#"{"name":"typescript","version":"7.0.2","license":"Apache-2.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("lib/lib.es5.d.ts"),
+            "/// <reference lib=\"dom\" />\ninterface Array<T> { length: number }\n",
+        )
+        .unwrap();
+        let artifact = read_exact_source_set(
+            root.path(),
+            &[
+                PathBuf::from("package.json"),
+                PathBuf::from("lib/lib.es5.d.ts"),
+            ],
+            32,
+            16,
+            &ArtifactProducerLimits::default(),
+        )
+        .unwrap();
+        let mut request = request(PathBuf::new());
+        request.artifact_kind = ExternalArtifactKind::TypeScriptLibrarySet;
+        let production = TypeScriptDeclarationPackProducer.produce_loaded_library_set(
+            &request,
+            &ArtifactProducerLimits::default(),
+            None,
+            &artifact,
+            "package.json",
+            &[("es5".to_owned(), "lib/lib.es5.d.ts".to_owned())],
+        );
+        assert_eq!(production.completeness, Completeness::Partial);
+        assert!(
+            production
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "typescript.library.reference_missing")
+        );
+    }
+
+    #[test]
+    fn library_source_set_diagnoses_unknown_triple_slash_reference() {
+        let root = tempfile::tempdir().expect("library source root");
+        std::fs::create_dir_all(root.path().join("lib")).unwrap();
+        std::fs::write(
+            root.path().join("package.json"),
+            r#"{"name":"typescript","version":"7.0.2","license":"Apache-2.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("lib/lib.es5.d.ts"),
+            "/// <reference lib = \"not-a-real-lib\" />\ninterface Array<T> {}\n",
+        )
+        .unwrap();
+        let artifact = read_exact_source_set(
+            root.path(),
+            &[
+                PathBuf::from("package.json"),
+                PathBuf::from("lib/lib.es5.d.ts"),
+            ],
+            32,
+            16,
+            &ArtifactProducerLimits::default(),
+        )
+        .unwrap();
+        let mut request = request(PathBuf::new());
+        request.artifact_kind = ExternalArtifactKind::TypeScriptLibrarySet;
+        let production = TypeScriptDeclarationPackProducer.produce_loaded_library_set(
+            &request,
+            &ArtifactProducerLimits::default(),
+            None,
+            &artifact,
+            "package.json",
+            &[("es5".to_owned(), "lib/lib.es5.d.ts".to_owned())],
+        );
+        assert!(
+            production
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "typescript.library.reference_unknown")
+        );
+    }
+
+    #[test]
+    fn aggregate_library_shard_selectors_include_transitive_components() {
+        let root = tempfile::tempdir().expect("library source root");
+        std::fs::create_dir_all(root.path().join("lib")).unwrap();
+        std::fs::write(
+            root.path().join("package.json"),
+            r#"{"name":"typescript","version":"7.0.2","license":"Apache-2.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("lib/lib.es5.d.ts"),
+            "interface Array<T> { length: number }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("lib/lib.es2015.core.d.ts"),
+            "/// <reference lib = \"es5\" />\ninterface PromiseLike<T> {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("lib/lib.es2015.d.ts"),
+            "/// <reference lib=\"es5\" />\n/// <reference lib=\"es2015.core\" />\n",
+        )
+        .unwrap();
+        let libraries = [
+            ("es5".to_owned(), "lib/lib.es5.d.ts".to_owned()),
+            (
+                "es2015.core".to_owned(),
+                "lib/lib.es2015.core.d.ts".to_owned(),
+            ),
+            ("es2015".to_owned(), "lib/lib.es2015.d.ts".to_owned()),
+        ];
+        let artifact = read_exact_source_set(
+            root.path(),
+            &libraries
+                .iter()
+                .map(|(_, path)| PathBuf::from(path))
+                .chain([PathBuf::from("package.json")])
+                .collect::<Vec<_>>(),
+            32,
+            16,
+            &ArtifactProducerLimits::default(),
+        )
+        .unwrap();
+        let mut request = request(PathBuf::new());
+        request.artifact_kind = ExternalArtifactKind::TypeScriptLibrarySet;
+        request.activation = vec![ActivationSelector {
+            package: None,
+            module: None,
+            toolchain: None,
+            targets: Vec::new(),
+            configurations: vec!["typescript-lib:es2015".to_owned()],
+            artifact_sha256: None,
+        }];
+        let production = TypeScriptDeclarationPackProducer.produce_loaded_library_set(
+            &request,
+            &ArtifactProducerLimits::default(),
+            None,
+            &artifact,
+            "package.json",
+            &libraries,
+        );
+        assert_eq!(production.completeness, Completeness::Complete);
+        let pack = production.pack.unwrap();
+        let es5 = pack
+            .shards
+            .iter()
+            .find(|shard| shard.id.ends_with(".es5"))
+            .unwrap();
+        assert!(
+            es5.activation[0]
+                .configurations
+                .contains(&"typescript-lib:es2015".to_owned())
+        );
+    }
+
+    #[test]
+    fn library_source_set_uses_one_record_budget() {
+        let root = tempfile::tempdir().expect("library source root");
+        std::fs::create_dir_all(root.path().join("lib")).unwrap();
+        std::fs::write(
+            root.path().join("package.json"),
+            r#"{"name":"typescript","version":"7.0.2","license":"Apache-2.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("lib/lib.es5.d.ts"),
+            "interface Array<T> { length: number }\ninterface Object {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("lib/lib.dom.d.ts"),
+            "interface Document { title: string }\n",
+        )
+        .unwrap();
+        let artifact = read_exact_source_set(
+            root.path(),
+            &[
+                PathBuf::from("package.json"),
+                PathBuf::from("lib/lib.dom.d.ts"),
+                PathBuf::from("lib/lib.es5.d.ts"),
+            ],
+            32,
+            16,
+            &ArtifactProducerLimits::default(),
+        )
+        .unwrap();
+        let mut request = request(PathBuf::new());
+        request.artifact_kind = ExternalArtifactKind::TypeScriptLibrarySet;
+        let limits = ArtifactProducerLimits {
+            max_records: 2,
+            ..ArtifactProducerLimits::default()
+        };
+        let production = TypeScriptDeclarationPackProducer.produce_loaded_library_set(
+            &request,
+            &limits,
+            None,
+            &artifact,
+            "package.json",
+            &[
+                ("es5".to_owned(), "lib/lib.es5.d.ts".to_owned()),
+                ("dom".to_owned(), "lib/lib.dom.d.ts".to_owned()),
+            ],
+        );
+        assert_eq!(production.completeness, Completeness::Partial);
+        assert!(
+            production
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "limit.records")
+        );
+    }
+
+    #[test]
+    fn library_activation_evidence_is_exact_and_narrow() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("tsconfig.json");
+        std::fs::write(&config, r#"{"compilerOptions":{"lib":["ES5","DOM"]}}"#).unwrap();
+        let outcome = typescript_library_activation_evidence(&config, root.path());
+        assert!(outcome.selection.is_complete(), "{outcome:?}");
+        assert_eq!(outcome.selection.libraries(), ["dom", "es5"]);
+        assert!(outcome.evidence.len() > 2);
+        assert!(outcome.evidence.iter().all(|evidence| {
+            evidence.package.as_ref().is_some_and(|package| {
+                package.name == TYPESCRIPT_STDLIB_PACKAGE
+                    && package.version.as_ref().is_some_and(|version| {
+                        version == &Version::parse(TYPESCRIPT_STDLIB_VERSION).unwrap()
+                    })
+            })
+        }));
+        assert!(
+            outcome
+                .evidence
+                .iter()
+                .any(|evidence| evidence.configuration.as_deref() == Some("typescript-lib:dom"))
+        );
+        assert!(
+            outcome
+                .evidence
+                .iter()
+                .any(|evidence| evidence.configuration.as_deref() == Some("typescript-lib:es2015"))
+        );
+    }
+
+    #[test]
+    fn malformed_library_config_has_no_uncertain_activation() {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("tsconfig.json");
+        std::fs::write(
+            &config,
+            r#"{"compilerOptions":{"lib":["DOM","not-a-library"]}}"#,
+        )
+        .unwrap();
+        let outcome = typescript_library_activation_evidence(&config, root.path());
+        assert!(!outcome.selection.is_complete());
+        assert!(outcome.selection.libraries().is_empty());
+        assert!(outcome.evidence.is_empty());
+        assert!(!outcome.diagnostics.is_empty());
     }
 
     fn request(path: PathBuf) -> ArtifactProductionRequest {

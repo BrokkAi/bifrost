@@ -36,7 +36,7 @@ use crate::graph_support::{
 };
 use crate::hierarchy::canonical_rust_hierarchy_type;
 use crate::imports::{resolve_rust_import_package_scoped, rust_focused_use_path};
-use crate::lexical_scope::RustLexicalScopeIndex;
+use crate::lexical_scope::{RustLexicalScopeIndex, rust_lexical_scope_index};
 use crate::usage::{
     RustBindingSeeds, RustReferenceNamespace, RustSymbolNamespace, usage_binding_seeds,
     usage_exact_root_for_resolution, usage_local_module_prefix_visible_at, usage_reference_at,
@@ -106,7 +106,7 @@ pub fn scan_file(
     // builder and (from Phase 1b) the forward scan resolve references
     // through it, so the two paths can't drift.
     let factory_returns = collect_factory_return_types(input.root(), input.source, &refs);
-    let lexical_scope = RustLexicalScopeIndex::new(input.root(), input.source);
+    let lexical_scope = rust_lexical_scope_index(input.root(), input.source);
     let mut same_file_nonmembers: HashMap<String, Vec<CodeUnit>> = HashMap::default();
     for declaration in rust.declarations(file).into_iter().filter(|declaration| {
         rust.parent_of(declaration)
@@ -147,7 +147,7 @@ struct RustScan<'a> {
     file: &'a ProjectFile,
     source: &'a str,
     refs: RustReferenceContext<'a>,
-    lexical_scope: RustLexicalScopeIndex,
+    lexical_scope: Arc<RustLexicalScopeIndex>,
     token_tree_roles: RustTokenTreeRoleCache,
     factory_returns: HashMap<String, String>,
     same_file_nonmembers: HashMap<String, Vec<CodeUnit>>,

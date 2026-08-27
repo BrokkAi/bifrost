@@ -1,5 +1,3 @@
-#[cfg(feature = "nlp")]
-use crate::nlp::{indexer::SemanticIndexer, query::semantic_search};
 #[cfg(test)]
 use crate::policy::{
     PolicyExecutionStage, PolicyExecutionTermination, PolicyReportDiagnosticCode,
@@ -10,7 +8,11 @@ use crate::searchtools::get_symbol_sources;
 use crate::{
     AnalyzerConfig, CancellationToken, FilesystemProject, Project, ProjectChangeWatcher,
     ProjectFile, WorkspaceAnalyzer, WorkspaceFileListingCache,
-    analyzer::packs_document::{activate_workspace_packs, load_workspace_packs_config_at},
+    analyzer::packs_document::{
+        WORKSPACE_PACKS_DOCUMENT_PATH, WorkspaceActivationSources, WorkspacePacksActivation,
+        WorkspacePacksConfig, activate_workspace_semantic_sources_in_catalog,
+        load_workspace_packs_config_at, workspace_pack_ecosystems,
+    },
     analyzer::semantic::WorkspaceRelativePath,
     analyzer::semantic_model::{
         CatalogCoordinate, CatalogOpenMode, CatalogOptions, SemanticModelActivationEvidence,
@@ -35,9 +37,10 @@ use crate::{
         ExplanationTarget, NearMissCandidates, POLICY_EXIT_CLEAN, POLICY_EXIT_FINDING,
         POLICY_EXIT_UNRELIABLE, PolicyBaselineOptions, PolicyBaselineSource, PolicyEvaluationDate,
         PolicyEvaluationInput, PolicyEvaluationOptions, PolicyExplanation, PolicyFailOn,
-        PolicyFindingId, PolicyId, PolicyNearMissRanking, PolicyReportDocument, PolicyScopeOptions,
-        PolicyScopeSource, PolicyStageTiming, PolicySuppressionOptions, PolicySuppressionSource,
-        built_in_policy_catalog, explain_policy_inputs, rank_policy_near_misses,
+        PolicyFindingId, PolicyHostActivationContext, PolicyId, PolicyNearMissRanking,
+        PolicyReportDocument, PolicyScopeOptions, PolicyScopeSource, PolicyStageTiming,
+        PolicySuppressionOptions, PolicySuppressionSource, built_in_policy_catalog,
+        explain_policy_inputs, rank_policy_near_misses,
         workspace_snapshot_deadline_outcome_with_preflight,
     },
     profiling,
@@ -222,93 +225,170 @@ fn parse_workspace_semantic_models_setting(
     }
 }
 
-/// Document-driven dependency-pack activation (#1868).
-///
-/// A bound MCP session activates the same packs the LSP and the CLI policy
-/// runner would from the same `.bifrost/packs.json`. A malformed document is
-/// loud but does not fail the workspace bind: search tools stay usable while
-/// the misconfiguration is reported on stderr, and a policy run against this
-/// workspace reports the same failure as a `packs-load-failed` diagnostic.
-fn activate_workspace_pack_document(workspace_root: &Path, workspace: &WorkspaceAnalyzer) {
-    let _scope = profiling::scope("semantic_pack.workspace_document");
-    let config = match load_workspace_packs_config_at(workspace_root) {
-        Ok(Some(config)) => config,
-        Ok(None) => return,
-        Err(error) => {
-            eprintln!(
-                "bifrost: workspace packs document is invalid, no packs were activated: {error}"
-            );
-            return;
-        }
-    };
-    match activate_workspace_packs(
-        workspace,
-        &AnalyzerConfig::default(),
-        workspace_root,
-        &config,
-        &CancellationToken::default(),
-    ) {
-        Ok(Some(activation)) => {
-            eprintln!(
-                "bifrost: workspace pack activation ecosystems={:?} complete={}",
-                activation
-                    .ecosystems
-                    .iter()
-                    .map(|ecosystem| ecosystem.label())
-                    .collect::<Vec<_>>(),
-                activation.outcome.complete()
-            );
-            if !activation.outcome.complete() {
-                eprintln!(
-                    "bifrost: workspace pack activation was incomplete: {:#?}",
-                    activation.outcome
-                );
-            }
-        }
-        Ok(None) => {}
-        Err(error) => eprintln!("bifrost: workspace pack activation failed: {error}"),
-    }
+#[derive(Debug)]
+struct WorkspacePackActivationState {
+    config: Option<Arc<WorkspacePacksConfig>>,
+    activation: Option<Arc<WorkspacePacksActivation>>,
+    ecosystems: Vec<crate::analyzer::DependencyPackEcosystem>,
+    failure: Option<String>,
 }
 
 fn activate_configured_semantic_models(
     workspace_root: &Path,
     workspace: &WorkspaceAnalyzer,
     configured: Option<ConfiguredSemanticModels>,
-) -> Result<(), String> {
+) -> Result<WorkspacePackActivationState, String> {
     let _scope = profiling::scope("semantic_pack.activate_configured");
-    // Every workspace build funnels through this activation step, so the
-    // shared packs document runs here first: MCP parity with the LSP and the
-    // CLI comes from one document, not per-host configuration (#1868).
-    activate_workspace_pack_document(workspace_root, workspace);
+    let packs_config = load_workspace_packs_config_at(workspace_root)
+        .map_err(|error| format!("failed to load workspace packs document: {error}"))?
+        .map(Arc::new);
     let bootstrap = SEMANTIC_MODEL_CATALOG_BOOTSTRAP.get().copied();
-    if configured.is_none() && bootstrap.is_none() {
-        return Ok(());
+    let explicit_legacy = configured.as_ref().is_some_and(|configured| {
+        configured.catalog_root.is_some() || !configured.evidence.is_empty()
+    });
+    if !explicit_legacy {
+        // This is the ordinary MCP path. Bootstrap alone is not a legacy
+        // override: it contributes reviewed records to the same catalog and
+        // one shared transaction as the ambient/default dependency route.
+        let workspace_models = configured
+            .as_ref()
+            .is_some_and(|configured| configured.workspace_models);
+        let ecosystems = workspace_pack_ecosystems(workspace, packs_config.as_deref());
+        let workspace_models_present = workspace_models
+            && std::fs::symlink_metadata(
+                workspace_root
+                    .join(crate::analyzer::semantic_model::WORKSPACE_SEMANTIC_MODEL_DIRECTORY),
+            )
+            .is_ok();
+        if ecosystems.is_empty() && !workspace_models_present {
+            return Ok(WorkspacePackActivationState {
+                config: packs_config,
+                activation: None,
+                ecosystems,
+                failure: None,
+            });
+        }
+        let catalog = {
+            let _scope = profiling::scope("semantic_pack.open_catalog");
+            match packs_config.as_ref().and_then(|config| config.catalog()) {
+                Some(relative) => match SemanticPackCatalog::open(
+                    &workspace_root.join(relative),
+                    CatalogOpenMode::ReadWrite,
+                    CatalogOptions::default(),
+                ) {
+                    Ok(catalog) => catalog,
+                    Err(error) => {
+                        return Ok(WorkspacePackActivationState {
+                            config: packs_config,
+                            activation: None,
+                            ecosystems,
+                            failure: Some(format!(
+                                "failed to open workspace semantic-pack catalog: {error}"
+                            )),
+                        });
+                    }
+                },
+                None => match crate::analyzer::semantic_model::open_default_semantic_pack_catalog(
+                    workspace_root,
+                    CatalogOptions::default(),
+                ) {
+                    Ok(catalog) => catalog,
+                    Err(error) => {
+                        return Ok(WorkspacePackActivationState {
+                            config: packs_config,
+                            activation: None,
+                            ecosystems,
+                            failure: Some(format!(
+                                "failed to open generated semantic-pack catalog: {error}"
+                            )),
+                        });
+                    }
+                },
+            }
+        };
+        let mut additional_evidence = Vec::new();
+        if let Some(bootstrap) = bootstrap {
+            if let Err(error) = bootstrap(&catalog) {
+                return Ok(WorkspacePackActivationState {
+                    config: packs_config,
+                    activation: None,
+                    ecosystems,
+                    failure: Some(format!(
+                        "failed to register the MCP semantic-pack catalog bootstrap: {error}"
+                    )),
+                });
+            }
+            additional_evidence.extend(intrinsic_language_evidence(workspace));
+        }
+        let activation = match activate_workspace_semantic_sources_in_catalog(
+            workspace,
+            &AnalyzerConfig::default(),
+            &catalog,
+            WorkspaceActivationSources {
+                catalog_root: workspace_root,
+                workspace_model_root: workspace_models.then_some(workspace_root),
+                config: packs_config.as_deref(),
+            },
+            &additional_evidence,
+            &CancellationToken::default(),
+        ) {
+            Ok(activation) => activation.map(Arc::new),
+            Err(error) => {
+                return Ok(WorkspacePackActivationState {
+                    config: packs_config,
+                    activation: None,
+                    ecosystems,
+                    failure: Some(format!(
+                        "workspace semantic-pack activation failed: {error}"
+                    )),
+                });
+            }
+        };
+        return Ok(WorkspacePackActivationState {
+            config: packs_config,
+            activation,
+            ecosystems,
+            failure: None,
+        });
+    }
+    if packs_config.is_some() {
+        let ecosystems = workspace_pack_ecosystems(workspace, packs_config.as_deref());
+        return Ok(WorkspacePackActivationState {
+            config: packs_config,
+            activation: None,
+            ecosystems,
+            failure: Some(
+                "workspace packs document cannot be combined with legacy semantic-pack environment configuration"
+                    .to_owned(),
+            ),
+        });
     }
     let configured = configured.unwrap_or(ConfiguredSemanticModels {
         catalog_root: None,
         evidence: Vec::new(),
         workspace_models: false,
     });
-    let catalog =
-        {
-            let _scope = profiling::scope("semantic_pack.open_catalog");
-            match &configured.catalog_root {
-                Some(catalog_root) => SemanticPackCatalog::open(
-                    catalog_root,
-                    CatalogOpenMode::ReadOnly,
-                    CatalogOptions::default(),
+    let catalog = {
+        let _scope = profiling::scope("semantic_pack.open_catalog");
+        match &configured.catalog_root {
+            Some(catalog_root) => SemanticPackCatalog::open(
+                catalog_root,
+                CatalogOpenMode::ReadOnly,
+                CatalogOptions::default(),
+            )
+            .map_err(|error| {
+                format!(
+                    "failed to open configured semantic-pack catalog {}: {error}",
+                    catalog_root.display()
                 )
-                .map_err(|error| {
-                    format!(
-                        "failed to open configured semantic-pack catalog {}: {error}",
-                        catalog_root.display()
-                    )
-                })?,
-                None => SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).map_err(
-                    |error| format!("failed to open ephemeral semantic-pack catalog: {error}"),
-                )?,
-            }
-        };
+            })?,
+            None => crate::analyzer::semantic_model::open_default_semantic_pack_catalog(
+                workspace_root,
+                CatalogOptions::default(),
+            )
+            .map_err(|error| format!("failed to open generated semantic-pack catalog: {error}"))?,
+        }
+    };
     let mut evidence = configured
         .evidence
         .into_iter()
@@ -387,7 +467,12 @@ fn activate_configured_semantic_models(
                     active.activation_report()
                 );
             }
-            Ok(())
+            Ok(WorkspacePackActivationState {
+                config: None,
+                activation: None,
+                ecosystems: Vec::new(),
+                failure: None,
+            })
         }
         SemanticModelRuntimeOutcome::Incomplete { report, .. } => Err(format!(
             "configured semantic-pack activation was incomplete: {report:?}"
@@ -408,7 +493,15 @@ pub fn prewarm_configured_semantic_models(
     workspace_root: &Path,
     workspace: &WorkspaceAnalyzer,
 ) -> Result<(), String> {
-    activate_configured_semantic_models(workspace_root, workspace, configured_semantic_models()?)
+    let state = activate_configured_semantic_models(
+        workspace_root,
+        workspace,
+        configured_semantic_models()?,
+    )?;
+    match state.failure {
+        Some(failure) => Err(failure),
+        None => Ok(()),
+    }
 }
 
 fn intrinsic_language_evidence(
@@ -529,7 +622,9 @@ mod workspace_semantic_model_configuration_tests {
         // No environment variables, no host options: the document alone is
         // the opt-in, so a bound MCP session activates the same packs the LSP
         // and the CLI would (#1868).
-        activate_configured_semantic_models(&root, &analyzer, None).unwrap();
+        let activation = activate_configured_semantic_models(&root, &analyzer, None).unwrap();
+        assert!(activation.config.is_some());
+        assert!(activation.activation.is_some());
 
         assert!(
             analyzer
@@ -538,6 +633,26 @@ mod workspace_semantic_model_configuration_tests {
                 .is_some(),
             "the packs document must drive dependency activation on workspace bind"
         );
+    }
+
+    #[test]
+    fn absent_packs_document_uses_bound_workspace_defaults() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::write(temp.path().join("src/lib.rs"), "pub struct Local;\n").unwrap();
+        let root = temp.path().canonicalize().unwrap().normalize();
+        let project: Arc<dyn Project> = Arc::new(FilesystemProject::new(root.clone()).unwrap());
+        let analyzer = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
+            .expect("ephemeral test workspace should build");
+
+        let state = activate_configured_semantic_models(&root, &analyzer, None).unwrap();
+        assert!(state.config.is_none());
+        assert_eq!(
+            state.ecosystems,
+            [crate::analyzer::DependencyPackEcosystem::Cargo]
+        );
+        assert!(state.activation.is_some());
+        assert!(state.failure.is_none());
     }
 
     #[test]
@@ -611,12 +726,14 @@ mod workspace_semantic_model_configuration_tests {
     #[test]
     fn invalid_workspace_pack_stops_activation_with_the_source_path() {
         let (root, analyzer) = workspace("{}");
-        let error = activate_configured_semantic_models(
+        let state = activate_configured_semantic_models(
             root.path(),
             &analyzer,
             Some(workspace_configuration()),
         )
-        .unwrap_err();
+        .unwrap();
+        let error = state.failure.expect("the failed activation is retained");
+        assert!(state.activation.is_none());
         assert!(error.contains("workspace semantic-model discovery failed"));
         assert!(error.contains(".bifrost/semantic-models/job-maker.json"));
     }
@@ -1012,7 +1129,6 @@ pub struct SearchToolsService {
     /// watcher-delta re-analysis or the initial index build (#1388).
     file_listing: RwLock<Option<Arc<WorkspaceFileListingCache>>>,
     update_strategy: UpdateStrategy,
-    semantic_indexing: bool,
     startup_index_warm: StartupIndexWarm,
     watcher_starter: WatcherStarter,
     diff_snapshot_object_dir: Option<PathBuf>,
@@ -1041,6 +1157,7 @@ enum StartupIndexWarm {
 struct WorkspaceSession {
     snapshot: Arc<WorkspaceAnalyzer>,
     document_root: Arc<WorkspaceRoot>,
+    pack_activation: Option<Arc<WorkspacePackActivationState>>,
     watcher: SessionWatcher,
     usage_index_warm: Option<JoinHandle<()>>,
     index_warmer: Arc<IndexWarmer>,
@@ -1048,8 +1165,6 @@ struct WorkspaceSession {
     /// call has completed. This keeps a long-lived server's startup
     /// accelerator from competing with an unrelated cold request.
     initial_index_warm_scheduled: std::sync::atomic::AtomicBool,
-    #[cfg(feature = "nlp")]
-    semantic: Option<Arc<SemanticIndexer>>,
 }
 
 enum SessionWatcher {
@@ -1065,6 +1180,7 @@ struct WorkspaceQueryScope {
     source_snapshot: Arc<WorkspaceAnalyzer>,
     snapshot: Arc<WorkspaceAnalyzer>,
     document_root: Arc<WorkspaceRoot>,
+    pack_activation: Option<Arc<WorkspacePackActivationState>>,
     context: Arc<crate::analyzer::AnalyzerQueryContext>,
 }
 
@@ -1748,14 +1864,19 @@ pub(crate) enum RunPolicyPreparation {
 }
 
 impl WorkspaceQueryScope {
-    fn new(source_snapshot: Arc<WorkspaceAnalyzer>, document_root: Arc<WorkspaceRoot>) -> Self {
+    fn new(
+        source_snapshot: Arc<WorkspaceAnalyzer>,
+        document_root: Arc<WorkspaceRoot>,
+        pack_activation: Option<Arc<WorkspacePackActivationState>>,
+    ) -> Self {
         let context = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
-        Self::with_context(source_snapshot, document_root, context)
+        Self::with_context(source_snapshot, document_root, pack_activation, context)
     }
 
     fn with_context(
         source_snapshot: Arc<WorkspaceAnalyzer>,
         document_root: Arc<WorkspaceRoot>,
+        pack_activation: Option<Arc<WorkspacePackActivationState>>,
         context: Arc<crate::analyzer::AnalyzerQueryContext>,
     ) -> Self {
         let snapshot = Arc::new(source_snapshot.as_ref().clone());
@@ -1764,6 +1885,7 @@ impl WorkspaceQueryScope {
             source_snapshot,
             snapshot,
             document_root,
+            pack_activation,
             context,
         }
     }
@@ -1776,6 +1898,7 @@ impl WorkspaceQueryScope {
         Self::with_context(
             source_snapshot,
             Arc::clone(&self.document_root),
+            self.pack_activation.clone(),
             Arc::clone(&self.context),
         )
     }
@@ -1862,6 +1985,32 @@ fn stale_symbol_source_files(
 }
 
 impl WorkspaceSession {
+    fn pack_activation_scope_changed(&self) -> bool {
+        self.pack_activation.as_ref().is_some_and(|state| {
+            workspace_pack_ecosystems(&self.snapshot, state.config.as_deref()) != state.ecosystems
+        })
+    }
+
+    /// Re-run the shared activation transaction after dependency inputs or the
+    /// workspace pack document change. Invalidation happens first so a failed
+    /// replacement cannot leave proof from an older workspace generation.
+    fn refresh_pack_activation(&mut self) {
+        self.snapshot
+            .invalidate_dependency_pack_state(&crate::analyzer::DependencyPackEcosystem::ALL);
+        let root = self.snapshot.analyzer().project().root();
+        self.pack_activation = match configured_semantic_models().and_then(|configured| {
+            activate_configured_semantic_models(root, self.snapshot.as_ref(), configured)
+        }) {
+            Ok(state) => Some(Arc::new(state)),
+            Err(error) => {
+                eprintln!(
+                    "bifrost: workspace semantic-pack activation refresh unavailable: {error}"
+                );
+                None
+            }
+        };
+    }
+
     /// Queue a background warm of the current snapshot's lazy query indexes.
     /// Free when the snapshot is already warm (incremental updates whose
     /// sources were unchanged share the previous generation's indexes).
@@ -1897,13 +2046,24 @@ impl WorkspaceSession {
             .as_ref()
             .is_none_or(JoinHandle::is_finished)
     }
+}
 
-    fn close_semantic(&self) {
-        #[cfg(feature = "nlp")]
-        if let Some(semantic) = &self.semantic {
-            semantic.close();
+fn changed_files_invalidate_pack_activation(changed_files: &BTreeSet<ProjectFile>) -> bool {
+    changed_files.iter().any(|file| {
+        let relative = file.rel_path();
+        if relative == Path::new(WORKSPACE_PACKS_DOCUMENT_PATH)
+            || relative
+                .starts_with(crate::analyzer::semantic_model::WORKSPACE_SEMANTIC_MODEL_DIRECTORY)
+        {
+            return true;
         }
-    }
+        let Some(file_name) = relative.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        crate::analyzer::DependencyPackEcosystem::ALL
+            .iter()
+            .any(|ecosystem| ecosystem.dependency_inputs().contains(&file_name))
+    })
 }
 
 impl Drop for WorkspaceSession {
@@ -1918,66 +2078,6 @@ impl Drop for WorkspaceSession {
             eprintln!("bifrost usage-index warm thread panicked: {panic:?}");
         }
     }
-}
-
-/// Semantic indexing is off by default. Set `BIFROST_SEMANTIC_INDEX=auto`
-/// (or `on`/`1`/`enabled`) to opt in when semantic_search is needed.
-pub(crate) fn semantic_indexing_enabled() -> bool {
-    if cfg!(not(feature = "nlp")) {
-        return false;
-    }
-    matches!(
-        std::env::var("BIFROST_SEMANTIC_INDEX").as_deref(),
-        Ok("auto") | Ok("on") | Ok("1") | Ok("enabled")
-    )
-}
-
-#[cfg(feature = "nlp")]
-fn maybe_start_semantic(
-    enabled: bool,
-    snapshot: &Arc<WorkspaceAnalyzer>,
-) -> Option<Arc<SemanticIndexer>> {
-    maybe_start_semantic_checked(enabled, snapshot, semantic_accelerator_ready)
-}
-
-/// Ok when the Muninn embedder can run: a CUDA/Metal accelerator is
-/// present, or the operator forced CPU. Mirrors `nlp::semantic_search_available`
-/// so the tool is never advertised without also being startable.
-#[cfg(feature = "nlp")]
-fn semantic_accelerator_ready() -> Result<(), String> {
-    if crate::nlp::semantic_search_available() {
-        Ok(())
-    } else {
-        Err(
-            "no CUDA or Metal accelerator detected; pass --force-semantic-cpu to run the \
-             embedder on CPU"
-                .to_string(),
-        )
-    }
-}
-
-#[cfg(feature = "nlp")]
-fn maybe_start_semantic_checked(
-    enabled: bool,
-    snapshot: &Arc<WorkspaceAnalyzer>,
-    accelerator_ready: impl FnOnce() -> Result<(), String>,
-) -> Option<Arc<SemanticIndexer>> {
-    if !enabled {
-        return None;
-    }
-    if let Err(err) = accelerator_ready() {
-        eprintln!("bifrost semantic index disabled: {err}");
-        return None;
-    }
-    let root = snapshot.analyzer().project().root().to_path_buf();
-    if !crate::nlp::gitcache::is_git_repo(&root) {
-        eprintln!("bifrost semantic index disabled: semantic search requires a git repository");
-        return None;
-    }
-    // `SemanticIndexer::start` resolves the same shared cache database as the
-    // analyzer store, so semantic rows land beside the analyzer rows for the
-    // primary checkout even when the session is bound to a linked worktree.
-    Some(SemanticIndexer::start(root, snapshot.clone()))
 }
 
 fn decode_run_policy_arguments(
@@ -2161,62 +2261,46 @@ impl SearchToolsService {
     }
 
     pub fn new(root: PathBuf) -> Result<Self, String> {
-        Self::new_with_strategy(
-            root,
-            UpdateStrategy::WatchFiles,
-            semantic_indexing_enabled(),
-        )
+        Self::new_with_strategy(root, UpdateStrategy::WatchFiles)
     }
 
     pub fn new_for_python(root: PathBuf) -> Result<Self, String> {
-        Self::new_lazy_with_strategy(
-            root,
-            UpdateStrategy::WatchFiles,
-            semantic_indexing_enabled(),
-        )
+        Self::new_lazy_with_strategy(root, UpdateStrategy::WatchFiles)
     }
 
-    /// Construct without a background semantic indexer regardless of env;
-    /// `semantic_search` reports itself unavailable on such a service.
-    pub fn new_without_semantic_index(root: PathBuf) -> Result<Self, String> {
-        Self::new_with_strategy(root, UpdateStrategy::WatchFiles, false)
-    }
-
-    /// Construct with no file watcher and no semantic indexer. This is useful
-    /// for immutable, short-lived workspaces such as inline test fixtures.
+    /// Construct with no file watcher. This is useful for immutable,
+    /// short-lived workspaces such as inline test fixtures.
     pub fn new_manual_ephemeral(root: PathBuf) -> Result<Self, String> {
-        Self::new_ephemeral_with_strategy(root, UpdateStrategy::Manual, false)
+        Self::new_ephemeral_with_strategy(root, UpdateStrategy::Manual)
     }
 
-    /// Construct with persisted analyzer storage, no watcher, and no semantic
-    /// indexer. The caller publishes changes explicitly through `update_paths`.
+    /// Construct with persisted analyzer storage and no watcher. The caller
+    /// publishes changes explicitly through `update_paths`.
     pub fn new_manual_persisted(root: PathBuf) -> Result<Self, String> {
-        Self::new_with_strategy(root, UpdateStrategy::Manual, false)
+        Self::new_with_strategy(root, UpdateStrategy::Manual)
     }
 
     /// Whether a tool is a pure function of its Git endpoints and never reads
-    /// the live workspace analyzer or semantic index.
+    /// the live workspace analyzer.
     ///
     /// `analyze_diff` is such a tool: it builds its own ephemeral per-endpoint
     /// analyzers (see `diff_analysis::build_analyzer`) and is dispatched before
     /// `snapshot_for_query` is ever consulted. Booting a persisted whole-repo
-    /// workspace and background semantic indexer to serve it is pure waste --
-    /// on a large repository that whole-repo embed plus SQLite cache persist
-    /// dominates wall time for an analysis that only touches two git trees.
+    /// workspace to serve it is pure waste.
     pub fn tool_is_workspace_independent(name: &str) -> bool {
         name == "analyze_diff"
     }
 
-    /// Lazy, watcher-less, non-semantic service whose workspace is never built
+    /// Lazy, watcher-less service whose workspace is never built
     /// unless a query forces it. The one-shot CLI uses this for
     /// [workspace-independent tools](Self::tool_is_workspace_independent): the
     /// deferred `session` (`None`) is never materialized, so no whole-repo
     /// analyzer is built and nothing is persisted to the cache database.
     pub fn new_workspace_independent(root: PathBuf) -> Result<Self, String> {
-        Self::new_lazy_with_strategy(root, UpdateStrategy::Manual, false)
+        Self::new_lazy_with_strategy(root, UpdateStrategy::Manual)
     }
 
-    /// Construct a manual, non-semantic service over `project` with an
+    /// Construct a manual service over `project` with an
     /// ephemeral (non-persisted) analyzer cache and a caller-supplied analyzer
     /// config. One-shot audit drivers (the MCP property fuzzer) use this:
     /// nothing is written into the target checkout, and because every file is
@@ -2254,7 +2338,6 @@ impl SearchToolsService {
             project,
             workspace,
             UpdateStrategy::Manual,
-            false,
             StartupIndexWarm::OnDemand,
             &watcher_starter,
         )?;
@@ -2270,7 +2353,6 @@ impl SearchToolsService {
             build_error: Mutex::new(None),
             file_listing: RwLock::new(None),
             update_strategy: UpdateStrategy::Manual,
-            semantic_indexing: false,
             startup_index_warm: StartupIndexWarm::OnDemand,
             watcher_starter,
             diff_snapshot_object_dir: None,
@@ -2469,7 +2551,12 @@ impl SearchToolsService {
         self.call_tool_output_with_cancellation(name, arguments, render_options, None)
     }
 
-    pub(crate) fn call_tool_output_with_cancellation(
+    /// [`Self::call_tool_output`] with a caller-driven cancellation token.
+    ///
+    /// The one-shot CLI uses this so an orphaned `--tool` run can be
+    /// cancelled when its parent process dies (public issue #11); MCP hosts
+    /// reach the same plumbing through the transport-timing wrappers below.
+    pub fn call_tool_output_with_cancellation(
         &self,
         name: &str,
         arguments: Value,
@@ -2622,12 +2709,6 @@ impl SearchToolsService {
             _ => {}
         }
 
-        if name == "semantic_search" {
-            return self.handle_semantic_search(arguments, render_options);
-        }
-        if name == "semantic_search_status" {
-            return self.handle_semantic_search_status(arguments);
-        }
         if name == "analyze_diff" {
             let params = serde_json::from_value::<AnalyzeDiffParams>(arguments).map_err(|err| {
                 SearchToolsServiceError::invalid_params(format!("Invalid tool arguments: {err}"))
@@ -3323,15 +3404,10 @@ impl SearchToolsService {
     // a git repository. The construction path is intentionally precise; hosts
     // that want git-root semantics should call `activate_workspace` after
     // start.
-    fn new_with_strategy(
-        root: PathBuf,
-        update_strategy: UpdateStrategy,
-        semantic_indexing: bool,
-    ) -> Result<Self, String> {
+    fn new_with_strategy(root: PathBuf, update_strategy: UpdateStrategy) -> Result<Self, String> {
         Self::new_with_strategy_and_watcher_starter(
             root,
             update_strategy,
-            semantic_indexing,
             production_watcher_starter(),
         )
     }
@@ -3352,16 +3428,11 @@ impl SearchToolsService {
     /// here for the same reason the scoped one-shot constructors already use it
     /// -- nothing updates this workspace after construction.
     pub fn new_one_shot(root: PathBuf) -> Result<Self, String> {
-        Self::new_one_shot_with_watcher_starter(
-            root,
-            semantic_indexing_enabled(),
-            production_watcher_starter(),
-        )
+        Self::new_one_shot_with_watcher_starter(root, production_watcher_starter())
     }
 
     fn new_one_shot_with_watcher_starter(
         root: PathBuf,
-        semantic_indexing: bool,
         watcher_starter: WatcherStarter,
     ) -> Result<Self, String> {
         let canonical = canonical_service_root(root)?;
@@ -3370,7 +3441,6 @@ impl SearchToolsService {
             canonical,
             file_listing,
             UpdateStrategy::Manual,
-            semantic_indexing,
             watcher_starter,
         )
     }
@@ -3378,18 +3448,11 @@ impl SearchToolsService {
     fn new_with_strategy_and_watcher_starter(
         root: PathBuf,
         update_strategy: UpdateStrategy,
-        semantic_indexing: bool,
         watcher_starter: WatcherStarter,
     ) -> Result<Self, String> {
         let canonical = canonical_service_root(root)?;
         let file_listing = listing_cache_for(update_strategy, &canonical);
-        Self::new_synchronous(
-            canonical,
-            file_listing,
-            update_strategy,
-            semantic_indexing,
-            watcher_starter,
-        )
+        Self::new_synchronous(canonical, file_listing, update_strategy, watcher_starter)
     }
 
     /// Build a persisted workspace and its session synchronously. The listing
@@ -3400,7 +3463,6 @@ impl SearchToolsService {
         canonical: PathBuf,
         file_listing: Option<Arc<WorkspaceFileListingCache>>,
         update_strategy: UpdateStrategy,
-        semantic_indexing: bool,
         watcher_starter: WatcherStarter,
     ) -> Result<Self, String> {
         let (project, workspace) =
@@ -3410,7 +3472,6 @@ impl SearchToolsService {
             project,
             workspace,
             update_strategy,
-            semantic_indexing,
             StartupIndexWarm::OnDemand,
             &watcher_starter,
         )?;
@@ -3426,7 +3487,6 @@ impl SearchToolsService {
             build_error: Mutex::new(None),
             file_listing: RwLock::new(file_listing),
             update_strategy,
-            semantic_indexing,
             startup_index_warm: StartupIndexWarm::OnDemand,
             watcher_starter,
             diff_snapshot_object_dir: None,
@@ -3436,12 +3496,10 @@ impl SearchToolsService {
     fn new_ephemeral_with_strategy(
         root: PathBuf,
         update_strategy: UpdateStrategy,
-        semantic_indexing: bool,
     ) -> Result<Self, String> {
         Self::new_ephemeral_with_strategy_and_watcher_starter(
             root,
             update_strategy,
-            semantic_indexing,
             production_watcher_starter(),
         )
     }
@@ -3449,7 +3507,6 @@ impl SearchToolsService {
     fn new_ephemeral_with_strategy_and_watcher_starter(
         root: PathBuf,
         update_strategy: UpdateStrategy,
-        semantic_indexing: bool,
         watcher_starter: WatcherStarter,
     ) -> Result<Self, String> {
         let canonical = canonical_service_root(root)?;
@@ -3460,7 +3517,6 @@ impl SearchToolsService {
             project,
             workspace,
             update_strategy,
-            semantic_indexing,
             StartupIndexWarm::OnDemand,
             &watcher_starter,
         )?;
@@ -3476,7 +3532,6 @@ impl SearchToolsService {
             build_error: Mutex::new(None),
             file_listing: RwLock::new(file_listing),
             update_strategy,
-            semantic_indexing,
             startup_index_warm: StartupIndexWarm::OnDemand,
             watcher_starter,
             diff_snapshot_object_dir: None,
@@ -3486,12 +3541,10 @@ impl SearchToolsService {
     fn new_lazy_with_strategy(
         root: PathBuf,
         update_strategy: UpdateStrategy,
-        semantic_indexing: bool,
     ) -> Result<Self, String> {
         Self::new_lazy_with_strategy_and_watcher_starter(
             root,
             update_strategy,
-            semantic_indexing,
             production_watcher_starter(),
         )
     }
@@ -3499,7 +3552,6 @@ impl SearchToolsService {
     fn new_lazy_with_strategy_and_watcher_starter(
         root: PathBuf,
         update_strategy: UpdateStrategy,
-        semantic_indexing: bool,
         watcher_starter: WatcherStarter,
     ) -> Result<Self, String> {
         let canonical = canonical_service_root(root)?;
@@ -3516,7 +3568,6 @@ impl SearchToolsService {
             build_error: Mutex::new(None),
             file_listing: RwLock::new(file_listing),
             update_strategy,
-            semantic_indexing,
             startup_index_warm: StartupIndexWarm::OnDemand,
             watcher_starter,
             diff_snapshot_object_dir: None,
@@ -3579,7 +3630,6 @@ impl SearchToolsService {
             build_error: Mutex::new(None),
             file_listing: RwLock::new(None),
             update_strategy,
-            semantic_indexing: semantic_indexing_enabled(),
             startup_index_warm: StartupIndexWarm::AtStartup,
             watcher_starter: production_watcher_starter(),
             diff_snapshot_object_dir: None,
@@ -3621,7 +3671,6 @@ impl SearchToolsService {
         let generation = self.workspace_generation().wrapping_add(1);
         let build_root = canonical.clone();
         let update_strategy = self.update_strategy;
-        let semantic_indexing = self.semantic_indexing;
         let startup_index_warm = self.startup_index_warm;
         let watcher_starter = Arc::clone(&self.watcher_starter);
         // Created before the deferred build so listing-backed fast paths can
@@ -3645,7 +3694,6 @@ impl SearchToolsService {
                         project,
                         workspace,
                         update_strategy,
-                        semantic_indexing,
                         startup_index_warm,
                         &watcher_starter,
                     )?;
@@ -3689,9 +3737,7 @@ impl SearchToolsService {
         drop(session);
         drop(pending);
         drop(old_pending);
-        if let Some(old_session) = old_session {
-            old_session.close_semantic();
-        }
+        drop(old_session);
         Ok(canonical)
     }
 
@@ -3725,9 +3771,7 @@ impl SearchToolsService {
         drop(session);
         drop(pending);
         drop(old_pending);
-        if let Some(old_session) = old_session {
-            old_session.close_semantic();
-        }
+        drop(old_session);
         Ok(())
     }
 
@@ -3748,7 +3792,6 @@ impl SearchToolsService {
         watcher_starter: WatcherStarter,
     ) -> Result<Self, String> {
         let _scope = profiling::scope("mcp_cold.workspace_binding");
-        let semantic_indexing = semantic_indexing_enabled();
         let canonical = canonical_service_root(root)?;
         // Created before the deferred build so listing-backed fast paths
         // (`find_filenames`, #1388) can fill it while indexing is pending.
@@ -3782,12 +3825,10 @@ impl SearchToolsService {
                         update_strategy,
                     )
                     .map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
-                    prewarm_configured_semantic_models(project.root(), &workspace)?;
                     let session = assemble_session(
                         project,
                         workspace,
                         update_strategy,
-                        semantic_indexing,
                         StartupIndexWarm::AtStartup,
                         &watcher_starter,
                     )?;
@@ -3807,7 +3848,6 @@ impl SearchToolsService {
             build_error: Mutex::new(None),
             file_listing: RwLock::new(file_listing),
             update_strategy,
-            semantic_indexing,
             startup_index_warm: StartupIndexWarm::AtStartup,
             watcher_starter,
             diff_snapshot_object_dir: None,
@@ -3876,7 +3916,6 @@ impl SearchToolsService {
                         project,
                         workspace,
                         self.update_strategy,
-                        self.semantic_indexing,
                         self.startup_index_warm,
                         &self.watcher_starter,
                     )
@@ -4003,9 +4042,7 @@ impl SearchToolsService {
             self.advance_workspace_generation();
         }
         drop(guard);
-        if let Some(session) = session {
-            session.close_semantic();
-        }
+        drop(session);
         Ok(())
     }
 
@@ -4031,18 +4068,7 @@ impl SearchToolsService {
         if self.workspace_generation() != expected_workspace_generation {
             return Ok(());
         }
-        let semantic_indexing = {
-            let session = session_guard.as_ref().ok_or_else(Self::closed_error)?;
-            #[cfg(feature = "nlp")]
-            {
-                session.semantic.is_some()
-            }
-            #[cfg(not(feature = "nlp"))]
-            {
-                let _ = session;
-                false
-            }
-        };
+        session_guard.as_ref().ok_or_else(Self::closed_error)?;
         let (project, workspace) =
             build_persisted_workspace(root, file_listing, self.update_strategy).map_err(
                 |error| {
@@ -4055,7 +4081,6 @@ impl SearchToolsService {
             project,
             workspace,
             self.update_strategy,
-            semantic_indexing,
             self.startup_index_warm,
             &self.watcher_starter,
         )
@@ -4069,30 +4094,14 @@ impl SearchToolsService {
             .replace(new_session)
             .ok_or_else(Self::closed_error)?;
         drop(session_guard);
-        old_session.close_semantic();
+        drop(old_session);
         Ok(())
     }
 
-    /// Run a forced git-reachability GC on the unified analyzer/semantic cache
+    /// Run a forced git-reachability GC on the analyzer cache
     /// and block until it completes. The session lock is released before blocking.
     pub fn request_cache_gc(&self) -> Result<(), SearchToolsServiceError> {
         self.ensure_ready()?;
-        #[cfg(feature = "nlp")]
-        {
-            let indexer = {
-                let guard = self.session.read().map_err(|_| {
-                    SearchToolsServiceError::internal("workspace session lock poisoned")
-                })?;
-                let session = guard.as_ref().ok_or_else(Self::closed_error)?;
-                session.semantic.clone()
-            };
-            if let Some(indexer) = indexer {
-                return indexer
-                    .run_gc_blocking()
-                    .map_err(SearchToolsServiceError::internal);
-            }
-        }
-
         let (root, db_path) = {
             let guard = self.session.read().map_err(|_| {
                 SearchToolsServiceError::internal("workspace session lock poisoned")
@@ -4134,10 +4143,7 @@ impl SearchToolsService {
             .invalidate_cached_file_identities();
         let next = session.snapshot.update_all();
         session.snapshot = Arc::new(next);
-        #[cfg(feature = "nlp")]
-        if let Some(semantic) = &session.semantic {
-            semantic.request_full_build(session.snapshot.clone());
-        }
+        session.refresh_pack_activation();
         session.schedule_index_warm();
         Self::structured_only(refresh_result(session.snapshot.analyzer()))
     }
@@ -4164,6 +4170,7 @@ impl SearchToolsService {
             .map(|rel| ProjectFile::new(root.clone(), rel.as_str()))
             .collect();
         if !changed.is_empty() {
+            let mut refresh_packs = changed_files_invalidate_pack_activation(&changed);
             // The caller is telling us these paths changed on disk; created or
             // deleted files must show up in listing-backed tools, so any
             // cached workspace listing is stale.
@@ -4174,6 +4181,10 @@ impl SearchToolsService {
                 .invalidate_cached_file_listing();
             let next = session.snapshot.update(&changed);
             session.snapshot = Arc::new(next);
+            refresh_packs |= session.pack_activation_scope_changed();
+            if refresh_packs {
+                session.refresh_pack_activation();
+            }
             session.schedule_index_warm();
         }
         Self::structured_only(refresh_result(session.snapshot.analyzer()))
@@ -4225,15 +4236,10 @@ impl SearchToolsService {
                 resolved.display()
             ))
         })?;
-        #[cfg(feature = "nlp")]
-        let semantic_indexing = session.semantic.is_some();
-        #[cfg(not(feature = "nlp"))]
-        let semantic_indexing = false;
         let new_session = assemble_session(
             new_project,
             new_workspace,
             self.update_strategy,
-            semantic_indexing,
             self.startup_index_warm,
             &self.watcher_starter,
         )
@@ -4259,7 +4265,7 @@ impl SearchToolsService {
             new_file_listing;
         drop(guard);
         drop(root);
-        old_session.close_semantic();
+        drop(old_session);
 
         // The replacement session's background index warm has only just
         // started, so this reports the newly activated workspace's readiness,
@@ -4306,6 +4312,7 @@ impl SearchToolsService {
             return Ok(WorkspaceQueryScope::new(
                 Arc::clone(&session.snapshot),
                 Arc::clone(&session.document_root),
+                session.pack_activation.clone(),
             ));
         }
 
@@ -4316,6 +4323,7 @@ impl SearchToolsService {
                 return Ok(WorkspaceQueryScope::new(
                     Arc::clone(&session.snapshot),
                     Arc::clone(&session.document_root),
+                    session.pack_activation.clone(),
                 ));
             }
         }
@@ -4327,6 +4335,7 @@ impl SearchToolsService {
         Ok(WorkspaceQueryScope::new(
             Arc::clone(&session.snapshot),
             Arc::clone(&session.document_root),
+            session.pack_activation.clone(),
         ))
     }
 
@@ -4471,51 +4480,6 @@ impl SearchToolsService {
         ))
     }
 
-    /// Same read-first strategy as `snapshot_for_query`, plus the session's
-    /// semantic indexer handle.
-    #[cfg(feature = "nlp")]
-    fn semantic_snapshot_for_query(
-        &self,
-    ) -> Result<(WorkspaceQueryScope, Option<Arc<SemanticIndexer>>), SearchToolsServiceError> {
-        if self.update_strategy == UpdateStrategy::Manual {
-            let guard = self.read_session()?;
-            let session = guard.as_ref().ok_or_else(Self::closed_error)?;
-            return Ok((
-                WorkspaceQueryScope::new(
-                    Arc::clone(&session.snapshot),
-                    Arc::clone(&session.document_root),
-                ),
-                session.semantic.clone(),
-            ));
-        }
-
-        {
-            let guard = self.read_session()?;
-            let session = guard.as_ref().ok_or_else(Self::closed_error)?;
-            if !Self::session_watcher_has_pending(session) {
-                return Ok((
-                    WorkspaceQueryScope::new(
-                        Arc::clone(&session.snapshot),
-                        Arc::clone(&session.document_root),
-                    ),
-                    session.semantic.clone(),
-                ));
-            }
-        }
-
-        // Only reached for `WatchFiles` sessions with a pending delta.
-        let mut guard = self.write_session()?;
-        let session = guard.as_mut().ok_or_else(Self::closed_error)?;
-        Self::apply_watcher_delta(session);
-        Ok((
-            WorkspaceQueryScope::new(
-                Arc::clone(&session.snapshot),
-                Arc::clone(&session.document_root),
-            ),
-            session.semantic.clone(),
-        ))
-    }
-
     fn apply_watcher_delta(session: &mut WorkspaceSession) {
         let _scope = profiling::scope("SearchToolsService::apply_watcher_delta");
         let watcher = match &session.watcher {
@@ -4539,10 +4503,7 @@ impl SearchToolsService {
                 let _scope = profiling::scope("SearchToolsService::snapshot_update_all");
                 session.snapshot.update_all()
             });
-            #[cfg(feature = "nlp")]
-            if let Some(semantic) = &session.semantic {
-                semantic.request_full_build(session.snapshot.clone());
-            }
+            session.refresh_pack_activation();
             session.schedule_index_warm();
             return;
         }
@@ -4562,13 +4523,14 @@ impl SearchToolsService {
         if profiling::enabled() {
             profiling::note(format!("snapshot_changed_files={}", changed_files.len()));
         }
+        let mut refresh_packs = changed_files_invalidate_pack_activation(&changed_files);
         session.snapshot = Arc::new({
             let _scope = profiling::scope("SearchToolsService::snapshot_update");
             session.snapshot.update(&changed_files)
         });
-        #[cfg(feature = "nlp")]
-        if let Some(semantic) = &session.semantic {
-            semantic.request_update(session.snapshot.clone(), changed_files);
+        refresh_packs |= session.pack_activation_scope_changed();
+        if refresh_packs {
+            session.refresh_pack_activation();
         }
         session.schedule_index_warm();
     }
@@ -4747,66 +4709,6 @@ impl SearchToolsService {
             structured,
             rendered_text: Some(rendered_text),
         })
-    }
-
-    #[cfg(feature = "nlp")]
-    fn handle_semantic_search(
-        &self,
-        arguments: Value,
-        render_options: RenderOptions,
-    ) -> Result<ToolOutput, SearchToolsServiceError> {
-        let (snapshot, semantic) = self.semantic_snapshot_for_query()?;
-        let result = match semantic {
-            Some(indexer) => Self::decode_render_and_try_run(
-                &snapshot,
-                arguments,
-                render_options,
-                move |workspace, params| semantic_search(workspace, &indexer, params),
-            ),
-            None => Err(SearchToolsServiceError::invalid_params(
-                "semantic_search is disabled for this session (set BIFROST_SEMANTIC_INDEX=auto to enable it)",
-            )),
-        };
-        snapshot.finish("semantic_search", result)
-    }
-
-    #[cfg(feature = "nlp")]
-    fn handle_semantic_search_status(
-        &self,
-        arguments: Value,
-    ) -> Result<ToolOutput, SearchToolsServiceError> {
-        let _params = serde_json::from_value::<RefreshParams>(arguments).map_err(|err| {
-            SearchToolsServiceError::invalid_params(format!("Invalid tool arguments: {err}"))
-        })?;
-        let (snapshot, semantic) = self.semantic_snapshot_for_query()?;
-        let result = match semantic {
-            Some(indexer) => Self::structured_only(indexer.status(&snapshot)),
-            None => Err(SearchToolsServiceError::invalid_params(
-                "semantic_search_status is disabled for this session (set BIFROST_SEMANTIC_INDEX=auto to enable it)",
-            )),
-        };
-        snapshot.finish("semantic_search_status", result)
-    }
-
-    #[cfg(not(feature = "nlp"))]
-    fn handle_semantic_search(
-        &self,
-        _arguments: Value,
-        _render_options: RenderOptions,
-    ) -> Result<ToolOutput, SearchToolsServiceError> {
-        Err(SearchToolsServiceError::invalid_params(
-            "semantic_search is not available in this build (nlp feature disabled)",
-        ))
-    }
-
-    #[cfg(not(feature = "nlp"))]
-    fn handle_semantic_search_status(
-        &self,
-        _arguments: Value,
-    ) -> Result<ToolOutput, SearchToolsServiceError> {
-        Err(SearchToolsServiceError::invalid_params(
-            "semantic_search_status is not available in this build (nlp feature disabled)",
-        ))
     }
 
     pub(crate) fn preflight_run_policy(
@@ -5096,18 +4998,26 @@ impl SearchToolsService {
         } = prepared;
         let result = (|| {
             let _scope = profiling::scope("run_policy.evaluate_policy_inputs");
-            let mut outcome = match suppression_preflight {
-                Some(preflight) => {
-                    CodeIntelligenceRuntime::new(&snapshot, &self.flow_state, cancellation)
-                        .evaluate_policy_inputs_with_suppression_preflight(
-                            &root,
-                            &policy_inputs,
-                            &options,
-                            preflight,
-                        )
+            let runtime = CodeIntelligenceRuntime::new(&snapshot, &self.flow_state, cancellation);
+            let runtime = match snapshot.pack_activation.as_deref() {
+                Some(state) => {
+                    runtime.with_host_activation_context(PolicyHostActivationContext::new(
+                        state.config.as_deref(),
+                        state.activation.as_deref(),
+                        &state.ecosystems,
+                        state.failure.as_deref(),
+                    ))
                 }
-                None => CodeIntelligenceRuntime::new(&snapshot, &self.flow_state, cancellation)
-                    .evaluate_policy_inputs(&root, &policy_inputs, &options),
+                None => runtime,
+            };
+            let mut outcome = match suppression_preflight {
+                Some(preflight) => runtime.evaluate_policy_inputs_with_suppression_preflight(
+                    &root,
+                    &policy_inputs,
+                    &options,
+                    preflight,
+                ),
+                None => runtime.evaluate_policy_inputs(&root, &policy_inputs, &options),
             }
             .map_err(|error| {
                 SearchToolsServiceError::internal(format!("run_policy evaluation failed: {error}"))
@@ -5224,21 +5134,17 @@ impl SearchToolsService {
 
 impl Drop for SearchToolsService {
     fn drop(&mut self) {
-        // If a deferred build is still in flight, join it so its session (and
-        // any semantic indexer it started) is closed rather than detached.
+        // If a deferred build is still in flight, join it rather than detach it.
         if let Ok(pending) = self.pending_build.get_mut()
             && let Some(handle) = pending.take()
-            && let Ok(Ok((_, _, session))) = handle.join()
+            && let Ok(Ok((_, _, _session))) = handle.join()
         {
-            session.close_semantic();
             return;
         }
         let Ok(session) = self.session.get_mut() else {
             return;
         };
-        if let Some(session) = session.take() {
-            session.close_semantic();
-        }
+        session.take();
     }
 }
 
@@ -5309,7 +5215,6 @@ fn build_persisted_workspace(
         update_strategy,
     )
     .map_err(|error| format!("Failed to build persisted workspace: {error}"))?;
-    prewarm_configured_semantic_models(project.root(), &workspace)?;
     Ok((project, workspace))
 }
 
@@ -5334,22 +5239,30 @@ fn build_ephemeral_workspace(
     let workspace =
         WorkspaceAnalyzer::build_ephemeral(Arc::clone(&project), AnalyzerConfig::default())
             .map_err(|error| format!("Failed to build ephemeral workspace: {error}"))?;
-    prewarm_configured_semantic_models(project.root(), &workspace)?;
     Ok((project, workspace))
 }
 
 /// Assemble a ready `WorkspaceSession` from a built project + analyzer: wrap the
 /// analyzer in an `Arc`, start the file watcher (per `update_strategy`), and
-/// start the semantic indexer when enabled. Shared by the synchronous and
-/// deferred constructors so both produce identical sessions.
+/// create the session state. Shared by synchronous and deferred constructors.
 fn assemble_session(
     project: Arc<dyn Project>,
     workspace: WorkspaceAnalyzer,
     update_strategy: UpdateStrategy,
-    semantic_indexing: bool,
     startup_index_warm: StartupIndexWarm,
     watcher_starter: &WatcherStarter,
 ) -> Result<WorkspaceSession, String> {
+    let pack_activation = match activate_configured_semantic_models(
+        project.root(),
+        &workspace,
+        configured_semantic_models()?,
+    ) {
+        Ok(state) => Some(Arc::new(state)),
+        Err(error) => {
+            eprintln!("bifrost: workspace semantic-pack activation unavailable: {error}");
+            None
+        }
+    };
     let document_root = Arc::new(
         WorkspaceRoot::open(project.root())
             .map_err(|error| format!("Failed to open workspace document root: {error}"))?,
@@ -5381,21 +5294,16 @@ fn assemble_session(
     } else {
         None
     };
-    #[cfg(feature = "nlp")]
-    let semantic = maybe_start_semantic(semantic_indexing, &snapshot);
-    #[cfg(not(feature = "nlp"))]
-    let _ = semantic_indexing;
     Ok(WorkspaceSession {
         snapshot,
         document_root,
+        pack_activation,
         watcher,
         usage_index_warm,
         index_warmer: IndexWarmer::new(),
         initial_index_warm_scheduled: std::sync::atomic::AtomicBool::new(
             startup_index_warm == StartupIndexWarm::OnDemand,
         ),
-        #[cfg(feature = "nlp")]
-        semantic,
     })
 }
 
@@ -5502,7 +5410,6 @@ mod watcher_startup_tests {
             build_error: Mutex::new(None),
             file_listing: RwLock::new(None),
             update_strategy: UpdateStrategy::WatchFiles,
-            semantic_indexing: false,
             startup_index_warm: StartupIndexWarm::AtStartup,
             watcher_starter: starter,
             diff_snapshot_object_dir: None,
@@ -5538,8 +5445,7 @@ mod watcher_startup_tests {
             })
         };
 
-        let service =
-            SearchToolsService::new_one_shot_with_watcher_starter(root, false, starter).unwrap();
+        let service = SearchToolsService::new_one_shot_with_watcher_starter(root, starter).unwrap();
 
         assert_eq!(
             0,
@@ -5584,7 +5490,6 @@ mod watcher_startup_tests {
         let error = match SearchToolsService::new_with_strategy_and_watcher_starter(
             root,
             UpdateStrategy::WatchFiles,
-            false,
             failing_starter(Arc::clone(&calls)),
         ) {
             Ok(_) => panic!("watching service unexpectedly ignored watcher failure"),
@@ -5603,7 +5508,6 @@ mod watcher_startup_tests {
         let service = SearchToolsService::new_lazy_with_strategy_and_watcher_starter(
             root,
             UpdateStrategy::WatchFiles,
-            false,
             failing_starter(Arc::clone(&calls)),
         )
         .unwrap();
@@ -5650,7 +5554,6 @@ mod watcher_startup_tests {
             SearchToolsService::new_lazy_with_strategy_and_watcher_starter(
                 root,
                 UpdateStrategy::WatchFiles,
-                false,
                 starter,
             )
             .unwrap(),
@@ -6614,7 +6517,6 @@ mod watcher_startup_tests {
         let service = SearchToolsService::new_ephemeral_with_strategy_and_watcher_starter(
             root.clone(),
             UpdateStrategy::Manual,
-            false,
             failing_starter(Arc::clone(&calls)),
         )
         .unwrap();
@@ -6641,7 +6543,6 @@ mod watcher_startup_tests {
         let service = SearchToolsService::new_ephemeral_with_strategy_and_watcher_starter(
             old_root.clone(),
             UpdateStrategy::WatchFiles,
-            false,
             starter,
         )
         .unwrap();
@@ -6680,7 +6581,7 @@ mod watcher_startup_tests {
         // events in this test are Git's own.
         std::fs::write(root.join("Later.java"), "class Later {}\n").unwrap();
 
-        let service = SearchToolsService::new_without_semantic_index(root.clone()).unwrap();
+        let service = SearchToolsService::new(root.clone()).unwrap();
         let warm = service.snapshot_for_query().unwrap();
         let published = Arc::clone(&warm.source_snapshot);
         warm.finish("capture_source_snapshot", Ok(())).unwrap();
@@ -6876,7 +6777,7 @@ mod analyzer_failure_boundary_tests {
         let (_project, workspace) = build_ephemeral_workspace(root, None).unwrap();
         let document_root =
             Arc::new(WorkspaceRoot::open(workspace.analyzer().project().root()).unwrap());
-        let scope = WorkspaceQueryScope::new(Arc::new(workspace), document_root);
+        let scope = WorkspaceQueryScope::new(Arc::new(workspace), document_root, None);
         scope
             .context
             .record_store_error(StoreError::new("injected store failure"));
@@ -6956,12 +6857,11 @@ public partial class MudDialogContainer
             session: RwLock::new(Some(WorkspaceSession {
                 snapshot: Arc::new(workspace),
                 document_root: Arc::new(WorkspaceRoot::open(project.root()).unwrap()),
+                pack_activation: None,
                 watcher: SessionWatcher::Disabled,
                 usage_index_warm: None,
                 index_warmer: IndexWarmer::new(),
                 initial_index_warm_scheduled: std::sync::atomic::AtomicBool::new(true),
-                #[cfg(feature = "nlp")]
-                semantic: None,
             })),
             workspace_generation: AtomicU64::new(1),
             flow_state: crate::flow::FlowWorkspaceState::new(),
@@ -6972,7 +6872,6 @@ public partial class MudDialogContainer
             build_error: Mutex::new(None),
             file_listing: RwLock::new(None),
             update_strategy: UpdateStrategy::WatchFiles,
-            semantic_indexing: false,
             startup_index_warm: StartupIndexWarm::OnDemand,
             watcher_starter: production_watcher_starter(),
             diff_snapshot_object_dir: None,
@@ -7206,7 +7105,6 @@ mod client_roots_tests {
             build_error: Mutex::new(None),
             file_listing: RwLock::new(None),
             update_strategy: UpdateStrategy::Manual,
-            semantic_indexing: false,
             startup_index_warm: StartupIndexWarm::AtStartup,
             watcher_starter: production_watcher_starter(),
             diff_snapshot_object_dir: None,
@@ -7281,7 +7179,7 @@ mod client_roots_tests {
         let (_temp, root) = committed_workspace("Watched.java", "class Watched {}\n");
         let db_path = make_cache_gc_due(&root);
 
-        let service = SearchToolsService::new_without_semantic_index(root).unwrap();
+        let service = SearchToolsService::new(root).unwrap();
         service.close().unwrap();
 
         let (last_gc_at, blobs_at_last_gc) = gc_accounting(&db_path);
@@ -7290,7 +7188,7 @@ mod client_roots_tests {
     }
 
     #[test]
-    fn explicit_gc_collects_a_manual_nonsemantic_cache() {
+    fn explicit_gc_collects_a_manual_cache() {
         let (_temp, root) = committed_workspace("Manual.java", "class Manual {}\n");
         let db_path = make_cache_gc_due(&root);
         let service = SearchToolsService::new_manual_persisted(root).unwrap();
@@ -7932,87 +7830,5 @@ mod query_protocol_tests {
             after_advance.pointer("/work/semantic/typestate/summary_recomputations"),
             Some(&json!(0))
         );
-    }
-}
-
-#[cfg(all(test, feature = "nlp"))]
-mod tests {
-    use super::*;
-    use crate::nlp::engine::FakeHashEmbedder;
-    use crate::nlp::indexer::FakeEngineProvider;
-    use std::time::Duration;
-
-    #[test]
-    fn service_close_closes_semantic_indexer() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("Thing.java"),
-            "public class Thing { public String value() { return \"value\"; } }\n",
-        )
-        .unwrap();
-        let (_project, workspace) =
-            build_persisted_workspace(dir.path().to_path_buf(), None, UpdateStrategy::WatchFiles)
-                .unwrap();
-        let snapshot = Arc::new(workspace);
-        let indexer = SemanticIndexer::start_with_provider(
-            dir.path().to_path_buf(),
-            snapshot.clone(),
-            FakeEngineProvider {
-                embedder: Arc::new(FakeHashEmbedder::new(16)),
-            },
-        );
-        let service = SearchToolsService {
-            root: RwLock::new(Some(dir.path().to_path_buf())),
-            session: RwLock::new(Some(WorkspaceSession {
-                snapshot,
-                document_root: Arc::new(WorkspaceRoot::open(dir.path()).unwrap()),
-                watcher: SessionWatcher::Disabled,
-                usage_index_warm: None,
-                index_warmer: IndexWarmer::new(),
-                initial_index_warm_scheduled: std::sync::atomic::AtomicBool::new(true),
-                semantic: Some(indexer.clone()),
-            })),
-            workspace_generation: AtomicU64::new(1),
-            flow_state: crate::flow::FlowWorkspaceState::new(),
-            query_protocols: RwLock::new(Default::default()),
-            query_value_flows: RwLock::new(Default::default()),
-            query_taint_results: RwLock::new(Default::default()),
-            pending_build: Mutex::new(None),
-            build_error: Mutex::new(None),
-            file_listing: RwLock::new(None),
-            update_strategy: UpdateStrategy::WatchFiles,
-            semantic_indexing: true,
-            startup_index_warm: StartupIndexWarm::OnDemand,
-            watcher_starter: production_watcher_starter(),
-            diff_snapshot_object_dir: None,
-        };
-
-        service.close().unwrap();
-
-        let err = indexer
-            .wait_ready(Duration::from_secs(30))
-            .expect_err("service close should close semantic indexer");
-        assert_eq!(err, "semantic index closed");
-    }
-
-    #[test]
-    fn missing_accelerator_disables_semantic_indexer_startup() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("Thing.java"),
-            "public class Thing { public String value() { return \"value\"; } }\n",
-        )
-        .unwrap();
-        let (_project, workspace) =
-            build_persisted_workspace(dir.path().to_path_buf(), None, UpdateStrategy::WatchFiles)
-                .unwrap();
-        let snapshot = Arc::new(workspace);
-
-        // No CUDA/Metal and no --force-semantic-cpu: the indexer must not start.
-        let semantic = maybe_start_semantic_checked(true, &snapshot, || {
-            Err("no CUDA or Metal accelerator detected".to_string())
-        });
-
-        assert!(semantic.is_none());
     }
 }

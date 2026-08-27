@@ -1175,7 +1175,7 @@ impl Decoder {
     fn decode_relational_assertion_analysis(
         &mut self,
         fields: &RecordCursor<'_>,
-        path: &str,
+        _path: &str,
     ) -> Result<AssertionPolicySpec, PolicySourceError> {
         let mut bindings = Vec::new();
         let mut derivations = Vec::new();
@@ -1183,8 +1183,7 @@ impl Decoder {
         let mut sugar_joins = Vec::new();
         let mut groups = Vec::new();
         let mut assertions = Vec::new();
-        for (index, entry) in fields.variadic().iter().enumerate() {
-            let entry_path = format!("{path}/plan/{index}");
+        for entry in fields.variadic() {
             match select_record(
                 entry,
                 &[
@@ -1200,7 +1199,7 @@ impl Decoder {
                 ],
                 "relational assertion plan entry",
             )? {
-                PolicyRecord::Bind => bindings.push(self.decode_row_binding(entry, &entry_path)?),
+                PolicyRecord::Bind => bindings.push(self.decode_row_binding(entry, None)?),
                 PolicyRecord::Filter => {
                     derivations.push(RowDerivation::Filter(decode_row_filter(entry)?));
                 }
@@ -1268,7 +1267,7 @@ impl Decoder {
     fn decode_row_binding(
         &mut self,
         expr: &Expr,
-        _path: &str,
+        selector_base: Option<&str>,
     ) -> Result<RowBinding, PolicySourceError> {
         let fields = RecordCursor::parse(
             expr,
@@ -1276,7 +1275,10 @@ impl Decoder {
             DecodeContext::policy(PolicyAnalysisKind::Assertion),
         )?;
         let name = parse_identifier(fields.required("name"), "row binding name")?;
-        let selector_path = relational_binding_selector_path(&name);
+        let selector_path = selector_base.map_or_else(
+            || relational_binding_selector_path(&name),
+            |base| row_selector_binding_selector_path(base, &name),
+        );
         let source = match (fields.get("query"), fields.get("from"), fields.get("step")) {
             (Some(query), None, None) => RowBindingSource::Query(self.decode_selector(
                 query,
@@ -3602,7 +3604,11 @@ impl Decoder {
     ) -> Result<PolicySelector, PolicySourceError> {
         match select_record(
             expr,
-            &[PolicyRecord::Rql, PolicyRecord::RqlFile],
+            &[
+                PolicyRecord::Rql,
+                PolicyRecord::RqlFile,
+                PolicyRecord::RowSelector,
+            ],
             "policy selector",
         )? {
             PolicyRecord::Rql => {
@@ -3685,8 +3691,75 @@ impl Decoder {
                     path: workspace_path,
                 })
             }
+            PolicyRecord::RowSelector => self.decode_row_selector(expr, context, path),
             record => unreachable!("selector returned {record:?}"),
         }
+    }
+
+    /// Decode an endpoint row selector using the shared typed relational
+    /// records. The nested records are assertion-owned vocabulary, while the
+    /// selector wrapper itself is legal only in taint and flow contexts.
+    fn decode_row_selector(
+        &mut self,
+        expr: &Expr,
+        context: DecodeContext,
+        path: &str,
+    ) -> Result<PolicySelector, PolicySourceError> {
+        let fields = RecordCursor::parse(expr, PolicyRecord::RowSelector, context)?;
+        let output = parse_identifier(fields.required("output"), "row selector output")?;
+        self.map(format!("{path}/output"), fields.required("output"));
+
+        let mut bindings = Vec::new();
+        let mut derivations = Vec::new();
+        let mut joins = Vec::new();
+        for (index, entry) in fields.variadic().iter().enumerate() {
+            let entry_path = format!("{path}/entries/{index}");
+            self.map(entry_path, entry);
+            match select_record(
+                entry,
+                &[
+                    PolicyRecord::Bind,
+                    PolicyRecord::Filter,
+                    PolicyRecord::Project,
+                    PolicyRecord::Join,
+                    PolicyRecord::CallArgument,
+                    PolicyRecord::Call,
+                ],
+                "row selector entry",
+            )? {
+                PolicyRecord::Bind => bindings.push(self.decode_row_binding(entry, Some(path))?),
+                PolicyRecord::Filter => {
+                    derivations.push(RowDerivation::Filter(decode_row_filter(entry)?));
+                }
+                PolicyRecord::Project => {
+                    derivations.push(RowDerivation::Project(decode_row_projection(entry)?));
+                }
+                PolicyRecord::Join => joins.push(decode_row_join(entry)?),
+                PolicyRecord::CallArgument => {
+                    derivations.push(RowDerivation::Filter(decode_call_argument(entry)?));
+                }
+                PolicyRecord::Call => {
+                    derivations.push(RowDerivation::Filter(decode_call(entry)?));
+                }
+                other => unreachable!("row selector registry returned {other:?}"),
+            }
+        }
+
+        let plan = RowSelectorPlan {
+            bindings,
+            derivations,
+            joins,
+            output,
+        };
+        crate::relational::validate_row_selector_plan(&plan).map_err(|error| {
+            source_error(
+                "invalid-row-selector-plan",
+                expr.range.clone(),
+                error.to_string(),
+            )
+        })?;
+        debug_assert!(self.selector_paths.insert(path.to_string()));
+        Ok(PolicySelector::Rows { plan })
     }
 
     fn decode_endpoint_binding(
@@ -5411,6 +5484,7 @@ fn decode_policy_assert(expr: &Expr) -> Result<PolicyAssert, PolicySourceError> 
             PolicyRecord::AssertResolution,
             PolicyRecord::AssertBindingScope,
             PolicyRecord::AssertValueOrigin,
+            PolicyRecord::AssertOriginShape,
             PolicyRecord::AssertBoundary,
             PolicyRecord::AssertGeneration,
             PolicyRecord::AssertDeclarationState,
@@ -5434,6 +5508,9 @@ fn decode_policy_assert(expr: &Expr) -> Result<PolicyAssert, PolicySourceError> 
         )),
         PolicyRecord::AssertValueOrigin => {
             Ok(PolicyAssert::ValueOrigin(decode_value_origin_assert(expr)?))
+        }
+        PolicyRecord::AssertOriginShape => {
+            Ok(PolicyAssert::OriginShape(decode_origin_shape_assert(expr)?))
         }
         PolicyRecord::AssertBoundary => Ok(PolicyAssert::Boundary(decode_boundary_assert(expr)?)),
         PolicyRecord::AssertGeneration => {
@@ -5719,6 +5796,48 @@ fn decode_value_origin_assert(expr: &Expr) -> Result<ValueOriginAssert, PolicySo
         role,
         containment,
         relative_to,
+    })
+}
+
+fn decode_origin_shape_assert(expr: &Expr) -> Result<OriginShapeAssert, PolicySourceError> {
+    let fields = RecordCursor::parse(
+        expr,
+        PolicyRecord::AssertOriginShape,
+        DecodeContext::policy(PolicyAnalysisKind::Assertion),
+    )?;
+    let id: PolicyAssertId = parse_identifier(fields.required("id"), "assert ID")?;
+    let at = decode_assert_capture(fields.required("at"), "assert capture name")?;
+    let anchor = decode_assert_capture(fields.required("anchor"), "assert anchor capture name")?;
+    let role = decode_reference_role(fields.required("role"), "`assert-origin-shape`")?;
+    let shape = match expect_atom(
+        fields.required("shape"),
+        AtomDomain::OriginShape,
+        "origin shape",
+    )? {
+        PolicyAtomValue::OriginShapeCollectionLiteral => OriginShape::CollectionLiteral,
+        value => unreachable!("OriginShape registry returned {value:?}"),
+    };
+    let max_elements = expect_u32(fields.required("max-elements"), "element bound", false)?;
+    // The anchor is the finding identity and `at` is what the assert
+    // resolves; the same capture for both would make every co-anchored match
+    // one finding, which is the collapse the anchor exists to prevent.
+    let anchor_expr = fields.required("anchor");
+    if anchor == at {
+        return Err(source_error(
+            "contradictory-assert-anchor",
+            anchor_expr.range.clone(),
+            format!(
+                "`:anchor` names the same capture as `:at` (`{at}`); the anchor must be the reported node, not the resolved value"
+            ),
+        ));
+    }
+    Ok(OriginShapeAssert {
+        id,
+        at,
+        anchor,
+        role,
+        shape,
+        max_elements,
     })
 }
 
@@ -6810,6 +6929,19 @@ mod tests {
         )
     }
 
+    fn row_selector_endpoint(entries: &str) -> String {
+        format!(
+            r#"(endpoint
+              :id "test.row-selector" :name "Row selector"
+              :display-name "Exact argument" :role source :categories [input.user]
+              :selector (row-selector :output calls
+                (bind :name calls :query
+                  (rql (call-bindings (call-shape (call :callee "execute")))))
+                {entries})
+              :binding (argument :name "sql"))"#
+        )
+    }
+
     #[test]
     fn decodes_an_ordered_equal_aggregate_over_two_position_columns() {
         let parsed = parse(&ordered_equal_policy(
@@ -7109,6 +7241,229 @@ mod tests {
         let field_help = rqlp_source_help_at(&source, source.find(":resolves-to").unwrap() + 3)
             .expect("registered resolves-to field has hover help");
         assert_eq!(field_help.signature, ":resolves-to MODEL_ID");
+    }
+
+    #[test]
+    fn row_selector_call_sugar_is_the_typed_relational_plan() {
+        let sugar = parse(&row_selector_endpoint(
+            r#"(call :over calls :resolves-to java.sql.Statement.execute :proof exact)
+               (call-argument :over calls :formal-name "sql")"#,
+        ))
+        .unwrap();
+        let typed = parse(&row_selector_endpoint(
+            r#"(filter :over calls :where
+                 ((calls.model_id eq "java.sql.Statement.execute")
+                  (calls.semantic_target_id is-not-null)
+                  (calls.signature_id is-not-null)
+                  (calls.dispatch_outcome eq resolved)
+                  (calls.dispatch_coverage eq exhaustive)
+                  (calls.dispatch_proof eq proven)
+                  (calls.dispatch_completeness eq complete)
+                  (calls.dispatch_target_count eq 1)
+                  (calls.dispatch_targets_truncated eq false)))
+               (filter :over calls :where
+                 ((calls.formal_name eq "sql")
+                  (calls.mapping eq exact)
+                  (calls.coverage eq exhaustive)
+                  (calls.terminal eq false)
+                  (calls.argument_id is-not-null)))"#,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            serde_json::to_vec(&sugar.document.to_normalized_authored_json()).unwrap(),
+            serde_json::to_vec(&typed.document.to_normalized_authored_json()).unwrap(),
+        );
+        assert_eq!(
+            serde_json::to_vec(
+                &sugar
+                    .document
+                    .to_inline_local_canonical_semantic_json()
+                    .unwrap(),
+            )
+            .unwrap(),
+            serde_json::to_vec(
+                &typed
+                    .document
+                    .to_inline_local_canonical_semantic_json()
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
+
+        let plan = |document: &RqlpDocument| match document {
+            RqlpDocument::Endpoint { definition } => match &definition.selector {
+                PolicySelector::Rows { plan } => plan.clone(),
+                _ => panic!("expected row selector"),
+            },
+            _ => panic!("expected endpoint"),
+        };
+        let sugar = crate::resolved::ResolvedPolicySelector::try_new_rows(
+            PolicySelectorPath::new("/endpoint/selector").unwrap(),
+            plan(&sugar.document),
+            crate::resolved::SelectorOrigin::Document {
+                source: PolicySourceIdentity::new("sugar.rqlp"),
+            },
+        )
+        .unwrap();
+        let typed = crate::resolved::ResolvedPolicySelector::try_new_rows(
+            PolicySelectorPath::new("/endpoint/selector").unwrap(),
+            plan(&typed.document),
+            crate::resolved::SelectorOrigin::Document {
+                source: PolicySourceIdentity::new("typed.rqlp"),
+            },
+        )
+        .unwrap();
+        assert_eq!(sugar.semantic_hash, typed.semantic_hash);
+        assert_eq!(
+            serde_json::to_vec(&crate::canonical_loaded::resolved_selector_to_json(&sugar))
+                .unwrap(),
+            serde_json::to_vec(&crate::canonical_loaded::resolved_selector_to_json(&typed))
+                .unwrap(),
+        );
+    }
+
+    #[test]
+    fn row_selector_formal_index_sugar_retains_exact_call_identity() {
+        let parsed = parse(&row_selector_endpoint(
+            r#"(call :over calls :resolves-to java.sql.Statement.execute :proof exact)
+               (call-argument :over calls :formal-index 0)"#,
+        ))
+        .unwrap();
+        let RqlpDocument::Endpoint { definition } = parsed.document else {
+            panic!("expected endpoint")
+        };
+        let PolicySelector::Rows { plan } = definition.selector else {
+            panic!("expected row selector")
+        };
+        assert_eq!(plan.output.as_str(), "calls");
+        assert_eq!(plan.bindings.len(), 1);
+        assert_eq!(plan.derivations.len(), 2);
+    }
+
+    #[test]
+    fn row_selector_formal_index_sugar_equals_the_typed_filter() {
+        let sugar = parse(&row_selector_endpoint(
+            r#"(call :over calls :resolves-to java.sql.Statement.execute :proof exact)
+               (call-argument :over calls :formal-index 0)"#,
+        ))
+        .unwrap();
+        let typed = parse(&row_selector_endpoint(
+            r#"(filter :over calls :where
+                 ((calls.model_id eq "java.sql.Statement.execute")
+                  (calls.semantic_target_id is-not-null)
+                  (calls.signature_id is-not-null)
+                  (calls.dispatch_outcome eq resolved)
+                  (calls.dispatch_coverage eq exhaustive)
+                  (calls.dispatch_proof eq proven)
+                  (calls.dispatch_completeness eq complete)
+                  (calls.dispatch_target_count eq 1)
+                  (calls.dispatch_targets_truncated eq false)))
+               (filter :over calls :where
+                 ((calls.formal_index eq 0)
+                  (calls.mapping eq exact)
+                  (calls.coverage eq exhaustive)
+                  (calls.terminal eq false)
+                  (calls.argument_id is-not-null)))"#,
+        ))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&sugar.document.to_normalized_authored_json()).unwrap(),
+            serde_json::to_vec(&typed.document.to_normalized_authored_json()).unwrap(),
+        );
+        assert_eq!(
+            serde_json::to_vec(
+                &sugar
+                    .document
+                    .to_inline_local_canonical_semantic_json()
+                    .unwrap(),
+            )
+            .unwrap(),
+            serde_json::to_vec(
+                &typed
+                    .document
+                    .to_inline_local_canonical_semantic_json()
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
+    }
+
+    #[test]
+    fn row_selector_projection_cannot_discard_call_site_identity() {
+        let source = row_selector_endpoint(
+            r#"(call :over calls :resolves-to java.sql.Statement.execute :proof exact)
+               (call-argument :over calls :formal-name "sql")
+               (project :name selected :from calls :columns (calls.formal_name))"#,
+        )
+        .replace(":output calls", ":output selected");
+        let error = parse(&source).unwrap_err().diagnostic;
+        assert_eq!(error.code, "invalid-row-selector-plan");
+        assert!(
+            error.message.contains("call-binding field"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn row_selector_preserves_joins_but_rejects_two_exposed_call_identities() {
+        let accepted = parse(&row_selector_endpoint(
+            r#"(bind :name peer :query
+                 (rql (call-bindings (call-shape (call :callee "execute")))))
+               (call :over calls :resolves-to java.sql.Statement.execute :proof exact)
+               (call-argument :over calls :formal-name "sql")
+               (join :left calls :right peer :kind semi :on ((site_id site_id)))"#,
+        ))
+        .unwrap();
+        let RqlpDocument::Endpoint { definition } = accepted.document else {
+            panic!("expected endpoint")
+        };
+        let PolicySelector::Rows { plan } = definition.selector else {
+            panic!("expected row selector")
+        };
+        assert_eq!(plan.joins.len(), 1);
+        assert_eq!(plan.joins[0].kind, RowJoinKind::Semi);
+        let resolved = crate::resolved::ResolvedPolicySelector::try_new_rows(
+            PolicySelectorPath::new("/endpoint/selector").unwrap(),
+            plan,
+            crate::resolved::SelectorOrigin::Document {
+                source: PolicySourceIdentity::new("join.rqlp"),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            resolved
+                .query_bindings()
+                .into_iter()
+                .map(|binding| (binding.name.as_str(), binding.path))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    "calls",
+                    "/endpoint/selector/bindings/calls/query".to_owned(),
+                ),
+                ("peer", "/endpoint/selector/bindings/peer/query".to_owned(),),
+            ]
+        );
+
+        let ambiguous = parse(&row_selector_endpoint(
+            r#"(bind :name peer :query
+                 (rql (call-bindings (call-shape (call :callee "execute")))))
+               (call :over calls :resolves-to java.sql.Statement.execute :proof exact)
+               (call-argument :over calls :formal-name "sql")
+               (join :left calls :right peer :on ((site_id site_id)))"#,
+        ))
+        .unwrap_err();
+        assert_eq!(ambiguous.diagnostic.code, "invalid-row-selector-plan");
+        assert!(
+            ambiguous
+                .diagnostic
+                .message
+                .contains("ambiguous call-binding identities"),
+            "{}",
+            ambiguous.diagnostic.message
+        );
     }
 
     /// The Milestone 4 sugar: it must add no evaluation rule of its own, so

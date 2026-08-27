@@ -111,6 +111,13 @@ impl ResolvedSelectorSemanticHash {
         });
         Self(hash_canonical_value(SELECTOR_SEMANTIC_DOMAIN, &value))
     }
+
+    pub(crate) fn from_rows(plan: &super::definition::RowSelectorPlan) -> Self {
+        Self(hash_canonical_value(
+            SELECTOR_SEMANTIC_DOMAIN,
+            &super::canonical::row_selector_plan_to_json(plan),
+        ))
+    }
 }
 
 impl EndpointSemanticHash {
@@ -283,8 +290,9 @@ mod tests {
         LoadedEndpoint, LoadedPolicy, MatchEndpointDefinition, PolicyDependencyPath,
         PolicyEndpointBinding, PolicyPrecedenceManifest, PolicySelector, PolicySelectorPath,
         PolicySourceIdentity, ResolvedEndpointDependency, ResolvedEndpointIdentity,
-        ResolvedEndpointManifestEntry, ResolvedEndpointModel, ResolvedMatchDirectoryManifest,
-        ResolvedPolicySelector, RqlpDocument, SelectorOrigin, parse_rqlp_source,
+        ResolvedEndpointManifestEntry, ResolvedEndpointModel, ResolvedEndpointSelectorSchemas,
+        ResolvedMatchDirectoryManifest, ResolvedPolicySelector, RqlpDocument, SelectorOrigin,
+        parse_rqlp_source,
     };
     use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
 
@@ -452,10 +460,12 @@ mod tests {
                     origin: brokk_bifrost_analysis::schema_version::SchemaVersionOrigin::Explicit,
                 },
             },
-            selector_schema: brokk_bifrost_analysis::schema_version::SchemaVersionResolution {
-                version: 2,
-                origin: brokk_bifrost_analysis::schema_version::SchemaVersionOrigin::Explicit,
-            },
+            selector_schemas: ResolvedEndpointSelectorSchemas::Query(
+                brokk_bifrost_analysis::schema_version::SchemaVersionResolution {
+                    version: 2,
+                    origin: brokk_bifrost_analysis::schema_version::SchemaVersionOrigin::Explicit,
+                },
+            ),
             semantic_hash,
             analysis_projection_hash: EndpointAnalysisProjectionHash::from_bytes([1; 32]),
         };
@@ -464,11 +474,12 @@ mod tests {
             definition_schema: EndpointDefinitionSchemaResolution::CatalogDocument {
                 schema_version: 99,
             },
-            selector_schema: brokk_bifrost_analysis::schema_version::SchemaVersionResolution {
-                version: 77,
-                origin:
-                    brokk_bifrost_analysis::schema_version::SchemaVersionOrigin::ImplicitCompatible,
-            },
+            selector_schemas: ResolvedEndpointSelectorSchemas::Query(
+                brokk_bifrost_analysis::schema_version::SchemaVersionResolution {
+                    version: 77,
+                    origin: brokk_bifrost_analysis::schema_version::SchemaVersionOrigin::ImplicitCompatible,
+                },
+            ),
             semantic_hash,
             analysis_projection_hash: EndpointAnalysisProjectionHash::from_bytes([2; 32]),
         };

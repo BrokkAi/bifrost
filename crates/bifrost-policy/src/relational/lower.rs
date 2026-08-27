@@ -15,9 +15,9 @@ use std::collections::HashSet;
 use brokk_bifrost_rql::structural::search::DetailedCodeQueryDomain;
 
 use crate::definition::{
-    PolicySelector, RelationalAssertionPlan, RowAggregate, RowAggregateOp, RowBindingSource,
-    RowDerivation, RowFieldRef, RowFilter, RowJoinKind, RowPredicate, RowPredicateOp,
-    RowPredicateOperand, RowProjection,
+    PolicySelector, RelationalAssertionPlan, RowAggregate, RowAggregateOp, RowBinding,
+    RowBindingName, RowBindingSource, RowDerivation, RowFieldRef, RowFilter, RowJoin, RowJoinKind,
+    RowPredicate, RowPredicateOp, RowPredicateOperand, RowProjection, RowSelectorPlan,
 };
 
 use super::ir::{
@@ -42,20 +42,30 @@ struct RelationSlot {
     domain: Option<DetailedCodeQueryDomain>,
 }
 
-/// Lower one authored relational plan into its IR.
+/// A row-selector plan lowered onto the same typed IR as relational assertions.
 ///
-/// The lowering is total over well-formed authored plans: every authored
-/// binding becomes a source or expansion relation, every derivation refines
-/// one of those relations in place, the authored join list becomes one
-/// left-deep join chain seeded by the first remaining relation, and every
-/// authored group becomes one group relation over that chain.
-pub fn lower_relational_assertion_plan(
-    plan: &RelationalAssertionPlan,
-) -> Result<RelationalPlanIr, RelationalAssertionPlanError> {
+/// `output` is the filtered relation the endpoint consumes. `upstream` is the
+/// source or expansion relation behind it before any derivation ran. Keeping
+/// both identities is what lets endpoint selection retain incomplete producer
+/// evidence even when an authored filter removes the row that carries it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoweredRowSelector {
+    pub plan: RelationalPlanIr,
+    pub relation: IrRelationId,
+    pub output_relation: IrRelationId,
+    pub upstream: IrRelationId,
+    pub output_binding: RowBindingName,
+    pub upstream_binding: RowBindingName,
+}
+
+fn lower_bindings_and_derivations(
+    bindings: &[RowBinding],
+    derivations: &[RowDerivation],
+) -> Result<(Vec<IrRelation>, Vec<RelationSlot>), RelationalAssertionPlanError> {
     let mut relations: Vec<IrRelation> = Vec::new();
     let mut slots: Vec<RelationSlot> = Vec::new();
 
-    for binding in &plan.bindings {
+    for binding in bindings {
         let name = binding.name.as_str().to_string();
         if slots.iter().any(|slot| slot.name == name) {
             return Err(RelationalAssertionPlanError::DuplicateBinding { name });
@@ -81,6 +91,9 @@ pub fn lower_relational_assertion_plan(
             RowBindingSource::Query(PolicySelector::File { .. }) => {
                 return Err(RelationalAssertionPlanError::DeferredSelectorDomain { binding: name });
             }
+            RowBindingSource::Query(PolicySelector::Rows { .. }) => {
+                return Err(RelationalAssertionPlanError::NestedRowSelector { binding: name });
+            }
             RowBindingSource::Expansion { from, step } => {
                 let Some((source_id, source_domain)) = slots
                     .iter()
@@ -93,8 +106,6 @@ pub fn lower_relational_assertion_plan(
                     });
                 };
                 let Some(domain) = expansion_result_domain(source_domain, *step) else {
-                    // The step is authorable but its result rows have no
-                    // registered domain, so nothing downstream could be typed.
                     return Err(RelationalAssertionPlanError::ExpansionDomainUnavailable {
                         binding: name,
                         step: step.label(),
@@ -124,11 +135,11 @@ pub fn lower_relational_assertion_plan(
         });
     }
 
-    if plan.bindings.is_empty() {
+    if bindings.is_empty() {
         return Err(RelationalAssertionPlanError::EmptyPlan);
     }
 
-    for derivation in &plan.derivations {
+    for derivation in derivations {
         match derivation {
             RowDerivation::Filter(filter) => {
                 lower_filter(&mut relations, &mut slots, filter)?;
@@ -139,10 +150,74 @@ pub fn lower_relational_assertion_plan(
         }
     }
 
+    Ok((relations, slots))
+}
+
+/// Lower one endpoint row selector onto the shared typed relational IR.
+pub fn lower_row_selector_plan(
+    selector: &RowSelectorPlan,
+) -> Result<LoweredRowSelector, RelationalAssertionPlanError> {
+    let (mut relations, slots) =
+        lower_bindings_and_derivations(&selector.bindings, &selector.derivations)?;
+    let Some(output_relation) = slots
+        .iter()
+        .find(|slot| slot.name == selector.output.as_str())
+        .map(|slot| slot.id)
+    else {
+        return Err(RelationalAssertionPlanError::UnknownBinding {
+            name: selector.output.as_str().to_string(),
+        });
+    };
+    let mut upstream = output_relation;
+    loop {
+        upstream = match &relations[upstream.index()].op {
+            IrRelationOp::Filter { input, .. } | IrRelationOp::Project { input, .. } => *input,
+            IrRelationOp::Source { .. } | IrRelationOp::Expand { .. } => break,
+            IrRelationOp::Join { .. } | IrRelationOp::Group { .. } => {
+                unreachable!("row selectors cannot author joins or groups")
+            }
+        };
+    }
+    let upstream_binding = match &relations[upstream.index()].op {
+        IrRelationOp::Source { binding, .. } | IrRelationOp::Expand { binding, .. } => {
+            binding.clone()
+        }
+        IrRelationOp::Filter { .. }
+        | IrRelationOp::Project { .. }
+        | IrRelationOp::Join { .. }
+        | IrRelationOp::Group { .. } => {
+            unreachable!("upstream row-selector relation is a source or expansion")
+        }
+    };
+    let (relation, schema) = lower_joins(&mut relations, &slots, &selector.joins)?;
+    if !schema_binds(&schema, selector.output.as_str()) {
+        return Err(RelationalAssertionPlanError::DisconnectedBinding {
+            binding: selector.output.as_str().to_string(),
+        });
+    }
+    Ok(LoweredRowSelector {
+        plan: RelationalPlanIr {
+            relations,
+            assertions: Vec::new(),
+            limits: IrLimits::default(),
+        },
+        relation,
+        output_relation,
+        upstream,
+        output_binding: selector.output.clone(),
+        upstream_binding,
+    })
+}
+
+fn lower_joins(
+    relations: &mut Vec<IrRelation>,
+    slots: &[RelationSlot],
+    joins: &[RowJoin],
+) -> Result<(IrRelationId, IrSchema), RelationalAssertionPlanError> {
     let mut chain = slots[0].id;
     let mut chain_schema = relations[chain.index()].schema.clone();
 
-    for join in &plan.joins {
+    for join in joins {
         let left = join.left.as_str();
         let right = join.right.as_str();
         if !schema_binds(&chain_schema, left) {
@@ -192,6 +267,23 @@ pub fn lower_relational_assertion_plan(
         });
         chain = id;
     }
+
+    Ok((chain, chain_schema))
+}
+
+/// Lower one authored relational plan into its IR.
+///
+/// The lowering is total over well-formed authored plans: every authored
+/// binding becomes a source or expansion relation, every derivation refines
+/// one of those relations in place, the authored join list becomes one
+/// left-deep join chain seeded by the first remaining relation, and every
+/// authored group becomes one group relation over that chain.
+pub fn lower_relational_assertion_plan(
+    plan: &RelationalAssertionPlan,
+) -> Result<RelationalPlanIr, RelationalAssertionPlanError> {
+    let (mut relations, slots) = lower_bindings_and_derivations(&plan.bindings, &plan.derivations)?;
+
+    let (chain, chain_schema) = lower_joins(&mut relations, &slots, &plan.joins)?;
 
     let mut group_relations: Vec<(String, IrRelationId)> = Vec::new();
     for group in &plan.groups {

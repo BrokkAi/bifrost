@@ -7,7 +7,7 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use super::{CatalogError, CatalogOpenMode};
 
 pub(super) const CATALOG_DB_FILE_NAME: &str = "catalog.db";
-const CURRENT_CATALOG_VERSION: i64 = 5;
+pub(super) const CURRENT_CATALOG_VERSION: i64 = 5;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const INITIALIZATION_RETRY_BACKOFF: Duration = Duration::from_millis(5);
 const INITIALIZATION_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(100);

@@ -25,7 +25,7 @@ use crate::graph_support::CppSource;
 use crate::imports::{IncludeTargetIndex, include_paths, resolve_include_targets_with_index};
 use crate::reconcile::{ReconciledIdentity, VisibleClass, reconcile_out_of_line_member_identity};
 use brokk_bifrost_core::analyzer::fq_name::{SegmentKind, segment_interner};
-use brokk_bifrost_core::analyzer::model::{CallableLinkage, Range};
+use brokk_bifrost_core::analyzer::model::{CallableLinkage, Range, SignatureMetadata};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path_fq;
 use brokk_bifrost_core::analyzer::tree_walk::{node_for_exact_range, subtree_contains};
@@ -84,12 +84,19 @@ pub fn cpp_callable_unit_role(
     index: &dyn CodeUnitIndex,
     callable: &CodeUnit,
 ) -> CppCallableUnitRole {
+    cpp_callable_unit_role_from_metadata(callable, index.signature_metadata(callable))
+}
+
+fn cpp_callable_unit_role_from_metadata(
+    callable: &CodeUnit,
+    metadata: impl IntoIterator<Item = SignatureMetadata>,
+) -> CppCallableUnitRole {
     if !callable.is_callable() {
         return CppCallableUnitRole::Unknown;
     }
     let mut declaration = false;
     let mut definition = false;
-    for metadata in index.signature_metadata(callable) {
+    for metadata in metadata {
         if metadata.is_declaration_only() {
             declaration = true;
         } else {

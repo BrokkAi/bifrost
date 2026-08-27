@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bifrost.dev/schemas/workspace-packs-v1.schema.json",
+  "title": "Bifrost Workspace Semantic-Pack Activation",
+  "description": "The shared .bifrost/packs.json document read by the CLI, MCP, and LSP hosts. The loader additionally enforces that catalog is a portable workspace-relative path and that the document is at most 256 KiB.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "catalog": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "description": "Optional workspace-relative catalog directory. When omitted, activation uses an ephemeral catalog. Absolute paths, parent components, and platform-prefixed paths are rejected by the loader."
+    },
+    "ecosystems": {
+      "type": "array",
+      "description": "Dependency ecosystems to activate. An empty array explicitly disables ambient dependency-pack activation; an absent document selects ecosystems serving languages present in the workspace.",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "enum": [
+          "jvm",
+          "dotnet",
+          "npm",
+          "python",
+          "go",
+          "cargo",
+          "ruby",
+          "composer",
+          "cpp"
+        ]
+      }
+    },
+    "enable": {
+      "type": "array",
+      "description": "Optional pack IDs that satisfy a pack's review_required gate.",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "schema_version",
+    "ecosystems"
+  ]
+}

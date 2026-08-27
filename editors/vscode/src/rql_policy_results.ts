@@ -2,6 +2,8 @@ import * as vscode from "vscode";
 import type {
   PolicyDisplayStep,
   PolicyFinding,
+  PolicySuppressionSourceState,
+  RqlPolicyDocument,
   PolicyReportDiagnostic,
   PolicyReportEvaluation,
   PolicyRule,
@@ -17,12 +19,18 @@ import {
   policyFindingDetail,
   policyFindingTerminalSymbol,
   policyRunDiagnosticCodeLabel,
-  policySuppressionAuditSummary
+  policySuppressionAuditSummary,
+  policySuppressionSources,
+  isPolicyFindingSuppressible,
+  isCurrentPolicyFinding
 } from "./rql_policy";
 
 export interface PolicyFindingTarget {
   reportRootUri: string;
   finding: PolicyFinding;
+  policyDocument?: RqlPolicyDocument;
+  resultGeneration?: number;
+  sourceVersion?: number;
 }
 
 export interface PolicyDisplayStepTarget {
@@ -45,12 +53,34 @@ export class RqlPolicyResultsProvider implements vscode.TreeDataProvider<PolicyT
   private readonly changeEmitter = new vscode.EventEmitter<PolicyTreeItem | undefined>();
   private response: RqlPolicyResponse | undefined;
   private staleReason: string | undefined;
+  private policyDocument: RqlPolicyDocument | undefined;
+  private resultGeneration = 0;
+  private sourceVersions = new Map<string, number | undefined>();
 
   readonly onDidChangeTreeData = this.changeEmitter.event;
 
-  update(response: RqlPolicyResponse): void {
+  update(response: RqlPolicyResponse, policyDocument?: RqlPolicyDocument): void {
     this.response = response;
+    this.policyDocument = policyDocument;
+    this.sourceVersions = new Map(
+      response.report.runs.flatMap((run) =>
+        run.findings.map((finding) => [
+          findingKey(finding),
+          currentPolicyFindingSourceVersion(response.reportRootUri, finding)
+        ])
+      )
+    );
+    this.resultGeneration += 1;
     this.staleReason = undefined;
+    this.changeEmitter.fire(undefined);
+  }
+
+  clear(): void {
+    this.response = undefined;
+    this.policyDocument = undefined;
+    this.sourceVersions.clear();
+    this.staleReason = undefined;
+    this.resultGeneration += 1;
     this.changeEmitter.fire(undefined);
   }
 
@@ -59,7 +89,45 @@ export class RqlPolicyResultsProvider implements vscode.TreeDataProvider<PolicyT
       return;
     }
     this.staleReason = reason;
+    this.resultGeneration += 1;
     this.changeEmitter.fire(undefined);
+  }
+
+  canSuppress(finding: PolicyFinding, resultGeneration: number | undefined): boolean {
+    const currentPolicyVersion = this.policyDocument
+      ? currentDocumentVersion(this.policyDocument.uri)
+      : undefined;
+    if (
+      this.policyDocument?.version !== undefined &&
+      currentPolicyVersion !== undefined &&
+      currentPolicyVersion !== this.policyDocument.version
+    ) {
+      return false;
+    }
+    const response = this.response;
+    const currentFinding = response?.report.runs
+      .flatMap((run) => run.findings)
+      .find(
+        (candidate) => candidate.policy_id === finding.policy_id && candidate.id === finding.id
+      );
+    const expectedSourceVersion = this.sourceVersions.get(findingKey(finding));
+    const currentSourceVersion = response
+      ? currentPolicyFindingSourceVersion(response.reportRootUri, finding)
+      : undefined;
+    if (
+      expectedSourceVersion !== undefined &&
+      currentSourceVersion !== undefined &&
+      currentSourceVersion !== expectedSourceVersion
+    ) {
+      return false;
+    }
+    return isCurrentPolicyFinding(
+      finding,
+      resultGeneration,
+      this.resultGeneration,
+      this.staleReason !== undefined,
+      currentFinding
+    );
   }
 
   getTreeItem(element: PolicyTreeItem): vscode.TreeItem {
@@ -76,7 +144,15 @@ export class RqlPolicyResultsProvider implements vscode.TreeDataProvider<PolicyT
       }
       children.push(
         ...activeFindings(element.run).map(
-          (finding) => new PolicyFindingItem(element.reportRootUri, finding)
+          (finding) =>
+            new PolicyFindingItem(
+              element.reportRootUri,
+              finding,
+              this.staleReason !== undefined,
+              this.policyDocument,
+              this.resultGeneration,
+              this.sourceVersions.get(findingKey(finding))
+            )
         )
       );
       return children;
@@ -182,10 +258,11 @@ class PolicySuppressionSummaryItem extends vscode.TreeItem {
     evaluation: PolicyReportEvaluation,
     readonly reviews: PolicySuppressionReview[]
   ) {
-    super("Suppression audit", vscode.TreeItemCollapsibleState.Expanded);
+    super("Suppression audit", vscode.TreeItemCollapsibleState.Collapsed);
     const omitted = reviews.filter((review) => review.result_omitted).length;
     this.description = policySuppressionAuditSummary(reviews);
-    this.tooltip = `Evaluated ${evaluation.suppression_path} on ${evaluation.evaluation_date}; document ${evaluation.suppression_document_state.replaceAll("_", " ")}.`;
+    const sources = policySuppressionSources(evaluation);
+    this.tooltip = `Evaluated ${evaluation.evaluation_date}; ${formatSuppressionSources(sources)}.`;
     this.iconPath = new vscode.ThemeIcon(omitted > 0 ? "error" : "verified");
   }
 }
@@ -200,7 +277,13 @@ class PolicySuppressionReviewItem extends vscode.TreeItem {
       review.applied ? "applied" : review.match_state.replaceAll("_", " "),
       review.temporal_state === "expired" ? "expired" : undefined,
       review.policy_hash_state === "drifted" ? "policy hash drifted" : undefined,
-      review.stale ? "stale" : undefined,
+      review.orphan_state === "orphaned"
+        ? "orphaned"
+        : review.orphan_state === "path_not_analyzed"
+          ? "path not analyzed"
+          : review.orphan_state === "path_unrecorded"
+            ? "path unrecorded"
+            : undefined,
       review.result_omitted ? "result omitted" : undefined
     ].filter((state): state is string => state !== undefined);
     this.description = states.join(" · ");
@@ -222,10 +305,14 @@ class PolicySuppressionReviewItem extends vscode.TreeItem {
   }
 }
 
-class PolicyFindingItem extends vscode.TreeItem {
+export class PolicyFindingItem extends vscode.TreeItem {
   constructor(
     readonly reportRootUri: string,
-    readonly finding: PolicyFinding
+    readonly finding: PolicyFinding,
+    stale: boolean,
+    readonly policyDocument: RqlPolicyDocument | undefined,
+    readonly resultGeneration: number,
+    readonly sourceVersion: number | undefined
   ) {
     super(
       compactText(finding.message),
@@ -252,10 +339,21 @@ class PolicyFindingItem extends vscode.TreeItem {
     tooltip.appendCodeblock(policyFindingDetail(finding), "json");
     this.tooltip = tooltip;
     this.iconPath = new vscode.ThemeIcon(severityIcon(finding.severity));
+    this.contextValue = isPolicyFindingSuppressible(finding, stale)
+      ? "bifrost.policyFindingSuppressible"
+      : "bifrost.policyFinding";
     this.command = {
       command: "bifrost.openRqlPolicyFinding",
       title: "Open Bifrost Policy Finding",
-      arguments: [{ reportRootUri, finding } satisfies PolicyFindingTarget]
+      arguments: [
+        {
+          reportRootUri,
+          finding,
+          policyDocument,
+          resultGeneration,
+          sourceVersion
+        } satisfies PolicyFindingTarget
+      ]
     };
   }
 }
@@ -351,7 +449,7 @@ function suppressionReviewIcon(review: PolicySuppressionReview): string {
   if (review.result_omitted) {
     return "error";
   }
-  if (review.stale) {
+  if (review.orphan_state === "orphaned") {
     return "history";
   }
   if (review.temporal_state === "expired") {
@@ -379,4 +477,40 @@ function severityIcon(severity: string): string {
 
 function compactText(text: string): string {
   return text.replace(/\s+/g, " ").trim();
+}
+
+function findingKey(finding: PolicyFinding): string {
+  return `${finding.policy_id}\u0000${finding.id}`;
+}
+
+export function currentPolicyFindingSourceVersion(
+  reportRootUri: string,
+  finding: PolicyFinding
+): number | undefined {
+  const sourceUri = vscode.Uri.joinPath(vscode.Uri.parse(reportRootUri), finding.primary.path);
+  return vscode.workspace.textDocuments.find(
+    (document) => document.uri.toString() === sourceUri.toString()
+  )?.version;
+}
+
+export function effectivePolicyFindingSourceVersion(
+  reportRootUri: string,
+  finding: PolicyFinding,
+  storedVersion: number | undefined
+): number | undefined {
+  return storedVersion ?? currentPolicyFindingSourceVersion(reportRootUri, finding);
+}
+
+function currentDocumentVersion(uri: string): number | undefined {
+  return vscode.workspace.textDocuments.find((document) => document.uri.toString() === uri)
+    ?.version;
+}
+
+function formatSuppressionSources(sources: readonly PolicySuppressionSourceState[]): string {
+  if (sources.length === 0) {
+    return "no suppression sources";
+  }
+  return sources
+    .map((source) => `${source.path} (${source.state.replaceAll("_", " ")})`)
+    .join(", ");
 }

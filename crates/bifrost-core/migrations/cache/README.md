@@ -67,3 +67,12 @@ independent epoch/count manifest. Epoch 1 has exactly the old row semantics,
 so the migration carries every complete blob forward in SQL. A later extractor
 epoch can selectively reconcile stale live blobs without invalidating stored
 declarations, semantic chunks, or vectors.
+
+Migration `0031-relational-definition-identifier-views.sql` gives identifier
+definition lookups lean stable and anchored views without the unused path-name
+arm of the wider exact-name projection.
+
+Migration `0032-revisioned-workspace-projections.sql` replaces mutable
+language-wide workspace rows with immutable, worktree-keyed revisions. Blob
+facts remain shared while each analyzer pins path, package, anchor, and path
+symbol queries to the revision it captured.

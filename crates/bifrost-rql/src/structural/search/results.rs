@@ -344,6 +344,10 @@ pub enum CodeQueryResultValue {
         #[serde(flatten)]
         value: Box<CodeQueryExpressionSite>,
     },
+    JsxAttributeValue {
+        #[serde(flatten)]
+        value: Box<CodeQueryJsxAttributeValue>,
+    },
     ReceiverAnalysis {
         #[serde(flatten)]
         value: Box<CodeQueryReceiverAnalysis>,
@@ -387,6 +391,10 @@ pub enum CodeQueryResultValue {
     SignatureParameter {
         #[serde(flatten)]
         value: Box<CodeQuerySignatureParameter>,
+    },
+    DecoratedParameter {
+        #[serde(flatten)]
+        value: Box<CodeQueryDecoratedParameter>,
     },
     CallableApplicability {
         #[serde(flatten)]

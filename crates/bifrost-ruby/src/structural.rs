@@ -417,7 +417,7 @@ impl StructuralSpec for RubyStructuralSpec {
     }
 
     fn supports_role(&self, role: Role) -> bool {
-        role != Role::Decorator
+        !matches!(role, Role::Decorator | Role::Iterable | Role::Element)
     }
 
     fn occurrence_role_support(&self) -> &OccurrenceRoleSupport {

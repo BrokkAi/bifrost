@@ -43,7 +43,7 @@ findings into **Bifrost Query Results** and cannot be passed to `--query-file`.
 The extension supplies today's UTC evaluation date and uses the conventional
 `.bifrost/suppressions.json` project file. Active findings appear under
 **Bifrost Policy Results**. Applied findings are hidden from each policy's
-active list but remain under **Suppression audit**, which also shows stale,
+active list but remain under **Suppression audit**, which also shows orphaned,
 expired, policy-hash-drifted, unproven, and omitted-result decisions. Editing
 the policy or workspace while a run is in flight marks retained results stale;
 starting a new run cancels the earlier request. Use the CLI with an explicit

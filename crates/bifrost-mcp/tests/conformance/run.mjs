@@ -267,11 +267,10 @@ function startBridge(binary, workspaceRoot) {
       workspaceRoot,
       '--mcp',
       'searchtools',
-      '--force-semantic-cpu',
     ],
     {
       cwd: HERE,
-      env: { ...process.env, BIFROST_SEMANTIC_INDEX: 'off' },
+      env: process.env,
       stdio: ['ignore', 'pipe', 'pipe'],
     },
   );

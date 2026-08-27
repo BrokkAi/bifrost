@@ -181,6 +181,7 @@ pub fn compile_pack(
         license: normalized.license,
         completeness: normalized.completeness,
         safety: normalized.safety,
+        carried_sources: normalized.carried_sources,
         semantic_sha256: String::new(),
         content_sha256: String::new(),
         shards: artifacts

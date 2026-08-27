@@ -5,16 +5,24 @@ name: policy-scan-smoke
 # therefore fail the dogfood or pollute its baseline. This workflow writes both
 # fixtures at run time into an untracked directory instead.
 
+# Leg B asserts that a planted finding trips the action's default gate, so
+# this smoke depends on the severities in bifrost.code-smells as much as on
+# the action itself. The pack is in the path filter because a severity
+# demotion is exactly what silently turns leg B into a no-op: #2641 moved the
+# *-in-loop family to note, the planted fixture stopped gating, and nothing
+# re-ran this workflow until an unrelated change touched the action.
 on:
   pull_request:
     paths:
       - .github/actions/policy-scan/**
       - .github/workflows/policy-scan-smoke.yml
+      - crates/bifrost-policy/policy-packs/**
   push:
     branches: [master]
     paths:
       - .github/actions/policy-scan/**
       - .github/workflows/policy-scan-smoke.yml
+      - crates/bifrost-policy/policy-packs/**
   schedule:
     # Sunday 04:17 UTC, off peak.
     - cron: '17 4 * * 0'
@@ -81,19 +89,16 @@ jobs:
           if __name__ == "__main__":
               main()
           EOF
+          # The planted policy must sit at or above the action's default
+          # fail-on threshold of warning, or leg B stops testing the gate.
+          # bifrost.correctness.dynamic-evaluation is a warning; the
+          # *-in-loop family is note-severity and would exit 0 here.
           cat > smoke-fixture/finding/main.py <<'EOF'
-          """Planted fixture. The loop compiles a regex on every iteration."""
-
-          import re
+          """Planted fixture. The dispatcher evaluates source text as code."""
 
 
-          def count_matches(lines):
-              total = 0
-              for line in lines:
-                  pattern = re.compile(r"[a-z]+")
-                  if pattern.search(line):
-                      total = total + 1
-              return total
+          def apply_rule(expression, values):
+              return eval(expression, {"values": values})
           EOF
 
       # Leg A: a clean workspace must select the local binary, exit 0, and

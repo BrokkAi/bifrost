@@ -25,10 +25,313 @@ const JSON_SCHEMA_2020_12: &str = "https://json-schema.org/draft/2020-12/schema"
 const MCP_POLICY_APP: &str = include_str!("fixtures/policy-cli/app.py");
 const MCP_DYNAMIC_EVAL_POLICY: &str = include_str!("fixtures/policy-cli/dynamic-eval.rqlp");
 
+const PACK_ACTIVATION_JAVA: &str = r#"import java.util.ArrayList;
+import java.util.Collections;
+
+class Main {
+  void sort(ArrayList<String> values) {
+    Collections.sort(values);
+  }
+}
+"#;
+
+const PACK_ACTIVATION_POLICY: &str = r#"(policy
+  :schema-version 1
+  :id "probe.mcp.external-indexed"
+  :name "MCP external references use a structured route"
+  :message "the stdlib reference did not resolve through its indexed pack"
+  :severity warning
+  :analysis (analysis
+    :type assertion
+    :subject (rql (identifier :text/regex "^Collections$" :capture "target"))
+    :asserts [(assert-resolution :id retain-candidate :at "target" :role receiver_position
+                :expect-tier external_root :at-least true)
+              (assert-boundary :id indexed-boundary :at "target" :role receiver_position
+                :forbid-fallback-past external_declared_unindexed)]))
+"#;
+
+const PACK_ACTIVATION_JDK: &str = r#"{
+  "schema_version": 1,
+  "pack_id": "fixture.jdk",
+  "version": "21.0.2",
+  "producer": { "name": "bifrost-fixture", "version": "1.0.0" },
+  "language": "java",
+  "ecosystem": "jdk",
+  "compatibility": {
+    "bifrost": ">=0.8.0, <1.0.0",
+    "toolchains": [{ "name": "jdk", "requirement": "=21.0.2" }]
+  },
+  "provenance": { "source": "checked-in MCP contract fixture", "revision": "fixture-v1" },
+  "license": "GPL-2.0-only WITH Classpath-exception-2.0",
+  "completeness": "complete",
+  "safety": { "generated_code_only": false, "review_required": false },
+  "shards": [{
+    "id": "jdk.array-list",
+    "activation": [{
+      "toolchain": { "name": "jdk", "version": "=21.0.2" },
+      "targets": ["jvm"]
+    }],
+    "payload": {
+      "kind": "declaration_facts",
+      "types": [{
+        "id": "jdk.java-util-arraylist",
+        "name": "java.util.ArrayList",
+        "type_kind": "class",
+        "visibility": "public",
+        "type_parameters": ["E"],
+        "hierarchy": [],
+        "aliases": [],
+        "extension_surfaces": [],
+        "locator": {
+          "kind": "artifact",
+          "path": "java.base/java/util/ArrayList.java",
+          "symbol": "java.util.ArrayList"
+        }
+      }, {
+        "id": "jdk.java-util-collections",
+        "name": "java.util.Collections",
+        "type_kind": "class",
+        "visibility": "public",
+        "type_parameters": [],
+        "hierarchy": [],
+        "aliases": [],
+        "extension_surfaces": [],
+        "locator": {
+          "kind": "artifact",
+          "path": "java.base/java/util/Collections.java",
+          "symbol": "java.util.Collections"
+        }
+      }],
+      "members": [{
+        "id": "jdk.java-util-collections.sort",
+        "owner": "jdk.java-util-collections",
+        "name": "sort",
+        "member_kind": "method",
+        "visibility": "public",
+        "is_static": true,
+        "locator": {
+          "kind": "artifact",
+          "path": "java.base/java/util/Collections.java",
+          "symbol": "java.util.Collections.sort"
+        }
+      }],
+      "relations": []
+    }
+  }]
+}"#;
+
 fn mcp_server_binary() -> &'static str {
     option_env!("CARGO_BIN_EXE_bifrost-mcp-test-server")
         .or(option_env!("CARGO_BIN_EXE_bifrost"))
         .expect("Cargo did not provide an MCP server binary")
+}
+
+fn install_pack_activation_fixture(root: &std::path::Path) {
+    use brokk_bifrost_analysis::analyzer::semantic_model::{
+        CatalogOpenMode, CatalogOptions, CompilerOptions, DurablePackSource, DurablePackSourceKind,
+        SemanticPackCatalog, SourceFormat, compile_source,
+    };
+
+    let compiled = compile_source(
+        SourceFormat::Json,
+        PACK_ACTIVATION_JDK.as_bytes(),
+        &CompilerOptions::default(),
+    )
+    .unwrap_or_else(|diagnostics| panic!("fixture pack compilation failed: {diagnostics:#?}"));
+    let catalog = SemanticPackCatalog::open(
+        &root.join(".bifrost/packs-catalog"),
+        CatalogOpenMode::ReadWrite,
+        CatalogOptions::default(),
+    )
+    .expect("open fixture catalog");
+    catalog
+        .install(
+            &compiled,
+            &DurablePackSource {
+                kind: DurablePackSourceKind::PreShipped,
+                source_id: "test:fixture.jdk@21.0.2".to_owned(),
+            },
+        )
+        .expect("install fixture pack");
+}
+
+fn fake_jdk_home(root: &std::path::Path, version: &str) -> PathBuf {
+    let home = root.join(format!("jdk-{version}"));
+    fs::create_dir_all(&home).expect("create fake JDK home");
+    fs::write(
+        home.join("release"),
+        format!("JAVA_VERSION=\"{version}\"\nIMPLEMENTOR=\"Bifrost fixture\"\n"),
+    )
+    .expect("write fake JDK release metadata");
+    home
+}
+
+fn run_pack_activation_policy(
+    project: &common::BuiltInlineTestProject,
+    java_home: &std::path::Path,
+) -> (Value, Value) {
+    let mut child = mcp_server_command(project.root(), "searchtools", &[])
+        .env("JAVA_HOME", java_home)
+        .spawn()
+        .expect("spawn pack activation MCP server");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+    let candidates = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1867,
+            "method": "tools/call",
+            "params": {
+                "name": "query_code",
+                "arguments": {
+                    "languages": ["java"],
+                    "occurrences": { "role": ["receiver_position"] },
+                    "steps": [{ "op": "candidates_of", "outcome": ["selected"] }]
+                }
+            }
+        }),
+    );
+    let response = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1868,
+            "method": "tools/call",
+            "params": {
+                "name": "run_policy",
+                "arguments": {
+                    "policy_files": ["policies/external-indexed.rqlp"],
+                    "evaluation_date": "2026-08-25",
+                    "fail_on": "warning"
+                }
+            }
+        }),
+    );
+    drop(stdin);
+    assert!(child.wait().expect("wait MCP server").success());
+    assert_eq!(candidates["result"]["isError"], false, "{candidates:#}");
+    assert_eq!(response["result"]["isError"], false, "{response:#}");
+    (
+        candidates["result"]["structuredContent"].clone(),
+        response["result"]["structuredContent"].clone(),
+    )
+}
+
+fn pack_activation_project(ecosystems: &str, install_pack: bool) -> common::BuiltInlineTestProject {
+    let project = InlineTestProject::new()
+        .file("src/Main.java", PACK_ACTIVATION_JAVA)
+        .file(
+            "policies/external-indexed.rqlp",
+            PACK_ACTIVATION_POLICY,
+        )
+        .file(
+            ".bifrost/packs.json",
+            format!(
+                r#"{{ "schema_version": 1, "catalog": ".bifrost/packs-catalog", "ecosystems": {ecosystems} }}"#
+            ),
+        )
+        .build();
+    if install_pack {
+        install_pack_activation_fixture(project.root());
+    }
+    project
+}
+
+#[test]
+fn mcp_bound_policy_reports_exact_pack_activation_and_honest_near_misses() {
+    let homes = TempDir::new().expect("fake JDK home root");
+    let jdk21 = fake_jdk_home(homes.path(), "21.0.2");
+    let compatible = pack_activation_project(r#"["jvm"]"#, true);
+    let (compatible_candidates, compatible_run) = run_pack_activation_policy(&compatible, &jdk21);
+    assert_eq!(compatible_run["exit_status"], 0, "{compatible_run:#}");
+    assert_eq!(
+        compatible_run["report"]["runs"][0]["completion"]["type"], "complete",
+        "{compatible_run:#}"
+    );
+    assert_eq!(
+        compatible_run["report"]["packs"]["dependency_mode"],
+        "configured"
+    );
+    assert_eq!(compatible_run["report"]["packs"]["complete"], true);
+    assert!(
+        compatible_candidates["results"]
+            .as_array()
+            .expect("resolution candidate rows")
+            .iter()
+            .any(|candidate| {
+                candidate["result_type"] == "resolution_candidate"
+                    && candidate["boundary"] == "external_indexed"
+                    && candidate["outcome"] == "selected"
+                    && candidate["external_target"] == "java.util.Collections.sort"
+            }),
+        "the bound MCP workspace must expose the exact selected boundary: {compatible_candidates:#}"
+    );
+
+    let no_pack = pack_activation_project(r#"["jvm"]"#, false);
+    let (_, no_pack_run) = run_pack_activation_policy(&no_pack, &jdk21);
+    assert_eq!(no_pack_run["exit_status"], 2, "{no_pack_run:#}");
+    assert_eq!(
+        no_pack_run["report"]["runs"][0]["completion"]["type"],
+        "inconclusive"
+    );
+
+    let incompatible = pack_activation_project(r#"["jvm"]"#, true);
+    let jdk17 = fake_jdk_home(homes.path(), "17.0.10");
+    let (_, incompatible_run) = run_pack_activation_policy(&incompatible, &jdk17);
+    assert_eq!(incompatible_run["exit_status"], 2, "{incompatible_run:#}");
+    assert!(
+        incompatible_run["report"]["packs"]["decisions"]
+            .as_array()
+            .expect("incompatible decisions")
+            .iter()
+            .any(|decision| decision["status"] == "version_mismatch"),
+        "{incompatible_run:#}"
+    );
+
+    let disabled = pack_activation_project("[]", true);
+    let (_, disabled_run) = run_pack_activation_policy(&disabled, &jdk21);
+    assert_eq!(disabled_run["exit_status"], 2, "{disabled_run:#}");
+    assert_eq!(
+        disabled_run["report"]["packs"]["dependency_mode"],
+        "disabled"
+    );
+    assert_eq!(
+        disabled_run["report"]["runs"][0]["completion"]["type"],
+        "inconclusive"
+    );
+
+    let failed = pack_activation_project(r#"["jvm"]"#, false);
+    fs::write(
+        failed.root().join(".bifrost/packs-catalog"),
+        "not a catalog directory",
+    )
+    .expect("create invalid configured catalog path");
+    let (_, failed_run) = run_pack_activation_policy(&failed, &jdk21);
+    assert_eq!(failed_run["exit_status"], 2, "{failed_run:#}");
+    assert_eq!(failed_run["report"]["packs"]["complete"], false);
+    assert!(
+        failed_run["report"]["packs"]["decisions"]
+            .as_array()
+            .expect("failed activation decisions")
+            .iter()
+            .any(|decision| decision["status"] == "rejected"),
+        "{failed_run:#}"
+    );
+    assert!(
+        failed_run["report"]["diagnostics"]
+            .as_array()
+            .expect("failed activation diagnostics")
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "pack-activation-failed"),
+        "{failed_run:#}"
+    );
 }
 
 fn assert_same_canonical_path(actual: &str, expected: &std::path::Path) {
@@ -143,10 +446,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     )
     .expect("set remote default");
 
-    let mut child = Command::new(mcp_server_binary());
-    child.env("BIFROST_SEMANTIC_INDEX", "off");
-    let mut child = child
-        .arg("--force-semantic-cpu")
+    let mut child = Command::new(mcp_server_binary())
         .arg("--root")
         .arg(fixture_root.path())
         .arg("--mcp")
@@ -189,7 +489,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
         .as_str()
         .expect("server instructions");
     assert!(
-        instructions.starts_with("Semantic source-code analysis and repository navigation."),
+        instructions.starts_with("Source-code analysis and repository navigation."),
         "{initialize}"
     );
     assert!(instructions.contains("Symbol tools"), "{initialize}");
@@ -1605,74 +1905,6 @@ fn bifrost_cli_toolset_exposes_classify_test_files() {
             "unresolved": ["Missing.java"]
         }),
         "{response}"
-    );
-
-    drop(stdin);
-    let status = child.wait().expect("wait bifrost");
-    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
-}
-
-/// When the embedding model cannot load, semantic_search must surface a
-/// clean tool error instead of hanging on the background build.
-#[test]
-#[cfg(feature = "nlp")]
-fn bifrost_semantic_search_fails_cleanly_without_models() {
-    let fixture = InlineTestProject::with_language(Language::Java)
-        .file("Config.java", "class Config {}\n")
-        .build();
-    let git_init = Command::new("git")
-        .args(["init", "--quiet"])
-        .current_dir(fixture.root())
-        .status()
-        .expect("initialize semantic-search test repository");
-    assert!(git_init.success(), "git init failed: {git_init}");
-
-    let mut command = Command::new(mcp_server_binary());
-    command
-        // Re-enable the indexer (spawn helpers disable it) but point the
-        // embedder at a directory that cannot exist: the engine load fails
-        // fast with no network access.
-        .env("BIFROST_SEMANTIC_INDEX", "auto")
-        .env(
-            "BIFROST_EMBED_MODEL_DIR",
-            "/nonexistent/bifrost-test-models",
-        )
-        .arg("--force-semantic-cpu")
-        .arg("--root")
-        .arg(fixture.root())
-        .arg("--mcp")
-        .arg("nlp")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command.spawn().expect("spawn bifrost");
-    let mut stdin = child.stdin.take().expect("stdin");
-    let stdout = child.stdout.take().expect("stdout");
-    let mut stderr = child.stderr.take().expect("stderr");
-    let mut reader = BufReader::new(stdout);
-
-    initialize_session(&mut stdin, &mut reader, &mut stderr);
-
-    let response = round_trip(
-        &mut stdin,
-        &mut reader,
-        &mut stderr,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {
-                "name": "semantic_search",
-                "arguments": { "query": "where is the config loaded", "k": 3 }
-            }
-        }),
-    );
-    let message = response["error"]["message"]
-        .as_str()
-        .expect("json-rpc error message");
-    assert!(
-        message.contains("semantic index unavailable") || message.contains("disabled"),
-        "unexpected error message: {message}"
     );
 
     drop(stdin);
@@ -5073,8 +5305,6 @@ fn profiled_stderr_capture_bounds_tail_and_transport_evidence() {
 
 fn mcp_server_command(root: &std::path::Path, mode: &str, extra_args: &[&str]) -> Command {
     let mut command = Command::new(mcp_server_binary());
-    command.env("BIFROST_SEMANTIC_INDEX", "off");
-    command.arg("--force-semantic-cpu");
     command.arg("--root").arg(root).arg("--mcp").arg(mode);
     for arg in extra_args {
         command.arg(arg);
@@ -5247,8 +5477,6 @@ fn light_lookup_overtakes_long_usage_scan() {
 
 fn spawn_rootless_server(cwd: &std::path::Path, mode: &str) -> std::process::Child {
     Command::new(mcp_server_binary())
-        .env("BIFROST_SEMANTIC_INDEX", "off")
-        .arg("--force-semantic-cpu")
         .arg("--mcp")
         .arg(mode)
         .current_dir(cwd)
@@ -5263,7 +5491,6 @@ fn spawn_server_no_args(cwd: &std::path::Path) -> std::process::Child {
     // No mode: the compatibility contract is MCP searchtools. No --root: the
     // server must default its root to the working directory.
     Command::new(mcp_server_binary())
-        .env("BIFROST_SEMANTIC_INDEX", "off")
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

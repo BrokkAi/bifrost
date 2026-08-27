@@ -122,7 +122,6 @@ require_archive_file brokk-bifrost-rust resources/treesitter/rust/definitions.sc
 require_archive_file brokk-bifrost-rust resources/treesitter/rust/imports.scm
 require_archive_file brokk-bifrost-analysis migrations/semantic-pack-catalog/0001-current-baseline.sql
 require_archive_file brokk-bifrost-analysis testdata/semantic-model-packs/declarations-v1.json
-require_archive_file brokk-bifrost-nlp src/lib.rs
 require_archive_file brokk-bifrost-policy src/lib.rs
 require_archive_file brokk-bifrost-policy policy-packs/bifrost.code-smells/manifest.json
 require_archive_file brokk-bifrost-semantic-packs src/lib.rs
@@ -149,9 +148,8 @@ while IFS= read -r required_file; do
 done < "$checked_in_policy_files"
 
 require_archive_file brokk-bifrost-mcp resources/agent-guidance/bifrost-agents.md
-require_archive_file brokk-bifrost scripts/public/embedding_sidecar.py
-require_archive_file brokk-bifrost scripts/public/voyage_sidecar.py
 require_archive_file brokk-bifrost schemas/semantic-model-pack-v1.schema.json
+require_archive_file brokk-bifrost schemas/workspace-packs-v1.schema.json
 
 root_archive=$(archive_for brokk-bifrost)
 root_files="$temporary/root-files.txt"
@@ -181,7 +179,7 @@ publish = false
 brokk-bifrost = { path = "$unpacked/brokk-bifrost-$version" }
 
 [features]
-full = ["brokk-bifrost/nlp", "brokk-bifrost/python"]
+full = ["brokk-bifrost/python"]
 
 [patch.crates-io]
 brokk-bifrost-core = { path = "$unpacked/brokk-bifrost-core-$version" }
@@ -197,7 +195,6 @@ brokk-bifrost-rust = { path = "$unpacked/brokk-bifrost-rust-$version" }
 brokk-bifrost-analysis = { path = "$unpacked/brokk-bifrost-analysis-$version" }
 brokk-bifrost-flow = { path = "$unpacked/brokk-bifrost-flow-$version" }
 brokk-bifrost-rql = { path = "$unpacked/brokk-bifrost-rql-$version" }
-brokk-bifrost-nlp = { path = "$unpacked/brokk-bifrost-nlp-$version" }
 brokk-bifrost-policy = { path = "$unpacked/brokk-bifrost-policy-$version" }
 brokk-bifrost-semantic-packs = { path = "$unpacked/brokk-bifrost-semantic-packs-$version" }
 brokk-bifrost-runtime = { path = "$unpacked/brokk-bifrost-runtime-$version" }

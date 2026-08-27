@@ -27,8 +27,8 @@ use super::identity::{EndpointAnalysisProjectionHash, EndpointSemanticHash, Poli
 use super::resolved::{
     EndpointDefinitionSchemaResolution, EndpointOrigin, LoadedPolicy, PolicyPrecedenceManifest,
     ResolvedCatalogIdentity, ResolvedEndpointDependency, ResolvedEndpointIdentity,
-    ResolvedEndpointManifestEntry, ResolvedEndpointModel, ResolvedMatchDirectoryManifest,
-    ResolvedPrecedenceEdge,
+    ResolvedEndpointManifestEntry, ResolvedEndpointModel, ResolvedEndpointSelectorSchemas,
+    ResolvedMatchDirectoryManifest, ResolvedPrecedenceEdge,
 };
 use super::retained::{RetainedSize, retained_extra, retained_vec_size_from_parts};
 use super::scope::{PolicyScopeReview, compare_scope_reviews};
@@ -92,10 +92,27 @@ impl PolicyRuleDescriptor {
         let mut selector_schemas = policy
             .resolved_selectors()
             .iter()
-            .map(|selector| {
-                SelectorSchemaVersionResolution::new(
-                    selector.path.clone(),
-                    selector.schema_resolution,
+            .flat_map(|selector| {
+                selector.as_query().map_or_else(
+                    || {
+                        selector
+                            .query_bindings()
+                            .into_iter()
+                            .map(|binding| {
+                                SelectorSchemaVersionResolution::new(
+                                    PolicySelectorPath::new(&binding.path)
+                                        .expect("resolved row binding path is valid"),
+                                    binding.schema_resolution,
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    },
+                    |(schema, _)| {
+                        vec![SelectorSchemaVersionResolution::new(
+                            selector.path.clone(),
+                            *schema,
+                        )]
+                    },
                 )
             })
             .collect::<Vec<_>>();
@@ -365,10 +382,14 @@ impl Serialize for EndpointDependencyWire<'_> {
             &EndpointDefinitionSchemaWire(value.definition_schema()),
         )?;
         state.serialize_field("selector_path", value.selector_path().as_str())?;
-        state.serialize_field(
-            "selector_schema",
-            &SchemaResolutionWire(value.selector_schema()),
-        )?;
+        match value.selector_schemas() {
+            ResolvedEndpointSelectorSchemas::Query(resolution) => {
+                state.serialize_field("selector_schema", &SchemaResolutionWire(*resolution))?;
+            }
+            ResolvedEndpointSelectorSchemas::Rows(bindings) => {
+                state.serialize_field("selector_schemas", &EndpointRowSchemasWire(bindings))?;
+            }
+        }
         state.serialize_field("model", &EndpointModelWire(value.model()))?;
         state.serialize_field("semantic_hash", &DisplayWire(value.semantic_hash()))?;
         state.serialize_field(
@@ -730,16 +751,38 @@ impl Serialize for ManifestEntryWire<'_> {
             "definition_schema",
             &EndpointDefinitionSchemaWire(&self.0.definition_schema),
         )?;
-        state.serialize_field(
-            "selector_schema",
-            &SchemaResolutionWire(self.0.selector_schema),
-        )?;
+        match &self.0.selector_schemas {
+            ResolvedEndpointSelectorSchemas::Query(resolution) => {
+                state.serialize_field("selector_schema", &SchemaResolutionWire(*resolution))?;
+            }
+            ResolvedEndpointSelectorSchemas::Rows(bindings) => {
+                state.serialize_field("selector_schemas", &EndpointRowSchemasWire(bindings))?;
+            }
+        }
         state.serialize_field("semantic_hash", &DisplayWire(self.0.semantic_hash))?;
         state.serialize_field(
             "analysis_projection_hash",
             &DisplayWire(self.0.analysis_projection_hash),
         )?;
         state.end()
+    }
+}
+
+struct EndpointRowSchemasWire<'a>(&'a [super::resolved::ResolvedEndpointRowBindingSchema]);
+
+impl Serialize for EndpointRowSchemasWire<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for binding in self.0 {
+            sequence.serialize_element(&SelectorSchemaVersionResolution::new(
+                binding.path.clone(),
+                binding.resolution,
+            ))?;
+        }
+        sequence.end()
     }
 }
 
@@ -1381,6 +1424,7 @@ fixed_report_type_retained_size!(
     PolicyReportDiagnosticCode,
     PolicySourceRange,
     PolicyStageTiming,
+    PolicyDependencyPackActivationMode,
 );
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -1773,6 +1817,23 @@ pub enum PolicyPackDecisionStatus {
     Rejected,
 }
 
+/// How dependency semantic-pack activation was selected for one policy run.
+///
+/// This is separate from individual pack decisions: a host can own
+/// activation without a workspace document, and a configured document can be
+/// deliberately empty while still needing an auditable report state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyDependencyPackActivationMode {
+    /// The host used compatible discovered-pack defaults.
+    Default,
+    /// The workspace supplied explicit dependency-pack configuration.
+    Configured,
+    /// Dependency-pack activation was configured but no ecosystems were
+    /// selected for this workspace.
+    Disabled,
+}
+
 /// One activated procedure summary's reachability evidence.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct PolicyPackProcedureSummaryEvidence {
@@ -1887,12 +1948,13 @@ impl RetainedSize for PolicyPackDecision {
     }
 }
 
-/// Top-level audit of the document-driven pack activation for one evaluation
-/// (#1868). Present only when a `.bifrost/packs.json` document configured
-/// activation, so a run without one keeps its exact schema-version-5 shape.
+/// Top-level audit of semantic-pack activation for one evaluation (#1868).
+/// Records whether dependency packs used the absent-document default, an
+/// explicit ecosystem configuration, or explicit disablement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PolicyPackActivationReview {
     document_path: String,
+    dependency_mode: PolicyDependencyPackActivationMode,
     ecosystems: Vec<String>,
     complete: bool,
     decisions: Vec<PolicyPackDecision>,
@@ -1900,8 +1962,9 @@ pub struct PolicyPackActivationReview {
 }
 
 impl PolicyPackActivationReview {
-    pub(crate) fn new(
+    pub(crate) fn new_with_mode(
         document_path: String,
+        dependency_mode: PolicyDependencyPackActivationMode,
         ecosystems: Vec<String>,
         complete: bool,
         mut decisions: Vec<PolicyPackDecision>,
@@ -1913,6 +1976,7 @@ impl PolicyPackActivationReview {
         tighten_vec(&mut decisions);
         Self {
             document_path,
+            dependency_mode,
             ecosystems,
             complete,
             decisions,
@@ -1922,6 +1986,10 @@ impl PolicyPackActivationReview {
 
     pub fn document_path(&self) -> &str {
         &self.document_path
+    }
+
+    pub const fn dependency_mode(&self) -> PolicyDependencyPackActivationMode {
+        self.dependency_mode
     }
 
     /// The activated ecosystem labels, in stable order.
@@ -4995,8 +5063,13 @@ mod tests {
 
     #[test]
     fn set_packs_over_budget_hits_the_single_review_retention_treatment() {
-        let review =
-            PolicyPackActivationReview::new("x".repeat(10_000), Vec::new(), true, Vec::new());
+        let review = PolicyPackActivationReview::new_with_mode(
+            "x".repeat(10_000),
+            PolicyDependencyPackActivationMode::Default,
+            Vec::new(),
+            true,
+            Vec::new(),
+        );
         let review_extra = retained_extra(&review);
         assert!(review_extra > EMERGENCY_DIAGNOSTIC_ALLOWANCE);
 

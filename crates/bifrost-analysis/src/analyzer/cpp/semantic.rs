@@ -19,7 +19,7 @@ use crate::analyzer::tree_sitter_analyzer::{
 use crate::analyzer::{CppAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 
-const ADAPTER_VERSION: &[u8] = b"cpp-cfg-values-v3";
+const ADAPTER_VERSION: &[u8] = b"cpp-cfg-values-v4";
 
 impl_program_semantics_provider!(CppAnalyzer, CppSemanticLowerer);
 
@@ -117,13 +117,14 @@ fn cpp_capabilities() -> SemanticCapabilities {
         SemanticCapability::ConcurrentSpawn,
         SemanticCapability::AsyncSuspendResume,
         SemanticCapability::GeneratorSuspension,
+        // Partial: every decision this adapter's condition lowering reaches
+        // publishes a row, and a literal constant condition publishes the
+        // constant it folded on. Comparisons, null tests, and every other
+        // condition are recorded `Opaque` rather than normalized (#2443).
+        SemanticCapability::GuardFacts,
     ] {
         builder = builder.partial(capability);
     }
-    // Explicitly unsupported: this adapter normalizes no branch conditions, so
-    // an empty `guard_facts` table means "this language publishes no guard
-    // facts" rather than "this procedure has no decision" (#2443).
-    builder = builder.unsupported(SemanticCapability::GuardFacts);
     builder.build()
 }
 
@@ -759,7 +760,8 @@ struct LoweringContext<'tree, 'targets> {
     locals: HashMap<Box<str>, Vec<LocalBinding>>,
     identity_bindings: HashSet<ValueId>,
     receiver: Option<ValueId>,
-    return_identity_preserving: bool,
+    return_transfer_is_exact: bool,
+    is_c_source: bool,
     labels: HashMap<Box<str>, ProgramPointId>,
     switch_case_entries: HashMap<usize, ProgramPointId>,
     published_gaps: HashSet<GapFact>,
@@ -810,6 +812,7 @@ fn lower_procedure<'tree>(
         cancellation,
         spec.noexcept == NoexceptSpecification::Unconditional,
     )?;
+    let is_c_source = locator_is_c_source(&spec.locator);
     let mut context = LoweringContext {
         source: prepared.source(),
         session,
@@ -818,7 +821,8 @@ fn lower_procedure<'tree>(
         locals: HashMap::default(),
         identity_bindings: HashSet::default(),
         receiver: None,
-        return_identity_preserving: cpp_callable_return_preserves_identity(spec.callable),
+        return_transfer_is_exact: cpp_callable_return_transfer_is_exact(spec.callable, is_c_source),
+        is_c_source,
         labels: HashMap::default(),
         switch_case_entries: HashMap::default(),
         published_gaps: HashSet::default(),
@@ -835,6 +839,7 @@ fn lower_procedure<'tree>(
 
     context.emit_procedure_inputs(
         &mut builder,
+        entry,
         spec.callable,
         spec.has_implicit_object_context,
     )?;
@@ -1080,6 +1085,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     fn emit_procedure_inputs(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
+        entry: ProgramPointId,
         callable: Node<'tree>,
         has_implicit_object_context: bool,
     ) -> Result<(), CppLoweringError> {
@@ -1122,8 +1128,33 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 ordinal = ordinal.checked_add(1).ok_or_else(|| {
                     CppLoweringError::Invalid("too many C++ formal parameters".into())
                 })?;
-                if cpp_declaration_preserves_identity(declaration) {
+                if cpp_declaration_value_transfer_is_exact(declaration, self.is_c_source) {
                     self.identity_bindings.insert(value);
+                }
+                // A defaulted parameter is bound by an expression the standard
+                // evaluates at every call site that omits the argument. That
+                // evaluation belongs to no procedure this lowering produces:
+                // it is not part of this body, and the omitting call sites are
+                // not visible from here. Both the value the parameter receives
+                // and any call the default performs are unrepresented, so a
+                // call that elides the argument must not read as complete.
+                if cpp_parameter_default_value(declaration).is_some() {
+                    self.add_gap(
+                        builder,
+                        entry,
+                        SemanticGapSubject::Value(value),
+                        SemanticCapability::ParameterFlow,
+                        SemanticGapKind::Unsupported,
+                        "a defaulted parameter is bound by a default argument evaluated at each omitting call site, which is not lowered",
+                    )?;
+                    self.add_gap(
+                        builder,
+                        entry,
+                        SemanticGapSubject::Point,
+                        SemanticCapability::Calls,
+                        SemanticGapKind::Unsupported,
+                        "a default argument may invoke callables at each omitting call site, and those invocations are not stitched into the ICFG",
+                    )?;
                 }
                 value
             };
@@ -1184,7 +1215,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     metadata,
                     SemanticValueKind::Local,
                 )?;
-                if cpp_declarator_preserves_identity(declarator) {
+                if cpp_value_transfer_is_exact(
+                    node.child_by_field_name("type"),
+                    declarator,
+                    self.is_c_source,
+                ) {
                     self.identity_bindings.insert(value);
                 }
                 self.locals
@@ -1304,58 +1339,76 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         Ok(())
     }
 
+    fn add_declaration_initializer_gap(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+    ) -> Result<(), CppLoweringError> {
+        self.add_gap(
+            builder,
+            point,
+            SemanticGapSubject::Point,
+            SemanticCapability::Assignments,
+            SemanticGapKind::Unknown,
+            "initializer-to-object value transfer and aliasing are not represented",
+        )
+    }
+
     fn emit_declaration_identity(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
         declaration: Node<'tree>,
         terminal: ProgramPointId,
     ) -> Result<bool, CppLoweringError> {
-        let mut emitted = false;
+        let mut every_initializer_modeled = true;
         for declarator in cpp_local_declarators(declaration) {
             let Some(name_node) = declarator_name_node(declarator) else {
+                every_initializer_modeled = false;
                 continue;
             };
             let Some(name) = nonempty_node_text(self.source, name_node) else {
+                every_initializer_modeled = false;
                 continue;
             };
             let Some(target) = self.local_declaration_value(name, name_node.start_byte()) else {
+                every_initializer_modeled = false;
                 continue;
             };
-            if self.identity_bindings.contains(&target) {
-                if let Some(initializer) = cpp_declarator_initializer(declaration, declarator) {
-                    let source = self.expression_value(
-                        builder,
-                        initializer,
-                        cpp_expression_value_kind(initializer),
-                    )?;
-                    self.append_effect(
-                        builder,
-                        terminal,
-                        SemanticEffect::Assignment {
-                            target,
-                            value: source,
-                        },
-                    )?;
-                    self.append_effect(
-                        builder,
-                        terminal,
-                        SemanticEffect::ValueFlow {
-                            kind: ValueFlowKind::Local,
-                            source,
-                            target,
-                        },
-                    )?;
-                    emitted = true;
-                }
-                continue;
-            }
             if let Some(kind) = cpp_local_allocation_kind(declaration, declarator) {
                 self.session
                     .add_allocation(builder, terminal, target, kind)?;
-                emitted = true;
             }
+            let Some(initializer) = cpp_declarator_initializer(declaration, declarator) else {
+                continue;
+            };
+            if !self.identity_bindings.contains(&target) {
+                every_initializer_modeled = false;
+                continue;
+            }
+            let source = self.expression_value(
+                builder,
+                initializer,
+                cpp_expression_value_kind(initializer),
+            )?;
+            self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::Assignment {
+                    target,
+                    value: source,
+                },
+            )?;
+            self.append_effect(
+                builder,
+                terminal,
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Local,
+                    source,
+                    target,
+                },
+            )?;
         }
-        Ok(emitted)
+        Ok(every_initializer_modeled)
     }
 
     fn step(
@@ -1401,6 +1454,21 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), CppLoweringError> {
+        // A folded literal keeps exactly one arm. Recording the guard is what
+        // keeps the fold legible: nothing else in the frozen artifact says the
+        // branch was constant (#2443).
+        if let Some(value) = cpp_folded_boolean_constant(self.source, node) {
+            let taken = if value { when_true } else { when_false };
+            self.edge(builder, entry, taken)?;
+            return self.record_guard(
+                builder,
+                entry,
+                GuardPredicate::ConstantBoolean { value },
+                None,
+                value.then_some(when_true),
+                (!value).then_some(when_false),
+            );
+        }
         match (node.kind(), binary_operator(node)) {
             ("binary_expression", Some("&&")) => {
                 let left = required_field(node, "left")?;
@@ -1519,7 +1587,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
             ("declaration", _) => {
                 let decision = self.point(builder, node, Vec::new())?;
-                if !self.is_c_source() && declaration_may_construct_object(node) {
+                if !self.is_c_source && declaration_may_construct_object(node) {
                     self.add_implicit_operator_gaps(
                         builder,
                         decision,
@@ -1528,6 +1596,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 }
                 self.edge(builder, decision, when_true)?;
                 self.edge(builder, decision, when_false)?;
+                self.record_guard(
+                    builder,
+                    decision,
+                    GuardPredicate::Opaque {
+                        digest: GuardConditionDigest::from_syntax_kind(node.kind()),
+                    },
+                    None,
+                    Some(when_true),
+                    Some(when_false),
+                )?;
                 stack.push(Work::Statement {
                     node,
                     entry,
@@ -1551,6 +1629,21 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let decision = self.point(builder, node, Vec::new())?;
                 self.edge(builder, decision, when_true)?;
                 self.edge(builder, decision, when_false)?;
+                // The condition's own value is the one thing an unnormalized
+                // guard can honestly name: the decision tested it, whatever it
+                // means.
+                let subject =
+                    self.expression_value(builder, node, cpp_expression_value_kind(node))?;
+                self.record_guard(
+                    builder,
+                    decision,
+                    GuardPredicate::Opaque {
+                        digest: GuardConditionDigest::from_syntax_kind(node.kind()),
+                    },
+                    Some(subject),
+                    Some(when_true),
+                    Some(when_false),
+                )?;
                 stack.push(Work::Expression {
                     node,
                     entry,
@@ -1560,6 +1653,63 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 Ok(())
             }
         }
+    }
+
+    /// Whether the relative evaluation order of an assignment's two operands
+    /// is observable.
+    ///
+    /// Order can matter only when one operand's evaluation has an effect the
+    /// other's evaluation could see. Evaluating a plain identifier that names
+    /// a binding of this procedure designates that object outright: it reads
+    /// no state, so an unsequenced sibling cannot change what it yields, and
+    /// the assignment has one meaning whichever order a compiler picks. Every
+    /// other target -- a dereference, a subscript, a field access, or a name
+    /// this lowering does not resolve to a binding -- evaluates state an
+    /// unsequenced effectful sibling may already have changed, so its order
+    /// stays a gap.
+    fn assignment_operand_order_is_observable(
+        &self,
+        left: Node<'tree>,
+        right: Node<'tree>,
+    ) -> bool {
+        let effectful = cpp_expression_may_have_side_effects(left, self.is_c_source)
+            || cpp_expression_may_have_side_effects(right, self.is_c_source);
+        let target_designates_binding = left.kind() == "identifier"
+            && nonempty_node_text(self.source, left)
+                .and_then(|name| self.binding_value(name, left.start_byte()))
+                .is_some();
+        effectful && !target_designates_binding
+    }
+
+    /// Publish one guard fact for a decision this lowerer just made.
+    ///
+    /// Arms must already have been added as edges; the IR validator enforces
+    /// that.
+    #[allow(clippy::too_many_arguments)]
+    fn record_guard(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        predicate: GuardPredicate,
+        subject: Option<ValueId>,
+        when_true: Option<EdgeTarget>,
+        when_false: Option<EdgeTarget>,
+    ) -> Result<(), CppLoweringError> {
+        let arm = |target: Option<EdgeTarget>| {
+            target.map(|target| GuardArm {
+                target_point: target.point,
+                kind: target.kind,
+            })
+        };
+        self.session.add_guard_fact(
+            builder,
+            point,
+            predicate,
+            subject,
+            arm(when_true),
+            arm(when_false),
+        )?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1585,10 +1735,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let nested_scope =
                     node.kind() == "compound_statement" && node.id() != self.root_body_id;
                 let has_raii_cleanup = nested_scope
-                    && !self.is_c_source()
+                    && !self.is_c_source
                     && block_has_automatic_object(self.source, node);
                 let has_vla_cleanup =
-                    nested_scope && self.is_c_source() && block_has_potential_vla(node);
+                    nested_scope && self.is_c_source && block_has_potential_vla(node);
                 if has_raii_cleanup || has_vla_cleanup {
                     let scope_exit = self.point(builder, node, Vec::new())?;
                     if has_raii_cleanup {
@@ -1642,17 +1792,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             | "field_initializer" => {
                 let initializers = initializer_values(node);
                 let values = declaration_runtime_expressions(node);
+                let function_local_static = self.is_function_local_static(node, &values);
+                // A "declaration" reaching the non-static branch below models
+                // its own initializer transfer where the transfer is exact, so
+                // that branch decides its gap from what it actually emitted.
+                let initializer_gap_decided_below =
+                    node.kind() == "declaration" && !function_local_static;
                 if !initializers.is_empty()
+                    && !initializer_gap_decided_below
                     && matches!(node.kind(), "declaration" | "field_declaration")
                 {
-                    self.add_gap(
-                        builder,
-                        entry,
-                        SemanticGapSubject::Point,
-                        SemanticCapability::Assignments,
-                        SemanticGapKind::Unknown,
-                        "initializer-to-object value transfer and aliasing are not represented",
-                    )?;
+                    self.add_declaration_initializer_gap(builder, entry)?;
                 }
                 if node.kind() == "field_initializer_list" && initializers.len() > 1 {
                     self.add_gap(
@@ -1664,14 +1814,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         "constructor initializers execute in base/member declaration order, which is unavailable here; written order is only a bounded lowering order",
                     )?;
                 }
-                if !self.is_c_source() && declaration_may_construct_object(node) {
+                if !self.is_c_source && declaration_may_construct_object(node) {
                     self.add_implicit_lifetime_call_gaps(
                         builder,
                         entry,
                         "object initialization may invoke constructors or conversion functions",
                     )?;
                 }
-                if !self.is_c_source()
+                if !self.is_c_source
                     && !initializers.is_empty()
                     && declaration_constructs_thread(self.source, node)
                 {
@@ -1691,7 +1841,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 } else {
                     let terminal = if node.kind() == "declaration" {
                         let terminal = self.point(builder, node, Vec::new())?;
-                        self.emit_declaration_identity(builder, node, terminal)?;
+                        let modeled = self.emit_declaration_identity(builder, node, terminal)?;
+                        if !initializers.is_empty() && !modeled {
+                            self.add_declaration_initializer_gap(builder, entry)?;
+                        }
                         self.edge(builder, terminal, next)?;
                         Some(terminal)
                     } else {
@@ -1717,7 +1870,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         cpp_expression_value_kind(value_node),
                     )?;
                     let value = self.value(builder, terminal, SemanticValueKind::Return)?;
-                    if node.kind() == "return_statement" && self.return_identity_preserving {
+                    if node.kind() == "return_statement" && self.return_transfer_is_exact {
                         self.append_effect(
                             builder,
                             terminal,
@@ -1907,8 +2060,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), CppLoweringError> {
         let condition = required_field(node, "condition")?;
-        let completion = if !self.is_c_source()
-            && syntax_has_automatic_object(self.source, condition)
+        let completion = if !self.is_c_source && syntax_has_automatic_object(self.source, condition)
         {
             EdgeTarget::normal(self.normal_cleanup_boundary(
                 builder,
@@ -1974,7 +2126,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let condition_entry = self.point(builder, condition, Vec::new())?;
         let body_entry = self.point(builder, body, Vec::new())?;
         let condition_declares_object =
-            !self.is_c_source() && syntax_has_automatic_object(self.source, condition);
+            !self.is_c_source && syntax_has_automatic_object(self.source, condition);
         let exit_target = if condition_declares_object {
             EdgeTarget::normal(self.normal_cleanup_boundary(
                 builder,
@@ -2095,10 +2247,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let update_entry = update
             .map(|update| self.point(builder, update, Vec::new()))
             .transpose()?;
-        let initializer_declares_object = !self.is_c_source()
+        let initializer_declares_object = !self.is_c_source
             && initializer
                 .is_some_and(|initializer| syntax_has_automatic_object(self.source, initializer));
-        let condition_declares_object = !self.is_c_source()
+        let condition_declares_object = !self.is_c_source
             && condition
                 .is_some_and(|condition| syntax_has_automatic_object(self.source, condition));
         let initializer_exit = if initializer_declares_object {
@@ -2187,16 +2339,23 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 },
             )?;
         }
+        // When the initializer already establishes the condition, the first
+        // test cannot fail, so the zero-trip path out of the loop does not
+        // exist. Entering the body directly is what lets a consumer see that
+        // the body definitely ran; every later iteration still reevaluates the
+        // condition and keeps the exit edge.
+        let first_arrival = if condition.is_some_and(|condition| {
+            cpp_for_condition_starts_true(self.source, initializer, condition)
+        }) {
+            EdgeTarget::normal(body_entry)
+        } else {
+            EdgeTarget::normal(condition_entry)
+        };
         if let Some(initializer) = initializer {
-            stack.push(self.execution_work(
-                initializer,
-                entry,
-                EdgeTarget::normal(condition_entry),
-                loop_scope,
-            ));
+            stack.push(self.execution_work(initializer, entry, first_arrival, loop_scope));
             Ok(())
         } else {
-            self.edge(builder, entry, EdgeTarget::normal(condition_entry))
+            self.edge(builder, entry, first_arrival)
         }
     }
 
@@ -2345,7 +2504,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let condition = required_field(node, "condition")?;
         let body = required_field(node, "body")?;
         let dispatch = self.point(builder, node, Vec::new())?;
-        if !self.is_c_source()
+        if !self.is_c_source
             && condition_value_declaration(condition).is_some_and(declaration_may_construct_object)
         {
             self.add_implicit_operator_gaps(
@@ -2354,8 +2513,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "contextual integral or enumeration conversion of a switch condition-declared object may invoke user-defined code",
             )?;
         }
-        let completion = if !self.is_c_source()
-            && syntax_has_automatic_object(self.source, condition)
+        let completion = if !self.is_c_source && syntax_has_automatic_object(self.source, condition)
         {
             EdgeTarget::normal(self.normal_cleanup_boundary(
                 builder,
@@ -2977,14 +3135,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         "assignment target/value identity, aliasing, and overloaded assignment require type refinement",
                     )?;
                 }
-                self.add_gap(
-                    builder,
-                    assignment,
-                    SemanticGapSubject::Point,
-                    SemanticCapability::NormalControlFlow,
-                    SemanticGapKind::Unknown,
-                    "assignment operand evaluation order is C/C++-standard dependent; RHS-first lowering is only a deterministic bounded order without a configured language standard",
-                )?;
+                if self.assignment_operand_order_is_observable(left, right) {
+                    self.add_gap(
+                        builder,
+                        assignment,
+                        SemanticGapSubject::Point,
+                        SemanticCapability::NormalControlFlow,
+                        SemanticGapKind::Unknown,
+                        "assignment operand evaluation order is C/C++-standard dependent; RHS-first lowering is only a deterministic bounded order without a configured language standard",
+                    )?;
+                }
                 if assignment_operator(node).is_some_and(|operator| operator != "=") {
                     self.add_implicit_operator_gaps(
                         builder,
@@ -3157,7 +3317,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         "C++ field-load identity requires structured memory and declared-member refinement",
                     )?;
                 }
-                if !self.is_c_source() && expression_may_invoke_overload(node) {
+                if !self.is_c_source && expression_may_invoke_overload(node) {
                     self.add_implicit_operator_gaps(
                         builder,
                         entry,
@@ -3168,7 +3328,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 if matches!(
                     node.kind(),
                     "binary_expression" | "subscript_expression" | "fold_expression"
-                ) && children.len() > 1
+                ) && cpp_operand_order_is_observable(&children, self.is_c_source)
                 {
                     self.add_gap(
                         builder,
@@ -3179,6 +3339,44 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         "relative operand evaluation order is unspecified or language-version dependent; source order is only a bounded lowering order",
                     )?;
                 }
+                // An operator or conversion computes its result from the
+                // operands it was given, so every operand's value reaches the
+                // result. The transfer is language-defined rather than an
+                // identity: arithmetic, a comparison, and a conversion all
+                // produce a value of their own.
+                //
+                // The memory-shaped members of this group are deliberately
+                // excluded. A subscript, a field access, and a dereference
+                // read storage this adapter does not model, and their
+                // operands address that storage rather than becoming the
+                // result; they keep their own gaps instead.
+                if matches!(
+                    node.kind(),
+                    "binary_expression" | "unary_expression" | "cast_expression"
+                ) {
+                    let terminal = self.point(builder, node, Vec::new())?;
+                    let operands = children
+                        .iter()
+                        .map(|child| {
+                            self.expression_value(
+                                builder,
+                                *child,
+                                cpp_expression_value_kind(*child),
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    self.session
+                        .append_language_defined_value_flows(builder, terminal, operands, result)?;
+                    self.edge(builder, terminal, next)?;
+                    return self.schedule_expressions(
+                        builder,
+                        entry,
+                        &children,
+                        EdgeTarget::normal(terminal),
+                        scope,
+                        stack,
+                    );
+                }
                 self.schedule_expressions(builder, entry, &children, next, scope, stack)
             }
             "condition_clause" => {
@@ -3187,7 +3385,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
             "initializer_list" => {
                 let children = runtime_expression_children(node);
-                if self.is_c_source() && children.len() > 1 {
+                if self.is_c_source && cpp_operand_order_is_observable(&children, self.is_c_source)
+                {
                     self.add_gap(
                         builder,
                         entry,
@@ -3412,7 +3611,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             )?;
         }
         let evaluations = call_operand_evaluations(node, function);
-        if evaluations.len() > 1 {
+        if cpp_operand_order_is_observable(&evaluations, self.is_c_source) {
             self.add_gap(
                 builder,
                 invoke,
@@ -3550,16 +3749,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         }
     }
 
-    fn is_c_source(&self) -> bool {
-        self.session
-            .locator()
-            .path()
-            .as_path()
-            .extension()
-            .and_then(|extension| extension.to_str())
-            == Some("c")
-    }
-
     fn normal_cleanup_boundary(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -3618,8 +3807,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         !self.is_synthetic_procedure
             && node.kind() == "declaration"
             && has_storage_class(self.source, node, "static")
-            && (!values.is_empty()
-                || (!self.is_c_source() && declaration_may_construct_object(node)))
+            && (!values.is_empty() || (!self.is_c_source && declaration_may_construct_object(node)))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4180,16 +4368,250 @@ fn cpp_declarator_preserves_identity(mut node: Node<'_>) -> bool {
     }
 }
 
-fn cpp_declaration_preserves_identity(declaration: Node<'_>) -> bool {
-    cpp_local_declarators(declaration)
-        .into_iter()
-        .any(cpp_declarator_preserves_identity)
+/// The compile-time truth value a condition names, when the condition is a
+/// literal this lowering decodes exactly.
+///
+/// `true` and `false` are literal node kinds in both dialects: C++ spells them
+/// as keywords, and a C translation unit only parses them as literals once the
+/// dialect actually has them, so neither spelling can be a rebindable name
+/// here. An integer literal converts to `false` exactly when its value is
+/// zero. Every other condition -- including a floating literal, a character
+/// literal, and a macro name -- folds nothing.
+fn cpp_folded_boolean_constant(source: &str, node: Node<'_>) -> Option<bool> {
+    match node.kind() {
+        "true" => Some(true),
+        "false" => Some(false),
+        "number_literal" => cpp_integer_literal_is_nonzero(nonempty_node_text(source, node)?),
+        _ => None,
+    }
 }
 
-fn cpp_callable_return_preserves_identity(callable: Node<'_>) -> bool {
+/// The digit run and radix of an integer literal token, or `None` when the
+/// token is not an integer literal this function decodes.
+///
+/// A width or signedness suffix carries no value and is dropped. A token whose
+/// remainder after the digit run is not a suffix -- a fractional part, or a
+/// decimal or binary exponent -- is a floating literal and is left undecoded
+/// rather than guessed at.
+fn cpp_integer_literal_digits(text: &str) -> Option<(&str, u32)> {
+    const SUFFIX: &str = "uUlLzZ";
+    let (body, radix) = text.strip_prefix('0').map_or((text, 10), |rest| {
+        match rest.as_bytes().first().map(u8::to_ascii_lowercase) {
+            Some(b'x') => (&rest[1..], 16),
+            Some(b'b') => (&rest[1..], 2),
+            // A leading `0` is octal, and is itself a digit of the value.
+            _ => (text, 8),
+        }
+    });
+    let digit_end = body
+        .find(|character: char| !character.is_digit(radix) && character != '\'')
+        .unwrap_or(body.len());
+    let (digits, remainder) = body.split_at(digit_end);
+    (!digits.is_empty()
+        && remainder
+            .chars()
+            .all(|character| SUFFIX.contains(character)))
+    .then_some((digits, radix))
+}
+
+/// Whether an integer literal token denotes a nonzero value.
+///
+/// Only the digits decide, whatever the base and whatever suffix the token
+/// carries, so this answers for literals far wider than any Rust integer.
+fn cpp_integer_literal_is_nonzero(text: &str) -> Option<bool> {
+    let (digits, radix) = cpp_integer_literal_digits(text)?;
+    Some(
+        digits
+            .chars()
+            .any(|character| character.is_digit(radix) && character != '0'),
+    )
+}
+
+/// The value of an integer literal token, when it fits an `i64`.
+fn cpp_integer_literal_value(text: &str) -> Option<i64> {
+    let (digits, radix) = cpp_integer_literal_digits(text)?;
+    i64::from_str_radix(&digits.replace('\'', ""), radix).ok()
+}
+
+/// Whether a C-style `for` condition is already true when the loop is first
+/// reached, so the loop body definitely executes at least once.
+///
+/// The one shape recognized is the counted loop: a `<` or `<=` test whose left
+/// operand is a counter the initializer declares with an integer-literal value
+/// already satisfying an integer-literal limit. Every ingredient is a
+/// tree-sitter field or a literal token; any other shape answers `false` and
+/// keeps the zero-trip path.
+fn cpp_for_condition_starts_true(
+    source: &str,
+    initializer: Option<Node<'_>>,
+    condition: Node<'_>,
+) -> bool {
+    if condition.kind() != "binary_expression" {
+        return false;
+    }
+    let Some(inclusive) = condition
+        .child_by_field_name("operator")
+        .and_then(|operator| match operator.kind() {
+            "<" => Some(false),
+            "<=" => Some(true),
+            _ => None,
+        })
+    else {
+        return false;
+    };
+    let Some(limit) = condition
+        .child_by_field_name("right")
+        .and_then(|right| nonempty_node_text(source, right))
+        .and_then(cpp_integer_literal_value)
+    else {
+        return false;
+    };
+    let Some(counter) = condition
+        .child_by_field_name("left")
+        .filter(|left| left.kind() == "identifier")
+        .and_then(|left| nonempty_node_text(source, left))
+    else {
+        return false;
+    };
+    let Some(initializer) = initializer.filter(|node| node.kind() == "declaration") else {
+        return false;
+    };
+    cpp_local_declarators(initializer)
+        .into_iter()
+        .any(|declarator| {
+            declarator_name_node(declarator).and_then(|name| nonempty_node_text(source, name))
+                == Some(counter)
+                && cpp_declarator_initializer(initializer, declarator)
+                    .and_then(|value| nonempty_node_text(source, value))
+                    .and_then(cpp_integer_literal_value)
+                    .is_some_and(|start| {
+                        if inclusive {
+                            start <= limit
+                        } else {
+                            start < limit
+                        }
+                    })
+        })
+}
+
+/// The default-argument expression of one formal parameter declaration.
+///
+/// C has no default arguments, so this only ever answers for a C++ callable.
+fn cpp_parameter_default_value(declaration: Node<'_>) -> Option<Node<'_>> {
+    (declaration.kind() == "optional_parameter_declaration")
+        .then(|| declaration.child_by_field_name("default_value"))
+        .flatten()
+}
+
+fn locator_is_c_source(locator: &SemanticLocator) -> bool {
+    locator
+        .path()
+        .as_path()
+        .extension()
+        .and_then(|extension| extension.to_str())
+        == Some("c")
+}
+
+/// Whether the declared type is a C++ scalar, for which a by-value copy
+/// reproduces the operand exactly.
+fn cpp_type_is_scalar(type_node: Node<'_>) -> bool {
+    matches!(
+        type_node.kind(),
+        "primitive_type" | "sized_type_specifier" | "enum_specifier"
+    )
+}
+
+/// Whether a value transfer into an entity declared by `type_node` and
+/// `declarator` reproduces the transferred value exactly.
+///
+/// A pointer or reference declarator names the operand's own object, so the
+/// transfer is exact by construction. C has no copy constructors, conversion
+/// functions, or move semantics, so every C by-value copy is exact as well. In
+/// C++ that only holds for scalars: a class, template, or deduced type may
+/// construct a distinct result object, which keeps its gap.
+///
+/// An array declarator is aggregate initialization rather than a single-value
+/// transfer, so it is never exact by this rule.
+fn cpp_value_transfer_is_exact(
+    type_node: Option<Node<'_>>,
+    declarator: Node<'_>,
+    is_c_source: bool,
+) -> bool {
+    if cpp_declarator_preserves_identity(declarator) {
+        return true;
+    }
+    if cpp_declarator_contains_kind(declarator, "array_declarator") {
+        return false;
+    }
+    is_c_source || type_node.is_some_and(cpp_type_is_scalar)
+}
+
+fn cpp_declaration_value_transfer_is_exact(declaration: Node<'_>, is_c_source: bool) -> bool {
+    let type_node = declaration.child_by_field_name("type");
+    cpp_local_declarators(declaration)
+        .into_iter()
+        .any(|declarator| cpp_value_transfer_is_exact(type_node, declarator, is_c_source))
+}
+
+fn cpp_callable_return_transfer_is_exact(callable: Node<'_>, is_c_source: bool) -> bool {
     callable
         .child_by_field_name("declarator")
-        .is_some_and(cpp_declarator_preserves_identity)
+        .is_some_and(|declarator| {
+            cpp_value_transfer_is_exact(
+                callable.child_by_field_name("type"),
+                declarator,
+                is_c_source,
+            )
+        })
+}
+
+/// Whether evaluating this expression can write memory or invoke user code, so
+/// that an unsequenced sibling evaluation could observe a different program
+/// state depending on the order the two are evaluated in.
+///
+/// The walk stops at nested execution boundaries: a lambda body is not
+/// evaluated by the expression that names the closure.
+fn cpp_expression_may_have_side_effects(node: Node<'_>, is_c_source: bool) -> bool {
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if matches!(
+            current.kind(),
+            "call_expression"
+                | "assignment_expression"
+                | "update_expression"
+                | "new_expression"
+                | "delete_expression"
+                | "throw_expression"
+                | "co_await_expression"
+                | "co_yield_expression"
+        ) {
+            return true;
+        }
+        // A C++ operand of class type can route almost any operator through
+        // user-defined code, so treat overloadable expressions as effectful
+        // there. C has no operator overloading.
+        if !is_c_source && expression_may_invoke_overload(current) {
+            return true;
+        }
+        if cpp_nested_execution_boundary(current) {
+            continue;
+        }
+        stack.extend(named_children(current));
+    }
+    false
+}
+
+/// Whether the relative evaluation order of `operands` is observable at all.
+///
+/// Order only matters when at least two unsequenced operand evaluations can
+/// interfere; a single effectful operand evaluated against pure siblings
+/// produces the same program state in every admissible order.
+fn cpp_operand_order_is_observable(operands: &[Node<'_>], is_c_source: bool) -> bool {
+    operands
+        .iter()
+        .filter(|operand| cpp_expression_may_have_side_effects(**operand, is_c_source))
+        .nth(1)
+        .is_some()
 }
 
 fn cpp_declaration_is_function(declaration: Node<'_>) -> bool {

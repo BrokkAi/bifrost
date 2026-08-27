@@ -16,45 +16,23 @@
 //! completes, the worker posts [`DependencyPackActivation`] to the server's
 //! main loop, which owns every state mutation and every publication.
 
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use semver::Version;
 
-use crate::analyzer::semantic_model::{
-    CatalogOpenMode, CatalogOptions, DependencyPackLimits, SemanticModelActivationRequest,
-    SemanticModelRuntimeLimits, SemanticPackCatalog,
+use crate::analyzer::packs_document::{
+    WorkspaceActivationSources, WorkspacePacksActivation, WorkspacePacksConfig,
+    activate_workspace_semantic_sources,
 };
-use crate::analyzer::{
-    AnalyzerConfig, DependencyPackEcosystem, DependencyPackWorkspaceContext, Language,
-    WorkspaceAnalyzer,
-};
+use crate::analyzer::{AnalyzerConfig, DependencyPackEcosystem, WorkspaceAnalyzer};
 use crate::cancellation::CancellationToken;
 
 /// Prefix of the one-line-per-activation session log. Stable so a rollout
 /// campaign and the host tests can both select these lines.
 pub(crate) const ACTIVATION_LOG_PREFIX: &str = "[bifrost-lsp] dependency-pack activation";
-
-/// The ecosystems whose languages the workspace actually analyzes. Activating
-/// an ecosystem with no source in the workspace would scan for manifests that
-/// cannot inform any diagnostic.
-pub(crate) fn ecosystems_for_languages(
-    languages: &BTreeSet<Language>,
-) -> Vec<DependencyPackEcosystem> {
-    DependencyPackEcosystem::ALL
-        .into_iter()
-        .filter(|ecosystem| {
-            ecosystem
-                .languages()
-                .iter()
-                .any(|language| languages.contains(language))
-        })
-        .collect()
-}
 
 /// The ecosystems whose declared dependency inputs include `file_name`. The
 /// names come from `DependencyPackEcosystem::dependency_inputs`, the single
@@ -67,11 +45,20 @@ pub(crate) fn ecosystems_for_dependency_input(file_name: &str) -> Vec<Dependency
 }
 
 /// One completed activation, delivered to the server's main loop.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct DependencyPackActivation {
     /// The scheduling generation this job answers. The main loop drops an
     /// answer that a newer schedule already superseded.
     pub(crate) generation: u64,
+    /// The exact workspace configuration used by this activation. None
+    /// denotes compatible discovered-pack defaults.
+    pub(crate) config: Option<WorkspacePacksConfig>,
+    /// A malformed configuration is retained so callers do not mistake it
+    /// for absent configuration and enable defaults.
+    pub(crate) config_error: Option<String>,
+    /// The shared activation transaction, when one completed or produced a
+    /// typed incomplete outcome.
+    pub(crate) activation: Option<Arc<WorkspacePacksActivation>>,
     pub(crate) ecosystems: Vec<DependencyPackEcosystem>,
     /// `true` when the analyzer published new proof, which obliges the host to
     /// refresh every document it has published diagnostics for.
@@ -87,10 +74,11 @@ struct ActivationJob {
     snapshot: Arc<WorkspaceAnalyzer>,
     config: AnalyzerConfig,
     ecosystems: Vec<DependencyPackEcosystem>,
-    /// Absolute root of the workspace-configured semantic-pack catalog from
-    /// `.bifrost/packs.json` (#1868). `None` keeps the session-scoped
-    /// ephemeral catalog.
-    catalog_root: Option<PathBuf>,
+    /// Root beneath which the shared activation transaction resolves the
+    /// configured catalog path.
+    workspace_root: PathBuf,
+    packs_config: Option<WorkspacePacksConfig>,
+    config_error: Option<String>,
     cancellation: CancellationToken,
 }
 
@@ -112,6 +100,7 @@ pub(crate) struct DependencyPackActivator {
     wake: Condvar,
     events: Sender<DependencyPackActivation>,
     completions: Receiver<DependencyPackActivation>,
+    completed: Arc<(Mutex<Option<DependencyPackActivation>>, Condvar)>,
 }
 
 impl DependencyPackActivator {
@@ -122,6 +111,7 @@ impl DependencyPackActivator {
             wake: Condvar::new(),
             events,
             completions,
+            completed: Arc::new((Mutex::new(None), Condvar::new())),
         })
     }
 
@@ -141,29 +131,49 @@ impl DependencyPackActivator {
         snapshot: Arc<WorkspaceAnalyzer>,
         config: AnalyzerConfig,
         ecosystems: Vec<DependencyPackEcosystem>,
-        catalog_root: Option<PathBuf>,
+        workspace_root: PathBuf,
+        packs_config: Option<WorkspacePacksConfig>,
+        config_error: Option<String>,
     ) -> u64 {
-        assert!(
-            !ecosystems.is_empty(),
-            "scheduling an activation over no ecosystem cannot publish proof"
-        );
         let mut state = self.lock();
         if state.stopped {
             return state.next_generation;
         }
         state.next_generation = state.next_generation.saturating_add(1);
         let generation = state.next_generation;
-        // The superseded job's snapshot is older than this one, so finishing it
-        // would publish proof the next job immediately replaces.
+        *self
+            .completed
+            .0
+            .lock()
+            .expect("dependency-pack completion lock poisoned") = None;
+        // A disabled or malformed replacement must also supersede an older
+        // running activation; otherwise that job could publish stale proof
+        // after the new generation has already become current.
         if let Some(running) = state.running.as_ref() {
             running.cancel();
+        }
+        if ecosystems.is_empty() || config_error.is_some() {
+            let completion = DependencyPackActivation {
+                generation,
+                config: packs_config,
+                config_error: config_error.clone(),
+                activation: None,
+                ecosystems,
+                refresh_required: false,
+                incomplete_detail: config_error,
+            };
+            drop(state);
+            self.set_completion(completion);
+            return generation;
         }
         state.pending = Some(ActivationJob {
             generation,
             snapshot,
             config,
             ecosystems,
-            catalog_root,
+            workspace_root,
+            packs_config,
+            config_error,
             cancellation: CancellationToken::new(),
         });
         if state.worker.is_none() {
@@ -188,16 +198,57 @@ impl DependencyPackActivator {
         generation
     }
 
-    /// Cancel the queued and running jobs without stopping the worker. Used
-    /// when the client turns the diagnostic opt-in off.
-    pub(crate) fn cancel(&self) {
-        let mut state = self.lock();
-        state.pending = None;
-        if let Some(running) = state.running.as_ref() {
-            running.cancel();
+    pub(crate) fn current_completion(&self) -> Option<DependencyPackActivation> {
+        self.completed
+            .0
+            .lock()
+            .expect("dependency-pack completion lock poisoned")
+            .clone()
+    }
+
+    pub(crate) fn wait_for_generation(&self, generation: u64) -> Option<DependencyPackActivation> {
+        let mut completed = self
+            .completed
+            .0
+            .lock()
+            .expect("dependency-pack completion lock poisoned");
+        loop {
+            if completed
+                .as_ref()
+                .is_some_and(|completion| completion.generation == generation)
+            {
+                return completed.clone();
+            }
+            drop(completed);
+            if self.lock().stopped {
+                return None;
+            }
+            completed = self
+                .completed
+                .0
+                .lock()
+                .expect("dependency-pack completion lock poisoned");
+            if completed
+                .as_ref()
+                .is_some_and(|completion| completion.generation == generation)
+            {
+                return completed.clone();
+            }
+            completed = self
+                .completed
+                .1
+                .wait(completed)
+                .expect("dependency-pack completion lock poisoned");
         }
-        drop(state);
-        self.wake.notify_all();
+    }
+
+    fn set_completion(&self, completion: DependencyPackActivation) {
+        *self
+            .completed
+            .0
+            .lock()
+            .expect("dependency-pack completion lock poisoned") = Some(completion);
+        self.completed.1.notify_all();
     }
 
     /// Cancel everything and join the worker. Called once on session teardown.
@@ -212,6 +263,7 @@ impl DependencyPackActivator {
             state.worker.take()
         };
         self.wake.notify_all();
+        self.completed.1.notify_all();
         if let Some(handle) = handle
             && handle.join().is_err()
         {
@@ -227,11 +279,6 @@ impl DependencyPackActivator {
 }
 
 fn run_worker(activator: &Arc<DependencyPackActivator>) {
-    // The catalog holds SQLite state, so it stays on this thread for the
-    // session's lifetime and is opened only once a job actually needs it. The
-    // cache is keyed by the configured root so a packs-document change to
-    // another catalog reopens it instead of publishing from the old one.
-    let mut catalog: Option<(Option<PathBuf>, SemanticPackCatalog)> = None;
     loop {
         let job = {
             let mut state = activator.lock();
@@ -250,23 +297,21 @@ fn run_worker(activator: &Arc<DependencyPackActivator>) {
             }
         };
 
-        let completion = run_job(&mut catalog, &job);
+        let completion = run_job(&job);
         {
             let mut state = activator.lock();
             state.running = None;
-            if catalog.is_none() {
-                // The catalog could not be opened, so no later job can publish
-                // proof either. Stop rather than retry the same failure per
-                // keystroke.
-                state.stopped = true;
-                state.pending = None;
-            }
         }
-        if let Some(completion) = completion
-            && activator.events.send(completion).is_err()
-        {
-            // The main loop has gone; nothing can consume further completions.
-            return;
+        if let Some(completion) = completion {
+            let current_generation = activator.lock().next_generation;
+            if current_generation != completion.generation {
+                continue;
+            }
+            activator.set_completion(completion.clone());
+            if activator.events.send(completion).is_err() {
+                // The main loop has gone; nothing can consume further completions.
+                return;
+            }
         }
     }
 }
@@ -274,77 +319,62 @@ fn run_worker(activator: &Arc<DependencyPackActivator>) {
 /// Run one activation. Returns `None` when the job was cancelled before it
 /// could publish, so the main loop is not asked to refresh for a job that
 /// deliberately changed nothing.
-fn run_job(
-    catalog: &mut Option<(Option<PathBuf>, SemanticPackCatalog)>,
-    job: &ActivationJob,
-) -> Option<DependencyPackActivation> {
+fn run_job(job: &ActivationJob) -> Option<DependencyPackActivation> {
     if job.cancellation.is_cancelled() {
         return None;
     }
-    if catalog
-        .as_ref()
-        .is_none_or(|(root, _)| *root != job.catalog_root)
-    {
-        let opened = match &job.catalog_root {
-            // Read-write so packs generated from local artifacts persist
-            // across sessions at the workspace-configured location (#1868).
-            Some(root) => SemanticPackCatalog::open(
-                root,
-                CatalogOpenMode::ReadWrite,
-                CatalogOptions::default(),
-            ),
-            None => SemanticPackCatalog::open_ephemeral(CatalogOptions::default()),
-        };
-        match opened {
-            Ok(opened) => *catalog = Some((job.catalog_root.clone(), opened)),
-            Err(error) => {
-                *catalog = None;
-                eprintln!(
-                    "[bifrost-lsp] dependency-pack catalog is unavailable, unrecognized-symbol \
-                     diagnostics stay suppressed: {error}"
-                );
-                return None;
-            }
-        }
-    }
-    let (_, catalog) = catalog.as_ref().expect("catalog opened above");
-    let activation = SemanticModelActivationRequest {
-        bifrost_version: Version::parse(env!("CARGO_PKG_VERSION"))
-            .expect("package version must be semver"),
-        evidence: Vec::new(),
-        controls: Vec::new(),
-        limits: SemanticModelRuntimeLimits::default(),
-    };
     let started = Instant::now();
-    let outcome = job.snapshot.activate_dependency_packs(
+    let outcome = activate_workspace_semantic_sources(
+        job.snapshot.as_ref(),
         &job.config,
-        &job.ecosystems,
-        DependencyPackWorkspaceContext {
-            catalog,
-            persistence: None,
-            activation: &activation,
-            limits: DependencyPackLimits::default(),
-            cancellation: &job.cancellation,
+        WorkspaceActivationSources {
+            catalog_root: &job.workspace_root,
+            workspace_model_root: None,
+            config: job.packs_config.as_ref(),
         },
+        &job.cancellation,
     );
+    let (activation, incomplete_detail, refresh_required, complete) = match outcome {
+        Ok(Some(activation)) => {
+            let complete = activation.outcome.complete();
+            let incomplete_detail = (!complete).then(|| format!("{activation:#?}"));
+            let refresh_required = activation.outcome.diagnostic_refresh_required;
+            (
+                Some(Arc::new(activation)),
+                incomplete_detail,
+                refresh_required,
+                complete,
+            )
+        }
+        Ok(None) => (None, None, false, true),
+        Err(error) => {
+            eprintln!(
+                "[bifrost-lsp] dependency-pack activation is unavailable, \
+                 unrecognized-symbol diagnostics stay suppressed: {error}"
+            );
+            (None, Some(error.to_string()), false, false)
+        }
+    };
     // One line per activation, so a rollout campaign can read activation
     // latency and completeness out of an ordinary session log (#1628).
     eprintln!(
         "{ACTIVATION_LOG_PREFIX} ecosystems={:?} elapsed_ms={:.3} complete={} refresh={} cancelled={}",
         job.ecosystems,
         started.elapsed().as_secs_f64() * 1000.0,
-        outcome.complete(),
-        outcome.diagnostic_refresh_required,
+        complete,
+        refresh_required,
         job.cancellation.is_cancelled(),
     );
-    if job.cancellation.is_cancelled() && !outcome.diagnostic_refresh_required {
+    if job.cancellation.is_cancelled() && !refresh_required {
         return None;
     }
-    let incomplete_detail = (!outcome.complete()).then(|| format!("{outcome:#?}"));
     Some(DependencyPackActivation {
         generation: job.generation,
+        config: job.packs_config.clone(),
+        config_error: job.config_error.clone(),
+        activation,
         ecosystems: job.ecosystems.clone(),
-        refresh_required: outcome.diagnostic_refresh_required,
+        refresh_required,
         incomplete_detail,
     })
 }
@@ -352,10 +382,6 @@ fn run_job(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn languages(languages: &[Language]) -> BTreeSet<Language> {
-        languages.iter().copied().collect()
-    }
 
     #[test]
     fn every_ecosystem_declares_a_dependency_input_that_maps_back_to_it() {
@@ -372,22 +398,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn ecosystem_selection_follows_the_languages_present() {
-        assert_eq!(
-            ecosystems_for_languages(&languages(&[Language::Python])),
-            vec![DependencyPackEcosystem::Python]
-        );
-        assert_eq!(
-            ecosystems_for_languages(&languages(&[Language::Kotlin, Language::Go])),
-            vec![DependencyPackEcosystem::Jvm, DependencyPackEcosystem::Go]
-        );
-        assert_eq!(
-            ecosystems_for_languages(&languages(&[Language::Cpp])),
-            vec![DependencyPackEcosystem::Cpp]
-        );
     }
 
     #[test]

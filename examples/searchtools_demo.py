@@ -28,13 +28,9 @@ version-pinned check (forced binary wheel + origin assertions), use
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from pathlib import Path
 
-# Keep the background semantic indexer (and its model download) out of a plain
-# "does it work" run. Export BIFROST_SEMANTIC_INDEX=on yourself to opt back in.
-os.environ.setdefault("BIFROST_SEMANTIC_INDEX", "off")
 
 from bifrost_searchtools import SearchToolsClient
 

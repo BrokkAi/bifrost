@@ -243,6 +243,12 @@ pub fn explain_match_candidate(
         .iter()
         .find(|selector| selector.path.as_str() == MATCH_SELECTOR_PATH)
         .ok_or(ExplainError::SelectorUnavailable)?;
+    let Some((_, query)) = selector.as_query() else {
+        return Err(ExplainError::PolicyUnavailable {
+            message: "match explanations require a query selector; row selectors are endpoint-only"
+                .to_owned(),
+        });
+    };
     if limits.max_prefix_executions() == 0 {
         return Err(ExplainError::BudgetExhausted {
             limit: ExplanationBudgetLimit::PrefixExecutions,
@@ -250,7 +256,7 @@ pub fn explain_match_candidate(
     }
 
     let stages = run_prefixes(
-        &selector.query,
+        query,
         context,
         candidate,
         budget,
@@ -258,7 +264,7 @@ pub fn explain_match_candidate(
         PrefixExecution::AnalyzerOnly,
         budget.max_findings(),
     );
-    let root = candidate_root(candidate, &selector.query, stages);
+    let root = candidate_root(candidate, query, stages);
     build_explanation(
         ExplanationQuestion::WhyNot,
         policy.definition().metadata.id.clone(),

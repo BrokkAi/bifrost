@@ -1704,6 +1704,7 @@ fn js_commonjs_export_assignment_name(
     let exposes_surface = value.is_some_and(|value| {
         matches!(value.kind(), "arrow_function" | "function_expression")
             || js_initializer_has_surface_shape(value, source)
+            || !matches!(value.kind(), "identifier" | "member_expression")
     });
     if !exposes_surface {
         return None;

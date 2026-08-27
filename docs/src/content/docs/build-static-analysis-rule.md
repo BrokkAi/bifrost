@@ -134,7 +134,7 @@ use serde_json::json;
 use std::path::PathBuf;
 
 fn run_rule(root: PathBuf) -> Result<CodeQueryResult, String> {
-    let service = SearchToolsService::new_without_semantic_index(root)?;
+    let service = SearchToolsService::new(root)?;
     let result = service.query_code_result(json!({
         "schema_version": 1,
         "languages": ["python"],
@@ -146,7 +146,7 @@ fn run_rule(root: PathBuf) -> Result<CodeQueryResult, String> {
 }
 ```
 
-`query_code_result` returns the Rust `CodeQueryResult` directly. Constructing `SearchToolsService` owns workspace indexing and file watching for a long-lived integration. Use `new_without_semantic_index` when this rule does not need the optional embedding service.
+`query_code_result` returns the Rust `CodeQueryResult` directly. Constructing `SearchToolsService` owns workspace indexing and file watching for a long-lived integration.
 
 ## 5. Consume Every Result Variant
 

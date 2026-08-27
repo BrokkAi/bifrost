@@ -489,7 +489,19 @@ test("an artifact whose name carries no commit is not reusable", () => {
   });
 });
 
-function completeBundle(dir, { crates = 20, wheels = 10, vsix = 1, tgz = 1, sidecars = 8, notices = true } = {}) {
+// The inventory check counts *.crate archives against RELEASE_CRATES, so a
+// complete bundle must hold exactly that many. Reading the count from the
+// shared inventory keeps this fixture from drifting when a crate is added or
+// removed, which is how a fixed 20 outlived the NLP crate's removal.
+const releaseCrateCount = Number(
+  execFileSync(
+    BASH,
+    ["-c", 'source "$1"; echo "${#RELEASE_CRATES[@]}"', "bash", path.join(repoRoot, "scripts", "lib", "release-crates.sh")],
+    { encoding: "utf8" },
+  ).trim(),
+);
+
+function completeBundle(dir, { crates = releaseCrateCount, wheels = 10, vsix = 1, tgz = 1, sidecars = 8, notices = true } = {}) {
   const bundle = path.join(dir, "qualification-bundle");
   fs.mkdirSync(bundle, { recursive: true });
   for (let index = 0; index < crates; index += 1) {
@@ -527,7 +539,7 @@ test("a complete qualification bundle passes the inventory check", () => {
 
 test("the inventory check counts crates against the release crate inventory", () => {
   withTempDir((dir) => {
-    const result = inventoryRun(completeBundle(dir, { crates: 18 }));
+    const result = inventoryRun(completeBundle(dir, { crates: releaseCrateCount - 1 }));
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, /\*\.crate,/u);
   });

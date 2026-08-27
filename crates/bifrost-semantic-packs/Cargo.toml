@@ -34,8 +34,8 @@ path = "src/bin/bifrost-semantic-pack.rs"
 required-features = ["release-tooling"]
 
 [dependencies]
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.10.6" }
-brokk-bifrost-flow = { path = "../bifrost-flow", version = "=0.10.6" }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.10.7" }
+brokk-bifrost-flow = { path = "../bifrost-flow", version = "=0.10.7" }
 semver = { version = "1.0.28", optional = true }
 serde = { version = "1.0.228", features = ["derive"], optional = true }
 serde_json = { version = "1.0.145", optional = true }

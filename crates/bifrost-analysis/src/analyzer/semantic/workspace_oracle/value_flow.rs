@@ -26,7 +26,7 @@ use crate::analyzer::semantic::{
     DispatchCandidate, EvidenceCompleteness, EvidenceHandle, FormalMultiplicity, HeapOracle,
     IndexSelector, MemoryLocationId, MemoryLocationKind, ObjectCardinality, OracleCallContext,
     OracleCandidate, OracleRelationArena, OracleRelationHandle, OracleRelationId,
-    OracleRelationKind, OracleRelationOwner, OracleRelationRecord, ProcedureHandle,
+    OracleRelationKind, OracleRelationOwner, OracleRelationRecord, ProcedureHandle, ProcedureKind,
     ProcedurePortHandle, ProgramPointHandle, ProgramPointId, ProofStatus, ScopedSemanticLocator,
     SemanticCapability, SemanticEffect, SemanticGapDischarge, SemanticGapImpact, SemanticGapKind,
     SemanticGapSubject, SemanticLocator, SemanticOutcome, SemanticProviderError, SemanticRequest,
@@ -830,11 +830,24 @@ pub fn implicit_abort_gap_is_discharged(
 ///   receiver) never carries the caller's `this`.
 /// - An inherited, companion-object, or imported-singleton member does not
 ///   share the declaration parent.
-/// - Sibling callables outside a declaring type (JavaScript file-level
-///   functions, Ruby top-level methods) own a `this`/`self` without sharing
-///   it through a bare call.
+/// - Sibling callables outside a declaring type that are not dispatched
+///   members -- JavaScript file-level `function` declarations, which own a
+///   `this` but receive `undefined`, not the caller's, through a bare call --
+///   do not share it either.
 ///
 /// Those shapes return `None` and the binding stays honestly open.
+///
+/// The shared parent does not have to be a type. A Ruby top-level `def` is a
+/// private instance method of `Object` lowered as `ProcedureKind::Method`
+/// with a `File` parent, and a `def` in a `module` body has a `Namespace`
+/// parent; in both, a bare sibling call dispatches on the caller's own `self`
+/// exactly as a same-class call does (#2637). The kind is what separates that
+/// from the JavaScript case: a `Method` is by construction invoked on a
+/// receiver object, so a receiverless call to one is an implicit-`self`
+/// dispatch, while a `Function` is not a member and its bare call binds no
+/// caller `this`. The type-parent arm is kept as its own disjunct so a
+/// non-member caller inside a type -- a static initializer, say -- keeps the
+/// binding it already had.
 fn implicit_dispatch_receiver_actual<'caller>(
     caller: &'caller ProcedureHandle,
     callee: &ProcedureHandle,
@@ -852,12 +865,19 @@ fn implicit_dispatch_receiver_actual<'caller>(
     let callee_locator = callee.semantics().locator();
     let (_, caller_parent) = caller_locator.declaration().segments().split_last()?;
     let (_, callee_parent) = callee_locator.declaration().segments().split_last()?;
+    let dispatched_member = |procedure: &ProcedureHandle| {
+        matches!(
+            procedure.semantics().kind(),
+            ProcedureKind::Method | ProcedureKind::Constructor
+        )
+    };
     (caller_locator.mount() == callee_locator.mount()
         && caller_locator.path() == callee_locator.path()
         && caller_parent == callee_parent
-        && caller_parent
+        && (caller_parent
             .last()
-            .is_some_and(|segment| segment.kind() == DeclarationSegmentKind::Type))
+            .is_some_and(|segment| segment.kind() == DeclarationSegmentKind::Type)
+            || (dispatched_member(caller) && dispatched_member(callee))))
     .then_some(caller_receiver)
 }
 

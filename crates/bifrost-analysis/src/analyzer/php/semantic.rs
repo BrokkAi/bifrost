@@ -19,7 +19,7 @@ use crate::analyzer::tree_sitter_analyzer::{
 use crate::analyzer::{DispatchExtensibility, Language, PhpAnalyzer, ProjectFile};
 use crate::hash::HashMap;
 
-const ADAPTER_VERSION: &[u8] = b"php-value-semantics-v2";
+const ADAPTER_VERSION: &[u8] = b"php-value-semantics-v3";
 
 impl_program_semantics_provider!(PhpAnalyzer, PhpSemanticLowerer);
 
@@ -70,13 +70,15 @@ impl ProgramSemanticsLowerer for PhpSemanticLowerer {
                 }
             };
 
+        let classes = php_class_inventory(prepared);
+
         lower_procedure_batch(
             &specs,
             initial_work,
             budget,
             cancellation,
             |spec, staged_budget, cancellation| {
-                lower_procedure(prepared, spec, staged_budget, cancellation)
+                lower_procedure(prepared, &classes, spec, staged_budget, cancellation)
             },
         )
     }
@@ -115,13 +117,26 @@ fn php_capabilities() -> SemanticCapabilities {
         SemanticCapability::DeferredExecution,
         SemanticCapability::NonLocalControl,
         SemanticCapability::ResourceManagement,
+        // `Partial` states the exact limit: every decision the condition
+        // lowering reaches publishes a row, but only a constant `true` or
+        // `false` -- through any number of `!` and parenthesis wrappers -- is
+        // normalized, and everything else is recorded `Opaque`. Conditional
+        // edges this adapter synthesizes outside condition lowering, such as
+        // the `??` null gate, the `foreach` header's exhaustion test, and
+        // `switch`/`match` arm dispatch, publish no guard row at all (#2443).
+        SemanticCapability::GuardFacts,
+        // Partial: a property write and read spelled `$o->name`, and an element
+        // write and read spelled `$a[k]`, lower into real memory rows whenever
+        // the target is a single such place (#2663). A dynamic property name,
+        // a static property, a destructuring target, a reference assignment,
+        // and a variable-variable still publish their own gaps instead, and a
+        // non-constant element key publishes an index-memory gap on the
+        // location it could not identify.
+        SemanticCapability::FieldMemory,
+        SemanticCapability::IndexMemory,
     ] {
         builder = builder.partial(capability);
     }
-    // Explicitly unsupported: this adapter normalizes no branch conditions, so
-    // an empty `guard_facts` table means "this language publishes no guard
-    // facts" rather than "this procedure has no decision" (#2443).
-    builder = builder.unsupported(SemanticCapability::GuardFacts);
     builder.build()
 }
 
@@ -549,6 +564,20 @@ struct LoweringContext<'tree, 'targets> {
     next_control_label: usize,
     cleanups: Vec<CleanupRegion<'tree>>,
     controls: HashMap<ScopeFrameId, Box<[PhpControlFrame]>>,
+    /// Every class-like declaration this file states, shared by every
+    /// procedure lowered from it.
+    classes: &'tree PhpClassInventory,
+    /// The class this procedure is written in, which is what `$this` holds.
+    enclosing_class: Option<Box<str>>,
+    /// What each local name of this procedure holds.
+    local_types: HashMap<Box<str>, PhpLocalType>,
+    /// The memory-location identity of a property whose declaration this file
+    /// does not state, interned once per name per procedure so a store and a
+    /// load of the same name still meet.
+    field_locators: HashMap<Box<str>, SemanticLocator>,
+    /// One value per distinct constant element key, so `$a["k"]` written and
+    /// `$a["k"]` read name the same index value.
+    constant_index_values: HashMap<Box<str>, ValueId>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -559,6 +588,7 @@ struct LocalBinding {
 
 fn lower_procedure<'tree>(
     prepared: &'tree PreparedSyntaxTree,
+    classes: &'tree PhpClassInventory,
     spec: &ProcedureSpec<'tree>,
     budget: &SemanticBudget,
     cancellation: &CancellationToken,
@@ -582,6 +612,14 @@ fn lower_procedure<'tree>(
     } = ProcedureLoweringSession::start(parts, budget, cancellation)?;
     let mut controls = HashMap::default();
     controls.insert(function_scope, Box::default());
+    let enclosing_class = enclosing_class_name(prepared.source(), spec.callable);
+    let local_types = php_local_types(
+        prepared,
+        classes,
+        spec.callable,
+        spec.body,
+        enclosing_class.as_deref(),
+    );
     let mut context = LoweringContext {
         prepared,
         session,
@@ -592,6 +630,11 @@ fn lower_procedure<'tree>(
         next_control_label: 0,
         cleanups: Vec::new(),
         controls,
+        classes,
+        enclosing_class,
+        local_types,
+        field_locators: HashMap::default(),
+        constant_index_values: HashMap::default(),
     };
     context.emit_procedure_inputs(
         &mut builder,
@@ -792,17 +835,27 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             if node.id() != body.id() && is_callable_kind(node.kind()) {
                 return Ok(WalkControl::SkipChildren);
             }
-            if node.kind() == "assignment_expression"
-                && let Some(left) = node.child_by_field_name("left")
-                && left.kind() == "variable_name"
-            {
+            // A `foreach` clause binds its targets exactly as an assignment
+            // does, and the loop body reads them, so they are locals of this
+            // procedure too.
+            let bound = if node.kind() == "foreach_statement" {
+                php_foreach_targets(node).0
+            } else if node.kind() == "assignment_expression" {
+                node.child_by_field_name("left")
+                    .filter(|left| left.kind() == "variable_name")
+                    .into_iter()
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            for left in bound {
                 let name = php_variable_name(self.prepared.source(), left);
                 if name.is_empty()
                     || name == "this"
                     || self.parameters.contains_key(name)
                     || self.locals.contains_key(name)
                 {
-                    return Ok(WalkControl::Continue);
+                    continue;
                 }
                 let metadata = self.value_mapping(builder, left)?;
                 let value = self.session.add_value_with_metadata(
@@ -983,6 +1036,20 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             );
         }
 
+        if let Some(place) = php_place(left) {
+            let value = self.expression_value(builder, right, expression_value_kind(right))?;
+            let evaluations = self.emit_memory_store(builder, terminal, &place, value, right)?;
+            self.edge(builder, terminal, next)?;
+            return self.schedule_expressions(
+                builder,
+                entry,
+                &evaluations,
+                EdgeTarget::normal(terminal),
+                scope,
+                stack,
+            );
+        }
+
         self.add_magic_dispatch_gaps(builder, terminal, "property or indexed assignment")?;
         self.add_gap(
             builder,
@@ -990,7 +1057,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             SemanticGapSubject::Point,
             SemanticCapability::Assignments,
             SemanticGapKind::Unsupported,
-            "PHP property, index, destructuring, and dynamic-variable assignment flow is not lowered",
+            php_declined_assignment_detail(left),
         )?;
         self.edge(builder, terminal, next)?;
         let children = runtime_expression_children(node);
@@ -1056,6 +1123,35 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), PhpLoweringError> {
+        // A folded literal keeps exactly one arm, so an `if (false)` body is
+        // never reachable. Recording the guard is what keeps the fold legible:
+        // after it, nothing else in the frozen artifact says the branch was
+        // constant (#2443).
+        if let Some(value) = php_folded_boolean_constant(self.prepared.source(), node) {
+            let taken = if value { when_true } else { when_false };
+            self.edge(builder, entry, taken)?;
+            return self.record_guard(
+                builder,
+                entry,
+                GuardPredicate::ConstantBoolean { value },
+                None,
+                value.then_some(when_true),
+                (!value).then_some(when_false),
+            );
+        }
+        // A negated guard is the same guard with its outcome swapped rather
+        // than a decision of its own, so `!` is peeled instead of minting a
+        // decision point that tests the negation's own value.
+        if let Some(operand) = php_logical_not_operand(node) {
+            stack.push(Work::Condition {
+                node: operand,
+                entry,
+                when_true: when_false,
+                when_false: when_true,
+                scope,
+            });
+            return Ok(());
+        }
         match (node.kind(), php_short_circuit_operator(node)) {
             ("binary_expression", Some("&&" | "and")) => {
                 let left = required_field(node, "left")?;
@@ -1198,6 +1294,19 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let decision = self.point(builder, node, Vec::new())?;
                 self.edge(builder, decision, when_true)?;
                 self.edge(builder, decision, when_false)?;
+                // The condition's own value is the one thing an opaque guard
+                // can honestly name: the decision tested it, whatever it means.
+                let subject = self.expression_value(builder, node, expression_value_kind(node))?;
+                self.record_guard(
+                    builder,
+                    decision,
+                    GuardPredicate::Opaque {
+                        digest: GuardConditionDigest::from_syntax_kind(node.kind()),
+                    },
+                    Some(subject),
+                    Some(when_true),
+                    Some(when_false),
+                )?;
                 stack.push(Work::Expression {
                     node,
                     entry,
@@ -1208,6 +1317,41 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 Ok(())
             }
         }
+    }
+
+    /// Publish one guard fact for a decision this lowerer just made.
+    ///
+    /// Only a constant boolean is normalized today. Everything else this
+    /// lowerer decides is recorded `Opaque` rather than guessed, so an absent
+    /// guard row means the condition lowering made no decision at that point
+    /// at all -- which is what makes the [`SemanticCapability::GuardFacts`]
+    /// entry readable. Arms must already have been added as edges; the IR
+    /// validator enforces that.
+    #[allow(clippy::too_many_arguments)]
+    fn record_guard(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        predicate: GuardPredicate,
+        subject: Option<ValueId>,
+        when_true: Option<EdgeTarget>,
+        when_false: Option<EdgeTarget>,
+    ) -> Result<(), PhpLoweringError> {
+        let arm = |target: Option<EdgeTarget>| {
+            target.map(|target| GuardArm {
+                target_point: target.point,
+                kind: target.kind,
+            })
+        };
+        self.session.add_guard_fact(
+            builder,
+            point,
+            predicate,
+            subject,
+            arm(when_true),
+            arm(when_false),
+        )?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1927,6 +2071,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         operands.remove(0);
         let test = self.point(builder, node, Vec::new())?;
         let binding = self.point(builder, node, Vec::new())?;
+        self.emit_foreach_binding(builder, node, binding, iterable)?;
         let body_entry = self.point(builder, body.unwrap_or(node), Vec::new())?;
         let loop_scope =
             self.push_loop_scope(builder, scope, next, test, ControlEdgeKind::LoopBack);
@@ -2440,14 +2585,25 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), PhpLoweringError> {
         let boundary = self.point(builder, node, Vec::new())?;
-        let detail = match node.kind() {
-            "subscript_expression" => "array access and ArrayAccess protocol dispatch",
-            "class_constant_access_expression" => {
-                "class constant resolution, autoload, and access checks"
+        // A write target is not a read: a declined store still schedules its
+        // own operands, and the target itself must mint no load of the
+        // location that statement overwrites.
+        match php_place(node).filter(|_| !is_php_assignment_target(node)) {
+            Some(place) => self.emit_memory_load(builder, boundary, &place, node)?,
+            None => {
+                let detail = match node.kind() {
+                    "subscript_expression" => "array access and ArrayAccess protocol dispatch",
+                    "class_constant_access_expression" => {
+                        "class constant resolution, autoload, and access checks"
+                    }
+                    "scoped_property_access_expression" => {
+                        "static property resolution, autoload, and access checks"
+                    }
+                    _ => "computed property access and magic property dispatch",
+                };
+                self.add_magic_dispatch_gaps(builder, boundary, detail)?;
             }
-            _ => "property access and magic property dispatch",
-        };
-        self.add_magic_dispatch_gaps(builder, boundary, detail)?;
+        }
         self.edge(builder, boundary, next)?;
 
         let chain_destination = chain_short_circuit.unwrap_or(next.point);
@@ -2977,7 +3133,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "member, late-static, or runtime-class dispatch may select an override, constructor, or magic method; receiver/runtime class and complete target coverage require class-hierarchy refinement",
             )?;
         }
-        if node.kind() == "object_creation_expression" {
+        // A class this file states in full, with no supertype, no interface,
+        // no trait use, and no `__destruct`, runs no user code when its
+        // instance is released. There is then no destructor timing to lower
+        // and nothing for the gap to refine, so publishing one would hold
+        // every allocation's snapshot open on a question the source answers.
+        if node.kind() == "object_creation_expression" && !self.creation_lifetime_is_closed(node) {
             self.add_gap(
                 builder,
                 invoke,
@@ -3213,6 +3374,378 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             SemanticGapKind::Unsupported,
             &detail,
         )
+    }
+
+    /// What one local name or expression holds at this occurrence.
+    fn local_type_of(&self, node: Node<'tree>) -> Option<PhpLocalType> {
+        php_expression_local_type(
+            self.prepared.source(),
+            self.classes,
+            &self.local_types,
+            self.enclosing_class.as_deref(),
+            node,
+            0,
+        )
+    }
+
+    /// Whether releasing what this creation expression allocates runs no user
+    /// code, so its lifetime holds nothing left to model.
+    fn creation_lifetime_is_closed(&self, node: Node<'tree>) -> bool {
+        let Some(PhpLocalType::Class(class)) = php_expression_local_type(
+            self.prepared.source(),
+            self.classes,
+            &self.local_types,
+            self.enclosing_class.as_deref(),
+            node,
+            0,
+        ) else {
+            return false;
+        };
+        self.classes
+            .get(&class)
+            .is_some_and(|facts| facts.lifetime_is_closed)
+    }
+
+    /// Whether an access to this place can run no user code.
+    ///
+    /// PHP reaches for `__get`/`__set` only when the property is not an
+    /// accessible declared one, and reaches for the `ArrayAccess` protocol
+    /// only when the base is an object. A declared property of a class this
+    /// file states in full, and an element of a value this procedure proved to
+    /// be a PHP array, are therefore settled by the syntax alone.
+    fn access_is_closed(&self, place: &PhpPlace<'tree>) -> bool {
+        match place {
+            PhpPlace::Field { object, name } => {
+                let Some(PhpLocalType::Class(class)) = self.local_type_of(*object) else {
+                    return false;
+                };
+                let Some(property) = nonempty_node_text(self.prepared.source(), *name) else {
+                    return false;
+                };
+                self.classes.get(&class).is_some_and(|facts| {
+                    facts.access_is_closed && facts.properties.contains_key(property)
+                })
+            }
+            PhpPlace::Element { object, .. } => {
+                object.kind() == "array_creation_expression"
+                    || self.local_type_of(*object) == Some(PhpLocalType::Array)
+            }
+        }
+    }
+
+    /// The memory-location identity of `$object->name`, and whether it is the
+    /// property's own declaration.
+    ///
+    /// A property is looked up by name at run time, so every occurrence of one
+    /// name on one object names the same location whatever the static type
+    /// says. The declaration is still the identity that lets two procedures of
+    /// a file agree; when this file does not state it -- an unresolved object
+    /// class, an imported class, a name two classes share -- the locator falls
+    /// back to one interned per property name per procedure, and the caller
+    /// publishes a field-identity gap for it.
+    fn memory_member_locator(
+        &mut self,
+        object: Node<'tree>,
+        name: Node<'tree>,
+    ) -> Result<(SemanticLocator, bool), PhpLoweringError> {
+        let property = nonempty_node_text(self.prepared.source(), name);
+        let declaration_anchor = property.and_then(|property| {
+            let PhpLocalType::Class(class) = self.local_type_of(object)? else {
+                return None;
+            };
+            self.classes
+                .get(&class)?
+                .properties
+                .get(property)
+                .copied()
+                .flatten()
+        });
+        if let Some(property) = property
+            && declaration_anchor.is_none()
+            && let Some(locator) = self.field_locators.get(property)
+        {
+            return Ok((locator.clone(), false));
+        }
+        let resolved = declaration_anchor.is_some();
+        let anchor = match declaration_anchor {
+            Some(anchor) => anchor,
+            None => source_anchor(name, 0).map_err(PhpLoweringError::Invalid)?,
+        };
+        let procedure = self.session.locator();
+        let locator = SemanticLocator::new(
+            procedure.mount(),
+            procedure.path().clone(),
+            procedure.language(),
+            procedure.declaration().clone(),
+            SemanticRole::MemoryLocation,
+            anchor,
+        );
+        if !resolved && let Some(property) = property {
+            self.field_locators.insert(property.into(), locator.clone());
+        }
+        Ok((locator, resolved))
+    }
+
+    /// The key value of `$array[key]`, when the key is a constant.
+    ///
+    /// A store and a load meet on an exact element only when both name the
+    /// same value, so one value is interned per distinct key text. A computed
+    /// key has no proven identity here and yields `None`, which the caller
+    /// turns into an any-element location plus an index-memory gap.
+    fn index_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+    ) -> Result<Option<ValueId>, PhpLoweringError> {
+        let Some(key) = php_constant_key(self.prepared.source(), node) else {
+            return Ok(None);
+        };
+        if let Some(value) = self.constant_index_values.get(&key) {
+            let value = *value;
+            self.expression_values.insert(node.id(), value);
+            return Ok(Some(value));
+        }
+        let value = self.expression_value(builder, node, SemanticValueKind::Constant)?;
+        self.constant_index_values.insert(key, value);
+        Ok(Some(value))
+    }
+
+    fn add_field_identity_gap(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        location: MemoryLocationId,
+    ) -> Result<(), PhpLoweringError> {
+        self.session.add_gap_with_impacts(
+            builder,
+            point,
+            SemanticGapSubject::MemoryLocation(location),
+            SemanticCapability::FieldMemory,
+            SemanticGapImpacts::single(SemanticGapImpact::HeapRead)
+                .with(SemanticGapImpact::HeapWrite)
+                .with(SemanticGapImpact::Aliasing),
+            SemanticGapKind::Unknown,
+            "PHP property occurrence is structured, but the class that declares it is not resolved",
+        )?;
+        Ok(())
+    }
+
+    fn add_dynamic_index_gap(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        location: MemoryLocationId,
+        detail: &str,
+    ) -> Result<(), PhpLoweringError> {
+        self.session.add_gap_with_impacts(
+            builder,
+            point,
+            SemanticGapSubject::MemoryLocation(location),
+            SemanticCapability::IndexMemory,
+            SemanticGapImpacts::single(SemanticGapImpact::HeapRead)
+                .with(SemanticGapImpact::HeapWrite)
+                .with(SemanticGapImpact::Aliasing),
+            SemanticGapKind::Unsupported,
+            detail,
+        )?;
+        Ok(())
+    }
+
+    /// The memory location a place names, plus its own identity gaps.
+    fn memory_location(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        place: &PhpPlace<'tree>,
+    ) -> Result<(MemoryLocationId, MemoryAccessKind), PhpLoweringError> {
+        match place {
+            PhpPlace::Field { object, name } => {
+                let base =
+                    self.expression_value(builder, *object, expression_value_kind(*object))?;
+                let (member, resolved) = self.memory_member_locator(*object, *name)?;
+                let location = self.session.add_memory_location(
+                    builder,
+                    point,
+                    MemoryLocationKind::Field { base, member },
+                )?;
+                if !resolved {
+                    self.add_field_identity_gap(builder, point, location)?;
+                }
+                Ok((location, MemoryAccessKind::Field))
+            }
+            PhpPlace::Element { object, key } => {
+                let base =
+                    self.expression_value(builder, *object, expression_value_kind(*object))?;
+                let index = match key {
+                    Some(key) => self.index_value(builder, *key)?,
+                    None => None,
+                };
+                let location = self.session.add_memory_location(
+                    builder,
+                    point,
+                    MemoryLocationKind::Index { base, index },
+                )?;
+                if index.is_none() {
+                    self.add_dynamic_index_gap(
+                        builder,
+                        point,
+                        location,
+                        if key.is_some() {
+                            "PHP computed element key identity is not proven"
+                        } else {
+                            "PHP append writes an element whose key the source does not state"
+                        },
+                    )?;
+                }
+                Ok((location, MemoryAccessKind::Index))
+            }
+        }
+    }
+
+    /// The runtime protocols an access to this place may still reach.
+    ///
+    /// A settled access publishes only the implicit-abort claim, `Unsupported`
+    /// on a `Point` subject, which is the shape the shared discharge closes
+    /// when no handler or cleanup body runs user code (#1952). An unsettled
+    /// one keeps the magic-dispatch pair it published before.
+    fn emit_access_dispatch_gaps(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        place: &PhpPlace<'tree>,
+    ) -> Result<(), PhpLoweringError> {
+        if !self.access_is_closed(place) {
+            return self.add_magic_dispatch_gaps(builder, point, php_place_detail(place));
+        }
+        if matches!(place, PhpPlace::Element { .. }) {
+            // A missing element of a PHP array is a warning and a null read,
+            // not an abort, and an array is not an object, so nothing else
+            // remains.
+            return Ok(());
+        }
+        self.add_gap(
+            builder,
+            point,
+            SemanticGapSubject::Point,
+            SemanticCapability::ExceptionalControlFlow,
+            SemanticGapKind::Unsupported,
+            "PHP property access may abort on a null base",
+        )
+    }
+
+    /// Lower `place = value` into a real store, and answer what the statement
+    /// still evaluates. The target node itself is deliberately absent: reading
+    /// it would publish a load of the very location the statement writes.
+    fn emit_memory_store(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        place: &PhpPlace<'tree>,
+        value: ValueId,
+        right: Node<'tree>,
+    ) -> Result<Vec<Node<'tree>>, PhpLoweringError> {
+        let (location, kind) = self.memory_location(builder, point, place)?;
+        self.emit_access_dispatch_gaps(builder, point, place)?;
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::MemoryStore {
+                kind,
+                location,
+                value,
+            },
+        )?;
+        let mut evaluations = match place {
+            PhpPlace::Field { object, .. } => vec![*object],
+            PhpPlace::Element { object, key } => {
+                let mut evaluations = vec![*object];
+                evaluations.extend(*key);
+                evaluations
+            }
+        };
+        evaluations.push(right);
+        Ok(evaluations)
+    }
+
+    /// Lower a read of `place` into a real load whose result is the access
+    /// expression's own value.
+    fn emit_memory_load(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        place: &PhpPlace<'tree>,
+        node: Node<'tree>,
+    ) -> Result<(), PhpLoweringError> {
+        let result = self.expression_value(builder, node, expression_value_kind(node))?;
+        let (location, kind) = self.memory_location(builder, point, place)?;
+        self.emit_access_dispatch_gaps(builder, point, place)?;
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::MemoryLoad {
+                kind,
+                location,
+                result,
+            },
+        )
+    }
+
+    /// Lower what one `foreach` iteration binds.
+    ///
+    /// An iteration reads an element of the collection, so the loop variable
+    /// is loaded from the collection's any-element cell. That wildcard is not
+    /// an approximation here the way an unpinned subscript is one: the loop
+    /// visits every element, so the cell it reads is exactly all of them, and
+    /// the load publishes no index-identity gap. The key side is loaded from
+    /// the same cell, which over-approximates -- a key carries at most what
+    /// the collection carries -- and never removes a path.
+    fn emit_foreach_binding(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+        point: ProgramPointId,
+        iterable: Node<'tree>,
+    ) -> Result<(), PhpLoweringError> {
+        let (targets, unlowered) = php_foreach_targets(node);
+        if unlowered {
+            self.add_gap(
+                builder,
+                point,
+                SemanticGapSubject::Point,
+                SemanticCapability::Assignments,
+                SemanticGapKind::Unsupported,
+                "PHP foreach by-reference and destructuring targets are not lowered",
+            )?;
+        }
+        let slots = targets
+            .into_iter()
+            .filter_map(|target| {
+                let name = php_variable_name(self.prepared.source(), target);
+                self.local_declaration_value(name, target.start_byte())
+                    .or_else(|| self.binding_value(name).map(|(value, _)| value))
+            })
+            .collect::<Vec<_>>();
+        if slots.is_empty() {
+            return Ok(());
+        }
+        let base = self.expression_value(builder, iterable, expression_value_kind(iterable))?;
+        let location = self.session.add_memory_location(
+            builder,
+            point,
+            MemoryLocationKind::Index { base, index: None },
+        )?;
+        for result in slots {
+            self.append_effect(
+                builder,
+                point,
+                SemanticEffect::MemoryLoad {
+                    kind: MemoryAccessKind::Index,
+                    location,
+                    result,
+                },
+            )?;
+        }
+        Ok(())
     }
 
     fn add_magic_dispatch_gaps(
@@ -3675,6 +4208,60 @@ fn php_short_circuit_operator(node: Node<'_>) -> Option<&'static str> {
     }
 }
 
+/// The operand of a logical negation, or `None` when the node is any other
+/// unary operator.
+fn php_logical_not_operand(node: Node<'_>) -> Option<Node<'_>> {
+    if node.kind() != "unary_op_expression" {
+        return None;
+    }
+    let operator = node.child_by_field_name("operator")?;
+    (operator.kind() == "!")
+        .then(|| node.child_by_field_name("argument"))
+        .flatten()
+}
+
+/// The value a PHP boolean literal names.
+///
+/// PHP spells both constants case-insensitively, so `FALSE` and `False` are
+/// the same literal as `false`; the grammar folds every spelling into one
+/// `boolean` node whose token text is the only thing that distinguishes them.
+fn php_boolean_literal_value(source: &str, node: Node<'_>) -> Option<bool> {
+    if node.kind() != "boolean" {
+        return None;
+    }
+    let text = node_text(source, node)?;
+    if text.eq_ignore_ascii_case("true") {
+        Some(true)
+    } else if text.eq_ignore_ascii_case("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// The constant value of a condition, when its parenthesis and `!` wrappers
+/// bottom out in a boolean literal.
+///
+/// The wrappers are peeled through tree-sitter structure -- a named child for
+/// the parentheses, the `operator` and `argument` fields for the negation --
+/// so a shape this does not recognize stays a real decision rather than a
+/// guessed constant.
+fn php_folded_boolean_constant(source: &str, node: Node<'_>) -> Option<bool> {
+    let mut cursor = node;
+    let mut negated = false;
+    loop {
+        match cursor.kind() {
+            "parenthesized_expression" => cursor = first_runtime_named_child(cursor)?,
+            "unary_op_expression" => {
+                cursor = php_logical_not_operand(cursor)?;
+                negated = !negated;
+            }
+            _ => break,
+        }
+    }
+    php_boolean_literal_value(source, cursor).map(|value| value != negated)
+}
+
 fn statement_is_directly_abrupt(node: Node<'_>) -> bool {
     match node.kind() {
         "return_statement" | "break_statement" | "continue_statement" | "goto_statement"
@@ -4065,6 +4652,818 @@ fn normalize_php_name(name: &str) -> &str {
     name.trim_start_matches('$')
 }
 
+/// What one class-like declaration in this file states about its own members.
+///
+/// PHP resolves `$o->name` by the property's name at run time, so a memory
+/// location is identified by the object plus that name. The declaration is
+/// still what gives the name a stable identity across the procedures of a
+/// file, which is why the anchor is recorded here rather than at each
+/// occurrence.
+#[derive(Debug, Default)]
+struct PhpClassFacts {
+    /// Where each property this class declares is written down. A name the
+    /// class states more than once collapses to `None`: the occurrence alone
+    /// no longer picks a declaration.
+    properties: HashMap<Box<str>, Option<SourceAnchor>>,
+    /// The class each typed property holds, so a nested access path can name
+    /// the next class in the chain.
+    property_classes: HashMap<Box<str>, Box<str>>,
+    /// Whether an access to a declared property of this class is settled by
+    /// the declaration alone. A magic accessor, a trait use, a supertype, or
+    /// an implemented interface can all introduce behaviour this file does not
+    /// state, so any of them reopens the question.
+    access_is_closed: bool,
+    /// Whether this class's own body runs nothing when an instance is
+    /// released: this file states the class in full, it uses no trait, and it
+    /// declares no `__destruct`. This is only the class's own contribution --
+    /// what its properties hold is settled separately.
+    owns_no_release_code: bool,
+    /// Whether some declared property may hold an object this file cannot
+    /// follow. An untyped property, a namespace-qualified or otherwise
+    /// unresolved type, a nullable object, a union, an intersection, an
+    /// array, `object`, `mixed`, `iterable`, `callable`, `self`, and
+    /// `static` all qualify: any of them can hold something whose release
+    /// runs a destructor this file never sees.
+    holds_unfollowable: bool,
+    /// The in-file classes this class's properties hold. Releasing an
+    /// instance releases them too, so each must itself be release-closed.
+    released_classes: Vec<Box<str>>,
+    /// Whether releasing an instance of this class runs no user code at all.
+    /// Settled by [`php_resolve_lifetime_closure`] once every class in the
+    /// file is known, because the answer depends on what the properties hold.
+    lifetime_is_closed: bool,
+}
+
+type PhpClassInventory = HashMap<Box<str>, PhpClassFacts>;
+
+/// Whether this method name is one of PHP's property-access magic hooks.
+fn php_property_magic_method(name: &str) -> bool {
+    matches!(
+        name,
+        "__get" | "__set" | "__isset" | "__unset" | "__call" | "__callStatic"
+    )
+}
+
+/// The class an occurrence names, when the occurrence names one this file can
+/// be sure of.
+///
+/// Only a bare `name` answers. A `qualified_name` states a namespace path, and
+/// this intrafile lowering resolves no `namespace` statement and no `use`
+/// import, so it can prove neither that `\Vendor\Holder` is the `class Holder`
+/// declared here nor that it is not. Binding the local class's facts to it
+/// would hand a foreign class the local declaration's property anchors and,
+/// worse, its "declares no `__get`" claim -- suppressing a magic-dispatch gap
+/// for a class that may well declare one. An unresolved name keeps those gaps,
+/// which is the answer that cannot be wrong.
+fn php_unqualified_class_name<'source>(
+    source: &'source str,
+    node: Node<'_>,
+) -> Option<&'source str> {
+    if node.kind() != "name" {
+        return None;
+    }
+    nonempty_node_text(source, node)
+}
+
+/// The class a `type` node names, when it names exactly one class this file
+/// can be sure of.
+///
+/// A union, an intersection, a primitive, and a namespace-qualified name all
+/// name no single in-file class, so the property they declare carries no chain
+/// identity.
+fn php_declared_class(source: &str, type_node: Node<'_>) -> Option<Box<str>> {
+    let mut current = type_node;
+    loop {
+        match current.kind() {
+            "type" | "optional_type" | "named_type" => {
+                current = first_named_child(current)?;
+            }
+            // A `catch` states its caught types as a list. One entry names one
+            // class; several name a choice this pass does not resolve.
+            "type_list" => {
+                let entries = named_children(current);
+                if entries.len() != 1 {
+                    return None;
+                }
+                current = entries[0];
+            }
+            _ => return php_unqualified_class_name(source, current).map(Box::<str>::from),
+        }
+    }
+}
+
+/// Every class-like declaration this file states, keyed by its own name.
+///
+/// A name two declarations share is poisoned rather than resolved: neither
+/// declaration can then claim an occurrence, and the accesses fall back to the
+/// procedure-local interned locator with a published field-identity gap.
+fn php_class_inventory(prepared: &PreparedSyntaxTree) -> PhpClassInventory {
+    let source = prepared.source();
+    let mut inventory: PhpClassInventory = HashMap::default();
+    let mut stack = vec![prepared.tree().root_node()];
+    while let Some(node) = stack.pop() {
+        stack.extend(named_children(node));
+        if !matches!(
+            node.kind(),
+            "class_declaration" | "trait_declaration" | "enum_declaration"
+        ) {
+            continue;
+        }
+        let Some(name) = node
+            .child_by_field_name("name")
+            .and_then(|name| nonempty_node_text(source, name))
+        else {
+            continue;
+        };
+        let facts = php_class_facts(source, node);
+        match inventory.entry(name.into()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(facts);
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.insert(PhpClassFacts::default());
+            }
+        }
+    }
+    php_resolve_lifetime_closure(&mut inventory);
+    inventory
+}
+
+/// Settle, for every class in the file at once, whether releasing an instance
+/// of it runs user code.
+///
+/// A class is release-closed when its own body runs nothing on release and
+/// every object its properties hold is itself release-closed. That is a
+/// property of the whole file, not of one declaration: `class Plain { public
+/// Closing $c; }` runs `Closing::__destruct` when a `Plain` goes away, even
+/// though `Plain` states no destructor of its own.
+///
+/// The answer is the greatest fixpoint. Every class whose own body is clean
+/// and whose property types this file can follow starts closed, and a class is
+/// then falsified whenever something it holds is not closed -- including a
+/// class this file does not declare, which is absent from the inventory and so
+/// never closed. Starting optimistic is what makes a cycle come out right:
+/// `A { public B $b; }` and `B { public A $a; }` with no destructor anywhere
+/// really does run nothing on release. Each pass falsifies at least one class
+/// or stops, so the loop is bounded by the number of classes and needs no
+/// recursion or visited set.
+fn php_resolve_lifetime_closure(inventory: &mut PhpClassInventory) {
+    let mut closed = inventory
+        .iter()
+        .map(|(name, facts)| {
+            (
+                name.clone(),
+                facts.owns_no_release_code && !facts.holds_unfollowable,
+            )
+        })
+        .collect::<HashMap<Box<str>, bool>>();
+    loop {
+        let mut falsified = Vec::new();
+        for (name, facts) in inventory.iter() {
+            if closed.get(name) != Some(&true) {
+                continue;
+            }
+            if facts
+                .released_classes
+                .iter()
+                .any(|held| closed.get(held) != Some(&true))
+            {
+                falsified.push(name.clone());
+            }
+        }
+        if falsified.is_empty() {
+            break;
+        }
+        for name in falsified {
+            closed.insert(name, false);
+        }
+    }
+    for (name, facts) in inventory.iter_mut() {
+        facts.lifetime_is_closed = closed.get(name) == Some(&true);
+    }
+}
+
+/// What a declared property may hold, as far as its written type states.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PhpPropertyRelease {
+    /// Every value of this type is a scalar, so releasing it runs nothing.
+    NoObject,
+    /// Exactly this in-file class, whose own release closure decides.
+    Class(Box<str>),
+    /// This file cannot follow what the property holds.
+    Unfollowable,
+}
+
+/// The scalar type names whose values are never objects.
+///
+/// The list is deliberately a whitelist. `array`, `object`, `mixed`,
+/// `iterable`, `callable`, `self`, `static`, and `parent` are all spelled the
+/// same way in this position and can every one of them hold an object, so
+/// anything absent here is unfollowable rather than assumed harmless.
+fn php_scalar_type_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "int" | "float" | "string" | "bool" | "true" | "false" | "null" | "void" | "never"
+    )
+}
+
+/// What the `type` node of a property declaration states it may hold.
+///
+/// An absent type node is unfollowable, and so is a nullable object, a union,
+/// and an intersection: this pass settles a whole-file question and answers it
+/// conservatively rather than reasoning about arms.
+fn php_property_release(source: &str, type_node: Option<Node<'_>>) -> PhpPropertyRelease {
+    let Some(mut current) = type_node else {
+        return PhpPropertyRelease::Unfollowable;
+    };
+    loop {
+        match current.kind() {
+            "type" | "named_type" => {
+                let Some(inner) = first_named_child(current) else {
+                    return PhpPropertyRelease::Unfollowable;
+                };
+                current = inner;
+            }
+            "primitive_type" | "bottom_type" => {
+                return match nonempty_node_text(source, current) {
+                    Some(name) if php_scalar_type_name(name) => PhpPropertyRelease::NoObject,
+                    _ => PhpPropertyRelease::Unfollowable,
+                };
+            }
+            "name" => {
+                return match nonempty_node_text(source, current) {
+                    Some(name) if php_scalar_type_name(name) => PhpPropertyRelease::NoObject,
+                    Some(name) => PhpPropertyRelease::Class(name.into()),
+                    None => PhpPropertyRelease::Unfollowable,
+                };
+            }
+            _ => return PhpPropertyRelease::Unfollowable,
+        }
+    }
+}
+
+fn php_class_facts(source: &str, node: Node<'_>) -> PhpClassFacts {
+    let fully_stated = !named_children(node)
+        .into_iter()
+        .any(|child| matches!(child.kind(), "base_clause" | "class_interface_clause"));
+    let mut facts = PhpClassFacts {
+        access_is_closed: fully_stated,
+        owns_no_release_code: fully_stated,
+        ..PhpClassFacts::default()
+    };
+    let Some(body) = node.child_by_field_name("body") else {
+        // A class whose body this adapter cannot read states nothing it can
+        // rely on, including about what its properties hold.
+        facts.holds_unfollowable = true;
+        return facts;
+    };
+    for member in named_children(body) {
+        match member.kind() {
+            "use_declaration" => {
+                // A used trait can state properties, magic accessors, and a
+                // destructor this class body does not.
+                facts.access_is_closed = false;
+                facts.owns_no_release_code = false;
+            }
+            "property_declaration" => {
+                let type_node = member.child_by_field_name("type");
+                for element in named_children(member) {
+                    if element.kind() != "property_element" {
+                        continue;
+                    }
+                    let Some(name) = element.child_by_field_name("name") else {
+                        continue;
+                    };
+                    php_record_property(source, &mut facts, name, type_node);
+                }
+            }
+            "method_declaration" => {
+                let method = member
+                    .child_by_field_name("name")
+                    .and_then(|name| nonempty_node_text(source, name));
+                if method.is_some_and(php_property_magic_method) {
+                    facts.access_is_closed = false;
+                }
+                if method == Some("__destruct") {
+                    facts.owns_no_release_code = false;
+                }
+                // Constructor property promotion declares properties in the
+                // parameter list rather than in the class body.
+                for parameter in member
+                    .child_by_field_name("parameters")
+                    .map(named_children)
+                    .unwrap_or_default()
+                {
+                    if parameter.kind() != "property_promotion_parameter" {
+                        continue;
+                    }
+                    let Some(name) = parameter.child_by_field_name("name") else {
+                        continue;
+                    };
+                    php_record_property(
+                        source,
+                        &mut facts,
+                        name,
+                        parameter.child_by_field_name("type"),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    facts
+}
+
+fn php_record_property(
+    source: &str,
+    facts: &mut PhpClassFacts,
+    name: Node<'_>,
+    type_node: Option<Node<'_>>,
+) {
+    let property = php_variable_name(source, name);
+    if property.is_empty() {
+        return;
+    }
+    let anchor = source_anchor(name, 0).ok();
+    match facts.properties.entry(property.into()) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(anchor);
+        }
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            entry.insert(None);
+        }
+    }
+    if let Some(declared) = type_node.and_then(|type_node| php_declared_class(source, type_node)) {
+        facts.property_classes.insert(property.into(), declared);
+    }
+    match php_property_release(source, type_node) {
+        PhpPropertyRelease::NoObject => {}
+        PhpPropertyRelease::Class(held) => facts.released_classes.push(held),
+        PhpPropertyRelease::Unfollowable => facts.holds_unfollowable = true,
+    }
+}
+
+/// The memory place an expression names, when this adapter lowers it.
+#[derive(Debug, Clone, Copy)]
+enum PhpPlace<'tree> {
+    /// `$object->name`, whose property name the source writes down.
+    Field {
+        object: Node<'tree>,
+        name: Node<'tree>,
+    },
+    /// `$array[key]`, or the append form `$array[]` whose key the source does
+    /// not state.
+    Element {
+        object: Node<'tree>,
+        key: Option<Node<'tree>>,
+    },
+}
+
+/// Why one assignment target is still declined, said in that target's own
+/// terms rather than as one list of every shape this adapter does not lower.
+fn php_declined_assignment_detail(left: Node<'_>) -> &'static str {
+    match left.kind() {
+        "member_access_expression" | "nullsafe_member_access_expression" => {
+            "PHP assignment to a computed property name is not lowered: the name is a value, so the occurrence identifies no member"
+        }
+        "scoped_property_access_expression" => {
+            "PHP static property assignment is not lowered: the scope expression names no resolved class here"
+        }
+        "list_literal" | "array_creation_expression" => {
+            "PHP list and array destructuring assignment is not lowered"
+        }
+        "dynamic_variable_name" => {
+            "PHP variable-variable assignment is not lowered: the target name is a value, not a binding this procedure states"
+        }
+        "function_call_expression"
+        | "member_call_expression"
+        | "nullsafe_member_call_expression"
+        | "scoped_call_expression" => {
+            "PHP assignment through a call result requires a resolved reference return"
+        }
+        _ => "PHP assignment to this target shape is not lowered",
+    }
+}
+
+/// The value a PHP integer literal denotes.
+///
+/// PHP writes an integer in decimal, hexadecimal, octal -- both the legacy
+/// leading-zero form and the explicit `0o` one -- or binary, and since 7.4 may
+/// separate any of their digits with underscores. Two spellings of one value
+/// name one array cell, so the answer is the value rather than the text. A
+/// spelling this function cannot read, or one that does not fit, yields `None`
+/// and the caller treats the key as non-constant.
+fn php_integer_literal(text: &str) -> Option<i64> {
+    let digits = text.replace('_', "");
+    let (radix, body) = if let Some(rest) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        (16, rest)
+    } else if let Some(rest) = digits
+        .strip_prefix("0b")
+        .or_else(|| digits.strip_prefix("0B"))
+    {
+        (2, rest)
+    } else if let Some(rest) = digits
+        .strip_prefix("0o")
+        .or_else(|| digits.strip_prefix("0O"))
+    {
+        (8, rest)
+    } else if digits.len() > 1 && digits.starts_with('0') {
+        (8, &digits[1..])
+    } else {
+        (10, digits.as_str())
+    };
+    if body.is_empty() {
+        return None;
+    }
+    i64::from_str_radix(body, radix).ok()
+}
+
+/// The integer a PHP array key string is cast to, when PHP casts it.
+///
+/// PHP casts a string key to an integer only when the string is the canonical
+/// decimal representation of one: an optional `-`, then digits with no leading
+/// zero unless the whole number is `0`, no `+`, no whitespace, and a value
+/// that fits. So `"0"` and `0` are one cell while `"007"`, `"-0"`, `" 7"`, and
+/// `"1_000"` all stay strings -- the underscore separator is a source-literal
+/// spelling, not part of a string's value.
+fn php_integer_string_key(text: &str) -> Option<i64> {
+    let (negative, digits) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    if digits.len() > 1 && digits.starts_with('0') {
+        return None;
+    }
+    if negative && digits == "0" {
+        return None;
+    }
+    let value = digits.parse::<i64>().ok()?;
+    Some(if negative { -value } else { value })
+}
+
+/// The cell an element key names, when the key is a constant.
+///
+/// PHP normalizes every array key to an integer or a string, and the source
+/// spelling is not part of it: `$a['k']` and `$a["k"]` are one cell, and so
+/// are `$a["0"]` and `$a[0]`. The answer is therefore the normalized key
+/// rather than the text, so a store and a load written differently still meet.
+///
+/// A string that interpolates, or that carries an escape this adapter does not
+/// decode, names no proven cell. Neither does a float: PHP truncates it toward
+/// zero, and rather than reimplement that cast the key is declined and the
+/// caller publishes its scoped index-memory gap. `true`, `false`, and `null`
+/// are cast exactly, to `1`, `0`, and the empty string.
+fn php_constant_key(source: &str, node: Node<'_>) -> Option<Box<str>> {
+    match node.kind() {
+        "integer" => {
+            let value = php_integer_literal(nonempty_node_text(source, node)?)?;
+            Some(format!("i:{value}").into())
+        }
+        "boolean" => {
+            let text = nonempty_node_text(source, node)?;
+            if text.eq_ignore_ascii_case("true") {
+                Some("i:1".into())
+            } else if text.eq_ignore_ascii_case("false") {
+                Some("i:0".into())
+            } else {
+                None
+            }
+        }
+        "null" => Some("s:".into()),
+        "string" | "encapsed_string" => {
+            let mut content = None;
+            for child in named_children(node) {
+                match child.kind() {
+                    "string_content" if content.is_none() => {
+                        content = Some(node_text(source, child)?);
+                    }
+                    _ => return None,
+                }
+            }
+            let content = content.unwrap_or_default();
+            Some(match php_integer_string_key(content) {
+                Some(value) => format!("i:{value}").into(),
+                None => format!("s:{content}").into(),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn php_place_detail(place: &PhpPlace<'_>) -> &'static str {
+    match place {
+        PhpPlace::Field { .. } => "property access and magic property dispatch",
+        PhpPlace::Element { .. } => "array access and ArrayAccess protocol dispatch",
+    }
+}
+
+/// The place an expression names, when the shape is one this adapter lowers.
+///
+/// A property whose name is computed -- `$o->$name`, `$o->{expr}` -- names no
+/// place here: the name is a value, so the occurrence identifies no member,
+/// and lowering it as an any-member access would let one write meet an
+/// unrelated read. A static property, a destructuring pattern, and a
+/// variable-variable are declined for their own reasons at the call site.
+fn php_place(node: Node<'_>) -> Option<PhpPlace<'_>> {
+    match node.kind() {
+        "member_access_expression" | "nullsafe_member_access_expression" => {
+            let object = node.child_by_field_name("object")?;
+            let name = node.child_by_field_name("name")?;
+            (name.kind() == "name").then_some(PhpPlace::Field { object, name })
+        }
+        "subscript_expression" => {
+            let children = runtime_expression_children(node);
+            let object = *children.first()?;
+            Some(PhpPlace::Element {
+                object,
+                key: children.get(1).copied(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The names a `foreach` clause binds, and whether it also binds a shape this
+/// adapter does not lower.
+///
+/// The clause's first child is the collection, which is read; everything after
+/// it is a target. `as $value` binds one name, `as $key => $value` binds the
+/// two sides of a `pair`. A by-reference target writes back into the
+/// collection, and a destructuring target spreads one element across several
+/// names; neither is lowered, and the caller declines for them.
+fn php_foreach_targets(node: Node<'_>) -> (Vec<Node<'_>>, bool) {
+    let body = node.child_by_field_name("body");
+    let mut pending = named_children(node)
+        .into_iter()
+        .filter(|child| body.is_none_or(|body| child.id() != body.id()))
+        .collect::<Vec<_>>();
+    if pending.is_empty() {
+        return (Vec::new(), false);
+    }
+    pending.remove(0);
+    let mut targets = Vec::new();
+    let mut unlowered = false;
+    while let Some(target) = pending.pop() {
+        match target.kind() {
+            "variable_name" => targets.push(target),
+            "pair" => pending.extend(named_children(target)),
+            _ => unlowered = true,
+        }
+    }
+    (targets, unlowered)
+}
+
+/// Whether this expression is written by the assignment that contains it.
+///
+/// A write target is not a read. A lowered store replaces its evaluation list
+/// so the target is never scheduled, but a declined one -- a destructuring
+/// pattern, a target this adapter does not lower -- still schedules its own
+/// operands. Minting a `MemoryLoad` there would publish a read of the very
+/// location the statement overwrites.
+fn is_php_assignment_target(node: Node<'_>) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            "parenthesized_expression"
+            | "list_literal"
+            | "array_creation_expression"
+            | "array_element_initializer" => current = parent,
+            "assignment_expression" | "reference_assignment_expression" => {
+                return field_matches(parent, "left", current);
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// What one local name of a procedure holds, when every binding of it agrees.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PhpLocalType {
+    /// An instance of exactly this class.
+    Class(Box<str>),
+    /// A PHP array. An array is not an object, so no `ArrayAccess` dispatch or
+    /// magic accessor can run behind an element access on it.
+    Array,
+}
+
+/// The class name of the type-like declaration this callable is written in.
+fn enclosing_class_name(source: &str, node: Node<'_>) -> Option<Box<str>> {
+    let mut parent = node.parent();
+    while let Some(candidate) = parent {
+        if matches!(
+            candidate.kind(),
+            "class_declaration" | "trait_declaration" | "enum_declaration"
+        ) {
+            return declaration_container_name(source, candidate);
+        }
+        parent = candidate.parent();
+    }
+    None
+}
+
+/// What each local name of one procedure holds.
+///
+/// The pass is a single source-order sweep, which is enough for the shape it
+/// serves: a name is bound before it is read, and `$alias = $original` carries
+/// the class the earlier binding proved. A name two bindings disagree about is
+/// removed rather than guessed, so an access through it falls back to the
+/// interned locator and publishes its own field-identity gap.
+fn php_local_types(
+    prepared: &PreparedSyntaxTree,
+    inventory: &PhpClassInventory,
+    callable: Node<'_>,
+    body: Node<'_>,
+    enclosing_class: Option<&str>,
+) -> HashMap<Box<str>, PhpLocalType> {
+    let source = prepared.source();
+    let mut types: HashMap<Box<str>, PhpLocalType> = HashMap::default();
+    let mut conflicting: Vec<Box<str>> = Vec::new();
+
+    for parameter in callable
+        .child_by_field_name("parameters")
+        .map(named_children)
+        .unwrap_or_default()
+    {
+        if !matches!(
+            parameter.kind(),
+            "simple_parameter" | "property_promotion_parameter"
+        ) {
+            continue;
+        }
+        let (Some(name), Some(class)) = (
+            parameter.child_by_field_name("name"),
+            parameter
+                .child_by_field_name("type")
+                .and_then(|type_node| php_declared_class(source, type_node)),
+        ) else {
+            continue;
+        };
+        let name = php_variable_name(source, name);
+        if !name.is_empty() {
+            types.insert(name.into(), PhpLocalType::Class(class));
+        }
+    }
+
+    let bind = |types: &mut HashMap<Box<str>, PhpLocalType>,
+                conflicting: &mut Vec<Box<str>>,
+                name: &str,
+                inferred: Option<PhpLocalType>| {
+        if name.is_empty() || name == "this" {
+            return;
+        }
+        match inferred {
+            Some(inferred) if types.get(name) == Some(&inferred) => {}
+            Some(inferred) if !types.contains_key(name) => {
+                types.insert(name.into(), inferred);
+            }
+            _ => {
+                types.remove(name);
+                conflicting.push(name.into());
+            }
+        }
+    };
+
+    let mut stack = vec![body];
+    let mut ordered = Vec::new();
+    while let Some(node) = stack.pop() {
+        if node.id() != body.id() && is_callable_kind(node.kind()) {
+            continue;
+        }
+        ordered.push(node);
+        stack.extend(named_children(node));
+    }
+    ordered.sort_by_key(|node| (node.start_byte(), node.end_byte()));
+    for node in ordered {
+        match node.kind() {
+            "assignment_expression" | "reference_assignment_expression" => {
+                let (Some(left), Some(right)) = (
+                    node.child_by_field_name("left"),
+                    node.child_by_field_name("right"),
+                ) else {
+                    continue;
+                };
+                if left.kind() != "variable_name" {
+                    continue;
+                }
+                let inferred =
+                    php_expression_local_type(source, inventory, &types, enclosing_class, right, 0);
+                bind(
+                    &mut types,
+                    &mut conflicting,
+                    php_variable_name(source, left),
+                    inferred,
+                );
+            }
+            "catch_clause" => {
+                let (Some(name), Some(class)) = (
+                    node.child_by_field_name("name"),
+                    node.child_by_field_name("type")
+                        .and_then(|type_node| php_declared_class(source, type_node)),
+                ) else {
+                    continue;
+                };
+                bind(
+                    &mut types,
+                    &mut conflicting,
+                    php_variable_name(source, name),
+                    Some(PhpLocalType::Class(class)),
+                );
+            }
+            "foreach_statement" => {
+                // A loop variable takes whatever the iterated collection
+                // yields, which this pass does not model. The collection
+                // itself is read, not bound, and keeps what it held.
+                for target in php_foreach_targets(node).0 {
+                    bind(
+                        &mut types,
+                        &mut conflicting,
+                        php_variable_name(source, target),
+                        None,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    for name in conflicting {
+        types.remove(&name);
+    }
+    types
+}
+
+/// The local type an expression produces, when its syntax states one.
+fn php_expression_local_type(
+    source: &str,
+    inventory: &PhpClassInventory,
+    types: &HashMap<Box<str>, PhpLocalType>,
+    enclosing_class: Option<&str>,
+    node: Node<'_>,
+    depth: usize,
+) -> Option<PhpLocalType> {
+    // A property chain is finite in practice; the bound keeps a pathological
+    // source from walking one occurrence per nesting level.
+    if depth > 16 {
+        return None;
+    }
+    match node.kind() {
+        "array_creation_expression" => Some(PhpLocalType::Array),
+        "object_creation_expression" => named_children(node)
+            .into_iter()
+            .find(|child| {
+                matches!(
+                    child.kind(),
+                    "name" | "qualified_name" | "anonymous_class" | "variable_name"
+                )
+            })
+            .and_then(|child| php_unqualified_class_name(source, child))
+            .map(|name| PhpLocalType::Class(name.into())),
+        "parenthesized_expression" | "clone_expression" => {
+            let inner = first_runtime_named_child(node)?;
+            php_expression_local_type(source, inventory, types, enclosing_class, inner, depth + 1)
+        }
+        "variable_name" => {
+            let name = php_variable_name(source, node);
+            if name == "this" {
+                return enclosing_class.map(|class| PhpLocalType::Class(class.into()));
+            }
+            types.get(name).cloned()
+        }
+        "member_access_expression" | "nullsafe_member_access_expression" => {
+            let object = node.child_by_field_name("object")?;
+            let name = node.child_by_field_name("name")?;
+            if name.kind() != "name" {
+                return None;
+            }
+            let property = nonempty_node_text(source, name)?;
+            let PhpLocalType::Class(class) = php_expression_local_type(
+                source,
+                inventory,
+                types,
+                enclosing_class,
+                object,
+                depth + 1,
+            )?
+            else {
+                return None;
+            };
+            inventory
+                .get(&class)?
+                .property_classes
+                .get(property)
+                .cloned()
+                .map(PhpLocalType::Class)
+        }
+        _ => None,
+    }
+}
+
 fn expression_value_kind(node: Node<'_>) -> SemanticValueKind {
     match node.kind() {
         "anonymous_function" | "arrow_function" => SemanticValueKind::Callable,
@@ -4092,4 +5491,192 @@ fn is_runtime_leaf(kind: &str) -> bool {
             | "variadic_placeholder"
             | "comment"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The constant the condition lowering folds `if (<condition>)` to, or
+    /// `None` when it keeps the decision and lowers the condition instead.
+    fn folded_condition(condition: &str) -> Option<bool> {
+        let source = format!(
+            "<?php\nfunction run(): void {{\n    if ({condition}) {{\n        noop();\n    }}\n}}\n"
+        );
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
+            .expect("PHP grammar must load");
+        let tree = parser
+            .parse(source.as_str(), None)
+            .expect("PHP source must parse");
+        let mut statement = None;
+        crate::analyzer::tree_sitter_analyzer::walk_named_tree_preorder(
+            tree.root_node(),
+            true,
+            |node| {
+                if node.kind() == "if_statement" {
+                    statement = Some(node);
+                    WalkControl::Break
+                } else {
+                    WalkControl::Continue
+                }
+            },
+        );
+        let statement = statement.expect("if statement");
+        let condition = statement
+            .child_by_field_name("condition")
+            .expect("if condition");
+        php_folded_boolean_constant(source.as_str(), condition)
+    }
+
+    #[test]
+    fn constant_boolean_conditions_fold_through_their_wrappers() {
+        for (condition, value) in [
+            ("false", false),
+            ("true", true),
+            ("!false", true),
+            ("!true", false),
+            ("!!false", false),
+            ("(false)", false),
+            ("((true))", true),
+            ("(!(false))", true),
+            // PHP spells both constants case-insensitively.
+            ("FALSE", false),
+            ("False", false),
+            ("TRUE", true),
+            ("!FALSE", true),
+        ] {
+            assert_eq!(
+                folded_condition(condition),
+                Some(value),
+                "`if ({condition})` is the constant {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_constant_conditions_keep_their_decision() {
+        for condition in [
+            "$flag",
+            "!$flag",
+            "$flag === false",
+            "is_ready()",
+            "!is_ready()",
+            "$flag && false",
+            // Truthiness of a non-boolean literal is a separate normalization
+            // this adapter does not claim.
+            "-1",
+            "0",
+            "\"false\"",
+        ] {
+            assert_eq!(
+                folded_condition(condition),
+                None,
+                "`if ({condition})` is not a folded constant"
+            );
+        }
+    }
+
+    #[test]
+    fn guard_facts_are_partially_supported() {
+        assert_eq!(
+            php_capabilities().support(SemanticCapability::GuardFacts),
+            CapabilitySupport::Partial,
+            "PHP folds constant boolean conditions and records every other decision opaque"
+        );
+    }
+
+    /// PHP casts an array key string to an integer only when the string is the
+    /// canonical decimal representation of one. The pairs that must meet and
+    /// the near misses that must not are both part of the contract: an
+    /// over-eager cast merges cells PHP keeps apart, and a missing one splits
+    /// a cell PHP keeps together.
+    #[test]
+    fn php_array_key_strings_cast_exactly_when_php_casts_them() {
+        for (text, expected) in [
+            ("0", Some(0)),
+            ("7", Some(7)),
+            ("-1", Some(-1)),
+            ("1234567890", Some(1_234_567_890)),
+            // A leading zero is not canonical, so the key stays a string and
+            // never meets the integer 7.
+            ("07", None),
+            ("007", None),
+            ("00", None),
+            // Negative zero, a leading plus, whitespace, and a separator are
+            // all spellings PHP leaves as strings.
+            ("-0", None),
+            ("+1", None),
+            (" 7", None),
+            ("7 ", None),
+            ("1_000", None),
+            // Not a decimal integer at all.
+            ("", None),
+            ("k", None),
+            ("0x1F", None),
+            ("1.0", None),
+            ("-", None),
+            // Beyond what an integer key can hold.
+            ("99999999999999999999", None),
+        ] {
+            assert_eq!(
+                php_integer_string_key(text),
+                expected,
+                "PHP array key string {text:?} cast wrongly"
+            );
+        }
+    }
+
+    /// Two spellings of one integer name one cell, so a literal is read for
+    /// its value and not its text.
+    #[test]
+    fn php_integer_literals_are_read_by_value() {
+        for (text, expected) in [
+            ("0", Some(0)),
+            ("7", Some(7)),
+            ("1000", Some(1000)),
+            ("1_000", Some(1000)),
+            ("0x1F", Some(31)),
+            ("0X1f", Some(31)),
+            ("0b1010", Some(10)),
+            ("0B1_010", Some(10)),
+            ("0o17", Some(15)),
+            ("017", Some(15)),
+            ("0_1_7", Some(15)),
+            // Spellings this reader refuses rather than guesses.
+            ("", None),
+            ("0x", None),
+            ("0b2", None),
+            ("019", None),
+            ("99999999999999999999", None),
+        ] {
+            assert_eq!(
+                php_integer_literal(text),
+                expected,
+                "PHP integer literal {text:?} read wrongly"
+            );
+        }
+    }
+
+    /// The scalar list is a whitelist because every name absent from it can
+    /// hold an object whose release runs a destructor this file never sees.
+    #[test]
+    fn only_whitelisted_scalar_type_names_hold_no_object() {
+        for name in ["int", "float", "string", "bool", "INT", "Never", "void"] {
+            assert!(
+                php_scalar_type_name(name),
+                "{name} states a scalar and holds no object"
+            );
+        }
+        for name in [
+            "array", "object", "mixed", "iterable", "callable", "self", "static", "parent",
+            "Closing",
+        ] {
+            assert!(
+                !php_scalar_type_name(name),
+                "{name} can hold an object and must not be treated as a scalar"
+            );
+        }
+    }
 }

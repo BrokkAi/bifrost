@@ -116,8 +116,8 @@ impl IncludeTargetIndex {
         include: &str,
     ) -> Vec<ProjectFile> {
         let include_path = Path::new(include);
-        let matches: Vec<_> = self
-            .resolve_indexed(include)
+        let indexed = self.resolve_indexed(include);
+        let matches: Vec<_> = indexed
             .into_iter()
             .filter(|file| {
                 if include_path.components().count() > 1 {
@@ -141,7 +141,26 @@ impl IncludeTargetIndex {
             })
             .collect::<Vec<_>>();
         if source_reachable.len() == 1 {
-            source_reachable
+            return source_reachable;
+        }
+        Vec::new()
+    }
+
+    fn resolve_unique_basename_alias(&self, include: &str) -> Vec<ProjectFile> {
+        let include_path = Path::new(include);
+        if include_path.components().count() <= 1 {
+            return Vec::new();
+        }
+        let Some(file_name) = include_path.file_name() else {
+            return Vec::new();
+        };
+        let matches = self
+            .resolve_indexed(include)
+            .into_iter()
+            .filter(|file| file.rel_path().file_name() == Some(file_name))
+            .collect::<Vec<_>>();
+        if matches.len() == 1 {
+            matches
         } else {
             Vec::new()
         }
@@ -221,6 +240,14 @@ pub fn resolve_include_targets_with_index(
         if candidates.is_empty() {
             candidates.extend(include_targets.resolve_unique_fallback(source_file, &template));
         }
+    }
+    // Installed include spellings often add a public package directory that
+    // does not exist in the source tree, for example `<botan/asn1_obj.h>` for
+    // `src/lib/asn1/asn1_obj.h`. After exact paths and generated-header
+    // templates have both failed, a globally unique basename is still a
+    // structured, unambiguous target. Duplicate basenames remain unresolved.
+    if candidates.is_empty() {
+        candidates = include_targets.resolve_unique_basename_alias(include);
     }
     candidates
 }
@@ -548,6 +575,26 @@ mod tests {
             &ambiguous_index,
         );
         assert!(ambiguous.is_empty());
+    }
+
+    #[test]
+    fn indexed_include_resolution_accepts_one_unique_installed_prefix_alias() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let source = write_file(&root, "src/lib/asn1/asn1_obj.cpp");
+        let target = write_file(&root, "src/lib/asn1/asn1_obj.h");
+        let index = IncludeTargetIndex::build([&source, &target]);
+
+        assert_eq!(
+            resolve_include_targets_with_index(&source, "botan/asn1_obj.h", &index),
+            vec![target.clone()]
+        );
+
+        let duplicate = write_file(&root, "vendor/asn1_obj.h");
+        let ambiguous = IncludeTargetIndex::build([&source, &target, &duplicate]);
+        assert!(
+            resolve_include_targets_with_index(&source, "botan/asn1_obj.h", &ambiguous).is_empty()
+        );
     }
 
     #[test]

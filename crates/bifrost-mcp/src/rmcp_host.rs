@@ -129,7 +129,6 @@ struct NamedWorkspaceEntry {
     id: u64,
     name: String,
     root: PathBuf,
-    git_repo: bool,
     service: Mutex<Option<Arc<SearchToolsService>>>,
 }
 
@@ -185,7 +184,6 @@ impl NamedWorkspaceRouter {
             entries.push(NamedWorkspaceEntry {
                 id: index as u64 + 1,
                 name: workspace.name,
-                git_repo: crate::mcp_registry::workspace_is_git(&root),
                 root,
                 service: Mutex::new(service),
             });
@@ -238,12 +236,8 @@ impl NamedWorkspaceRouter {
             .collect()
     }
 
-    fn names_for_tool(&self, tool_name: &str) -> Vec<&str> {
-        self.entries
-            .iter()
-            .filter(|entry| tool_name != "semantic_search" || entry.git_repo)
-            .map(|entry| entry.name.as_str())
-            .collect()
+    fn names_for_tool(&self, _tool_name: &str) -> Vec<&str> {
+        self.names()
     }
 
     fn instructions(&self, base: &str) -> Result<String, String> {
@@ -2636,7 +2630,6 @@ mod named_workspace_tests {
                 id: index as u64 + 1,
                 name: name.to_string(),
                 root: PathBuf::from(format!("/{name}")),
-                git_repo: true,
                 service: Mutex::new(None),
             })
             .collect::<Vec<_>>();

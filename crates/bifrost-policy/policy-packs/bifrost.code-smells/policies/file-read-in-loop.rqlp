@@ -3,29 +3,33 @@
   :id "bifrost.performance.file-read-in-loop"
   :name "File read inside a loop"
   :message "Review whether this lexically nested file read repeats per iteration"
-  :severity warning
-  :description "A file-read call lexically nested under a loop may multiply I/O and allocation. This structural prompt also includes deferred nested bodies; verify execution before reading once, streaming, or batching."
+  :severity note
+  :description "A file-read call lexically nested under a loop may multiply I/O and allocation. This structural prompt also includes deferred nested bodies; verify execution before reading once, streaming, or batching. A for-each loop whose iterated expression provably resolves to a collection literal with at most eight elements is excluded; the proof covers declarator-established bindings (JS/TS const/let/var, Rust let, Java locals), so field-, assignment-, or call-produced iterables still report."
   :help-uri "https://bifrost.brokk.ai/static-analysis-policies/#built-in-code-smell-pack"
   :tags ["performance" "io" "loop" "code-smell"]
   :analysis
     (analysis
-      :type match
-      :selector
+      :type assertion
+      :subject
         (rql
           :schema-version 1
           (union
-            (language python (inside-decl (loop) (call :callee (name "open"))))
+            (language python (inside-decl (loop :capture "region") (call :callee (name "open") :capture "smell")))
             (language java
-              (inside-decl (loop) (call :receiver (name "Files") :callee (name "readString"))))
+              (inside-decl (loop :capture "region") (call :receiver (name "Files") :callee (name "readString") :capture "smell")))
             (language java
-              (inside-decl (loop) (call :receiver (name "Files") :callee (name "readAllBytes"))))
+              (inside-decl (loop :capture "region") (call :receiver (name "Files") :callee (name "readAllBytes") :capture "smell")))
             (language javascript
-              (inside-decl (loop) (call :receiver (name "fs") :callee (name "readFileSync"))))
+              (inside-decl (loop :capture "region") (call :receiver (name "fs") :callee (name "readFileSync") :capture "smell")))
             (language typescript
-              (inside-decl (loop) (call :receiver (name "fs") :callee (name "readFileSync"))))
+              (inside-decl (loop :capture "region") (call :receiver (name "fs") :callee (name "readFileSync") :capture "smell")))
             (language rust
               (inside-decl
-                (loop)
+                (loop :capture "region")
                 (call
                   :receiver (name "fs")
-                  :callee (name/regex "^(read|read_to_string)$"))))))))
+                  :callee (name/regex "^(read|read_to_string)$") :capture "smell")))))
+      :asserts [
+        (assert-origin-shape :id small-literal-iterable :at "region" :anchor "smell"
+                             :role value_reference :shape collection-literal :max-elements 8)
+      ]))

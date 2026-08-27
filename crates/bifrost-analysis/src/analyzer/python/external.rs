@@ -134,6 +134,7 @@ impl DependencyPackAdapter for PythonDependencyPackAdapter {
             };
         }
         dedup_declarations(&mut types, &mut members);
+        resolve_hierarchy_references(&mut types);
         let mut activation = request.activation.clone();
         for selector in &mut activation {
             selector.artifact_sha256 = None;
@@ -151,6 +152,7 @@ impl DependencyPackAdapter for PythonDependencyPackAdapter {
                 license: request.license,
                 completeness,
                 safety: request.safety,
+                carried_sources: Vec::new(),
                 shards: vec![AuthoredShard {
                     id: "declarations.external".to_owned(),
                     activation,
@@ -321,6 +323,7 @@ impl PythonArtifactPackProducer {
                 license: request.license.clone(),
                 completeness,
                 safety: request.safety.clone(),
+                carried_sources: Vec::new(),
                 shards: vec![AuthoredShard {
                     id: "declarations.external".to_owned(),
                     activation,
@@ -429,6 +432,7 @@ impl PythonArtifactPackProducer {
             };
         }
         dedup_declarations(&mut types, &mut members);
+        resolve_hierarchy_references(&mut types);
         let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
         let completeness = if diagnostics.is_empty() && suppressed_diagnostics == 0 {
             Completeness::Complete
@@ -456,6 +460,7 @@ impl PythonArtifactPackProducer {
                 license: request.license.clone(),
                 completeness,
                 safety: request.safety.clone(),
+                carried_sources: Vec::new(),
                 shards: vec![AuthoredShard {
                     id: "declarations.external".to_owned(),
                     activation,
@@ -646,6 +651,7 @@ struct PythonApiCollector<'a, 'd> {
 struct HierarchyBinding {
     target: Option<String>,
     guard: Option<usize>,
+    local_type: bool,
 }
 
 /// One pending subtree in the collector's iterative walk.
@@ -914,7 +920,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
                 hierarchy,
                 guard,
             );
-            self.record_hierarchy_binding(&owner, &name, Some(qualified.clone()), guard);
+            self.record_hierarchy_binding(&owner, &name, Some(qualified.clone()), guard, true);
             if let Some(body) = definition.child_by_field_name("body") {
                 stack.push(PendingNode {
                     node: body,
@@ -940,7 +946,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
             .any(|decorator| decorator == "staticmethod");
         let signature =
             function_signature(definition, self.source, self.limits.max_signature_depth);
-        self.record_hierarchy_binding(&owner, &name, None, guard);
+        self.record_hierarchy_binding(&owner, &name, None, guard, false);
         self.push_member(owner, name, member_kind, is_static, signature, guard);
     }
 
@@ -963,7 +969,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
         let Some(name) = node_identifier(Some(left), self.source) else {
             return;
         };
-        self.record_hierarchy_binding(owner, &name, None, guard);
+        self.record_hierarchy_binding(owner, &name, None, guard, false);
         if assignment
             .child_by_field_name("type")
             .or_else(|| {
@@ -1019,7 +1025,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
                 None => PYTHON_UNENUMERATED_BINDING,
             };
             if name != PYTHON_UNENUMERATED_BINDING {
-                self.record_hierarchy_binding(owner, name, hierarchy_target, guard);
+                self.record_hierarchy_binding(owner, name, hierarchy_target, guard, false);
             }
             // Two branches of a `try`/`except ImportError` pair bind the same
             // name; recording it twice would mint one identity twice and mark
@@ -1086,9 +1092,14 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
         name: &str,
         target: Option<String>,
         guard: Option<usize>,
+        local_type: bool,
     ) {
         let key = format!("{owner}.{name}");
-        let next = HierarchyBinding { target, guard };
+        let next = HierarchyBinding {
+            target,
+            guard,
+            local_type,
+        };
         match self.hierarchy_bindings.get(&key) {
             Some(previous) if guard.is_some() && previous != &next => {
                 self.hierarchy_bindings.insert(
@@ -1096,6 +1107,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
                     HierarchyBinding {
                         target: None,
                         guard: None,
+                        local_type: false,
                     },
                 );
             }
@@ -1115,11 +1127,13 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
         };
         let mut scope = Some(owner);
         let mut target = None;
+        let mut local_type = false;
         while let Some(current) = scope {
             let key = format!("{current}.{local}");
             if let Some(binding) = self.hierarchy_bindings.get(&key) {
                 if binding.guard.is_none() || binding.guard == guard {
                     target = binding.target.clone();
+                    local_type = binding.local_type;
                 }
                 break;
             }
@@ -1132,20 +1146,28 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
             target.push('.');
             target.push_str(&suffix.join("."));
         }
-        match parsed {
-            TypeRef::Named {
+        let TypeRef::Named {
+            arguments,
+            nullable,
+            ..
+        } = parsed
+        else {
+            return parsed;
+        };
+        if !local_type {
+            return TypeRef::Named {
+                name: target,
                 arguments,
                 nullable,
-                ..
-            } => TypeRef::Declared {
-                id: type_declaration_id(TypeIdentity {
-                    ecosystem: "python",
-                    name: &target,
-                }),
-                arguments,
-                nullable,
-            },
-            other => other,
+            };
+        }
+        TypeRef::Declared {
+            id: type_declaration_id(TypeIdentity {
+                ecosystem: "python",
+                name: &target,
+            }),
+            arguments,
+            nullable,
         }
     }
 
@@ -1319,6 +1341,40 @@ fn dedup_declarations(types: &mut Vec<TypeFact>, members: &mut Vec<MemberFact>) 
         kept.guard = DeclarationGuard::union(kept.guard.take(), later.guard.take());
         true
     });
+}
+
+/// Resolve imported hierarchy names only when their declarations are part of
+/// this exact source set. An import can name a valid external Python type that
+/// is not included in a pinned artifact; keeping that edge named preserves the
+/// relationship without emitting a declared ID the pack cannot define.
+fn resolve_hierarchy_references(types: &mut [TypeFact]) {
+    let declared_names = types
+        .iter()
+        .map(|fact| fact.name.clone())
+        .collect::<std::collections::HashSet<_>>();
+    for fact in types.iter_mut() {
+        for hierarchy in &mut fact.hierarchy {
+            let TypeRef::Named {
+                name,
+                arguments,
+                nullable,
+            } = &hierarchy.target
+            else {
+                continue;
+            };
+            if !declared_names.contains(name.as_str()) {
+                continue;
+            }
+            hierarchy.target = TypeRef::Declared {
+                id: type_declaration_id(TypeIdentity {
+                    ecosystem: "python",
+                    name,
+                }),
+                arguments: arguments.clone(),
+                nullable: *nullable,
+            };
+        }
+    }
 }
 
 /// The condition one conditional block places on the declarations inside it.
@@ -2588,4 +2644,96 @@ fn bounded_message(mut message: String, limit: usize) -> String {
         message.truncate(limit);
     }
     message
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::semantic_model::{CompilerOptions, compile_pack, read_exact_source_set};
+    use tempfile::tempdir;
+
+    #[test]
+    fn source_set_resolves_present_imported_hierarchy_and_keeps_external_named() {
+        let fixture = tempdir().unwrap();
+        std::fs::write(fixture.path().join("base.pyi"), "class Base: ...\n").unwrap();
+        std::fs::write(
+            fixture.path().join("derived.pyi"),
+            "from base import Base\nfrom absent import Missing\n\nclass Derived(Base): ...\nclass External(Missing): ...\n",
+        )
+        .unwrap();
+        let artifact = read_exact_source_set(
+            fixture.path(),
+            &["base.pyi".into(), "derived.pyi".into()],
+            32,
+            16,
+            &ArtifactProducerLimits::default(),
+        )
+        .unwrap();
+        let production = PythonArtifactPackProducer.produce_loaded_source_set(
+            &ArtifactProductionRequest {
+                path: fixture.path().to_owned(),
+                artifact_kind: ExternalArtifactKind::PythonStub,
+                pack_id: "python-hierarchy-fixture".to_owned(),
+                pack_version: "1.0.0".to_owned(),
+                ecosystem: "python".to_owned(),
+                compatibility: Compatibility {
+                    bifrost: format!("={}", env!("CARGO_PKG_VERSION")),
+                    toolchains: Vec::new(),
+                },
+                activation: vec![ActivationSelector {
+                    package: None,
+                    module: None,
+                    toolchain: None,
+                    targets: Vec::new(),
+                    configurations: Vec::new(),
+                    artifact_sha256: None,
+                }],
+                provenance: Provenance {
+                    source: "fixture".to_owned(),
+                    revision: None,
+                },
+                license: "Apache-2.0".to_owned(),
+                safety: Safety {
+                    generated_code_only: false,
+                    review_required: false,
+                },
+            },
+            &ArtifactProducerLimits::default(),
+            None,
+            &artifact,
+        );
+        assert!(
+            production.diagnostics.is_empty(),
+            "{:#?}",
+            production.diagnostics
+        );
+        let pack = production.pack.unwrap();
+        let derived = pack
+            .shards
+            .first()
+            .and_then(|shard| match &shard.payload {
+                AuthoredPayload::DeclarationFacts { types, .. } => {
+                    types.iter().find(|fact| fact.name == "derived.Derived")
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            matches!(derived.hierarchy[0].target, TypeRef::Declared { .. }),
+            "derived hierarchy: {:?}",
+            derived.hierarchy
+        );
+        let external = match &pack.shards[0].payload {
+            AuthoredPayload::DeclarationFacts { types, .. } => types
+                .iter()
+                .find(|fact| fact.name == "derived.External")
+                .unwrap(),
+            _ => unreachable!(),
+        };
+        assert!(matches!(
+            external.hierarchy[0].target,
+            TypeRef::Named { ref name, .. } if name == "absent.Missing"
+        ));
+        compile_pack(&pack, &CompilerOptions::default()).unwrap();
+    }
 }

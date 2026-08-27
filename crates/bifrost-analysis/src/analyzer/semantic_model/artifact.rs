@@ -1,5 +1,7 @@
 use super::model::*;
-use super::validate::{Diagnostic, ValidationLimits, validate_pack_locally};
+use super::validate::{
+    Diagnostic, ValidationLimits, is_canonical_relative_path, validate_pack_locally,
+};
 use crate::analyzer::canonical_hash::{
     hash_domain_bytes, is_lower_sha256, lower_hex_string, sha256_bytes,
 };
@@ -62,6 +64,12 @@ pub struct CompiledPackManifest {
     pub license: String,
     pub completeness: Completeness,
     pub safety: Safety,
+    /// The producer's claim that it parsed each of these relative source paths
+    /// from a sources artifact while generating the pack (#2613); strictly
+    /// ascending. Serialized only when non-empty so packs without carried
+    /// sources keep byte-identical manifests and digests.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub carried_sources: Vec<String>,
     pub semantic_sha256: String,
     pub content_sha256: String,
     pub shards: Vec<CompiledShardDescriptor>,
@@ -524,6 +532,23 @@ pub fn decode_manifest(
         }
     }
     if manifest
+        .carried_sources
+        .windows(2)
+        .any(|pair| pair[0] >= pair[1])
+    {
+        return Err(ArtifactError::InvalidDescriptor(
+            "carried sources must be unique ascending paths".to_owned(),
+        ));
+    }
+    for path in &manifest.carried_sources {
+        validate_text(path, limits, "carried source path")?;
+        if !is_canonical_relative_path(path) {
+            return Err(ArtifactError::InvalidDescriptor(
+                "carried sources must be relative canonical slash-separated paths".to_owned(),
+            ));
+        }
+    }
+    if manifest
         .shards
         .windows(2)
         .any(|pair| pair[0].shard_id >= pair[1].shard_id)
@@ -929,6 +954,8 @@ pub(crate) fn manifest_content_digest(
         license: &'a str,
         completeness: Completeness,
         safety: &'a Safety,
+        #[serde(skip_serializing_if = "<[String]>::is_empty")]
+        carried_sources: &'a [String],
         semantic_sha256: &'a str,
         shards: &'a [CompiledShardDescriptor],
     }
@@ -944,6 +971,7 @@ pub(crate) fn manifest_content_digest(
         license: &manifest.license,
         completeness: manifest.completeness,
         safety: &manifest.safety,
+        carried_sources: &manifest.carried_sources,
         semantic_sha256: &manifest.semantic_sha256,
         shards: &manifest.shards,
     })?;
@@ -1136,6 +1164,7 @@ fn authored_pack_from_wire(shard: &WireCompiledShard) -> AuthoredSemanticModelPa
         license: shard.license.clone(),
         completeness: shard.completeness,
         safety: shard.safety.clone(),
+        carried_sources: Vec::new(),
         shards: vec![AuthoredShard {
             id: shard.shard_id.clone(),
             activation: shard.activation.clone(),

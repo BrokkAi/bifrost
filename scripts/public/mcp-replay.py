@@ -36,7 +36,6 @@ import time
 class McpClient:
     def __init__(self, binary, workspace, mode, use_roots, extra_env=None):
         env = dict(os.environ)
-        env["BIFROST_SEMANTIC_INDEX"] = "off"
         if extra_env:
             env.update(extra_env)
         self.use_roots = use_roots

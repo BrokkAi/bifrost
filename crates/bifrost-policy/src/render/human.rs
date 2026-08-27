@@ -13,19 +13,20 @@ use super::super::{
     EndpointObservationPhase, EndpointOrigin, EndpointRole, EndpointTaintSemantics, EvidenceRef,
     FindingCertainty, FindingClassification, FindingCompleteness, FindingDiffDisposition,
     FindingIdentityStability, FindingSeverity, MatchFindingAnchor, MatchResultDomain,
-    OrganizationalRiskAssessment, PolicyAnalysisType, PolicyCapability, PolicyDiagnosticImpact,
-    PolicyDiagnosticSeverity, PolicyEndpointBinding, PolicyFailureReason, PolicyFinding,
-    PolicyFindingEvidence, PolicyIncompleteReason, PolicyLevel, PolicyLocationRelationship,
-    PolicyMessageSpec, PolicyObligation, PolicyOverlayScope, PolicyQueryProof,
-    PolicyQueryProvenance, PolicyQueryResultRef, PolicyReportDocument, PolicyRuleDescriptor,
-    PolicyRun, PolicyRunCompletion, PolicySemanticEvent, PolicySeveritySpec, PolicySourceLocation,
-    PolicySuppressionDecision, PolicySuppressionMatchState, PolicySuppressionOrphanState,
-    PolicySuppressionPolicyHashState, PolicySuppressionReview, PolicySuppressionTemporalState,
-    ProofMetadata, ProofReason, ResolvedEndpointDependency, ResolvedEndpointIdentity,
-    ResolvedEndpointManifestEntry, ResolvedMatchDirectoryManifest, ResolvedPrecedenceEdge,
-    ResolvedTypestateTerminal, SchemaVersionOrigin, SchemaVersionResolution,
-    StableSemanticIdentity, TaintSourceEvidence, TaintSystemEntry, TaintTrustBoundary,
-    TypestateViolationEvidence,
+    OrganizationalRiskAssessment, PolicyAnalysisType, PolicyCapability,
+    PolicyDependencyPackActivationMode, PolicyDiagnosticImpact, PolicyDiagnosticSeverity,
+    PolicyEndpointBinding, PolicyFailureReason, PolicyFinding, PolicyFindingEvidence,
+    PolicyIncompleteReason, PolicyLevel, PolicyLocationRelationship, PolicyMessageSpec,
+    PolicyObligation, PolicyOverlayScope, PolicyPackActivationReview, PolicyPackDecisionStatus,
+    PolicyQueryProof, PolicyQueryProvenance, PolicyQueryResultRef, PolicyReportDocument,
+    PolicyRuleDescriptor, PolicyRun, PolicyRunCompletion, PolicySemanticEvent, PolicySeveritySpec,
+    PolicySourceLocation, PolicySuppressionDecision, PolicySuppressionMatchState,
+    PolicySuppressionOrphanState, PolicySuppressionPolicyHashState, PolicySuppressionReview,
+    PolicySuppressionTemporalState, ProofMetadata, ProofReason, ResolvedEndpointDependency,
+    ResolvedEndpointIdentity, ResolvedEndpointManifestEntry, ResolvedEndpointSelectorSchemas,
+    ResolvedMatchDirectoryManifest, ResolvedPrecedenceEdge, ResolvedTypestateTerminal,
+    SchemaVersionOrigin, SchemaVersionResolution, StableSemanticIdentity, TaintSourceEvidence,
+    TaintSystemEntry, TaintTrustBoundary, TypestateViolationEvidence,
 };
 
 use super::{
@@ -874,9 +875,13 @@ fn write_schema_inference_notes<W: Write>(
             }),
         );
         let inferred_endpoint_rql_versions = normalized_inferred_versions(
-            rule.endpoint_dependencies().iter().filter_map(|endpoint| {
-                (endpoint.selector_schema().origin == SchemaVersionOrigin::ImplicitCompatible)
-                    .then_some(endpoint.selector_schema().version)
+            rule.endpoint_dependencies().iter().flat_map(|endpoint| {
+                endpoint_schema_resolutions(endpoint.selector_schemas())
+                    .into_iter()
+                    .filter_map(|resolution| {
+                        (resolution.origin == SchemaVersionOrigin::ImplicitCompatible)
+                            .then_some(resolution.version)
+                    })
             }),
         );
 
@@ -933,6 +938,17 @@ fn normalized_inferred_versions(values: impl Iterator<Item = u32>) -> Vec<u32> {
     values.sort_unstable();
     values.dedup();
     values
+}
+
+fn endpoint_schema_resolutions(
+    schemas: &ResolvedEndpointSelectorSchemas,
+) -> Vec<SchemaVersionResolution> {
+    match schemas {
+        ResolvedEndpointSelectorSchemas::Query(resolution) => vec![*resolution],
+        ResolvedEndpointSelectorSchemas::Rows(bindings) => {
+            bindings.iter().map(|binding| binding.resolution).collect()
+        }
+    }
 }
 
 fn write_rule_detail<W: Write>(
@@ -1035,14 +1051,36 @@ fn write_endpoint_dependency<W: Write>(
     write!(output, "    definition schema: ").map_err(map_io_error)?;
     write_endpoint_definition_schema(output, endpoint.definition_schema())?;
     writeln!(output).map_err(map_io_error)?;
-    write!(
-        output,
-        "    selector {}: ",
-        escape_terminal_text(endpoint.selector_path().as_str()),
-    )
-    .map_err(map_io_error)?;
-    write_schema_resolution_value(output, endpoint.selector_schema())?;
-    writeln!(output).map_err(map_io_error)?;
+    match endpoint.selector_schemas() {
+        ResolvedEndpointSelectorSchemas::Query(resolution) => {
+            write!(
+                output,
+                "    selector {}: ",
+                escape_terminal_text(endpoint.selector_path().as_str()),
+            )
+            .map_err(map_io_error)?;
+            write_schema_resolution_value(output, *resolution)?;
+            writeln!(output).map_err(map_io_error)?;
+        }
+        ResolvedEndpointSelectorSchemas::Rows(bindings) => {
+            writeln!(
+                output,
+                "    selector {}: row plan",
+                escape_terminal_text(endpoint.selector_path().as_str()),
+            )
+            .map_err(map_io_error)?;
+            for binding in bindings {
+                write!(
+                    output,
+                    "      binding {}: ",
+                    escape_terminal_text(binding.path.as_str()),
+                )
+                .map_err(map_io_error)?;
+                write_schema_resolution_value(output, binding.resolution)?;
+                writeln!(output).map_err(map_io_error)?;
+            }
+        }
+    }
     writeln!(output, "    semantic hash: {}", endpoint.semantic_hash()).map_err(map_io_error)?;
     writeln!(
         output,
@@ -1238,9 +1276,25 @@ fn write_manifest_entry<W: Write>(
     write!(output, "      definition schema: ").map_err(map_io_error)?;
     write_endpoint_definition_schema(output, &entry.definition_schema)?;
     writeln!(output).map_err(map_io_error)?;
-    write!(output, "      selector schema: ").map_err(map_io_error)?;
-    write_schema_resolution_value(output, entry.selector_schema)?;
-    writeln!(output).map_err(map_io_error)?;
+    match &entry.selector_schemas {
+        ResolvedEndpointSelectorSchemas::Query(resolution) => {
+            write!(output, "      selector schema: ").map_err(map_io_error)?;
+            write_schema_resolution_value(output, *resolution)?;
+            writeln!(output).map_err(map_io_error)?;
+        }
+        ResolvedEndpointSelectorSchemas::Rows(bindings) => {
+            for binding in bindings {
+                write!(
+                    output,
+                    "      selector binding {}: ",
+                    escape_terminal_text(binding.path.as_str()),
+                )
+                .map_err(map_io_error)?;
+                write_schema_resolution_value(output, binding.resolution)?;
+                writeln!(output).map_err(map_io_error)?;
+            }
+        }
+    }
     writeln!(output, "      semantic hash: {}", entry.semantic_hash).map_err(map_io_error)?;
     writeln!(
         output,
@@ -2429,6 +2483,21 @@ fn write_query_result_detail<W: Write>(
                     .map_err(map_io_error)?;
             }
         }
+        PolicyQueryResultRef::JsxAttributeValue {
+            element_identity,
+            coverage,
+            ast_id,
+            ..
+        } => {
+            write!(
+                output,
+                " {}; coverage {}; ast_id {}",
+                escape_terminal_text(element_identity),
+                escape_terminal_text(coverage),
+                escape_terminal_text(ast_id),
+            )
+            .map_err(map_io_error)?;
+        }
         PolicyQueryResultRef::ReceiverAnalysis {
             analysis_kind,
             outcome,
@@ -2974,6 +3043,9 @@ fn write_summary<W: Write>(
             .map_err(map_io_error)?;
         }
     }
+    if let Some(review) = report.packs() {
+        write_dependency_pack_summary(output, review)?;
+    }
     if report.runs().is_empty() {
         write!(output, "; 0 policy runs").map_err(map_io_error)?;
     } else {
@@ -2998,6 +3070,68 @@ fn write_summary<W: Write>(
         write!(output, "; non-clean").map_err(map_io_error)?;
     }
     writeln!(output).map_err(map_io_error)
+}
+
+fn write_dependency_pack_summary<W: Write>(
+    output: &mut BoundedWriter<W>,
+    review: &PolicyPackActivationReview,
+) -> Result<(), PolicyRenderError> {
+    write!(
+        output,
+        "; dependency packs: mode {}; {}; ecosystems {}",
+        dependency_pack_activation_mode(review.dependency_mode()),
+        if review.complete() {
+            "complete"
+        } else {
+            "incomplete"
+        },
+        if review.ecosystems().is_empty() {
+            "none".to_owned()
+        } else {
+            review.ecosystems().join(",")
+        },
+    )
+    .map_err(map_io_error)?;
+    if !review.decisions().is_empty() {
+        write!(output, "; decisions ").map_err(map_io_error)?;
+        for (index, decision) in review.decisions().iter().enumerate() {
+            if index > 0 {
+                write!(output, ", ").map_err(map_io_error)?;
+            }
+            write!(
+                output,
+                "{}={}",
+                escape_terminal_text(decision.pack()),
+                policy_pack_decision_status(decision.status()),
+            )
+            .map_err(map_io_error)?;
+            if let Some(reason) = decision.reason() {
+                write!(output, " ({})", escape_terminal_text(reason)).map_err(map_io_error)?;
+            }
+        }
+        if review.decisions_truncated() {
+            write!(output, ", ... (decisions truncated)").map_err(map_io_error)?;
+        }
+    }
+    Ok(())
+}
+
+const fn dependency_pack_activation_mode(mode: PolicyDependencyPackActivationMode) -> &'static str {
+    match mode {
+        PolicyDependencyPackActivationMode::Default => "default",
+        PolicyDependencyPackActivationMode::Configured => "configured",
+        PolicyDependencyPackActivationMode::Disabled => "disabled",
+    }
+}
+
+const fn policy_pack_decision_status(status: PolicyPackDecisionStatus) -> &'static str {
+    match status {
+        PolicyPackDecisionStatus::Selected => "selected",
+        PolicyPackDecisionStatus::VersionMismatch => "version-mismatch",
+        PolicyPackDecisionStatus::Missing => "missing",
+        PolicyPackDecisionStatus::Incompatible => "incompatible",
+        PolicyPackDecisionStatus::Rejected => "rejected",
+    }
 }
 
 fn write_summary_count<W: Write>(
@@ -3152,6 +3286,7 @@ const fn query_result_kind(value: &PolicyQueryResultRef) -> &'static str {
         PolicyQueryResultRef::ReferenceSite { .. } => "reference_site",
         PolicyQueryResultRef::CallSite { .. } => "call_site",
         PolicyQueryResultRef::ExpressionSite { .. } => "expression_site",
+        PolicyQueryResultRef::JsxAttributeValue { .. } => "jsx_attribute_value",
         PolicyQueryResultRef::ReceiverAnalysis { .. } => "receiver_analysis",
         PolicyQueryResultRef::Unsupported { .. } => "unsupported",
     }
@@ -3231,6 +3366,7 @@ const fn match_result_domain(value: MatchResultDomain) -> &'static str {
         MatchResultDomain::ReferenceSite => "reference_site",
         MatchResultDomain::CallSite => "call_site",
         MatchResultDomain::ExpressionSite => "expression_site",
+        MatchResultDomain::JsxAttributeValue => "jsx_attribute_value",
         MatchResultDomain::Occurrence => "occurrence",
         MatchResultDomain::LexicalScope => "lexical_scope",
         MatchResultDomain::Binding => "binding",

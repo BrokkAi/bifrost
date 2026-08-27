@@ -32,6 +32,14 @@ pub fn relational_binding_selector_path(name: &RowBindingName) -> String {
     format!("/analysis/plan/bindings/{}/query", name.as_str())
 }
 
+/// The selector path of a query nested in an endpoint row selector.
+///
+/// The endpoint's own selector path is the prefix so source, sink, flow, and
+/// auxiliary endpoint sets can all use the same stable naming rule.
+pub fn row_selector_binding_selector_path(path: &str, name: &RowBindingName) -> String {
+    format!("{path}/bindings/{}/query", name.as_str())
+}
+
 pub const DEFAULT_WITNESS_MAX_STEPS: usize = 64;
 pub const DEFAULT_WITNESS_MAX_BYTES: usize = 16 * 1024;
 pub const DEFAULT_WITNESSES_PER_FINDING: usize = 8;
@@ -217,6 +225,21 @@ pub struct RelationalAssertionPlan {
     pub groups: Vec<RowGroup>,
     pub assertions: Vec<RowAssertion>,
     pub limits: RelationalAssertionLimits,
+}
+
+/// A bounded relational selector used by a taint or value-flow endpoint.
+///
+/// Unlike an assertion plan, this form has no groups or assertions. Its
+/// output is one live relation, which is later consumed as the endpoint's
+/// selected call/argument rows. Joins are retained here because endpoint
+/// selectors may combine exact call and binding evidence before selecting the
+/// output relation.
+#[derive(Debug, Clone)]
+pub struct RowSelectorPlan {
+    pub bindings: Vec<RowBinding>,
+    pub derivations: Vec<RowDerivation>,
+    pub joins: Vec<RowJoin>,
+    pub output: RowBindingName,
 }
 
 #[derive(Debug, Clone)]
@@ -553,6 +576,7 @@ pub enum PolicyAssert {
     Resolution(ResolutionAssert),
     BindingScope(BindingScopeAssert),
     ValueOrigin(ValueOriginAssert),
+    OriginShape(OriginShapeAssert),
     Boundary(BoundaryAssert),
     Generation(GenerationAssert),
     DeclarationState(DeclarationStateAssert),
@@ -572,6 +596,7 @@ impl PolicyAssert {
             Self::Resolution(assertion) => &assertion.id,
             Self::BindingScope(assertion) => &assertion.id,
             Self::ValueOrigin(assertion) => &assertion.id,
+            Self::OriginShape(assertion) => &assertion.id,
             Self::Boundary(assertion) => &assertion.id,
             Self::Generation(assertion) => &assertion.id,
             Self::DeclarationState(assertion) => &assertion.id,
@@ -595,6 +620,12 @@ impl PolicyAssert {
             Self::Resolution(assertion) => Some(&assertion.at),
             Self::BindingScope(assertion) => Some(&assertion.at),
             Self::ValueOrigin(assertion) => Some(&assertion.at),
+            // The origin-shape family joins findings to its `anchor` capture
+            // (the smell site), not to `at` (the iterable it resolves): two
+            // calls under one loop must stay two findings rather than
+            // collapsing on the shared iterable node. `at` is resolved inside
+            // the family's own evaluation, which tolerates its absence.
+            Self::OriginShape(assertion) => Some(&assertion.anchor),
             Self::Boundary(assertion) => Some(&assertion.at),
             Self::Generation(assertion) => Some(&assertion.at),
             Self::DeclarationState(assertion) => Some(&assertion.at),
@@ -626,7 +657,14 @@ impl PolicyAssert {
             Self::Route(assertion) => Some(assertion.role),
             Self::RoundTrip(assertion) => Some(assertion.role),
             Self::FlowEstablishment(assertion) => Some(assertion.role),
-            Self::Generation(_) | Self::DeclarationState(_) | Self::RewriteTermination(_) => None,
+            // Origin-shape: the role scopes the *iterable's* binding join,
+            // not the anchor this accessor's callers join rows for, so the
+            // generic role-row gate must not skip its subjects. The evaluator
+            // feeds the role into the row-query planning explicitly.
+            Self::Generation(_)
+            | Self::DeclarationState(_)
+            | Self::OriginShape(_)
+            | Self::RewriteTermination(_) => None,
         }
     }
 
@@ -636,6 +674,7 @@ impl PolicyAssert {
             Self::Resolution(_) => "resolution",
             Self::BindingScope(_) => "binding_scope",
             Self::ValueOrigin(_) => "value_origin",
+            Self::OriginShape(_) => "origin_shape",
             Self::Boundary(_) => "boundary",
             Self::Generation(_) => "generation",
             Self::DeclarationState(_) => "declaration-state",
@@ -830,6 +869,57 @@ impl BindingScopeAssert {
             self.containment.label(),
             self.relative_to
         )
+    }
+}
+
+/// Require one captured reference's value to provably originate from a small
+/// literal collection (#2647). The polarity is inverted relative to every
+/// other family: this assert is the *exclusion* half of a review-prompt
+/// policy, so anything short of positive proof -- the capture absent on this
+/// subject row, the reference resolving to no binding, no establishing
+/// assignment found, or any establishing initializer that is not a matching
+/// collection literal -- is a violation and keeps the finding. Only an
+/// iterated expression that is itself, or whose every establishing
+/// initializer is, a `collection_literal` fact with at most `max_elements`
+/// elements satisfies it.
+#[derive(Debug, Clone)]
+pub struct OriginShapeAssert {
+    pub id: PolicyAssertId,
+    /// The captured loop whose iterated expression's origin shape is
+    /// asserted about. The evaluator joins the loop to its iterated
+    /// expression internally, so the subject selector keeps matching every
+    /// loop kind; a loop that does not iterate an expression in evidence
+    /// violates.
+    pub at: String,
+    /// The capture the finding anchors to (for the loop family: the smell
+    /// call). Distinct from `at` so two calls under one loop stay two
+    /// findings rather than collapsing on the shared iterable node.
+    pub anchor: String,
+    pub role: OccurrenceRole,
+    pub shape: OriginShape,
+    pub max_elements: u32,
+}
+
+impl OriginShapeAssert {
+    pub fn expectation(&self) -> String {
+        format!(
+            "value provably originates from a {} with at most {} elements",
+            self.shape.label(),
+            self.max_elements
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OriginShape {
+    CollectionLiteral,
+}
+
+impl OriginShape {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::CollectionLiteral => "collection-literal",
+        }
     }
 }
 
@@ -1436,6 +1526,9 @@ pub enum PolicySelector {
     File {
         authored_schema_version: Option<u32>,
         path: WorkspaceRelativePath,
+    },
+    Rows {
+        plan: RowSelectorPlan,
     },
 }
 

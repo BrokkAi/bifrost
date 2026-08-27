@@ -40,6 +40,24 @@ use std::sync::Arc;
 pub trait CppSource:
     CodeUnitIndex + TypeAliasProvider + TypeHierarchyProvider + CppWorkspaceSource
 {
+    /// Structured includes for a disposable visibility traversal.
+    fn visibility_import_statements(
+        &self,
+        _token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Vec<String> {
+        self.import_statements(file)
+    }
+
+    /// Physical identifier candidates used only to discover source files for
+    /// a bounded visibility traversal. Re-keyed out-of-line definitions do not
+    /// add an includable source, so analyzer implementations may answer this
+    /// from their stored declaration index without global identity
+    /// reconciliation.
+    fn visibility_identifier_candidates(&self, identifier: &str) -> BTreeSet<CodeUnit> {
+        self.lookup_candidates_by_identifier(identifier)
+    }
+
     /// The callable role recorded for a physical stored declaration, without
     /// consulting reconciliation fallbacks that may themselves be building.
     fn stored_callable_unit_role(&self, callable: &CodeUnit) -> CppCallableUnitRole;

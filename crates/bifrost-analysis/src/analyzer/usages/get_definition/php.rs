@@ -1,5 +1,6 @@
 use super::*;
 use crate::analyzer::BoundedDefinitionLookup;
+use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::ForwardQueryProvider;
 use crate::analyzer::TypeHierarchyProvider;
 use crate::analyzer::php::{
@@ -9,10 +10,17 @@ use crate::analyzer::php::{
 };
 use crate::analyzer::usages::local_inference::SymbolResolution;
 use crate::analyzer::usages::php_graph::syntax::{
-    PhpMagicSurface, declared_callable_return_type_fq_name, declared_field_type_fq_name,
-    declared_type_of, is_local_scope as php_is_local_scope, magic_member_names,
-    object_creation_type as php_object_creation_type, seed_assignment_binding,
-    seed_parameter_types, static_member_parts as php_static_member_parts,
+    PhpMagicSurface, anonymous_function_capture_names, captured_local_scope_bindings,
+    collection_element_type_fq_name, constructor_parameter_type_node, declaration_doc_comment,
+    declared_callable_return_type_fq_name, declared_field_type_fq_name, declared_type_of,
+    dominating_instanceof_type_node, enclosing_array_map_collection,
+    enclosing_class_declaration_for_field, enclosing_foreach_collection,
+    foreach_value_reassigned_before, infer_constructor_assigned_field_type,
+    infer_indexed_field_element_type, infer_indexed_local_element_type,
+    infer_static_assigned_field_type, is_local_scope as php_is_local_scope, magic_member_names,
+    object_creation_type as php_object_creation_type, parameter_doc_element_type,
+    parameter_type_node, promoted_property_doc_element_type, relative_declared_type_keyword,
+    seed_assignment_binding, seed_parameter_types, static_member_parts as php_static_member_parts,
     unwrap_parenthesized as php_unwrap_parenthesized,
     variable_identifier as php_variable_identifier,
 };
@@ -23,6 +31,11 @@ use crate::analyzer::usages::target_kind::TypeLookupTargetKind;
 use brokk_bifrost_php::graph::PhpCallableFacts;
 use brokk_bifrost_php::graph_support::{
     php_direct_declared_class_parent, php_file_context_from_source, php_is_interface,
+};
+use brokk_bifrost_php::phpdoc::{
+    return_element_type as phpdoc_return_element_type,
+    return_nominal_type as phpdoc_return_nominal_type, var_element_type as phpdoc_var_element_type,
+    var_nominal_type as phpdoc_var_nominal_type,
 };
 
 const PHP_BOUNDED_AUXILIARY_MAX_SOURCE_BYTES: usize =
@@ -160,6 +173,7 @@ pub(crate) fn php_type_lookup_resolution_bounded(
     let enclosing = php_enclosing_type_from_tree(support, node, source, &ctx, session)?;
     let bindings = php_bindings_before(
         php,
+        analyzer,
         file,
         source,
         root,
@@ -223,23 +237,36 @@ fn php_expression_type_fqn(
         );
     }
     match node.kind() {
-        "variable_name" => {
-            let name = php_variable_identifier(node, source);
-            if name == "this" {
-                enclosing.fqn.clone()
-            } else {
-                php_precise_owner(bindings, name)
-            }
-        }
+        "variable_name" => php_instance_receiver_fqn(
+            php, analyzer, support, node, source, enclosing, bindings, ctx, session,
+        ),
         "object_creation_expression" => php_object_creation_type_with_session(node, session)
-            .and_then(|type_node| resolve_php_type(php_node_text(type_node, source), ctx)),
-        "parenthesized_expression" => node.named_child(0).and_then(|inner| {
+            .and_then(|type_node| {
+                php_static_scope_fqn(php, support, type_node, source, ctx, enclosing, session)
+            }),
+        "parenthesized_expression" | "clone_expression" => node.named_child(0).and_then(|inner| {
             php_expression_type_fqn(
                 php, analyzer, support, inner, source, enclosing, bindings, ctx, session,
             )
         }),
+        "subscript_expression" => php_instance_receiver_fqn(
+            php, analyzer, support, node, source, enclosing, bindings, ctx, session,
+        ),
         "function_call_expression" | "scoped_call_expression" => {
             php_assignment_receiver_fqn(php, support, node, source, enclosing, ctx)
+        }
+        "scoped_property_access_expression" => {
+            let (scope, name) = php_static_member_parts(node)?;
+            let owner = php_static_scope_fqn(php, support, scope, source, ctx, enclosing, session)?;
+            let member = php_variable_identifier(name, source);
+            let mut fields = php_fqn_candidates(support, &format!("{owner}.{member}"));
+            fields.retain(CodeUnit::is_field);
+            sort_units(&mut fields);
+            fields.dedup();
+            let [field] = fields.as_slice() else {
+                return None;
+            };
+            php_field_type_fqn(php, analyzer, support, field, session)
         }
         "member_call_expression" | "nullsafe_member_call_expression" => {
             php_member_call_return_type_fqn(
@@ -350,7 +377,7 @@ fn resolve_php_with_session(
         }
         None => {
             let ctx = php_file_context_from_source(php, file, source);
-            let class_ranges = ClassRangeIndex::build(analyzer, file);
+            let class_ranges = analyzer.class_range_index(file);
             let enclosing = PhpEnclosingType::from_index(&class_ranges, site.range.start_byte);
             (ctx, enclosing)
         }
@@ -453,6 +480,7 @@ fn resolve_php_with_session(
             let member = php_node_text(name, source).trim_start_matches('$');
             let bindings = php_bindings_before(
                 php,
+                analyzer,
                 file,
                 source,
                 root,
@@ -1047,6 +1075,8 @@ const PHP_DYNAMIC_RECEIVER: &str = "php_dynamic_receiver";
 enum PhpReceiverOwners {
     /// At least one class the receiver can be. Never empty.
     Nominal(Vec<String>),
+    /// A member-call chain entered a nominal owner outside this workspace.
+    UnindexedBoundary { owner: String, member: String },
     /// Proven dynamic, with the phrase naming the proof.
     ProvenDynamic(String),
     /// The receiver shape or type is not followed.
@@ -1093,6 +1123,21 @@ fn php_member_outcome(
             return no_definition(
                 PHP_DYNAMIC_RECEIVER,
                 format!("PHP member `{member}` is resolved at run time: {proof}"),
+            );
+        }
+        PhpReceiverOwners::UnindexedBoundary {
+            owner,
+            member: boundary_member,
+        } => {
+            return gated_boundary(
+                || !php_crosses_unindexed_boundary(support, &owner),
+                format!(
+                    "`{member}` appears to cross a PHP boundary through `{owner}.{boundary_member}`, whose receiver type is not indexed in this workspace"
+                ),
+                "unsupported_php_receiver",
+                format!(
+                    "receiver for PHP member `{member}` is not resolved after `{owner}.{boundary_member}`"
+                ),
             );
         }
         PhpReceiverOwners::Nominal(owners) => owners,
@@ -1986,6 +2031,68 @@ enum PhpExpressionTypeFrame<'tree> {
 }
 
 #[allow(clippy::too_many_arguments)]
+fn php_collection_element_type_fqn_bounded(
+    php: &PhpAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    collection: Node<'_>,
+    source: &str,
+    enclosing: &PhpEnclosingType,
+    bindings: &LocalInferenceEngine<String>,
+    ctx: &FileContext,
+    session: &ResolutionSession,
+) -> Option<String> {
+    match collection.kind() {
+        "variable_name" => infer_indexed_local_element_type(
+            collection,
+            source,
+            collection.start_byte(),
+            &mut |right| {
+                php_expression_type_fqn_bounded(
+                    php, support, right, source, enclosing, bindings, ctx, session,
+                )
+            },
+        ),
+        "member_access_expression" | "nullsafe_member_access_expression" => {
+            let object = collection.child_by_field_name("object")?;
+            if object.kind() != "variable_name" || php_variable_identifier(object, source) != "this"
+            {
+                return None;
+            }
+            let member = collection.child_by_field_name("name")?;
+            let member = php_literal_member_name(member, source, session)?;
+            let owner = enclosing.fqn()?;
+            let field = php_unique_member_candidate_bounded(
+                php,
+                support,
+                owner,
+                member,
+                CodeUnit::is_field,
+                session,
+            )?;
+            php_declared_field_element_type_fqn_bounded(php, support, &field, session)
+        }
+        "member_call_expression" | "nullsafe_member_call_expression" => {
+            let object = collection.child_by_field_name("object")?;
+            let owner = php_expression_type_fqn_bounded(
+                php, support, object, source, enclosing, bindings, ctx, session,
+            )?;
+            let member = collection.child_by_field_name("name")?;
+            let member = php_literal_member_name(member, source, session)?;
+            let callable = php_unique_member_candidate_bounded(
+                php,
+                support,
+                &owner,
+                member,
+                CodeUnit::is_function,
+                session,
+            )?;
+            php_declared_callable_return_element_type_fqn_bounded(php, &callable, session)
+        }
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn php_expression_type_fqn_bounded(
     php: &PhpAnalyzer,
     support: &dyn BoundedDefinitionLookup,
@@ -2006,10 +2113,41 @@ fn php_expression_type_fqn_bounded(
             PhpExpressionTypeFrame::Evaluate(expression) => match expression.kind() {
                 "variable_name" => {
                     let name = php_variable_identifier(expression, source);
-                    let value = if name == "this" {
+                    let value = if let Some(type_node) =
+                        dominating_instanceof_type_node(expression, source, || session.scope_step())
+                    {
+                        resolve_php_type_node(type_node, source, ctx, || session.scope_step())
+                    } else if name == "this" {
                         enclosing.fqn.clone()
+                    } else if let Some(collection) =
+                        enclosing_foreach_collection(expression, source, || session.scope_step())
+                    {
+                        php_collection_element_type_fqn_bounded(
+                            php, support, collection, source, enclosing, bindings, ctx, session,
+                        )
+                        .or_else(|| {
+                            foreach_value_reassigned_before(expression, source)
+                                .then(|| php_precise_owner(bindings, name))
+                                .flatten()
+                        })
+                    } else if let Some(owner) = php_precise_owner(bindings, name) {
+                        Some(owner)
+                    } else if let Some(collection) = enclosing_array_map_collection(
+                        expression,
+                        source,
+                        ctx,
+                        || session.scope_step(),
+                        |candidate| {
+                            php_fqn_candidates(support, candidate)
+                                .iter()
+                                .any(CodeUnit::is_function)
+                        },
+                    ) {
+                        php_collection_element_type_fqn_bounded(
+                            php, support, collection, source, enclosing, bindings, ctx, session,
+                        )
                     } else {
-                        php_precise_owner(bindings, name)
+                        None
                     }?;
                     values.push(value);
                 }
@@ -2020,9 +2158,15 @@ fn php_expression_type_fqn_bounded(
                         php, support, type_node, source, ctx, enclosing, session,
                     )?);
                 }
-                "parenthesized_expression" => {
+                "parenthesized_expression" | "clone_expression" => {
                     let inner = expression.named_child(0)?;
                     frames.push(PhpExpressionTypeFrame::Evaluate(inner));
+                }
+                "subscript_expression" => {
+                    let collection = expression.named_child(0)?;
+                    values.push(php_collection_element_type_fqn_bounded(
+                        php, support, collection, source, enclosing, bindings, ctx, session,
+                    )?);
                 }
                 "function_call_expression" => {
                     let function = expression.child_by_field_name("function")?;
@@ -2052,6 +2196,30 @@ fn php_expression_type_fqn_bounded(
                         support,
                         &format!("{owner}.{member}"),
                         Some(session),
+                    )?);
+                }
+                "scoped_property_access_expression" => {
+                    let (scope, name) = php_static_member_parts(expression)?;
+                    let owner = php_static_scope_fqn(
+                        php,
+                        support,
+                        scope,
+                        source,
+                        ctx,
+                        enclosing,
+                        Some(session),
+                    )?;
+                    let member = php_variable_identifier(name, source);
+                    let field = php_unique_member_candidate_bounded(
+                        php,
+                        support,
+                        &owner,
+                        member,
+                        CodeUnit::is_field,
+                        session,
+                    )?;
+                    values.push(php_declared_unit_type_fqn_bounded(
+                        php, support, &field, session,
                     )?);
                 }
                 "member_call_expression" | "nullsafe_member_call_expression" => {
@@ -2191,6 +2359,26 @@ fn php_declared_unit_type_fqn_bounded(
     (arms.len() == 1).then(|| arms.remove(0))
 }
 
+fn php_declared_callable_return_element_type_fqn_bounded(
+    php: &PhpAnalyzer,
+    callable: &CodeUnit,
+    session: &ResolutionSession,
+) -> Option<String> {
+    if !callable.is_function() {
+        return None;
+    }
+    let (prepared, range) = php_prepared_declaration_bounded(php, callable, session)?;
+    let source = prepared.source();
+    let root = prepared.tree().root_node();
+    let declaration = php_declaration_node_bounded(root, source, callable, &range, session)?;
+    let raw = phpdoc_return_element_type(declaration_doc_comment(declaration, source)?)?;
+    let ctx = php_file_context_from_tree_at(root, source, declaration.start_byte(), || {
+        session.scope_step()
+    })?;
+    let mut arms = resolve_php_type_arms(&raw, &ctx);
+    (arms.len() == 1).then(|| arms.remove(0))
+}
+
 /// What the declared return or field type of `unit` proves, read from the
 /// declaration's own parser nodes.
 ///
@@ -2225,7 +2413,72 @@ fn php_declared_unit_type_bounded_inner(
         "property_declaration" | "property_promotion_parameter" => "type",
         _ => return None,
     };
-    let type_node = declaration.child_by_field_name(field_name)?;
+    let Some(type_node) = declaration.child_by_field_name(field_name) else {
+        if unit.is_function() {
+            let raw = phpdoc_return_nominal_type(declaration_doc_comment(declaration, source)?)?;
+            let ctx =
+                php_file_context_from_tree_at(root, source, declaration.start_byte(), || {
+                    session.scope_step()
+                })?;
+            return Some(PhpDeclaredType::nominal(resolve_php_type_arms(&raw, &ctx)));
+        }
+        if !unit.is_field() {
+            return None;
+        }
+        let owner = php.parent_of(unit).filter(CodeUnit::is_class)?;
+        let class = enclosing_class_declaration_for_field(
+            root,
+            source,
+            &owner,
+            std::slice::from_ref(&range),
+            || session.scope_step(),
+        )?;
+        let ctx = php_file_context_from_tree_at(root, source, class.start_byte(), || {
+            session.scope_step()
+        })?;
+        let enclosing = php_enclosing_type_from_tree(support, declaration, source, &ctx, session)?;
+        if let Some(raw) = phpdoc_var_nominal_type(declaration_doc_comment(declaration, source)?) {
+            return Some(PhpDeclaredType::nominal(resolve_php_type_arms(&raw, &ctx)));
+        }
+        let inferred = infer_constructor_assigned_field_type(
+            class,
+            source,
+            unit.identifier(),
+            || session.scope_step(),
+            |right| {
+                let right = php_unwrap_parenthesized(right);
+                if right.kind() == "object_creation_expression" {
+                    let type_node = php_object_creation_type_with_session(right, Some(session))?;
+                    return php_bounded_type_reference_fqn(
+                        php, support, type_node, source, &ctx, &enclosing, session,
+                    );
+                }
+                let type_node =
+                    constructor_parameter_type_node(right, source, || session.scope_step())?;
+                let mut arms =
+                    resolve_php_type_node_arms(type_node, source, &ctx, || session.scope_step());
+                (arms.len() == 1).then(|| arms.remove(0))
+            },
+        )
+        .or_else(|| {
+            infer_static_assigned_field_type(
+                class,
+                source,
+                unit.identifier(),
+                || session.scope_step(),
+                |right| {
+                    let right = php_unwrap_parenthesized(right);
+                    let type_node = (right.kind() == "object_creation_expression")
+                        .then(|| php_object_creation_type_with_session(right, Some(session)))
+                        .flatten()?;
+                    php_bounded_type_reference_fqn(
+                        php, support, type_node, source, &ctx, &enclosing, session,
+                    )
+                },
+            )
+        });
+        return inferred.map(|fqn| PhpDeclaredType::Nominal(vec![fqn]));
+    };
     if !session.scope_step() {
         return None;
     }
@@ -2261,30 +2514,77 @@ fn php_declared_unit_type_bounded_inner(
     )))
 }
 
+fn php_declared_field_element_type_fqn_bounded(
+    php: &PhpAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    field: &CodeUnit,
+    session: &ResolutionSession,
+) -> Option<String> {
+    if !field.is_field() {
+        return None;
+    }
+    let owner = php.parent_of(field).filter(CodeUnit::is_class)?;
+    let (prepared, range) = php_prepared_declaration_bounded(php, field, session)?;
+    let source = prepared.source();
+    let root = prepared.tree().root_node();
+    let declaration = php_declaration_node_bounded(root, source, field, &range, session)?;
+    let class = enclosing_class_declaration_for_field(
+        root,
+        source,
+        &owner,
+        std::slice::from_ref(&range),
+        || session.scope_step(),
+    )?;
+    let ctx =
+        php_file_context_from_tree_at(root, source, class.start_byte(), || session.scope_step())?;
+    let enclosing = php_enclosing_type_from_tree(support, class, source, &ctx, session)?;
+    infer_indexed_field_element_type(
+        class,
+        source,
+        field.identifier(),
+        || session.scope_step(),
+        |right| {
+            let right = php_unwrap_parenthesized(right);
+            if right.kind() == "object_creation_expression" {
+                let type_node = php_object_creation_type_with_session(right, Some(session))?;
+                return php_bounded_type_reference_fqn(
+                    php, support, type_node, source, &ctx, &enclosing, session,
+                );
+            }
+            let type_node = parameter_type_node(right, source, || session.scope_step())?;
+            let mut arms =
+                resolve_php_type_node_arms(type_node, source, &ctx, || session.scope_step());
+            (arms.len() == 1).then(|| arms.remove(0))
+        },
+    )
+    .or_else(|| {
+        let raw = phpdoc_var_element_type(declaration_doc_comment(declaration, source)?)?;
+        resolve_php_type(&raw, &ctx)
+    })
+    .or_else(|| {
+        let raw = promoted_property_doc_element_type(declaration, source, || session.scope_step())?;
+        resolve_php_type(&raw, &ctx)
+    })
+    .or_else(|| {
+        infer_constructor_assigned_field_type(
+            class,
+            source,
+            field.identifier(),
+            || session.scope_step(),
+            |right| {
+                let raw = parameter_doc_element_type(right, source, || session.scope_step())?;
+                resolve_php_type(&raw, &ctx)
+            },
+        )
+    })
+}
+
 fn php_relative_type_keyword_bounded<'a>(
-    mut node: Node<'_>,
+    node: Node<'_>,
     source: &'a str,
     session: &ResolutionSession,
 ) -> Option<&'a str> {
-    if !session.scope_step() {
-        return None;
-    }
-    if node.kind() == "named_type" {
-        if node.named_child_count() != 1 || !session.scope_step() {
-            return None;
-        }
-        node = node.named_child(0)?;
-    }
-    if node.kind() != "name" && node.kind() != "relative_scope" {
-        return None;
-    }
-    if !session.scope_step() {
-        return None;
-    }
-    let text = php_node_text(node, source);
-    ["self", "static", "parent"]
-        .into_iter()
-        .find(|keyword| text.eq_ignore_ascii_case(keyword))
+    relative_declared_type_keyword(node, source, || session.scope_step())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2307,22 +2607,77 @@ fn php_instance_receiver_fqn(
     match object.kind() {
         "variable_name" => {
             let name = php_variable_identifier(object, source);
+            if let Some(type_node) = dominating_instanceof_type_node(object, source, || true) {
+                return resolve_php_type_node(type_node, source, ctx, || true);
+            }
             if name == "this" {
                 return enclosing.fqn.clone();
+            }
+            if let Some(collection) = enclosing_foreach_collection(object, source, || true) {
+                let facts = PhpAnalyzerFacts::new(php);
+                return collection_element_type_fq_name(
+                    php,
+                    php_graph_source(php, &facts),
+                    collection,
+                    source,
+                    ctx,
+                    bindings,
+                    &mut |_, _| enclosing.fqn.clone(),
+                );
+            }
+            if let Some(collection) = enclosing_array_map_collection(
+                object,
+                source,
+                ctx,
+                || true,
+                |candidate| {
+                    php_fqn_candidates(support, candidate)
+                        .iter()
+                        .any(CodeUnit::is_function)
+                },
+            ) {
+                let facts = PhpAnalyzerFacts::new(php);
+                return collection_element_type_fq_name(
+                    php,
+                    php_graph_source(php, &facts),
+                    collection,
+                    source,
+                    ctx,
+                    bindings,
+                    &mut |_, _| enclosing.fqn.clone(),
+                );
             }
             php_precise_owner(bindings, name)
         }
         // `(new Foo())->member` — the receiver is typed by the constructed class.
         "object_creation_expression" => php_object_creation_type_with_session(object, session)
-            .and_then(|type_node| resolve_php_type(php_node_text(type_node, source), ctx)),
+            .and_then(|type_node| {
+                php_static_scope_fqn(php, support, type_node, source, ctx, enclosing, session)
+            }),
         "parenthesized_expression" => object.named_child(0).and_then(|inner| {
             php_instance_receiver_fqn(
                 php, analyzer, support, inner, source, enclosing, bindings, ctx, session,
             )
         }),
+        "subscript_expression" => {
+            let collection = object.named_child(0)?;
+            let facts = PhpAnalyzerFacts::new(php);
+            collection_element_type_fq_name(
+                php,
+                php_graph_source(php, &facts),
+                collection,
+                source,
+                ctx,
+                bindings,
+                &mut |_, _| enclosing.fqn.clone(),
+            )
+        }
         "function_call_expression" | "scoped_call_expression" => {
             php_assignment_receiver_fqn(php, support, object, source, enclosing, ctx)
         }
+        "scoped_property_access_expression" => php_expression_type_fqn(
+            php, analyzer, support, object, source, enclosing, bindings, ctx, session,
+        ),
         "member_call_expression" | "nullsafe_member_call_expression" => {
             php_member_call_return_type_fqn(
                 php, analyzer, support, object, source, enclosing, bindings, ctx, session,
@@ -2441,22 +2796,36 @@ fn php_instance_receiver_owners(
             .map(|field| php_declared_unit_receiver_owners(php, analyzer, support, &field, session))
             .unwrap_or(PhpReceiverOwners::Unknown)
         }
-        "member_call_expression" | "nullsafe_member_call_expression" => php_receiver_member_unit(
-            php,
-            analyzer,
-            support,
-            object,
-            source,
-            enclosing,
-            &bindings.engine,
-            ctx,
-            session,
-            CodeUnit::is_function,
-        )
-        .map(|callable| {
-            php_declared_unit_receiver_owners(php, analyzer, support, &callable, session)
-        })
-        .unwrap_or(PhpReceiverOwners::Unknown),
+        "member_call_expression" | "nullsafe_member_call_expression" => {
+            if let Some(callable) = php_receiver_member_unit(
+                php,
+                analyzer,
+                support,
+                object,
+                source,
+                enclosing,
+                &bindings.engine,
+                ctx,
+                session,
+                CodeUnit::is_function,
+            ) {
+                php_declared_unit_receiver_owners(php, analyzer, support, &callable, session)
+            } else if let Some((owner, member)) = php_unindexed_member_call_boundary(
+                php,
+                analyzer,
+                support,
+                object,
+                source,
+                enclosing,
+                &bindings.engine,
+                ctx,
+                session,
+            ) {
+                PhpReceiverOwners::UnindexedBoundary { owner, member }
+            } else {
+                PhpReceiverOwners::Unknown
+            }
+        }
         "function_call_expression" | "scoped_call_expression" => {
             php_direct_callable_unit(php, support, object, source, enclosing, ctx, session)
                 .map(|callable| {
@@ -2466,6 +2835,36 @@ fn php_instance_receiver_owners(
         }
         _ => PhpReceiverOwners::Unknown,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn php_unindexed_member_call_boundary(
+    php: &PhpAnalyzer,
+    analyzer: &dyn IAnalyzer,
+    support: &dyn BoundedDefinitionLookup,
+    call: Node<'_>,
+    source: &str,
+    enclosing: &PhpEnclosingType,
+    bindings: &LocalInferenceEngine<String>,
+    ctx: &FileContext,
+    session: Option<&ResolutionSession>,
+) -> Option<(String, String)> {
+    let object = call.child_by_field_name("object")?;
+    let owner = php_instance_receiver_fqn(
+        php, analyzer, support, object, source, enclosing, bindings, ctx, session,
+    )?;
+    if !php_crosses_unindexed_boundary(support, &owner) {
+        return None;
+    }
+    let name = call.child_by_field_name("name")?;
+    let member = if let Some(session) = session {
+        php_literal_member_name(name, source, session)?.to_string()
+    } else if name.kind() == "name" {
+        php_node_text(name, source).to_string()
+    } else {
+        return None;
+    };
+    Some((owner, member))
 }
 
 /// The receiver reading of one declaration's declared type: its classes, or the
@@ -2662,6 +3061,7 @@ struct PhpLocalBindings {
 #[allow(clippy::too_many_arguments)]
 fn php_bindings_before(
     php: &PhpAnalyzer,
+    analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
@@ -2671,76 +3071,86 @@ fn php_bindings_before(
     support: &dyn BoundedDefinitionLookup,
     session: Option<&ResolutionSession>,
 ) -> PhpLocalBindings {
-    let scope = php_enclosing_scope(root, byte, session).unwrap_or(root);
+    let scopes = php_enclosing_scopes(root, byte, session);
     let mut bindings = PhpLocalBindings {
         engine: LocalInferenceEngine::new(LocalInferenceConfig::default()),
         dynamic: HashMap::default(),
     };
-    let mut stack = vec![scope];
-    while let Some(node) = stack.pop() {
-        if session.is_some_and(|session| !session.scope_step()) {
-            break;
+    for (scope_index, scope) in scopes.into_iter().enumerate() {
+        if scope_index > 0 {
+            bindings.engine = captured_local_scope_bindings(scope, source, &bindings.engine);
+            match scope.kind() {
+                "arrow_function" => {}
+                "anonymous_function" | "anonymous_function_creation" => {
+                    let captured = anonymous_function_capture_names(scope, source);
+                    bindings.dynamic.retain(|name, _| captured.contains(name));
+                }
+                _ => bindings.dynamic.clear(),
+            }
         }
-        if node.start_byte() >= byte {
-            continue;
-        }
-        if node != scope && php_is_local_scope(node) {
-            continue;
-        }
-        php_seed_parameters(node, source, ctx, session, &mut bindings);
-        if node.end_byte() <= byte {
-            php_seed_assignment(
-                php,
-                file,
-                node,
-                source,
-                enclosing,
-                ctx,
-                support,
-                session,
-                &mut bindings.engine,
-            );
-        }
-        let mut cursor = node.walk();
-        let mut children = Vec::new();
-        for child in node.named_children(&mut cursor) {
+        let mut stack = vec![scope];
+        while let Some(node) = stack.pop() {
             if session.is_some_and(|session| !session.scope_step()) {
                 return bindings;
             }
-            if child.start_byte() < byte {
-                children.push(child);
+            if node.start_byte() >= byte {
+                continue;
             }
+            if node != scope && php_is_local_scope(node) {
+                continue;
+            }
+            php_seed_parameters(node, source, ctx, enclosing, session, &mut bindings);
+            if node.end_byte() <= byte {
+                php_seed_assignment(
+                    php,
+                    analyzer,
+                    file,
+                    node,
+                    source,
+                    enclosing,
+                    ctx,
+                    support,
+                    session,
+                    &mut bindings.engine,
+                );
+            }
+            let mut cursor = node.walk();
+            let children = node
+                .named_children(&mut cursor)
+                .filter(|child| child.start_byte() < byte)
+                .collect::<Vec<_>>();
+            stack.extend(children.into_iter().rev());
         }
-        stack.extend(children.into_iter().rev());
     }
     bindings
 }
 
-fn php_enclosing_scope<'tree>(
+fn php_enclosing_scopes<'tree>(
     root: Node<'tree>,
     byte: usize,
     session: Option<&ResolutionSession>,
-) -> Option<Node<'tree>> {
-    let mut best = None;
+) -> Vec<Node<'tree>> {
+    let mut scopes = vec![root];
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         if session.is_some_and(|session| !session.scope_step()) {
-            return None;
+            return scopes;
         }
         if node.start_byte() <= byte && byte < node.end_byte() {
-            if php_is_local_scope(node) {
-                best = Some(node);
+            if node.id() != root.id() && php_is_local_scope(node) {
+                scopes.push(node);
             }
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
                 if session.is_some_and(|session| !session.scope_step()) {
-                    return None;
+                    return scopes;
                 }
                 stack.push(child);
             }
         }
     }
-    best
+    scopes.sort_by_key(|scope| std::cmp::Reverse(scope.end_byte() - scope.start_byte()));
+    scopes
 }
 
 /// Seed one scope's parameters, recording both what their declared types name
@@ -2749,25 +3159,32 @@ fn php_seed_parameters(
     node: Node<'_>,
     source: &str,
     ctx: &FileContext,
+    enclosing: &PhpEnclosingType,
     session: Option<&ResolutionSession>,
     bindings: &mut PhpLocalBindings,
 ) {
     if session.is_none() {
         let dynamic = &mut bindings.dynamic;
         seed_parameter_types(node, source, &mut bindings.engine, |name, raw| {
+            dynamic.remove(name);
             if let Some(builtin) = php_dynamic_type_keyword(raw) {
                 dynamic.insert(name.to_string(), builtin);
             }
-            resolve_php_type_arms(raw, ctx)
+            if raw.eq_ignore_ascii_case("self") || raw.eq_ignore_ascii_case("static") {
+                enclosing.fqn.clone().into_iter().collect()
+            } else {
+                resolve_php_type_arms(raw, ctx)
+            }
         });
         return;
     }
+    let session = session.expect("bounded parameter path");
     let Some(parameters) = node.child_by_field_name("parameters") else {
         return;
     };
     let mut cursor = parameters.walk();
     for child in parameters.named_children(&mut cursor) {
-        if session.is_some_and(|session| !session.scope_step()) {
+        if !session.scope_step() {
             return;
         }
         if !matches!(
@@ -2783,19 +3200,25 @@ fn php_seed_parameters(
         if name.is_empty() {
             continue;
         }
+        bindings.dynamic.remove(name);
         let type_node = child.child_by_field_name("type");
         if let Some(builtin) = type_node.and_then(|type_node| {
-            php_dynamic_type_keyword_node(type_node, source, || {
-                session.is_some_and(ResolutionSession::scope_step)
-            })
+            php_dynamic_type_keyword_node(type_node, source, || session.scope_step())
         }) {
             bindings.dynamic.insert(name.to_string(), builtin);
         }
         let arms = type_node
             .map(|type_node| {
-                resolve_php_type_node_arms(type_node, source, ctx, || {
-                    session.is_some_and(ResolutionSession::scope_step)
-                })
+                if php_relative_type_keyword_bounded(type_node, source, session).is_some_and(
+                    |keyword| {
+                        keyword.eq_ignore_ascii_case("self")
+                            || keyword.eq_ignore_ascii_case("static")
+                    },
+                ) {
+                    enclosing.fqn.clone().into_iter().collect()
+                } else {
+                    resolve_php_type_node_arms(type_node, source, ctx, || session.scope_step())
+                }
             })
             .unwrap_or_default();
         if arms.is_empty() {
@@ -2809,6 +3232,7 @@ fn php_seed_parameters(
 #[allow(clippy::too_many_arguments)]
 fn php_seed_assignment(
     php: &PhpAnalyzer,
+    analyzer: &dyn IAnalyzer,
     _file: &ProjectFile,
     node: Node<'_>,
     source: &str,
@@ -2828,7 +3252,9 @@ fn php_seed_assignment(
                 php, support, right, source, enclosing, bindings, ctx, session,
             )
         } else {
-            php_assignment_receiver_fqn(php, support, right, source, enclosing, ctx)
+            php_expression_type_fqn(
+                php, analyzer, support, right, source, enclosing, bindings, ctx, None,
+            )
         }
     });
 }
@@ -2845,7 +3271,9 @@ fn php_assignment_receiver_fqn(
 ) -> Option<String> {
     match right.kind() {
         "object_creation_expression" => php_object_creation_type_with_session(right, None)
-            .and_then(|type_node| resolve_php_type(php_node_text(type_node, source), ctx)),
+            .and_then(|type_node| {
+                php_static_scope_fqn(php, support, type_node, source, ctx, enclosing, None)
+            }),
         "function_call_expression" => {
             let function = right.child_by_field_name("function")?;
             let raw = php_qualified_candidate_text_with_session(function, source, None);
@@ -3303,6 +3731,166 @@ class Service extends Base {
                 "{needle}: {value:#?}"
             );
         }
+    }
+
+    #[test]
+    fn bounded_lookup_respects_php_closure_capture_and_parameter_shadowing() {
+        let source = r#"<?php
+namespace Demo;
+class Captured { public function run(): void {} }
+class Wrong { public function run(): void {} }
+class Consumer {
+    private Captured $service;
+    public function exercise(Captured $parameter): void {
+        $local = $this->service;
+        $arrow = fn () => $parameter->run();
+        $assigned = fn () => $local->run();
+        $explicit = function () use ($parameter) { $parameter->run(); };
+        $byReference = function () use (&$local) { $local->run(); };
+        $shadowed = fn (Wrong $parameter) => $parameter->run();
+        $uncaptured = function () { $parameter->run(); };
+    }
+}
+"#;
+        let fixture = AnalyzerFixture::new_for_language(Language::Php, &[("Closures.php", source)]);
+        let file = ProjectFile::new(fixture.project_root(), "Closures.php");
+        let tree = parse_php_tree(source).expect("PHP tree");
+
+        for (needle, expected) in [
+            ("$arrow = fn () => $parameter->run()", "Demo.Captured.run"),
+            ("$assigned = fn () => $local->run()", "Demo.Captured.run"),
+            (
+                "$explicit = function () use ($parameter) { $parameter->run()",
+                "Demo.Captured.run",
+            ),
+            (
+                "$byReference = function () use (&$local) { $local->run()",
+                "Demo.Captured.run",
+            ),
+            (
+                "$shadowed = fn (Wrong $parameter) => $parameter->run()",
+                "Demo.Wrong.run",
+            ),
+        ] {
+            let site = php_site(source, &file, needle, "run");
+            let outcome = resolve_php_bounded(
+                fixture.analyzer.analyzer(),
+                &file,
+                source,
+                Some(&tree),
+                &site,
+                ReceiverAnalysisBudget::default(),
+                None,
+            );
+            let BoundedResolution::Complete { value, .. } = outcome else {
+                panic!("bounded `{needle}` lookup did not complete: {outcome:#?}");
+            };
+            assert!(
+                matches!(
+                    value.definitions.as_slice(),
+                    [definition] if definition.fq_name() == expected
+                ),
+                "{needle}: {value:#?}"
+            );
+        }
+
+        let needle = "$uncaptured = function () { $parameter->run()";
+        let site = php_site(source, &file, needle, "run");
+        let outcome = resolve_php_bounded(
+            fixture.analyzer.analyzer(),
+            &file,
+            source,
+            Some(&tree),
+            &site,
+            ReceiverAnalysisBudget::default(),
+            None,
+        );
+        let BoundedResolution::Complete { value, .. } = outcome else {
+            panic!("bounded uncaptured lookup did not complete: {outcome:#?}");
+        };
+        assert!(value.definitions.is_empty(), "{value:#?}");
+    }
+
+    #[test]
+    fn bounded_lookup_uses_exiting_negative_instanceof_guards() {
+        let source = r#"<?php
+namespace Demo;
+class Stub { public int $position = 0; }
+class Wrong { public int $position = 0; }
+class Reader {
+    private function value(mixed $value): mixed { return $value; }
+    public function simple(mixed $item): void {
+        if (!($item = $this->value($item)) instanceof Stub) { return; }
+        echo $item->position;
+    }
+    public function disjunction(mixed $item): void {
+        if (!($item = $this->value($item)) instanceof Stub || !$item->position) { return; }
+        echo $item->position;
+    }
+    public function nonExiting(mixed $item): void {
+        if (!($item = $this->value($item)) instanceof Stub) { echo 'no'; }
+        echo $item->position;
+    }
+    public function reassigned(mixed $item): void {
+        if (!($item = $this->value($item)) instanceof Stub) { return; }
+        $item = new Wrong();
+        echo $item->position;
+    }
+}
+"#;
+        let fixture = AnalyzerFixture::new_for_language(Language::Php, &[("Guards.php", source)]);
+        let file = ProjectFile::new(fixture.project_root(), "Guards.php");
+        let tree = parse_php_tree(source).expect("PHP tree");
+
+        for (needle, expected) in [
+            (
+                "echo $item->position;\n    }\n    public function disjunction",
+                "Demo.Stub.position",
+            ),
+            ("|| !$item->position", "Demo.Stub.position"),
+            (
+                "echo $item->position;\n    }\n    public function nonExiting",
+                "Demo.Stub.position",
+            ),
+            ("echo $item->position;\n    }\n}\n", "Demo.Wrong.position"),
+        ] {
+            let site = php_site(source, &file, needle, "position");
+            let outcome = resolve_php_bounded(
+                fixture.analyzer.analyzer(),
+                &file,
+                source,
+                Some(&tree),
+                &site,
+                ReceiverAnalysisBudget::default(),
+                None,
+            );
+            let BoundedResolution::Complete { value, .. } = outcome else {
+                panic!("bounded `{needle}` lookup did not complete: {outcome:#?}");
+            };
+            assert!(
+                matches!(
+                    value.definitions.as_slice(),
+                    [definition] if definition.fq_name() == expected
+                ),
+                "{needle}: {value:#?}"
+            );
+        }
+
+        let needle = "echo $item->position;\n    }\n    public function reassigned";
+        let site = php_site(source, &file, needle, "position");
+        let outcome = resolve_php_bounded(
+            fixture.analyzer.analyzer(),
+            &file,
+            source,
+            Some(&tree),
+            &site,
+            ReceiverAnalysisBudget::default(),
+            None,
+        );
+        let BoundedResolution::Complete { value, .. } = outcome else {
+            panic!("bounded non-exiting guard lookup did not complete: {outcome:#?}");
+        };
+        assert!(value.definitions.is_empty(), "{value:#?}");
     }
 
     #[test]

@@ -52,11 +52,9 @@ pub use brokk_bifrost_analysis::{
 pub use brokk_bifrost_flow as flow;
 pub use brokk_bifrost_lsp::lsp;
 pub use brokk_bifrost_mcp::{
-    mcp_cli, mcp_common, mcp_core, mcp_extended, mcp_nlp, mcp_registry, mcp_slopcop, mcp_text,
-    rmcp_host, scoped_project, searchtools_service, tool_arguments,
+    mcp_cli, mcp_common, mcp_core, mcp_extended, mcp_registry, mcp_slopcop, mcp_text, rmcp_host,
+    scoped_project, searchtools_service, tool_arguments,
 };
-#[cfg(feature = "nlp")]
-pub use brokk_bifrost_nlp as nlp;
 pub use brokk_bifrost_policy as policy;
 pub use brokk_bifrost_rql::{
     self as rql, CodeQuery, CodeQueryExecutionLimits, CodeQueryExecutionMode, CodeQueryExplain,

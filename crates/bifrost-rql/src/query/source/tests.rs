@@ -405,6 +405,41 @@ fn typed_pipeline_help_and_json_diagnostics_use_shared_schema() {
 }
 
 #[test]
+fn decorator_binding_identity_options_have_shared_help_and_validation() {
+    let rql = r#"(decorator-bindings :module "@nestjs/common" :imported-name Query (parameter))"#;
+    assert!(validate_query_source(rql).is_empty(), "{rql:?}");
+    for token in [":module", ":imported-name"] {
+        let help = query_source_help_at(rql, rql.find(token).unwrap())
+            .unwrap_or_else(|| panic!("no help for {token}"));
+        assert_eq!(&rql[help.range], token);
+        assert!(!help.description.is_empty());
+    }
+
+    let json = r#"{"match":{"kind":"parameter"},"steps":[{"op":"decorator_bindings","module":"@nestjs/common","imported_name":"Query"}]}"#;
+    assert!(validate_query_source(json).is_empty(), "{json:?}");
+    for token in ["module", "imported_name"] {
+        let help = query_source_help_at(json, json.find(token).unwrap())
+            .unwrap_or_else(|| panic!("no help for {token}"));
+        assert!(!help.description.is_empty());
+    }
+
+    let invalid_rql = r#"(decorator-bindings :module (wrong) (parameter))"#;
+    let diagnostic = validate_query_source(invalid_rql)
+        .into_iter()
+        .find(|diagnostic| diagnostic.code == "wrong-value-shape")
+        .expect("invalid module value should be diagnosed");
+    assert_eq!(&invalid_rql[diagnostic.range], "(wrong)");
+
+    let invalid_json =
+        r#"{"match":{"kind":"parameter"},"steps":[{"op":"decorator_bindings","module":7}]}"#;
+    let diagnostic = validate_query_source(invalid_json)
+        .into_iter()
+        .find(|diagnostic| diagnostic.code == "wrong-value-shape")
+        .expect("invalid module value should be diagnosed");
+    assert_eq!(&invalid_json[diagnostic.range], "7");
+}
+
+#[test]
 fn hierarchy_step_help_and_option_diagnostics_are_range_precise() {
     let rql = "(subtypes :depth 2 (enclosing-decl (class)))";
     for token in ["subtypes", ":depth"] {
@@ -1214,6 +1249,39 @@ fn callable_signature_form_help_and_diagnostics_are_range_precise() {
     assert_eq!(&misspelled[diagnostic.range.clone()], "callable-signatures");
 }
 
+/// The decorator-binding wrapper is declared once and therefore gets parser,
+/// alias, validation, and hover behavior in both spellings from the same
+/// registry (#2644).
+#[test]
+fn decorator_binding_form_help_and_diagnostics_are_range_precise() {
+    let rql = "(decorator-bindings (parameter))";
+    for token in ["decorator-bindings", "parameter"] {
+        let offset = rql.find(token).unwrap();
+        let help =
+            query_source_help_at(rql, offset).unwrap_or_else(|| panic!("no help for {token}"));
+        assert_eq!(&rql[help.range], token);
+        assert!(!help.description.is_empty());
+    }
+    assert!(validate_query_source(rql).is_empty(), "{rql}");
+
+    let underscored = "(decorator_bindings (parameter))";
+    assert!(
+        validate_query_source(underscored).is_empty(),
+        "{underscored}: {:#?}",
+        validate_query_source(underscored)
+    );
+
+    let misspelled = "(decorator-binding (parameter))";
+    let diagnostic = validate_query_source(misspelled)
+        .into_iter()
+        .find(|diagnostic| diagnostic.code == "unknown-form")
+        .expect("unknown-form diagnostic");
+    assert_eq!(&misspelled[diagnostic.range.clone()], "decorator-binding");
+
+    let json = r#"{"match":{"kind":"parameter"},"steps":[{"op":"decorator_bindings"}]}"#;
+    assert!(validate_query_source(json).is_empty(), "{json}");
+}
+
 /// Materialization filters are validated against the registries in both
 /// frontends, and hover reaches every option keyword (#1476).
 #[test]
@@ -1504,4 +1572,35 @@ fn visibility_and_parameter_type_frontends_validate_at_exact_positions() {
         diagnostic.message.contains("unknown visibility"),
         "{diagnostic:?}"
     );
+}
+
+#[test]
+fn jsx_attribute_value_source_frontends_validate_and_hover_from_schema() {
+    let rql = r#"(jsx-attribute-value :identity intrinsic :element-name div :property-name __html
+        (jsx_attribute (name "dangerouslySetInnerHTML")))"#;
+    assert!(
+        validate_query_source(rql).is_empty(),
+        "{:#?}",
+        validate_query_source(rql)
+    );
+    let help =
+        query_source_help_at(rql, rql.find(":identity").unwrap()).expect("identity option help");
+    assert!(help.description.contains("semantic element identity"));
+
+    let json = r#"{"match":{"kind":"jsx_attribute"},"steps":[{"op":"jsx_attribute_value","identity":"intrinsic","element_name":"div","property_name":"__html"}]}"#;
+    assert!(
+        validate_query_source(json).is_empty(),
+        "{:#?}",
+        validate_query_source(json)
+    );
+    let help =
+        query_source_help_at(json, json.find("\"identity\"").unwrap()).expect("JSON identity help");
+    assert!(help.description.contains("semantic element identity"));
+
+    let invalid = r#"(jsx-attribute-value :identity unresolved (jsx_attribute))"#;
+    let diagnostic = validate_query_source(invalid)
+        .into_iter()
+        .find(|diagnostic| diagnostic.code == "unknown-value")
+        .expect("invalid identity diagnostic");
+    assert!(diagnostic.message.contains("intrinsic"));
 }

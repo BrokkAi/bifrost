@@ -93,6 +93,7 @@ mod call_binding;
 mod call_shape;
 mod callable_signature;
 mod control_relations;
+mod decorator_binding;
 mod dispatch;
 mod edges;
 mod effects;
@@ -102,6 +103,7 @@ pub(crate) mod expansions;
 mod flow_state;
 mod guards;
 mod imports;
+mod jsx;
 mod materialization;
 mod member_family;
 mod occurrences;
@@ -117,6 +119,7 @@ use applicability::{CallableApplicabilityValue, OverloadSelectionValue};
 use call_binding::CallBindingValue;
 use callable_signature::{CallableSignatureValue, SignatureParameterValue};
 use control_relations::{ControlRelationKey, ControlRelationTraversalCache, ControlRelationValue};
+use decorator_binding::DecoratedParameterValue;
 use dispatch::{DispatchSiteValue, DispatchTargetValue};
 use effects::{CallEffectValue, EffectTraversalCache, ProcedureEffectValue};
 use environment::{
@@ -214,6 +217,7 @@ pub use results::CodeQueryCompletion;
 pub use results::CodeQueryControlEdge;
 pub use results::CodeQueryDeclaration;
 pub use results::CodeQueryDeclarationState;
+pub use results::CodeQueryDecoratedParameter;
 pub use results::CodeQueryDiagnostic;
 pub use results::CodeQueryDiagnosticCode;
 pub use results::CodeQueryDiagnosticImpact;
@@ -243,6 +247,7 @@ pub use results::CodeQueryFlowWitnessStep;
 pub use results::CodeQueryFlowWitnessStepKind;
 pub use results::CodeQueryGenerationSite;
 pub use results::CodeQueryImportBinder;
+pub use results::CodeQueryJsxAttributeValue;
 pub use results::CodeQueryLexicalScope;
 pub use results::CodeQueryMatch;
 pub use results::CodeQueryMemberFamily;
@@ -499,6 +504,70 @@ struct ExpressionSiteValue {
     input: ExpressionInput,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum JsxElementIdentity {
+    Intrinsic,
+    Component,
+    Unknown,
+}
+
+impl JsxElementIdentity {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Intrinsic => "intrinsic",
+            Self::Component => "component",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum JsxValueCoverage {
+    Complete,
+    Incomplete,
+}
+
+impl JsxValueCoverage {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Incomplete => "incomplete",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct JsxAttributeValue {
+    seed: Arc<SeedMatch>,
+    value_node: u32,
+    attribute_node: u32,
+    element_identity: JsxElementIdentity,
+    element_name: Option<String>,
+    attribute_name: Option<String>,
+    property_name: Option<String>,
+    coverage: JsxValueCoverage,
+    reason: Option<&'static str>,
+    component: Option<CodeUnit>,
+    attribute_target: Option<CodeUnit>,
+}
+
+impl JsxAttributeValue {
+    fn ast_id(&self) -> String {
+        crate::analyzer::structural::occurrence_rows::ast_id(
+            self.seed.facts.source_identity(),
+            self.value_node,
+        )
+    }
+
+    fn id(&self) -> String {
+        format!(
+            "jsx_attribute_value:{}:{}",
+            self.ast_id(),
+            self.attribute_node
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ReceiverAnalysisValue {
     report: ReceiverQueryReport,
@@ -650,6 +719,7 @@ enum PipelineValue {
     ReferenceSite(ReferenceSiteValue),
     CallSite(CallSiteValue),
     ExpressionSite(ExpressionSiteValue),
+    JsxAttributeValue(Box<JsxAttributeValue>),
     ReceiverAnalysis(ReceiverAnalysisValue),
     ReceiverOutcome(ReceiverAnalysisValue),
     ReceiverEvidence(ReceiverEvidenceValue),
@@ -661,6 +731,7 @@ enum PipelineValue {
     ProcedureEffect(Box<ProcedureEffectValue>),
     CallableSignature(Box<CallableSignatureValue>),
     SignatureParameter(Box<SignatureParameterValue>),
+    DecoratedParameter(DecoratedParameterValue),
     CallableApplicability(Box<CallableApplicabilityValue>),
     OverloadSelection(Box<OverloadSelectionValue>),
     MemberSelection(MemberSelectionValue),
@@ -741,6 +812,7 @@ enum PipelineKey {
     ReferenceSite(ReferenceSiteValue),
     CallSite(CallSiteValue),
     ExpressionSite(ExpressionSiteValue),
+    JsxAttributeValue(String),
     ReceiverAnalysis(ReceiverQueryOperation, ProjectFile, Range),
     ReceiverOutcome(String),
     ReceiverEvidence(String),
@@ -752,6 +824,7 @@ enum PipelineKey {
     ProcedureEffect(String),
     CallableSignature(String),
     SignatureParameter(String),
+    DecoratedParameter(String),
     CallableApplicability(String),
     OverloadSelection(String),
     MemberSelection(String),
@@ -804,6 +877,7 @@ impl PipelineValue {
             Self::ReferenceSite(site) => PipelineKey::ReferenceSite(site.clone()),
             Self::CallSite(site) => PipelineKey::CallSite(site.clone()),
             Self::ExpressionSite(site) => PipelineKey::ExpressionSite(site.clone()),
+            Self::JsxAttributeValue(value) => PipelineKey::JsxAttributeValue(value.id()),
             Self::ReceiverAnalysis(value) => PipelineKey::ReceiverAnalysis(
                 value.report.operation,
                 value.report.site.file.clone(),
@@ -828,6 +902,9 @@ impl PipelineValue {
             }
             Self::SignatureParameter(value) => {
                 PipelineKey::SignatureParameter(value.row().id.clone())
+            }
+            Self::DecoratedParameter(value) => {
+                PipelineKey::DecoratedParameter(value.id().to_string())
             }
             Self::CallableApplicability(value) => {
                 PipelineKey::CallableApplicability(value.row().id.clone())
@@ -1071,6 +1148,7 @@ enum PipelineTraceValue {
     ReferenceSite(ReferenceSiteValue),
     CallSite(CallSiteValue),
     ExpressionSite(ExpressionSiteValue),
+    JsxAttributeValue(Box<JsxAttributeValue>),
     ReceiverAnalysis(ReceiverAnalysisValue),
     ReceiverOutcome(ReceiverAnalysisValue),
     ReceiverEvidence(ReceiverEvidenceValue),
@@ -1082,6 +1160,7 @@ enum PipelineTraceValue {
     ProcedureEffect(Box<ProcedureEffectValue>),
     CallableSignature(Box<CallableSignatureValue>),
     SignatureParameter(Box<SignatureParameterValue>),
+    DecoratedParameter(DecoratedParameterValue),
     CallableApplicability(Box<CallableApplicabilityValue>),
     OverloadSelection(Box<OverloadSelectionValue>),
     MemberSelection(MemberSelectionValue),
@@ -3176,6 +3255,32 @@ fn detailed_evidence_for_pipeline_value(
                 provenance: Vec::new(),
             }
         }
+        PipelineValue::JsxAttributeValue(value) => {
+            let node = value.seed.facts.node(value.value_node);
+            let byte_span = node.range.start_byte..node.range.end_byte;
+            let ast_id = value.ast_id();
+            let candidate = canonical_ast_candidate_for_node(&value.seed, value.value_node);
+            DetailedCodeQueryEvidence {
+                result_index,
+                domain: DetailedCodeQueryDomain::JsxAttributeValue,
+                key: DetailedCodeQueryKey::JsxAttributeValue {
+                    id: value.id(),
+                    ast_id,
+                },
+                file: value.seed.file.clone(),
+                source_slice_sha256: retained_source
+                    .and_then(|source| source_slice_sha256(source, &byte_span)),
+                byte_span: Some(byte_span),
+                identities: DetailedCodeQueryProvenanceIdentities::Primary(candidate.as_ref().map(
+                    |candidate| DetailedCodeQueryIdentityCandidate {
+                        file: value.seed.file.clone(),
+                        candidate: candidate.clone(),
+                    },
+                )),
+                stable_owner_candidate: candidate,
+                provenance: Vec::new(),
+            }
+        }
         PipelineValue::ReceiverAnalysis(value) => {
             let site = &value.report.site;
             let byte_span = range_byte_span(site.range);
@@ -3357,6 +3462,21 @@ fn detailed_evidence_for_pipeline_value(
             file: value.file().clone(),
             source_slice_sha256: None,
             byte_span: Some(range_byte_span(value.signature.declaration.range)),
+            identities: DetailedCodeQueryProvenanceIdentities::None,
+            stable_owner_candidate: None,
+            provenance: Vec::new(),
+        },
+        PipelineValue::DecoratedParameter(value) => DetailedCodeQueryEvidence {
+            result_index,
+            domain: DetailedCodeQueryDomain::DecoratedParameter,
+            key: DetailedCodeQueryKey::DecoratedParameter {
+                id: value.row.id.clone(),
+                parameter_id: value.row.parameter_id.clone(),
+            },
+            file: value.file.clone(),
+            source_slice_sha256: retained_source
+                .and_then(|source| source_slice_sha256(source, &range_byte_span(value.range))),
+            byte_span: Some(range_byte_span(value.range)),
             identities: DetailedCodeQueryProvenanceIdentities::None,
             stable_owner_candidate: None,
             provenance: Vec::new(),
@@ -3889,8 +4009,10 @@ fn terminal_source_file(value: &PipelineValue) -> Option<&ProjectFile> {
         PipelineValue::ReferenceSite(site) => Some(&site.file),
         PipelineValue::CallSite(site) => Some(&site.0.file),
         PipelineValue::ExpressionSite(site) => Some(&site.call_site.0.file),
+        PipelineValue::JsxAttributeValue(value) => Some(&value.seed.file),
         PipelineValue::CallableSignature(value) => Some(value.file()),
         PipelineValue::SignatureParameter(value) => Some(value.file()),
+        PipelineValue::DecoratedParameter(value) => Some(&value.file),
         PipelineValue::CallableApplicability(value) => Some(&value.occurrence.file),
         PipelineValue::OverloadSelection(value) => Some(&value.occurrence.file),
         PipelineValue::CallShape(value) => Some(&value.report.outcome.file),
@@ -4017,6 +4139,9 @@ fn collect_pipeline_value_source_files(value: &PipelineValue, files: &mut BTreeS
         PipelineValue::ReferenceSite(site) => collect_reference_source_files(site, files),
         PipelineValue::CallSite(site) => collect_call_source_files(site, files),
         PipelineValue::ExpressionSite(site) => collect_call_source_files(&site.call_site, files),
+        PipelineValue::JsxAttributeValue(value) => {
+            files.insert(value.seed.file.clone());
+        }
         PipelineValue::ReceiverAnalysis(value) => collect_receiver_source_files(value, files),
         PipelineValue::ReceiverOutcome(value) => collect_receiver_source_files(value, files),
         PipelineValue::ReceiverEvidence(value) => {
@@ -4048,6 +4173,9 @@ fn collect_pipeline_value_source_files(value: &PipelineValue, files: &mut BTreeS
         }
         PipelineValue::SignatureParameter(value) => {
             files.insert(value.file().clone());
+        }
+        PipelineValue::DecoratedParameter(value) => {
+            files.insert(value.file.clone());
         }
         PipelineValue::CallableApplicability(value) => {
             files.insert(value.occurrence.file.clone());
@@ -4140,6 +4268,9 @@ fn collect_trace_value_source_files(value: &PipelineTraceValue, files: &mut BTre
         PipelineTraceValue::ExpressionSite(site) => {
             collect_call_source_files(&site.call_site, files);
         }
+        PipelineTraceValue::JsxAttributeValue(value) => {
+            files.insert(value.seed.file.clone());
+        }
         PipelineTraceValue::ReceiverAnalysis(value) => collect_receiver_source_files(value, files),
         PipelineTraceValue::ReceiverOutcome(value) => collect_receiver_source_files(value, files),
         PipelineTraceValue::ReceiverEvidence(value) => {
@@ -4171,6 +4302,9 @@ fn collect_trace_value_source_files(value: &PipelineTraceValue, files: &mut BTre
         }
         PipelineTraceValue::SignatureParameter(value) => {
             files.insert(value.file().clone());
+        }
+        PipelineTraceValue::DecoratedParameter(value) => {
+            files.insert(value.file.clone());
         }
         PipelineTraceValue::CallableApplicability(value) => {
             files.insert(value.occurrence.file.clone());
@@ -4433,6 +4567,9 @@ fn detailed_trace_provenance_ref(
         PipelineTraceValue::ExpressionSite(value) => {
             detailed_expression_provenance_ref(value, cache)
         }
+        PipelineTraceValue::JsxAttributeValue(value) => {
+            detailed_jsx_attribute_value_provenance_ref(value, cache)
+        }
         PipelineTraceValue::ReceiverAnalysis(value) => {
             detailed_receiver_provenance_ref(value, cache)
         }
@@ -4649,6 +4786,16 @@ fn detailed_trace_provenance_ref(
             },
             value.file(),
             value.signature.declaration.range,
+            cache,
+        ),
+        PipelineTraceValue::DecoratedParameter(value) => detailed_environment_provenance_ref(
+            DetailedCodeQueryDomain::DecoratedParameter,
+            DetailedCodeQueryKey::DecoratedParameter {
+                id: value.row.id.clone(),
+                parameter_id: value.row.parameter_id.clone(),
+            },
+            &value.file,
+            value.range,
             cache,
         ),
         PipelineTraceValue::CallableApplicability(value) => detailed_environment_provenance_ref(
@@ -4990,6 +5137,35 @@ fn detailed_expression_provenance_ref(
     }
 }
 
+fn detailed_jsx_attribute_value_provenance_ref(
+    value: &JsxAttributeValue,
+    cache: &PipelineRenderCache,
+) -> DetailedCodeQueryProvenanceRefEvidence {
+    let node = value.seed.facts.node(value.value_node);
+    let range = node.range;
+    let byte_span = range_byte_span(range);
+    let ast_id = value.ast_id();
+    DetailedCodeQueryProvenanceRefEvidence {
+        domain: DetailedCodeQueryDomain::JsxAttributeValue,
+        key: DetailedCodeQueryKey::JsxAttributeValue {
+            id: value.id(),
+            ast_id: ast_id.clone(),
+        },
+        file: value.seed.file.clone(),
+        source_slice_sha256: cached_source_slice_sha256(cache, &value.seed.file, &byte_span),
+        byte_span: Some(byte_span),
+        display_range: cached_display_range(cache, &value.seed.file, range),
+        identities: DetailedCodeQueryProvenanceIdentities::Primary(
+            canonical_ast_candidate_for_node(&value.seed, value.value_node).map(|candidate| {
+                DetailedCodeQueryIdentityCandidate {
+                    file: value.seed.file.clone(),
+                    candidate,
+                }
+            }),
+        ),
+    }
+}
+
 fn detailed_receiver_provenance_ref(
     value: &ReceiverAnalysisValue,
     cache: &PipelineRenderCache,
@@ -5193,8 +5369,15 @@ fn stable_identity_candidate_for_unit(unit: &CodeUnit) -> Option<CodeQueryStable
 const MAX_CANONICAL_AST_KEY_BYTES: usize = 256;
 
 fn canonical_ast_candidate(seed: &SeedMatch) -> Option<CodeQueryStableOwnerCandidate> {
+    canonical_ast_candidate_for_node(seed, seed.fact_match.node)
+}
+
+fn canonical_ast_candidate_for_node(
+    seed: &SeedMatch,
+    node_id: u32,
+) -> Option<CodeQueryStableOwnerCandidate> {
     let mut segments = Vec::new();
-    let mut current = Some(seed.fact_match.node);
+    let mut current = Some(node_id);
     while let Some(node_id) = current {
         let node = seed.facts.node(node_id);
         segments.push((
@@ -5283,6 +5466,9 @@ fn pipeline_trace_value(value: &PipelineValue) -> Option<PipelineTraceValue> {
         PipelineValue::ExpressionSite(site) => {
             Some(PipelineTraceValue::ExpressionSite(site.clone()))
         }
+        PipelineValue::JsxAttributeValue(value) => {
+            Some(PipelineTraceValue::JsxAttributeValue(value.clone()))
+        }
         PipelineValue::ReceiverAnalysis(value) => {
             Some(PipelineTraceValue::ReceiverAnalysis(value.clone()))
         }
@@ -5329,6 +5515,9 @@ fn pipeline_trace_value(value: &PipelineValue) -> Option<PipelineTraceValue> {
         }
         PipelineValue::SignatureParameter(value) => {
             Some(PipelineTraceValue::SignatureParameter(value.clone()))
+        }
+        PipelineValue::DecoratedParameter(value) => {
+            Some(PipelineTraceValue::DecoratedParameter(value.clone()))
         }
         PipelineValue::MemberFamily(value) => Some(PipelineTraceValue::MemberFamily(value.clone())),
         PipelineValue::MemberFamilyEdge(value) => {

@@ -310,6 +310,11 @@ pub(super) fn describe_ref(value: &PolicyQueryResultRef) -> String {
             (Some(index), None) => format!("expression_site {input_kind} #{index}"),
             (None, None) => format!("expression_site {input_kind}"),
         },
+        PolicyQueryResultRef::JsxAttributeValue {
+            element_identity,
+            coverage,
+            ..
+        } => format!("jsx_attribute_value {element_identity} {coverage}"),
         PolicyQueryResultRef::ReceiverAnalysis {
             analysis_kind,
             outcome,

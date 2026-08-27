@@ -169,6 +169,11 @@ pub struct CppAnalyzer {
     /// counted 11.0M of.
     #[cfg(any(test, feature = "test-support"))]
     reconcile_candidate_evaluation_count: Arc<std::sync::atomic::AtomicUsize>,
+    /// Raw signature-fact reads performed by the reconciliation builder. This
+    /// is distinct from the public overlay-aware metadata surface so cache
+    /// initialization cannot recursively request itself.
+    #[cfg(any(test, feature = "test-support"))]
+    reconcile_stored_signature_metadata_count: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     external_header_closure_build_count: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
@@ -315,6 +320,10 @@ impl CppAnalyzer {
             reconcile_candidate_scan_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
             reconcile_candidate_evaluation_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "test-support"))]
+            reconcile_stored_signature_metadata_count: Arc::new(
+                std::sync::atomic::AtomicUsize::new(0),
+            ),
             #[cfg(test)]
             external_header_closure_build_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
@@ -497,6 +506,10 @@ impl CppAnalyzer {
             reconcile_candidate_scan_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-support"))]
             reconcile_candidate_evaluation_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "test-support"))]
+            reconcile_stored_signature_metadata_count: Arc::new(
+                std::sync::atomic::AtomicUsize::new(0),
+            ),
             #[cfg(test)]
             external_header_closure_build_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
@@ -868,6 +881,8 @@ impl CppAnalyzer {
             .store(0, std::sync::atomic::Ordering::Relaxed);
         self.reconcile_candidate_evaluation_count
             .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.reconcile_stored_signature_metadata_count
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Identifier-index scans issued for reconciliation.
@@ -881,6 +896,13 @@ impl CppAnalyzer {
     #[cfg(any(test, feature = "test-support"))]
     pub fn reconcile_candidate_evaluation_count_for_test(&self) -> usize {
         self.reconcile_candidate_evaluation_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Raw, overlay-free signature reads performed while building reconcile groups.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn reconcile_stored_signature_metadata_count_for_test(&self) -> usize {
+        self.reconcile_stored_signature_metadata_count
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -935,7 +957,23 @@ use crate::analyzer::CodeUnitIndex;
 /// the five caches, two `OnceLock`s and two `PoolSafeMemo`s stay here and no
 /// function on the other side of the crate line can reach past this surface.
 impl CppSource for CppAnalyzer {
+    fn visibility_import_statements(
+        &self,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+    ) -> Vec<String> {
+        let _streaming = crate::analyzer::AnalyzerStreamingFileScope::new(self, file);
+        self.import_statements_from_projection(token, file)
+    }
+
+    fn visibility_identifier_candidates(&self, identifier: &str) -> BTreeSet<CodeUnit> {
+        self.inner.lookup_candidates_by_identifier(identifier)
+    }
+
     fn stored_callable_unit_role(&self, callable: &CodeUnit) -> CppCallableUnitRole {
+        #[cfg(any(test, feature = "test-support"))]
+        self.reconcile_stored_signature_metadata_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         cpp_callable_unit_role(&self.inner, callable)
     }
 
@@ -1117,6 +1155,15 @@ impl CppWorkspaceSource for CppAnalyzer {
 }
 
 impl CodeUnitIndex for CppAnalyzer {
+    /// Forwarded so the request-scoped memo on the inner analyzer answers
+    /// (#2679); the trait default would rebuild uncached per call.
+    fn class_range_index(
+        &self,
+        file: &ProjectFile,
+    ) -> std::sync::Arc<brokk_bifrost_core::analyzer::usages::inverted_edges::ClassRangeIndex> {
+        self.inner.class_range_index(file)
+    }
+
     fn enclosing_code_unit(
         &self,
         file: &ProjectFile,
@@ -1354,6 +1401,14 @@ impl IAnalyzer for CppAnalyzer {
         self.inner.active_query_cancellation()
     }
 
+    fn begin_streaming_file_read(&self, file: &ProjectFile) {
+        self.inner.begin_streaming_file_read(file);
+    }
+
+    fn end_streaming_file_read(&self, file: &ProjectFile) {
+        self.inner.end_streaming_file_read(file);
+    }
+
     fn relational_definition_batch(
         &self,
         requests: &[crate::analyzer::RelationalDefinitionRequest],
@@ -1500,18 +1555,6 @@ impl IAnalyzer for CppAnalyzer {
 
     fn record_query_failure(&self, error: crate::analyzer::store::StoreError) {
         self.inner.record_query_failure(error);
-    }
-
-    fn begin_streaming_file_read(&self, file: &ProjectFile) {
-        self.inner.begin_streaming_file_read(file);
-    }
-
-    fn end_streaming_file_read(&self, file: &ProjectFile) {
-        self.inner.end_streaming_file_read(file);
-    }
-
-    fn release_streaming_readers(&self) {
-        self.inner.release_streaming_readers();
     }
 
     fn workspace_file_index_cell(&self) -> Option<crate::analyzer::WorkspaceFileIndexCell> {

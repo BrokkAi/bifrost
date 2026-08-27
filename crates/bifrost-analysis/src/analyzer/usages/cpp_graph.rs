@@ -46,8 +46,7 @@ pub(in crate::analyzer::usages) use brokk_bifrost_cpp::graph::extractor::{
     resolve_type_components_lexically_at_preserving_alias as cpp_resolve_type_components_lexically_at_preserving_alias,
 };
 pub(in crate::analyzer::usages) use brokk_bifrost_cpp::graph::resolver::{
-    CallArityEvidence, CppTemplateResolutionError,
-    DesignatedInitializerOwner as CppDesignatedInitializerOwner,
+    CppTemplateResolutionError, DesignatedInitializerOwner as CppDesignatedInitializerOwner,
     LexicalTypeResolution as CppLexicalTypeResolution, TargetKind as CppTargetKind,
     VisibilityIndex as CppVisibilityIndex, argument_children as cpp_argument_children,
     canonical_cpp_scope_components, constructor_type_node as cpp_constructor_type_node,

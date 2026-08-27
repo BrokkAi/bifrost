@@ -738,15 +738,21 @@ impl LadderPlan {
             .iter()
             .find(|selector| selector.path.as_str() == MATCH_SELECTOR_PATH)
             .ok_or(ExplainError::SelectorUnavailable)?;
-        let scope = relaxable_scope(&selector.query).map_err(|reason| {
-            ExplainError::NearMissScopeUnavailable {
+        let Some((_, query)) = selector.as_query() else {
+            return Err(ExplainError::PolicyUnavailable {
+                message:
+                    "match explanations require a query selector; row selectors are endpoint-only"
+                        .to_owned(),
+            });
+        };
+        let scope =
+            relaxable_scope(query).map_err(|reason| ExplainError::NearMissScopeUnavailable {
                 reason: format!("the match policy's selector {reason}"),
-            }
-        })?;
+            })?;
         let scope_label = render_scope(&scope);
         // The match evaluator reads the analyzer directly and bounds its
         // selector by the finding budget, so a faithful re-execution does too.
-        let rungs = relaxation_rungs(&selector.query, scope, PrefixExecution::AnalyzerOnly, "");
+        let rungs = relaxation_rungs(query, scope, PrefixExecution::AnalyzerOnly, "");
         Ok(Self {
             rungs,
             verdict: LadderVerdict::Selected,
@@ -923,7 +929,7 @@ fn binding_query<'a>(
         .resolved_selectors()
         .iter()
         .find(|selector| selector.path.as_str() == path)
-        .map(|selector| &selector.query)
+        .and_then(|selector| selector.as_query().map(|(_, query)| query))
         .ok_or_else(|| ExplainError::BindingSelectorUnavailable {
             binding: binding.name.as_str().to_string(),
         })

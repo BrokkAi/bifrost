@@ -14,6 +14,7 @@ mod structural_spec_tests {
     use crate::analyzer::structural::adapter_helpers::{
         assert_occurrence_role, block_facts_of, occurrence_roles_of,
     };
+    use brokk_bifrost_core::analyzer::structural::kinds::NormalizedKind;
     use brokk_bifrost_core::analyzer::structural::occurrences::OccurrenceRole;
     use brokk_bifrost_core::analyzer::structural::spec::StructuralSpec;
 
@@ -165,10 +166,26 @@ mod structural_spec_tests {
 
     #[test]
     fn typescript_kind_table_matches_grammar() {
+        // TypeScript and TSX share one StructuralSpec, so its table is the
+        // union needed by both parser flavors. CompiledKinds drops entries
+        // absent from the concrete grammar. Check the non-JSX subset against
+        // plain TypeScript here; the TSX test below checks the full union.
+        let plain_typescript_table = TS_KIND_TABLE
+            .iter()
+            .copied()
+            .filter(|(_, kind)| {
+                !matches!(
+                    kind,
+                    NormalizedKind::JsxElement
+                        | NormalizedKind::JsxAttribute
+                        | NormalizedKind::JsxSpreadAttribute
+                )
+            })
+            .collect::<Vec<_>>();
         crate::analyzer::structural::adapter_helpers::assert_kind_table_matches_grammar(
             tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             "tree-sitter-typescript",
-            TS_KIND_TABLE,
+            &plain_typescript_table,
         );
     }
 

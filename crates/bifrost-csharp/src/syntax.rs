@@ -987,6 +987,20 @@ pub struct CSharpRelationalGenericCall<'tree> {
     pub call_arity: usize,
 }
 
+/// An unqualified one-type-argument, one-value-argument generic call that
+/// follows an explicit cast and tree-sitter-c-sharp parsed as two relational
+/// expressions. `(T)Convert<T>(value)` becomes `((T)Convert < T) > (value)`:
+/// the function identifier is the cast expression's `value`, while the two
+/// binary operator fields retain the generic delimiters structurally.
+#[derive(Clone, Copy)]
+pub struct CSharpCastRelationalGenericCall<'tree> {
+    pub function: Node<'tree>,
+    pub type_argument: Node<'tree>,
+    pub argument: Node<'tree>,
+    pub explicit_generic_arity: usize,
+    pub call_arity: usize,
+}
+
 pub fn csharp_conditional_member_access(
     node: Node<'_>,
 ) -> Option<CSharpConditionalMemberAccess<'_>> {
@@ -1112,6 +1126,49 @@ pub fn csharp_relational_generic_call_for_argument(
     }
     let call = csharp_relational_generic_call(member_access)?;
     (call.argument == argument).then_some(call)
+}
+
+pub fn csharp_cast_relational_generic_call_for_name(
+    identifier: Node<'_>,
+) -> Option<CSharpCastRelationalGenericCall<'_>> {
+    if identifier.kind() != "identifier" {
+        return None;
+    }
+    let cast = identifier.parent()?;
+    if cast.kind() != "cast_expression" || cast.child_by_field_name("value") != Some(identifier) {
+        return None;
+    }
+    let less_than = cast.parent()?;
+    if less_than.kind() != "binary_expression"
+        || less_than.child_by_field_name("left") != Some(cast)
+        || less_than
+            .child_by_field_name("operator")
+            .is_none_or(|operator| operator.kind() != "<")
+    {
+        return None;
+    }
+    let type_argument = less_than.child_by_field_name("right")?;
+    let greater_than = less_than.parent()?;
+    if greater_than.kind() != "binary_expression"
+        || greater_than.child_by_field_name("left") != Some(less_than)
+        || greater_than
+            .child_by_field_name("operator")
+            .is_none_or(|operator| operator.kind() != ">")
+    {
+        return None;
+    }
+    let argument_container = greater_than.child_by_field_name("right")?;
+    let argument = (argument_container.kind() == "parenthesized_expression"
+        && argument_container.named_child_count() == 1)
+        .then(|| argument_container.named_child(0))
+        .flatten()?;
+    Some(CSharpCastRelationalGenericCall {
+        function: identifier,
+        type_argument,
+        argument,
+        explicit_generic_arity: 1,
+        call_arity: 1,
+    })
 }
 
 pub fn csharp_unqualified_invocation_for_name(

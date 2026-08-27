@@ -24,10 +24,11 @@ use crate::graph::extractor::{
 };
 use crate::graph::resolver::{
     UnqualifiedMethodGroupResolution, argument_count, class_unit_for_fq_name,
-    extension_visibility_site_key, first_type_child, invocation_member_candidates_for_owner,
-    is_member_variable_declaration, is_type_reference_node, nearest_member_candidates_for_owner,
-    node_text, object_initializer_for_label, object_initializer_owner_type_node,
-    reference_type_text, resolve_arity_free_type_fq_name_at, resolve_type_fq_name_at,
+    collection_target_element_type_node, extension_visibility_site_key, first_type_child,
+    invocation_member_candidates_for_owner, is_member_variable_declaration, is_type_reference_node,
+    nearest_member_candidates_for_owner, node_text, object_creation_collection_target,
+    object_initializer_for_label, object_initializer_owner_type_node, reference_type_text,
+    resolve_arity_free_type_fq_name_at, resolve_type_fq_name_at,
     resolve_unqualified_method_group_for_owner, same_node, unqualified_member_has_local_binding,
     unqualified_member_has_structured_shadow, usage_class_field_receiver_type, usage_direct_base,
     usage_member_declared_type_fq_name, usage_method_return_type_fq_name_for_arity,
@@ -464,7 +465,11 @@ fn record_reference(
                 && let Some(initializer) = object_initializer_for_label(node)
             {
                 let name = node_text(node, ctx.source);
-                if let Some(type_node) = object_initializer_owner_type_node(initializer)
+                let type_node = object_initializer_owner_type_node(initializer).or_else(|| {
+                    let target = object_creation_collection_target(initializer)?;
+                    collection_target_element_type_node(target, ctx.source)
+                });
+                if let Some(type_node) = type_node
                     && ctx.may_match_terminal(name)
                     && let Some(owner) = ctx.resolve_type_fqn_at(
                         token,

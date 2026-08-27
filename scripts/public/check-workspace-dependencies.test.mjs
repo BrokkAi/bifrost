@@ -18,7 +18,6 @@ const names = [
   "brokk-bifrost-analysis",
   "brokk-bifrost-flow",
   "brokk-bifrost-rql",
-  "brokk-bifrost-nlp",
   "brokk-bifrost-policy",
   "brokk-bifrost-runtime",
   "brokk-bifrost-mcp",
@@ -64,7 +63,6 @@ function metadata(overrides = {}) {
       dependency("brokk-bifrost-analysis"),
       dependency("brokk-bifrost-flow"),
     ],
-    "brokk-bifrost-nlp": [dependency("brokk-bifrost-analysis")],
     "brokk-bifrost-policy": [
       dependency("brokk-bifrost-analysis"),
       dependency("brokk-bifrost-flow"),

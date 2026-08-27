@@ -1135,7 +1135,8 @@ pub(super) fn append_diagnostic_terminations(
             | CodeQueryDiagnosticCode::TopologyDerivationIncomplete
             | CodeQueryDiagnosticCode::TopologyOwnershipAmbiguous
             | CodeQueryDiagnosticCode::PathDerivationIncomplete
-            | CodeQueryDiagnosticCode::EffectDerivationIncomplete => {
+            | CodeQueryDiagnosticCode::EffectDerivationIncomplete
+            | CodeQueryDiagnosticCode::JsxProjectionIncomplete => {
                 Some(QueryOperatorTermination::AnalysisIncomplete)
             }
             CodeQueryDiagnosticCode::InvalidPlan

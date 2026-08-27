@@ -25,7 +25,6 @@ RELEASE_CRATES=(
   brokk-bifrost-rust
   brokk-bifrost-analysis
   brokk-bifrost-flow
-  brokk-bifrost-nlp
   brokk-bifrost-rql
   brokk-bifrost-semantic-packs
   brokk-bifrost-policy

@@ -3822,6 +3822,7 @@ fn resolve_scala_with_context(
         token,
         scala,
         support,
+        cache,
         &batch.imports,
         file,
         source,
@@ -3970,7 +3971,7 @@ fn resolve_scala_with_context(
         return resolve_scala_type(ctx, token, &resolver, root, qualified_type_root);
     }
     if let Some(outcome) = resolve_scala_bare_apply_fast_path(
-        scala, analyzer, token, support, file, source, root, node, &resolver, session,
+        scala, analyzer, token, support, batch, file, source, root, node, &resolver, cache, session,
     ) {
         return outcome;
     }
@@ -4177,6 +4178,7 @@ fn scala_import_reference_outcome(
     token: QueryToken<'_>,
     scala: &ScalaAnalyzer,
     support: &dyn BoundedDefinitionLookup,
+    cache: &ScalaLookupCache,
     import_infos: &[ImportInfo],
     file: &ProjectFile,
     source: &str,
@@ -4232,13 +4234,12 @@ fn scala_import_reference_outcome(
         scala_lexical_context_at(Some(&session), root, source, node, node.start_byte())?;
     let lexical_resolver = ScalaNameResolver::for_file(scala, token, support, file)
         .with_lexical_context(package_prefixes, lexical_scopes, node.start_byte());
-    let cache = ScalaLookupCache::default();
     let ctx = ScalaLookupCtx {
         scala,
         token,
         analyzer,
         support,
-        cache: &cache,
+        cache,
         file,
         source,
         session: Some(&session),
@@ -5875,11 +5876,13 @@ fn resolve_scala_bare_apply_fast_path(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
     support: &dyn BoundedDefinitionLookup,
+    batch: &ScalaDefinitionContext,
     file: &ProjectFile,
     source: &str,
     root: Node<'_>,
     node: Node<'_>,
     resolver: &ScalaNameResolver<'_>,
+    cache: &ScalaLookupCache,
     session: Option<&ResolutionSession>,
 ) -> Option<DefinitionLookupOutcome> {
     let Some(ScalaReferenceNode::Call(call)) = scala_reference_node(node) else {
@@ -5893,13 +5896,12 @@ fn resolve_scala_bare_apply_fast_path(
     if name.is_empty() {
         return None;
     }
-    let cache = ScalaLookupCache::default();
     let ctx = ScalaLookupCtx {
         scala,
         token,
         analyzer,
         support,
-        cache: &cache,
+        cache,
         file,
         source,
         session,
@@ -5926,6 +5928,7 @@ fn resolve_scala_bare_apply_fast_path(
             analyzer,
             token,
             support,
+            cache,
             file,
             function.start_byte(),
             name,
@@ -5934,6 +5937,7 @@ fn resolve_scala_bare_apply_fast_path(
             scala,
             token,
             support,
+            batch,
             file,
             name,
             call_shape.as_ref(),
@@ -11030,7 +11034,9 @@ fn scala_receiver_owner_with_bindings(
     }
     let name = scala_node_text(receiver, ctx.source).trim();
     if matches!(name, "this" | "super") {
-        return ClassRangeIndex::build(ctx.analyzer, ctx.file)
+        return ctx
+            .analyzer
+            .class_range_index(ctx.file)
             .enclosing_unit(receiver.start_byte())
             .cloned()
             .map(ScalaReceiverOwner::Exact);
@@ -12137,7 +12143,7 @@ fn scala_type_member_before_anonymous_refinement(
                     let Some(named_owner) = scala_named_template_owner_for_forward(node) else {
                         return ScalaTypeNamespaceResolution::AuthoritativeMiss;
                     };
-                    let ranges = ClassRangeIndex::build(ctx.analyzer, ctx.file);
+                    let ranges = ctx.analyzer.class_range_index(ctx.file);
                     let Some(owner) = ranges
                         .unit_for_exact_span(named_owner.start_byte(), named_owner.end_byte())
                         .cloned()
@@ -12542,16 +12548,19 @@ fn scala_enclosing_class(
     file: &ProjectFile,
     byte: usize,
 ) -> Option<CodeUnit> {
-    ClassRangeIndex::build(analyzer, file)
+    analyzer
+        .class_range_index(file)
         .enclosing_unit(byte)
         .cloned()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scala_enclosing_member_shadows_bare_call(
     scala: &ScalaAnalyzer,
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
     support: &dyn BoundedDefinitionLookup,
+    cache: &ScalaLookupCache,
     file: &ProjectFile,
     byte: usize,
     name: &str,
@@ -12562,13 +12571,12 @@ fn scala_enclosing_member_shadows_bare_call(
     if owner.identifier().trim_end_matches('$') == name {
         return false;
     }
-    let cache = ScalaLookupCache::default();
     let ctx = ScalaLookupCtx {
         scala,
         token,
         analyzer,
         support,
-        cache: &cache,
+        cache,
         file,
         source: "",
         session: None,
@@ -12592,13 +12600,18 @@ fn scala_imported_member_shadows_bare_call(
     scala: &ScalaAnalyzer,
     token: QueryToken<'_>,
     support: &dyn BoundedDefinitionLookup,
+    batch: &ScalaDefinitionContext,
     file: &ProjectFile,
     name: &str,
     call_shape: Option<&ScalaCallSiteShape>,
 ) -> bool {
-    let file_package = scala_package_name_of(scala, file).unwrap_or_default();
-    for import in scala.import_info_of(token, file) {
-        let Some(path) = scala_import_path(&import) else {
+    let file_package: &str = &batch.package;
+    // One resolver for every wildcard import in the file: `for_file` re-derives
+    // the file's package and import list, and this loop used to build it once
+    // per wildcard import, once per occurrence (#2679).
+    let mut wildcard_resolver = None;
+    for import in batch.imports.iter() {
+        let Some(path) = scala_import_path(import) else {
             continue;
         };
         if import.is_wildcard {
@@ -12619,14 +12632,16 @@ fn scala_imported_member_shadows_bare_call(
                 .as_ref()
                 .map(|structured_path| structured_path.segments.as_slice())
                 .unwrap_or(&[]);
-            let resolver = ForwardScalaNameResolver::for_file(scala, token, support, file);
+            let resolver = wildcard_resolver.get_or_insert_with(|| {
+                ForwardScalaNameResolver::for_file(scala, token, support, file)
+            });
             if scala_wildcard_imported_member_units(
                 scala,
                 token,
                 support,
-                &resolver,
+                resolver,
                 &path,
-                &file_package,
+                file_package,
                 &enclosing_owners,
                 segments,
                 name,
@@ -12650,7 +12665,7 @@ fn scala_imported_member_shadows_bare_call(
         if import.local_name() != Some(name) {
             continue;
         }
-        for candidate in import_candidate_fq_names(&path, &file_package) {
+        for candidate in import_candidate_fq_names(&path, file_package) {
             let normalized = scala_normalized_fq_name(&candidate);
             if support
                 .fqn(&candidate)
@@ -13022,7 +13037,8 @@ fn scala_seed_value_definition(
     }
     let declaration_owner = scala_is_direct_member_value_definition(node)
         .then(|| {
-            ClassRangeIndex::build(ctx.analyzer, ctx.file)
+            ctx.analyzer
+                .class_range_index(ctx.file)
                 .enclosing_unit(node.start_byte())
                 .cloned()
         })
@@ -13053,7 +13069,9 @@ fn scala_exact_stable_value_owner(
         return None;
     }
     let segments = scala_type_lookup_segments(value, ctx.source);
-    let mut lexical_owner = ClassRangeIndex::build(ctx.analyzer, ctx.file)
+    let mut lexical_owner = ctx
+        .analyzer
+        .class_range_index(ctx.file)
         .enclosing_unit(value.start_byte())
         .cloned();
     while let Some(owner) = lexical_owner {

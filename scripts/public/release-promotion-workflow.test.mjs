@@ -214,6 +214,30 @@ test("GitHub releases use the exact curated changelog entry", () => {
   );
 });
 
+test("release readiness qualifies and assembles attributable semantic-pack partial bundles", () => {
+  for (const [jobName, scriptName] of [
+    ["semantic-pack-jvm", "build-pinned-jvm-semantic-packs.sh"],
+    ["semantic-pack-python", "build-pinned-python-semantic-packs.sh"],
+    ["semantic-pack-typescript", "build-pinned-typescript-semantic-packs.sh"],
+    ["semantic-pack-rust", "build-pinned-rust-semantic-packs.sh"],
+  ]) {
+    const job = jobBlock(readiness, jobName);
+    assert.match(job, new RegExp(`scripts/public/${scriptName.replaceAll(".", "\\.")}`, "u"));
+    assert.match(job, /-- verify/u);
+    assert.match(job, /actions\/upload-artifact@/u);
+  }
+  const assembler = jobBlock(readiness, "semantic-pack-bundle");
+  assert.match(
+    assembler,
+    /needs: \[preflight, semantic-pack-jvm, semantic-pack-python, semantic-pack-typescript, semantic-pack-rust\]/u,
+  );
+  assert.match(assembler, /actions\/download-artifact@/u);
+  assert.match(assembler, /-- merge/u);
+  assert.match(assembler, /-- verify/u);
+  assert.match(assembler, /measurements\.json/u);
+  assert.match(assembler, /bifrost-semantic-packs-\$\{RELEASE_TAG\}\.tar\.gz/u);
+});
+
 test("promotion is byte-only and does not rebuild, package, or repack", () => {
   for (const workflow of [release, cratePublisher]) {
     for (const forbidden of [
@@ -272,16 +296,14 @@ test("publisher dependency order and protected identities remain explicit", () =
   ]) {
     assert.equal(analysisDependencies.has(dependency), true, `analysis crate must wait for ${dependency}`);
   }
-  for (const sibling of ["flow", "nlp"]) {
-    assert.match(
-      jobBlock(release, `publish-crate-${sibling}`),
-      /^    needs: \[release-context, promote-qualification, publish-crate-analysis\]$/mu,
-    );
-  }
+  assert.match(
+    jobBlock(release, "publish-crate-flow"),
+    /^    needs: \[release-context, promote-qualification, publish-crate-analysis\]$/mu,
+  );
   for (const sibling of ["rql", "semantic-packs"]) {
     assert.match(
       jobBlock(release, `publish-crate-${sibling}`),
-      /^    needs: \[release-context, promote-qualification, publish-crate-flow, publish-crate-nlp\]$/mu,
+      /^    needs: \[release-context, promote-qualification, publish-crate-flow\]$/mu,
     );
   }
   assert.match(

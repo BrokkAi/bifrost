@@ -113,6 +113,36 @@ pub struct CodeQueryExpressionSite {
     pub call_range: CodeQueryRange,
 }
 
+/// One exact operand projected from a JSX attribute.
+///
+/// The row's `range` and `ast_id` belong to the normalized operand itself,
+/// not to the enclosing attribute. This is the terminal contract consumed by
+/// `matched-value` policies.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryJsxAttributeValue {
+    pub id: String,
+    pub ast_id: String,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub text: String,
+    pub element_identity: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub element_name: Option<String>,
+    pub attribute_kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attribute_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub property_name: Option<String>,
+    pub coverage: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub component: Option<CodeQueryDeclaration>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attribute_target: Option<CodeQueryDeclaration>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CodeQueryReceiverAnalysis {
     pub site_id: String,
@@ -877,6 +907,45 @@ pub struct CodeQuerySignatureParameter {
     pub repeated: Option<bool>,
     pub label_start_byte: usize,
     pub label_end_byte: usize,
+}
+
+/// One decorator application attached to one exact source parameter. The
+/// optional identities are intentional: an adapter can publish the
+/// application and its source anchor while still being unable to prove a
+/// lexical import or semantic port. The status fields make that boundary
+/// explicit rather than turning the row into a false negative.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryDecoratedParameter {
+    pub id: String,
+    pub parameter_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decorator_id: Option<String>,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub decorator_range: CodeQueryRange,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub procedure_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameter_ordinal: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port_id: Option<String>,
+    pub decorator_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub imported_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub module: Option<String>,
+    pub binding_status: &'static str,
+    pub boundary: &'static str,
+    pub completion: &'static str,
+    pub coverage: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub terminal: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -8,14 +8,230 @@ use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::analyzer::{
     CSharpAnalyzer, CodeUnit, IAnalyzer, Language, ProjectFile, resolve_analyzer,
 };
-use crate::hash::HashSet;
+use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
-use brokk_bifrost_csharp::graph::extractor::{ScanState, prepare_file, scan_prepared_file};
+use brokk_bifrost_csharp::graph::extractor::{
+    BatchScanState, PreparedCSharpFile, ScanState, prepare_file, scan_prepared_file,
+    scan_prepared_file_batch,
+};
 use brokk_bifrost_csharp::graph::resolver::TargetSpec;
 use std::collections::BTreeSet;
+use std::sync::Arc;
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub(crate) struct CSharpQueryResolver<'a> {
     csharp: &'a CSharpAnalyzer,
+}
+
+/// One authoritative C# inverse batch over a fixed union of caller roots.
+///
+/// Preparing a C# file reads and parses its source, builds its line table and
+/// class-range index, and loads its using aliases. None of that state depends
+/// on the target being queried, so the reference-differential campaign keeps
+/// it once and shares it across target groups. Interactive and cancellable
+/// usage queries continue to prepare only the files in their own request.
+pub struct CSharpAuthoritativeUsageBatch<'a> {
+    analyzer: &'a dyn IAnalyzer,
+    resolver: CSharpQueryResolver<'a>,
+    prepared_files: HashMap<ProjectFile, Arc<PreparedCSharpFile>>,
+    token: QueryToken<'a>,
+    #[cfg(any(test, feature = "test-support"))]
+    batch_file_scans: AtomicUsize,
+}
+
+pub struct CSharpAuthoritativeUsageRequest<'a> {
+    overloads: &'a [CodeUnit],
+    candidate_files: &'a HashSet<ProjectFile>,
+    max_usages: usize,
+}
+
+impl<'a> CSharpAuthoritativeUsageRequest<'a> {
+    pub fn new(
+        overloads: &'a [CodeUnit],
+        candidate_files: &'a HashSet<ProjectFile>,
+        max_usages: usize,
+    ) -> Self {
+        Self {
+            overloads,
+            candidate_files,
+            max_usages,
+        }
+    }
+}
+
+impl<'a> CSharpAuthoritativeUsageBatch<'a> {
+    pub fn new(
+        analyzer: &'a dyn IAnalyzer,
+        token: QueryToken<'a>,
+        roots: &HashSet<ProjectFile>,
+    ) -> Option<Self> {
+        let resolver = CSharpQueryResolver::try_new(analyzer)?;
+        let prepared_files = roots
+            .iter()
+            .filter_map(|file| {
+                prepare_file(resolver.csharp, file)
+                    .map(|prepared| (file.clone(), Arc::new(prepared)))
+            })
+            .collect();
+        Some(Self {
+            analyzer,
+            resolver,
+            prepared_files,
+            token,
+            #[cfg(any(test, feature = "test-support"))]
+            batch_file_scans: AtomicUsize::new(0),
+        })
+    }
+
+    pub fn find_usages(
+        &self,
+        overloads: &[CodeUnit],
+        candidate_files: &HashSet<ProjectFile>,
+        max_usages: usize,
+    ) -> GraphUsageOutcome {
+        self.find_usages_batch(&[CSharpAuthoritativeUsageRequest::new(
+            overloads,
+            candidate_files,
+            max_usages,
+        )])
+        .pop()
+        .expect("one C# authoritative request produces one outcome")
+    }
+
+    pub fn find_usages_batch(
+        &self,
+        requests: &[CSharpAuthoritativeUsageRequest<'_>],
+    ) -> Vec<GraphUsageOutcome> {
+        struct SpecResult {
+            spec: TargetSpec,
+            hits: BTreeSet<UsageHit>,
+            unproven_hits: BTreeSet<UsageHit>,
+            limit_exceeded: bool,
+        }
+
+        struct QueryPlan<'a> {
+            target: CodeUnit,
+            candidate_files: &'a HashSet<ProjectFile>,
+            max_usages: usize,
+            specs: Vec<SpecResult>,
+        }
+
+        let graph = csharp_graph_source(self.analyzer);
+        let mut outcomes: Vec<Option<GraphUsageOutcome>> = std::iter::repeat_with(|| None)
+            .take(requests.len())
+            .collect();
+        let mut plans: Vec<Option<QueryPlan<'_>>> = Vec::with_capacity(requests.len());
+        for (index, request) in requests.iter().enumerate() {
+            let Some(target) = request.overloads.first() else {
+                outcomes[index] = Some(GraphUsageOutcome::Resolved(FuzzyResult::empty_success()));
+                plans.push(None);
+                continue;
+            };
+            let mut specs = Vec::with_capacity(request.overloads.len());
+            let mut unsupported = None;
+            for overload in request.overloads {
+                let Some(spec) = TargetSpec::from_target(&graph, overload) else {
+                    unsupported = Some(GraphUsageOutcome::fallback_safe(
+                        overload.fq_name(),
+                        GraphFailureReason::UnsupportedTargetShape("target shape is unsupported"),
+                        "CSharpUsageGraphStrategy",
+                    ));
+                    break;
+                };
+                specs.push(SpecResult {
+                    spec,
+                    hits: BTreeSet::new(),
+                    unproven_hits: BTreeSet::new(),
+                    limit_exceeded: false,
+                });
+            }
+            if let Some(unsupported) = unsupported {
+                outcomes[index] = Some(unsupported);
+                plans.push(None);
+            } else {
+                plans.push(Some(QueryPlan {
+                    target: target.clone(),
+                    candidate_files: request.candidate_files,
+                    max_usages: request.max_usages,
+                    specs,
+                }));
+            }
+        }
+
+        for (file, prepared) in &self.prepared_files {
+            let mut scans = Vec::new();
+            for plan in plans.iter_mut().flatten() {
+                if !plan.candidate_files.contains(file) {
+                    continue;
+                }
+                for result in &mut plan.specs {
+                    scans.push(BatchScanState {
+                        spec: &result.spec,
+                        max_usages: plan.max_usages,
+                        hits: &mut result.hits,
+                        unproven_hits: &mut result.unproven_hits,
+                        limit_exceeded: &mut result.limit_exceeded,
+                    });
+                }
+            }
+            if !scans.is_empty() {
+                #[cfg(any(test, feature = "test-support"))]
+                self.batch_file_scans.fetch_add(1, Ordering::Relaxed);
+                scan_prepared_file_batch(
+                    self.resolver.csharp,
+                    self.token,
+                    &graph,
+                    file,
+                    prepared,
+                    &mut scans,
+                );
+            }
+        }
+
+        for (index, plan) in plans.into_iter().enumerate() {
+            let Some(plan) = plan else {
+                continue;
+            };
+            let mut hits = BTreeSet::new();
+            let mut unproven_hits = BTreeSet::new();
+            let mut limit_exceeded = false;
+            for result in plan.specs {
+                hits.extend(result.hits);
+                unproven_hits.extend(result.unproven_hits);
+                limit_exceeded |= result.limit_exceeded;
+            }
+            let external_callsites =
+                crate::analyzer::usages::common::external_usage_hit_count(&hits);
+            outcomes[index] = Some(GraphUsageOutcome::Resolved(
+                if limit_exceeded || external_callsites > plan.max_usages {
+                    FuzzyResult::TooManyCallsites {
+                        short_name: plan.target.short_name().to_string(),
+                        total_callsites: external_callsites,
+                        limit: plan.max_usages,
+                        sample_hits: hits,
+                    }
+                } else {
+                    FuzzyResult::success_with_unproven(plan.target, hits, unproven_hits)
+                },
+            ));
+        }
+
+        outcomes
+            .into_iter()
+            .map(|outcome| outcome.expect("every C# authoritative request has an outcome"))
+            .collect()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn prepared_file_count_for_test(&self) -> usize {
+        self.prepared_files.len()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn batch_file_scan_count_for_test(&self) -> usize {
+        self.batch_file_scans.load(Ordering::Relaxed)
+    }
 }
 
 impl<'a> UsageQueryResolver<'a> for CSharpQueryResolver<'a> {
@@ -34,6 +250,23 @@ impl<'a> UsageQueryResolver<'a> for CSharpQueryResolver<'a> {
     ) -> GraphUsageOutcome {
         let scope = AnalyzerQueryScope::new(analyzer);
         let token = scope.token();
+        self.find_usages_with_prepared_files(
+            analyzer, token, overloads, scan_scope, max_usages, None,
+        )
+    }
+}
+
+impl CSharpQueryResolver<'_> {
+    #[allow(clippy::too_many_arguments)]
+    fn find_usages_with_prepared_files(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        token: QueryToken<'_>,
+        overloads: &[CodeUnit],
+        scan_scope: &UsageScanScope<'_>,
+        max_usages: usize,
+        prepared_files: Option<&HashMap<ProjectFile, Arc<PreparedCSharpFile>>>,
+    ) -> GraphUsageOutcome {
         let Some(target) = overloads.first() else {
             return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
         };
@@ -75,7 +308,14 @@ impl<'a> UsageQueryResolver<'a> for CSharpQueryResolver<'a> {
             if scan_scope.is_cancelled() || *state.limit_exceeded {
                 break;
             }
-            let Some(prepared) = prepare_file(self.csharp, &file) else {
+            let local_prepared = prepared_files
+                .is_none()
+                .then(|| prepare_file(self.csharp, &file))
+                .flatten();
+            let prepared = prepared_files
+                .and_then(|files| files.get(&file).map(Arc::as_ref))
+                .or(local_prepared.as_ref());
+            let Some(prepared) = prepared else {
                 continue;
             };
             for spec in &specs {
@@ -84,7 +324,7 @@ impl<'a> UsageQueryResolver<'a> for CSharpQueryResolver<'a> {
                     token,
                     &graph,
                     &file,
-                    &prepared,
+                    prepared,
                     spec,
                     &mut state,
                 );

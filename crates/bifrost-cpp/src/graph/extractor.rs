@@ -35,6 +35,7 @@ use std::cell::Cell;
 use std::cell::{OnceCell, RefCell};
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Instant;
 use tree_sitter::Node;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -328,12 +329,36 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     seed_declarations(node, ctx);
     maybe_record_hit(node, ctx);
 
+    let translation_unit = node.kind() == "translation_unit";
+    let mut fractured_function_scope = false;
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
+        if translation_unit && fractured_function_scope && child.kind() == "ERROR" {
+            ctx.bindings.exit_scope();
+            ctx.local_shadows.exit_scope();
+            fractured_function_scope = false;
+        }
         scan_node(child, ctx);
         if *ctx.limit_exceeded {
             break;
         }
+        if translation_unit
+            && macro_fractured_function(child)
+            && macro_fracture_boundary(child).is_some()
+        {
+            if fractured_function_scope {
+                ctx.bindings.exit_scope();
+                ctx.local_shadows.exit_scope();
+            }
+            ctx.bindings.enter_scope();
+            ctx.local_shadows.enter_scope();
+            seed_fractured_function_prefix(child, ctx);
+            fractured_function_scope = true;
+        }
+    }
+    if fractured_function_scope {
+        ctx.bindings.exit_scope();
+        ctx.local_shadows.exit_scope();
     }
 
     if enters_scope {
@@ -342,6 +367,88 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     }
     if enters_using_enum_scope {
         ctx.using_enum_owners.exit_scope();
+    }
+}
+
+fn macro_fractured_function(node: Node<'_>) -> bool {
+    if node.kind() != "function_definition" {
+        return false;
+    }
+    let Some(body) = node.child_by_field_name("body") else {
+        return false;
+    };
+    let mut stack = vec![body];
+    while let Some(current) = stack.pop() {
+        if matches!(current.kind(), "preproc_def" | "preproc_function_def") {
+            return true;
+        }
+        let mut cursor = current.walk();
+        stack.extend(current.named_children(&mut cursor));
+    }
+    false
+}
+
+fn macro_fracture_boundary(node: Node<'_>) -> Option<usize> {
+    let first_orphan = node.next_named_sibling()?;
+    if !matches!(
+        first_orphan.kind(),
+        "expression_statement"
+            | "if_statement"
+            | "for_statement"
+            | "while_statement"
+            | "do_statement"
+            | "return_statement"
+    ) {
+        return None;
+    }
+    let mut sibling = Some(first_orphan);
+    while let Some(current) = sibling {
+        if current.kind() == "ERROR" {
+            return Some(current.end_byte());
+        }
+        if matches!(
+            current.kind(),
+            "function_definition" | "declaration" | "type_definition"
+        ) {
+            return None;
+        }
+        sibling = current.next_named_sibling();
+    }
+    None
+}
+
+fn seed_fractured_function_prefix(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
+    let cutoff = node.end_byte().saturating_sub(1);
+    seed_fractured_active_path(node, cutoff, ctx);
+}
+
+fn seed_fractured_active_path(node: Node<'_>, cutoff: usize, ctx: &mut ScanCtx<'_>) {
+    if node.start_byte() >= cutoff {
+        return;
+    }
+    let enters_scope = matches!(
+        node.kind(),
+        "compound_statement"
+            | "function_definition"
+            | "lambda_expression"
+            | "for_range_loop"
+            | "for_statement"
+            | "while_statement"
+            | "if_statement"
+            | "class_specifier"
+            | "struct_specifier"
+            | "union_specifier"
+    );
+    if enters_scope && !(node.start_byte() <= cutoff && cutoff < node.end_byte()) {
+        return;
+    }
+    seed_declarations(node, ctx);
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.start_byte() >= cutoff {
+            break;
+        }
+        seed_fractured_active_path(child, cutoff, ctx);
     }
 }
 
@@ -892,6 +999,31 @@ fn maybe_record_type_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         {
             *ctx.raw_match_count += 1;
             push_type_hit(type_node, ctx);
+        }
+        return;
+    }
+    if is_c_sizeof_expression_type_candidate(ctx.file, node) {
+        if ctx.local_shadows.is_shadowed(node_text(node, ctx.source))
+            || local_type_name_shadows(node, ctx)
+        {
+            return;
+        }
+        if let LexicalTypeResolution::Resolved {
+            unit, candidates, ..
+        } = resolve_type_node_lexically_for_target(
+            node,
+            &ctx.analyzer,
+            ctx.visibility,
+            &ctx.ordinary_type_imports,
+            ctx.file,
+            ctx.source,
+            &ctx.spec.target,
+            Some(&ctx.lexical_scope_cache),
+            ctx.recovered_sentinel_scope(node).as_deref(),
+        ) && type_resolution_matches_target(node, &unit, &candidates, ctx)
+        {
+            *ctx.raw_match_count += 1;
+            push_type_hit(node, ctx);
         }
         return;
     }
@@ -1596,7 +1728,7 @@ fn target_guided_compatible_foreign_import_type_leaf<'tree>(
             ctx.file,
             ctx.source,
             &lexical_scope,
-            &ctx.spec.target,
+            Some(&ctx.spec.target),
         )
     else {
         return None;
@@ -2319,6 +2451,11 @@ fn type_reference_components_may_name_target(node: Node<'_>, ctx: &ScanCtx<'_>) 
     };
     components.iter().any(|component| {
         ctx.type_reference_component_names.contains(component)
+            || ctx.visibility.parser_alias_name_may_resolve_to_target(
+                ctx.file,
+                component,
+                &ctx.spec.target,
+            )
             || (component == ctx.spec.target.identifier()
                 && matches!(
                     node.kind(),
@@ -3124,12 +3261,21 @@ pub fn resolve_bare_call_target(
                                 && visibility
                                     .callable_is_deduction_guide_declaration(analyzer, candidate)))
                     && cpp_name_for(candidate) == qualified.join("::")
-                    && visibility.declaration_visible_at(
-                        analyzer,
-                        file,
-                        candidate,
-                        call.start_byte(),
-                    )
+                    && if analyzer.reference_uses_c_semantics(file) {
+                        visibility.declaration_visible_for_c_forward_call(
+                            analyzer,
+                            file,
+                            candidate,
+                            call.start_byte(),
+                        )
+                    } else {
+                        visibility.declaration_visible_at(
+                            analyzer,
+                            file,
+                            candidate,
+                            call.start_byte(),
+                        )
+                    }
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -5628,7 +5774,9 @@ fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         return;
     };
     if node.kind() == "field_initializer" {
-        if !field_initializer_constructs_target(node, ctx, owner) {
+        if !field_initializer_constructs_target(node, ctx, owner)
+            && !unqualified_base_initializer_constructs_target(node, ctx, owner)
+        {
             return;
         }
         if let Some(expected) = ctx.spec.callable_arity_at(node.start_byte()) {
@@ -5713,6 +5861,37 @@ fn maybe_record_constructor_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     } else {
         push_unproven_hit(hit_node, ctx);
     }
+}
+
+fn unqualified_base_initializer_constructs_target(
+    node: Node<'_>,
+    ctx: &ScanCtx<'_>,
+    target_owner: &CodeUnit,
+) -> bool {
+    if first_named_child_of_kind(node, "qualified_identifier").is_some() {
+        return false;
+    }
+    let Some(name) = node
+        .child_by_field_name("name")
+        .or_else(|| first_named_child_of_kind(node, "field_identifier"))
+    else {
+        return false;
+    };
+    if node_text(name, ctx.source) != ctx.spec.member_name {
+        return false;
+    }
+    let Some(enclosing_owner) = structured_enclosing_owner(node, ctx) else {
+        return false;
+    };
+    let inherited = ctx.visibility.inherited_injected_class_owner(
+        &ctx.analyzer,
+        ctx.file,
+        &enclosing_owner,
+        &ctx.spec.member_name,
+    );
+    inherited.is_some_and(|owner| {
+        receiver_owner_matches_target(&owner, target_owner, node.start_byte(), ctx)
+    })
 }
 
 fn maybe_record_free_function_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
@@ -6316,8 +6495,13 @@ fn maybe_record_method_hit(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
             push_hit(function_terminal_node(function), ctx);
         }
         MethodReceiverTargetResolution::Missing
-            if same_owner_context(function, ctx)
-                || out_of_line_target_owner_context(function, ctx) =>
+            if (matches!(function.kind(), "identifier" | "template_function")
+                || call_function_has_direct_self_receiver(
+                    function,
+                    ctx.analyzer.reference_uses_c_semantics(ctx.file),
+                ))
+                && (same_owner_context(function, ctx)
+                    || out_of_line_target_owner_context(function, ctx)) =>
         {
             push_self_receiver_hit(function_terminal_node(function), ctx);
         }
@@ -7858,18 +8042,13 @@ fn receiver_matches_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
         return false;
     };
     match node.kind() {
-        "field_expression" => node
-            .child_by_field_name("argument")
-            .or_else(|| node.child_by_field_name("object"))
-            .is_some_and(|receiver| {
-                receiver_is_self_like(receiver, ctx.analyzer.reference_uses_c_semantics(ctx.file))
-                    && same_owner_context(receiver, ctx)
-                    || receiver_type_units(receiver, ctx.source, ctx)
-                        .iter()
-                        .any(|target| {
-                            receiver_owner_matches_target(target, owner, node.start_byte(), ctx)
-                        })
-            }),
+        // `declaring_owner_for_explicit_receiver` already tried the complete field chain.
+        // When that structured lookup fails, the base expression's owner is not the field's
+        // type: treating `value_` as `Value` would misclassify
+        // `value_.map_->clear()` as `Value::clear`. Direct `this->clear()` reaches this helper
+        // with the `this` node itself, so failing closed for an unresolved field chain does not
+        // discard genuine self calls.
+        "field_expression" => false,
         "call_expression" => node
             .child_by_field_name("function")
             .is_some_and(|function| receiver_matches_target(function, ctx)),
@@ -8155,6 +8334,18 @@ fn receiver_has_known_non_target(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
             .child_by_field_name("argument")
             .or_else(|| node.child_by_field_name("object"))
             .is_some_and(|receiver| {
+                // `this` names the enclosing class, not necessarily the class that
+                // declares the invoked member. Let the hierarchy-aware enclosing-owner
+                // lookup decide whether this is a same-owner call, an inherited base
+                // member, a nearer override, or an ambiguous base. Rejecting a derived
+                // `this` merely because its immediate type differs from the target owner
+                // drops genuine inherited calls (#2541).
+                if receiver_is_self_like(
+                    receiver,
+                    ctx.analyzer.reference_uses_c_semantics(ctx.file),
+                ) {
+                    return false;
+                }
                 let units = receiver_type_units(receiver, ctx.source, ctx);
                 !units.is_empty()
                     && units.iter().all(|target| {
@@ -8582,6 +8773,7 @@ fn enclosing_lexical_scope_components_with_unresolved_owner(
             file,
             source,
             None,
+            false,
             false,
             false,
             namespace.clone(),
@@ -9183,6 +9375,7 @@ fn target_guided_qualified_namespace_function_type_resolution(
         source,
         Some(target),
         true,
+        false,
         false,
         target_scope,
     );
@@ -9805,15 +9998,26 @@ fn orphaned_using_owner_name(node: Node<'_>, source: &str) -> Option<String> {
 }
 
 fn build_project_using_index(visibility: &VisibilityIndex<'_>) -> ProjectUsingIndex {
+    let started = Instant::now();
+    let report_stats = std::env::var_os("BIFROST_CPP_VISIBILITY_STATS").is_some();
+    let source_files = visibility.all_visible_source_files();
+    if report_stats {
+        eprintln!(
+            "BIFROST_CPP_USING_INDEX_STATS status=started source_files={}",
+            source_files.len()
+        );
+    }
     let mut project = ProjectUsingIndex::default();
-    for source_file in visibility.all_visible_source_files() {
+    let mut ordinary_bindings = 0usize;
+    for source_file in &source_files {
         // The per-file index is memoized on the analyzer, so assembling the
         // project index for a fresh `VisibilityIndex` copies bindings instead
         // of re-walking each file's AST (#1927).
         let source_index = visibility
             .cpp()
-            .source_using_index(visibility.token(), &source_file);
+            .source_using_index(visibility.token(), source_file);
         for (name, bindings) in &source_index.ordinary_by_name {
+            ordinary_bindings += bindings.len();
             project
                 .ordinary_by_name
                 .entry(name.clone())
@@ -9823,6 +10027,16 @@ fn build_project_using_index(visibility: &VisibilityIndex<'_>) -> ProjectUsingIn
         project
             .directives
             .extend(source_index.directives.iter().cloned());
+    }
+    if report_stats {
+        eprintln!(
+            "BIFROST_CPP_USING_INDEX_STATS status=completed source_files={} ordinary_names={} ordinary_bindings={} directives={} elapsed_ms={}",
+            source_files.len(),
+            project.ordinary_by_name.len(),
+            ordinary_bindings,
+            project.directives.len(),
+            started.elapsed().as_millis(),
+        );
     }
     project
 }
@@ -10133,7 +10347,7 @@ fn effective_using_binding_guards_active(
         && reference_guards.is_some_and(|active| binding.required_guards.is_subset(active))
         && visibility.preprocessor_guards_stable_between(
             file,
-            0,
+            binding.declaration_byte,
             reference_byte,
             &binding.required_guards,
         )
@@ -10155,7 +10369,7 @@ fn effective_using_binding_guards_compatible(
         })
         && visibility.preprocessor_guards_stable_between(
             file,
-            0,
+            binding.declaration_byte,
             reference_byte,
             &binding.required_guards,
         )
@@ -10524,7 +10738,7 @@ fn compatible_foreign_type_import_resolution(
     file: &ProjectFile,
     source: &str,
     lexical_scope: &[String],
-    direct_target: &CodeUnit,
+    direct_target: Option<&CodeUnit>,
 ) -> OrdinaryTypeImportResolution {
     if global || components.len() != 1 {
         return OrdinaryTypeImportResolution::Missing;
@@ -10571,7 +10785,7 @@ fn compatible_foreign_type_import_resolution(
         visibility,
         file,
         lexical_scope,
-        Some(direct_target),
+        direct_target,
         &compatible,
         &transitive,
     )
@@ -10741,6 +10955,7 @@ pub fn resolve_type_components_lexically_at(
         None,
         false,
         false,
+        false,
         None,
     )
 }
@@ -10776,6 +10991,7 @@ pub fn resolve_type_components_lexically_at_preserving_alias(
         None,
         false,
         true,
+        true,
         None,
     )
 }
@@ -10804,6 +11020,7 @@ fn resolve_type_components_lexically_at_preserving_alias_with_scope_cache(
         None,
         false,
         true,
+        false,
         scope_cache,
     )
 }
@@ -10834,6 +11051,7 @@ fn resolve_type_components_lexically_at_for_target_with_scope_cache(
         Some(target),
         apply_structured_prefilter,
         false,
+        false,
         scope_cache,
     )
 }
@@ -10862,6 +11080,7 @@ fn resolve_type_components_lexically_at_preserving_alias_with_recovered_scope(
         None,
         false,
         true,
+        false,
         recovered_scope.to_vec(),
     )
 }
@@ -10892,6 +11111,7 @@ fn resolve_type_components_lexically_at_for_target_with_recovered_scope(
         Some(target),
         apply_structured_prefilter,
         false,
+        false,
         recovered_scope.to_vec(),
     )
 }
@@ -10909,8 +11129,14 @@ fn resolve_type_components_lexically_at_inner(
     direct_target: Option<&CodeUnit>,
     apply_structured_prefilter: bool,
     preserve_alias: bool,
+    allow_compatible_foreign_import: bool,
     scope_cache: Option<&LexicalScopeCache>,
 ) -> LexicalTypeResolution {
+    let report_stats = std::env::var_os("BIFROST_CPP_VISIBILITY_STATS").is_some();
+    let lexical_scope_started = Instant::now();
+    if report_stats {
+        eprintln!("BIFROST_CPP_TYPE_LEXICAL_PHASE phase=lexical_scope status=started");
+    }
     let lexical_scope = if global {
         Vec::new()
     } else {
@@ -10926,10 +11152,33 @@ fn resolve_type_components_lexically_at_inner(
             scope_cache,
         ) {
             LexicalScopeResolution::Resolved(scope) => scope,
-            LexicalScopeResolution::Ambiguous => return LexicalTypeResolution::Ambiguous,
-            LexicalScopeResolution::Missing => return LexicalTypeResolution::Missing,
+            LexicalScopeResolution::Ambiguous => {
+                if report_stats {
+                    eprintln!(
+                        "BIFROST_CPP_TYPE_LEXICAL_PHASE phase=lexical_scope status=completed outcome=ambiguous elapsed_ms={}",
+                        lexical_scope_started.elapsed().as_millis(),
+                    );
+                }
+                return LexicalTypeResolution::Ambiguous;
+            }
+            LexicalScopeResolution::Missing => {
+                if report_stats {
+                    eprintln!(
+                        "BIFROST_CPP_TYPE_LEXICAL_PHASE phase=lexical_scope status=completed outcome=missing elapsed_ms={}",
+                        lexical_scope_started.elapsed().as_millis(),
+                    );
+                }
+                return LexicalTypeResolution::Missing;
+            }
         }
     };
+    if report_stats {
+        eprintln!(
+            "BIFROST_CPP_TYPE_LEXICAL_PHASE phase=lexical_scope status=completed components={} elapsed_ms={}",
+            lexical_scope.len(),
+            lexical_scope_started.elapsed().as_millis(),
+        );
+    }
     resolve_type_components_lexically_at_scoped(
         node,
         components,
@@ -10942,6 +11191,7 @@ fn resolve_type_components_lexically_at_inner(
         direct_target,
         apply_structured_prefilter,
         preserve_alias,
+        allow_compatible_foreign_import,
         lexical_scope,
     )
 }
@@ -10959,6 +11209,7 @@ fn resolve_type_components_lexically_at_scoped(
     direct_target: Option<&CodeUnit>,
     apply_structured_prefilter: bool,
     preserve_alias: bool,
+    allow_compatible_foreign_import: bool,
     mut lexical_scope: Vec<String>,
 ) -> LexicalTypeResolution {
     if !global
@@ -10992,6 +11243,7 @@ fn resolve_type_components_lexically_at_scoped(
         direct_target,
         apply_structured_prefilter,
         preserve_alias,
+        allow_compatible_foreign_import,
         lexical_scope,
     )
 }
@@ -11014,6 +11266,7 @@ fn resolve_type_components_in_authoritative_scope(
     direct_target: Option<&CodeUnit>,
     apply_structured_prefilter: bool,
     preserve_alias: bool,
+    allow_compatible_foreign_import: bool,
     lexical_scope: Vec<String>,
 ) -> LexicalTypeResolution {
     if apply_structured_prefilter
@@ -11059,6 +11312,11 @@ fn resolve_type_components_in_authoritative_scope(
     {
         return LexicalTypeResolution::Missing;
     }
+    let report_stats = std::env::var_os("BIFROST_CPP_VISIBILITY_STATS").is_some();
+    let lexical_normal_started = Instant::now();
+    if report_stats {
+        eprintln!("BIFROST_CPP_TYPE_LEXICAL_PHASE phase=lexical_normal status=started");
+    }
     let normal = if preserve_alias {
         visibility.resolve_type_components_lexically_for_forward(
             analyzer,
@@ -11090,6 +11348,12 @@ fn resolve_type_components_in_authoritative_scope(
             },
         )
     };
+    if report_stats {
+        eprintln!(
+            "BIFROST_CPP_TYPE_LEXICAL_PHASE phase=lexical_normal status=completed elapsed_ms={}",
+            lexical_normal_started.elapsed().as_millis(),
+        );
+    }
     let normal = match normal {
         LexicalTypeResolution::Resolved { ref unit, .. }
             if !visibility
@@ -11110,7 +11374,11 @@ fn resolve_type_components_in_authoritative_scope(
     // fallback at the same or a shallower depth. A declaration in a more deeply
     // nested named scope is the closer lexical result and remains authoritative.
     // Ambiguous imports fail closed unless such a closer declaration exists.
-    match ordinary_type_import_resolution(
+    let ordinary_import_started = Instant::now();
+    if report_stats {
+        eprintln!("BIFROST_CPP_TYPE_LEXICAL_PHASE phase=ordinary_import status=started");
+    }
+    let ordinary_import_resolution = ordinary_type_import_resolution(
         node,
         components,
         global,
@@ -11121,7 +11389,14 @@ fn resolve_type_components_in_authoritative_scope(
         source,
         &lexical_scope,
         direct_target,
-    ) {
+    );
+    if report_stats {
+        eprintln!(
+            "BIFROST_CPP_TYPE_LEXICAL_PHASE phase=ordinary_import status=completed elapsed_ms={}",
+            ordinary_import_started.elapsed().as_millis(),
+        );
+    }
+    let resolution = match ordinary_import_resolution {
         OrdinaryTypeImportResolution::Missing => normal,
         OrdinaryTypeImportResolution::Resolved {
             lexical_depth,
@@ -11151,6 +11426,43 @@ fn resolve_type_components_in_authoritative_scope(
         {
             normal
         }
+        OrdinaryTypeImportResolution::Ambiguous { .. } => LexicalTypeResolution::Ambiguous,
+    };
+    if !allow_compatible_foreign_import || !matches!(resolution, LexicalTypeResolution::Missing) {
+        return resolution;
+    }
+
+    // A foreign header can contribute an exact using binding from a build
+    // configuration that is compatible with, but not implied by, the current
+    // reference. Forward navigation has no "unproven" result channel, so it
+    // may still navigate through one unique structured import after ordinary
+    // lookup misses. Inverse attribution keeps using its target-guided path
+    // and records the same evidence as unproven (#940).
+    match compatible_foreign_type_import_resolution(
+        node,
+        components,
+        global,
+        analyzer,
+        visibility,
+        ordinary_type_imports,
+        file,
+        source,
+        &lexical_scope,
+        None,
+    ) {
+        OrdinaryTypeImportResolution::Missing => resolution,
+        OrdinaryTypeImportResolution::Resolved {
+            target,
+            target_components,
+            ..
+        } => visibility.resolve_imported_type_candidate(
+            analyzer,
+            file,
+            &target,
+            &target_components,
+            None,
+            true,
+        ),
         OrdinaryTypeImportResolution::Ambiguous { .. } => LexicalTypeResolution::Ambiguous,
     }
 }

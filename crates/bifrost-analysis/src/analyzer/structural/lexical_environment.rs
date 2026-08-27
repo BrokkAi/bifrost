@@ -123,6 +123,10 @@ impl ScopeRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportBinderDetail {
     pub local_name: String,
+    /// The parser-derived name exported by the import target. This is kept
+    /// separate from `local_name` so an aliased import remains distinguishable
+    /// from a same-named local binder without recovering it from source text.
+    pub imported_name: Option<String>,
     pub alias: Option<String>,
     pub target_segments: Vec<String>,
     pub wildcard: bool,
@@ -679,6 +683,11 @@ fn import_binder_rows(
             visibility: DeclaredVisibility::Unknown,
             import: Some(ImportBinderDetail {
                 local_name: local_name.to_owned(),
+                imported_name: if import.is_wildcard {
+                    None
+                } else {
+                    import.identifier.clone()
+                },
                 alias: import.alias.clone(),
                 target_segments: import
                     .path

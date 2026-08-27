@@ -49,6 +49,4 @@ test("uses one stable namespace for every Pi-visible tool", () => {
 
 test("does not advertise Semantic Search as a Pi capability", () => {
   assert.equal(BIFROST_CAPABILITY_IDS.includes("semantic"), false);
-  assert.equal(capabilityForTool("semantic_search"), undefined);
-  assert.equal(toolBelongsToSelection("semantic_search", BIFROST_CAPABILITY_IDS), false);
 });

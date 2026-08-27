@@ -66,6 +66,7 @@ normalized_kinds! {
     Lambda => "lambda": "Match an anonymous function or lambda expression.",
     Class => "class": "Match a class-like declaration.",
     Import => "import": "Match an import declaration.",
+    Parameter => "parameter": "Match a formal parameter declaration.",
     // expression-ish kinds (kept flat; see ExecPlan decision log)
     Call => "call": "Match call expressions for functions, methods, or constructors.",
     Assignment => "assignment": "Match an assignment expression or statement.",
@@ -76,6 +77,16 @@ normalized_kinds! {
     NumericLiteral => "numeric_literal": "Match a numeric literal.",
     BooleanLiteral => "boolean_literal": "Match a boolean literal.",
     NullLiteral => "null_literal": "Match a null-like literal.",
+    CollectionLiteral => "collection_literal": "Match a collection display literal such as an array, list, set, dictionary, or tuple literal.",
+    // JSX and object-property facts. These kinds describe syntax only; JSX
+    // intrinsic/component identity is a resolver-backed projection, not a
+    // normalized kind.
+    JsxElement => "jsx_element": "Match a JSX element, including a self-closing element.",
+    JsxAttribute => "jsx_attribute": "Match a named JSX attribute.",
+    JsxSpreadAttribute => "jsx_spread_attribute": "Match a JSX spread attribute expression.",
+    ObjectProperty => "object_property": "Match a named object-literal property pair.",
+    ComputedProperty => "computed_property": "Match a computed object-property key.",
+    SpreadElement => "spread_element": "Match a structured spread expression in an object, array, or argument list.",
     // statement-ish kinds
     Return => "return": "Match a return statement.",
     Throw => "throw": "Match a throw or raise statement.",
@@ -94,12 +105,15 @@ impl NormalizedKind {
     pub fn parent(self) -> Option<NormalizedKind> {
         use NormalizedKind::*;
         match self {
-            Callable | Class | Import => Some(Declaration),
+            Callable | Class | Import | Parameter => Some(Declaration),
             Function | Method | Constructor | Lambda => Some(Callable),
-            StringLiteral | NumericLiteral | BooleanLiteral | NullLiteral => Some(Literal),
+            StringLiteral | NumericLiteral | BooleanLiteral | NullLiteral | CollectionLiteral => {
+                Some(Literal)
+            }
             ForLoop | WhileLoop => Some(Loop),
             Declaration | Call | Assignment | FieldAccess | Identifier | Literal | Return
-            | Throw | Catch | If | Loop | Decorator | Block => None,
+            | Throw | Catch | If | Loop | Decorator | Block | JsxElement | JsxAttribute
+            | JsxSpreadAttribute | ObjectProperty | ComputedProperty | SpreadElement => None,
         }
     }
 
@@ -200,6 +214,13 @@ roles! {
     Decorator => "decorators": PatternList, "Constrain decorators or annotations.",
     Object => "object": Pattern, "Constrain the object of a field access.",
     Field => "field": Pattern, "Constrain the field portion of a field access.",
+    Iterable => "iterable": Pattern, "Constrain the expression a for-each loop iterates.",
+    Element => "elements": PatternList, "Constrain the elements of a collection literal in order.",
+    Tag => "tag": Pattern, "Constrain the tag expression of a JSX element.",
+    Attributes => "attributes": PatternList, "Constrain the attributes of a JSX element in source order.",
+    Children => "children": PatternList, "Constrain the source children of a JSX element in source order.",
+    Value => "value": Pattern, "Constrain the exact value expression of an attribute, property, or spread.",
+    Key => "key": Pattern, "Constrain the static key of an object property.",
 }
 
 pub const SINGLE_TARGET_ROLES: &[Role] = &[
@@ -210,9 +231,19 @@ pub const SINGLE_TARGET_ROLES: &[Role] = &[
     Role::Module,
     Role::Object,
     Role::Field,
+    Role::Iterable,
+    Role::Tag,
+    Role::Value,
+    Role::Key,
 ];
 
-pub const LIST_TARGET_ROLES: &[Role] = &[Role::Arg, Role::Decorator];
+pub const LIST_TARGET_ROLES: &[Role] = &[
+    Role::Arg,
+    Role::Decorator,
+    Role::Element,
+    Role::Attributes,
+    Role::Children,
+];
 
 pub const MAP_TARGET_ROLES: &[Role] = &[Role::Kwarg];
 
@@ -241,9 +272,32 @@ impl Role {
             Role::Module => matches!(kind, Import | Declaration),
             Role::Decorator => matches!(
                 kind,
-                Function | Method | Constructor | Lambda | Callable | Class | Declaration
+                Function
+                    | Method
+                    | Constructor
+                    | Lambda
+                    | Callable
+                    | Class
+                    | Parameter
+                    | Declaration
             ),
             Role::Object | Role::Field => kind == FieldAccess,
+            // `iterable` is deliberately not valid for the broader `loop`
+            // kind: only the for-each family has an iterated expression, and
+            // constraining it on `loop`/`while_loop` would silently narrow a
+            // query to for-loops while reading as if it covered every loop.
+            Role::Iterable => kind == ForLoop,
+            Role::Element => kind == CollectionLiteral,
+            Role::Tag | Role::Attributes | Role::Children => kind == JsxElement,
+            Role::Value => matches!(
+                kind,
+                JsxAttribute
+                    | JsxSpreadAttribute
+                    | ObjectProperty
+                    | ComputedProperty
+                    | SpreadElement
+            ),
+            Role::Key => kind == ObjectProperty,
         }
     }
 }
@@ -316,6 +370,7 @@ mod tests {
         assert!(Lambda.satisfies(Callable));
         assert!(Class.satisfies(Declaration));
         assert!(Import.satisfies(Declaration));
+        assert!(Parameter.satisfies(Declaration));
 
         assert!(ForLoop.satisfies(Loop));
         assert!(WhileLoop.satisfies(Loop));
@@ -351,11 +406,21 @@ mod tests {
         assert!(!Role::Left.valid_for(Call));
         assert!(Role::Decorator.valid_for(Function));
         assert!(Role::Decorator.valid_for(Class));
+        assert!(Role::Decorator.valid_for(Parameter));
         assert!(Role::Decorator.valid_for(Declaration));
         assert!(!Role::Decorator.valid_for(Call));
         assert!(Role::Module.valid_for(Import));
         assert!(Role::Object.valid_for(FieldAccess));
         assert!(!Role::Object.valid_for(Identifier));
+        assert!(Role::Tag.valid_for(JsxElement));
+        assert!(Role::Attributes.valid_for(JsxElement));
+        assert!(Role::Children.valid_for(JsxElement));
+        assert!(Role::Value.valid_for(JsxAttribute));
+        assert!(Role::Value.valid_for(ObjectProperty));
+        assert!(Role::Value.valid_for(ComputedProperty));
+        assert!(Role::Key.valid_for(ObjectProperty));
+        assert!(!Role::Tag.valid_for(Call));
+        assert!(!Role::Key.valid_for(ComputedProperty));
     }
 
     #[test]

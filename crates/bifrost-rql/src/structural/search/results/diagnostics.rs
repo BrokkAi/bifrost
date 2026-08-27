@@ -87,6 +87,7 @@ pub enum CodeQueryDiagnosticCode {
     PathDerivationIncomplete,
     EffectDerivationIncomplete,
     EffectBudgetExhausted,
+    JsxProjectionIncomplete,
     ResultLimitReached,
     BroadQuery,
 }
@@ -177,6 +178,7 @@ impl CodeQueryDiagnosticCode {
             Self::PathDerivationIncomplete => "path_derivation_incomplete",
             Self::EffectDerivationIncomplete => "effect_derivation_incomplete",
             Self::EffectBudgetExhausted => "effect_budget_exhausted",
+            Self::JsxProjectionIncomplete => "jsx_projection_incomplete",
             Self::ResultLimitReached => "result_limit_reached",
             Self::BroadQuery => "broad_query",
         }

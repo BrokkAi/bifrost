@@ -93,6 +93,7 @@ pub const JAVA_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     // Java scopes statements with `block`; `switch_block` is the statement
     // list of a switch, and both are separate nodes from the callable, class,
     // and loop declarations that already become facts.
+    ("array_initializer", NormalizedKind::CollectionLiteral),
     ("block", NormalizedKind::Block),
     ("switch_block", NormalizedKind::Block),
     ("annotation", NormalizedKind::Decorator),
@@ -581,6 +582,27 @@ impl StructuralSpec for JavaStructuralSpec {
             }
             NormalizedKind::Lambda => {
                 attach_decorators(sink, node);
+            }
+            NormalizedKind::ForLoop => {
+                if let Some(value) = node.child_by_field_name("value") {
+                    attach_role_with_derived_name(
+                        sink,
+                        Role::Iterable,
+                        value,
+                        expression_name_node,
+                    );
+                }
+            }
+            NormalizedKind::CollectionLiteral => {
+                for index in 0..node.named_child_count() {
+                    let Some(child) = node.named_child(index) else {
+                        continue;
+                    };
+                    if matches!(child.kind(), "line_comment" | "block_comment") {
+                        continue;
+                    }
+                    attach_role_with_derived_name(sink, Role::Element, child, expression_name_node);
+                }
             }
             _ => {
                 if let Some(name) = first_named_child(node).and_then(expression_name_node) {

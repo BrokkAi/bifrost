@@ -5,7 +5,6 @@
 //! surface. Run the optimized benchmark with:
 //!
 //! ```text
-//! BIFROST_SEMANTIC_INDEX=off \
 //!   cargo test --release --lib code_query_execution_profile_measurement \
 //!   -- --ignored --nocapture
 //! ```

@@ -1457,11 +1457,15 @@ pub(super) fn resolve_scan_usages_target(
                 else {
                     return false;
                 };
+                // Semantic-model authored anchors carry the analyzer's 1-based
+                // stored-range line convention (built from `facts.line_of_byte`
+                // and `analyzer.ranges`); normalize to the 0-based rows
+                // `scan_usages_target_matches_range` compares against (#2709).
                 let range = crate::analyzer::Range {
                     start_byte: anchor.range.start_byte,
                     end_byte: anchor.range.end_byte,
-                    start_line: anchor.range.start_line,
-                    end_line: anchor.range.end_line,
+                    start_line: anchor.range.start_line.saturating_sub(1),
+                    end_line: anchor.range.end_line.saturating_sub(1),
                 };
                 scan_usages_target_matches_range(selection, range)
                     && selector.is_none_or(|requested| {
@@ -1528,7 +1532,21 @@ pub(super) fn resolve_scan_usages_target(
                         return None;
                     };
                     if selector_matches && (accept_declaration_range || unit.is_module()) {
-                        ranges.extend(analyzer.location_ranges(&unit));
+                        // `location_ranges` carries the analyzer's 1-based
+                        // stored-range line convention (#2428), while the
+                        // derived name ranges above are 0-based tree-sitter
+                        // rows and `scan_usages_target_matches_range` compares
+                        // against the 0-based family. Normalize where the two
+                        // families meet so a probe at the declaration's own
+                        // reported start line (e.g. an annotation line) is
+                        // accepted and one line past end is rejected (#2709).
+                        ranges.extend(analyzer.location_ranges(&unit).into_iter().map(|range| {
+                            Range {
+                                start_line: range.start_line.saturating_sub(1),
+                                end_line: range.end_line.saturating_sub(1),
+                                ..range
+                            }
+                        }));
                         ranges.sort_unstable();
                         ranges.dedup();
                     }
@@ -5694,6 +5712,130 @@ mod tests {
         assert_eq!(
             result.results[0].fq_name.as_deref(),
             Some("example.com/repro.Error.Error"),
+            "{result:#?}"
+        );
+    }
+
+    /// #2709: `analyzer.location_ranges()` returns the analyzer's 1-based
+    /// stored ranges while the derived declaration-name ranges are 0-based
+    /// tree-sitter rows. Before the families were normalized where they meet,
+    /// an exact-selector probe at an annotated declaration's own reported
+    /// start line (the annotation line) was rejected, and one line past the
+    /// declaration's end was wrongly accepted.
+    fn scan_location(
+        fixture: &AnalyzerFixture,
+        path: &str,
+        line: usize,
+        symbol: &str,
+    ) -> ScanUsagesResult {
+        scan_usages_by_location(
+            fixture.analyzer.analyzer(),
+            ScanUsagesByLocationParams {
+                targets: vec![ScanUsagesTarget {
+                    path: path.to_string(),
+                    line,
+                    column: None,
+                    symbol: Some(symbol.to_string()),
+                }],
+                include_tests: false,
+                paths: None,
+                include_same_owner: false,
+                max_duration_secs: None,
+            },
+        )
+    }
+
+    #[test]
+    fn issue_2709_annotated_kotlin_declaration_resolves_at_its_reported_start_line() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Kotlin,
+            &[(
+                "Service.kt",
+                "package repro\n\nclass Service {\n    @Deprecated(\"use other\")\n    fun call() {}\n}\n",
+            )],
+        );
+
+        // The stored declaration range starts at the annotation line (4), not
+        // at the `fun call()` name line (5).
+        let result = scan_location(&fixture, "Service.kt", 4, "repro.Service.call");
+        assert_ne!(
+            ScanUsagesStatus::NotFound,
+            result.results[0].status,
+            "{result:#?}"
+        );
+        assert_eq!(
+            result.results[0].fq_name.as_deref(),
+            Some("repro.Service.call"),
+            "{result:#?}"
+        );
+
+        // One line past the declaration's end is the class closing brace: no
+        // resolution.
+        let past_end = scan_location(&fixture, "Service.kt", 6, "repro.Service.call");
+        assert_eq!(
+            ScanUsagesStatus::NotFound,
+            past_end.results[0].status,
+            "{past_end:#?}"
+        );
+    }
+
+    #[test]
+    fn issue_2709_annotated_java_declaration_resolves_at_its_reported_start_line() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Java,
+            &[(
+                "Service.java",
+                "package repro;\n\nclass Service {\n    @Deprecated\n    void call() {}\n}\n",
+            )],
+        );
+
+        let result = scan_location(&fixture, "Service.java", 4, "repro.Service.call");
+        assert_ne!(
+            ScanUsagesStatus::NotFound,
+            result.results[0].status,
+            "{result:#?}"
+        );
+        assert_eq!(
+            result.results[0].fq_name.as_deref(),
+            Some("repro.Service.call"),
+            "{result:#?}"
+        );
+
+        let past_end = scan_location(&fixture, "Service.java", 6, "repro.Service.call");
+        assert_eq!(
+            ScanUsagesStatus::NotFound,
+            past_end.results[0].status,
+            "{past_end:#?}"
+        );
+    }
+
+    #[test]
+    fn issue_2709_companion_object_resolves_at_its_declaration_line() {
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Kotlin,
+            &[(
+                "WithCompanion.kt",
+                "package repro\n\nclass WithCompanion {\n    companion object {\n        fun create() {}\n    }\n}\n",
+            )],
+        );
+
+        // An unnamed companion has no name token, so the declaration-range
+        // fallback is the only acceptance path; its reported start line is the
+        // `companion object {` line (4).
+        let result = scan_location(
+            &fixture,
+            "WithCompanion.kt",
+            4,
+            "repro.WithCompanion.Companion",
+        );
+        assert_ne!(
+            ScanUsagesStatus::NotFound,
+            result.results[0].status,
+            "{result:#?}"
+        );
+        assert_eq!(
+            result.results[0].fq_name.as_deref(),
+            Some("repro.WithCompanion.Companion"),
             "{result:#?}"
         );
     }

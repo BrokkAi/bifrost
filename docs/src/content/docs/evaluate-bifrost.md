@@ -143,7 +143,7 @@ the `audit(...)` call at `src/app.py:5:12` and ends with one complete policy run
 [warning]  src/app.py:5:12
     Review this direct audit call
 
-summary: 1 active finding; 0 suppressed findings; 1 complete policy run
+summary: 1 active finding; 0 suppressed findings; dependency packs: mode default; complete; ecosystems python; 1 complete policy run
 ```
 
 </details>

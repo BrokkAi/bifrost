@@ -34,12 +34,7 @@ confidence-threshold = 0.8
 include-build = true
 include-dev = false
 unused-allowed-license = "allow"
-exceptions = [
-    # Only the optional nlp feature reaches this MPL crate through hf-hub.
-    # Any prebuilt nlp artifact must also inform recipients how to obtain the
-    # option-ext source, as documented on the public third-party-notices page.
-    { crate = "option-ext@0.2.0", allow = ["MPL-2.0"] },
-]
+exceptions = []
 
 [licenses.private]
 ignore = false

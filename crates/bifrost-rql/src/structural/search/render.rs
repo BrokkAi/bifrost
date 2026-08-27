@@ -71,6 +71,9 @@ pub(super) fn render_pipeline_item(
         PipelineValue::ExpressionSite(site) => CodeQueryResultValue::ExpressionSite {
             value: Box::new(render_expression_site(analyzer, &site, cache)),
         },
+        PipelineValue::JsxAttributeValue(value) => CodeQueryResultValue::JsxAttributeValue {
+            value: Box::new(render_jsx_attribute_value(analyzer, &value, detail, cache)),
+        },
         PipelineValue::ReceiverAnalysis(value) => CodeQueryResultValue::ReceiverAnalysis {
             value: Box::new(render_receiver_analysis(analyzer, &value, detail, cache)),
         },
@@ -103,6 +106,9 @@ pub(super) fn render_pipeline_item(
         },
         PipelineValue::SignatureParameter(value) => CodeQueryResultValue::SignatureParameter {
             value: Box::new(render_signature_parameter(analyzer, &value, cache)),
+        },
+        PipelineValue::DecoratedParameter(value) => CodeQueryResultValue::DecoratedParameter {
+            value: Box::new(render_decorated_parameter(&value)),
         },
         PipelineValue::CallableApplicability(value) => {
             CodeQueryResultValue::CallableApplicability {
@@ -223,6 +229,9 @@ pub(super) fn render_provenance(
                     PipelineTraceValue::ExpressionSite(site) => {
                         render_expression_site_ref(analyzer, site, cache)
                     }
+                    PipelineTraceValue::JsxAttributeValue(value) => {
+                        render_jsx_attribute_value_ref(analyzer, value, cache)
+                    }
                     PipelineTraceValue::ReceiverAnalysis(value) => {
                         render_receiver_analysis_ref(analyzer, value, cache)
                     }
@@ -318,6 +327,20 @@ pub(super) fn render_provenance(
                             path: rendered.path,
                             range: rendered.range,
                             parameter_index: rendered.parameter_index,
+                        }
+                    }
+                    PipelineTraceValue::DecoratedParameter(value) => {
+                        let rendered = render_decorated_parameter(value);
+                        CodeQueryResultRef::DecoratedParameter {
+                            id: rendered.id,
+                            parameter_id: rendered.parameter_id,
+                            decorator_id: rendered.decorator_id,
+                            path: rendered.path,
+                            range: rendered.range,
+                            decorator_range: rendered.decorator_range,
+                            parameter_ordinal: rendered.parameter_ordinal,
+                            binding_status: rendered.binding_status,
+                            coverage: rendered.coverage,
                         }
                     }
                     PipelineTraceValue::CallableApplicability(value) => {
@@ -1856,6 +1879,70 @@ pub(super) fn render_expression_site(
     }
 }
 
+pub(super) fn render_jsx_attribute_value(
+    analyzer: &dyn IAnalyzer,
+    value: &JsxAttributeValue,
+    detail: CodeQueryResultDetail,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryJsxAttributeValue {
+    let node = value.seed.facts.node(value.value_node);
+    let range = Range {
+        start_byte: node.range.start_byte,
+        end_byte: node.range.end_byte,
+        start_line: node.range.start_line,
+        end_line: node.range.end_line,
+    };
+    let text = value
+        .seed
+        .facts
+        .source()
+        .get(range.start_byte..range.end_byte)
+        .map(snippet)
+        .unwrap_or_default();
+    let component = value.component.as_ref().map(|unit| {
+        let declaration = declaration_value_for_unit(analyzer, unit, range);
+        render_declaration(analyzer, &declaration, detail, cache)
+    });
+    let attribute_target = value.attribute_target.as_ref().map(|unit| {
+        let declaration = declaration_value_for_unit(analyzer, unit, range);
+        render_declaration(analyzer, &declaration, detail, cache)
+    });
+    CodeQueryJsxAttributeValue {
+        id: value.id(),
+        ast_id: value.ast_id(),
+        path: rel_path_string(&value.seed.file),
+        language: value.seed.language.config_label(),
+        range: render_source_range(analyzer, &value.seed.file, &range, cache),
+        text,
+        element_identity: value.element_identity.label(),
+        element_name: value.element_name.clone(),
+        attribute_kind: value.seed.facts.node(value.attribute_node).kind.label(),
+        attribute_name: value.attribute_name.clone(),
+        property_name: value.property_name.clone(),
+        coverage: value.coverage.label(),
+        reason: value.reason,
+        component,
+        attribute_target,
+    }
+}
+
+fn render_jsx_attribute_value_ref(
+    analyzer: &dyn IAnalyzer,
+    value: &JsxAttributeValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultRef {
+    let rendered =
+        render_jsx_attribute_value(analyzer, value, CodeQueryResultDetail::Compact, cache);
+    CodeQueryResultRef::JsxAttributeValue {
+        id: rendered.id,
+        ast_id: rendered.ast_id,
+        path: rendered.path,
+        range: rendered.range,
+        element_identity: rendered.element_identity,
+        coverage: rendered.coverage,
+    }
+}
+
 pub(super) fn render_receiver_analysis(
     analyzer: &dyn IAnalyzer,
     value: &ReceiverAnalysisValue,
@@ -2205,6 +2292,12 @@ pub(super) fn render_signature_parameter(
         label_start_byte: parameter.label_start_byte,
         label_end_byte: parameter.label_end_byte,
     }
+}
+
+pub(super) fn render_decorated_parameter(
+    value: &decorator_binding::DecoratedParameterValue,
+) -> CodeQueryDecoratedParameter {
+    value.row.clone()
 }
 
 pub(super) fn render_receiver_evidence(

@@ -1,5 +1,6 @@
 use brokk_bifrost_analysis::analyzer::usages::UsageHitKind;
 use brokk_bifrost_rql::structural::edges::EdgeProvenance;
+use std::collections::HashSet;
 
 use super::*;
 
@@ -83,7 +84,15 @@ pub(super) fn evaluate_assertion_policy(
         );
     };
 
-    let mut subject_query = selector.query.clone();
+    let Some((_, query)) = selector.as_query() else {
+        return failed_policy_run(
+            policy,
+            PolicyAnalysisType::Assertion,
+            "assertion subjects require a query selector; row selectors are endpoint-only",
+            budget,
+        );
+    };
+    let mut subject_query = query.clone();
     subject_query.result_detail = CodeQueryResultDetail::Full;
     subject_query.limit = budget.query_limits().max_pipeline_rows;
     let subject = execute_code_query_detailed_eager_index(
@@ -144,6 +153,10 @@ pub(super) fn evaluate_assertion_policy(
         match assertion {
             PolicyAssert::Canonical(assertion) => occurrence_roles.push(assertion.equals_role),
             PolicyAssert::Route(assertion) => occurrence_roles.push(assertion.to_role),
+            // Origin-shape reports role() as None so the generic anchor gates
+            // stay out of its way; its iterable join still needs the role's
+            // occurrence and binding rows.
+            PolicyAssert::OriginShape(assertion) => occurrence_roles.push(assertion.role),
             _ => {}
         }
     }
@@ -163,12 +176,27 @@ pub(super) fn evaluate_assertion_policy(
     // `value_reference`, the class an assignment's left operand carries -- but
     // only for a file that actually has an assignment inside a subject's
     // region. That is decided per file below, after the assignment query runs.
-    let binding_row_roles = asserted_roles(spec, |assertion| {
+    let mut binding_row_roles = asserted_roles(spec, |assertion| {
         matches!(
             assertion,
             PolicyAssert::BindingScope(_) | PolicyAssert::ValueOrigin(_)
         )
     });
+    for assertion in &spec.asserts {
+        if let PolicyAssert::OriginShape(assertion) = assertion {
+            binding_row_roles.push(assertion.role);
+        }
+    }
+    binding_row_roles.sort();
+    binding_row_roles.dedup();
+    let origin_shape_asserts: Vec<&OriginShapeAssert> = spec
+        .asserts
+        .iter()
+        .filter_map(|assertion| match assertion {
+            PolicyAssert::OriginShape(assertion) => Some(assertion),
+            _ => None,
+        })
+        .collect();
     // Only the occurrence family's `:require-target` reads a row's resolved
     // target; every other family joins rows by AST identity, role and
     // position. Deriving targets is one definition resolution per
@@ -404,6 +432,50 @@ pub(super) fn evaluate_assertion_policy(
             }
         }
 
+        if !origin_shape_asserts.is_empty() {
+            match origin_shape_iterable_query(&file_paths, budget) {
+                Ok(query) => queries.push(query),
+                Err(message) => {
+                    return failed_policy_run(
+                        policy,
+                        PolicyAnalysisType::Assertion,
+                        message,
+                        budget,
+                    );
+                }
+            }
+            match origin_shape_assignment_query(&file_paths, budget) {
+                Ok(query) => queries.push(query),
+                Err(message) => {
+                    return failed_policy_run(
+                        policy,
+                        PolicyAnalysisType::Assertion,
+                        message,
+                        budget,
+                    );
+                }
+            }
+            let mut maxes: Vec<u32> = origin_shape_asserts
+                .iter()
+                .map(|assertion| assertion.max_elements)
+                .collect();
+            maxes.sort_unstable();
+            maxes.dedup();
+            for max in maxes {
+                match origin_shape_literal_query(&file_paths, max, budget) {
+                    Ok(query) => queries.push(query),
+                    Err(message) => {
+                        return failed_policy_run(
+                            policy,
+                            PolicyAnalysisType::Assertion,
+                            message,
+                            budget,
+                        );
+                    }
+                }
+            }
+        }
+
         let mut executed = Vec::new();
         for query in &queries {
             let outcome = execute_row_query(
@@ -564,6 +636,58 @@ pub(super) fn evaluate_assertion_policy(
                 }
             }
         }
+        // Origin-shape row material: every assignment's (left, right) capture
+        // pair, and per element bound the collection-literal facts within it.
+        // A right operand without an AST id is unjoinable and is kept as
+        // `None`: it can establish a binding but can never prove the literal
+        // shape, which is exactly the conservative direction this family
+        // fails in.
+        let mut origin_assignments: Vec<(&str, Option<&str>)> = Vec::new();
+        let mut origin_literals: HashMap<u32, HashSet<&str>> = HashMap::new();
+        // Which expression each for-each loop iterates, joined by the loop
+        // node's AST identity. A loop absent from this map -- a while loop, a
+        // counting for, or a for-each whose iterable carried no identity --
+        // has an unknown iteration source, which the assert reports.
+        let mut origin_iterables: HashMap<&str, Vec<&str>> = HashMap::new();
+        for query in &executed {
+            for item in &query.result.results {
+                let CodeQueryResultValue::StructuralMatch { value } = &item.value else {
+                    continue;
+                };
+                let mut left: Option<&str> = None;
+                let mut right: Option<Option<&str>> = None;
+                let mut loop_node: Option<&str> = None;
+                let mut iterable: Option<&str> = None;
+                for capture in &value.captures {
+                    if capture.name == ORIGIN_LEFT_CAPTURE {
+                        left = capture.ast_id.as_deref();
+                    } else if capture.name == ORIGIN_RIGHT_CAPTURE {
+                        right = Some(capture.ast_id.as_deref());
+                    } else if capture.name == ORIGIN_LOOP_CAPTURE {
+                        loop_node = capture.ast_id.as_deref();
+                    } else if capture.name == ORIGIN_ITERABLE_CAPTURE {
+                        iterable = capture.ast_id.as_deref();
+                    } else if let Some(max) = capture
+                        .name
+                        .strip_prefix(ORIGIN_LITERAL_CAPTURE_PREFIX)
+                        .and_then(|suffix| suffix.parse::<u32>().ok())
+                        && let Some(ast_id) = capture.ast_id.as_deref()
+                    {
+                        origin_literals.entry(max).or_default().insert(ast_id);
+                    }
+                }
+                if let (Some(left), Some(right)) = (left, right) {
+                    origin_assignments.push((left, right));
+                }
+                if let (Some(loop_node), Some(iterable)) = (loop_node, iterable) {
+                    origin_iterables
+                        .entry(loop_node)
+                        .or_default()
+                        .push(iterable);
+                }
+            }
+        }
+
         let mut states_by_ast_id: HashMap<String, Vec<&DeclarationStateRow>> = HashMap::new();
         for result in &state_results {
             for row in &result.states {
@@ -760,6 +884,14 @@ pub(super) fn evaluate_assertion_policy(
                         context,
                         &mut late_incomplete,
                     ),
+                    PolicyAssert::OriginShape(assertion) => evaluate_origin_shape_assert(
+                        assertion,
+                        subject,
+                        &bindings_by_occurrence,
+                        &origin_iterables,
+                        &origin_assignments,
+                        &origin_literals,
+                    ),
                     PolicyAssert::ValueOrigin(assertion) => {
                         match subject.ast_ids(&assertion.relative_to) {
                             Some(_) => evaluate_value_origin_assert(
@@ -830,7 +962,13 @@ pub(super) fn evaluate_assertion_policy(
                 let Ok(evidence) = super::super::finding::AssertionFindingEvidence::try_new(
                     anchor,
                     assertion.kind_label(),
-                    assertion.role().map_or("declaration", |role| role.label()),
+                    match assertion {
+                        // role() is None for this family so the generic gates
+                        // join on the anchor, but the evidence names the role
+                        // its iterable join actually used.
+                        PolicyAssert::OriginShape(assertion) => assertion.role.label(),
+                        _ => assertion.role().map_or("declaration", |role| role.label()),
+                    },
                     violation.expected_class,
                     violation.expectation.clone(),
                     violation.observed.clone(),
@@ -1349,7 +1487,18 @@ fn evaluate_relational_assertion_policy(
                         budget,
                     );
                 };
-                let mut query = selector.query.clone();
+                let Some((_, query)) = selector.as_query() else {
+                    return failed_policy_run(
+                        policy,
+                        PolicyAnalysisType::Assertion,
+                        &format!(
+                            "relational binding `{}` requires a query selector; nested row selectors are unsupported",
+                            binding.name
+                        ),
+                        budget,
+                    );
+                };
+                let mut query = query.clone();
                 query.result_detail = CodeQueryResultDetail::Full;
                 query.limit = budget.query_limits().max_pipeline_rows;
                 query
@@ -3391,6 +3540,11 @@ fn evaluate_binding_scope_assert<'rows>(
 /// operand. It is internal to the evaluator: the value-origin family builds
 /// the query, so no authored selector can collide with it.
 const ASSIGNED_VALUE_CAPTURE: &str = "__bifrost_assigned_value";
+const ORIGIN_LEFT_CAPTURE: &str = "__bifrost_origin_left";
+const ORIGIN_LOOP_CAPTURE: &str = "__bifrost_origin_loop";
+const ORIGIN_ITERABLE_CAPTURE: &str = "__bifrost_origin_iterable";
+const ORIGIN_RIGHT_CAPTURE: &str = "__bifrost_origin_right";
+const ORIGIN_LITERAL_CAPTURE_PREFIX: &str = "__bifrost_origin_literal_";
 
 /// The refined loop-invariance predicate: where is the value read here
 /// *established*?
@@ -3675,6 +3829,278 @@ fn assertion_assignment_query(
         result_detail: CodeQueryResultDetail::Full,
         execution_mode: Default::default(),
     })
+}
+
+/// Every for-each loop of the subject file with its iterated expression
+/// captured, for the origin-shape family (#2647). The `iterable` sub-pattern
+/// is deliberately unconstrained: whatever expression the loop iterates, the
+/// map must know it, and the assert decides what qualifies.
+fn origin_shape_iterable_query(
+    paths: &[&str],
+    budget: &PolicyBudget,
+) -> Result<CodeQuery, &'static str> {
+    assert!(
+        !paths.is_empty(),
+        "assertion row queries require subject paths"
+    );
+    let Ok(where_globs) = exact_path_globs(paths.iter().copied()) else {
+        return Err("an assertion subject path is not a valid scan pattern");
+    };
+    let iterable = Pattern {
+        capture: Some(ORIGIN_ITERABLE_CAPTURE.to_owned()),
+        ..Pattern::default()
+    };
+    let root = Pattern {
+        kinds: vec![NormalizedKind::ForLoop],
+        iterable: Some(Box::new(iterable)),
+        capture: Some(ORIGIN_LOOP_CAPTURE.to_owned()),
+        ..Pattern::default()
+    };
+    Ok(CodeQuery {
+        schema_version: SCHEMA_VERSION,
+        plan: CodeQueryPlan {
+            source: CodeQueryPlanSource::Seed(Box::new(CodeQuerySeed {
+                where_globs,
+                languages: Vec::new(),
+                root,
+                inside: None,
+                inside_decl: None,
+                not_inside: None,
+            })),
+            steps: Vec::new(),
+        },
+        limit: budget.query_limits().max_pipeline_rows,
+        result_detail: CodeQueryResultDetail::Full,
+        execution_mode: Default::default(),
+    })
+}
+
+/// Every assignment of the subject file with both operands captured, for the
+/// origin-shape family (#2647). Unlike [`assertion_assignment_query`], the
+/// left operand is joined two ways -- by binding-of row for a reassignment,
+/// and by binder AST identity for a declaration initializer -- so the query
+/// does not care which occurrence class the left operand carries, and the
+/// right operand is captured because *it* is the establishing value whose
+/// shape the assert checks.
+fn origin_shape_assignment_query(
+    paths: &[&str],
+    budget: &PolicyBudget,
+) -> Result<CodeQuery, &'static str> {
+    assert!(
+        !paths.is_empty(),
+        "assertion row queries require subject paths"
+    );
+    let Ok(where_globs) = exact_path_globs(paths.iter().copied()) else {
+        return Err("an assertion subject path is not a valid scan pattern");
+    };
+    let left = Pattern {
+        kinds: vec![NormalizedKind::Identifier],
+        capture: Some(ORIGIN_LEFT_CAPTURE.to_owned()),
+        ..Pattern::default()
+    };
+    let right = Pattern {
+        capture: Some(ORIGIN_RIGHT_CAPTURE.to_owned()),
+        ..Pattern::default()
+    };
+    let root = Pattern {
+        kinds: vec![NormalizedKind::Assignment],
+        left: Some(Box::new(left)),
+        right: Some(Box::new(right)),
+        ..Pattern::default()
+    };
+    Ok(CodeQuery {
+        schema_version: SCHEMA_VERSION,
+        plan: CodeQueryPlan {
+            source: CodeQueryPlanSource::Seed(Box::new(CodeQuerySeed {
+                where_globs,
+                languages: Vec::new(),
+                root,
+                inside: None,
+                inside_decl: None,
+                not_inside: None,
+            })),
+            steps: Vec::new(),
+        },
+        limit: budget.query_limits().max_pipeline_rows,
+        result_detail: CodeQueryResultDetail::Full,
+        execution_mode: Default::default(),
+    })
+}
+
+/// Every collection literal of the subject file with at most `max_elements`
+/// elements, for the origin-shape family (#2647). The element bound rides the
+/// arity predicate, which counts a collection literal's `elements` role edges
+/// the same way it counts a call's `args`.
+fn origin_shape_literal_query(
+    paths: &[&str],
+    max_elements: u32,
+    budget: &PolicyBudget,
+) -> Result<CodeQuery, &'static str> {
+    assert!(
+        !paths.is_empty(),
+        "assertion row queries require subject paths"
+    );
+    let Ok(where_globs) = exact_path_globs(paths.iter().copied()) else {
+        return Err("an assertion subject path is not a valid scan pattern");
+    };
+    let root = Pattern {
+        kinds: vec![NormalizedKind::CollectionLiteral],
+        // At least one element: a Rust repeat array emits no element edges
+        // precisely so it can never qualify, and an empty display literal has
+        // nothing bounded to prove either.
+        arity: Some(ArityConstraint {
+            min: Some(1),
+            max: Some(max_elements),
+        }),
+        capture: Some(format!("{ORIGIN_LITERAL_CAPTURE_PREFIX}{max_elements}")),
+        ..Pattern::default()
+    };
+    Ok(CodeQuery {
+        schema_version: SCHEMA_VERSION,
+        plan: CodeQueryPlan {
+            source: CodeQueryPlanSource::Seed(Box::new(CodeQuerySeed {
+                where_globs,
+                languages: Vec::new(),
+                root,
+                inside: None,
+                inside_decl: None,
+                not_inside: None,
+            })),
+            steps: Vec::new(),
+        },
+        limit: budget.query_limits().max_pipeline_rows,
+        result_detail: CodeQueryResultDetail::Full,
+        execution_mode: Default::default(),
+    })
+}
+
+/// The exclusion half of a review-prompt policy (#2647): does the value read
+/// at the `at` capture provably originate from a collection literal with at
+/// most `max_elements` elements?
+///
+/// The polarity is inverted relative to every other family. The others
+/// abstain when the subject is out of evidence, because their finding is a
+/// positive claim; here the finding is the *review prompt the subject match
+/// already earned*, and the assert only withdraws it on positive proof of the
+/// bounded-literal shape. Everything short of proof -- the capture absent on
+/// this subject row, a reference with no lexical binding, no establishing
+/// initializer in evidence, an unjoinable initializer, or any establishing
+/// initializer that is not a small collection literal -- keeps the finding.
+fn evaluate_origin_shape_assert<'rows>(
+    assertion: &OriginShapeAssert,
+    subject: &AssertionSubject,
+    bindings_by_occurrence: &HashMap<(&str, &str), Vec<&'rows CodeQueryBinding>>,
+    origin_iterables: &HashMap<&str, Vec<&str>>,
+    origin_assignments: &[(&str, Option<&str>)],
+    origin_literals: &HashMap<u32, HashSet<&str>>,
+) -> Option<AssertionViolation<'rows>> {
+    let violation = |observed: String, binding: Option<&'rows CodeQueryBinding>| {
+        let mut violation =
+            AssertionViolation::new("reference", assertion.expectation(), Some(observed));
+        violation.actual_count = 1;
+        violation.binding = binding;
+        Some(violation)
+    };
+    let empty = HashSet::new();
+    let literals = origin_literals
+        .get(&assertion.max_elements)
+        .unwrap_or(&empty);
+
+    let Some(captures) = subject.captures.get(&assertion.at) else {
+        return violation(
+            format!(
+                "capture `{}` is not bound on this subject, so the iterated value is out of evidence",
+                assertion.at
+            ),
+            None,
+        );
+    };
+    let loop_ids: Vec<&str> = captures
+        .iter()
+        .filter_map(|capture| capture.ast_id.as_deref())
+        .collect();
+    if loop_ids.is_empty() {
+        return violation(
+            format!(
+                "capture `{}` carries no AST identity, so the iterated value is out of evidence",
+                assertion.at
+            ),
+            None,
+        );
+    }
+    // The captured loop joins to its iterated expression by AST identity. A
+    // loop with no iterable row -- a while loop, a counting for, an adapter
+    // that could not attach the edge -- has an unknown iteration source.
+    let ast_ids: Vec<&str> = loop_ids
+        .iter()
+        .filter_map(|loop_id| origin_iterables.get(loop_id))
+        .flatten()
+        .copied()
+        .collect();
+    if ast_ids.is_empty() {
+        return violation(
+            "the enclosing loop does not iterate an expression in evidence, so the iteration source is unknown".to_owned(),
+            None,
+        );
+    }
+
+    // Direct case: the captured expression is itself a qualifying literal.
+    if ast_ids.iter().all(|ast_id| literals.contains(ast_id)) {
+        return None;
+    }
+
+    let mut reached: Vec<&CodeQueryBinding> = Vec::new();
+    for ast_id in &ast_ids {
+        if let Some(rows) = bindings_by_occurrence.get(&(subject.path.as_str(), *ast_id)) {
+            reached.extend(rows.iter().copied().filter(|row| !row.shadowed));
+        }
+    }
+    let Some(binding) = reached.first().copied() else {
+        return violation(
+            "the iterated expression is not a qualifying literal and resolves to no lexical binding".to_owned(),
+            None,
+        );
+    };
+
+    // Establishing initializers: the declaration initializer joins by the
+    // binder token's AST identity, a reassignment by its left operand's
+    // binding-of row. Identity, never the spelled name.
+    let mut establishing: Vec<Option<&str>> = Vec::new();
+    for (left, right) in origin_assignments {
+        let is_declaration_initializer = binding.ast_id.as_deref() == Some(*left);
+        let reaches_binding = bindings_by_occurrence
+            .get(&(subject.path.as_str(), *left))
+            .is_some_and(|rows| {
+                rows.iter()
+                    .filter(|row| !row.shadowed)
+                    .any(|row| same_binding(row, binding))
+            });
+        if is_declaration_initializer || reaches_binding {
+            establishing.push(*right);
+        }
+    }
+    if establishing.is_empty() {
+        return violation(
+            format!(
+                "binding `{}` has no establishing initializer in evidence",
+                binding.name
+            ),
+            Some(binding),
+        );
+    }
+    let all_literal = establishing
+        .iter()
+        .all(|right| right.is_some_and(|ast_id| literals.contains(ast_id)));
+    if all_literal {
+        return None;
+    }
+    violation(
+        format!(
+            "binding `{}` is established by an initializer that is not a collection literal with at most {} elements",
+            binding.name, assertion.max_elements
+        ),
+        Some(binding),
+    )
 }
 
 /// Every scope of the subject files, so a binding's declaring scope index can

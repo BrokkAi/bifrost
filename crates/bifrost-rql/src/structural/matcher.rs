@@ -302,13 +302,15 @@ fn eval_pattern_inner_with_name(
     }
     let roles = facts.roles(node);
 
-    // Arity constrains the matched call's positional argument count, read
-    // straight from the already-extracted `Arg` role edges -- no re-parse. A
-    // fact without argument edges (any non-call) has arity zero.
+    // Arity constrains the matched fact's positional-child count, read
+    // straight from the already-extracted role edges -- no re-parse. On a
+    // call that is the `Arg` edges; on a collection literal the `Element`
+    // edges (#2647). No fact carries both families, so the union is
+    // unambiguous, and a fact with neither has arity zero.
     if let Some(arity) = &pattern.arity {
         let positional = roles
             .iter()
-            .filter(|target| target.role == Role::Arg)
+            .filter(|target| matches!(target.role, Role::Arg | Role::Element))
             .count();
         if !arity.matches(positional) {
             return false;

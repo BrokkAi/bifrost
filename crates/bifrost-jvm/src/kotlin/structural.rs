@@ -555,6 +555,11 @@ impl StructuralSpec for KotlinStructuralSpec {
                 .any(|(_, fact_kind)| fact_kind.satisfies(kind))
     }
 
+    fn supports_role(&self, role: Role) -> bool {
+        // #2647: not yet extracted by this adapter.
+        !matches!(role, Role::Iterable | Role::Element)
+    }
+
     fn occurrence_role_support(&self) -> &OccurrenceRoleSupport {
         &KOTLIN_OCCURRENCE_ROLE_SUPPORT
     }

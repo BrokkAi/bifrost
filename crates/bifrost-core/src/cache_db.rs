@@ -17,7 +17,8 @@ const CACHE_DB_STEM: &str = "bifrost_cache";
 /// The pre-versioning store name. Builds older than version-keyed naming open
 /// this file in place, so a current build imports from it and never writes it.
 pub const LEGACY_CACHE_DB_FILE_NAME: &str = "bifrost_cache.db";
-pub const LEGACY_SEMANTIC_DB_FILE_NAME: &str = "semantic_cache.db";
+#[cfg(test)]
+const LEGACY_SEMANTIC_DB_FILE_NAME: &str = "semantic_cache.db";
 pub const LEGACY_ANALYZER_DB_FILE_NAME: &str = "analyzer_cache.db";
 /// The store file and the SQLite sidecars that belong to it.
 pub const STORE_FILE_SUFFIXES: [&str; 4] = ["", "-wal", "-shm", "-journal"];
@@ -30,7 +31,7 @@ const BASELINE_MIGRATION_VERSION: i64 = 18;
 // Version 25 belonged to a rejected local relational-key experiment. Skipping
 // it prevents an old experimental v25 store from being mistaken for this
 // schema; the version sequence is intentionally monotonic, not contiguous.
-const CURRENT_MIGRATION_VERSION: i64 = 31;
+const CURRENT_MIGRATION_VERSION: i64 = 32;
 pub const OPTIONAL_FACT_KIND_CPP_TEMPLATE_METADATA: i64 = 1;
 pub const OPTIONAL_FACT_KIND_RUBY_METHOD_DISPATCH_MODE: i64 = 2;
 pub const OPTIONAL_FACT_KIND_SCALA_TRAIT: i64 = 3;
@@ -60,6 +61,8 @@ const REFERENCE_IDENTIFIER_FACTS_SQL: &str =
     include_str!("../migrations/cache/0030-reference-identifier-facts.sql");
 const RELATIONAL_DEFINITION_IDENTIFIER_VIEWS_SQL: &str =
     include_str!("../migrations/cache/0031-relational-definition-identifier-views.sql");
+const REVISIONED_WORKSPACE_PROJECTIONS_SQL: &str =
+    include_str!("../migrations/cache/0032-revisioned-workspace-projections.sql");
 
 // Migration 0023 spells the signature-metadata byte cap as the literal 8388608,
 // because a checked-in SQL file cannot interpolate a Rust constant. The two must
@@ -80,7 +83,7 @@ struct CacheMigration {
     sql: &'static str,
 }
 
-const CACHE_MIGRATIONS: [CacheMigration; 13] = [
+const CACHE_MIGRATIONS: [CacheMigration; 14] = [
     CacheMigration {
         version: 18,
         sql: CURRENT_BASELINE_SQL,
@@ -132,6 +135,10 @@ const CACHE_MIGRATIONS: [CacheMigration; 13] = [
     CacheMigration {
         version: 31,
         sql: RELATIONAL_DEFINITION_IDENTIFIER_VIEWS_SQL,
+    },
+    CacheMigration {
+        version: 32,
+        sql: REVISIONED_WORKSPACE_PROJECTIONS_SQL,
     },
 ];
 
@@ -590,9 +597,8 @@ pub fn open_readonly_connection(db_path: &Path) -> Result<Connection> {
 /// Open an initialized cache with a read-only main database and a writable
 /// temporary schema.
 ///
-/// Active semantic-search state belongs to one worktree. It must not enter the
-/// shared cache. The SQLite read-only flag prevents persistent writes, while a
-/// writable TEMP schema permits connection-local membership and FTS tables.
+/// The SQLite read-only flag prevents persistent writes, while a writable TEMP
+/// schema permits connection-local membership and FTS tables.
 pub fn open_readonly_temp_connection(db_path: &Path) -> Result<Connection> {
     ensure_safe_cache_path(db_path)?;
     let db_path = canonicalize_cache_db_parent(db_path)?;
@@ -613,8 +619,7 @@ pub fn open_readonly_temp_connection(db_path: &Path) -> Result<Connection> {
 /// Streaming readers deliberately retain little SQLite state: unlike an
 /// interactive reader, a sequential workspace scan is unlikely to reuse pages
 /// after advancing to the next file group. Keeping these connections separate
-/// prevents their page cache and mmap residency from displacing interactive
-/// analyzer queries.
+/// prevents their page cache from displacing interactive analyzer queries.
 pub fn open_streaming_readonly_connection(db_path: &Path) -> Result<Connection> {
     ensure_safe_cache_path(db_path)?;
     let db_path = canonicalize_cache_db_parent(db_path)?;
@@ -700,8 +705,6 @@ fn configure_readonly_page_cache(conn: &Connection) -> Result<()> {
     // space and 2.3 GB of RSS back, and it removes a ceiling that grows with
     // both the DB size and the core count (5.55-12.3 GB on the 848 MB rustc
     // cache, ~30 GB worst case on a 120-CPU host).
-    // `open_streaming_readonly_connection` already reached this conclusion for
-    // scans; it holds for interactive readers too.
     conn.pragma_update(None, "mmap_size", 0)
         .map_err(|err| format!("cache DB read-only SQLite error: {err}"))?;
     conn.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
@@ -735,16 +738,22 @@ fn prepare_cache_db_path(db_path: &Path) -> Result<PathBuf> {
         migrate_legacy_project_cache(project_dir)?;
     }
     if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|err| format!("cache DB I/O error: {err}"))?;
-        ensure_cache_dir_self_ignored(parent)?;
+        let parent = prepare_cache_dir(parent)?;
         if let Some(file_name) = db_path.file_name() {
-            let parent = parent
-                .canonicalize()
-                .map_err(|err| format!("cache DB I/O error: {err}"))?;
             return Ok(parent.join(file_name));
         }
     }
     Ok(db_path.to_path_buf())
+}
+
+/// Create and canonicalize one generated-cache directory, ensuring the
+/// repository-default location cannot leak live cache files into Git walks.
+pub fn prepare_cache_dir(cache_dir: &Path) -> Result<PathBuf> {
+    std::fs::create_dir_all(cache_dir).map_err(|err| format!("cache DB I/O error: {err}"))?;
+    ensure_cache_dir_self_ignored(cache_dir)?;
+    cache_dir
+        .canonicalize()
+        .map_err(|err| format!("cache DB I/O error: {err}"))
 }
 
 /// Seed this build's store from the newest older one, when it has none yet.
@@ -921,7 +930,7 @@ fn refuse_store_below_baseline(conn: &Connection, source: &Path) -> Result<()> {
 /// A cache store's `user_version` is a count of the migrations its build had,
 /// not an identity for the schema they produced. Two branches that both add
 /// migrations mint the same numbers for different schemas, and merging them
-/// renumbers one side. That is not hypothetical: `bifrost-nlp-ft` shipped
+/// renumbers one side. That is not hypothetical: a foreign branch shipped
 /// `import-bindings` as its migration 18, then merged master, which inserted
 /// `0016-optional-fact-manifest` beneath three migrations the branch had
 /// already shipped and pushed `import-bindings` to 19. Stores written by that
@@ -954,13 +963,26 @@ struct RecognizedForeignStore {
 const OPTIONAL_FACT_MANIFEST_AFTER_IMPORT_BINDINGS_SQL: &str =
     include_str!("../migrations/cache/bridges/0016-optional-fact-manifest-after-19.sql");
 
-const RECOGNIZED_FOREIGN_STORES: [RecognizedForeignStore; 2] = [
+// This branch originally shipped revisioned workspace projections as version
+// 30 while the reference-fact and definition-view work independently occupied
+// versions 30 and 31. The revision schema already removed the superseded
+// definition views, so only the content-addressed reference facts are missing.
+const REVISIONED_WORKSPACE_AT_30_BRIDGE_SQL: &str = REFERENCE_IDENTIFIER_FACTS_SQL;
+
+const RECOGNIZED_FOREIGN_STORES: [RecognizedForeignStore; 3] = [
     RecognizedForeignStore {
         declared_version: 18,
-        recognize: is_nlp_ft_import_bindings_store,
+        recognize: is_foreign_import_bindings_store,
         bridge_sql: OPTIONAL_FACT_MANIFEST_AFTER_IMPORT_BINDINGS_SQL,
         equivalent_version: 19,
-        lineage: "bifrost-nlp-ft import-bindings-at-18",
+        lineage: "foreign import-bindings-at-18",
+    },
+    RecognizedForeignStore {
+        declared_version: 30,
+        recognize: is_revisioned_workspace_at_30_store,
+        bridge_sql: REVISIONED_WORKSPACE_AT_30_BRIDGE_SQL,
+        equivalent_version: 32,
+        lineage: "revisioned-workspace-projections-at-30",
     },
     RecognizedForeignStore {
         declared_version: 30,
@@ -971,16 +993,20 @@ const RECOGNIZED_FOREIGN_STORES: [RecognizedForeignStore; 2] = [
     },
 ];
 
-/// The `bifrost-nlp-ft` version 18 store: migration 19's `import_statements`
+/// A foreign version 18 store with migration 19's `import_statements`
 /// is present, and migration 16's manifest table is not.
 ///
 /// Both halves are needed. The first alone also matches this build's version 19
 /// and later; the second alone also matches this build's version 15 and
 /// earlier. Together they describe a schema no version of this build's own
 /// chain ever produced.
-fn is_nlp_ft_import_bindings_store(conn: &Connection) -> Result<bool> {
+fn is_foreign_import_bindings_store(conn: &Connection) -> Result<bool> {
     Ok(column_exists(conn, "import_statements", "is_wildcard")?
         && !table_exists(conn, "blob_optional_fact_manifest")?)
+}
+
+fn is_revisioned_workspace_at_30_store(conn: &Connection) -> Result<bool> {
+    Ok(table_exists(conn, "workspace_revisions")? && !table_exists(conn, "workspace_snapshots")?)
 }
 
 /// The short-lived master schema that assigned version 30 to the lean
@@ -1717,9 +1743,7 @@ fn delete_legacy_cache_files(db_path: &Path) {
     let Some(parent) = db_path.parent() else {
         return;
     };
-    for name in [LEGACY_SEMANTIC_DB_FILE_NAME, LEGACY_ANALYZER_DB_FILE_NAME] {
-        delete_legacy_cache_if_idle(&parent.join(name));
-    }
+    delete_legacy_cache_if_idle(&parent.join(LEGACY_ANALYZER_DB_FILE_NAME));
 }
 
 fn delete_legacy_cache_if_idle(legacy_path: &Path) {
@@ -2225,7 +2249,7 @@ mod tests {
     }
 
     #[test]
-    fn relational_definition_views_enforce_identity_constraints_and_index_name_lookups() {
+    fn revisioned_workspace_projection_enforces_temporal_identity_and_indexed_membership() {
         let conn = open_in_memory_cache();
         conn.execute_batch(
             "INSERT INTO analysis_epochs(lang, epoch, generation)
@@ -2255,89 +2279,52 @@ mod tests {
              INSERT INTO unit_signatures(blob_oid, lang, unit_key, ordinal, text)
                VALUES('1111111111111111111111111111111111111111', 'java', 1, 0,
                       'class Live$1');
-             INSERT INTO workspace_snapshots(lang, generation, fingerprint)
-               VALUES('java', 7,
-                 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
-             INSERT INTO workspace_files(lang, generation, rel_path, blob_oid)
-               VALUES('java', 7, 'src/Live.java',
-                 '1111111111111111111111111111111111111111');",
+             INSERT INTO workspace_revisions(workspace_id, lang, generation, revision)
+               VALUES(
+                 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                 'java', 7, 1
+               ), (
+                 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                 'java', 7, 2
+               );
+             INSERT INTO workspace_heads(workspace_id, lang, generation, revision)
+               VALUES(
+                 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                 'java', 7, 2
+               );
+             INSERT INTO workspace_file_versions(
+               workspace_id, lang, generation, rel_path, blob_oid,
+               projection_digest, valid_from, valid_until
+             ) VALUES(
+               'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+               'java', 7, 'src/Live.java',
+               '1111111111111111111111111111111111111111',
+               'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+               1, 2
+             );",
         )
         .unwrap();
 
-        let exact: Vec<String> = conn
-            .prepare(
-                "SELECT tail FROM live_definition_exact_names
-                 WHERE lang = 'java' AND source_kind = 'content'
-                   AND tail = 'pkg.Live$1'",
-            )
-            .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .collect::<std::result::Result<_, _>>()
-            .unwrap();
-        assert_eq!(exact, ["pkg.Live$1"]);
-        let normalized: Vec<String> = conn
-            .prepare(
-                "SELECT tail FROM live_definition_normalized_names
-                 WHERE lang = 'java' AND source_kind = 'content'
-                   AND tail = 'pkg.Live'",
-            )
-            .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .collect::<std::result::Result<_, _>>()
-            .unwrap();
-        assert_eq!(normalized, ["pkg.Live"]);
-
         for (sql, expected_index) in [
             (
-                "SELECT blob_oid FROM live_structural_members
-                 WHERE lang = 'java' AND source_kind = 'content'
-                   AND exact_parent_tail = 'pkg'",
-                "idx_code_units_stable_parent_identifier",
+                "SELECT file_version_id FROM workspace_file_versions
+                 WHERE workspace_id =
+                     'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+                   AND lang = 'java' AND generation = 7
+                   AND rel_path = 'src/Live.java'
+                   AND valid_from <= 1
+                   AND (valid_until IS NULL OR 1 < valid_until)",
+                "idx_workspace_file_versions_snapshot_path",
             ),
             (
-                "SELECT blob_oid FROM live_structural_members
-                 WHERE lang = 'java' AND source_kind = 'content'
-                   AND exact_parent_tail = 'pkg' AND identifier = 'Live$1'",
-                "idx_code_units_stable_parent_identifier",
-            ),
-            (
-                "SELECT blob_oid FROM live_definition_normalized_names
-                 WHERE lang = 'java' AND source_kind = 'content'
-                   AND tail = 'pkg.Live'",
-                "idx_code_units_stable_normalized_tail",
-            ),
-            (
-                "SELECT blob_oid FROM live_package_types
-                 WHERE lang = 'java' AND source_kind = 'content'
-                   AND prefix = '' AND package_tail = 'pkg'
-                   AND simple_type_name = 'Live'",
-                "idx_code_units_stable_package_type",
-            ),
-            (
-                "SELECT blob_oid FROM live_package_types
-                 WHERE lang = 'java' AND source_kind = 'content'
-                   AND prefix = '' AND package_tail = 'pkg'",
-                "idx_code_units_stable_package_type",
-            ),
-            // The lean 0030 identifier views (issue #2588 residual cost) must
-            // seek the identifier index for both the equality and the prefix
-            // range shape, on both the stable and the anchored arm.
-            (
-                "SELECT blob_oid FROM live_stable_definition_identifiers
-                 WHERE lang = 'java' AND identifier = 'Live$1'",
-                "idx_code_units_lang_identifier_lookup",
-            ),
-            (
-                "SELECT blob_oid FROM live_stable_definition_identifiers
-                 WHERE lang = 'java' AND identifier >= 'Live' AND identifier < 'Livf'",
-                "idx_code_units_lang_identifier_lookup",
-            ),
-            (
-                "SELECT blob_oid FROM live_anchored_definition_identifiers
-                 WHERE lang = 'java' AND identifier = 'Live$1'",
-                "idx_code_units_lang_identifier_lookup",
+                "SELECT file_version_id FROM workspace_file_versions
+                 WHERE workspace_id =
+                     'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+                   AND lang = 'java' AND generation = 7
+                   AND blob_oid = '1111111111111111111111111111111111111111'
+                   AND valid_from <= 1
+                 AND (valid_until IS NULL OR 1 < valid_until)",
+                "idx_workspace_file_versions_snapshot_blob",
             ),
         ] {
             let plan = conn
@@ -2352,61 +2339,47 @@ mod tests {
                 "relational lookup must use {expected_index}: {plan:?}"
             );
             assert!(
-                plan.iter().all(|step| !step.contains("SCAN units")),
-                "relational lookup must not scan code_units: {plan:?}"
+                plan.iter()
+                    .all(|step| !step.contains("SCAN workspace_file_versions")),
+                "snapshot lookup must not scan workspace_file_versions: {plan:?}"
             );
         }
 
-        let blob_local_plan = conn
-            .prepare(
-                "EXPLAIN QUERY PLAN
-                 SELECT unit_key FROM live_definition_identifiers
-                 WHERE lang = 'java'
-                   AND blob_oid = '1111111111111111111111111111111111111111'
-                   AND identifier = 'Live$1'",
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM workspace_file_versions
+                 WHERE valid_from <= 1 AND (valid_until IS NULL OR 1 < valid_until)",
+                [],
+                |row| row.get::<_, usize>(0),
             )
-            .unwrap()
-            .query_map([], |row| row.get::<_, String>(3))
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap();
-        assert!(
-            blob_local_plan
-                .iter()
-                .any(|step| step.contains("PRIMARY KEY (blob_oid=? AND lang=?)")),
-            "blob-local identifier lookup must seek the code_units primary key range: \
-             {blob_local_plan:?}"
+            .unwrap(),
+            1
         );
-        assert!(
-            blob_local_plan
-                .iter()
-                .all(|step| !step.contains("SCAN units")),
-            "blob-local identifier lookup must not scan code_units: {blob_local_plan:?}"
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM workspace_file_versions
+                 WHERE valid_from <= 2 AND (valid_until IS NULL OR 2 < valid_until)",
+                [],
+                |row| row.get::<_, usize>(0),
+            )
+            .unwrap(),
+            0
         );
 
-        let callable_plan = conn
-            .prepare(
-                "EXPLAIN QUERY PLAN
-                 SELECT ordinal, text FROM live_callable_facts
-                 WHERE blob_oid = '1111111111111111111111111111111111111111'
-                   AND lang = 'java' AND unit_key = 1",
-            )
-            .unwrap()
-            .query_map([], |row| row.get::<_, String>(3))
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap();
-        assert!(
-            callable_plan.iter().any(|step| {
-                step.contains("PRIMARY KEY (blob_oid=? AND lang=? AND unit_key=?)")
-            }),
-            "callable facts must seek their owning unit/signature key: {callable_plan:?}"
+        let invalid_interval = conn.execute(
+            "INSERT INTO workspace_file_versions(
+               workspace_id, lang, generation, rel_path, blob_oid,
+               projection_digest, valid_from, valid_until
+             ) VALUES(?1, 'java', 7, 'src/Bad.java', ?2, ?3, 2, 2)",
+            rusqlite::params![
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "1111111111111111111111111111111111111111",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ],
         );
         assert!(
-            callable_plan
-                .iter()
-                .all(|step| !step.contains("SCAN units")),
-            "callable-fact lookup must not scan code_units: {callable_plan:?}"
+            invalid_interval.is_err(),
+            "empty validity intervals are invalid"
         );
 
         let invalid_anchor = conn.execute(
@@ -3150,21 +3123,19 @@ mod tests {
     }
 
     #[test]
-    fn first_unified_open_removes_only_idle_legacy_caches_after_migration() {
+    fn first_unified_open_removes_only_idle_legacy_analyzer_cache_after_migration() {
         let temp = tempfile::tempdir().unwrap();
         let cache_dir = temp.path().join(".bifrost");
         std::fs::create_dir(&cache_dir).unwrap();
-        for name in [LEGACY_SEMANTIC_DB_FILE_NAME, LEGACY_ANALYZER_DB_FILE_NAME] {
-            create_legacy_cache(&cache_dir.join(name));
-        }
+        create_legacy_cache(&cache_dir.join(LEGACY_SEMANTIC_DB_FILE_NAME));
+        create_legacy_cache(&cache_dir.join(LEGACY_ANALYZER_DB_FILE_NAME));
 
         let unified = cache_dir.join(cache_db_file_name());
         let connection = open_unified_connection(&unified).unwrap();
 
         assert!(unified_cache_initialized(&connection).unwrap());
-        for name in [LEGACY_SEMANTIC_DB_FILE_NAME, LEGACY_ANALYZER_DB_FILE_NAME] {
-            assert!(!cache_dir.join(name).exists());
-        }
+        assert!(cache_dir.join(LEGACY_SEMANTIC_DB_FILE_NAME).exists());
+        assert!(!cache_dir.join(LEGACY_ANALYZER_DB_FILE_NAME).exists());
     }
 
     #[test]
@@ -3740,7 +3711,7 @@ mod tests {
     /// The stamp is a parameter because a store's version number is a count of
     /// its own build's migrations, which is not always the count applied here:
     /// that mismatch is the whole subject of
-    /// [`nlp_ft_lineage_v18_store_is_bridged_and_carried_forward`].
+    /// [`foreign_import_bindings_lineage_v18_store_is_bridged_and_carried_forward`].
     fn create_store_at(path: &Path, migrations: &[CacheMigration], user_version: i64) {
         let mut conn = Connection::open(path).unwrap();
         configure_connection(&mut conn).unwrap();
@@ -3863,8 +3834,21 @@ mod tests {
             .collect()
     }
 
+    /// The other schema that briefly shipped as version 30 while the
+    /// reference-fact and definition-view migrations were developed in
+    /// parallel.
+    fn revisioned_workspace_v30_migrations() -> Vec<CacheMigration> {
+        definition_identifier_views_v30_migrations()
+            .into_iter()
+            .chain(std::iter::once(CacheMigration {
+                version: 31,
+                sql: REVISIONED_WORKSPACE_PROJECTIONS_SQL,
+            }))
+            .collect()
+    }
+
     /// Undo what migration 16 did, so a fixture can stand where the
-    /// `bifrost-nlp-ft` branch stood when it shipped its version 18.
+    /// foreign import-bindings branch stood when it shipped its version 18.
     ///
     /// Migration 16 is inside the baseline now, so it can no longer be left
     /// out of a chain. Putting back the three counts it moved and dropping the
@@ -3876,9 +3860,9 @@ mod tests {
         ALTER TABLE blob_meta ADD COLUMN cpp_template_metadata_count INTEGER NOT NULL DEFAULT 0;\
         DROP TABLE blob_optional_fact_manifest;";
 
-    /// A store shaped the way `bifrost-nlp-ft` wrote one at its version 18:
+    /// A store shaped the way the foreign import-bindings branch wrote one at version 18:
     /// migration 19 applied, migration 16 not, and the number 18 on the front.
-    fn create_nlp_ft_v18_store(path: &Path) {
+    fn create_foreign_import_bindings_v18_store(path: &Path) {
         let mut conn = Connection::open(path).unwrap();
         configure_connection(&mut conn).unwrap();
         migrate_with_sql(&mut conn, &migrations_through(18)).unwrap();
@@ -4081,7 +4065,7 @@ mod tests {
         }
     }
 
-    /// A `bifrost-nlp-ft` store declares version 18 while holding this build's
+    /// A foreign import-bindings store declares version 18 while holding this build's
     /// version 19 schema minus migration 16. Its pending migrations are
     /// therefore not "19 onwards", and running 19 over it fails on `DROP TABLE
     /// import_details`.
@@ -4090,11 +4074,11 @@ mod tests {
     /// that error, the upgrade is abandoned, and the assertions below see an
     /// empty store beside an ignored 248 MB one.
     #[test]
-    fn nlp_ft_lineage_v18_store_is_bridged_and_carried_forward() {
+    fn foreign_import_bindings_lineage_v18_store_is_bridged_and_carried_forward() {
         let temp = tempfile::tempdir().unwrap();
         let cache_dir = temp.path();
         let foreign = store_path(cache_dir, 18);
-        create_nlp_ft_v18_store(&foreign);
+        create_foreign_import_bindings_v18_store(&foreign);
         let expected = read_semantic_rows(&foreign);
         assert_eq!(expected.len(), SEEDED_CHUNKS.len());
         let foreign_before = std::fs::read(&foreign).unwrap();
@@ -4132,15 +4116,44 @@ mod tests {
         };
 
         assert!(
-            !is_nlp_ft_import_bindings_store(&conn).unwrap(),
+            !is_foreign_import_bindings_store(&conn).unwrap(),
             "this build's version 18 has migration 16's manifest table"
         );
 
         let temp = tempfile::tempdir().unwrap();
         let foreign_path = temp.path().join("foreign.db");
-        create_nlp_ft_v18_store(&foreign_path);
+        create_foreign_import_bindings_v18_store(&foreign_path);
         let foreign = Connection::open(&foreign_path).unwrap();
-        assert!(is_nlp_ft_import_bindings_store(&foreign).unwrap());
+        assert!(is_foreign_import_bindings_store(&foreign).unwrap());
+    }
+
+    /// The revisioned-workspace branch and master both shipped a different
+    /// migration 30 before they merged. Preserve a populated cache from the
+    /// revisioned branch by recognizing its schema, adding the missing
+    /// reference facts, and adopting it as the merged chain's version 32 rather
+    /// than trying migrations 30 and 31 on tables that branch already replaced.
+    #[test]
+    fn revisioned_workspace_v30_store_is_adopted_as_v32() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path();
+        let foreign = store_path(cache_dir, 30);
+        create_store_at(&foreign, &revisioned_workspace_v30_migrations(), 30);
+        let expected = read_semantic_rows(&foreign);
+        let foreign_before = std::fs::read(&foreign).unwrap();
+
+        let conn = open_unified_connection(&current_store_path(cache_dir)).unwrap();
+
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        assert_eq!(semantic_rows(&conn), expected);
+        assert_eq!(
+            schema_object_definitions(&conn).unwrap(),
+            *CURRENT_SCHEMA_OBJECTS
+        );
+        assert!(quick_check_is_ok(&conn).unwrap());
+        assert_eq!(std::fs::read(&foreign).unwrap(), foreign_before);
     }
 
     /// A store this build already owns wins over any older one. A session that

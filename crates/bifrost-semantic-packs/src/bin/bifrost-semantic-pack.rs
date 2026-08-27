@@ -16,7 +16,7 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{
 };
 use brokk_bifrost_semantic_packs::release_bundle::{
     BundleInput, ReleaseBundleRejects, generate_release_bundle, install_release_bundle,
-    verify_release_bundle,
+    merge_release_bundles, verify_release_bundle,
 };
 use brokk_bifrost_semantic_packs::summary_foundry::framework_pack::{
     convert_framework_candidates, write_framework_packs,
@@ -84,6 +84,7 @@ fn run(mut arguments: Vec<OsString>) -> Result<u8, CommandFailure> {
         "list" => list_command(arguments, format),
         "workspace-check" => workspace_check_command(arguments, format),
         "generate" => generate_command(arguments, format),
+        "merge" => merge_command(arguments, format),
         "verify" => verify_command(arguments, format),
         "install" => install_command(arguments, format),
         "summary-corpus-join" => summary_corpus_join_command(arguments, format),
@@ -323,6 +324,27 @@ fn verify_command(arguments: Vec<OsString>, format: OutputFormat) -> Result<u8, 
         .map_err(|error_value| failure(2, error_value.to_string(), format))?;
     println!(
         "verified {} pinned semantic packs in {}",
+        bundle.index.packs.len(),
+        output_root.display()
+    );
+    print_release_rejects(&bundle.rejects);
+    Ok(0)
+}
+
+fn merge_command(arguments: Vec<OsString>, format: OutputFormat) -> Result<u8, CommandFailure> {
+    require_human_release_output(format)?;
+    let [output, inputs @ ..] = arguments.as_slice() else {
+        return Err(failure(2, usage(), format));
+    };
+    if inputs.is_empty() {
+        return Err(failure(2, usage(), format));
+    }
+    let output_root = PathBuf::from(output);
+    let input_roots = inputs.iter().map(PathBuf::from).collect::<Vec<_>>();
+    let bundle = merge_release_bundles(&output_root, &input_roots)
+        .map_err(|error_value| failure(2, error_value.to_string(), format))?;
+    println!(
+        "merged {} pinned semantic packs in {}",
         bundle.index.packs.len(),
         output_root.display()
     );
@@ -897,5 +919,5 @@ impl ActivationControlInput {
 }
 
 fn usage() -> &'static str {
-    "usage:\n  bifrost-semantic-pack validate SOURCE [--format human|json]\n  bifrost-semantic-pack lint SOURCE [--format human|json]\n  bifrost-semantic-pack compile SOURCE OUTPUT [--format human|json]\n  bifrost-semantic-pack list CATALOG [ACTIVATION.json] [--format human|json]\n  bifrost-semantic-pack workspace-check WORKSPACE [--format human|json]\n  bifrost-semantic-pack generate OUTPUT SPEC ARTIFACT [SPEC ARTIFACT ...]\n  bifrost-semantic-pack verify OUTPUT\n  bifrost-semantic-pack install BUNDLE CATALOG\n  bifrost-semantic-pack summary-corpus-join PINS CODEQL_MODELS JOERN_SOURCE REPORT.json [JVM_SOURCES]\n  bifrost-semantic-pack sanitizer-pack CANDIDATES_DIR OUTPUT_ROOT\n  bifrost-semantic-pack framework-decl-pack CANDIDATES_DIR OUTPUT_ROOT\n  bifrost-semantic-pack golden-summary-pack CANDIDATES_DIR OUTPUT_ROOT REALM"
+    "usage:\n  bifrost-semantic-pack validate SOURCE [--format human|json]\n  bifrost-semantic-pack lint SOURCE [--format human|json]\n  bifrost-semantic-pack compile SOURCE OUTPUT [--format human|json]\n  bifrost-semantic-pack list CATALOG [ACTIVATION.json] [--format human|json]\n  bifrost-semantic-pack workspace-check WORKSPACE [--format human|json]\n  bifrost-semantic-pack generate OUTPUT SPEC ARTIFACT [SPEC ARTIFACT ...]\n  bifrost-semantic-pack merge OUTPUT INPUT...\n  bifrost-semantic-pack verify OUTPUT\n  bifrost-semantic-pack install BUNDLE CATALOG\n  bifrost-semantic-pack summary-corpus-join PINS CODEQL_MODELS JOERN_SOURCE REPORT.json [JVM_SOURCES]\n  bifrost-semantic-pack sanitizer-pack CANDIDATES_DIR OUTPUT_ROOT\n  bifrost-semantic-pack framework-decl-pack CANDIDATES_DIR OUTPUT_ROOT\n  bifrost-semantic-pack golden-summary-pack CANDIDATES_DIR OUTPUT_ROOT REALM"
 }

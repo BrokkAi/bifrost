@@ -31,7 +31,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-pub const STRUCTURAL_INDEX_REPRESENTATION_VERSION: u32 = 1;
+// Version 2: `collection_literal` facts plus `iterable`/`elements` role
+// postings change derived index content (#2647).
+// Version 3: TypeScript `parameter` facts plus their decorator role postings
+// change derived index content (#2644).
+// Version 4: JSX element/attribute and object-property facts plus their
+// tag/attribute/child/key/value role postings change derived index content (#2645).
+pub const STRUCTURAL_INDEX_REPRESENTATION_VERSION: u32 = 4;
 const MAX_INDEX_FILES: usize = 1_000_000;
 const MAX_INDEX_FACT_NODES: u64 = 100_000_000;
 const MAX_INDEX_SOURCE_BYTES: u64 = 16 * 1024 * 1024 * 1024;

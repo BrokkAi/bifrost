@@ -286,6 +286,25 @@ pub trait CSharpSource: CodeUnitIndex + ImportAnalysisProvider + TypeHierarchyPr
     /// be expressed as a default over the budgeted spelling below.
     fn global_using_namespaces(&self) -> &HashSet<String>;
 
+    /// [`file_using_namespaces`] with whatever per-file memo the
+    /// implementation keeps (#2679). The visible-type search asks this once
+    /// per probed name, and the bulk reference engine probes several names per
+    /// occurrence, so the unmemoized default re-reads and re-filters the
+    /// file's import records once per probe.
+    fn file_using_namespaces_of(&self, token: QueryToken<'_>, file: &ProjectFile) -> Vec<String> {
+        file_using_namespaces(self, token, file)
+    }
+
+    /// [`Self::global_using_namespaces`] as a sorted list (#2679). The
+    /// visible-type search wants deterministic candidate order, and cloning
+    /// and sorting the whole workspace set once per probed name is what this
+    /// default does; implementations memoize the sorted list.
+    fn sorted_global_using_namespaces(&self) -> Vec<String> {
+        let mut namespaces: Vec<_> = self.global_using_namespaces().iter().cloned().collect();
+        namespaces.sort();
+        namespaces
+    }
+
     /// [`Self::global_using_namespaces`] under a budget, from one store-wide
     /// import walk. It fills the same memo cell when the batch completes.
     fn global_using_namespaces_limited(
@@ -649,8 +668,8 @@ pub fn compute_using_namespaces_of(
 /// workspace `global using` directives. Visible-type lookup keeps this set as
 /// a distinct precedence tier so a global directive from another compilation
 /// cannot make a file-local import ambiguous (#2060).
-pub fn file_using_namespaces(
-    source: &dyn CSharpSource,
+pub fn file_using_namespaces<S: CSharpSource + ?Sized>(
+    source: &S,
     token: QueryToken<'_>,
     file: &ProjectFile,
 ) -> Vec<String> {
@@ -1293,12 +1312,8 @@ where
 {
     let mut using_aliases = || Some(source.using_aliases_of(file));
     let mut namespace_of_file = || Some(source.namespace_of_file(file));
-    let mut file_using_namespaces = || Some(file_using_namespaces(source, token, file));
-    let mut global_using_namespaces = || {
-        let mut namespaces: Vec<_> = source.global_using_namespaces().iter().cloned().collect();
-        namespaces.sort();
-        Some(namespaces)
-    };
+    let mut file_using_namespaces = || Some(source.file_using_namespaces_of(token, file));
+    let mut global_using_namespaces = || Some(source.sorted_global_using_namespaces());
     let mut namespace_exists = |namespace: &str| source.workspace_namespace_exists(namespace);
     let mut type_candidates_by_fqn = |fqn: &str| Some(type_candidates(fqn));
     visible_type_candidates_with_lookups(

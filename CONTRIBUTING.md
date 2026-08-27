@@ -28,7 +28,7 @@ Run the core Rust checks before submitting a change:
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo machete
-uv run --python 3.12 -- cargo test --features nlp,python
+uv run --python 3.12 -- cargo test --features python
 ```
 
 `cargo machete` is the unused-dependency gate that CI's lint job runs; install
@@ -38,11 +38,8 @@ use it cannot see), add the dependency to that crate's
 `[package.metadata.cargo-machete] ignored` list with a comment explaining why
 it is real; otherwise remove the dependency.
 
-Bifrost's default feature set is empty. Include the `nlp` and `python` features
-when running the full test suite; a featureless `cargo test` skips the
-feature-gated integration suites. `--all-features` enables those same two
-features. Embedding acceleration is selected by the Python sidecar at runtime,
-so these checks do not require CUDA or Metal build tooling. Run Rust tests that
+Bifrost's default feature set is empty. Include the `python` feature when
+running the Python-facing Rust test suite. Run Rust tests that
 enable the `python` feature through uv so PyO3 uses the project's Python 3.12
 environment rather than whichever system interpreter happens to be on `PATH`.
 
@@ -57,7 +54,7 @@ That wrapper provisions a uv-managed Python 3.12 environment, makes `maturin` av
 For host-local changes, run the independently owned package contract first:
 
 ```bash
-cargo test -p brokk-bifrost-mcp --features nlp
+cargo test -p brokk-bifrost-mcp
 cargo test -p brokk-bifrost-lsp --all-features
 ```
 
@@ -366,8 +363,8 @@ the dependency graph: `brokk-bifrost-core`, then the language crates
 `brokk-bifrost-cpp`, `brokk-bifrost-csharp`, `brokk-bifrost-go`,
 `brokk-bifrost-js-ts`, `brokk-bifrost-jvm`, `brokk-bifrost-php`,
 `brokk-bifrost-python`, `brokk-bifrost-ruby` and `brokk-bifrost-rust` (which may
-run in parallel), then `brokk-bifrost-analysis`, then `brokk-bifrost-flow` and
-`brokk-bifrost-nlp` in parallel, then `brokk-bifrost-rql` and
+run in parallel), then `brokk-bifrost-analysis`, then `brokk-bifrost-flow`, then
+`brokk-bifrost-rql` and
 `brokk-bifrost-semantic-packs` in parallel, then `brokk-bifrost-policy`, then
 `brokk-bifrost-runtime`, then MCP and LSP (which may run in parallel), and the
 stable `brokk-bifrost` facade last. Each publication waits for crates.io to
@@ -391,7 +388,6 @@ This table is the expected crates.io publication set for the workspace.
 | `brokk-bifrost-rust` | `crates/bifrost-rust/Cargo.toml` | 2 |
 | `brokk-bifrost-analysis` | `crates/bifrost-analysis/Cargo.toml` | 3 |
 | `brokk-bifrost-flow` | `crates/bifrost-flow/Cargo.toml` | 4 |
-| `brokk-bifrost-nlp` | `crates/bifrost-nlp/Cargo.toml` | 4 |
 | `brokk-bifrost-rql` | `crates/bifrost-rql/Cargo.toml` | 5 |
 | `brokk-bifrost-semantic-packs` | `crates/bifrost-semantic-packs/Cargo.toml` | 5 |
 | `brokk-bifrost-policy` | `crates/bifrost-policy/Cargo.toml` | 6 |
@@ -419,17 +415,31 @@ workflow in the same change. Publish the crate through a separate bootstrap
 change before the next version release. Configure its trusted publisher during
 that bootstrap.
 
-The 19 packages that preceded `brokk-bifrost-flow` have been bootstrapped on
-crates.io. The language crates and `brokk-bifrost-rql` are published through
-`0.10.2`, and the latest publication entry for each existing package carries
-`trustpub_data.repository` set to `BrokkAi/bifrost`. For any future package,
-retain the bootstrap policy above: trusted publishing cannot create a new
-crate, so the first version must be uploaded with a scoped crates.io API token
-from a clean, reviewed commit. Then set the crate owners and configure the
-trusted publisher per the checklist above, and verify that configuration
-before you tag. `brokk-bifrost-flow` must be bootstrapped and have its trusted
-publisher configured before the next release; adding it to this inventory does
-not authorize that publication.
+Every package in the inventory is now bootstrapped on crates.io, and the
+latest publication entry for each carries `trustpub_data.repository` set to
+`BrokkAi/bifrost`. For any future package, retain the bootstrap policy above:
+trusted publishing cannot create a new crate, so the first version must be
+uploaded with a scoped crates.io API token from a clean, reviewed commit. Then
+set the crate owners and configure the trusted publisher per the checklist
+above, and verify that configuration before you tag.
+
+`brokk-bifrost-flow` was bootstrapped during the `v0.10.6` release rather than
+before it, which is the failure this policy exists to prevent. The inventory
+already listed the crate and already carried the warning; only the bootstrap
+itself was missed, so the release published ten crates, refused the eleventh
+with `Trusted Publishing tokens do not support creating new crates`, and
+correctly withheld the facade rather than publishing one that depended on a
+version nobody could resolve.
+
+Recovery, if it happens again: upload the qualified `.crate` from the
+readiness bundle with `scripts/public/publish-qualified-crate.mjs
+--metadata-file ... --crate-file ... --expected-sha256 ...` and a personal
+token, which publishes the exact qualified bytes rather than a local rebuild.
+Then configure the trusted publisher and re-run the failed release jobs, which
+reuse the validated artifacts. Verifying the configuration before tagging is
+still cheaper: check the crate's settings page shows the workflow as
+`release.yml`, the entry workflow, not the reusable `publish-crate.yml` that
+contains the job.
 
 Use the **Release** workflow's unqualified `vX.Y.Z` `tag` input for a manual
 release. Dispatch it from `master`. The workflow definition comes from

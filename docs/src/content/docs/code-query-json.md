@@ -125,14 +125,15 @@ literal
 ├── string_literal
 ├── numeric_literal
 ├── boolean_literal
-└── null_literal
+├── null_literal
+└── collection_literal
 
 loop
 ├── for_loop
 └── while_loop
 ```
 
-The remaining kinds are independent leaves: `call`, `assignment`, `field_access`, `identifier`, `return`, `throw`, `catch`, `if`, `decorator`, and `block`. `block` matches a statement list that opens a lexical scope of its own — a method body, a bare block, a loop or conditional body, a `switch` body — and never a class or interface member list. `for_loop` covers the for-each family (iteration over a collection, iterator, or range); `while_loop` covers condition-controlled loops including do-while and until. Loop forms a language cannot refine lexically — Go's single `for` construct, C-style counting `for`, and Rust's bare `loop` — remain plain `loop`, so query `loop` when every form must match.
+The remaining kinds are independent leaves: `call`, `assignment`, `field_access`, `identifier`, `return`, `throw`, `catch`, `if`, `decorator`, and `block`. `block` matches a statement list that opens a lexical scope of its own — a method body, a bare block, a loop or conditional body, a `switch` body — and never a class or interface member list. `for_loop` covers the for-each family (iteration over a collection, iterator, or range); `while_loop` covers condition-controlled loops including do-while and until. Loop forms a language cannot refine lexically — Go's single `for` construct, C-style counting `for`, and Rust's bare `loop` — remain plain `loop`, so query `loop` when every form must match. `collection_literal` covers collection display literals — array, list, set, dictionary, and tuple literals — in the adapters that classify them (JavaScript, TypeScript, Python, Java array initializers, Rust arrays and tuples); a Rust `[value; length]` repeat array is a `collection_literal` fact with no `elements` edges because its run-time size is not its spelled element count.
 
 Therefore `{"kind":"callable"}` matches functions, methods, constructors, and lambdas, and `{"kind":"literal"}` matches every normalized literal subtype. There is deliberately no exact-kind operator. Use a leaf kind or subtract unwanted subtypes with `not_kind`.
 
@@ -150,8 +151,10 @@ Roles are normalized edges from one structural fact to a related node or source 
 | `module` | one | `import`, `declaration` | Imported module or binding target. |
 | `decorators` | list | callable or class-like declarations | Decorators, annotations, or attributes. |
 | `object`, `field` | one each | `field_access` | Object and terminal field sides of member access. |
+| `iterable` | one | `for_loop` | The expression a for-each loop iterates. |
+| `elements` | ordered list | `collection_literal` | The entries of a collection display literal. |
 
-Each `args` pattern must match a distinct positional argument in source order, but the matches need not be contiguous and do not assert exact arity. For exact positions or arity, narrow the surrounding source shape in a follow-up query; there is no positional-index operator.
+Each `args` or `elements` pattern must match a distinct positional child in source order, but the matches need not be contiguous and do not assert exact arity. The `arity` predicate counts a call's positional arguments or a collection literal's elements exactly. For exact positions or arity, narrow the surrounding source shape in a follow-up query; there is no positional-index operator.
 
 `kwargs` support is adapter-specific. Python, PHP, Scala, C#, Ruby, and Kotlin expose normalized named arguments; languages without that role return a capability diagnostic.
 

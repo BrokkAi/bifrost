@@ -11,9 +11,11 @@ use crate::graph::resolver::{
     qualified_candidate_text, receiver_type_matches, static_receiver_matches,
 };
 use crate::graph::syntax::{
-    assignment_parts, assignment_value_type_fq_name, instance_receiver_type_fq_name,
-    is_local_scope, literal_member_identifier, seed_assignment_binding, seed_parameter_types,
-    static_member_parts, static_property_identifier, static_scope_type_fq_name,
+    assignment_parts, assignment_value_type_fq_name, captured_local_scope_bindings,
+    declared_instance_callable, declared_instance_field, direct_variable_receiver_type_fq_names,
+    instance_receiver_type_fq_name, is_local_scope, literal_member_identifier,
+    seed_assignment_binding, seed_parameter_types, static_member_parts, static_property_identifier,
+    static_scope_type_fq_name,
 };
 use crate::graph_support::PhpSource;
 use crate::graph_support::php_file_context_from_source;
@@ -445,12 +447,8 @@ fn scan_member_tree<'tree>(
     php: &dyn PhpSource,
     hits: &mut BTreeSet<UsageHit>,
 ) {
-    let mut scopes: Vec<(Node<'tree>, bool)> = vec![(node, false)];
-    while let Some((scope_root, seed_parameters)) = scopes.pop() {
-        let mut engine = LocalInferenceEngine::default();
-        if seed_parameters {
-            seed_parameter_receivers(scope_root, source, ctx, &mut engine);
-        }
+    let mut scopes = vec![(node, LocalInferenceEngine::default())];
+    while let Some((scope_root, mut engine)) = scopes.pop() {
         scan_member_scope(
             scope_root,
             analyzer,
@@ -482,7 +480,7 @@ fn scan_member_scope<'tree>(
     spec: &TargetSpec,
     php: &dyn PhpSource,
     engine: &mut LocalInferenceEngine<String>,
-    scopes: &mut Vec<(Node<'tree>, bool)>,
+    scopes: &mut Vec<(Node<'tree>, LocalInferenceEngine<String>)>,
     hits: &mut BTreeSet<UsageHit>,
 ) {
     enum Visit<'tree> {
@@ -509,7 +507,18 @@ fn scan_member_scope<'tree>(
             }
         };
         if node != root && is_local_scope(node) {
-            scopes.push((node, true));
+            let mut scoped = captured_local_scope_bindings(node, source, engine);
+            seed_parameter_receivers(
+                node,
+                php,
+                analyzer,
+                file,
+                source,
+                line_starts,
+                ctx,
+                &mut scoped,
+            );
+            scopes.push((node, scoped));
             continue;
         }
         record_member_hit(
@@ -556,14 +565,35 @@ fn contains_member_reference_candidate(root: Node<'_>, source: &str, spec: &Targ
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn seed_parameter_receivers(
     node: Node<'_>,
+    php: &dyn PhpSource,
+    analyzer: PhpGraphSource<'_>,
+    file: &ProjectFile,
     source: &str,
+    line_starts: &[usize],
     ctx: &PhpFileContext,
     engine: &mut LocalInferenceEngine<String>,
 ) {
     seed_parameter_types(node, source, engine, |_name, raw| {
-        resolve_php_type_arms(raw, ctx)
+        if ["self", "static", "parent"]
+            .iter()
+            .any(|keyword| raw.eq_ignore_ascii_case(keyword))
+        {
+            let owner = enclosing_owner_fq_name_at(
+                analyzer,
+                file,
+                node.start_byte(),
+                node.end_byte(),
+                line_starts,
+            );
+            static_scope_type_fq_name(php, analyzer, raw, ctx, owner.as_deref())
+                .into_iter()
+                .collect()
+        } else {
+            resolve_php_type_arms(raw, ctx)
+        }
     });
 }
 
@@ -578,15 +608,9 @@ fn apply_receiver_assignment(
     ctx: &PhpFileContext,
     engine: &mut LocalInferenceEngine<String>,
 ) {
-    seed_assignment_binding(node, source, engine, |right, _bindings| {
-        assignment_value_type_fq_name(php, analyzer, right, source, ctx, || {
-            enclosing_owner_fq_name_at(
-                analyzer,
-                file,
-                right.start_byte(),
-                right.end_byte(),
-                line_starts,
-            )
+    seed_assignment_binding(node, source, engine, |right, bindings| {
+        assignment_value_type_fq_name(php, analyzer, right, source, ctx, bindings, |start, end| {
+            enclosing_owner_fq_name_at(analyzer, file, start, end, line_starts)
         })
     });
 }
@@ -631,6 +655,14 @@ fn record_member_hit(
                 engine,
             )
             .is_some_and(|fq| receiver_type_matches(php, &fq, owner, hierarchy))
+                || direct_receiver_union_resolves_to_target(
+                    receiver_node,
+                    php,
+                    analyzer,
+                    source,
+                    engine,
+                    spec,
+                )
             {
                 // `$this->m()` is a same-owner instance call on the current
                 // object; a call through another object of the same type is not.
@@ -717,6 +749,33 @@ fn receiver_expression_type(
     instance_receiver_type_fq_name(php, analyzer, node, source, ctx, engine, |start, end| {
         enclosing_owner_fq_name_at(analyzer, file, start, end, line_starts)
     })
+}
+
+fn direct_receiver_union_resolves_to_target(
+    receiver: Node<'_>,
+    php: &dyn PhpSource,
+    analyzer: PhpGraphSource<'_>,
+    source: &str,
+    bindings: &LocalInferenceEngine<String>,
+    spec: &TargetSpec,
+) -> bool {
+    let owners = direct_variable_receiver_type_fq_names(receiver, source, bindings);
+    if owners.len() < 2 {
+        return false;
+    }
+    let mut candidates = owners
+        .into_iter()
+        .filter_map(|owner| match spec.kind {
+            TargetKind::Method => {
+                declared_instance_callable(php, analyzer, &owner, &spec.member_name)
+            }
+            TargetKind::Field => declared_instance_field(php, analyzer, &owner, &spec.member_name),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.dedup();
+    matches!(candidates.as_slice(), [candidate] if candidate.fq_name() == spec.target_fq_name)
 }
 
 #[allow(clippy::too_many_arguments)]

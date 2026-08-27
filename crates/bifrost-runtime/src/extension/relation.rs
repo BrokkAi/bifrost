@@ -6,11 +6,20 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::{
+    cmp::Ordering,
     fmt,
     io::{BufRead, Write},
 };
 
 const SCHEMA: &str = "1.0";
+
+/// Maximum number of semantic-gap reasons retained in one boundary summary.
+///
+/// This is deliberately a fixed contract limit rather than a caller budget:
+/// the same frontier produces the same bounded explanation at every request
+/// limit. When more reasons exist, [`SemanticGapReasonSummary::omitted_count`]
+/// reports the exact number that could not be retained.
+pub const MAX_RETAINED_SEMANTIC_GAP_REASONS: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -203,6 +212,156 @@ pub struct SemanticEvidence {
     pub completeness: SemanticRelationCompleteness,
 }
 
+/// One source-backed explanation for a value-flow semantic frontier.
+///
+/// The labels are extension-owned strings so this public contract does not
+/// expose analyzer arenas, handles, or storage identifiers. `span` is the
+/// gap's direct source mapping; `evidence` carries its proof status,
+/// completeness, and every additional source mapping available for the gap.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticGapReason {
+    pub capability: Box<str>,
+    pub kind: Box<str>,
+    pub impacts: Box<[Box<str>]>,
+    pub subject: Box<str>,
+    pub detail: Box<str>,
+    pub span: SourceSpan,
+    pub evidence: SemanticEvidence,
+}
+impl SemanticGapReason {
+    pub fn validate(&self) -> Result<(), RelationCodecError> {
+        for value in [
+            &self.capability,
+            &self.kind,
+            &self.subject,
+            &self.detail,
+            &self.evidence.kind,
+        ] {
+            if value.is_empty() {
+                return Err(RelationCodecError::new(
+                    "semantic gap reason labels and detail must be nonempty",
+                ));
+            }
+        }
+        if self.impacts.is_empty() || self.impacts.iter().any(|impact| impact.is_empty()) {
+            return Err(RelationCodecError::new(
+                "semantic gap reason impacts must be nonempty",
+            ));
+        }
+        self.span.validate().map_err(RelationCodecError::new)?;
+        for mapping in &self.evidence.mappings {
+            mapping.validate().map_err(RelationCodecError::new)?;
+        }
+        if let SemanticProof::Unproven { reason } = &self.evidence.proof
+            && reason.is_empty()
+        {
+            return Err(RelationCodecError::new(
+                "unproven semantic gap evidence requires a reason",
+            ));
+        }
+        if let SemanticRelationCompleteness::Partial { reason } = &self.evidence.completeness
+            && reason.is_empty()
+        {
+            return Err(RelationCodecError::new(
+                "partial semantic gap evidence requires a reason",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// A deterministic, bounded collection of retained semantic-gap reasons.
+///
+/// `new` sorts the reasons using the canonical extension order and retains at
+/// most [`MAX_RETAINED_SEMANTIC_GAP_REASONS`] entries. A summary must contain
+/// at least one retained reason; `truncated` is true exactly when
+/// `omitted_count` is nonzero.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticGapReasonSummary {
+    pub reasons: Box<[SemanticGapReason]>,
+    pub truncated: bool,
+    pub omitted_count: u64,
+}
+impl SemanticGapReasonSummary {
+    pub fn new(mut reasons: Vec<SemanticGapReason>) -> Result<Self, RelationCodecError> {
+        reasons.sort_by(compare_gap_reasons);
+        let omitted_count = reasons
+            .len()
+            .saturating_sub(MAX_RETAINED_SEMANTIC_GAP_REASONS);
+        reasons.truncate(MAX_RETAINED_SEMANTIC_GAP_REASONS);
+        let summary = Self {
+            reasons: reasons.into_boxed_slice(),
+            truncated: omitted_count != 0,
+            omitted_count: omitted_count as u64,
+        };
+        summary.validate()?;
+        Ok(summary)
+    }
+
+    pub fn validate(&self) -> Result<(), RelationCodecError> {
+        if self.reasons.is_empty() {
+            return Err(RelationCodecError::new(
+                "semantic gap reason summary must retain at least one reason",
+            ));
+        }
+        if self.reasons.len() > MAX_RETAINED_SEMANTIC_GAP_REASONS {
+            return Err(RelationCodecError::new(
+                "semantic gap reason summary exceeds the retention limit",
+            ));
+        }
+        if self.truncated != (self.omitted_count != 0) {
+            return Err(RelationCodecError::new(
+                "semantic gap reason truncation does not match omitted count",
+            ));
+        }
+        for reason in &self.reasons {
+            reason.validate()?;
+        }
+        if self
+            .reasons
+            .windows(2)
+            .any(|pair| compare_gap_reasons(&pair[0], &pair[1]) == Ordering::Greater)
+        {
+            return Err(RelationCodecError::new(
+                "semantic gap reasons must be in canonical order",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn compare_gap_reasons(left: &SemanticGapReason, right: &SemanticGapReason) -> Ordering {
+    left.capability
+        .cmp(&right.capability)
+        .then_with(|| left.kind.cmp(&right.kind))
+        .then_with(|| left.impacts.cmp(&right.impacts))
+        .then_with(|| left.subject.cmp(&right.subject))
+        .then_with(|| compare_source_spans(&left.span, &right.span))
+        .then_with(|| left.detail.cmp(&right.detail))
+        .then_with(|| left.evidence.kind.cmp(&right.evidence.kind))
+        .then_with(|| compare_source_span_slices(&left.evidence.mappings, &right.evidence.mappings))
+        .then_with(|| left.evidence.proof.cmp(&right.evidence.proof))
+        .then_with(|| left.evidence.completeness.cmp(&right.evidence.completeness))
+}
+
+fn compare_source_spans(left: &SourceSpan, right: &SourceSpan) -> Ordering {
+    (&left.path, left.start_utf8_byte, left.end_utf8_byte).cmp(&(
+        &right.path,
+        right.start_utf8_byte,
+        right.end_utf8_byte,
+    ))
+}
+
+fn compare_source_span_slices(left: &[SourceSpan], right: &[SourceSpan]) -> Ordering {
+    left.iter()
+        .zip(right)
+        .map(|(left, right)| compare_source_spans(left, right))
+        .find(|ordering| *ordering != Ordering::Equal)
+        .unwrap_or_else(|| left.len().cmp(&right.len()))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SemanticNodeOccurrence {
@@ -345,6 +504,10 @@ pub struct SemanticRelationBoundary {
     pub relations: Box<[SemanticRelationKind]>,
     pub message: Box<str>,
     pub evidence: Box<[SemanticEvidence]>,
+    /// Source-backed explanations are meaningful only for a missing-semantic
+    /// frontier. Other boundary kinds leave this optional field absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_summary: Option<SemanticGapReasonSummary>,
 }
 
 impl SemanticRelationBoundaryKind {
@@ -535,6 +698,18 @@ impl SemanticRelationSnapshot {
                 return Err(RelationCodecError::new(
                     "value dependence edge requires value detail",
                 ));
+            }
+        }
+        for boundary in &self.boundaries {
+            if boundary.reason_summary.is_some()
+                && boundary.kind != SemanticRelationBoundaryKind::MissingSemantics
+            {
+                return Err(RelationCodecError::new(
+                    "semantic gap reason summaries require a missing-semantics boundary",
+                ));
+            }
+            if let Some(summary) = &boundary.reason_summary {
+                summary.validate()?;
             }
         }
         let budget_boundaries = self

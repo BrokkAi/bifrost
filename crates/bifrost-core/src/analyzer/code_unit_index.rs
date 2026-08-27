@@ -92,6 +92,26 @@ pub trait CodeUnitIndex: Send + Sync {
         self.declarations(file)
     }
 
+    /// The per-file [`ClassRangeIndex`] over this index's class-like
+    /// declarations.
+    ///
+    /// Building the index clones the file's whole declaration set and issues
+    /// one range lookup per class, and its result is a pure function of the
+    /// index state for `file`. The interactive definition resolvers ask the
+    /// enclosing-class question once per reference site, so the unified
+    /// reference engine's bulk shape — resolving every occurrence of a file —
+    /// rebuilt the index once per occurrence, in several languages inside
+    /// per-import or per-preceding-binding loops (issue #2679; the Rust
+    /// analogue was public issue #11). Analyzers with a request-scoped read
+    /// cache override this to build at most once per file per request; the
+    /// default is the plain uncached build.
+    fn class_range_index(
+        &self,
+        file: &ProjectFile,
+    ) -> Arc<crate::analyzer::usages::inverted_edges::ClassRangeIndex> {
+        Arc::new(crate::analyzer::usages::inverted_edges::ClassRangeIndex::build(self, file))
+    }
+
     /// Declarations for a source-location query. Persisted analyzers can
     /// override this when the working-tree source needs a compatible range
     /// projection without changing ordinary snapshot queries.

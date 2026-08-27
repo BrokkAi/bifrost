@@ -20,16 +20,9 @@ const auditedLinksPackages = new Set([
   "libgit2-sys",
   "libsqlite3-sys",
   "libz-sys",
-  // onig_sys (MIT) vendors oniguruma (BSD-2-Clause); its COPYING ships in
-  // the crate archive. Entered the resolve graph when #1548 made
-  // brokk-bifrost-nlp a workspace member (tokenizers -> onig -> onig_sys).
-  "onig_sys",
+  "pyo3",
   "pyo3-ffi",
   "rayon-core",
-  // ring 0.17 is Apache-2.0 AND ISC including its vendored C/asm; both are
-  // allowlisted in licenses/deny.toml. Same #1548 entry path via
-  // hf-hub -> ureq -> rustls.
-  "ring",
   "tree-sitter",
   "tree-sitter-language",
   "wasm-bindgen-shared",

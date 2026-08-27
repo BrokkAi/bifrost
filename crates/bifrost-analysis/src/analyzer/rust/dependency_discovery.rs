@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -19,6 +20,21 @@ use crate::hash::{HashMap, HashSet};
 const CARGO_METADATA_FORMAT_VERSION: u32 = 1;
 const MINIMUM_LOCKFILE_VERSION: u32 = 3;
 const MAXIMUM_LOCKFILE_VERSION: u32 = 4;
+
+pub const RUST_STDLIB_TOOLCHAIN_CHANNEL: &str = "nightly-2026-08-24";
+pub const RUST_STDLIB_TOOLCHAIN_NAME: &str = "rust";
+pub const RUST_STDLIB_TOOLCHAIN_VERSION: &str = "1.100.0-nightly";
+pub const RUST_STDLIB_RUSTC_COMMIT: &str = "fb6531d55";
+
+#[derive(Debug, Deserialize)]
+struct RustToolchainFile {
+    toolchain: RustToolchainSection,
+}
+
+#[derive(Debug, Deserialize)]
+struct RustToolchainSection {
+    channel: String,
+}
 
 #[derive(Debug, Deserialize)]
 struct CargoMetadata {
@@ -166,6 +182,22 @@ pub fn resolve_rust_semantic_pack_dependencies(
         }
     }
 
+    if !cancelled {
+        match resolve_rust_stdlib_dependency(
+            project,
+            limits,
+            &mut evidence_bytes_read,
+            cancellation,
+        ) {
+            Ok(Some(stdlib)) => dependencies.push(stdlib),
+            Ok(None) => {}
+            Err(diagnostic) => {
+                cancelled |= diagnostic.code == "rust.evidence.cancelled";
+                diagnostics.push(diagnostic);
+            }
+        }
+    }
+
     dependencies.sort_by(|left, right| left.id.cmp(&right.id));
     dependencies.dedup();
     let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
@@ -180,6 +212,102 @@ pub fn resolve_rust_semantic_pack_dependencies(
         suppressed_diagnostics,
         cancelled,
     }
+}
+
+fn resolve_rust_stdlib_dependency(
+    project: &dyn Project,
+    limits: &DependencyPackLimits,
+    evidence_bytes_read: &mut u64,
+    cancellation: Option<&CancellationToken>,
+) -> Result<Option<ResolvedDependency>, DependencyPackDiagnostic> {
+    let path = project.root().join("rust-toolchain.toml");
+    match std::fs::metadata(&path) {
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(diagnostic(
+                "rust.toolchain.not_file",
+                Some(&path),
+                "rust-toolchain.toml is not a regular file",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(diagnostic(
+                "rust.toolchain.metadata",
+                Some(&path),
+                format!("could not inspect rust-toolchain.toml: {error}"),
+            ));
+        }
+    }
+    let artifact =
+        read_evidence_file_with_budget(&path, limits, evidence_bytes_read, cancellation)?;
+    let source = std::str::from_utf8(artifact.bytes()).map_err(|error| {
+        diagnostic(
+            "rust.toolchain.invalid_utf8",
+            Some(&path),
+            format!("rust-toolchain.toml is not UTF-8: {error}"),
+        )
+    })?;
+    let file: RustToolchainFile = toml::from_str(source).map_err(|error| {
+        diagnostic(
+            "rust.toolchain.invalid_toml",
+            Some(&path),
+            format!("could not decode rust-toolchain.toml: {error}"),
+        )
+    })?;
+    if file.toolchain.channel != RUST_STDLIB_TOOLCHAIN_CHANNEL {
+        return Err(diagnostic(
+            "rust.toolchain.stdlib_channel_mismatch",
+            Some(&path),
+            format!(
+                "Rust standard-library pack requires exact channel {}; configured channel {} does not select it",
+                RUST_STDLIB_TOOLCHAIN_CHANNEL, file.toolchain.channel
+            ),
+        ));
+    }
+    let version = semver::Version::parse(RUST_STDLIB_TOOLCHAIN_VERSION)
+        .expect("pinned Rust toolchain version is valid semver");
+    Ok(Some(ResolvedDependency {
+        id: format!("rust:stdlib:{RUST_STDLIB_TOOLCHAIN_CHANNEL}"),
+        evidence: SemanticModelActivationEvidence {
+            language: "rust".to_owned(),
+            ecosystem: "cargo".to_owned(),
+            package: None,
+            module: None,
+            toolchain: Some(CatalogCoordinate {
+                name: RUST_STDLIB_TOOLCHAIN_NAME.to_owned(),
+                version: Some(version),
+            }),
+            target: None,
+            configuration: None,
+            artifact_sha256: None,
+        },
+        provenance: vec![
+            DependencyProvenance {
+                key: "rust.toolchain_channel".to_owned(),
+                value: RUST_STDLIB_TOOLCHAIN_CHANNEL.to_owned(),
+            },
+            DependencyProvenance {
+                key: "rustc.version".to_owned(),
+                value: RUST_STDLIB_TOOLCHAIN_VERSION.to_owned(),
+            },
+            DependencyProvenance {
+                key: "rustc.commit".to_owned(),
+                value: RUST_STDLIB_RUSTC_COMMIT.to_owned(),
+            },
+            DependencyProvenance {
+                key: "rustdoc.format_version".to_owned(),
+                value: rustdoc_types::FORMAT_VERSION.to_string(),
+            },
+            DependencyProvenance {
+                key: "rust.stdlib.crates".to_owned(),
+                value: "core,alloc,std".to_owned(),
+            },
+        ],
+        artifacts: Vec::new(),
+        scope: DependencyScope::Unknown,
+        declared_by: None,
+    }))
 }
 
 fn resolve_rust_dependency_evidence(
@@ -1072,6 +1200,89 @@ mod tests {
         assert_eq!(outcome.profile.metadata_inputs_considered, 2);
         assert_eq!(outcome.profile.dependencies_resolved, 1);
         assert_eq!(outcome.dependencies.len(), 1);
+    }
+
+    #[test]
+    fn exact_rust_toolchain_toml_emits_stdlib_dependency() {
+        let fixture = EvidenceFixture::new();
+        fs::write(
+            fixture._root.path().join("rust-toolchain.toml"),
+            format!(
+                "[toolchain]\nchannel = \"{RUST_STDLIB_TOOLCHAIN_CHANNEL}\"\ncomponents = [\"rust-src\"]\n"
+            ),
+        )
+        .unwrap();
+        let project = TestProject::new(fixture._root.path().to_path_buf(), Language::Rust);
+        let outcome = resolve_rust_semantic_pack_dependencies(
+            &RustAnalyzerConfig::default(),
+            &project,
+            &DependencyPackLimits::default(),
+            None,
+        );
+
+        assert!(outcome.complete, "diagnostics: {:?}", outcome.diagnostics);
+        let dependency = outcome
+            .dependencies
+            .iter()
+            .find(|dependency| dependency.id == "rust:stdlib:nightly-2026-08-24")
+            .expect("exact pinned Rust nightly should emit stdlib evidence");
+        assert_eq!(dependency.evidence.ecosystem, "cargo");
+        assert_eq!(dependency.evidence.package, None);
+        assert_eq!(dependency.evidence.module, None);
+        assert_eq!(
+            dependency.evidence.toolchain.as_ref().unwrap().name,
+            RUST_STDLIB_TOOLCHAIN_NAME
+        );
+        assert_eq!(
+            dependency
+                .evidence
+                .toolchain
+                .as_ref()
+                .unwrap()
+                .version
+                .as_ref()
+                .unwrap()
+                .to_string(),
+            RUST_STDLIB_TOOLCHAIN_VERSION
+        );
+        assert!(dependency.artifacts.is_empty());
+        assert!(dependency.provenance.iter().any(|entry| {
+            entry.key == "rustc.commit" && entry.value == RUST_STDLIB_RUSTC_COMMIT
+        }));
+    }
+
+    #[test]
+    fn non_exact_rust_toolchain_is_attributable_and_does_not_emit_stdlib_dependency() {
+        let fixture = EvidenceFixture::new();
+        fs::write(
+            fixture._root.path().join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"nightly\"\n",
+        )
+        .unwrap();
+        let project = TestProject::new(fixture._root.path().to_path_buf(), Language::Rust);
+        let outcome = resolve_rust_semantic_pack_dependencies(
+            &RustAnalyzerConfig::default(),
+            &project,
+            &DependencyPackLimits::default(),
+            None,
+        );
+
+        assert!(!outcome.complete);
+        assert!(outcome.dependencies.is_empty());
+        assert_eq!(
+            outcome.diagnostics[0].code,
+            "rust.toolchain.stdlib_channel_mismatch"
+        );
+        assert!(
+            outcome.diagnostics[0]
+                .message
+                .contains(RUST_STDLIB_TOOLCHAIN_CHANNEL)
+        );
+        assert!(
+            outcome.diagnostics[0]
+                .message
+                .contains("configured channel nightly")
+        );
     }
 
     #[test]

@@ -31,7 +31,7 @@ use brokk_bifrost_analysis::analyzer::semantic_model::{
 use brokk_bifrost_analysis::analyzer::usages::effects::ModeledProcedureKey;
 use brokk_bifrost_analysis::analyzer::usages::effects::modeled_procedure_key_for_unit;
 use brokk_bifrost_analysis::analyzer::{
-    AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer,
+    AnalyzerConfig, DependencyPackEcosystem, FilesystemProject, Project, WorkspaceAnalyzer,
 };
 use brokk_bifrost_analysis::diff_analysis::export_revision;
 use brokk_bifrost_analysis::schema_version::SchemaVersionOrigin;
@@ -55,12 +55,13 @@ use super::finding_identity::{FindingIdentityStability, PolicyFindingId};
 use super::loading::{PolicyDocumentLoadError, read_rqlp_document};
 use super::registry::{PolicyRegistry, PolicyRegistryError, PolicyRegistryLimits};
 use super::report::{
-    MAX_DIFF_FIXED_FINDINGS, PolicyDiffFixedFinding, PolicyDiffReview, PolicyExecutionMetadata,
-    PolicyExecutionStage, PolicyExecutionTermination, PolicyOptionalReviews,
-    PolicyPackActivationReview, PolicyPackDecision, PolicyPackDecisionStatus,
-    PolicyPackProcedureSummaryEvidence, PolicyReportBuilder, PolicyReportBuilderError,
-    PolicyReportDiagnostic, PolicyReportDiagnosticCode, PolicyReportDocument,
-    PolicyRetentionOutcome, PolicyRuleDescriptor, PolicySourceRange, PolicyStageTiming,
+    MAX_DIFF_FIXED_FINDINGS, PolicyDependencyPackActivationMode, PolicyDiffFixedFinding,
+    PolicyDiffReview, PolicyExecutionMetadata, PolicyExecutionStage, PolicyExecutionTermination,
+    PolicyOptionalReviews, PolicyPackActivationReview, PolicyPackDecision,
+    PolicyPackDecisionStatus, PolicyPackProcedureSummaryEvidence, PolicyReportBuilder,
+    PolicyReportBuilderError, PolicyReportDiagnostic, PolicyReportDiagnosticCode,
+    PolicyReportDocument, PolicyRetentionOutcome, PolicyRuleDescriptor, PolicySourceRange,
+    PolicyStageTiming,
 };
 use super::resolved::{
     EndpointDefinitionSchemaResolution, EndpointOrigin, LoadedPolicy, ResolvedEndpointIdentity,
@@ -505,6 +506,7 @@ pub fn evaluate_policy_inputs(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -526,6 +528,32 @@ pub fn evaluate_policy_inputs_with_analyzer(
         Some(workspace),
         Some(flow_state),
         None,
+        None,
+        cancellation,
+    )
+}
+
+/// Evaluate mixed policy inputs against a caller-owned analyzer and its
+/// already completed host-owned pack activation.
+pub fn evaluate_policy_inputs_with_analyzer_and_host_activation(
+    root: impl AsRef<Path>,
+    policy_inputs: &[PolicyEvaluationInput],
+    workspace: &WorkspaceAnalyzer,
+    flow_state: &brokk_bifrost_flow::FlowWorkspaceState,
+    options: &PolicyEvaluationOptions,
+    host_activation: PolicyHostActivationContext<'_>,
+    cancellation: Option<&CancellationToken>,
+) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
+    evaluate_policy_inputs_with_limits(
+        root.as_ref(),
+        policy_inputs,
+        options,
+        PolicyBatchBudget::default(),
+        PolicyRegistryLimits::default(),
+        Some(workspace),
+        Some(flow_state),
+        None,
+        Some(host_activation),
         cancellation,
     )
 }
@@ -536,6 +564,33 @@ pub struct PolicySemanticModelContext<'a> {
     pub catalog: &'a SemanticPackCatalog,
     pub request: &'a SemanticModelActivationRequest,
     pub persistence: Option<SemanticModelActivationPersistence<'a>>,
+}
+
+/// Activation state already owned by a protocol host for one analyzer
+/// snapshot. Policy evaluation borrows this context and never activates packs
+/// itself when it is supplied.
+#[derive(Clone, Copy, Debug)]
+pub struct PolicyHostActivationContext<'a> {
+    pub config: Option<&'a WorkspacePacksConfig>,
+    pub activation: Option<&'a WorkspacePacksActivation>,
+    pub attempted_ecosystems: &'a [DependencyPackEcosystem],
+    pub failure: Option<&'a str>,
+}
+
+impl<'a> PolicyHostActivationContext<'a> {
+    pub const fn new(
+        config: Option<&'a WorkspacePacksConfig>,
+        activation: Option<&'a WorkspacePacksActivation>,
+        attempted_ecosystems: &'a [DependencyPackEcosystem],
+        failure: Option<&'a str>,
+    ) -> Self {
+        Self {
+            config,
+            activation,
+            attempted_ecosystems,
+            failure,
+        }
+    }
 }
 
 /// Evaluate mixed policy inputs with one generation-cached semantic-model acquisition.
@@ -557,6 +612,7 @@ pub fn evaluate_policy_inputs_with_analyzer_and_semantic_models(
         Some(workspace),
         Some(flow_state),
         Some(semantic_models),
+        None,
         cancellation,
     )
 }
@@ -581,6 +637,30 @@ pub fn evaluate_policy_source(
         workspace,
         flow_state,
         options,
+        cancellation,
+    )
+}
+
+/// Evaluate one live policy source against a caller-owned analyzer and its
+/// already completed host-owned pack activation.
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_policy_source_with_host_activation(
+    root: impl AsRef<Path>,
+    source_identity: PolicySourceIdentity,
+    source: &str,
+    workspace: &WorkspaceAnalyzer,
+    flow_state: &brokk_bifrost_flow::FlowWorkspaceState,
+    options: &PolicyEvaluationOptions,
+    host_activation: PolicyHostActivationContext<'_>,
+    cancellation: Option<&CancellationToken>,
+) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
+    evaluate_policy_inputs_with_analyzer_and_host_activation(
+        root,
+        &[PolicyEvaluationInput::embedded(source_identity, source)],
+        workspace,
+        flow_state,
+        options,
+        host_activation,
         cancellation,
     )
 }
@@ -908,6 +988,7 @@ fn evaluate_policy_files_with_limits(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -921,6 +1002,7 @@ fn evaluate_policy_inputs_with_limits(
     supplied_workspace: Option<&WorkspaceAnalyzer>,
     supplied_flow_state: Option<&brokk_bifrost_flow::FlowWorkspaceState>,
     semantic_models: Option<PolicySemanticModelContext<'_>>,
+    host_activation: Option<PolicyHostActivationContext<'_>>,
     cancellation: Option<&CancellationToken>,
 ) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
     if policy_inputs.is_empty() {
@@ -957,6 +1039,7 @@ fn evaluate_policy_inputs_with_limits(
         supplied_workspace,
         supplied_flow_state,
         semantic_models,
+        host_activation,
         None,
         cancellation,
     )
@@ -971,6 +1054,54 @@ pub fn evaluate_policy_inputs_with_analyzer_and_suppression_preflight(
     flow_state: &brokk_bifrost_flow::FlowWorkspaceState,
     options: &PolicyEvaluationOptions,
     suppression_preflight: PolicySuppressionPreflight,
+    cancellation: Option<&CancellationToken>,
+) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
+    evaluate_policy_inputs_with_analyzer_and_suppression_preflight_impl(
+        root,
+        policy_inputs,
+        workspace,
+        flow_state,
+        options,
+        suppression_preflight,
+        None,
+        cancellation,
+    )
+}
+
+/// Evaluate mixed policy inputs with suppression preflight and a host-owned
+/// activation already completed for the supplied analyzer snapshot.
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_policy_inputs_with_analyzer_and_suppression_preflight_and_host_activation(
+    root: impl AsRef<Path>,
+    policy_inputs: &[PolicyEvaluationInput],
+    workspace: &WorkspaceAnalyzer,
+    flow_state: &brokk_bifrost_flow::FlowWorkspaceState,
+    options: &PolicyEvaluationOptions,
+    suppression_preflight: PolicySuppressionPreflight,
+    host_activation: PolicyHostActivationContext<'_>,
+    cancellation: Option<&CancellationToken>,
+) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
+    evaluate_policy_inputs_with_analyzer_and_suppression_preflight_impl(
+        root,
+        policy_inputs,
+        workspace,
+        flow_state,
+        options,
+        suppression_preflight,
+        Some(host_activation),
+        cancellation,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_policy_inputs_with_analyzer_and_suppression_preflight_impl(
+    root: impl AsRef<Path>,
+    policy_inputs: &[PolicyEvaluationInput],
+    workspace: &WorkspaceAnalyzer,
+    flow_state: &brokk_bifrost_flow::FlowWorkspaceState,
+    options: &PolicyEvaluationOptions,
+    suppression_preflight: PolicySuppressionPreflight,
+    host_activation: Option<PolicyHostActivationContext<'_>>,
     cancellation: Option<&CancellationToken>,
 ) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
     if policy_inputs.is_empty() {
@@ -1007,6 +1138,7 @@ pub fn evaluate_policy_inputs_with_analyzer_and_suppression_preflight(
         Some(workspace),
         Some(flow_state),
         None,
+        host_activation,
         Some(suppression_preflight),
         cancellation,
     )
@@ -1031,16 +1163,11 @@ fn analyzed_source_volume(workspace: &WorkspaceAnalyzer) -> (u64, usize) {
 
 /// The workspace location the pack-activation review is attributed to.
 ///
-/// A run with a pack-activation document is attributed to that document. A run
-/// that activates only reviewed workspace-local models is attributed to the
-/// directory those models live in, because that directory is the opt-in
-/// (#2493).
-fn pack_activation_source_path(config: Option<&WorkspacePacksConfig>) -> String {
-    if config.is_some() {
-        WORKSPACE_PACKS_DOCUMENT_PATH.to_owned()
-    } else {
-        WORKSPACE_SEMANTIC_MODEL_DIRECTORY.to_owned()
-    }
+/// Dependency activation is attributed to the conventional packs document,
+/// including ambient default activation without a document. Workspace-local
+/// model paths remain available through their typed decisions and diagnostics.
+fn pack_activation_source_path(_config: Option<&WorkspacePacksConfig>) -> String {
+    WORKSPACE_PACKS_DOCUMENT_PATH.to_owned()
 }
 
 /// Count the workspace declarations that reach each active procedure summary
@@ -1191,22 +1318,31 @@ fn active_workspace_model_zero_match_diagnostics(
 fn pack_activation_review(
     config: Option<&WorkspacePacksConfig>,
     activation: Option<&WorkspacePacksActivation>,
+    attempted_ecosystems: Option<&[DependencyPackEcosystem]>,
+    activation_failure: Option<&str>,
     summary_evidence: Option<&BTreeMap<String, Vec<PolicyPackProcedureSummaryEvidence>>>,
 ) -> PolicyPackActivationReview {
+    let dependency_mode = policy_dependency_pack_activation_mode(config);
     let Some(activation) = activation else {
-        return PolicyPackActivationReview::new(
+        let decisions = activation_failure
+            .map(|failure| {
+                vec![PolicyPackDecision::new(
+                    "workspace-activation".to_owned(),
+                    PolicyPackDecisionStatus::Rejected,
+                    Some(failure.to_owned()),
+                )]
+            })
+            .unwrap_or_default();
+        return PolicyPackActivationReview::new_with_mode(
             pack_activation_source_path(config),
-            config
-                .map(|config| {
-                    config
-                        .ecosystems()
-                        .iter()
-                        .map(|ecosystem| ecosystem.label().to_owned())
-                        .collect()
-                })
-                .unwrap_or_default(),
-            true,
-            Vec::new(),
+            dependency_mode,
+            attempted_ecosystems
+                .unwrap_or_else(|| config.map_or(&[], WorkspacePacksConfig::ecosystems))
+                .iter()
+                .map(|ecosystem| ecosystem.label().to_owned())
+                .collect(),
+            activation_failure.is_none(),
+            decisions,
         );
     };
     let mut decisions = Vec::new();
@@ -1261,16 +1397,36 @@ fn pack_activation_review(
         ) => record_explanations(&mut decisions, &report.explanations),
         None => {}
     }
-    PolicyPackActivationReview::new(
+    if let Some(failure) = activation_failure {
+        decisions.push(PolicyPackDecision::new(
+            "workspace-activation".to_owned(),
+            PolicyPackDecisionStatus::Rejected,
+            Some(failure.to_owned()),
+        ));
+    }
+    PolicyPackActivationReview::new_with_mode(
         pack_activation_source_path(config),
+        dependency_mode,
         activation
             .ecosystems
             .iter()
             .map(|ecosystem| ecosystem.label().to_owned())
             .collect(),
-        activation.outcome.complete(),
+        activation.outcome.complete() && activation_failure.is_none(),
         decisions,
     )
+}
+
+fn policy_dependency_pack_activation_mode(
+    config: Option<&WorkspacePacksConfig>,
+) -> PolicyDependencyPackActivationMode {
+    match config {
+        None => PolicyDependencyPackActivationMode::Default,
+        Some(config) if config.ecosystems().is_empty() => {
+            PolicyDependencyPackActivationMode::Disabled
+        }
+        Some(_) => PolicyDependencyPackActivationMode::Configured,
+    }
 }
 
 /// The report diagnostic for a workspace activation that could not be built.
@@ -1447,6 +1603,7 @@ fn evaluate_prepared_policy_inputs(
     supplied_workspace: Option<&WorkspaceAnalyzer>,
     supplied_flow_state: Option<&brokk_bifrost_flow::FlowWorkspaceState>,
     semantic_models: Option<PolicySemanticModelContext<'_>>,
+    host_activation: Option<PolicyHostActivationContext<'_>>,
     suppression_preflight: Option<PolicySuppressionPreflight>,
     cancellation: Option<&CancellationToken>,
 ) -> Result<PolicyBatchOutcome, PolicyCoordinatorError> {
@@ -1549,16 +1706,19 @@ fn evaluate_prepared_policy_inputs(
     // stdlib semantic-pack activation (#1868). A malformed document is loud:
     // its diagnostic makes the run unreliable rather than silently evaluating
     // without the configured packs.
+    let mut packs_load_failure = None;
     let packs_config = match load_workspace_packs_config(read_root) {
         Ok(config) => config,
         Err(error) => {
+            let failure = format!("failed to load the workspace packs document: {error}");
             secondary_diagnostics.push(report_diagnostic(
                 PolicyReportDiagnosticCode::PacksLoadFailed,
-                format!("failed to load the workspace packs document: {error}"),
+                failure.clone(),
                 Some(PolicySourceIdentity::new(WORKSPACE_PACKS_DOCUMENT_PATH)),
                 None,
                 Vec::new(),
             )?);
+            packs_load_failure = Some(failure);
             None
         }
     };
@@ -1787,6 +1947,7 @@ fn evaluate_prepared_policy_inputs(
     // the second, so a policy that depends on a checked-in model runs from
     // `bifrost --policy-file` alone.
     let workspace_activation = match owned_analyzer.as_ref() {
+        Some(_) if packs_load_failure.is_some() => Some(None),
         Some(analyzer_workspace) => {
             match activate_workspace_semantic_sources(
                 analyzer_workspace,
@@ -1807,8 +1968,12 @@ fn evaluate_prepared_policy_inputs(
         }
         None => None,
     };
+    let activation_for_report = workspace_activation
+        .as_ref()
+        .and_then(Option::as_ref)
+        .or_else(|| host_activation.and_then(|context| context.activation));
     let summary_evidence = workspace.and_then(|workspace| {
-        let activation = workspace_activation.as_ref()?.as_ref()?;
+        let activation = activation_for_report?;
         let active = match activation.outcome.runtime.as_ref()? {
             SemanticModelRuntimeOutcome::Ready { active, .. } => Some(active),
             SemanticModelRuntimeOutcome::Incomplete { usable, .. } => usable.as_ref(),
@@ -1825,35 +1990,58 @@ fn evaluate_prepared_policy_inputs(
         Some(Some(activation)) => Some(pack_activation_review(
             packs_config.as_ref(),
             Some(activation),
+            None,
+            None,
             summary_evidence.as_ref(),
         )),
         // The transaction ran and neither route contributed. A document still
         // earns a review row so its opt-in stays auditable; a run with no
         // document and no reviewed model keeps its exact schema-version-5
         // shape and attaches nothing.
-        Some(None) => packs_config
-            .as_ref()
-            .map(|config| pack_activation_review(Some(config), None, None)),
-        // No coordinator-owned analyzer, or the transaction failed and already
-        // reported why.
-        None => None,
+        Some(None) => match (packs_config.as_ref(), packs_load_failure.as_deref()) {
+            (_, Some(failure)) => Some(pack_activation_review(
+                None,
+                None,
+                None,
+                Some(failure),
+                None,
+            )),
+            (Some(config), None) => {
+                Some(pack_activation_review(Some(config), None, None, None, None))
+            }
+            (None, None) => None,
+        },
+        // A supplied analyzer's host owns the transaction. Preserve its exact
+        // activation evidence instead of re-running it here.
+        None => host_activation.map(|context| {
+            pack_activation_review(
+                context.config,
+                context.activation,
+                Some(context.attempted_ecosystems),
+                context.failure,
+                summary_evidence.as_ref(),
+            )
+        }),
     };
+    if let Some(failure) = host_activation.and_then(|context| context.failure) {
+        secondary_diagnostics.push(report_diagnostic(
+            PolicyReportDiagnosticCode::PackActivationFailed,
+            format!("host-owned workspace pack activation failed: {failure}"),
+            Some(PolicySourceIdentity::new(WORKSPACE_PACKS_DOCUMENT_PATH)),
+            None,
+            Vec::new(),
+        )?);
+    }
     // A registered workspace model that never reaches the active set is
     // invisible, and an invisible model decides verdicts by its absence. The
     // review gate is the one honest exception: a `review_required` model with
     // no matching `enable` entry is inert by design, so it is reported as a
     // warning the author can read rather than as a failed run.
-    for diagnostic in inactive_workspace_model_diagnostics(
-        workspace_activation
-            .as_ref()
-            .and_then(|activation| activation.as_ref()),
-    )? {
+    for diagnostic in inactive_workspace_model_diagnostics(activation_for_report)? {
         secondary_diagnostics.push(diagnostic);
     }
     for diagnostic in active_workspace_model_zero_match_diagnostics(
-        workspace_activation
-            .as_ref()
-            .and_then(|activation| activation.as_ref()),
+        activation_for_report,
         summary_evidence.as_ref(),
     )? {
         secondary_diagnostics.push(diagnostic);
@@ -1867,7 +2055,8 @@ fn evaluate_prepared_policy_inputs(
     // must not silently model calls it never resolved.
     let document_summary_models = workspace_activation
         .as_ref()
-        .and_then(|activation| activation.as_ref())
+        .and_then(Option::as_ref)
+        .or_else(|| host_activation.and_then(|context| context.activation))
         .and_then(|activation| activation.outcome.runtime.as_ref())
         .and_then(|runtime| match runtime {
             SemanticModelRuntimeOutcome::Ready { active, .. } => Some(Arc::clone(active)),
@@ -2471,6 +2660,7 @@ fn evaluate_policy_diff_baseline(
         batch_budget,
         registry_limits,
         Some(&base_workspace),
+        None,
         None,
         None,
         cancellation,
@@ -3246,21 +3436,31 @@ fn explicit_version_diagnostics(
     }
 
     for selector in policy.resolved_selectors() {
-        if selector.schema_resolution.origin != SchemaVersionOrigin::ImplicitCompatible {
-            continue;
+        let schemas = selector.as_query().map_or_else(
+            || {
+                selector
+                    .query_bindings()
+                    .into_iter()
+                    .map(|binding| (binding.path, binding.schema_resolution))
+                    .collect::<Vec<_>>()
+            },
+            |(schema, _)| vec![(selector.path.as_str().to_owned(), *schema)],
+        );
+        for (path, resolution) in schemas {
+            if resolution.origin != SchemaVersionOrigin::ImplicitCompatible {
+                continue;
+            }
+            diagnostics.push(report_diagnostic(
+                PolicyReportDiagnosticCode::ExplicitRqlSchemaVersionRequired,
+                format!(
+                    "selector {path} inferred RQL schema version {}; add :schema-version {}",
+                    resolution.version, resolution.version
+                ),
+                Some(selector_source(policy, &selector.origin)),
+                None,
+                Vec::new(),
+            )?);
         }
-        diagnostics.push(report_diagnostic(
-            PolicyReportDiagnosticCode::ExplicitRqlSchemaVersionRequired,
-            format!(
-                "selector {} inferred RQL schema version {}; add :schema-version {}",
-                selector.path,
-                selector.schema_resolution.version,
-                selector.schema_resolution.version
-            ),
-            Some(selector_source(policy, &selector.origin)),
-            None,
-            Vec::new(),
-        )?);
     }
     diagnostics.sort_by(|left, right| {
         (

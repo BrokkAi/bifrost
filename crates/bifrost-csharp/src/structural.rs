@@ -349,6 +349,11 @@ impl StructuralSpec for CSharpStructuralSpec {
             .then(|| CallSiteFacts::of_kind(CallKind::Constructor))
     }
 
+    fn supports_role(&self, role: Role) -> bool {
+        // #2647: not yet extracted by this adapter.
+        !matches!(role, Role::Iterable | Role::Element)
+    }
+
     fn occurrence_role_support(&self) -> &OccurrenceRoleSupport {
         &CSHARP_OCCURRENCE_ROLE_SUPPORT
     }

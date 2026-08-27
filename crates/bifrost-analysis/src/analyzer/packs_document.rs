@@ -1,10 +1,12 @@
 //! The shared workspace pack-activation document (`.bifrost/packs.json`).
 //!
 //! One schema-versioned document names the semantic-pack catalog location and
-//! the discovered dependency ecosystems the workspace opts into activating.
+//! the discovered dependency ecosystems the workspace activates. When the
+//! document is absent, the host uses the ambient default of every ecosystem
+//! serving a language present in the workspace. A present document with an
+//! empty `ecosystems` list explicitly disables that dependency-pack route.
 //! The CLI policy runner, the MCP host, and the LSP host all read this one
 //! document, so every entry point activates the same packs (#1868).
-//! Activation stays opt-in: an absent document activates nothing.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -15,11 +17,11 @@ use serde::Deserialize;
 use crate::analyzer::semantic_model::{
     CatalogError, CatalogOpenMode, CatalogOptions, DependencyPackLimits,
     RegisteredWorkspaceSemanticModel, SemanticModelActivationControl,
-    SemanticModelActivationRequest, SemanticModelControlAction, SemanticModelControlScope,
-    SemanticModelPackSelector, SemanticModelRuntimeLimits, SemanticPackCatalog,
-    WORKSPACE_SEMANTIC_MODEL_DIRECTORY, WorkspaceSemanticModelOptions,
+    SemanticModelActivationEvidence, SemanticModelActivationRequest, SemanticModelControlAction,
+    SemanticModelControlScope, SemanticModelPackSelector, SemanticModelRuntimeLimits,
+    SemanticPackCatalog, WORKSPACE_SEMANTIC_MODEL_DIRECTORY, WorkspaceSemanticModelOptions,
     WorkspaceSemanticModelRegistration, WorkspaceSemanticModelRegistrationError,
-    register_workspace_semantic_models,
+    open_default_semantic_pack_catalog, register_workspace_semantic_models,
 };
 use crate::analyzer::{
     AnalyzerConfig, DependencyPackActivationOutcome, DependencyPackEcosystem,
@@ -60,7 +62,8 @@ impl WorkspacePacksConfig {
         self.catalog.as_deref()
     }
 
-    /// The opted-in ecosystems, sorted and free of duplicates.
+    /// The configured ecosystems, sorted and free of duplicates. An empty
+    /// list explicitly disables ambient dependency-pack activation.
     pub fn ecosystems(&self) -> &[DependencyPackEcosystem] {
         &self.ecosystems
     }
@@ -126,9 +129,6 @@ fn normalize_packs_document(
         }
         None => None,
     };
-    if wire.ecosystems.is_empty() {
-        return Err(WorkspacePacksValidationError::EmptyEcosystems);
-    }
     let mut ecosystems = Vec::with_capacity(wire.ecosystems.len());
     for label in &wire.ecosystems {
         let Some(ecosystem) = DependencyPackEcosystem::from_label(label) else {
@@ -151,7 +151,8 @@ fn normalize_packs_document(
 }
 
 /// Load the conventional document beneath an opened workspace root.
-/// An absent document is the opt-out and returns `Ok(None)`.
+/// An absent document returns `Ok(None)` so hosts can distinguish the ambient
+/// default from an explicitly configured document.
 pub fn load_workspace_packs_config(
     root: &WorkspaceRoot,
 ) -> Result<Option<WorkspacePacksConfig>, WorkspacePacksLoadError> {
@@ -259,13 +260,14 @@ impl From<CatalogError> for WorkspaceActivationError {
     }
 }
 
-/// Activate the document's opted-in ecosystems on `workspace` (#1868).
+/// Activate the document's configured ecosystems on `workspace` (#1868).
 ///
 /// The catalog opens read-write at the document's configured location, so
-/// locally generated packs persist across runs; an unconfigured catalog is
-/// ephemeral. Ecosystems that serve no language present in the workspace are
-/// skipped: naming one is configuration, not proof the workspace uses it.
-/// Returns `Ok(None)` when no requested ecosystem is relevant.
+/// locally generated packs persist across runs; an unconfigured catalog uses
+/// the repository-local generated cache. Ecosystems that serve no language
+/// present in the workspace are skipped: naming one is configuration, not
+/// proof the workspace uses it.
+/// Returns `Ok(None)` when no configured ecosystem is relevant.
 ///
 /// This is the document route alone. Use
 /// [`activate_workspace_semantic_sources`] to join the reviewed
@@ -305,33 +307,62 @@ pub fn activate_workspace_packs(
 ///
 /// - The pack-activation document names the dependency ecosystems and the
 ///   catalog, and its `enable` list supplies the review controls. It may also
-///   enable a reviewed workspace-local pack by id.
+///   enable a reviewed workspace-local pack by id. An absent document selects
+///   every ecosystem serving a language present in the workspace; an empty
+///   configured list selects none.
 /// - `.bifrost/semantic-models/` supplies the reviewed models the repository
 ///   checked in beside its policies. Their presence is the opt-in; an absent
 ///   directory contributes nothing.
 ///
-/// Returns `Ok(None)` when neither route contributes anything, so a workspace
-/// with no configuration keeps paying nothing.
+/// Returns `Ok(None)` when neither route contributes anything.
 pub fn activate_workspace_semantic_sources(
     workspace: &WorkspaceAnalyzer,
     analyzer_config: &AnalyzerConfig,
     sources: WorkspaceActivationSources<'_>,
     cancellation: &crate::CancellationToken,
 ) -> Result<Option<WorkspacePacksActivation>, WorkspaceActivationError> {
-    let languages = workspace.analyzer().languages();
-    let ecosystems: Vec<_> = sources
-        .config
-        .map(WorkspacePacksConfig::ecosystems)
-        .unwrap_or_default()
-        .iter()
-        .copied()
-        .filter(|ecosystem| {
-            ecosystem
-                .languages()
-                .iter()
-                .any(|language| languages.contains(language))
-        })
-        .collect();
+    let ecosystems = workspace_pack_ecosystems(workspace, sources.config);
+    let workspace_models_present = sources.workspace_model_root.is_some_and(|root| {
+        std::fs::symlink_metadata(root.join(WORKSPACE_SEMANTIC_MODEL_DIRECTORY)).is_ok()
+    });
+    if ecosystems.is_empty() && !workspace_models_present {
+        return Ok(None);
+    }
+    let catalog = match sources.config.and_then(WorkspacePacksConfig::catalog) {
+        Some(relative) => SemanticPackCatalog::open(
+            &sources.catalog_root.join(relative),
+            CatalogOpenMode::ReadWrite,
+            CatalogOptions::default(),
+        )?,
+        None => {
+            open_default_semantic_pack_catalog(sources.catalog_root, CatalogOptions::default())?
+        }
+    };
+    activate_workspace_semantic_sources_in_catalog(
+        workspace,
+        analyzer_config,
+        &catalog,
+        sources,
+        &[],
+        cancellation,
+    )
+}
+
+/// Activate all semantic sources against a caller-opened catalog.
+///
+/// Hosts that own a reviewed catalog bootstrap can register it before calling
+/// this function and supply bounded intrinsic or host-derived evidence. The
+/// catalog, workspace-local models, and dependency ecosystems still publish
+/// through one activation request and one analyzer overlay.
+pub fn activate_workspace_semantic_sources_in_catalog(
+    workspace: &WorkspaceAnalyzer,
+    analyzer_config: &AnalyzerConfig,
+    catalog: &SemanticPackCatalog,
+    sources: WorkspaceActivationSources<'_>,
+    additional_evidence: &[SemanticModelActivationEvidence],
+    cancellation: &crate::CancellationToken,
+) -> Result<Option<WorkspacePacksActivation>, WorkspaceActivationError> {
+    let ecosystems = workspace_pack_ecosystems(workspace, sources.config);
     // Does this workspace opt into the reviewed route at all? Presence of the
     // directory is the whole opt-in, and asking costs one stat. Discovery
     // asks again and properly, rejecting a symlink or a non-directory; an
@@ -347,14 +378,6 @@ pub fn activate_workspace_semantic_sources(
     if ecosystems.is_empty() && workspace_model_root.is_none() {
         return Ok(None);
     }
-    let catalog = match sources.config.and_then(WorkspacePacksConfig::catalog) {
-        Some(relative) => SemanticPackCatalog::open(
-            &sources.catalog_root.join(relative),
-            CatalogOpenMode::ReadWrite,
-            CatalogOptions::default(),
-        )?,
-        None => SemanticPackCatalog::open_ephemeral(CatalogOptions::default())?,
-    };
     // The reviewed workspace-local models join the same catalog handle and the
     // same evidence, before the dependency route resolves. A discovery,
     // compile, or registration failure aborts the transaction: a checked-in
@@ -363,7 +386,7 @@ pub fn activate_workspace_semantic_sources(
     let registration = match workspace_model_root {
         Some(model_root) => register_workspace_semantic_models(
             model_root,
-            &catalog,
+            catalog,
             WorkspaceSemanticModelOptions::default(),
         )
         .map_err(WorkspaceActivationError::WorkspaceModels)?,
@@ -393,7 +416,8 @@ pub fn activate_workspace_semantic_sources(
             },
         })
         .collect();
-    let mut evidence = registration.evidence;
+    let mut evidence = additional_evidence.to_vec();
+    evidence.extend(registration.evidence);
     evidence.sort();
     evidence.dedup();
     let activation = SemanticModelActivationRequest {
@@ -410,7 +434,7 @@ pub fn activate_workspace_semantic_sources(
         analyzer_config,
         &ecosystems,
         DependencyPackWorkspaceContext {
-            catalog: &catalog,
+            catalog,
             persistence: None,
             activation: &activation,
             limits: DependencyPackLimits::default(),
@@ -422,6 +446,28 @@ pub fn activate_workspace_semantic_sources(
         workspace_models: registration.models,
         outcome,
     }))
+}
+
+/// Resolve the dependency ecosystems one host will attempt for this analyzer.
+///
+/// Keeping this projection beside the activation transaction lets MCP and LSP
+/// retain an exact attempted set even when catalog opening or activation fails.
+pub fn workspace_pack_ecosystems(
+    workspace: &WorkspaceAnalyzer,
+    config: Option<&WorkspacePacksConfig>,
+) -> Vec<DependencyPackEcosystem> {
+    let languages = workspace.analyzer().languages();
+    config
+        .map(|config| config.ecosystems().to_vec())
+        .unwrap_or_else(|| DependencyPackEcosystem::ALL.to_vec())
+        .into_iter()
+        .filter(|ecosystem| {
+            ecosystem
+                .languages()
+                .iter()
+                .any(|language| languages.contains(language))
+        })
+        .collect()
 }
 
 #[derive(Debug)]
@@ -486,7 +532,6 @@ impl std::error::Error for WorkspacePacksDocumentError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspacePacksValidationError {
     UnsupportedSchemaVersion { observed: u64 },
-    EmptyEcosystems,
     UnknownEcosystem { label: String },
     DuplicateEcosystem { ecosystem: DependencyPackEcosystem },
     CatalogPathTooLong { max_bytes: usize },
@@ -500,9 +545,6 @@ impl fmt::Display for WorkspacePacksValidationError {
                 formatter,
                 "packs document schema_version {observed} is not supported; expected {WORKSPACE_PACKS_SCHEMA_VERSION}"
             ),
-            Self::EmptyEcosystems => {
-                formatter.write_str("packs document must name at least one ecosystem")
-            }
             Self::UnknownEcosystem { label } => {
                 let known = DependencyPackEcosystem::ALL
                     .iter()
@@ -539,6 +581,7 @@ impl std::error::Error for WorkspacePacksValidationError {}
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     #[test]
@@ -611,9 +654,7 @@ mod tests {
         ));
         assert!(matches!(
             parse_workspace_packs_config(r#"{ "schema_version": 1, "ecosystems": [] }"#),
-            Err(WorkspacePacksDocumentError::Validation(
-                WorkspacePacksValidationError::EmptyEcosystems
-            ))
+            Ok(config) if config.ecosystems().is_empty()
         ));
         assert!(matches!(
             parse_workspace_packs_config(r#"{ "schema_version": 1, "ecosystems": ["jdk"] }"#),
@@ -650,12 +691,65 @@ mod tests {
     }
 
     #[test]
-    fn an_absent_document_is_the_opt_out() {
+    fn an_absent_document_leaves_hosts_to_select_the_ambient_default() {
         let temp = TempDir::new().unwrap();
         assert!(
             load_workspace_packs_config_at(temp.path())
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn an_absent_document_activates_every_ecosystem_for_present_languages() {
+        let temp = TempDir::new().unwrap();
+        fs::write(temp.path().join("lib.rs"), "pub fn value() {}\n").unwrap();
+        let project = Arc::new(crate::FilesystemProject::new(temp.path()).unwrap());
+        let workspace =
+            WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default()).unwrap();
+        let activation = activate_workspace_semantic_sources(
+            &workspace,
+            &AnalyzerConfig::default(),
+            WorkspaceActivationSources {
+                catalog_root: temp.path(),
+                workspace_model_root: None,
+                config: None,
+            },
+            &crate::CancellationToken::default(),
+        )
+        .unwrap()
+        .expect("the ambient Cargo ecosystem should be selected");
+        assert_eq!(activation.ecosystems, [DependencyPackEcosystem::Cargo]);
+    }
+
+    #[test]
+    fn an_empty_document_disables_ambient_dependency_activation() {
+        let temp = TempDir::new().unwrap();
+        fs::write(temp.path().join("lib.rs"), "pub fn value() {}\n").unwrap();
+        let project = Arc::new(crate::FilesystemProject::new(temp.path()).unwrap());
+        let workspace =
+            WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default()).unwrap();
+        let config = parse_workspace_packs_config(
+            r#"{ "schema_version": 1, "catalog": ".bifrost/disabled-catalog", "ecosystems": [] }"#,
+        )
+        .unwrap();
+        assert!(
+            activate_workspace_semantic_sources(
+                &workspace,
+                &AnalyzerConfig::default(),
+                WorkspaceActivationSources {
+                    catalog_root: temp.path(),
+                    workspace_model_root: None,
+                    config: Some(&config),
+                },
+                &crate::CancellationToken::default(),
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            !temp.path().join(".bifrost/disabled-catalog").exists(),
+            "disabled activation must not create or mutate a configured catalog"
         );
     }
 

@@ -31,7 +31,8 @@
 
 use super::resolver::node_text;
 use super::syntax::{
-    assignment_value_type_fq_name, declared_instance_callable, declared_instance_field,
+    assignment_value_type_fq_name, captured_local_scope_bindings, declared_instance_callable,
+    declared_instance_field, direct_variable_receiver_type_fq_names,
     instance_receiver_type_fq_name, is_local_scope, object_creation_type, seed_assignment_binding,
     seed_parameter_types, static_member_parts, static_scope_type_fq_name, variable_identifier,
 };
@@ -42,7 +43,6 @@ use crate::aliases::{
 use crate::graph::PhpGraphSource;
 use crate::graph_support::PhpSource;
 use crate::graph_support::php_file_context_from_source;
-use brokk_bifrost_core::analyzer::ProjectFile;
 use brokk_bifrost_core::analyzer::usages::inverted_edges::{
     ClassRangeIndex, FileEdgeScanInput, PerFileEdges, classify_reference_node,
 };
@@ -50,6 +50,7 @@ use brokk_bifrost_core::analyzer::usages::local_inference::{
     LocalInferenceConfig, LocalInferenceEngine,
 };
 use brokk_bifrost_core::analyzer::usages::same_owner::route_same_owner;
+use brokk_bifrost_core::analyzer::{CodeUnit, ProjectFile};
 use tree_sitter::Node;
 
 /// Resolve every reference in one already-parsed PHP file.
@@ -135,11 +136,20 @@ impl PhpScan<'_> {
 }
 
 fn walk(node: Node<'_>, scan: &mut PhpScan<'_>, bindings: &mut LocalInferenceEngine<String>) {
-    let enters_scope = is_local_scope(node);
-    if enters_scope {
-        bindings.enter_scope();
-        seed_parameters(node, scan, bindings);
+    if is_local_scope(node) {
+        let mut scoped = captured_local_scope_bindings(node, scan.source, bindings);
+        seed_parameters(node, scan, &mut scoped);
+        walk_contents(node, scan, &mut scoped);
+    } else {
+        walk_contents(node, scan, bindings);
     }
+}
+
+fn walk_contents(
+    node: Node<'_>,
+    scan: &mut PhpScan<'_>,
+    bindings: &mut LocalInferenceEngine<String>,
+) {
     record_reference(node, scan, bindings);
 
     let mut cursor = node.walk();
@@ -151,10 +161,6 @@ fn walk(node: Node<'_>, scan: &mut PhpScan<'_>, bindings: &mut LocalInferenceEng
     // Mutate the LHS only after every RHS reference has been recorded, so
     // `$x = $x->method()` can still prove the receiver of `method`.
     seed_assignment(node, scan, bindings);
-
-    if enters_scope {
-        bindings.exit_scope();
-    }
 }
 
 fn record_reference(
@@ -291,12 +297,15 @@ fn record_reference(
                     );
                 },
                 |scan| {
-                    if let Some(owner) = receiver_type_fqn(object, scan, bindings) {
-                        if let Some(callable) =
+                    let callable = receiver_type_fqn(object, scan, bindings)
+                        .and_then(|owner| {
                             declared_instance_callable(scan.php, scan.analyzer, &owner, method)
-                        {
-                            scan.record(callable.fq_name(), name_node);
-                        }
+                        })
+                        .or_else(|| {
+                            direct_receiver_union_member(object, scan, bindings, method, true)
+                        });
+                    if let Some(callable) = callable {
+                        scan.record(callable.fq_name(), name_node);
                     } else {
                         scan.edges.record_unproven_name(
                             scan.input,
@@ -335,10 +344,14 @@ fn record_reference(
                     );
                 },
                 |scan| {
-                    if let Some(owner) = receiver_type_fqn(object, scan, bindings)
-                        && let Some(field) =
+                    let field = receiver_type_fqn(object, scan, bindings)
+                        .and_then(|owner| {
                             declared_instance_field(scan.php, scan.analyzer, &owner, member)
-                    {
+                        })
+                        .or_else(|| {
+                            direct_receiver_union_member(object, scan, bindings, member, false)
+                        });
+                    if let Some(field) = field {
                         scan.record(field.fq_name(), name_node);
                     }
                 },
@@ -395,6 +408,35 @@ fn receiver_type_fqn(
     )
 }
 
+fn direct_receiver_union_member(
+    object: Node<'_>,
+    scan: &PhpScan<'_>,
+    bindings: &LocalInferenceEngine<String>,
+    member: &str,
+    callable: bool,
+) -> Option<CodeUnit> {
+    let owners = direct_variable_receiver_type_fq_names(object, scan.source, bindings);
+    if owners.len() < 2 {
+        return None;
+    }
+    let mut candidates = owners
+        .into_iter()
+        .filter_map(|owner| {
+            if callable {
+                declared_instance_callable(scan.php, scan.analyzer, &owner, member)
+            } else {
+                declared_instance_field(scan.php, scan.analyzer, &owner, member)
+            }
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.dedup();
+    let [candidate] = candidates.as_slice() else {
+        return None;
+    };
+    Some(candidate.clone())
+}
+
 /// Seed parameter types into the binding scope: a `simple_parameter` with a type
 /// hint that resolves to a class fqn becomes a precise binding; an untyped
 /// parameter is a shadow so its name is not later read as a static type.
@@ -404,7 +446,22 @@ fn seed_parameters(
     bindings: &mut LocalInferenceEngine<String>,
 ) {
     seed_parameter_types(node, scan.source, bindings, |_name, raw| {
-        scan.resolve_type_arm_fqns(raw)
+        if ["self", "static", "parent"]
+            .iter()
+            .any(|keyword| raw.eq_ignore_ascii_case(keyword))
+        {
+            static_scope_type_fq_name(
+                scan.php,
+                scan.analyzer,
+                raw,
+                &scan.ctx,
+                scan.enclosing_class(node.start_byte()),
+            )
+            .into_iter()
+            .collect()
+        } else {
+            scan.resolve_type_arm_fqns(raw)
+        }
     });
 }
 
@@ -416,14 +473,15 @@ fn seed_assignment(
     scan: &PhpScan<'_>,
     bindings: &mut LocalInferenceEngine<String>,
 ) {
-    seed_assignment_binding(node, scan.source, bindings, |right, _bindings| {
+    seed_assignment_binding(node, scan.source, bindings, |right, bindings| {
         assignment_value_type_fq_name(
             scan.php,
             scan.analyzer,
             right,
             scan.source,
             &scan.ctx,
-            || scan.enclosing_class(right.start_byte()).map(str::to_string),
+            bindings,
+            |start, _end| scan.enclosing_class(start).map(str::to_string),
         )
     });
 }

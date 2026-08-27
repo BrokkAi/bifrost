@@ -65,6 +65,10 @@ pub const PYTHON_KIND_TABLE: &[(&str, NormalizedKind)] = &[
     ("except_clause", NormalizedKind::Catch),
     ("if_statement", NormalizedKind::If),
     ("for_statement", NormalizedKind::ForLoop),
+    ("list", NormalizedKind::CollectionLiteral),
+    ("set", NormalizedKind::CollectionLiteral),
+    ("dictionary", NormalizedKind::CollectionLiteral),
+    ("tuple", NormalizedKind::CollectionLiteral),
     ("while_statement", NormalizedKind::WhileLoop),
     // Python's indented suite. The module node is deliberately absent: a file
     // scope is not a statement list nested inside another one, and making the
@@ -508,6 +512,27 @@ impl StructuralSpec for PythonStructuralSpec {
             NormalizedKind::Decorator => {
                 if let Some(name) = first_named_child(node).and_then(expression_name_node) {
                     sink.set_name(name);
+                }
+            }
+            NormalizedKind::ForLoop => {
+                if let Some(right) = node.child_by_field_name("right") {
+                    attach_role_with_derived_name(
+                        sink,
+                        Role::Iterable,
+                        right,
+                        expression_name_node,
+                    );
+                }
+            }
+            NormalizedKind::CollectionLiteral => {
+                for index in 0..node.named_child_count() {
+                    let Some(child) = node.named_child(index) else {
+                        continue;
+                    };
+                    if child.kind() == "comment" {
+                        continue;
+                    }
+                    attach_role_with_derived_name(sink, Role::Element, child, expression_name_node);
                 }
             }
             _ => {}

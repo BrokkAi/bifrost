@@ -522,8 +522,6 @@ impl WireSession {
 
     fn spawn(revision: &'static str, mut command: Command) -> Self {
         let mut child = command
-            .env("BIFROST_SEMANTIC_INDEX", "off")
-            .arg("--force-semantic-cpu")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

@@ -201,8 +201,8 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  semantic-pack-bundle:
-    name: generate semantic packs
+  semantic-pack-jvm:
+    name: generate JVM semantic-pack partial bundle
     if: ${{ inputs.requalify_from_run == '' }}
     needs: preflight
     runs-on: ubuntu-latest
@@ -215,21 +215,171 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ needs.preflight.outputs.commit }}
-      - name: Install Rust toolchain
+      - name: Install stable Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: 1.97.1
-
       # Keep semantic-pack build inputs isolated to this exact public commit;
-      # no private projection or NLP model cache is involved.
-      - name: Cache Cargo dependencies for semantic packs
+      # no private projection is involved.
+      - name: Cache Cargo dependencies for JVM semantic packs
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          shared-key: release-readiness-${{ needs.preflight.outputs.commit }}-semantic-packs
+          shared-key: release-readiness-${{ needs.preflight.outputs.commit }}-semantic-packs-jvm
+      - name: Generate JVM partial bundle
+        run: bash scripts/public/build-pinned-jvm-semantic-packs.sh "${RUNNER_TEMP}/bifrost-semantic-packs-jvm" "${RUNNER_TEMP}"
+      - name: Verify JVM partial bundle
+        run: cargo run --locked --release --features release-tooling -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- verify "${RUNNER_TEMP}/bifrost-semantic-packs-jvm"
+      - name: Upload JVM partial bundle
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: bifrost-semantic-packs-jvm
+          path: ${{ runner.temp }}/bifrost-semantic-packs-jvm
+          if-no-files-found: error
+          retention-days: 14
 
-      - name: Generate and verify semantic-pack bundle
+  semantic-pack-python:
+    name: generate Python semantic-pack partial bundle
+    if: ${{ inputs.requalify_from_run == '' }}
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout qualified source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.preflight.outputs.commit }}
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.97.1
+      - name: Cache Cargo dependencies for Python semantic packs
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: release-readiness-${{ needs.preflight.outputs.commit }}-semantic-packs-python
+      - name: Generate Python partial bundle
+        run: bash scripts/public/build-pinned-python-semantic-packs.sh "${RUNNER_TEMP}/bifrost-semantic-packs-python" "${RUNNER_TEMP}"
+      - name: Verify Python partial bundle
+        run: cargo run --locked --release --features release-tooling -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- verify "${RUNNER_TEMP}/bifrost-semantic-packs-python"
+      - name: Upload Python partial bundle
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: bifrost-semantic-packs-python
+          path: ${{ runner.temp }}/bifrost-semantic-packs-python
+          if-no-files-found: error
+          retention-days: 14
+
+  semantic-pack-typescript:
+    name: generate TypeScript semantic-pack partial bundle
+    if: ${{ inputs.requalify_from_run == '' }}
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout qualified source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.preflight.outputs.commit }}
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.97.1
+      - name: Cache Cargo dependencies for TypeScript semantic packs
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: release-readiness-${{ needs.preflight.outputs.commit }}-semantic-packs-typescript
+      - name: Generate TypeScript partial bundle
+        run: bash scripts/public/build-pinned-typescript-semantic-packs.sh "${RUNNER_TEMP}/bifrost-semantic-packs-typescript" "${RUNNER_TEMP}"
+      - name: Verify TypeScript partial bundle
+        run: cargo run --locked --release --features release-tooling -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- verify "${RUNNER_TEMP}/bifrost-semantic-packs-typescript"
+      - name: Upload TypeScript partial bundle
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: bifrost-semantic-packs-typescript
+          path: ${{ runner.temp }}/bifrost-semantic-packs-typescript
+          if-no-files-found: error
+          retention-days: 14
+
+  semantic-pack-rust:
+    name: generate Rust semantic-pack partial bundle
+    if: ${{ inputs.requalify_from_run == '' }}
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout qualified source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.preflight.outputs.commit }}
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.97.1
+      - name: Cache Cargo dependencies for Rust semantic packs
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: release-readiness-${{ needs.preflight.outputs.commit }}-semantic-packs-rust
+      - name: Generate Rust partial bundle
+        run: bash scripts/public/build-pinned-rust-semantic-packs.sh "${RUNNER_TEMP}/bifrost-semantic-packs-rust" "${RUNNER_TEMP}"
+      - name: Verify Rust partial bundle
+        run: cargo run --locked --release --features release-tooling -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- verify "${RUNNER_TEMP}/bifrost-semantic-packs-rust"
+      - name: Upload Rust partial bundle
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: bifrost-semantic-packs-rust
+          path: ${{ runner.temp }}/bifrost-semantic-packs-rust
+          if-no-files-found: error
+          retention-days: 14
+
+  semantic-pack-bundle:
+    name: assemble semantic-pack bundle
+    if: ${{ inputs.requalify_from_run == '' }}
+    needs: [preflight, semantic-pack-jvm, semantic-pack-python, semantic-pack-typescript, semantic-pack-rust]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout qualified source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.preflight.outputs.commit }}
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.97.1
+      - name: Cache Cargo dependencies for semantic-pack assembly
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: release-readiness-${{ needs.preflight.outputs.commit }}-semantic-packs-assembly
+      - name: Download all semantic-pack partial bundles
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: bifrost-semantic-packs-*
+          path: ${{ runner.temp }}/semantic-pack-parts
+      - name: Merge and verify semantic-pack bundle
         shell: bash
-        run: bash scripts/public/build-pinned-jvm-semantic-packs.sh "${RUNNER_TEMP}/bifrost-semantic-packs" "${RUNNER_TEMP}"
+        run: |
+          set -euo pipefail
+          cargo run --locked --release --features release-tooling \
+            -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- merge \
+            "${RUNNER_TEMP}/bifrost-semantic-packs" \
+            "${RUNNER_TEMP}/semantic-pack-parts/bifrost-semantic-packs-jvm" \
+            "${RUNNER_TEMP}/semantic-pack-parts/bifrost-semantic-packs-python" \
+            "${RUNNER_TEMP}/semantic-pack-parts/bifrost-semantic-packs-typescript" \
+            "${RUNNER_TEMP}/semantic-pack-parts/bifrost-semantic-packs-rust"
+          cargo run --locked --release --features release-tooling \
+            -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- verify \
+            "${RUNNER_TEMP}/bifrost-semantic-packs"
       - name: Package semantic-pack bundle
         shell: bash
         env:

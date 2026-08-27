@@ -16,6 +16,221 @@ pub enum PythonDirectScopeBindingKind {
     Other,
 }
 
+/// Whether `reference` reads a target introduced by an enclosing comprehension.
+///
+/// Comprehensions create an implicit scope even at module level. The element
+/// expression is textually before its `for` clauses but evaluates after their
+/// binders, while a clause's own iterable evaluates before that clause binds
+/// its target. This structured walk models that ordering without source-text
+/// parsing.
+pub fn python_comprehension_binds_name_at(name: &str, reference: Node<'_>, source: &str) -> bool {
+    let mut current = reference;
+    while let Some(parent) = current.parent() {
+        if is_comprehension(parent.kind()) {
+            let mut cursor = parent.walk();
+            for clause in parent
+                .named_children(&mut cursor)
+                .filter(|child| child.kind() == "for_in_clause")
+            {
+                let Some(target) = clause.child_by_field_name("left") else {
+                    continue;
+                };
+                let mut bound = false;
+                let _ = collect_binding_targets(target, source, &mut || true, |candidate, _| {
+                    bound |= candidate == name;
+                });
+                if !bound {
+                    continue;
+                }
+                let inside_own_iterable =
+                    clause.child_by_field_name("right").is_some_and(|right| {
+                        right.start_byte() <= reference.start_byte()
+                            && reference.end_byte() <= right.end_byte()
+                    });
+                if !inside_own_iterable {
+                    return true;
+                }
+            }
+        }
+        if matches!(
+            parent.kind(),
+            "function_definition" | "lambda" | "class_definition" | "module"
+        ) {
+            break;
+        }
+        current = parent;
+    }
+    false
+}
+
+/// Whether `reference` reads a PEP 695 type parameter declared by its enclosing
+/// class, function, or type-alias definition.
+///
+/// Type parameters are lexical bindings rather than indexed workspace
+/// declarations. The binder is the first identifier in each structured
+/// parameter node; identifiers in bounds and constraints remain references.
+pub fn python_type_parameter_binds_name_at(name: &str, reference: Node<'_>, source: &str) -> bool {
+    let mut current = reference;
+    let mut enclosing_functions = Vec::new();
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "function_definition" {
+            enclosing_functions.push(parent);
+        }
+        if matches!(
+            parent.kind(),
+            "class_definition" | "function_definition" | "type_alias_statement"
+        ) && let Some(parameters) = parent.child_by_field_name("type_parameters")
+            && !(parameters.start_byte() <= reference.start_byte()
+                && reference.end_byte() <= parameters.end_byte())
+        {
+            let mut cursor = parameters.walk();
+            for parameter in parameters.named_children(&mut cursor) {
+                let binder = if parameter.kind() == "identifier" {
+                    Some(parameter)
+                } else {
+                    first_identifier_bounded(parameter, &mut || true).flatten()
+                };
+                if binder.is_some_and(|binder| node_text(binder, source) == name) {
+                    // Only a name that actually matched an enclosing type
+                    // parameter needs the function-wide directive scans. This
+                    // keeps the hot-path check for ordinary identifiers a
+                    // bounded ancestor walk with no scope-inventory builds.
+                    return !python_name_declared_global_at_in_functions(
+                        name,
+                        reference,
+                        source,
+                        enclosing_functions,
+                    );
+                }
+            }
+        }
+        current = parent;
+    }
+    false
+}
+
+/// Resolve `name` through the nearest enclosing function scope. This is the
+/// structured fallback for references inside nested functions that do not
+/// have their own indexed `CodeUnit` scope snapshot.
+pub fn python_name_resolution_at(
+    name: &str,
+    reference: Node<'_>,
+    source: &str,
+) -> PythonLexicalNameResolution {
+    let mut functions = Vec::new();
+    let mut current = reference;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "function_definition" {
+            functions.push(parent);
+        }
+        current = parent;
+    }
+    python_name_resolution_at_in_functions(name, reference, source, functions)
+}
+
+fn python_name_declared_global_at_in_functions(
+    name: &str,
+    reference: Node<'_>,
+    source: &str,
+    functions: Vec<Node<'_>>,
+) -> bool {
+    python_name_resolution_at_in_functions(name, reference, source, functions)
+        == PythonLexicalNameResolution::Global
+}
+
+fn python_name_resolution_at_in_functions(
+    name: &str,
+    reference: Node<'_>,
+    source: &str,
+    functions: Vec<Node<'_>>,
+) -> PythonLexicalNameResolution {
+    for function in functions {
+        let parameter_names = function
+            .child_by_field_name("parameters")
+            .into_iter()
+            .flat_map(|parameters| {
+                let mut cursor = parameters.walk();
+                parameters
+                    .named_children(&mut cursor)
+                    .filter_map(|parameter| python_parameter_name(parameter, source))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let Some(inventory) =
+            PythonLexicalScopeInventory::collect_bounded(function, source, parameter_names, || {
+                true
+            })
+        else {
+            return PythonLexicalNameResolution::Unbound;
+        };
+        let resolution = inventory.name_resolution_at(name, reference);
+        match resolution {
+            PythonLexicalNameResolution::Global => return PythonLexicalNameResolution::Global,
+            PythonLexicalNameResolution::Local | PythonLexicalNameResolution::Nonlocal => {
+                return resolution;
+            }
+            PythonLexicalNameResolution::Unbound => {}
+        }
+    }
+    PythonLexicalNameResolution::Unbound
+}
+
+fn python_parameter_name(node: Node<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" => Some(node_text(node, source).trim().to_string()),
+        "typed_parameter"
+        | "typed_default_parameter"
+        | "default_parameter"
+        | "list_splat_pattern"
+        | "dictionary_splat_pattern" => node
+            .child_by_field_name("name")
+            .or_else(|| {
+                let mut cursor = node.walk();
+                node.named_children(&mut cursor)
+                    .find(|child| child.kind() == "identifier")
+            })
+            .and_then(|name| python_parameter_name(name, source)),
+        _ => None,
+    }
+    .filter(|name| !name.is_empty())
+}
+
+/// Whether this identifier is the binder (rather than a bound/constraint use)
+/// of one structured PEP 695 type parameter.
+pub fn python_is_type_parameter_binder(node: Node<'_>) -> bool {
+    if node.kind() != "identifier" {
+        return false;
+    }
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if matches!(
+            parent.kind(),
+            "class_definition" | "function_definition" | "type_alias_statement"
+        ) && let Some(parameters) = parent.child_by_field_name("type_parameters")
+            && parameters.start_byte() <= node.start_byte()
+            && node.end_byte() <= parameters.end_byte()
+        {
+            let mut cursor = parameters.walk();
+            return parameters.named_children(&mut cursor).any(|parameter| {
+                let binder = if parameter.kind() == "identifier" {
+                    Some(parameter)
+                } else {
+                    first_identifier_bounded(parameter, &mut || true).flatten()
+                };
+                binder.is_some_and(|binder| binder.id() == node.id())
+            });
+        }
+        if matches!(
+            parent.kind(),
+            "module" | "class_definition" | "function_definition" | "type_alias_statement"
+        ) {
+            return false;
+        }
+        current = parent;
+    }
+    false
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct PythonDirectScopeBinding<'tree> {
     pub declaration: Node<'tree>,

@@ -17,7 +17,6 @@ const RUST = "brokk-bifrost-rust";
 const ANALYSIS = "brokk-bifrost-analysis";
 const FLOW = "brokk-bifrost-flow";
 const RQL = "brokk-bifrost-rql";
-const NLP = "brokk-bifrost-nlp";
 const POLICY = "brokk-bifrost-policy";
 const RUNTIME = "brokk-bifrost-runtime";
 const MCP = "brokk-bifrost-mcp";
@@ -39,7 +38,6 @@ const EXPECTED_MEMBERS = new Set([
   ANALYSIS,
   FLOW,
   RQL,
-  NLP,
   POLICY,
   RUNTIME,
   MCP,
@@ -55,9 +53,8 @@ const EXPECTED_MEMBERS = new Set([
 // for Java, Scala and Kotlin because the JVM source realm makes their routes
 // mutually dependent and all three share one `JvmAnalyzerConfig`; `js-ts` is one
 // crate for JavaScript and TypeScript for the same reason -- one module, one
-// `EdgePassId`, one usage strategy and one `JsTsAnalyzerConfig`. Policy and nlp sit directly
-// on analysis as siblings (#1548) so that neither can be pulled into the
-// analysis compilation unit again. Policy composes analysis, flow, and RQL.
+// `EdgePassId`, one usage strategy and one `JsTsAnalyzerConfig`. Policy
+// composes analysis, flow, and RQL.
 const ALLOWED_WORKSPACE_DEPENDENCIES = new Map([
   [CORE, new Set()],
   [CPP, new Set([CORE])],
@@ -72,13 +69,12 @@ const ALLOWED_WORKSPACE_DEPENDENCIES = new Map([
   [ANALYSIS, new Set([CORE, CPP, CSHARP, GO, JS_TS, JVM, PHP, PYTHON, RUBY, RUST])],
   [FLOW, new Set([CORE, ANALYSIS])],
   [RQL, new Set([CORE, ANALYSIS, FLOW])],
-  [NLP, new Set([ANALYSIS])],
   [POLICY, new Set([ANALYSIS, FLOW, RQL])],
   [SEMANTIC_PACKS, new Set([ANALYSIS, FLOW])],
   [RUNTIME, new Set([ANALYSIS, FLOW, POLICY, RQL])],
-  [MCP, new Set([ANALYSIS, FLOW, NLP, POLICY, RUNTIME, RQL])],
+  [MCP, new Set([ANALYSIS, FLOW, POLICY, RUNTIME, RQL])],
   [LSP, new Set([ANALYSIS, FLOW, POLICY, RUNTIME, RQL])],
-  [FACADE, new Set([ANALYSIS, FLOW, NLP, POLICY, RUNTIME, MCP, LSP, SEMANTIC_PACKS, RQL])],
+  [FACADE, new Set([ANALYSIS, FLOW, POLICY, RUNTIME, MCP, LSP, SEMANTIC_PACKS, RQL])],
 ]);
 const REQUIRED_WORKSPACE_DEPENDENCIES = new Map([
   [CORE, new Set()],
@@ -94,7 +90,6 @@ const REQUIRED_WORKSPACE_DEPENDENCIES = new Map([
   [ANALYSIS, new Set([CORE, CPP, CSHARP, GO, JS_TS, JVM, PHP, PYTHON, RUBY, RUST])],
   [FLOW, new Set([CORE, ANALYSIS])],
   [RQL, new Set([CORE, ANALYSIS, FLOW])],
-  [NLP, new Set([ANALYSIS])],
   [POLICY, new Set([ANALYSIS, FLOW, RQL])],
   [SEMANTIC_PACKS, new Set([ANALYSIS, FLOW])],
   [RUNTIME, new Set([ANALYSIS, FLOW, POLICY, RQL])],
@@ -103,11 +98,9 @@ const REQUIRED_WORKSPACE_DEPENDENCIES = new Map([
   [FACADE, new Set()],
 ]);
 const FORBIDDEN_EXTERNAL_DEPENDENCIES = new Map([
-  // hf-hub/tokenizers/fastrq are listed here on purpose: #1548 moved the
-  // embedding stack out so that enabling semantic search stops invalidating the
-  // workspace's largest compilation unit. If any of them reappears here, that
-  // property is silently lost, so fail the check instead. Core inherits the
-  // same ban: it is below analysis, so anything forbidden there is worse here.
+  // Model and tokenizer dependencies remain prohibited in low-level crates.
+  // Core inherits the same ban: it is below analysis, so anything forbidden
+  // there is worse here.
   [
     CORE,
     new Set(["lsp-server", "lsp-types", "pyo3", "hf-hub", "tokenizers", "fastrq"]),
@@ -157,7 +150,6 @@ const FORBIDDEN_EXTERNAL_DEPENDENCIES = new Map([
     new Set(["lsp-server", "lsp-types", "pyo3", "hf-hub", "tokenizers", "fastrq"]),
   ],
   [RQL, new Set(["lsp-server", "lsp-types", "pyo3"])],
-  [NLP, new Set(["lsp-server", "lsp-types", "pyo3"])],
   [POLICY, new Set(["lsp-server", "lsp-types", "pyo3"])],
   [SEMANTIC_PACKS, new Set(["lsp-server", "lsp-types", "pyo3"])],
   [RUNTIME, new Set(["lsp-server", "lsp-types", "pyo3"])],

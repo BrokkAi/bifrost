@@ -316,7 +316,12 @@ mod effective_using_scale_tests {
         );
         assert_eq!(
             first_alias_names, second_alias_names,
-            "repeated target component-name lookups must reuse the root alias index"
+            "repeated target component-name lookups must be stable"
+        );
+        assert_eq!(
+            visibility.alias_source_parse_count_for_test(&alias_header),
+            0,
+            "an indexed target name must not hydrate parser aliases from its include closure"
         );
 
         reset_lexical_scope_reconstructions_for_test();
@@ -354,11 +359,6 @@ mod effective_using_scale_tests {
             visibility.visible_parser_alias_name_set_build_count(),
             1,
             "the visible parser-alias-name set must build lazily once and then be reused"
-        );
-        assert_eq!(
-            visibility.visible_parser_alias_target_names_build_count(),
-            1,
-            "the visible parser-alias target index must build once per root and serve repeated target scans"
         );
         assert_eq!(
             visibility.alias_source_parse_count_for_test(&alias_header),

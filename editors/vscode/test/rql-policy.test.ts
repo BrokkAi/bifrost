@@ -4,6 +4,13 @@ import { test } from "node:test";
 import { resolve } from "node:path";
 import {
   RUN_RQL_POLICY_METHOD,
+  decodePolicySuppressionAuthoringResponse,
+  ExpectedPolicySuppressionWrite,
+  hasCompletePolicySuppressionSourcePreconditions,
+  isPolicySuppressionSourcePrecondition,
+  isCurrentPolicyFinding,
+  isPolicyFindingSuppressible,
+  normalizeSuppressionReason,
   PolicyRunTracker,
   policyCompletionDetail,
   policyCompletionLabel,
@@ -29,8 +36,11 @@ function response(completion: unknown = { type: "complete" }): unknown {
       schema_version: 5,
       evaluation: {
         evaluation_date: "2026-07-27",
-        suppression_path: ".bifrost/suppressions.json",
-        suppression_document_state: "not_found",
+        suppression_sources: [
+          { path: ".bifrost/suppressions.json", state: "not_found" },
+          { path: ".bifrost/suppressions.private.json", state: "not_found" },
+          { path: ".bifrost/suppressions.local.json", state: "not_found" }
+        ],
         scope_path: ".bifrost/scopes.json",
         scope_document_state: "not_found"
       },
@@ -82,7 +92,7 @@ function runner(overrides: Partial<RqlPolicyRunner> = {}): RqlPolicyRunner {
   };
 }
 
-void test("accepts the canonical Rust schema-4 one-finding contract artifact", () => {
+void test("accepts the canonical Rust schema-5 one-finding contract artifact", () => {
   const fixture = JSON.parse(
     readFileSync(
       resolve(__dirname, "../../../../scripts/fixtures/policy-report/v5-one-finding.json"),
@@ -97,6 +107,151 @@ void test("accepts the canonical Rust schema-4 one-finding contract artifact", (
   assert.equal(fixture.report.schema_version, 5);
   assert.equal(fixture.report.runs[0].findings.length, 1);
   assert.equal(fixture.report.runs[0].findings[0].primary.path, "app.ts");
+});
+
+void test("accepts a canonical schema-5 report with an applied suppression review", () => {
+  const fixture = JSON.parse(
+    readFileSync(
+      resolve(__dirname, "../../../../scripts/fixtures/policy-report/v5-suppressed-finding.json"),
+      "utf8"
+    )
+  ) as unknown;
+
+  assert.equal(isRqlPolicyResponse(fixture), true);
+  if (!isRqlPolicyResponse(fixture)) {
+    return;
+  }
+  assert.equal(fixture.report.suppressions.length, 1);
+  assert.equal(fixture.report.suppressions[0].orphan_state, "resolved");
+  assert.equal(fixture.report.suppressions[0].applied, true);
+  assert.equal(fixture.report.runs[0].findings[0].suppression?.policy_hash_state, "matching");
+});
+
+void test("rejects the removed singular suppression evaluation fields", () => {
+  const legacy = response() as {
+    report: { evaluation: Record<string, unknown> };
+  };
+  delete legacy.report.evaluation.suppression_sources;
+  legacy.report.evaluation.suppression_path = ".bifrost/suppressions.json";
+  legacy.report.evaluation.suppression_document_state = "not_found";
+  assert.equal(isRqlPolicyResponse(legacy), false);
+});
+
+void test("decodes current suppression sources and prepared destination content", () => {
+  const decoded = decodePolicySuppressionAuthoringResponse({
+    documentUri: "file:///workspace/.bifrost/suppressions.json",
+    expectedVersion: 7,
+    expectedText: '{\n  "schema_version": 1\n}\n',
+    content: '{\n  "schema_version": 1,\n  "suppressions": []\n}\n',
+    create: false,
+    sourcePreconditions: [
+      {
+        path: ".bifrost/suppressions.json",
+        uri: "file:///workspace/.bifrost/suppressions.json",
+        exists: true,
+        expectedVersion: 7,
+        expectedText: '{\n  "schema_version": 1\n}\n'
+      },
+      {
+        path: ".bifrost/suppressions.private.json",
+        uri: "file:///workspace/.bifrost/suppressions.private.json",
+        exists: false,
+        expectedVersion: null
+      },
+      {
+        path: ".bifrost/suppressions.local.json",
+        uri: "file:///workspace/.bifrost/suppressions.local.json",
+        exists: false,
+        expectedVersion: null
+      }
+    ]
+  });
+  assert.ok(decoded);
+  assert.equal(decoded.documentUri, "file:///workspace/.bifrost/suppressions.json");
+  assert.equal(decoded.expectedVersion, 7);
+  assert.equal(decoded.create, false);
+  assert.equal(decoded.sourcePreconditions.length, 3);
+  assert.equal(decodePolicySuppressionAuthoringResponse({ content: "bad" }), undefined);
+  assert.equal(hasCompletePolicySuppressionSourcePreconditions(decoded.sourcePreconditions), true);
+  assert.equal(
+    isPolicySuppressionSourcePrecondition({
+      path: ".bifrost/suppressions.json",
+      uri: "file:///workspace/.bifrost/suppressions.json",
+      exists: false,
+      expectedVersion: null,
+      expectedText: "unexpected"
+    }),
+    false
+  );
+  assert.equal(
+    hasCompletePolicySuppressionSourcePreconditions([
+      ...decoded.sourcePreconditions.slice(0, 2),
+      decoded.sourcePreconditions[0]
+    ]),
+    false
+  );
+  assert.equal(
+    hasCompletePolicySuppressionSourcePreconditions(
+      decoded.sourcePreconditions.map((source, index) =>
+        index === 0 ? { ...source, path: ".bifrost/suppressions.other.json" } : source
+      )
+    ),
+    false
+  );
+});
+
+void test("eligibility and optional reason normalization fail closed", () => {
+  const finding = {
+    id: "1".repeat(64),
+    identity_stability: "strong",
+    policy_id: "test.policy",
+    policy_hash: "a".repeat(64),
+    severity: "warning",
+    message: "Avoid target",
+    primary: { path: "app.ts" },
+    suppression: null
+  } as PolicyFinding;
+  assert.equal(isPolicyFindingSuppressible(finding), true);
+  assert.equal(isPolicyFindingSuppressible(finding, true), false);
+  assert.equal(isPolicyFindingSuppressible({ ...finding, identity_stability: "weak" }), false);
+  assert.equal(
+    isPolicyFindingSuppressible({
+      ...finding,
+      suppression: {
+        identity_stability: "strong",
+        status: "accepted",
+        reason: "reviewed",
+        accepted_at: "2026-07-27",
+        policy_hash_state: "matching"
+      }
+    }),
+    false
+  );
+  assert.equal(normalizeSuppressionReason("  reviewed  ", false), "reviewed");
+  assert.equal(normalizeSuppressionReason("", false), "unspecified");
+  assert.equal(normalizeSuppressionReason("   ", true), undefined);
+  assert.equal(isCurrentPolicyFinding(finding, 4, 4, false, finding), true);
+  assert.equal(isCurrentPolicyFinding(finding, 4, 5, false, finding), false);
+  assert.equal(isCurrentPolicyFinding(finding, 4, 4, true, finding), false);
+  assert.equal(isCurrentPolicyFinding(finding, 4, 4, false, { ...finding }), false);
+});
+
+void test("rejects a cached finding after policy or source state changes", () => {
+  const finding = {
+    id: "2".repeat(64),
+    identity_stability: "strong",
+    policy_id: "test.policy",
+    policy_hash: "b".repeat(64),
+    severity: "warning",
+    message: "Avoid target",
+    primary: { path: "app.ts" },
+    suppression: null
+  } as PolicyFinding;
+
+  // A new policy publication invalidates command arguments from the prior run.
+  assert.equal(isCurrentPolicyFinding(finding, 8, 9, false, finding), false);
+  // A source edit marks the retained run stale before the replacement run is published.
+  assert.equal(isCurrentPolicyFinding(finding, 8, 8, true, finding), false);
 });
 
 void test("keeps the Java relay display rows in server order for the policy tree", () => {
@@ -278,7 +433,9 @@ void test("treats only complete diagnostic-free zero-finding reports as clean", 
 
   complete.report.runs[0].findings.push({
     id: "1".repeat(64),
+    identity_stability: "strong",
     policy_id: "test.policy",
+    policy_hash: "a".repeat(64),
     severity: "warning",
     message: "Accepted result",
     primary: { path: "app.ts", region: null },
@@ -304,8 +461,8 @@ void test("summarizes orthogonal suppression audit states without hiding overlap
     finding_id: "1".repeat(64),
     match_state: "strong_finding" as const,
     temporal_state: "current" as const,
+    orphan_state: "resolved" as const,
     applied: true,
-    stale: false,
     result_omitted: false
   };
   assert.equal(
@@ -318,7 +475,7 @@ void test("summarizes orthogonal suppression audit states without hiding overlap
         temporal_state: "expired",
         policy_hash_state: "drifted",
         applied: false,
-        stale: true,
+        orphan_state: "orphaned",
         result_omitted: true
       },
       {
@@ -328,14 +485,16 @@ void test("summarizes orthogonal suppression audit states without hiding overlap
         applied: false
       }
     ]),
-    "1 applied · 1 stale · 1 expired · 1 drifted · 1 unproven · 1 result omitted"
+    "1 applied · 1 orphaned · 1 expired · 1 drifted · 1 unproven · 1 result omitted"
   );
 });
 
 void test("extracts terminal symbols while keeping evidence structured", () => {
   const finding = {
     id: "finding",
+    identity_stability: "strong",
     policy_id: "test.policy",
+    policy_hash: "a".repeat(64),
     severity: "warning",
     message: "Avoid target",
     primary: { path: "app.ts", region: null },
@@ -409,4 +568,29 @@ void test("publishes only the newest run and preserves changes during execution"
     publish: true,
     staleReason: "policy changed"
   });
+});
+
+void test("ignores repeated watcher events only while an authored suppression matches", () => {
+  const tracker = new ExpectedPolicySuppressionWrite();
+  const uri = "file:///workspace/.bifrost/suppressions.json";
+  const expected = '{"suppressions":[]}\r\n';
+
+  tracker.expect(uri, expected);
+  assert.equal(tracker.observe(uri, '{"suppressions":[]}\n'), true);
+  assert.equal(tracker.observe(uri, expected), true);
+  assert.equal(tracker.observe(uri, '{"suppressions":["external"]}\r\n'), false);
+  assert.equal(tracker.isPending(uri), false);
+  assert.equal(tracker.observe(uri, expected), false);
+});
+
+void test("does not consume an authored suppression expectation for another path", () => {
+  const tracker = new ExpectedPolicySuppressionWrite();
+  const uri = "file:///workspace/.bifrost/suppressions.json";
+  const otherUri = "file:///workspace/src/app.ts";
+  const expected = '{"suppressions":[]}\n';
+
+  tracker.expect(uri, expected);
+  assert.equal(tracker.observe(otherUri, "changed"), false);
+  assert.equal(tracker.isPending(uri), true);
+  assert.equal(tracker.observe(uri, expected), true);
 });

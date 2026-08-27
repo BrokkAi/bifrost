@@ -162,12 +162,19 @@ impl BoundedDefinitionLookup for KotlinDefinitionProvider<'_> {
     }
 }
 
+/// Memoized on exact source bytes (#2679): `KotlinCtx`'s per-request file
+/// syntax cache dies with each occurrence, so every declaring file it
+/// inspects was re-parsed once per occurrence of the file under resolution.
+static KOTLIN_TREES: super::TreeParseMemo = super::TreeParseMemo::new();
+
 pub(super) fn parse_kotlin_tree(source: &str) -> Option<Tree> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&crate::analyzer::kotlin::language::LANGUAGE.into())
-        .ok()?;
-    parser.parse(source.as_bytes(), None)
+    KOTLIN_TREES.parse(source, |source| {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&crate::analyzer::kotlin::language::LANGUAGE.into())
+            .ok()?;
+        parser.parse(source.as_bytes(), None)
+    })
 }
 
 pub(crate) fn resolve_kotlin(
@@ -606,11 +613,20 @@ impl<'a> KotlinCtx<'a> {
         (units.len() == 1).then(|| units.remove(0))
     }
 
+    /// The type declarations at `fqn`.
+    ///
+    /// A Kotlin `typealias` counts: `declarations.rs` indexes one as a `Field`
+    /// carrying the alias marker rather than as a class, and a spelled type
+    /// name can resolve to one (issue #2696). The usage scan's target model
+    /// makes the same extension, so navigation and usages cannot disagree
+    /// about whether an alias is a type.
     fn types_named(&self, fqn: &str) -> Vec<CodeUnit> {
         self.support
             .fqn_in_any_language(fqn)
             .into_iter()
-            .filter(|unit| unit.is_class() && !unit.is_synthetic())
+            .filter(|unit| {
+                !unit.is_synthetic() && (unit.is_class() || self.is_kotlin_type_alias(unit))
+            })
             .collect()
     }
 
@@ -1247,6 +1263,15 @@ impl<'a> KotlinCtx<'a> {
     /// about which objects are companions.
     fn is_companion_object(&self, unit: &CodeUnit) -> bool {
         crate::analyzer::usages::kotlin_graph::is_companion_object(self.analyzer, unit)
+    }
+
+    /// Whether `unit` is a Kotlin `typealias`.
+    ///
+    /// The alias marker is the same one the usage scan consults (issue #1239):
+    /// an alias is indexed as a `Field`, so without asking for the marker the
+    /// type tier of this ladder would never see one (issue #2696).
+    fn is_kotlin_type_alias(&self, unit: &CodeUnit) -> bool {
+        crate::analyzer::usages::kotlin_graph::is_kotlin_type_alias(self.analyzer, unit)
     }
 
     /// The declarations enclosing `byte`, innermost first, followed by the

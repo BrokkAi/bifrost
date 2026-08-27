@@ -15,7 +15,6 @@ Bifrost has several interfaces because editor navigation, agent tools, structura
 | “What value can this receiver denote, or which exact member does it select?” | [`receiver_targets`, `points_to`, or `member_targets`](/code-query-tutorials/receiver-traversal/) | Returns a bounded `receiver_analysis` row with explicit precision, ambiguity, unsupported, and budget outcomes for each input. |
 | “Can selected untrusted values reach selected sensitive operations?” | A [taint `.rqlp` policy](/data-flow-and-typestate/#set-oriented-taint) | Compiles typed source and sink sets into compatible shared solves, then reports actual meetings with bounded witnesses and explicit completeness. |
 | “Can this resource or API reach an invalid lifecycle state?” | A [typestate policy or registered typestate query](/data-flow-and-typestate/) | Runs a finite-state protocol over the bounded interprocedural semantic graph and preserves uncertainty and terminal obligations. |
-| “Which code is conceptually about this topic?” | [`semantic_search`](/semantic-search/) | This optional feature retrieves by meaning when names and shapes are not known in advance. |
 | “Where does this literal string occur?” | A text-search tool | Text search is the honest choice when the question is textual rather than structural or semantic. |
 | “Can Bifrost prove path feasibility, complete whole-program points-to, or general unbounded aliasing?” | Do not use the current engine for that proof | Bounded value-flow, taint, and typestate results do not imply those stronger guarantees. |
 

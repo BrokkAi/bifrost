@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::io;
+use std::fs;
+use std::io::{self, Read};
 use std::panic;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -46,7 +47,10 @@ use crate::analyzer::{
     AnalyzerConfig, AnalyzerQueryScope, BIFROST_IGNORE_FILE_NAME, BuildProgressEvent,
     BuildProgressPhase, FilesystemProject, IndexWarmer, MultiRootProject, OverlayProject, Project,
     ProjectFile, PythonAnalyzerConfig, PythonEnvironmentConfig, WorkspaceAnalyzer,
-    packs_document::{WorkspacePacksConfig, load_workspace_packs_config_at},
+    packs_document::{
+        WORKSPACE_PACKS_DOCUMENT_PATH, WorkspacePacksConfig, load_workspace_packs_config_at,
+        workspace_pack_ecosystems,
+    },
     semantic_model::{
         CatalogOpenMode, CatalogOptions, DependencyPackLimits, SemanticModelActivationRequest,
         SemanticModelRuntimeLimits, SemanticPackCatalog,
@@ -70,12 +74,20 @@ use crate::lsp::handlers::{
 };
 use crate::lsp::progress::work_done_progress_message;
 use crate::lsp::request_context::{RequestCancelled, RequestContext};
+use crate::lsp::suppression_authoring::{
+    PolicySuppressionFindingParams, PolicySuppressionSourcePrecondition,
+    PreparePolicySuppressionParams, PreparePolicySuppressionResult,
+};
 use crate::lsp::text_sync::apply_content_changes;
 #[cfg(test)]
 use crate::path_normalization::NormalizePath;
 use crate::policy::{
-    PolicyEvaluationOptions, PolicyReportDocument, PolicySourceDiagnosticSeverity,
-    PolicySourceIdentity, PolicySuppressionOptions, PolicySuppressionSource,
+    AcceptedPolicyHash, CONVENTIONAL_POLICY_SUPPRESSION_PATHS,
+    MAX_POLICY_SUPPRESSION_DOCUMENT_BYTES, MAX_POLICY_SUPPRESSIONS, PolicyEvaluationOptions,
+    PolicyFindingId, PolicyHostActivationContext, PolicyId, PolicyReportDocument,
+    PolicySourceDiagnosticSeverity, PolicySourceIdentity, PolicySuppressionAuthoringInput,
+    PolicySuppressionOptions, PolicySuppressionRecord, PolicySuppressionSource,
+    parse_policy_suppression_document, prepare_policy_suppression_document,
     rqlp_source_completion_at, rqlp_source_help_at, validate_rqlp_source,
 };
 use crate::rql::{
@@ -269,6 +281,7 @@ fn handle_dependency_pack_activation(
         // own; refreshing now would publish against proof about to be replaced.
         return Ok(());
     }
+    state.dependency_pack_activation = Some(activation.clone());
     if let Some(detail) = activation.incomplete_detail.as_deref() {
         // Not an error: the collectors keep their typed suppressions, so an
         // incomplete activation costs recall, never a wrong diagnostic.
@@ -760,6 +773,9 @@ fn handle_request(
     }
     if req.method == RunRqlPolicy::METHOD {
         return handle_run_rql_policy_request(connection, state, req);
+    }
+    if req.method == PreparePolicySuppression::METHOD {
+        return handle_prepare_policy_suppression_request(connection, state, req);
     }
     if req.method == SemanticTokensFullRequest::METHOD {
         return handle_semantic_tokens_request(connection, state, req);
@@ -1284,6 +1300,20 @@ fn handle_run_rql_policy_request(
     // result paths are relative to the active project's report coordinate root.
     let policy_root_uri = path_to_uri_string(&workspace_root);
     let report_root_uri = path_to_uri_string(state.project().root());
+    let dependency_pack_activation = state
+        .dependency_pack_activation
+        .as_ref()
+        .filter(|activation| activation.generation == state.dependency_pack_generation)
+        .cloned()
+        .or_else(|| {
+            if state.dependency_pack_generation != 0 {
+                state
+                    .dependency_packs
+                    .wait_for_generation(state.dependency_pack_generation)
+            } else {
+                None
+            }
+        });
 
     let flow_state = Arc::clone(&state.flow_state);
     start_cancellable_worker(
@@ -1301,18 +1331,33 @@ fn handle_run_rql_policy_request(
         },
         move |workspace, _project, context, cancellation| {
             context.report("Evaluating policy");
-            let outcome =
-                CodeIntelligenceRuntime::new(workspace, flow_state.as_ref(), Some(cancellation))
-                    .evaluate_policy_source(&workspace_root, source_identity, &source, &options)
-                    .map_err(|error| {
-                        if cancellation.is_cancelled() {
-                            CancellableWorkerError::Cancelled
-                        } else {
-                            CancellableWorkerError::Failed(format!(
-                                "Failed to evaluate RQL policy: {error}"
-                            ))
-                        }
-                    })?;
+            let runtime =
+                CodeIntelligenceRuntime::new(workspace, flow_state.as_ref(), Some(cancellation));
+            let runtime = match dependency_pack_activation.as_ref() {
+                Some(activation) if activation.config_error.is_none() => runtime
+                    .with_host_activation_context(PolicyHostActivationContext::new(
+                        activation.config.as_ref(),
+                        activation.activation.as_deref(),
+                        &activation.ecosystems,
+                        activation
+                            .activation
+                            .is_none()
+                            .then_some(activation.incomplete_detail.as_deref())
+                            .flatten(),
+                    )),
+                _ => runtime,
+            };
+            let outcome = runtime
+                .evaluate_policy_source(&workspace_root, source_identity, &source, &options)
+                .map_err(|error| {
+                    if cancellation.is_cancelled() {
+                        CancellableWorkerError::Cancelled
+                    } else {
+                        CancellableWorkerError::Failed(format!(
+                            "Failed to evaluate RQL policy: {error}"
+                        ))
+                    }
+                })?;
             if cancellation.is_cancelled() {
                 return Err(CancellableWorkerError::Cancelled);
             }
@@ -1323,6 +1368,336 @@ fn handle_run_rql_policy_request(
             })
         },
     )
+}
+
+fn handle_prepare_policy_suppression_request(
+    connection: &Connection,
+    state: &ServerState,
+    req: Request,
+) -> Result<(), String> {
+    let id = req.id.clone();
+    let method = req.method.clone();
+    let params =
+        match req.extract::<PreparePolicySuppressionParams>(PreparePolicySuppression::METHOD) {
+            Ok((_, params)) => params,
+            Err(ExtractError::JsonError { error, .. }) => {
+                return send_lsp_error(
+                    connection,
+                    id,
+                    ErrorCode::InvalidParams as i32,
+                    format!("Failed to decode params for {method}: {error}"),
+                );
+            }
+            Err(ExtractError::MethodMismatch(_)) => {
+                return send_lsp_error(
+                    connection,
+                    id,
+                    ErrorCode::MethodNotFound as i32,
+                    format!("Method not implemented: {method}"),
+                );
+            }
+        };
+
+    let result = prepare_policy_suppression(state, params);
+    match result {
+        Ok(result) => {
+            let value = serde_json::to_value(result)
+                .map_err(|error| format!("Failed to serialize suppression edit: {error}"))?;
+            connection
+                .sender
+                .send(Message::Response(Response::new_ok(id, value)))
+                .map_err(|error| format!("Failed to send LSP response: {error}"))
+        }
+        Err(message) => send_lsp_error(connection, id, ErrorCode::InvalidParams as i32, message),
+    }
+}
+
+fn prepare_policy_suppression(
+    state: &ServerState,
+    params: PreparePolicySuppressionParams,
+) -> Result<PreparePolicySuppressionResult, String> {
+    let report_root = uri_to_path(&params.report_root_uri)
+        .ok_or_else(|| "Suppression report root must be a file URI".to_string())?;
+    let report_root = report_root
+        .canonicalize()
+        .map_err(|error| format!("Suppression report root is unavailable: {error}"))?;
+    let project_root = state
+        .project()
+        .root()
+        .canonicalize()
+        .map_err(|error| format!("Active Bifrost project root is unavailable: {error}"))?;
+    if report_root != project_root {
+        return Err("Suppression report root is not the active Bifrost workspace".to_string());
+    }
+
+    validate_open_document_version(
+        state,
+        &params.policy_document_uri,
+        params.policy_document_version,
+        "policy document",
+    )?;
+    if let (Some(source_uri), Some(source_version)) = (
+        params.finding.source_uri.as_ref(),
+        params.finding.source_version,
+    ) {
+        validate_open_document_version(state, source_uri, Some(source_version), "finding source")?;
+    } else if let Some(source_uri) = params.finding.source_uri.as_ref() {
+        validate_open_document_version(state, source_uri, None, "finding source")?;
+    }
+
+    // Resolve the policy URI through the active project as an additional
+    // containment check. This also rejects non-portable policy paths and
+    // avoids accepting an arbitrary URI supplied by an editor client.
+    resolve_run_policy_identity(state.project(), &params.policy_document_uri)?;
+
+    let finding = validate_policy_suppression_finding(&params.finding)?;
+    if let Some(source_uri) = params.finding.source_uri.as_ref() {
+        let expected_source_uri: Uri = path_to_uri_string(&report_root.join(finding.2.as_path()))
+            .parse()
+            .map_err(|_| "Finding source cannot be represented as a file URI".to_string())?;
+        if source_uri != &expected_source_uri {
+            return Err("Finding source URI does not match the reported finding path".to_string());
+        }
+        let source_path = uri_to_path(source_uri)
+            .ok_or_else(|| "Finding source must be a file URI".to_string())?;
+        ensure_path_within_root(&report_root, &source_path)?;
+    }
+    let relative_destination = params.destination.relative_path();
+    let destination = WorkspaceRelativePath::new(relative_destination)
+        .map_err(|error| format!("Invalid suppression destination: {error}"))?;
+    let destination_path = report_root.join(destination.as_path());
+    ensure_path_within_root(&report_root, &destination_path)?;
+    let destination_uri: Uri = path_to_uri_string(&destination_path)
+        .parse()
+        .map_err(|_| "Suppression destination cannot be represented as a file URI".to_string())?;
+
+    let snapshots = snapshot_conventional_suppression_sources(state, &report_root)?;
+    let destination_snapshot = snapshots
+        .iter()
+        .find(|snapshot| snapshot.relative_path == relative_destination)
+        .expect("destination is one of the conventional suppression sources");
+    let create = !destination_snapshot.exists;
+    let existing_source = destination_snapshot.text.clone();
+    let expected_version = destination_snapshot.version;
+    let expected_text = destination_snapshot.text.clone();
+
+    let content = prepare_policy_suppression_document(
+        existing_source.as_deref(),
+        PolicySuppressionAuthoringInput {
+            policy_id: finding.0,
+            finding_id: finding.1,
+            path: Some(finding.2),
+            policy_hash_at_acceptance: Some(finding.3),
+            accepted_at: params.evaluation_date,
+            reason: params.reason,
+            accepted_by: params.accepted_by,
+            expires_at: params.expires_at,
+        },
+    )
+    .map_err(|error| format!("Cannot prepare suppression document: {error}"))?;
+
+    Ok(PreparePolicySuppressionResult {
+        document_uri: destination_uri,
+        expected_version,
+        expected_text,
+        content,
+        create,
+        source_preconditions: snapshots
+            .into_iter()
+            .map(|snapshot| PolicySuppressionSourcePrecondition {
+                path: snapshot.relative_path.to_string(),
+                uri: snapshot.uri,
+                exists: snapshot.exists,
+                expected_version: snapshot.version,
+                expected_text: snapshot.text,
+            })
+            .collect(),
+    })
+}
+
+fn validate_policy_suppression_finding(
+    finding: &PolicySuppressionFindingParams,
+) -> Result<
+    (
+        PolicyId,
+        PolicyFindingId,
+        WorkspaceRelativePath,
+        AcceptedPolicyHash,
+    ),
+    String,
+> {
+    if finding.identity_stability != "strong" {
+        return Err("Only strong policy findings can be suppressed".to_string());
+    }
+    let policy_id = PolicyId::new(&finding.policy_id)
+        .map_err(|error| format!("Invalid suppression policy ID: {error}"))?;
+    let finding_id = finding
+        .finding_id
+        .parse::<PolicyFindingId>()
+        .map_err(|error| format!("Invalid suppression finding ID: {error}"))?;
+    let path = WorkspaceRelativePath::new(&finding.path)
+        .map_err(|error| format!("Invalid suppression finding path: {error}"))?;
+    let policy_hash = finding
+        .policy_hash
+        .parse::<AcceptedPolicyHash>()
+        .map_err(|error| format!("Invalid suppression policy hash: {error}"))?;
+    Ok((policy_id, finding_id, path, policy_hash))
+}
+
+struct ConventionalSuppressionSnapshot {
+    relative_path: &'static str,
+    uri: Uri,
+    exists: bool,
+    version: Option<i32>,
+    text: Option<String>,
+}
+
+fn snapshot_conventional_suppression_sources(
+    state: &ServerState,
+    report_root: &Path,
+) -> Result<Vec<ConventionalSuppressionSnapshot>, String> {
+    let mut snapshots = Vec::with_capacity(CONVENTIONAL_POLICY_SUPPRESSION_PATHS.len());
+    let mut claimed: HashMap<(PolicyId, PolicyFindingId), (&str, PolicySuppressionRecord)> =
+        HashMap::new();
+    let mut total_records = 0_usize;
+    for relative_path in CONVENTIONAL_POLICY_SUPPRESSION_PATHS {
+        let path = report_root.join(relative_path);
+        ensure_path_within_root(report_root, &path)?;
+        let uri: Uri = path_to_uri_string(&path).parse().map_err(|_| {
+            "Configured suppression path cannot be represented as a URI".to_string()
+        })?;
+        let (exists, version, text) = if let Some(open) = state.open_documents.get(uri.as_str()) {
+            (true, Some(open.version), Some(open.text.clone()))
+        } else {
+            let text = read_bounded_text(&path).map_err(|error| {
+                format!("Failed to read suppression source {relative_path}: {error}")
+            })?;
+            (text.is_some(), None, text)
+        };
+        if let Some(text) = text.as_deref() {
+            let document = parse_policy_suppression_document(text).map_err(|error| {
+                format!("Cannot author suppression while {relative_path} is invalid: {error}")
+            })?;
+            total_records = total_records.saturating_add(document.suppressions().len());
+            if total_records > MAX_POLICY_SUPPRESSIONS {
+                return Err(format!(
+                    "Configured suppression sources hold {total_records} records, exceeding {MAX_POLICY_SUPPRESSIONS}"
+                ));
+            }
+            for record in document.suppressions() {
+                let key = (record.policy_id().clone(), record.finding_id());
+                if let Some((first_path, first_record)) = claimed.get(&key) {
+                    let terms = if first_record == record {
+                        "identical"
+                    } else {
+                        "conflicting"
+                    };
+                    return Err(format!(
+                        "Cannot author suppression: {relative_path} has {terms} record for policy {} finding {} already present in {first_path}",
+                        record.policy_id(),
+                        record.finding_id()
+                    ));
+                }
+                claimed.insert(key, (relative_path, record.clone()));
+            }
+        }
+        snapshots.push(ConventionalSuppressionSnapshot {
+            relative_path,
+            uri,
+            exists,
+            version,
+            text,
+        });
+    }
+    Ok(snapshots)
+}
+
+fn read_bounded_text(path: &Path) -> io::Result<Option<String>> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata()?;
+    if metadata.len() > MAX_POLICY_SUPPRESSION_DOCUMENT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("document exceeds {MAX_POLICY_SUPPRESSION_DOCUMENT_BYTES} bytes"),
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_POLICY_SUPPRESSION_DOCUMENT_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_POLICY_SUPPRESSION_DOCUMENT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("document exceeds {MAX_POLICY_SUPPRESSION_DOCUMENT_BYTES} bytes"),
+        ));
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn validate_open_document_version(
+    state: &ServerState,
+    uri: &Uri,
+    expected_version: Option<i32>,
+    label: &str,
+) -> Result<(), String> {
+    let Some(document) = state.open_documents.get(uri.as_str()) else {
+        return Ok(());
+    };
+    let Some(expected_version) = expected_version else {
+        return Err(format!(
+            "{label} is open at version {}; retry with that version",
+            document.version
+        ));
+    };
+    if expected_version != document.version {
+        return Err(format!(
+            "{label} is stale: requested version {expected_version}, current version {}",
+            document.version
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_path_within_root(root: &Path, path: &Path) -> Result<(), String> {
+    let mut candidate = path;
+    loop {
+        match candidate.canonicalize() {
+            Ok(canonical) => {
+                if canonical.strip_prefix(root).is_err() {
+                    return Err("Suppression destination escapes the report root".to_string());
+                }
+                return Ok(());
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                candidate = candidate
+                    .parent()
+                    .ok_or_else(|| "Suppression destination has no existing parent".to_string())?;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Cannot validate suppression destination {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+}
+
+fn send_lsp_error(
+    connection: &Connection,
+    id: RequestId,
+    code: i32,
+    message: String,
+) -> Result<(), String> {
+    connection
+        .sender
+        .send(Message::Response(Response::new_err(id, code, message)))
+        .map_err(|error| format!("Failed to send LSP response: {error}"))
 }
 
 fn resolve_run_policy_identity(
@@ -1403,6 +1778,7 @@ fn run_rql_query_result(
                     CodeQueryResultValue::ReferenceSite { value } => &value.path,
                     CodeQueryResultValue::CallSite { value } => &value.path,
                     CodeQueryResultValue::ExpressionSite { value } => &value.path,
+                    CodeQueryResultValue::JsxAttributeValue { value } => &value.path,
                     CodeQueryResultValue::ReceiverAnalysis { value } => &value.path,
                     CodeQueryResultValue::ReceiverOutcome { value } => &value.path,
                     CodeQueryResultValue::MemberSelection { value } => &value.path,
@@ -1417,6 +1793,7 @@ fn run_rql_query_result(
                     CodeQueryResultValue::ProcedureEffect { value } => &value.path,
                     CodeQueryResultValue::CallableSignature { value } => &value.path,
                     CodeQueryResultValue::SignatureParameter { value } => &value.path,
+                    CodeQueryResultValue::DecoratedParameter { value } => &value.path,
                     CodeQueryResultValue::CallableApplicability { value } => &value.path,
                     CodeQueryResultValue::OverloadSelection { value } => &value.path,
                     CodeQueryResultValue::Occurrence { value } => &value.path,
@@ -1982,6 +2359,13 @@ fn handle_notification(
                         DidChangeWatchedFiles::METHOD
                     )
                 })?;
+            let packs_document_changed = state.active_roots.first().is_some_and(|root| {
+                let packs_path = root.analyzer_path.join(WORKSPACE_PACKS_DOCUMENT_PATH);
+                params
+                    .changes
+                    .iter()
+                    .any(|change| uri_to_path(&change.uri).is_some_and(|path| path == packs_path))
+            });
             let bifrostignore_changed = params.changes.iter().any(|change| {
                 uri_to_path(&change.uri).is_some_and(|path| {
                     path.file_name()
@@ -2032,6 +2416,13 @@ fn handle_notification(
                     publish_diagnostics_for_state(connection, state, &uri)?;
                 }
             }
+            if packs_document_changed {
+                state.packs_config = load_lsp_packs_config(&state.active_roots);
+                state.schedule_dependency_pack_activation();
+                for uri in state.published_diagnostic_uris.clone() {
+                    publish_diagnostics_for_state(connection, state, &uri)?;
+                }
+            }
             Ok(())
         }
         DidChangeWorkspaceFolders::METHOD => {
@@ -2067,18 +2458,25 @@ fn handle_notification(
 /// Send a `textDocument/publishDiagnostics` notification with the current
 /// configuration-gated diagnostic report for `uri`. We always send — even
 /// when the diagnostic list is empty — so clients clear stale diagnostics.
+///
+/// `version` is the open-document version the report was computed against,
+/// when the document is open. Background refreshes (e.g. a completed
+/// dependency-pack activation) republish for already-published URIs, so a
+/// client — and the integration tests — can otherwise not tell a stale
+/// report from the response to their latest edit.
 fn publish_diagnostics(
     connection: &Connection,
     workspace: &WorkspaceAnalyzer,
     project: &dyn Project,
     uri: &Uri,
+    version: Option<i32>,
     include_semantic_diagnostics: bool,
 ) -> Result<(), String> {
     let diagnostics = diagnostic::collect(workspace, project, uri, include_semantic_diagnostics);
     let params = PublishDiagnosticsParams {
         uri: uri.clone(),
         diagnostics,
-        version: None,
+        version,
     };
     let note = Notification::new(PublishDiagnostics::METHOD.to_string(), params);
     connection
@@ -2092,11 +2490,16 @@ fn publish_diagnostics_for_state(
     state: &mut ServerState,
     uri: &Uri,
 ) -> Result<(), String> {
+    let version = state
+        .open_documents
+        .get(uri.as_str())
+        .map(|document| document.version);
     publish_diagnostics(
         connection,
         &state.workspace,
         state.project(),
         uri,
+        version,
         state.runtime_configuration.unrecognized_symbol_diagnostics,
     )?;
     state.remember_published_diagnostic_uri(uri);
@@ -2143,11 +2546,6 @@ fn apply_runtime_configuration_value(
     if semantic_diagnostics_changed {
         if state.runtime_configuration.unrecognized_symbol_diagnostics {
             state.schedule_dependency_pack_activation();
-        } else {
-            // Turning the opt-in off makes any in-flight discovery pointless.
-            // Cancelling is safe by contract: a cancelled activation publishes
-            // nothing and therefore cannot clobber a prior complete overlay.
-            state.dependency_packs.cancel();
         }
         for uri in state.published_diagnostic_uris.clone() {
             publish_diagnostics_for_state(connection, state, &uri)?;
@@ -2192,7 +2590,10 @@ pub(crate) struct ServerState {
     /// it. Presence of the document is itself an activation opt-in; it also
     /// narrows activation to its named ecosystems and names the shared
     /// catalog every entry point uses.
-    packs_config: Option<(PathBuf, WorkspacePacksConfig)>,
+    packs_config: Result<Option<(PathBuf, WorkspacePacksConfig)>, String>,
+    /// The activation completion for dependency_pack_generation, when it has
+    /// arrived. Requests use only this generation-matched result.
+    dependency_pack_activation: Option<DependencyPackActivation>,
     /// The `OverlayProject` is shared with the analyzer (via `Arc<dyn Project>`
     /// inside `WorkspaceAnalyzer`) and with request-time read paths in
     /// `handlers::util::read_document_for_uri`. did{Open,Change,Close}
@@ -2367,6 +2768,17 @@ impl lsp_types::request::Request for RunRqlPolicy {
     type Result = serde_json::Value;
 
     const METHOD: &'static str = "bifrost/runPolicy";
+}
+
+/// Prepare a canonical suppression document for an editor WorkspaceEdit.
+/// This request never writes the destination itself.
+enum PreparePolicySuppression {}
+
+impl lsp_types::request::Request for PreparePolicySuppression {
+    type Params = PreparePolicySuppressionParams;
+    type Result = PreparePolicySuppressionResult;
+
+    const METHOD: &'static str = "bifrost/preparePolicySuppression";
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -2982,6 +3394,7 @@ impl ServerState {
             dependency_packs: DependencyPackActivator::new(),
             dependency_pack_generation: 0,
             packs_config,
+            dependency_pack_activation: None,
             overlay,
             completion_cache: completion::CompletionCache::new(),
             rejected_didchange_log: ThrottledLog::new(
@@ -3009,38 +3422,40 @@ impl ServerState {
     }
 
     /// Queue a background dependency-pack activation for the current snapshot
-    /// (#1628, #1868). Two opt-ins reach this path: the workspace packs
-    /// document, which also narrows the ecosystems and names the shared
-    /// catalog, and the legacy `unrecognized_symbol_diagnostics` client
-    /// setting, which activates every present-language ecosystem into an
-    /// ephemeral catalog. Without either, activation would be pure cost.
+    /// (#1628, #1868). Compatible discovered packs are enabled by default;
+    /// a valid workspace document narrows ecosystems and names the shared
+    /// catalog, while an explicit empty ecosystem list records a disabled
+    /// generation without starting a worker.
     ///
     /// Never called from a request handler. A diagnostic that arrives before
     /// the activation lands reports the collectors' typed suppressions, which
     /// is the correct answer for a session that cannot yet see its
     /// dependencies.
     fn schedule_dependency_pack_activation(&mut self) {
-        if self.packs_config.is_none()
-            && !self.runtime_configuration.unrecognized_symbol_diagnostics
-        {
-            return;
-        }
-        let languages = self.workspace.analyzer().languages();
-        let mut ecosystems = dependency_packs::ecosystems_for_languages(&languages);
-        let mut catalog_root = None;
-        if let Some((root, config)) = self.packs_config.as_ref() {
-            ecosystems.retain(|ecosystem| config.ecosystems().contains(ecosystem));
-            catalog_root = config.catalog().map(|relative| root.join(relative));
-        }
-        if ecosystems.is_empty() {
-            return;
-        }
+        let (packs_config, config_error) = match &self.packs_config {
+            Ok(Some((_, config))) => (Some(config.clone()), None),
+            Ok(None) => (None, None),
+            Err(error) => (None, Some(error.clone())),
+        };
+        let ecosystems = if config_error.is_some() {
+            Vec::new()
+        } else {
+            workspace_pack_ecosystems(&self.workspace, packs_config.as_ref())
+        };
+        let workspace_root = self
+            .active_roots
+            .first()
+            .map(|root| root.analyzer_path.clone())
+            .unwrap_or_else(|| self.configuration_base.clone());
         self.dependency_pack_generation = self.dependency_packs.schedule(
             Arc::new(self.workspace.clone()),
             lsp_analyzer_config(self.python_pack.as_ref()),
             ecosystems,
-            catalog_root,
+            workspace_root,
+            packs_config,
+            config_error,
         );
+        self.dependency_pack_activation = self.dependency_packs.current_completion();
     }
 
     /// Withdraw published pack proof for the ecosystems whose declared
@@ -3521,16 +3936,18 @@ impl Project for ScopedProject {
 /// its other workspace conventions.
 fn load_lsp_packs_config(
     active_roots: &[WorkspaceRoot],
-) -> Option<(PathBuf, WorkspacePacksConfig)> {
-    let root = &active_roots.first()?.analyzer_path;
+) -> Result<Option<(PathBuf, WorkspacePacksConfig)>, String> {
+    let Some(root) = active_roots.first().map(|root| &root.analyzer_path) else {
+        return Ok(None);
+    };
     match load_workspace_packs_config_at(root) {
-        Ok(Some(config)) => Some((root.clone(), config)),
-        Ok(None) => None,
+        Ok(Some(config)) => Ok(Some((root.clone(), config))),
+        Ok(None) => Ok(None),
         Err(error) => {
             eprintln!(
                 "[bifrost-lsp] workspace packs document is invalid, no packs were activated: {error}"
             );
-            None
+            Err(error.to_string())
         }
     }
 }
@@ -4591,6 +5008,102 @@ mod tests {
                 path_to_uri_string(&expected_root.join("main.ts")),
                 path_to_uri_string(&expected_root.join("helper.ts")),
             ]))
+        );
+    }
+
+    #[test]
+    fn rql_query_transport_preserves_decorated_parameter_result_fields() {
+        use crate::rql::{CodeQueryDecoratedParameter, CodeQueryRange, CodeQueryResult};
+
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("main.ts"),
+            "class Controller { handle(@Query value: string) {} }\n",
+        )
+        .unwrap();
+        let project: Arc<dyn Project> = Arc::new(FilesystemProject::new(temp.path()).unwrap());
+        let workspace = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
+            .expect("ephemeral workspace should build");
+        let parameter_range = CodeQueryRange {
+            start_line: 1,
+            start_column: 26,
+            end_line: 1,
+            end_column: 46,
+        };
+        let decorator_range = CodeQueryRange {
+            start_line: 1,
+            start_column: 26,
+            end_line: 1,
+            end_column: 32,
+        };
+        let response = CodeQueryResponse::Results(CodeQueryResult {
+            results: vec![CodeQueryResultItem {
+                value: CodeQueryResultValue::DecoratedParameter {
+                    value: Box::new(CodeQueryDecoratedParameter {
+                        id: "decorated-parameter".to_string(),
+                        parameter_id: "parameter".to_string(),
+                        decorator_id: Some("decorator".to_string()),
+                        path: "main.ts".to_string(),
+                        language: "typescript",
+                        range: parameter_range,
+                        decorator_range,
+                        owner_id: Some("Controller.handle".to_string()),
+                        procedure_id: Some("procedure".to_string()),
+                        parameter_ordinal: Some(0),
+                        port_id: Some("procedure:parameter:0".to_string()),
+                        decorator_name: "Query".to_string(),
+                        local_name: Some("NestQuery".to_string()),
+                        imported_name: Some("Query".to_string()),
+                        module: Some("@nestjs/common".to_string()),
+                        binding_status: "resolved",
+                        boundary: "external",
+                        completion: "complete",
+                        coverage: "complete",
+                        reason: None,
+                        terminal: true,
+                    }),
+                },
+                provenance: Vec::new(),
+                provenance_truncated: false,
+            }],
+            truncated: false,
+            diagnostics: Vec::new(),
+        });
+
+        let value = serde_json::to_value(run_rql_query_result(&workspace, response)).unwrap();
+        let expected_root = workspace.analyzer().project().root();
+        assert_eq!(
+            value.pointer("/results/0/uri"),
+            Some(&json!(path_to_uri_string(&expected_root.join("main.ts"))))
+        );
+        assert_eq!(
+            value.pointer("/results/0/result_type"),
+            Some(&json!("decorated_parameter"))
+        );
+        assert_eq!(
+            value.pointer("/results/0/range"),
+            Some(&serde_json::to_value(parameter_range).unwrap())
+        );
+        assert_eq!(
+            value.pointer("/results/0/decorator_range"),
+            Some(&serde_json::to_value(decorator_range).unwrap())
+        );
+        assert_eq!(
+            value.pointer("/results/0/parameter_ordinal"),
+            Some(&json!(0))
+        );
+        assert_eq!(
+            value.pointer("/results/0/port_id"),
+            Some(&json!("procedure:parameter:0"))
+        );
+        assert_eq!(
+            value.pointer("/results/0/module"),
+            Some(&json!("@nestjs/common"))
+        );
+        assert_eq!(
+            value.pointer("/results/0/provenance"),
+            None,
+            "empty provenance remains omitted from transport output"
         );
     }
 

@@ -774,6 +774,7 @@ impl ExtensionWorkspace {
                         )
                         .into_boxed_str(),
                         evidence: Box::new([]),
+                        reason_summary: None,
                     }
                 }));
             }
@@ -804,12 +805,76 @@ impl ExtensionWorkspace {
                 // value-flow analysis could see, not of any caller limit: it is
                 // a frontier, and raising every budget returns it again.
                 if snapshot.coverage() != CandidateCoverage::Exhaustive {
+                    let semantic_gaps = snapshot
+                        .procedure()
+                        .semantics()
+                        .gaps()
+                        .iter()
+                        .filter(|gap| {
+                            brokk_bifrost_analysis::analyzer::semantic::workspace_oracle::gap_impacts_value_flow(
+                                gap,
+                            ) && !snapshot.gap_is_discharged(gap.id)
+                        })
+                        .map(|gap| {
+                            let evidence = procedure
+                                .evidence_row(gap.evidence)
+                                .expect("validated semantic-gap evidence");
+                            SemanticGapReason {
+                                capability: gap.capability.label().into(),
+                                kind: gap.kind.label().into(),
+                                impacts: gap
+                                    .impacts
+                                    .iter()
+                                    .map(|impact| impact.label().into())
+                                    .collect(),
+                                subject: gap.subject.label().into(),
+                                detail: gap.detail.clone(),
+                                span: source_span(gap.source),
+                                evidence: SemanticEvidence {
+                                    kind: "semantic_gap".into(),
+                                    mappings: evidence
+                                        .sources
+                                        .iter()
+                                        .copied()
+                                        .map(source_span)
+                                        .collect(),
+                                    proof: match &evidence.proof {
+                                        ProofStatus::Proven => SemanticProof::Proven,
+                                        ProofStatus::Unproven(reason) => {
+                                            SemanticProof::Unproven {
+                                                reason: reason.clone(),
+                                            }
+                                        }
+                                    },
+                                    completeness: match &evidence.completeness {
+                                        EvidenceCompleteness::Complete => {
+                                            SemanticRelationCompleteness::Complete
+                                        }
+                                        EvidenceCompleteness::Partial(reason) => {
+                                            SemanticRelationCompleteness::Partial {
+                                                reason: reason.clone(),
+                                            }
+                                        }
+                                    },
+                                },
+                            }
+                        })
+                        .collect::<Vec<_>>();
                     relation_boundaries.push(SemanticRelationBoundary {
                         kind: SemanticRelationBoundaryKind::MissingSemantics,
                         at: None,
                         relations: vec![SemanticRelationKind::ValueDependence].into_boxed_slice(),
                         message: "value-flow candidate coverage is not exhaustive".into(),
                         evidence: Box::new([]),
+                        reason_summary: if semantic_gaps.is_empty() {
+                            None
+                        } else {
+                            Some(
+                                SemanticGapReasonSummary::new(semantic_gaps).map_err(|error| {
+                                    ExtensionError::Execution(error.to_string().into_boxed_str())
+                                })?,
+                            )
+                        },
                     });
                 }
                 for relation in snapshot
@@ -898,6 +963,7 @@ impl ExtensionWorkspace {
                 relations: request.relations.clone(),
                 message: format!("{} exhausted", dimension.limit).into_boxed_str(),
                 evidence: Box::new([]),
+                reason_summary: None,
             })
             .collect::<Vec<_>>();
         // Frontier boundaries are carried alongside, never folded into the

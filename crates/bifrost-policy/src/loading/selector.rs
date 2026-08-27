@@ -121,6 +121,19 @@ pub(crate) fn resolve_parsed_selector(
                 referenced: Some(referenced),
             })
         }
+        PolicySelector::Rows { plan } => {
+            let selector = ResolvedPolicySelector::try_new_rows(
+                selector_path,
+                plan.clone(),
+                SelectorOrigin::Document {
+                    source: parsed.identity().clone(),
+                },
+            )?;
+            Ok(ResolvedSelectorLoad {
+                selector,
+                referenced: None,
+            })
+        }
     }
 }
 

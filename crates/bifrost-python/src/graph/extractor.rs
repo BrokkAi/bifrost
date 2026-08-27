@@ -2,6 +2,11 @@
 //! per-file walk that proves a reference, and the receiver-type facts both this
 //! and the inverted walk resolve through.
 
+use crate::bindings::{
+    PythonLexicalNameResolution, python_comprehension_binds_name_at,
+    python_is_type_parameter_binder, python_name_resolution_at,
+    python_type_parameter_binds_name_at,
+};
 use crate::graph::PythonGraphSource;
 use crate::graph::hits::{
     record_hit, record_import_hit, record_self_receiver_hit, record_unproven_hit,
@@ -10,11 +15,13 @@ use crate::graph::resolver::{
     annotation_class_qualifier_site, annotation_reference_candidates, member_name,
     normalized_receiver_type, receiver_annotation_matches_target,
     resolve_callable_parameter_default_types, resolve_constructor_types, resolve_receiver_type,
-    resolved_member_declarations, target_owner_code_unit, top_level_identifier,
+    resolve_visible_named_import_candidates, resolved_member_declarations, target_owner_code_unit,
+    top_level_identifier,
 };
 use crate::graph_support::{PythonSource, PythonUsageSource};
 use crate::imports::{
-    PythonImportBinding, imported_module_assignment_at, parse_python_import_bindings,
+    PythonImportBinding, PythonImportDetails, imported_module_assignment_at,
+    parse_python_import_bindings, python_import_details, python_import_infos_from_node,
     resolve_fqn_candidates, resolve_python_relative_module,
 };
 use crate::usage_index::{
@@ -453,6 +460,20 @@ impl ScanCtx<'_> {
     }
 
     fn binds_target(&self, ident: &str, node: Node<'_>) -> bool {
+        if python_comprehension_binds_name_at(ident, node, self.source)
+            || python_type_parameter_binds_name_at(ident, node, self.source)
+        {
+            return false;
+        }
+        if self.target_self_file && ident == self.target_short {
+            match python_name_resolution_at(ident, node, self.source) {
+                PythonLexicalNameResolution::Global => return true,
+                PythonLexicalNameResolution::Local | PythonLexicalNameResolution::Nonlocal => {
+                    return false;
+                }
+                PythonLexicalNameResolution::Unbound => {}
+            }
+        }
         let scope_entry = self.scope_entry_for_node(node);
         if self.target_self_file
             && ident == self.target_short
@@ -632,6 +653,20 @@ impl ScanCtx<'_> {
         if self.target_member.is_some() {
             return self.module_binding_targets_symbol(ident, node);
         }
+        if self.target_is_module
+            && imported_module_bindings(self, node, node)
+                .into_iter()
+                .flat_map(|binding| {
+                    usage_resolve_module_files(self.python, self.file, &binding.module)
+                })
+                .any(|resolved| &resolved == self.target_source)
+        {
+            // Unaliased dotted imports are cumulative: `import pkg`, followed
+            // by `import pkg.a`, still leaves the bare `pkg` binding naming the
+            // root module. The classified single-binding timeline cannot keep
+            // that fact once a later dotted import shares the same local.
+            return true;
+        }
         if let Some(matches) = self.function_import_binding_targets_query(ident, node) {
             return matches;
         }
@@ -704,6 +739,12 @@ impl ScanCtx<'_> {
             .rposition(|event| !event.conditional)
             .unwrap_or(0);
         visible[start..].iter().any(|event| matches(event.kind))
+    }
+
+    fn module_binding_is_local_at(&self, ident: &str, node: Node<'_>) -> bool {
+        self.module_binding_matches_query(ident, node, false, |kind| {
+            kind == ModuleBindingKind::Other
+        })
     }
 
     /// Whether the class enclosing `node` is the target member's owner (or a
@@ -996,11 +1037,44 @@ fn handle_keyword_argument_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         ctx.scope_facts_for_node(function)
             .is_some_and(|facts| facts.is_shadowed(slice(root, ctx.source)))
     });
-    if root_shadowed && !scoped_callee_matches && !default_callee_matches {
+    let named_import_callee_matches = if !root_shadowed && function.kind() == "identifier" {
+        let cutoff = if reference_is_deferred_function_body(function) {
+            usize::MAX
+        } else {
+            function.start_byte()
+        };
+        resolve_visible_named_import_candidates(
+            ctx.graph,
+            ctx.python,
+            ctx.file,
+            ctx.raw_module_bindings,
+            slice(function, ctx.source),
+            cutoff,
+        )
+        .into_iter()
+        .any(|class| {
+            &class == target_owner
+                || ctx
+                    .graph
+                    .hierarchy
+                    .map(|provider| provider.get_ancestors(&class))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .any(|ancestor| &ancestor == target_owner)
+        })
+    } else {
+        false
+    };
+    if root_shadowed
+        && !scoped_callee_matches
+        && !default_callee_matches
+        && !named_import_callee_matches
+    {
         return;
     }
     let matches = scoped_callee_matches
         || default_callee_matches
+        || named_import_callee_matches
         || (!root_shadowed
             && resolve_constructor_types(ctx.graph, ctx.python, ctx.file, ctx.source, function)
                 .into_iter()
@@ -1086,8 +1160,16 @@ fn handle_identifier_candidate(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
     if !ctx.binds_target(text, node) {
         return;
     }
+    // A named submodule import (`from pkg import models`) binds the module,
+    // not every top-level declaration exported by that module. The same
+    // binding is valid as the structured receiver in `models.Model`, but a
+    // bare `models` read is a reference to the module itself.
+    if !ctx.target_is_module && imported_root_targets_module(ctx, node, node) {
+        return;
+    }
     if !ctx.target_is_module
         && ctx.edges.iter().any(|edge| edge.local_name == text)
+        && !ctx.module_binding_is_local_at(text, node)
         && !ctx.module_binding_targets_symbol(text, node)
     {
         return;
@@ -1791,29 +1873,43 @@ fn is_call_callee(node: Node<'_>) -> bool {
 }
 
 pub fn is_declaration_identifier(node: Node<'_>) -> bool {
-    let Some(parent) = node.parent() else {
-        return false;
-    };
     let contains = |container: Node<'_>| {
         container.start_byte() <= node.start_byte() && node.end_byte() <= container.end_byte()
     };
-    match parent.kind() {
-        "class_definition" | "function_definition" => parent
-            .child_by_field_name("name")
-            .is_some_and(|name| name.id() == node.id()),
-        "parameters" | "lambda_parameters" | "list_splat_pattern" | "dictionary_splat_pattern" => {
-            true
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            "class_definition" | "function_definition" => {
+                return parent
+                    .child_by_field_name("name")
+                    .is_some_and(|name| name.id() == node.id())
+                    || python_is_type_parameter_binder(node);
+            }
+            "parameters"
+            | "lambda_parameters"
+            | "list_splat_pattern"
+            | "dictionary_splat_pattern" => return true,
+            "default_parameter" | "typed_parameter" | "typed_default_parameter" => {
+                return parent.child_by_field_name("name").is_some_and(contains);
+            }
+            "assignment" | "augmented_assignment" | "for_statement" | "for_in_clause" => {
+                return parent.child_by_field_name("left").is_some_and(contains);
+            }
+            "named_expression" => {
+                return parent.child_by_field_name("name").is_some_and(contains);
+            }
+            "aliased_import" | "import_from_statement" | "import_statement" => return true,
+            "pattern_list"
+            | "tuple_pattern"
+            | "list_pattern"
+            | "parenthesized_expression"
+            | "type"
+            | "type_parameter"
+            | "constrained_type" => current = parent,
+            _ => return false,
         }
-        "default_parameter" | "typed_parameter" | "typed_default_parameter" => {
-            parent.child_by_field_name("name").is_some_and(contains)
-        }
-        "assignment" | "augmented_assignment" | "for_statement" | "for_in_clause" => {
-            parent.child_by_field_name("left").is_some_and(contains)
-        }
-        "named_expression" => parent.child_by_field_name("name").is_some_and(contains),
-        "aliased_import" | "import_from_statement" | "import_statement" => true,
-        _ => false,
     }
+    false
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1893,68 +1989,59 @@ fn collect_import_binding_events(
     source: &str,
     timeline: &mut ModuleBindingTimeline,
 ) {
-    if node.kind() == "import_statement" {
-        let mut cursor = node.walk();
-        for imported in node.children_by_field_name("name", &mut cursor) {
-            let name = imported.child_by_field_name("name").unwrap_or(imported);
-            let Some(local) = imported
-                .child_by_field_name("alias")
-                .or_else(|| first_identifier(name))
-            else {
-                continue;
-            };
-            let module = slice(name, source).trim();
-            let consumed_attributes = if imported.child_by_field_name("alias").is_some() {
-                0
-            } else {
-                parse_symbol_path(Language::Python, module)
-                    .len()
-                    .saturating_sub(1)
-            };
-            record_module_binding(
-                timeline,
-                slice(local, source),
-                node.end_byte(),
-                binding_is_conditional(node),
-                ModuleBindingEventKind::ImportModule {
-                    module: module.to_string(),
-                    consumed_attributes,
-                },
-            );
-        }
-        return;
-    }
-
-    let Some(module_node) = node.child_by_field_name("module_name") else {
-        return;
-    };
-    let module = slice(module_node, source).trim();
-    let mut cursor = node.walk();
-    for imported in node.children_by_field_name("name", &mut cursor) {
-        if imported.kind() == "wildcard_import" {
-            continue;
-        }
-        let name = imported.child_by_field_name("name").unwrap_or(imported);
-        let Some(imported_identifier) = last_identifier(name) else {
+    for import in python_import_infos_from_node(node, source) {
+        let Some(details) = python_import_details(&import) else {
             continue;
         };
-        let imported_name = slice(imported_identifier, source).trim();
-        let Some(local) = imported
-            .child_by_field_name("alias")
-            .or_else(|| last_identifier(name))
-        else {
-            continue;
-        };
-        record_module_binding(
-            timeline,
-            slice(local, source),
-            node.end_byte(),
-            binding_is_conditional(node),
-            ModuleBindingEventKind::FromImport {
-                module: module.to_string(),
-                imported_name: imported_name.to_string(),
-            },
-        );
+        match details {
+            PythonImportDetails::Import { module, alias } => {
+                let Some(local) = import.local_name() else {
+                    continue;
+                };
+                let consumed_attributes = if alias.is_some() {
+                    0
+                } else {
+                    import
+                        .path
+                        .as_ref()
+                        .map(|path| path.segments.len().saturating_sub(1))
+                        .unwrap_or(0)
+                };
+                record_module_binding(
+                    timeline,
+                    local,
+                    node.end_byte(),
+                    binding_is_conditional(node),
+                    ModuleBindingEventKind::ImportModule {
+                        module,
+                        consumed_attributes,
+                    },
+                );
+            }
+            PythonImportDetails::FromImport {
+                module,
+                name,
+                wildcard,
+                ..
+            } => {
+                if wildcard {
+                    continue;
+                }
+                let Some(local) = import.local_name() else {
+                    continue;
+                };
+                record_module_binding(
+                    timeline,
+                    local,
+                    node.end_byte(),
+                    binding_is_conditional(node),
+                    ModuleBindingEventKind::FromImport {
+                        module,
+                        imported_name: name,
+                    },
+                );
+            }
+        }
     }
 }
 
@@ -2111,37 +2198,7 @@ fn binding_is_conditional(mut node: Node<'_>) -> bool {
     false
 }
 
-fn first_identifier(node: Node<'_>) -> Option<Node<'_>> {
-    identifier_extreme(node, false)
-}
-
-fn last_identifier(node: Node<'_>) -> Option<Node<'_>> {
-    identifier_extreme(node, true)
-}
-
-fn identifier_extreme(node: Node<'_>, last: bool) -> Option<Node<'_>> {
-    let mut best = None;
-    let mut stack = vec![node];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "identifier" {
-            if best.is_none_or(|current: Node<'_>| {
-                if last {
-                    node.start_byte() > current.start_byte()
-                } else {
-                    node.start_byte() < current.start_byte()
-                }
-            }) {
-                best = Some(node);
-            }
-            continue;
-        }
-        let mut cursor = node.walk();
-        stack.extend(node.named_children(&mut cursor));
-    }
-    best
-}
-
-fn reference_is_deferred_function_body(node: Node<'_>) -> bool {
+pub(super) fn reference_is_deferred_function_body(node: Node<'_>) -> bool {
     let site_start = node.start_byte();
     let site_end = node.end_byte();
     let mut current = node;
@@ -2217,6 +2274,10 @@ fn collect_imported_factory_return_types(
         for unit in units {
             if unit.is_function() {
                 if let Some(return_type) = callable_return_type_name(graph, python, &unit) {
+                    let return_type =
+                        resolve_receiver_type(graph, python, unit.source(), &return_type, true)
+                            .map(|unit| unit.fq_name())
+                            .unwrap_or(return_type);
                     factory_return_types
                         .entry(local.clone())
                         .or_insert(return_type);
@@ -3120,6 +3181,13 @@ fn receiver_type_from_annotation_node(annotation: Node<'_>, source: &str) -> Opt
                 let parameter = annotation.named_child(1)?;
                 return receiver_type_from_annotation_node(parameter.named_child(0)?, source);
             }
+            if runtime_type_annotation_wrapper(base, source) {
+                let parameter = annotation.named_child(1)?;
+                return receiver_type_from_annotation_node(
+                    parameter.named_child(0).unwrap_or(parameter),
+                    source,
+                );
+            }
             receiver_type_from_annotation_node(base, source)
         }
         "subscript" => {
@@ -3128,9 +3196,32 @@ fn receiver_type_from_annotation_node(annotation: Node<'_>, source: &str) -> Opt
                 let inner = annotation.child_by_field_name("subscript")?;
                 return receiver_type_from_annotation_node(inner, source);
             }
+            if runtime_type_annotation_wrapper(value, source) {
+                let inner = annotation.child_by_field_name("subscript")?;
+                return receiver_type_from_annotation_node(inner, source);
+            }
             normalized_receiver_type(slice(value, source).trim())
         }
         _ => None,
+    }
+}
+
+fn runtime_type_annotation_wrapper(node: Node<'_>, source: &str) -> bool {
+    match node.kind() {
+        "identifier" => matches!(slice(node, source), "type" | "Type"),
+        "attribute" => {
+            let (Some(object), Some(attribute)) = (
+                node.child_by_field_name("object"),
+                node.child_by_field_name("attribute"),
+            ) else {
+                return false;
+            };
+            object.kind() == "identifier"
+                && attribute.kind() == "identifier"
+                && slice(object, source) == "typing"
+                && slice(attribute, source) == "Type"
+        }
+        _ => false,
     }
 }
 

@@ -813,12 +813,20 @@ fn java_declaration_name_type(
     }
 }
 
+/// Memoized on exact source bytes (#2679): the resolver re-parses the file it
+/// is resolving in once per local-type candidate, and its cross-file receiver
+/// and return-type probes re-parse the same declaring files once per
+/// occurrence.
+static JAVA_TREES: super::TreeParseMemo = super::TreeParseMemo::new();
+
 pub(super) fn parse_java_tree(source: &str) -> Option<Tree> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_java::LANGUAGE.into())
-        .ok()?;
-    parser.parse(source, None)
+    JAVA_TREES.parse(source, |source| {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .ok()?;
+        parser.parse(source, None)
+    })
 }
 
 fn java_next_named_preorder<'tree>(

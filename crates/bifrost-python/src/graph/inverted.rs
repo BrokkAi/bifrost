@@ -19,16 +19,21 @@
 use super::extractor::{
     call_result_types, collect_assigned_identifiers, collect_function_scope_facts_from_node,
     collect_scope_facts_from_parsed_source, enclosing_scope_facts, is_declaration_identifier,
-    slice,
+    reference_is_deferred_function_body, slice,
 };
 use super::resolver::{
     annotation_reference_candidates, resolve_callable_parameter_default_types,
-    resolve_constructor_types, resolve_receiver_type, resolved_member_declarations,
+    resolve_constructor_types, resolve_receiver_type, resolve_visible_named_import_candidates,
+    resolved_member_declarations,
 };
+use crate::bindings::{python_comprehension_binds_name_at, python_type_parameter_binds_name_at};
 use crate::graph::PythonGraphSource;
 use crate::graph_support::PythonUsageSource;
 use crate::imports::{imported_module_assignment_at, resolve_fqn_candidates};
-use crate::usage_index::{usage_resolve_module_files, usage_scope_facts};
+use crate::usage_index::{
+    ModuleBindingEventKind, ModuleBindingTimeline, usage_module_binding_timeline,
+    usage_resolve_module_files, usage_scope_facts,
+};
 use brokk_bifrost_core::analyzer::symbol_path::parse_symbol_path;
 use brokk_bifrost_core::analyzer::usages::inverted_edges::{
     FileEdgeScanInput, PerFileEdges, classify_reference_node,
@@ -132,6 +137,7 @@ impl<'a> PythonEdgeScan<'a> {
                             namespace.insert(
                                 local.clone(),
                                 NamespaceBinding {
+                                    root_module: imported_module.clone(),
                                     module: imported_module,
                                     workspace_module: true,
                                     consumed_attributes: 0,
@@ -156,10 +162,14 @@ impl<'a> PythonEdgeScan<'a> {
                         let bound_segments = parse_symbol_path(Language::Python, &direct_module);
                         imported_segments.len().saturating_sub(bound_segments.len())
                     });
+                    let canonical_module = module.unwrap_or(direct_module);
+                    let mut root_segments = parse_symbol_path(Language::Python, &canonical_module);
+                    root_segments.truncate(root_segments.len().saturating_sub(consumed_attributes));
                     namespace.insert(
                         local.clone(),
                         NamespaceBinding {
-                            module: module.unwrap_or(direct_module),
+                            root_module: root_segments.join("."),
+                            module: canonical_module,
                             workspace_module,
                             consumed_attributes,
                         },
@@ -174,6 +184,9 @@ impl<'a> PythonEdgeScan<'a> {
             .into_iter()
             .map(|unit| (unit.identifier().to_string(), unit.fq_name()))
             .collect();
+        let module_bindings = usage_module_binding_timeline(python, file, || {
+            super::extractor::collect_module_binding_timeline(input.root(), source)
+        });
 
         // Per-function receiver-type facts (typed params + `x = Foo()`),
         // computed by the same routine the forward scan uses, so a typed
@@ -192,6 +205,7 @@ impl<'a> PythonEdgeScan<'a> {
             named,
             namespace,
             same_file,
+            module_bindings,
             scope_facts: scope_facts.as_ref(),
             canonical_namespace_candidates: &self.canonical_namespace_candidates,
             input,
@@ -230,6 +244,7 @@ struct PyScan<'a> {
     named: HashMap<String, String>,
     namespace: HashMap<String, NamespaceBinding>,
     same_file: HashMap<String, String>,
+    module_bindings: Arc<ModuleBindingTimeline>,
     scope_facts: &'a HashMap<CodeUnit, LocalBindingsSnapshot<String>>,
     canonical_namespace_candidates: &'a Mutex<HashMap<String, Arc<Vec<String>>>>,
     input: &'a FileEdgeScanInput<'a>,
@@ -237,6 +252,7 @@ struct PyScan<'a> {
 }
 
 struct NamespaceBinding {
+    root_module: String,
     module: String,
     workspace_module: bool,
     consumed_attributes: usize,
@@ -245,17 +261,68 @@ struct NamespaceBinding {
 impl PyScan<'_> {
     /// The callee fqn a bare name refers to: a named import, a namespace import of
     /// a symbol (module_specifier is the full fqn), or a same-file declaration.
-    fn bare_callee(&self, text: &str) -> Option<String> {
+    fn bare_callee(&self, text: &str, node: Node<'_>) -> Option<String> {
         if let Some(fqn) = self.named.get(text) {
             return Some(fqn.clone());
         }
         if let Some(fqn) = self.namespace.get(text) {
-            return Some(fqn.module.clone());
+            return self
+                .visible_namespace_root(text, node)
+                .or_else(|| Some(fqn.root_module.clone()));
         }
         if let Some(fqn) = self.same_file.get(text) {
             return Some(fqn.clone());
         }
         None
+    }
+
+    fn visible_namespace_root(&self, local: &str, node: Node<'_>) -> Option<String> {
+        let events = self.module_bindings.get(local)?;
+        let cutoff = if reference_is_deferred_function_body(node) {
+            usize::MAX
+        } else {
+            node.start_byte()
+        };
+        let visible: Vec<_> = events
+            .iter()
+            .filter(|event| event.visible_from <= cutoff)
+            .collect();
+        let start = visible
+            .iter()
+            .rposition(|event| {
+                if event.conditional {
+                    return false;
+                }
+                match &event.kind {
+                    ModuleBindingEventKind::ImportModule {
+                        module,
+                        consumed_attributes,
+                    } => *consumed_attributes == 0 && module != local,
+                    ModuleBindingEventKind::FromImport { .. } | ModuleBindingEventKind::Other => {
+                        true
+                    }
+                }
+            })
+            .unwrap_or(0);
+        let mut roots = visible[start..]
+            .iter()
+            .filter_map(|event| match &event.kind {
+                ModuleBindingEventKind::ImportModule {
+                    module,
+                    consumed_attributes,
+                } => {
+                    let mut segments = parse_symbol_path(Language::Python, module);
+                    segments.truncate(segments.len().saturating_sub(*consumed_attributes));
+                    let root = segments.join(".");
+                    canonical_import_module_fqn(self.graph, self.python, self.file, &root)
+                        .or(Some(root))
+                }
+                ModuleBindingEventKind::FromImport { .. } | ModuleBindingEventKind::Other => None,
+            })
+            .collect::<Vec<_>>();
+        roots.sort();
+        roots.dedup();
+        (roots.len() == 1).then(|| roots.remove(0))
     }
 
     /// The class fqn `receiver` is typed as within the given scope `facts` — a
@@ -512,10 +579,19 @@ fn merged_enclosing_scope_facts(
 struct FunctionScope {
     locals: HashSet<String>,
     parameters: HashSet<String>,
+    globals: HashSet<String>,
 }
 
 fn is_shadowed(scopes: &[FunctionScope], name: &str) -> bool {
-    scopes.iter().any(|scope| scope.locals.contains(name))
+    for scope in scopes.iter().rev() {
+        if scope.globals.contains(name) {
+            return false;
+        }
+        if scope.locals.contains(name) {
+            return true;
+        }
+    }
+    false
 }
 
 fn is_receiver_parameter(scopes: &[FunctionScope], name: &str) -> bool {
@@ -537,10 +613,14 @@ fn handle_identifier(node: Node<'_>, ctx: &mut PyScan<'_>, scopes: &[FunctionSco
         return;
     }
     let text = slice(node, ctx.source);
-    if text.is_empty() || is_shadowed(scopes, text) {
+    if text.is_empty()
+        || is_shadowed(scopes, text)
+        || python_comprehension_binds_name_at(text, node, ctx.source)
+        || python_type_parameter_binds_name_at(text, node, ctx.source)
+    {
         return;
     }
-    if let Some(callee) = ctx.bare_callee(text) {
+    if let Some(callee) = ctx.bare_callee(text, node) {
         ctx.record(callee, node);
     }
 }
@@ -717,6 +797,21 @@ fn handle_keyword_argument(node: Node<'_>, ctx: &mut PyScan<'_>, scopes: &[Funct
     });
     let root_shadowed = leftmost_identifier(function)
         .is_some_and(|root| is_shadowed(scopes, slice(root, ctx.source)));
+    if !root_shadowed && let Some(local_name) = function_name {
+        let cutoff = if reference_is_deferred_function_body(function) {
+            usize::MAX
+        } else {
+            function.start_byte()
+        };
+        default_classes.extend(resolve_visible_named_import_candidates(
+            ctx.graph,
+            ctx.python,
+            ctx.file,
+            ctx.module_bindings.as_ref(),
+            local_name,
+            cutoff,
+        ));
+    }
     let mut classes = if function_name == Some("cls") {
         lexical_class(ctx, function).into_iter().collect()
     } else {
@@ -801,8 +896,41 @@ fn collect_function_scope(func: Node<'_>, source: &str) -> FunctionScope {
     }
     if let Some(body) = func.child_by_field_name("body") {
         collect_bound_targets(body, source, &mut scope.locals);
+        collect_scope_globals(body, source, &mut scope.globals);
+        scope.locals.retain(|name| !scope.globals.contains(name));
     }
     scope
+}
+
+fn collect_scope_globals(node: Node<'_>, source: &str, out: &mut HashSet<String>) {
+    let root = node;
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "global_statement" {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if child.kind() == "identifier" {
+                    let name = slice(child, source).trim();
+                    if !name.is_empty() {
+                        out.insert(name.to_string());
+                    }
+                }
+            }
+            continue;
+        }
+        if node != root
+            && matches!(
+                node.kind(),
+                "function_definition" | "lambda" | "class_definition"
+            )
+        {
+            continue;
+        }
+        let mut cursor = node.walk();
+        let mut children: Vec<_> = node.named_children(&mut cursor).collect();
+        children.reverse();
+        stack.extend(children);
+    }
 }
 
 fn collect_parameter_names(params: Node<'_>, source: &str, out: &mut HashSet<String>) {

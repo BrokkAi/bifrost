@@ -1100,6 +1100,114 @@ pub fn member_declared_type_fq_name_in_session(
     member_declared_type_fq_name_inner(csharp, token, owner, member_name, false, Some(session))
 }
 
+/// Resolve the unique element type of a field or property declaration.
+///
+/// Arrays project their element node. A generic declaration projects its sole
+/// structured type argument; declarations with zero or several arguments fail
+/// closed. Keeping this on `StructuredTypeIdentity` avoids reconstructing type
+/// arguments from normalized signature text (#2231).
+pub fn member_declared_collection_element_type_fq_name_in_session(
+    csharp: &dyn CSharpSource,
+    token: QueryToken<'_>,
+    owner: &CodeUnit,
+    member_name: &str,
+    session: &ResolutionSession,
+) -> Option<String> {
+    let member_fqn = format!("{}.{}", owner.fq_name(), member_name);
+    let candidates = session.query_limited_rows(|limit| {
+        csharp.member_candidates_for_owner_limited(
+            owner.fq_name().as_str(),
+            member_name,
+            limit,
+            &mut || session.observe_cancellation(),
+        )
+    });
+    if !session.observe_cancellation() {
+        return None;
+    }
+
+    let mut resolved_types = Vec::new();
+    for unit in candidates {
+        if !session.scope_step() {
+            return None;
+        }
+        if !unit.is_field() || unit.fq_name() != member_fqn {
+            continue;
+        }
+        let metadata =
+            session.query_limited_rows(|limit| csharp.signature_metadata_limited(&unit, limit));
+        if !session.observe_cancellation() {
+            return None;
+        }
+        for metadata in metadata {
+            if !session.scope_step() {
+                return None;
+            }
+            let Some(identity) = metadata.return_type_identity().cloned() else {
+                continue;
+            };
+            let element = if identity.is_array() {
+                identity.into_container_element_with(|| session.scope_step())
+            } else {
+                identity.into_single_generic_argument_with(|| session.scope_step())
+            };
+            let Some(element) = element else {
+                continue;
+            };
+            if let Some(resolved) = resolve_structured_member_type_fq_name_in_session(
+                csharp,
+                token,
+                unit.source(),
+                owner,
+                &element,
+                session,
+            ) {
+                resolved_types.push(resolved);
+            }
+        }
+    }
+    resolved_types.sort();
+    resolved_types.dedup();
+    (resolved_types.len() == 1).then(|| resolved_types.remove(0))
+}
+
+pub fn member_declared_collection_element_type_fq_name(
+    csharp: &dyn CSharpSource,
+    token: QueryToken<'_>,
+    owner: &CodeUnit,
+    member_name: &str,
+) -> Option<String> {
+    let member_fqn = format!("{}.{}", owner.fq_name(), member_name);
+    let mut resolved_types = csharp
+        .member_candidates_for_owner(owner.fq_name().as_str(), member_name)
+        .into_iter()
+        .filter(|unit| unit.is_field() && unit.fq_name() == member_fqn)
+        .flat_map(|unit| {
+            csharp
+                .signature_metadata(&unit)
+                .into_iter()
+                .filter_map(move |metadata| {
+                    let identity = metadata.return_type_identity()?.clone();
+                    let element = if identity.is_array() {
+                        identity.into_container_element_with(|| true)
+                    } else {
+                        identity.into_single_generic_argument_with(|| true)
+                    }?;
+                    resolve_structured_member_type_fq_name(
+                        csharp,
+                        token,
+                        unit.source(),
+                        owner,
+                        &element,
+                    )
+                })
+        })
+        .collect::<Vec<_>>();
+    resolved_types.sort();
+    resolved_types.dedup();
+    (resolved_types.len() == 1).then(|| resolved_types.remove(0))
+}
+
 pub(super) fn usage_member_declared_type_fq_name(
     csharp: &dyn CSharpSource,
     token: QueryToken<'_>,
@@ -1624,6 +1732,48 @@ fn resolve_structured_member_type_fq_name_in_session(
     resolve_structured_type_fq_name_in_session(csharp, token, file, name, session)
 }
 
+fn resolve_structured_member_type_fq_name(
+    csharp: &dyn CSharpSource,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+    owner: &CodeUnit,
+    identity: &StructuredTypeIdentity,
+) -> Option<String> {
+    let name = identity.nominal_name()?;
+    if csharp_owner_chain_declares_type_parameter(csharp, owner, name) {
+        return None;
+    }
+    resolve_structured_type_fq_name(csharp, token, file, name)
+}
+
+fn csharp_owner_chain_declares_type_parameter(
+    csharp: &dyn CSharpSource,
+    owner: &CodeUnit,
+    name: &StructuredTypeName,
+) -> bool {
+    let [candidate] = name.path() else {
+        return false;
+    };
+    if name.is_absolute() {
+        return false;
+    }
+    let mut current = Some(owner.clone());
+    while let Some(unit) = current {
+        if !unit.is_class() {
+            return false;
+        }
+        if csharp
+            .signature_metadata(&unit)
+            .iter()
+            .any(|metadata| metadata.type_parameters().contains(candidate))
+        {
+            return true;
+        }
+        current = csharp.parent_of(&unit);
+    }
+    false
+}
+
 fn csharp_structured_name_is_method_type_parameter(
     name: &StructuredTypeName,
     metadata: &SignatureMetadata,
@@ -1685,6 +1835,52 @@ fn resolve_structured_type_fq_name_in_session(
         return Some(canonical.to_string());
     }
     resolve_non_builtin_structured_type_fq_name_in_session(csharp, token, file, name, session)
+}
+
+fn resolve_structured_type_fq_name(
+    csharp: &dyn CSharpSource,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+    name: &StructuredTypeName,
+) -> Option<String> {
+    if let [builtin] = name.path()
+        && let Some(canonical) = canonical_builtin_type_identity(builtin)
+    {
+        return Some(canonical.to_string());
+    }
+    let path = name.path();
+    if path.is_empty() {
+        return None;
+    }
+    let alias_qualified = path
+        .first()
+        .and_then(|component| component.strip_suffix("::"));
+    if !name.is_absolute() && alias_qualified.is_none() {
+        for prefix_len in (0..=name.lexical_scope().len()).rev() {
+            let candidate =
+                render_csharp_structured_path(&name.lexical_scope()[..prefix_len], path, false);
+            let candidates = forward_type_declarations_for_fq_name(csharp, &candidate);
+            if !candidates.is_empty() {
+                return graph_support::unique_logical_type(candidates).map(|unit| unit.fq_name());
+            }
+        }
+    }
+    let rendered = if let Some(alias) = alias_qualified {
+        let suffix = render_csharp_structured_path(&[], &path[1..], false);
+        if suffix.is_empty() {
+            alias.to_string()
+        } else {
+            format!("{alias}::{suffix}")
+        }
+    } else {
+        render_csharp_structured_path(&[], path, name.is_absolute())
+    };
+    let candidates = if name.is_absolute() {
+        forward_type_declarations_for_fq_name(csharp, &rendered)
+    } else {
+        graph_support::visible_type_candidates(csharp, token, file, &rendered)
+    };
+    graph_support::unique_logical_type(candidates).map(|unit| unit.fq_name())
 }
 
 fn resolve_non_builtin_structured_type_fq_name_in_session(
@@ -2272,7 +2468,7 @@ fn resolve_in_enclosing_namespace(
     })
 }
 
-fn type_parameter_shadows_reference(node: Node<'_>, source: &str, reference: &str) -> bool {
+pub fn type_parameter_shadows_reference(node: Node<'_>, source: &str, reference: &str) -> bool {
     if reference.contains('.') {
         return false;
     }
@@ -3982,6 +4178,48 @@ pub fn object_creation_assignment_target(initializer: Node<'_>) -> Option<Node<'
     assignment.child_by_field_name("left")
 }
 
+/// The collection expression whose element target-types this initializer's
+/// implicit `new()`.
+///
+/// This covers both forms from #2231: an implicit creation nested beneath a
+/// collection expression assigned to a collection value, and an implicit
+/// creation assigned directly through an element access. The returned node is
+/// the collection value (`items` in both `items = [new()]` and
+/// `items[index] = new()`), not the element access itself.
+pub fn object_creation_collection_target(initializer: Node<'_>) -> Option<Node<'_>> {
+    let object_creation = initializer.parent()?;
+    if object_creation.kind() != "implicit_object_creation_expression" {
+        return None;
+    }
+
+    if let Some(assignment) = object_creation.parent()
+        && assignment.kind() == "assignment_expression"
+        && assignment.child_by_field_name("right") == Some(object_creation)
+    {
+        let left = assignment.child_by_field_name("left")?;
+        if left.kind() == "element_access_expression" {
+            return left
+                .child_by_field_name("expression")
+                .or_else(|| left.named_child(0));
+        }
+    }
+
+    let mut current = object_creation.parent()?;
+    while matches!(current.kind(), "expression_element" | "collection_element") {
+        current = current.parent()?;
+    }
+    if current.kind() != "collection_expression" {
+        return None;
+    }
+    let assignment = current.parent()?;
+    if assignment.kind() != "assignment_expression"
+        || assignment.child_by_field_name("right") != Some(current)
+    {
+        return None;
+    }
+    assignment.child_by_field_name("left")
+}
+
 /// The written type a target-typed `new()` takes its type from.
 ///
 /// C# gives `new()` the type of the expression's *target*, so this is a walk to
@@ -3991,18 +4229,64 @@ pub fn object_creation_assignment_target(initializer: Node<'_>) -> Option<Node<'
 /// `return` statement or expression body, whose target is the enclosing
 /// function's declared return type.
 ///
-/// A target whose type the tree does not write is deliberately not answered:
-/// an element of a collection expression, the left side of an assignment, a
-/// call argument, or a switch arm. Each of those needs the target's own
-/// declaration resolved through the index, which is the resolver's work, not
-/// this syntax walk's.
+/// Collection elements are the one nested target handled here. An array type
+/// or a collection type with exactly one structured generic argument states a
+/// unique element type in the tree. Multi-argument collections remain refused:
+/// choosing a key or value argument would be a guess. Other targets whose type
+/// the tree does not write are deliberately not answered: the left side of an
+/// assignment, a call argument, or a switch arm. Each of those needs the
+/// target's own declaration resolved through the index, which is the resolver's
+/// work, not this syntax walk's.
 ///
 /// The `= <value>` clause is transparent because the grammar does not always
 /// build one: a `variable_declarator` can carry the value in its own `value`
 /// field, which is why the declarator is matched here rather than through the
 /// clause.
 fn implicit_object_creation_target_type(object_creation: Node<'_>) -> Option<Node<'_>> {
-    let mut current = object_creation;
+    if let Some(mut parent) = object_creation.parent() {
+        while matches!(parent.kind(), "expression_element" | "collection_element") {
+            parent = parent.parent()?;
+        }
+        match parent.kind() {
+            // `T[] values = [new() { ... }]`: the collection expression takes
+            // its target from the outer declaration, while the implicit object
+            // creation takes the element of that target.
+            "collection_expression" => {
+                let collection_type = expression_target_type(parent)?;
+                return collection_element_type_node(collection_type);
+            }
+            // `new List<T> { new() { ... } }`: the containing object creation
+            // writes the collection type directly. The initializer expression
+            // is the structured bridge between both creations.
+            "initializer_expression" => {
+                let collection_creation = parent.parent()?;
+                if !matches!(
+                    collection_creation.kind(),
+                    "object_creation_expression" | "implicit_object_creation_expression"
+                ) {
+                    return None;
+                }
+                let collection_type = match collection_creation.kind() {
+                    "object_creation_expression" => collection_creation
+                        .child_by_field_name("type")
+                        .or_else(|| first_type_child(collection_creation)),
+                    "implicit_object_creation_expression" => {
+                        expression_target_type(collection_creation)
+                    }
+                    _ => None,
+                }?;
+                return collection_element_type_node(collection_type);
+            }
+            _ => {}
+        }
+    }
+
+    expression_target_type(object_creation)
+}
+
+/// The target type written by the syntax surrounding `expression`.
+fn expression_target_type(expression: Node<'_>) -> Option<Node<'_>> {
+    let mut current = expression;
     while let Some(parent) = current.parent() {
         match parent.kind() {
             "equals_value_clause" | "parenthesized_expression" | "checked_expression" => {
@@ -4010,8 +4294,8 @@ fn implicit_object_creation_target_type(object_creation: Node<'_>) -> Option<Nod
             }
             "variable_declarator" => {
                 let initializer = variable_declarator_initializer(parent)?;
-                if initializer.start_byte() > object_creation.start_byte()
-                    || object_creation.end_byte() > initializer.end_byte()
+                if initializer.start_byte() > expression.start_byte()
+                    || expression.end_byte() > initializer.end_byte()
                 {
                     return None;
                 }
@@ -4035,6 +4319,219 @@ fn implicit_object_creation_target_type(object_creation: Node<'_>) -> Option<Nod
                 current = parent;
             }
             _ => return None,
+        }
+    }
+    None
+}
+
+/// Project the unique element type written by a collection type syntax node.
+///
+/// This is deliberately AST-only. An array owns one element type, and a generic
+/// name with exactly one type argument has one possible element projection. A
+/// qualified type delegates to its terminal name. Multi-argument generic names
+/// and non-generic collection spellings do not prove an element type.
+pub fn collection_element_type_node(mut collection_type: Node<'_>) -> Option<Node<'_>> {
+    loop {
+        match collection_type.kind() {
+            "type" | "nullable_type" => {
+                collection_type = collection_type
+                    .child_by_field_name("type")
+                    .or_else(|| collection_type.named_child(0))?;
+            }
+            "array_type" => {
+                return collection_type
+                    .child_by_field_name("type")
+                    .or_else(|| collection_type.named_child(0));
+            }
+            "qualified_name" | "alias_qualified_name" => {
+                collection_type = collection_type.child_by_field_name("name").or_else(|| {
+                    collection_type.named_child(collection_type.named_child_count().checked_sub(1)?)
+                })?;
+            }
+            "generic_name" => {
+                let arguments = collection_type
+                    .child_by_field_name("type_arguments")
+                    .or_else(|| first_named_child_of_kind(collection_type, "type_argument_list"))?;
+                return (arguments.named_child_count() == 1)
+                    .then(|| arguments.named_child(0))
+                    .flatten();
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// The element type written for a local, parameter, same-file field, or
+/// same-file property used as `collection_target`.
+///
+/// The local walk follows only the lexical scope path containing the target and
+/// uses the same nearest-scope binding engine as ordinary receiver inference.
+/// A non-collection local shadows a same-named field and therefore returns no
+/// type instead of falling through. Cross-file and inherited members require
+/// index metadata and remain the caller's fallback.
+pub fn collection_target_element_type_node<'tree>(
+    collection_target: Node<'tree>,
+    source: &str,
+) -> Option<Node<'tree>> {
+    if collection_target.kind() != "identifier" {
+        return None;
+    }
+    let target_name = node_text(collection_target, source);
+    let mut root = collection_target;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+
+    if let Some(local_elements) = local_collection_element_type_nodes(
+        root,
+        collection_target.start_byte(),
+        target_name,
+        source,
+    ) {
+        return (local_elements.len() == 1).then(|| local_elements[0]);
+    }
+    same_file_member_collection_element_type_node(collection_target, target_name, source)
+}
+
+/// `None` means no local declaration shadows `target_name`; `Some([])` means a
+/// local exists but does not prove exactly one element type.
+fn local_collection_element_type_nodes<'tree>(
+    root: Node<'tree>,
+    cutoff_start: usize,
+    target_name: &str,
+    source: &str,
+) -> Option<Vec<Node<'tree>>> {
+    let mut bindings = LocalInferenceEngine::new(Default::default());
+    let mut stack = vec![(root, 0usize)];
+    while let Some((node, next_child)) = stack.pop() {
+        if next_child == 0 {
+            if node.start_byte() >= cutoff_start {
+                continue;
+            }
+            let enters_scope = SCOPE_NODES.contains(&node.kind());
+            if enters_scope
+                && !(node.start_byte() <= cutoff_start && cutoff_start < node.end_byte())
+            {
+                continue;
+            }
+            if enters_scope {
+                bindings.enter_scope();
+            }
+            if node.kind() == "parameter" && node.end_byte() <= cutoff_start {
+                seed_collection_element_binding(node, source, &mut bindings);
+            } else if node.kind() == "variable_declaration"
+                && !is_member_variable_declaration(node)
+                && node.end_byte() <= cutoff_start
+            {
+                let Some(type_node) = node.child_by_field_name("type") else {
+                    continue;
+                };
+                let mut cursor = node.walk();
+                for declarator in node
+                    .named_children(&mut cursor)
+                    .filter(|child| child.kind() == "variable_declarator")
+                {
+                    let Some(name_node) = declarator.child_by_field_name("name") else {
+                        continue;
+                    };
+                    seed_collection_element_name(name_node, type_node, source, &mut bindings);
+                }
+            }
+        }
+        let Some(child) = node.named_child(next_child) else {
+            continue;
+        };
+        if child.start_byte() >= cutoff_start {
+            continue;
+        }
+        stack.push((node, next_child + 1));
+        stack.push((child, 0));
+    }
+
+    match bindings.resolve_symbol(target_name) {
+        SymbolResolution::Precise(nodes) => Some(nodes.into_iter().collect()),
+        SymbolResolution::Ambiguous => Some(Vec::new()),
+        SymbolResolution::Unknown if bindings.is_shadowed(target_name) => Some(Vec::new()),
+        SymbolResolution::Unknown => None,
+    }
+}
+
+fn seed_collection_element_binding<'tree>(
+    declaration: Node<'tree>,
+    source: &str,
+    bindings: &mut LocalInferenceEngine<Node<'tree>>,
+) {
+    let Some(name_node) = declaration.child_by_field_name("name") else {
+        return;
+    };
+    let Some(type_node) = declaration.child_by_field_name("type") else {
+        return;
+    };
+    seed_collection_element_name(name_node, type_node, source, bindings);
+}
+
+fn seed_collection_element_name<'tree>(
+    name_node: Node<'tree>,
+    type_node: Node<'tree>,
+    source: &str,
+    bindings: &mut LocalInferenceEngine<Node<'tree>>,
+) {
+    let name = node_text(name_node, source);
+    if let Some(element) = collection_element_type_node(type_node) {
+        bindings.seed_symbol(name, element);
+    } else {
+        bindings.declare_shadow(name);
+    }
+}
+
+fn same_file_member_collection_element_type_node<'tree>(
+    target: Node<'tree>,
+    target_name: &str,
+    source: &str,
+) -> Option<Node<'tree>> {
+    let mut owner = target;
+    loop {
+        owner = owner.parent()?;
+        if matches!(
+            owner.kind(),
+            "class_declaration" | "struct_declaration" | "record_declaration"
+        ) {
+            break;
+        }
+    }
+    let body = owner
+        .child_by_field_name("body")
+        .or_else(|| owner.named_child(owner.named_child_count().checked_sub(1)?))?;
+    let mut cursor = body.walk();
+    for declaration in body.named_children(&mut cursor) {
+        match declaration.kind() {
+            "field_declaration" | "event_field_declaration" => {
+                let variable = declaration.child_by_field_name("declaration").or_else(|| {
+                    let mut declaration_cursor = declaration.walk();
+                    declaration
+                        .named_children(&mut declaration_cursor)
+                        .find(|child| child.kind() == "variable_declaration")
+                })?;
+                let type_node = variable.child_by_field_name("type")?;
+                let mut variable_cursor = variable.walk();
+                if variable
+                    .named_children(&mut variable_cursor)
+                    .filter(|child| child.kind() == "variable_declarator")
+                    .filter_map(|declarator| declarator.child_by_field_name("name"))
+                    .any(|name| node_text(name, source) == target_name)
+                {
+                    return collection_element_type_node(type_node);
+                }
+            }
+            "property_declaration" => {
+                let name_node = declaration.child_by_field_name("name")?;
+                if node_text(name_node, source) == target_name {
+                    return declaration
+                        .child_by_field_name("type")
+                        .and_then(collection_element_type_node);
+                }
+            }
+            _ => {}
         }
     }
     None

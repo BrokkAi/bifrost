@@ -1,4 +1,4 @@
-//! Shared opportunistic GC driver for the unified bifrost cache DB.
+//! Opportunistic GC driver for analyzer rows in the Bifrost cache DB.
 
 use std::ffi::OsStr;
 use std::path::Path;
@@ -26,7 +26,6 @@ static MIN_INTERVAL_SECS: AtomicI64 = AtomicI64::new(GC_MIN_INTERVAL_SECS);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GcOutcome {
     pub ran: bool,
-    pub semantic_dropped: usize,
     pub analyzer_dropped: usize,
     pub total_blobs_after: i64,
     pub version_stores_removed: usize,
@@ -36,7 +35,6 @@ impl GcOutcome {
     pub fn skipped(total_blobs_after: i64) -> Self {
         Self {
             ran: false,
-            semantic_dropped: 0,
             analyzer_dropped: 0,
             total_blobs_after,
             version_stores_removed: 0,
@@ -50,9 +48,8 @@ struct GcClaim {
 }
 
 /// Collect against a unified cache DB. `db_path` is all collection needs from
-/// either store: the registry tables it sweeps are reached through that path,
-/// never through the store handle, which is why neither the semantic store nor
-/// the analyzer store has to be visible from this crate.
+/// the analyzer store: the registry tables it sweeps are reached through that
+/// path rather than through a store handle.
 ///
 /// `workspace_root` is the root of the workspace whose build scheduled this
 /// collection. Its files are live by definition, and the Git status scans that
@@ -132,12 +129,7 @@ fn sweep_with_claim(
     conn.pragma_update(None, "temp_store", "FILE")
         .map_err(|err| format!("cache GC SQLite error: {err}"))?;
     conn.execute_batch(
-        "CREATE TEMP TABLE gc_semantic_candidates(
-           blob_oid TEXT PRIMARY KEY
-         ) WITHOUT ROWID;
-         INSERT INTO gc_semantic_candidates(blob_oid)
-           SELECT DISTINCT blob_oid FROM semantic_files;
-         CREATE TEMP TABLE gc_analyzer_candidates(
+        "CREATE TEMP TABLE gc_analyzer_candidates(
            blob_oid TEXT NOT NULL,
            lang TEXT NOT NULL,
            generation INTEGER NOT NULL,
@@ -156,36 +148,6 @@ fn sweep_with_claim(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|err| format!("cache GC SQLite error: {err}"))?;
-    let dead_semantic = {
-        let mut stmt = tx
-            .prepare("SELECT blob_oid FROM gc_semantic_candidates")
-            .map_err(|err| format!("cache GC SQLite error: {err}"))?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|err| format!("cache GC SQLite error: {err}"))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(|err| format!("cache GC SQLite error: {err}"))?
-            .into_iter()
-            .filter(|oid| !live.contains(oid))
-            .collect::<Vec<_>>()
-    };
-    {
-        let mut delete = tx
-            .prepare("DELETE FROM semantic_files WHERE blob_oid = ?1")
-            .map_err(|err| format!("cache GC SQLite error: {err}"))?;
-        for oid in &dead_semantic {
-            delete
-                .execute([oid])
-                .map_err(|err| format!("cache GC SQLite error: {err}"))?;
-        }
-    }
-    tx.execute(
-        "DELETE FROM semantic_vectors
-         WHERE vector_hash NOT IN (SELECT vector_hash FROM semantic_file_chunks)",
-        [],
-    )
-    .map_err(|err| format!("cache GC SQLite error: {err}"))?;
-
     let dead_analyzer = {
         let mut stmt = tx
             .prepare("SELECT blob_oid, lang, generation FROM gc_analyzer_candidates")
@@ -211,7 +173,6 @@ fn sweep_with_claim(
     conn.pragma_update(None, "incremental_vacuum", 0)
         .map_err(|err| format!("cache GC SQLite error: {err}"))?;
 
-    let semantic_dropped = dead_semantic.len();
     let total_blobs_after = finish_gc(&claim.db_path)?;
     // Row collection and file collection answer the same question about
     // different granularities, and both belong under the claim: one sweeper at
@@ -223,7 +184,6 @@ fn sweep_with_claim(
     let version_stores_removed = sweep_disused_version_stores(cache_dir)?.len();
     Ok(GcOutcome {
         ran: true,
-        semantic_dropped,
         analyzer_dropped,
         total_blobs_after,
         version_stores_removed,
@@ -394,14 +354,8 @@ fn total_blob_count(db_path: &Path) -> Result<i64, String> {
 }
 
 fn total_blob_count_conn(conn: &Connection) -> Result<i64, String> {
-    conn.query_row(
-        "SELECT
-           (SELECT COUNT(DISTINCT blob_oid) FROM semantic_files) +
-           (SELECT COUNT(*) FROM blobs)",
-        [],
-        |row| row.get(0),
-    )
-    .map_err(|err| format!("cache GC SQLite error: {err}"))
+    conn.query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
+        .map_err(|err| format!("cache GC SQLite error: {err}"))
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -531,6 +485,63 @@ mod tests {
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         assert_eq!(remaining, vec![live_oid]);
+    }
+
+    #[test]
+    fn gc_leaves_orphaned_semantic_cache_rows_untouched() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo_root = temp.path().canonicalize().unwrap();
+        let repo = gitblob::test_repo::init_repo(&repo_root);
+        let dead_oid = "2222222222222222222222222222222222222222";
+        let vector_hash = [7_u8; 32];
+
+        let db_path = gitblob::cache_db_path(&repo_root);
+        {
+            let conn = cache_db::open_unified_connection(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO analysis_epochs(lang, epoch, generation) VALUES('go', 'a', 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, 'go', 1)",
+                [dead_oid],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO semantic_files(blob_oid, rel_path, language)
+                 VALUES(?1, 'old.go', 'go')",
+                [dead_oid],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO semantic_vectors(vector_hash, dim, vector) VALUES(?1, 1, X'00')",
+                [&vector_hash[..]],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO semantic_file_chunks(
+                   blob_oid, rel_path, chunk_ord, symbol, vector_hash
+                 ) VALUES(?1, 'old.go', 0, 'old', ?2)",
+                rusqlite::params![dead_oid, &vector_hash[..]],
+            )
+            .unwrap();
+        }
+
+        let outcome = force_gc(&db_path, &repo, &repo_root).unwrap();
+        assert!(outcome.ran);
+        assert_eq!(outcome.analyzer_dropped, 1);
+        assert_eq!(outcome.total_blobs_after, 0);
+
+        let conn = Connection::open(&db_path).unwrap();
+        for table in ["semantic_files", "semantic_file_chunks", "semantic_vectors"] {
+            let count = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap();
+            assert_eq!(count, 1, "{table} must remain untouched");
+        }
     }
 
     #[test]

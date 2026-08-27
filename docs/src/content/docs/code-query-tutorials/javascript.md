@@ -3,7 +3,7 @@ title: JavaScript
 description: Query JavaScript member calls, arrows, class expressions, field access, and new expressions with query_code.
 ---
 
-> Last verified end to end: 2026-07-18 (`query_code` schema version 1).
+> Last verified end to end: 2026-08-26 (`query_code` schema version 1).
 
 For exact inbound and outbound symbol edges, proof tiers, and adapter-specific caveats, see [Reference Traversal](../reference-traversal/).
 
@@ -37,6 +37,13 @@ const Inline = class {
     return service.send(value);
   }
 };
+
+const TARGETS = ["staging", "production"];
+function deployAll() {
+  for (const target of TARGETS) {
+    service.send(target);
+  }
+}
 ```
 
 ## Narrow A Common Member Name
@@ -374,6 +381,86 @@ class QueryLeaf extends QueryRoot {
       "result_type": "declaration",
       "signature": "class QueryLeaf extends QueryRoot {",
       "start_line": 5
+    }
+  ],
+  "truncated": false
+}
+```
+
+## Loops And The Collections They Iterate
+
+A for-each loop exposes its iterated expression through the `iterable` role, and a collection display literal is a `collection_literal` fact whose `elements` role edges carry its entries -- the `arity` predicate counts them the same way it counts a call's `args`.
+
+<!-- code-query-case:literal-iterable:rql -->
+```lisp
+(language javascript
+  (for_loop :iterable (identifier :capture "collection")))
+```
+
+<!-- code-query-case:literal-iterable:json -->
+```json
+{
+  "languages": ["javascript"],
+  "match": {
+    "kind": "for_loop",
+    "iterable": {"kind": "identifier", "capture": "collection"}
+  }
+}
+```
+
+<!-- code-query-case:literal-iterable:expected -->
+```json
+{
+  "results": [
+    {
+      "result_type": "structural_match",
+      "path": "javascript/app.js",
+      "language": "javascript",
+      "kind": "for_loop",
+      "enclosing_symbol": "deployAll",
+      "start_line": 28,
+      "end_line": 30,
+      "text": "for (const target of TARGETS) {…",
+      "captures": [
+        {"name": "collection", "start_line": 28, "text": "TARGETS"}
+      ]
+    }
+  ],
+  "truncated": false
+}
+```
+
+<!-- code-query-case:small-collection-literal:rql -->
+```lisp
+(language javascript
+  (collection_literal (arity :max 4) :elements [(string_literal)]))
+```
+
+<!-- code-query-case:small-collection-literal:json -->
+```json
+{
+  "languages": ["javascript"],
+  "match": {
+    "kind": "collection_literal",
+    "arity": {"max": 4},
+    "elements": [{"kind": "string_literal"}]
+  }
+}
+```
+
+<!-- code-query-case:small-collection-literal:expected -->
+```json
+{
+  "results": [
+    {
+      "result_type": "structural_match",
+      "path": "javascript/app.js",
+      "language": "javascript",
+      "kind": "collection_literal",
+      "enclosing_symbol": "app.js.TARGETS",
+      "start_line": 26,
+      "end_line": 26,
+      "text": "[\"staging\", \"production\"]"
     }
   ],
   "truncated": false

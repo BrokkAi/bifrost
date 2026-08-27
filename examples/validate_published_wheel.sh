@@ -118,7 +118,7 @@ PY
 # 5. Run the example app against the sample project, from the temp dir so the
 #    repo's ./bifrost_searchtools can never shadow the installed package.
 echo "==> Running example app against the sample project"
-( cd "$WORKDIR" && BIFROST_SEMANTIC_INDEX=off "$VENV_PY" "$DEMO" --root "$FIXTURE" Calculator compute )
+( cd "$WORKDIR" && "$VENV_PY" "$DEMO" --root "$FIXTURE" Calculator compute )
 
 echo
 echo "PASS: published wheel $PKG works on $(uname -s)/$(uname -m)."
