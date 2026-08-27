@@ -288,6 +288,44 @@ pub fn occurrences_for_file_with_options_and_roles(
     roles: Option<&[OccurrenceRole]>,
     cancellation: &CancellationToken,
 ) -> Result<OccurrenceFileResult, OccurrencesCancelled> {
+    occurrences_for_file_scoped(analyzer, file, options, roles, None, cancellation)
+}
+
+/// [`occurrences_for_file`], resolving targets only for reference rows that
+/// start on one of `lines`.
+///
+/// Rows off those lines keep [`OccurrenceTarget::NotDerived`] ("not
+/// attempted"), so a consumer that only probes specific sites -- the
+/// usage-graph structural exact fallback reads its table at legacy call-site
+/// lines -- pays the definition batch for exactly the rows it will read.
+/// Classification, enclosing attachment, and the completeness account stay
+/// exhaustive, so row identity is unchanged (issue #2679: resolving every
+/// row of every file to serve a handful of site probes was the dominant cost
+/// of review-sized diffs).
+pub fn occurrences_for_file_at_lines(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    lines: &std::collections::BTreeSet<usize>,
+    cancellation: &CancellationToken,
+) -> Result<OccurrenceFileResult, OccurrencesCancelled> {
+    occurrences_for_file_scoped(
+        analyzer,
+        file,
+        OccurrenceDerivationOptions::ROWS_ONLY,
+        None,
+        Some(lines),
+        cancellation,
+    )
+}
+
+fn occurrences_for_file_scoped(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    options: OccurrenceDerivationOptions,
+    roles: Option<&[OccurrenceRole]>,
+    lines: Option<&std::collections::BTreeSet<usize>>,
+    cancellation: &CancellationToken,
+) -> Result<OccurrenceFileResult, OccurrencesCancelled> {
     if cancellation.is_cancelled() {
         return Err(OccurrencesCancelled);
     }
@@ -324,7 +362,15 @@ pub fn occurrences_for_file_with_options_and_roles(
     if cancellation.is_cancelled() {
         return Err(OccurrencesCancelled);
     }
-    resolve_reference_targets(analyzer, file, &facts, &mut rows, options, cancellation)?;
+    resolve_reference_targets(
+        analyzer,
+        file,
+        &facts,
+        &mut rows,
+        options,
+        lines,
+        cancellation,
+    )?;
 
     Ok(OccurrenceFileResult {
         rows,
@@ -462,14 +508,29 @@ fn resolve_reference_targets(
     facts: &FileFacts,
     rows: &mut [OccurrenceRow],
     options: OccurrenceDerivationOptions,
+    lines: Option<&std::collections::BTreeSet<usize>>,
     cancellation: &CancellationToken,
 ) -> Result<(), OccurrencesCancelled> {
-    let reference_indices: Vec<usize> = rows
-        .iter()
-        .enumerate()
-        .filter(|(_, row)| row.class == OccurrenceClass::Reference)
-        .map(|(index, _)| index)
-        .collect();
+    let (reference_indices, undemanded_indices): (Vec<usize>, Vec<usize>) = {
+        let mut demanded = Vec::new();
+        let mut undemanded = Vec::new();
+        for (index, row) in rows.iter().enumerate() {
+            if row.class != OccurrenceClass::Reference {
+                continue;
+            }
+            if lines.is_none_or(|lines| lines.contains(&row.range.start_line)) {
+                demanded.push(index);
+            } else {
+                undemanded.push(index);
+            }
+        }
+        (demanded, undemanded)
+    };
+    // A row outside the caller's demanded lines is "not attempted", exactly
+    // like the identity-only derivation below -- not "resolved to nothing".
+    for &index in &undemanded_indices {
+        rows[index].target = OccurrenceTarget::NotDerived;
+    }
     if !options.targets {
         // The caller asked for identity, role and position only. Say so in
         // every reference row rather than leaving `None`, which means "this

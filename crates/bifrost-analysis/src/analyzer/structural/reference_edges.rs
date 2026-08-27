@@ -26,8 +26,8 @@ use super::facts::Span;
 use super::kinds::{NormalizedKind, Role};
 use super::lexical_environment::environment_for_file;
 use super::occurrence_rows::{
-    OccurrenceCompleteness, OccurrenceRow, OccurrenceTarget, OccurrencesCancelled, ast_id,
-    occurrences_for_file,
+    OccurrenceCompleteness, OccurrenceFileResult, OccurrenceRow, OccurrenceTarget,
+    OccurrencesCancelled, ast_id, occurrences_for_file, occurrences_for_file_at_lines,
 };
 use super::occurrences::{ALL_OCCURRENCE_ROLES, OccurrenceClass, OccurrenceRole};
 use super::resolution::EnvironmentAxis;
@@ -38,6 +38,27 @@ use crate::analyzer::usages::{
 use crate::analyzer::{CodeUnit, DeclarationId, IAnalyzer, ProjectFile, Range};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
+use rayon::prelude::*;
+
+/// The file a scan unit reads: a bare file scans whole, a file with demanded
+/// lines scans only those lines' reference rows. Declared for
+/// `ReferenceEngine::scan_units`, whose byte accounting needs the file either
+/// way.
+trait UnitFile {
+    fn file(&self) -> &ProjectFile;
+}
+
+impl UnitFile for ProjectFile {
+    fn file(&self) -> &ProjectFile {
+        self
+    }
+}
+
+impl UnitFile for (ProjectFile, std::collections::BTreeSet<usize>) {
+    fn file(&self) -> &ProjectFile {
+        &self.0
+    }
+}
 
 /// Bounds for one inverse derivation. The file bound matches the reference
 /// traversal's scan bound; the hit bound is per seed declaration.
@@ -493,25 +514,96 @@ impl<'a> ReferenceEngine<'a> {
     /// Stream the explicitly selected files through the same canonical
     /// occurrence-to-declaration relation. The input slice is the hard scope:
     /// this method never discovers or opens another file as a scan unit.
+    /// See [`Self::scan_units`] for the fan-out and merge semantics.
     pub fn scan_file_edges(&self, analyzer: &dyn IAnalyzer, files: &[ProjectFile]) -> ReferenceRun {
+        self.scan_units(analyzer, files, |file| {
+            forward_edges_for_file(analyzer, file, self.cancellation())
+        })
+    }
+
+    /// [`Self::scan_file_edges`], resolving only the reference rows that start
+    /// on each file's demanded lines. A consumer that reads the resulting
+    /// edges at known sites -- the usage-graph structural exact fallback probes
+    /// its table at legacy call-site lines -- pays the definition batch for
+    /// exactly those rows instead of every occurrence of every file
+    /// (issue #2679).
+    pub fn scan_file_edges_at_lines(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        demanded: &[(ProjectFile, std::collections::BTreeSet<usize>)],
+    ) -> ReferenceRun {
+        self.scan_units(analyzer, demanded, |(file, lines)| {
+            forward_edges_for_file_at_lines(analyzer, file, lines, self.cancellation())
+        })
+    }
+
+    /// The shared per-unit scan: fan the units out, merge in input order.
+    ///
+    /// One unit's occurrence batch is a long serial resolver ladder, and
+    /// scanning units one after another left every other core idle for
+    /// minutes on review-sized Rust diffs (issue #2679 -- every capture
+    /// showed one busy worker and eleven idle cores). A short serial prefix
+    /// runs first so the request-scoped analyzer memos are warm before the
+    /// fan-out: a cold parallel start made every worker race the same common
+    /// names through the racy per-request maps and cost more than the
+    /// parallelism returned (measured: +42% user time at width 2). Per-unit
+    /// results are merged in input order, so the emitted run matches the
+    /// serial loop's output; on cancellation the merge stops at the first
+    /// cancelled unit, exactly as a serial `break` discarded units it never
+    /// reached.
+    fn scan_units<T: UnitFile + Sync>(
+        &self,
+        analyzer: &dyn IAnalyzer,
+        units: &[T],
+        scan: impl Fn(&T) -> Result<EdgeDerivationResult, OccurrencesCancelled> + Sync,
+    ) -> ReferenceRun {
+        enum FileScan {
+            Cancelled,
+            Scanned {
+                source_bytes: usize,
+                result: EdgeDerivationResult,
+            },
+        }
         let generation = analyzer.project().analysis_generation();
+        let scan_one = |unit: &T| {
+            if self.cancellation().is_cancelled() {
+                return FileScan::Cancelled;
+            }
+            let source_bytes = analyzer
+                .indexed_source(unit.file())
+                .map_or(0, |source| source.len());
+            match scan(unit) {
+                Ok(result) => FileScan::Scanned {
+                    source_bytes,
+                    result,
+                },
+                Err(OccurrencesCancelled) => FileScan::Cancelled,
+            }
+        };
+        let warm_prefix = units.len().min(rayon::current_num_threads().max(2));
+        let mut per_file: Vec<FileScan> = units[..warm_prefix].iter().map(scan_one).collect();
+        per_file.extend(
+            units[warm_prefix..]
+                .par_iter()
+                .map(scan_one)
+                .collect::<Vec<FileScan>>(),
+        );
         let mut edges = Vec::new();
         let mut reasons = Vec::new();
         let mut scanned_files = 0usize;
         let mut scanned_source_bytes = 0usize;
-        for file in files {
-            if self.cancellation().is_cancelled() {
-                reasons.push(EdgeIncompleteReason::Cancelled);
-                break;
-            }
-            scanned_files += 1;
-            scanned_source_bytes = scanned_source_bytes.saturating_add(
-                analyzer
-                    .indexed_source(file)
-                    .map_or(0, |source| source.len()),
-            );
-            match forward_edges_for_file(analyzer, file, self.cancellation()) {
-                Ok(result) => {
+        for scan in per_file {
+            match scan {
+                FileScan::Cancelled => {
+                    reasons.push(EdgeIncompleteReason::Cancelled);
+                    break;
+                }
+                FileScan::Scanned {
+                    source_bytes,
+                    result,
+                } => {
+                    scanned_files += 1;
+                    scanned_source_bytes = scanned_source_bytes.saturating_add(source_bytes);
                     edges.extend(result.edges);
                     if let EdgeCompleteness::Incomplete {
                         reasons: file_reasons,
@@ -519,10 +611,6 @@ impl<'a> ReferenceEngine<'a> {
                     {
                         reasons.extend(file_reasons);
                     }
-                }
-                Err(OccurrencesCancelled) => {
-                    reasons.push(EdgeIncompleteReason::Cancelled);
-                    break;
                 }
             }
         }
@@ -536,7 +624,7 @@ impl<'a> ReferenceEngine<'a> {
             },
             generation,
             work: ReferenceWork {
-                candidate_files: files.len(),
+                candidate_files: units.len(),
                 scanned_files,
                 scanned_source_bytes,
                 emitted_edges,
@@ -998,27 +1086,60 @@ pub fn forward_edges_for_file(
     cancellation: &CancellationToken,
 ) -> Result<EdgeDerivationResult, OccurrencesCancelled> {
     let generation = analyzer.project().analysis_generation();
-    match supports_edge_axis(analyzer, file, EdgeAxis::ForwardProjection) {
-        Some(true) => {}
-        Some(false) => {
-            return Ok(EdgeDerivationResult::incomplete(
-                vec![EdgeIncompleteReason::AxisUnsupported(
-                    EdgeAxis::ForwardProjection,
-                )],
-                EdgeProvenance::Forward,
-                generation,
-            ));
-        }
-        None => {
-            return Ok(EdgeDerivationResult::incomplete(
-                vec![EdgeIncompleteReason::NoStructuralAdapter],
-                EdgeProvenance::Forward,
-                generation,
-            ));
-        }
+    if let Some(unsupported) = forward_axis_gate(analyzer, file, generation) {
+        return Ok(unsupported);
     }
-
     let occurrences = occurrences_for_file(analyzer, file, cancellation)?;
+    forward_edges_from_occurrences(analyzer, file, occurrences, generation)
+}
+
+/// [`forward_edges_for_file`], resolving only the reference rows that start on
+/// one of `lines`. Rows off those lines are never resolved and therefore emit
+/// no edges; classification and the completeness account stay exhaustive. The
+/// usage-graph structural exact fallback uses this because it only ever reads
+/// its edge table at legacy call-site lines (issue #2679).
+pub fn forward_edges_for_file_at_lines(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    lines: &std::collections::BTreeSet<usize>,
+    cancellation: &CancellationToken,
+) -> Result<EdgeDerivationResult, OccurrencesCancelled> {
+    let generation = analyzer.project().analysis_generation();
+    if let Some(unsupported) = forward_axis_gate(analyzer, file, generation) {
+        return Ok(unsupported);
+    }
+    let occurrences = occurrences_for_file_at_lines(analyzer, file, lines, cancellation)?;
+    forward_edges_from_occurrences(analyzer, file, occurrences, generation)
+}
+
+fn forward_axis_gate(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    generation: u64,
+) -> Option<EdgeDerivationResult> {
+    match supports_edge_axis(analyzer, file, EdgeAxis::ForwardProjection) {
+        Some(true) => None,
+        Some(false) => Some(EdgeDerivationResult::incomplete(
+            vec![EdgeIncompleteReason::AxisUnsupported(
+                EdgeAxis::ForwardProjection,
+            )],
+            EdgeProvenance::Forward,
+            generation,
+        )),
+        None => Some(EdgeDerivationResult::incomplete(
+            vec![EdgeIncompleteReason::NoStructuralAdapter],
+            EdgeProvenance::Forward,
+            generation,
+        )),
+    }
+}
+
+fn forward_edges_from_occurrences(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    occurrences: OccurrenceFileResult,
+    generation: u64,
+) -> Result<EdgeDerivationResult, OccurrencesCancelled> {
     let import_target_nodes = import_target_nodes_for_file(analyzer, file).unwrap_or_default();
     let mut edges = Vec::new();
     for row in &occurrences.rows {

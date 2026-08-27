@@ -3250,7 +3250,7 @@ fn jsts_local_new_receiver_owner_candidates(
     let Some(scope) = jsts_enclosing_function_or_program_scope(root, before_byte) else {
         return Vec::new();
     };
-    let mut state = None;
+    let mut state = LocalReceiverWrites::Unseen;
     jsts_collect_local_new_receiver_owner_candidates(
         analyzer,
         host,
@@ -3268,7 +3268,37 @@ fn jsts_local_new_receiver_owner_candidates(
         depth,
         &mut state,
     );
-    state.unwrap_or_default()
+    match state {
+        LocalReceiverWrites::Owners(owners) => owners,
+        LocalReceiverWrites::Unseen | LocalReceiverWrites::Conflicted => Vec::new(),
+    }
+}
+
+/// The visible writes to one local receiver name, folded in source order.
+///
+/// Two writes that resolve to different owners are a merge, not a proof: this
+/// walk is flow-insensitive, so it cannot say which write reaches the use, and
+/// the symbol stays unresolved rather than taking the last write seen (#2717,
+/// the TypeScript edition of the #2495 rule). A write with no resolvable
+/// owners keeps the pre-existing behavior of clearing the answer.
+enum LocalReceiverWrites {
+    Unseen,
+    Owners(Vec<CodeUnit>),
+    Conflicted,
+}
+
+impl LocalReceiverWrites {
+    fn record(&mut self, owners: Vec<CodeUnit>) {
+        match self {
+            LocalReceiverWrites::Conflicted => {}
+            LocalReceiverWrites::Owners(previous)
+                if !previous.is_empty() && !owners.is_empty() && *previous != owners =>
+            {
+                *self = LocalReceiverWrites::Conflicted;
+            }
+            _ => *self = LocalReceiverWrites::Owners(owners),
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3287,7 +3317,7 @@ fn jsts_collect_local_new_receiver_owner_candidates(
     receiver: &str,
     before_byte: usize,
     depth: usize,
-    state: &mut Option<Vec<CodeUnit>>,
+    state: &mut LocalReceiverWrites,
 ) {
     let mut stack = vec![node];
     while let Some(node) = stack.pop() {
@@ -3332,7 +3362,7 @@ fn jsts_collect_local_new_receiver_owner_candidates(
                     )
                 })
                 .unwrap_or_default();
-            *state = Some(owners);
+            state.record(owners);
         }
 
         if node.kind() == "assignment_expression"
@@ -3359,7 +3389,7 @@ fn jsts_collect_local_new_receiver_owner_candidates(
                     )
                 })
                 .unwrap_or_default();
-            *state = Some(owners);
+            state.record(owners);
         }
 
         let mut cursor = node.walk();

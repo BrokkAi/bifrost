@@ -501,8 +501,15 @@ impl DependencyResolver for PythonDependencyResolver {
 
     fn dependency_inputs(&self) -> &'static [&'static str] {
         // Python discovery reads distribution metadata under the roots the
-        // host configures; there is no project-level manifest it consults.
-        &["METADATA", "RECORD", "top_level.txt"]
+        // host configures, plus the workspace's own toolchain declaration
+        // files, which key the standard-library pack selection (#1869).
+        &[
+            "METADATA",
+            "RECORD",
+            "top_level.txt",
+            "pyproject.toml",
+            ".python-version",
+        ]
     }
 
     fn bounds(&self, config: &AnalyzerConfig) -> DependencyResolverBounds {

@@ -33,6 +33,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use tokio::sync::Mutex as AsyncMutex;
 
 /// Counts workspace revocations in the order they arrived on the wire.
 ///
@@ -184,18 +185,23 @@ impl OutboundResponseTimings {
 /// Wraps a transport to emit `response_queue_wait` and `writer_delivery` for
 /// responses the handler armed.
 ///
-/// `Transport::send` takes `&mut self`, so deliveries are serialized: a
-/// response's timing lines are on stderr before the next outbound message can
-/// start sending. That is the ordering the benchmark's profile boundaries
-/// rely on.
+/// `Transport::send` takes `&mut self`, but it returns an independently owned
+/// future. The async mutex therefore covers the complete inner send and its
+/// timing emission so a later profile-boundary response cannot overtake the
+/// preceding response's `writer_delivery` line.
 pub struct ResponseTimingTransport<T> {
     inner: T,
     timings: Arc<OutboundResponseTimings>,
+    delivery: Arc<AsyncMutex<()>>,
 }
 
 impl<T> ResponseTimingTransport<T> {
     pub fn new(inner: T, timings: Arc<OutboundResponseTimings>) -> Self {
-        Self { inner, timings }
+        Self {
+            inner,
+            timings,
+            delivery: Arc::new(AsyncMutex::new(())),
+        }
     }
 }
 
@@ -215,7 +221,9 @@ where
             _ => None,
         };
         let send = self.inner.send(item);
+        let delivery = Arc::clone(&self.delivery);
         async move {
+            let _delivery = delivery.lock().await;
             if let Some(timing) = &timing {
                 profiling::duration(
                     transport_phase_label(
@@ -255,6 +263,7 @@ where
 mod tests {
     use super::*;
     use rmcp::model::ClientJsonRpcMessage;
+    use tokio::sync::oneshot;
 
     /// A transport that replays a fixed script, so the ordering rule can be
     /// checked without a real client.
@@ -272,6 +281,40 @@ mod tests {
 
         async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleServer>> {
             self.0.pop_front()
+        }
+
+        fn close(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
+            std::future::ready(Ok(()))
+        }
+    }
+
+    struct GatedSendTransport {
+        first_started: Option<oneshot::Sender<()>>,
+        first_release: Option<oneshot::Receiver<()>>,
+    }
+
+    impl Transport<RoleServer> for GatedSendTransport {
+        type Error = std::io::Error;
+
+        fn send(
+            &mut self,
+            _item: rmcp::service::TxJsonRpcMessage<RoleServer>,
+        ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
+            let started = self.first_started.take();
+            let release = self.first_release.take();
+            async move {
+                if let Some(started) = started {
+                    started.send(()).expect("first send start receiver");
+                }
+                if let Some(release) = release {
+                    release.await.expect("first send release sender");
+                }
+                Ok(())
+            }
+        }
+
+        async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleServer>> {
+            None
         }
 
         fn close(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
@@ -386,6 +429,44 @@ mod tests {
             .await
             .expect("send the error response");
         assert_eq!(timings.armed_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_later_send_waits_until_the_previous_delivery_future_finishes() {
+        let (first_started, first_start) = oneshot::channel();
+        let (first_release, release_first) = oneshot::channel();
+        let mut transport = ResponseTimingTransport::new(
+            GatedSendTransport {
+                first_started: Some(first_started),
+                first_release: Some(release_first),
+            },
+            Arc::new(OutboundResponseTimings::default()),
+        );
+        let first = transport.send(rmcp::model::JsonRpcMessage::response(
+            rmcp::model::ServerResult::empty(()),
+            RequestId::Number(1),
+        ));
+        let second = transport.send(rmcp::model::JsonRpcMessage::response(
+            rmcp::model::ServerResult::empty(()),
+            RequestId::Number(2),
+        ));
+
+        let first = tokio::spawn(first);
+        first_start.await.expect("first send started");
+        let mut second = tokio::spawn(second);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut second)
+                .await
+                .is_err(),
+            "the second send completed while the first delivery was still in progress"
+        );
+
+        first_release.send(()).expect("first send release receiver");
+        first.await.expect("first send task").expect("first send");
+        second
+            .await
+            .expect("second send task")
+            .expect("second send");
     }
 
     #[tokio::test]

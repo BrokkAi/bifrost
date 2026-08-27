@@ -19,7 +19,7 @@ use brokk_bifrost_js_ts::syntax::{
 };
 
 const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-value-semantics-v13";
-const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v14";
+const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v16";
 
 #[derive(Debug, Clone, Copy)]
 enum JsTsSemanticFlavor {

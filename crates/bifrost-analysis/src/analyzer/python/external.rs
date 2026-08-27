@@ -1820,10 +1820,270 @@ fn python_visibility(name: &str) -> Visibility {
     }
 }
 
+const PYTHON_VERSION_FILE_NAME: &str = ".python-version";
+const PYPROJECT_FILE_NAME: &str = "pyproject.toml";
+const CPYTHON_TOOLCHAIN_NAME: &str = "cpython";
+const MAX_PYTHON_TOOLCHAIN_DECLARATION_BYTES: u64 = 256 * 1024;
+
+/// Resolve the standard-library dependency a workspace *declares* rather than
+/// installs: an exact `cpython` toolchain pin read from `.python-version` or
+/// from `pyproject.toml`'s `requires-python` lower bound (#1869).
+///
+/// The dependency carries no artifacts on purpose. Preparation serves an
+/// artifact-less dependency from a compatible installed pack, so this is what
+/// selects the released `bifrost.python-stdlib` typeshed pack the same way an
+/// evidence-only `JAVA_HOME` selects the released JDK pack and a declared
+/// `rust-toolchain.toml` selects the Rust standard-library pack. No
+/// interpreter is discovered or consulted; the declaration files are ordinary
+/// workspace files.
+fn resolve_declared_python_stdlib_dependency(
+    project_root: &Path,
+    inputs_considered: &mut usize,
+) -> Result<Option<ResolvedDependency>, DependencyPackDiagnostic> {
+    let version_file = project_root.join(PYTHON_VERSION_FILE_NAME);
+    if let Some(source) = read_bounded_declaration_file(&version_file).map_err(|message| {
+        declaration_diagnostic("python.toolchain.version_file", &version_file, message)
+    })? {
+        *inputs_considered += 1;
+        let (version, declared) = parse_python_version_file(&source).map_err(|message| {
+            declaration_diagnostic("python.toolchain.version_file", &version_file, message)
+        })?;
+        return Ok(Some(declared_python_stdlib_dependency(
+            version,
+            PYTHON_VERSION_FILE_NAME,
+            &declared,
+        )));
+    }
+    let pyproject = project_root.join(PYPROJECT_FILE_NAME);
+    let Some(source) = read_bounded_declaration_file(&pyproject).map_err(|message| {
+        declaration_diagnostic("python.toolchain.requires_python", &pyproject, message)
+    })?
+    else {
+        return Ok(None);
+    };
+    *inputs_considered += 1;
+    let Some(requirement) = parse_pyproject_requires_python(&source).map_err(|message| {
+        declaration_diagnostic("python.toolchain.requires_python", &pyproject, message)
+    })?
+    else {
+        return Ok(None);
+    };
+    let version = requires_python_lower_bound(&requirement).map_err(|message| {
+        declaration_diagnostic("python.toolchain.requires_python", &pyproject, message)
+    })?;
+    Ok(Some(declared_python_stdlib_dependency(
+        version,
+        PYPROJECT_FILE_NAME,
+        &requirement,
+    )))
+}
+
+fn declaration_diagnostic(
+    code: &str,
+    location: &Path,
+    message: String,
+) -> DependencyPackDiagnostic {
+    DependencyPackDiagnostic {
+        severity: DependencyPackDiagnosticSeverity::Warning,
+        code: code.to_owned(),
+        dependency_id: None,
+        location: Some(location.display().to_string()),
+        message,
+    }
+}
+
+/// Read one workspace toolchain-declaration file. Absent means "the workspace
+/// declares nothing here" and is not a diagnostic.
+fn read_bounded_declaration_file(path: &Path) -> Result<Option<String>, String> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("could not inspect declaration file: {error}")),
+    };
+    if !metadata.is_file() || metadata.len() > MAX_PYTHON_TOOLCHAIN_DECLARATION_BYTES {
+        return Err(format!(
+            "declaration file is not a regular file within {MAX_PYTHON_TOOLCHAIN_DECLARATION_BYTES} bytes"
+        ));
+    }
+    fs::read_to_string(path)
+        .map(Some)
+        .map_err(|error| format!("could not read declaration file: {error}"))
+}
+
+/// Parse the first declared line of a `.python-version` file into an exact
+/// cpython version. The pyenv/uv convention allows comments and multiple
+/// lines; only the first declaration decides, and only a plain numeric
+/// `MAJOR.MINOR[.PATCH]` is an interpretable cpython pin. Implementation
+/// prefixes (`pypy3.10`), suffixes (`3.13-dev`), and anything else stay an
+/// attributable refusal rather than a guessed toolchain.
+fn parse_python_version_file(source: &str) -> Result<(Version, String), String> {
+    let declared = source
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .ok_or_else(|| "`.python-version` declares no version line".to_owned())?;
+    let version = parse_exact_cpython_version(declared).ok_or_else(|| {
+        format!(
+            "`.python-version` declaration {declared:?} is not an exact cpython version \
+             (expected MAJOR.MINOR or MAJOR.MINOR.PATCH)"
+        )
+    })?;
+    Ok((version, declared.to_owned()))
+}
+
+/// Parse a plain dotted numeric version with two or three components. A
+/// missing patch component means `.0`: declaring `3.12` pins the interpreter
+/// line's floor, which is the only version the declaration proves.
+fn parse_exact_cpython_version(text: &str) -> Option<Version> {
+    let mut components = text.split('.').map(|component| {
+        (!component.is_empty() && component.bytes().all(|byte| byte.is_ascii_digit()))
+            .then(|| component.parse::<u64>().ok())
+            .flatten()
+    });
+    let major = components.next().flatten()?;
+    let minor = components.next().flatten()?;
+    let patch = match components.next() {
+        Some(patch) => patch?,
+        None => 0,
+    };
+    components
+        .next()
+        .is_none()
+        .then(|| Version::new(major, minor, patch))
+}
+
+/// Extract `[project] requires-python` from `pyproject.toml` source. An
+/// absent table or field is `Ok(None)`: the workspace declares nothing.
+fn parse_pyproject_requires_python(source: &str) -> Result<Option<String>, String> {
+    #[derive(serde::Deserialize)]
+    struct PyProjectDocument {
+        project: Option<PyProjectSection>,
+    }
+    #[derive(serde::Deserialize)]
+    struct PyProjectSection {
+        #[serde(rename = "requires-python")]
+        requires_python: Option<String>,
+    }
+    let document: PyProjectDocument = toml::from_str(source)
+        .map_err(|error| format!("could not decode pyproject.toml: {error}"))?;
+    Ok(document.project.and_then(|project| project.requires_python))
+}
+
+/// Pin the provable inclusive lower bound of a `requires-python` specifier
+/// list. `>=X.Y[.Z]` and `~=X.Y[.Z]` state it directly, and `==X.Y[.Z]` or
+/// `==X.Y.*` pin it exactly; upper bounds (`<`, `<=`) and exclusions (`!=`)
+/// never lower it and pass through uninterpreted. Any clause this cannot
+/// read exactly refuses the whole declaration: a guessed pin would let the
+/// pack prove a declaration absent for an interpreter the workspace supports.
+fn requires_python_lower_bound(requirement: &str) -> Result<Version, String> {
+    let mut lower: Option<Version> = None;
+    for clause in requirement.split(',') {
+        let clause = clause.trim();
+        let bound = if let Some(rest) = clause
+            .strip_prefix(">=")
+            .or_else(|| clause.strip_prefix("~="))
+        {
+            Some(parse_exact_cpython_version(rest.trim()).ok_or_else(|| {
+                format!("requires-python clause {clause:?} does not state an exact lower bound")
+            })?)
+        } else if let Some(rest) = clause.strip_prefix("==") {
+            let rest = rest.trim();
+            let exact = rest.strip_suffix(".*").unwrap_or(rest);
+            Some(parse_exact_cpython_version(exact).ok_or_else(|| {
+                format!("requires-python clause {clause:?} does not state an exact version")
+            })?)
+        } else if clause.starts_with("<=") || clause.starts_with('<') || clause.starts_with("!=") {
+            None
+        } else {
+            return Err(format!(
+                "requires-python clause {clause:?} is not an interpretable version specifier"
+            ));
+        };
+        if let Some(bound) = bound
+            && lower.as_ref().is_none_or(|current| bound > *current)
+        {
+            lower = Some(bound);
+        }
+    }
+    lower.ok_or_else(|| {
+        format!("requires-python {requirement:?} declares no provable inclusive lower bound")
+    })
+}
+
+fn declared_python_stdlib_dependency(
+    version: Version,
+    source_file: &str,
+    declared: &str,
+) -> ResolvedDependency {
+    ResolvedDependency {
+        id: format!("python:stdlib:declared:cpython:{version}"),
+        evidence: SemanticModelActivationEvidence {
+            language: "python".to_owned(),
+            ecosystem: "python".to_owned(),
+            package: None,
+            module: None,
+            toolchain: Some(CatalogCoordinate {
+                name: CPYTHON_TOOLCHAIN_NAME.to_owned(),
+                version: Some(version.clone()),
+            }),
+            // The workspace declares a version, not a platform. Leaving the
+            // target unpinned keeps platform-guarded declarations active and
+            // read-incomplete instead of provably dropped, per the pack's
+            // one-way honesty rule (semantic-packs/python/README.md).
+            target: None,
+            configuration: None,
+            artifact_sha256: None,
+        },
+        provenance: vec![
+            DependencyProvenance {
+                key: "python.toolchain_declaration".to_owned(),
+                value: source_file.to_owned(),
+            },
+            DependencyProvenance {
+                key: "python.declared_requirement".to_owned(),
+                value: declared.to_owned(),
+            },
+            DependencyProvenance {
+                key: "python.pinned_version".to_owned(),
+                value: version.to_string(),
+            },
+        ],
+        artifacts: Vec::new(),
+        scope: DependencyScope::Unknown,
+        declared_by: None,
+    }
+}
+
+/// The discovery outcome for a workspace with no configured Python
+/// environment: the declared-toolchain route alone (#1869). A workspace that
+/// declares nothing resolves nothing and stays complete, exactly as before.
+fn resolve_declared_python_stdlib_outcome(project: &dyn Project) -> DependencyDiscoveryOutcome {
+    let mut outcome = DependencyDiscoveryOutcome::complete(Vec::new());
+    match resolve_declared_python_stdlib_dependency(
+        project.root(),
+        &mut outcome.profile.metadata_inputs_considered,
+    ) {
+        Ok(Some(dependency)) => {
+            outcome.dependencies.push(dependency);
+            outcome.profile.dependencies_resolved = 1;
+        }
+        Ok(None) => {}
+        Err(diagnostic) => {
+            outcome.diagnostics.push(diagnostic);
+            outcome.complete = false;
+        }
+    }
+    outcome
+}
+
 /// Resolve configured Python standard-library, bundled-stub, and installed
 /// distribution files without using the interpreter, `sys.path`, `.pth`, or a
 /// package manager. A disabled Python environment intentionally resolves no
-/// dependencies.
+/// environment dependencies; the workspace-declared toolchain route
+/// ([`resolve_declared_python_stdlib_dependency`]) still runs so an installed
+/// standard-library pack can activate by default. An explicitly configured
+/// environment supersedes the declaration: it pins the interpreter exactly
+/// and produces the stdlib pack from the interpreter's own stubs.
 pub fn resolve_python_semantic_pack_dependencies(
     config: &PythonAnalyzerConfig,
     project: &dyn Project,
@@ -1831,7 +2091,7 @@ pub fn resolve_python_semantic_pack_dependencies(
     cancellation: Option<&CancellationToken>,
 ) -> DependencyDiscoveryOutcome {
     let Some(environment) = &config.environment else {
-        return DependencyDiscoveryOutcome::complete(Vec::new());
+        return resolve_declared_python_stdlib_outcome(project);
     };
     let mut state = DiscoveryState::new(environment, limits);
     if state.cancelled(cancellation) {
@@ -2651,6 +2911,114 @@ mod tests {
     use super::*;
     use crate::analyzer::semantic_model::{CompilerOptions, compile_pack, read_exact_source_set};
     use tempfile::tempdir;
+
+    #[test]
+    fn version_file_declarations_pin_exact_cpython_versions() {
+        let (version, declared) = parse_python_version_file("3.12.4\n").unwrap();
+        assert_eq!(version, Version::new(3, 12, 4));
+        assert_eq!(declared, "3.12.4");
+        let (version, _) = parse_python_version_file("# team default\n\n3.11\n3.9\n").unwrap();
+        assert_eq!(version, Version::new(3, 11, 0), "first declaration decides");
+        for refused in ["pypy3.10", "3.13-dev", "cpython-3.12", "3", "3.12.4.1", ""] {
+            assert!(
+                parse_python_version_file(refused).is_err(),
+                "{refused:?} must not pin a cpython version"
+            );
+        }
+    }
+
+    #[test]
+    fn requires_python_pins_the_provable_inclusive_lower_bound() {
+        assert_eq!(
+            requires_python_lower_bound(">=3.10").unwrap(),
+            Version::new(3, 10, 0)
+        );
+        assert_eq!(
+            requires_python_lower_bound(">=3.10.2, <3.15").unwrap(),
+            Version::new(3, 10, 2)
+        );
+        assert_eq!(
+            requires_python_lower_bound("~=3.11.1").unwrap(),
+            Version::new(3, 11, 1)
+        );
+        assert_eq!(
+            requires_python_lower_bound("==3.12.*").unwrap(),
+            Version::new(3, 12, 0)
+        );
+        assert_eq!(
+            requires_python_lower_bound(">=3.9, >=3.10, !=3.10.1").unwrap(),
+            Version::new(3, 10, 0),
+            "the strictest lower bound wins"
+        );
+        for refused in [">3.9", ">=3.*", "<3.13", ">=3.10rc1", "3.10", ""] {
+            assert!(
+                requires_python_lower_bound(refused).is_err(),
+                "{refused:?} must refuse rather than guess a pin"
+            );
+        }
+    }
+
+    #[test]
+    fn declared_toolchain_discovery_reads_version_file_before_pyproject() {
+        let root = tempdir().unwrap();
+        std::fs::write(
+            root.path().join("pyproject.toml"),
+            "[project]\nname = \"fixture\"\nrequires-python = \">=3.10\"\n",
+        )
+        .unwrap();
+        let mut inputs = 0;
+        let dependency = resolve_declared_python_stdlib_dependency(root.path(), &mut inputs)
+            .unwrap()
+            .expect("requires-python declares a toolchain");
+        assert_eq!(dependency.id, "python:stdlib:declared:cpython:3.10.0");
+        let toolchain = dependency.evidence.toolchain.as_ref().unwrap();
+        assert_eq!(toolchain.name, "cpython");
+        assert_eq!(toolchain.version, Some(Version::new(3, 10, 0)));
+        assert_eq!(dependency.evidence.target, None);
+        assert!(dependency.artifacts.is_empty());
+
+        std::fs::write(root.path().join(".python-version"), "3.12.1\n").unwrap();
+        let mut inputs = 0;
+        let dependency = resolve_declared_python_stdlib_dependency(root.path(), &mut inputs)
+            .unwrap()
+            .expect(".python-version declares a toolchain");
+        assert_eq!(
+            dependency.id, "python:stdlib:declared:cpython:3.12.1",
+            "the exact version file wins over the pyproject range"
+        );
+    }
+
+    #[test]
+    fn undeclared_and_uninterpretable_toolchains_stay_honest() {
+        let root = tempdir().unwrap();
+        let mut inputs = 0;
+        assert_eq!(
+            resolve_declared_python_stdlib_dependency(root.path(), &mut inputs).unwrap(),
+            None,
+            "a workspace declaring nothing resolves nothing"
+        );
+        std::fs::write(
+            root.path().join("pyproject.toml"),
+            "[project]\nname = \"fixture\"\n",
+        )
+        .unwrap();
+        let mut inputs = 0;
+        assert_eq!(
+            resolve_declared_python_stdlib_dependency(root.path(), &mut inputs).unwrap(),
+            None,
+            "a pyproject without requires-python declares nothing"
+        );
+        std::fs::write(root.path().join(".python-version"), "pypy3.10\n").unwrap();
+        let mut inputs = 0;
+        let diagnostic =
+            resolve_declared_python_stdlib_dependency(root.path(), &mut inputs).unwrap_err();
+        assert_eq!(diagnostic.code, "python.toolchain.version_file");
+        assert_eq!(
+            diagnostic.severity,
+            DependencyPackDiagnosticSeverity::Warning
+        );
+        assert!(diagnostic.message.contains("pypy3.10"), "{diagnostic:#?}");
+    }
 
     #[test]
     fn source_set_resolves_present_imported_hierarchy_and_keeps_external_named() {

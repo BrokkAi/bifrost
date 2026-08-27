@@ -19,7 +19,7 @@ use crate::analyzer::tree_sitter_analyzer::{
 use crate::analyzer::{CppAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 
-const ADAPTER_VERSION: &[u8] = b"cpp-cfg-values-v4";
+const ADAPTER_VERSION: &[u8] = b"cpp-cfg-values-v7";
 
 impl_program_semantics_provider!(CppAnalyzer, CppSemanticLowerer);
 
@@ -48,7 +48,7 @@ impl ProgramSemanticsLowerer for CppSemanticLowerer {
         budget: &SemanticBudget,
         cancellation: &CancellationToken,
     ) -> Result<SemanticOutcome<Vec<ProcedureSemanticsParts>>, SemanticProviderError> {
-        let (specs, initial_work) =
+        let (inventory, initial_work) =
             match enumerate_procedures(file, prepared, budget, cancellation)? {
                 ProcedureEnumeration::Complete {
                     value,
@@ -70,13 +70,25 @@ impl ProgramSemanticsLowerer for CppSemanticLowerer {
                 }
             };
 
+        let ProcedureInventory {
+            specs,
+            member_declarations,
+            trivial_types,
+        } = inventory;
         lower_procedure_batch(
             &specs,
             initial_work,
             budget,
             cancellation,
             |spec, staged_budget, cancellation| {
-                lower_procedure(prepared, spec, staged_budget, cancellation)
+                lower_procedure(
+                    prepared,
+                    spec,
+                    &member_declarations,
+                    &trivial_types,
+                    staged_budget,
+                    cancellation,
+                )
             },
         )
     }
@@ -111,6 +123,16 @@ fn cpp_capabilities() -> SemanticCapabilities {
         SemanticCapability::LocalFlow,
         SemanticCapability::ParameterFlow,
         SemanticCapability::ReceiverFlow,
+        // Partial, not complete: a write or read through a member, element, or
+        // static target becomes a `MemoryStore`/`MemoryLoad` against a
+        // structured location, but whether that location is the *declared*
+        // member is only known when this file can resolve the base's type, and
+        // an element is only addressed when the subscript is constant and the
+        // base is provably an array. Every other occurrence publishes its own
+        // location-subject gap (#2666, #2665).
+        SemanticCapability::FieldMemory,
+        SemanticCapability::StaticMemory,
+        SemanticCapability::IndexMemory,
         SemanticCapability::NonLocalControl,
         SemanticCapability::ResourceManagement,
         SemanticCapability::DeferredExecution,
@@ -152,7 +174,214 @@ enum NoexceptSpecification {
     Conditional,
 }
 
-type ProcedureEnumeration<'tree> = ProcedureInventoryOutcome<Vec<ProcedureSpec<'tree>>>;
+/// One data member of a class, struct, or union, as the enumeration pass sees
+/// it.
+///
+/// `anchor` is the *declaration's* own source anchor, which is what makes two
+/// occurrences of the same member -- a store in one statement and a load in
+/// another -- agree on one [`MemoryLocationKind::Field`] identity instead of
+/// each minting a location that only looks like the other.
+#[derive(Debug, Clone)]
+struct MemberDeclaration {
+    anchor: SourceAnchor,
+    /// A `static` data member is one class-wide slot addressed by nothing, so
+    /// it is a [`MemoryLocationKind::Static`] rather than a field of a base.
+    is_static: bool,
+    /// Whether writing the member is the very object the written expression
+    /// denotes: a pointer or reference member, or a member of fundamental
+    /// type. Combined with `is_c_source` at the use site, this is the member's
+    /// half of the same question [`cpp_identity_is_preserved`] asks of a local.
+    identity_preserved: bool,
+    /// The member's own declared type name, when it names one. This is what
+    /// lets `a.b.c` find the type that declares `c` from the declaration of
+    /// `b`, instead of stopping at the first hop.
+    type_name: Option<Box<str>>,
+}
+
+/// Data members declared in this file, keyed by owning type and member name.
+///
+/// A `None` value records a name that more than one declaration in this file
+/// claims. Such a name resolves to no single anchor, so an occurrence of it
+/// declines rather than picking one arbitrarily.
+type MemberDeclarations = HashMap<TypeMemberKey, Option<MemberDeclaration>>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TypeMemberKey {
+    /// The enclosing namespace path, outermost first, so a `Holder` in two
+    /// namespaces of one file stays two types.
+    namespace: Box<[Box<str>]>,
+    owner: Box<str>,
+    name: Box<str>,
+}
+
+/// The class, struct, and union names this file declares whose construction
+/// and destruction provably run no user code.
+///
+/// A C++ automatic object of such a type opens no RAII boundary: there is no
+/// destructor to run at scope exit and no constructor or conversion function
+/// to run at initialization, so the cleanup, lifetime-call, and unwinding
+/// declines those boundaries publish would be claims about code that does not
+/// exist. Because those declines carry value, heap, and aliasing impact, an
+/// unqualified "this scope has an automatic object" made every C++ procedure
+/// holding a plain aggregate unprovable (#2666).
+///
+/// The proof is deliberately narrow and purely structural. A name qualifies
+/// only when every declaration of it in this file is a class body that
+///
+/// - has no base-class clause,
+/// - declares nothing but data members and access specifiers, so no
+///   constructor, destructor, assignment operator, or virtual function,
+/// - gives no member a default member initializer, and
+/// - gives every member a type that is fundamental, a pointer or reference, or
+///   another name proved trivial the same way.
+///
+/// Anything this file cannot see -- a type from a header, a template
+/// parameter, a name declared twice -- is absent from the set, and its objects
+/// keep every boundary they had.
+#[derive(Debug, Default)]
+struct TrivialTypeIndex {
+    names: HashSet<Box<str>>,
+}
+
+impl TrivialTypeIndex {
+    /// Build the index by fixpoint over the file's class bodies.
+    ///
+    /// The dependency `Middle { Leaf c; }` is resolved by iterating: each pass
+    /// admits the candidates all of whose member types are already admitted,
+    /// and the loop stops when a pass admits nothing new. At most one name is
+    /// admitted per pass, so the iteration is bounded by the candidate count.
+    fn build(source: &str, root: Node<'_>) -> Self {
+        // name -> member type names it depends on; `None` once a second,
+        // conflicting declaration of the name is seen.
+        let mut candidates: HashMap<Box<str>, Option<Vec<Box<str>>>> = HashMap::default();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            stack.extend(named_children(node));
+            if !matches!(
+                node.kind(),
+                "struct_specifier" | "class_specifier" | "union_specifier"
+            ) {
+                continue;
+            }
+            let Some(name) = node
+                .child_by_field_name("name")
+                .and_then(|name| nonempty_node_text(source, name))
+            else {
+                continue;
+            };
+            let dependencies = trivial_body_dependencies(source, node);
+            match candidates.entry(Box::from(name)) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(dependencies);
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    // A forward declaration carries no body and no members, so
+                    // it neither proves nor disproves anything; a second body
+                    // for one name is an ambiguity this file cannot settle.
+                    if node.child_by_field_name("body").is_some() {
+                        entry.insert(None);
+                    }
+                }
+            }
+        }
+        let mut names: HashSet<Box<str>> = HashSet::default();
+        loop {
+            let mut admitted = false;
+            for (name, dependencies) in &candidates {
+                if names.contains(name) {
+                    continue;
+                }
+                let Some(dependencies) = dependencies else {
+                    continue;
+                };
+                if dependencies
+                    .iter()
+                    .all(|dependency| names.contains(dependency))
+                {
+                    names.insert(name.clone());
+                    admitted = true;
+                }
+            }
+            if !admitted {
+                break;
+            }
+        }
+        Self { names }
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        self.names.contains(name)
+    }
+
+    /// Whether every object `declaration` declares is of a proved-trivial
+    /// type, so its construction and destruction run no user code.
+    fn declaration_is_trivial(&self, source: &str, declaration: Node<'_>) -> bool {
+        declared_type_name(source, declaration)
+            .is_some_and(|name| self.contains(&name))
+            // A declarator that introduces a function is not an object at all,
+            // and the `type` field then names the return type.
+            && !cpp_declaration_is_function(declaration)
+    }
+}
+
+/// The member type names a class body depends on for triviality, or `None`
+/// when the body itself disqualifies it.
+fn trivial_body_dependencies(source: &str, specifier: Node<'_>) -> Option<Vec<Box<str>>> {
+    let body = specifier.child_by_field_name("body")?;
+    if named_children(specifier)
+        .into_iter()
+        .any(|child| child.kind() == "base_class_clause")
+    {
+        return None;
+    }
+    let mut dependencies = Vec::new();
+    for member in named_children(body) {
+        match member.kind() {
+            "access_specifier" | "comment" => continue,
+            "field_declaration" => {}
+            // A member function, a nested definition, a using declaration, a
+            // friend, or a template is beyond what this proof inspects.
+            _ => return None,
+        }
+        if cpp_declaration_is_function(member) {
+            return None;
+        }
+        // A default member initializer is an expression that runs on
+        // construction.
+        if member.child_by_field_name("default_value").is_some() {
+            return None;
+        }
+        let declarators = cpp_local_declarators(member);
+        if declarators.is_empty() {
+            return None;
+        }
+        let type_node = member.child_by_field_name("type")?;
+        for declarator in declarators {
+            if cpp_declarator_initializer(member, declarator).is_some() {
+                return None;
+            }
+            // A pointer or reference member holds an address; destroying it
+            // runs nothing whatever it points at.
+            if cpp_declarator_preserves_identity(declarator) {
+                continue;
+            }
+            if cpp_type_is_fundamental(type_node) {
+                continue;
+            }
+            let name = declared_type_name(source, member)?;
+            dependencies.push(name);
+        }
+    }
+    Some(dependencies)
+}
+
+struct ProcedureInventory<'tree> {
+    specs: Vec<ProcedureSpec<'tree>>,
+    member_declarations: MemberDeclarations,
+    trivial_types: TrivialTypeIndex,
+}
+
+type ProcedureEnumeration<'tree> = ProcedureInventoryOutcome<ProcedureInventory<'tree>>;
 
 struct ProcedureEnumerationFrame<'tree> {
     node: Node<'tree>,
@@ -209,7 +438,15 @@ fn enumerate_procedures<'tree>(
     {
         return Ok(stop.into_outcome());
     }
+    // Built before the enumeration walk, because a callable's RAII preflight
+    // asks about a type that may be declared later in the file.
+    let trivial_types = if is_c_source {
+        TrivialTypeIndex::default()
+    } else {
+        TrivialTypeIndex::build(prepared.source(), root)
+    };
     let mut specs: Vec<ProcedureSpec<'tree>> = Vec::new();
+    let mut member_declarations = MemberDeclarations::default();
     let mut stack = vec![ProcedureEnumerationFrame {
         node: root,
         lexical_parent: None,
@@ -229,6 +466,13 @@ fn enumerate_procedures<'tree>(
         if let Err(stop) = inventory.charge_traversal_entry() {
             return Ok(stop.into_outcome());
         }
+
+        record_member_declarations(
+            &mut member_declarations,
+            frame.node,
+            prepared.source(),
+            is_c_source,
+        );
 
         let mut child_path = frame.declaration_path;
         let mut child_member_context = frame.member_context;
@@ -275,6 +519,8 @@ fn enumerate_procedures<'tree>(
         if let Some((kind, segment_kind, body, mut properties)) = shape {
             let scan = match callable_preflight(
                 frame.node,
+                prepared.source(),
+                &trivial_types,
                 temporary_free_calls.as_ref(),
                 budget,
                 inventory.observed_work(),
@@ -369,11 +615,169 @@ fn enumerate_procedures<'tree>(
         }
     }
 
-    Ok(inventory.complete(specs))
+    Ok(inventory.complete(ProcedureInventory {
+        specs,
+        member_declarations,
+        trivial_types,
+    }))
+}
+
+/// Index one node's data-member declarations, if it declares any.
+///
+/// A member of a nested type is indexed like any other. The key carries only
+/// the innermost type name, so a nested `Inner` and a top-level `Inner` in the
+/// same namespace share one key -- and the duplicate collapse below turns that
+/// into a decline, which is the honest answer.
+fn record_member_declarations(
+    members: &mut MemberDeclarations,
+    node: Node<'_>,
+    source: &str,
+    is_c_source: bool,
+) {
+    if node.kind() != "field_declaration" {
+        return;
+    }
+    // A member function declaration is not storage.
+    if cpp_declaration_is_function(node) {
+        return;
+    }
+    let Some(owner_node) = enclosing_member_owner(node) else {
+        return;
+    };
+    let Some(owner) = declaration_container_name(source, owner_node) else {
+        return;
+    };
+    let is_static = has_storage_class(source, node, "static");
+    let namespace = enclosing_namespace_path(source, node);
+    for declarator in cpp_local_declarators(node) {
+        let Some(name_node) = declarator_name_node(declarator) else {
+            continue;
+        };
+        let Some(name) = nonempty_node_text(source, name_node) else {
+            continue;
+        };
+        let Ok(anchor) = source_anchor(name_node, 0) else {
+            continue;
+        };
+        let key = TypeMemberKey {
+            namespace: namespace.clone(),
+            owner: owner.clone(),
+            name: Box::from(name),
+        };
+        let declaration = MemberDeclaration {
+            anchor,
+            type_name: declared_type_name(source, node),
+            is_static,
+            identity_preserved: is_c_source
+                || cpp_declarator_preserves_identity(declarator)
+                || (!cpp_declarator_contains_kind(declarator, "array_declarator")
+                    && node
+                        .child_by_field_name("type")
+                        .is_some_and(cpp_type_is_fundamental)),
+        };
+        match members.entry(key) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Some(declaration));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.insert(None);
+            }
+        }
+    }
+}
+
+/// The class, struct, or union declaration a member declaration belongs to.
+fn enclosing_member_owner(node: Node<'_>) -> Option<Node<'_>> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(
+            parent.kind(),
+            "struct_specifier" | "class_specifier" | "union_specifier"
+        ) {
+            return Some(parent);
+        }
+        if parent.kind() == "function_definition" {
+            return None;
+        }
+        current = parent.parent();
+    }
+    None
+}
+
+/// The type a declaration's `type` field names, when it names one by name.
+///
+/// Read from the AST's own `type` field and the specifier's `name` field. A
+/// spelled-out type that is not a named one -- a primitive, a `decltype`, an
+/// `auto` placeholder -- has no member owner and yields `None`.
+fn declared_type_name(source: &str, declaration: Node<'_>) -> Option<Box<str>> {
+    let type_node = declaration.child_by_field_name("type")?;
+    let name_node = match type_node.kind() {
+        "struct_specifier" | "class_specifier" | "union_specifier" | "enum_specifier" => {
+            type_node.child_by_field_name("name")?
+        }
+        "type_identifier" => type_node,
+        "qualified_identifier" => last_named_field_child(type_node, "name")?,
+        "template_type" => type_node.child_by_field_name("name")?,
+        _ => return None,
+    };
+    // A qualified or template name resolves to its innermost identifier, which
+    // is the spelling the member index is keyed by.
+    let name_node = match name_node.kind() {
+        "qualified_identifier" => last_named_field_child(name_node, "name")?,
+        _ => name_node,
+    };
+    nonempty_node_text(source, name_node).map(Box::from)
+}
+
+/// The class, struct, or union definition a node lexically sits inside.
+fn enclosing_type_node(node: Node<'_>) -> Option<Node<'_>> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(
+            parent.kind(),
+            "struct_specifier" | "class_specifier" | "union_specifier"
+        ) {
+            return Some(parent);
+        }
+        current = parent.parent();
+    }
+    None
+}
+
+/// The single named parameter a catch clause binds, if it has one.
+///
+/// `catch (...)` binds nothing, and a handler that names a type without a
+/// declarator binds nothing either.
+fn catch_clause_parameter<'tree>(catch: Node<'tree>) -> Option<Node<'tree>> {
+    let parameters = catch.child_by_field_name("parameters")?;
+    match named_children(parameters).as_slice() {
+        [only] if only.kind() == "parameter_declaration" => Some(*only),
+        _ => None,
+    }
+}
+
+/// The enclosing `namespace` names, outermost first.
+fn enclosing_namespace_path(source: &str, node: Node<'_>) -> Box<[Box<str>]> {
+    let mut path = Vec::new();
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "namespace_definition"
+            && let Some(name) = parent
+                .child_by_field_name("name")
+                .and_then(|name| nonempty_node_text(source, name))
+        {
+            path.push(Box::<str>::from(name));
+        }
+        current = parent.parent();
+    }
+    path.reverse();
+    path.into_boxed_slice()
 }
 
 fn callable_preflight(
     root: Node<'_>,
+    source: &str,
+    trivial_types: &TrivialTypeIndex,
     // `Some` for C++ sources; `None` for C, which never opens RAII boundaries.
     temporary_free_calls: Option<&CppTemporaryFreeCallIndex<'_>>,
     budget: &SemanticBudget,
@@ -436,7 +840,8 @@ fn callable_preflight(
             // A call expression can materialize a class-typed temporary that
             // is destroyed at the end of the full expression, unless the
             // per-file index proves this exact call temporary-free (#1984).
-            result.has_raii_boundaries |= declaration_may_construct_object(node)
+            result.has_raii_boundaries |= (declaration_may_construct_object(node)
+                && !trivial_types.declaration_is_trivial(source, node))
                 || matches!(
                     node.kind(),
                     "new_expression" | "compound_literal_expression"
@@ -759,9 +1164,40 @@ struct LoweringContext<'tree, 'targets> {
     parameters: HashMap<Box<str>, ValueId>,
     locals: HashMap<Box<str>, Vec<LocalBinding>>,
     identity_bindings: HashSet<ValueId>,
+    /// Bindings whose declared type is fundamental, so every built-in operator
+    /// written over them is the built-in operator (`cpp_binding_is_fundamental`).
+    fundamental_bindings: HashSet<ValueId>,
+    /// Data members declared anywhere in this file, so a store and a load of
+    /// one member anchor to that member's declaration rather than to
+    /// themselves (#2666).
+    member_declarations: &'targets MemberDeclarations,
+    /// Class names this file proves trivially constructible and destructible,
+    /// so an automatic object of one opens no RAII boundary.
+    trivial_types: &'targets TrivialTypeIndex,
+    /// Bindings declared with a pointer declarator, whose `->` is the built-in
+    /// indirection operator rather than a user-defined `operator->`.
+    pointer_bindings: HashSet<ValueId>,
+    /// Bindings declared with an array declarator. Subscripting one is the
+    /// built-in subscript operator addressing that array's storage, which is
+    /// what `operator[]` on a class type is not.
+    array_bindings: HashSet<ValueId>,
+    /// Bindings whose declared base type is fundamental, whatever the
+    /// declarator wraps it in. This answers the identity question for an
+    /// element write, whose target type is the array's element type.
+    fundamental_storage_bindings: HashSet<ValueId>,
+    /// The declared type name of a bound object, when its declaration named a
+    /// type by name. This is what lets `holder.tainted` find the `Holder`
+    /// declaration that owns `tainted`.
+    binding_type_names: HashMap<ValueId, Box<str>>,
+    /// One value per distinct constant subscript spelling in this procedure.
+    ///
+    /// An element location is identified by its base and index *values*, so
+    /// two occurrences of `values[0]` must share one index value or they
+    /// address two different elements. Java and C# canonicalize the same way.
+    constant_index_values: HashMap<Box<str>, ValueId>,
     receiver: Option<ValueId>,
-    return_transfer_is_exact: bool,
     is_c_source: bool,
+    return_transfer_is_exact: bool,
     labels: HashMap<Box<str>, ProgramPointId>,
     switch_case_entries: HashMap<usize, ProgramPointId>,
     published_gaps: HashSet<GapFact>,
@@ -770,6 +1206,30 @@ struct LoweringContext<'tree, 'targets> {
     has_implicit_object_context: bool,
     raii_possible: bool,
     vla_possible: bool,
+}
+
+/// One structured heap location an access expression names, together with what
+/// this file could establish about which declaration it addresses.
+#[derive(Debug, Clone, Copy)]
+struct MemoryTarget {
+    location: MemoryLocationId,
+    kind: MemoryAccessKind,
+    identity: MemoryIdentity,
+}
+
+/// Why a structured access does or does not name a known declaration.
+///
+/// The two failing answers are different in kind, and the distinction is what a
+/// consumer sees. `UserDefinedAccessor` is a decision: a C++ class-typed base
+/// resolves its subscript through an `operator[]` this adapter does not lower,
+/// and no amount of information about this program changes that. `Unresolved`
+/// is missing information: the occurrence is well formed and the declaration
+/// simply was not found here (#2666).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemoryIdentity {
+    Resolved,
+    UserDefinedAccessor,
+    Unresolved,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -781,12 +1241,15 @@ struct LocalBinding {
     value: ValueId,
 }
 
-fn lower_procedure<'tree>(
+fn lower_procedure<'tree, 'targets>(
     prepared: &'tree PreparedSyntaxTree,
     spec: &ProcedureSpec<'tree>,
-    budget: &SemanticBudget,
-    cancellation: &CancellationToken,
+    member_declarations: &'targets MemberDeclarations,
+    trivial_types: &'targets TrivialTypeIndex,
+    budget: &'targets SemanticBudget,
+    cancellation: &'targets CancellationToken,
 ) -> Result<(ProcedureSemanticsParts, SemanticWork), CppLoweringError> {
+    let is_c_source = locator_is_c_source(&spec.locator);
     let mut parts = ProcedureSemanticsParts::new(
         spec.id,
         spec.locator.clone(),
@@ -812,7 +1275,6 @@ fn lower_procedure<'tree>(
         cancellation,
         spec.noexcept == NoexceptSpecification::Unconditional,
     )?;
-    let is_c_source = locator_is_c_source(&spec.locator);
     let mut context = LoweringContext {
         source: prepared.source(),
         session,
@@ -820,9 +1282,17 @@ fn lower_procedure<'tree>(
         parameters: HashMap::default(),
         locals: HashMap::default(),
         identity_bindings: HashSet::default(),
+        fundamental_bindings: HashSet::default(),
+        member_declarations,
+        trivial_types,
+        pointer_bindings: HashSet::default(),
+        array_bindings: HashSet::default(),
+        fundamental_storage_bindings: HashSet::default(),
+        binding_type_names: HashMap::default(),
+        constant_index_values: HashMap::default(),
         receiver: None,
-        return_transfer_is_exact: cpp_callable_return_transfer_is_exact(spec.callable, is_c_source),
         is_c_source,
+        return_transfer_is_exact: cpp_callable_return_transfer_is_exact(spec.callable, is_c_source),
         labels: HashMap::default(),
         switch_case_entries: HashMap::default(),
         published_gaps: HashSet::default(),
@@ -1131,6 +1601,26 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 if cpp_declaration_value_transfer_is_exact(declaration, self.is_c_source) {
                     self.identity_bindings.insert(value);
                 }
+                if cpp_declaration_binds_fundamental_value(declaration) {
+                    self.fundamental_bindings.insert(value);
+                }
+                if let Some(type_name) = declared_type_name(self.source, declaration) {
+                    self.binding_type_names.insert(value, type_name);
+                }
+                if let Some(declarator) = declaration.child_by_field_name("declarator") {
+                    if cpp_declarator_contains_kind(declarator, "pointer_declarator") {
+                        self.pointer_bindings.insert(value);
+                    }
+                    if cpp_declarator_contains_kind(declarator, "array_declarator") {
+                        self.array_bindings.insert(value);
+                    }
+                }
+                if declaration
+                    .child_by_field_name("type")
+                    .is_some_and(cpp_type_is_fundamental)
+                {
+                    self.fundamental_storage_bindings.insert(value);
+                }
                 // A defaulted parameter is bound by an expression the standard
                 // evaluates at every call site that omits the argument. That
                 // evaluation belongs to no procedure this lowering produces:
@@ -1193,6 +1683,19 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             if node.id() != body.id() && cpp_nested_execution_boundary(node) {
                 return Ok(WalkControl::SkipChildren);
             }
+            // A catch clause's parameter binds the in-flight exception object.
+            // It is deliberately bound without an allocation and without any
+            // producing effect: an undefined local read under a handler entry
+            // is exactly what the shared handler-binding derivation (#2446)
+            // resolves to the value the reaching `throw` carried. Publishing a
+            // definition here would hide that origin behind a value nothing
+            // threw.
+            if node.kind() == "catch_clause" {
+                if let Some(parameter) = catch_clause_parameter(node) {
+                    self.bind_catch_parameter(builder, node, parameter)?;
+                }
+                return Ok(WalkControl::Continue);
+            }
             if node.kind() != "declaration"
                 || has_storage_class(self.source, node, "extern")
                 || cpp_declaration_is_function(node)
@@ -1215,12 +1718,26 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     metadata,
                     SemanticValueKind::Local,
                 )?;
-                if cpp_value_transfer_is_exact(
-                    node.child_by_field_name("type"),
-                    declarator,
-                    self.is_c_source,
-                ) {
+                if cpp_value_transfer_is_exact(node, declarator, self.is_c_source) {
                     self.identity_bindings.insert(value);
+                }
+                if cpp_binding_is_fundamental(node, declarator) {
+                    self.fundamental_bindings.insert(value);
+                }
+                if cpp_declarator_contains_kind(declarator, "array_declarator") {
+                    self.array_bindings.insert(value);
+                }
+                if cpp_declarator_contains_kind(declarator, "pointer_declarator") {
+                    self.pointer_bindings.insert(value);
+                }
+                if node
+                    .child_by_field_name("type")
+                    .is_some_and(cpp_type_is_fundamental)
+                {
+                    self.fundamental_storage_bindings.insert(value);
+                }
+                if let Some(type_name) = declared_type_name(self.source, node) {
+                    self.binding_type_names.insert(value, type_name);
                 }
                 self.locals
                     .entry(name.into())
@@ -1235,6 +1752,48 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
             Ok(WalkControl::Continue)
         })
+    }
+
+    /// Bind a catch clause's parameter as a local of the handler's scope.
+    ///
+    /// No allocation and no producing effect: see the call site.
+    fn bind_catch_parameter(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        catch: Node<'tree>,
+        parameter: Node<'tree>,
+    ) -> Result<(), CppLoweringError> {
+        let Some(declarator) = parameter.child_by_field_name("declarator") else {
+            return Ok(());
+        };
+        let Some(name_node) = declarator_name_node(declarator) else {
+            return Ok(());
+        };
+        let Some(name) = nonempty_node_text(self.source, name_node) else {
+            return Ok(());
+        };
+        let metadata = self.value_mapping(builder, name_node)?;
+        let value =
+            self.session
+                .add_value_with_metadata(builder, metadata, SemanticValueKind::Local)?;
+        self.identity_bindings.insert(value);
+        if cpp_binding_is_fundamental(parameter, declarator) {
+            self.fundamental_bindings.insert(value);
+        }
+        if let Some(type_name) = declared_type_name(self.source, parameter) {
+            self.binding_type_names.insert(value, type_name);
+        }
+        self.locals
+            .entry(name.into())
+            .or_default()
+            .push(LocalBinding {
+                declaration_start: name_node.start_byte(),
+                visible_from: name_node.end_byte(),
+                scope_start: catch.start_byte(),
+                scope_end: catch.end_byte(),
+                value,
+            });
+        Ok(())
     }
 
     fn local_at(&self, name: &str, byte: usize) -> Option<ValueId> {
@@ -1307,6 +1866,151 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .add_value_with_metadata(builder, metadata, kind)
     }
 
+    /// Whether every leaf of `node` is provably of fundamental type, so the
+    /// whole expression is built out of built-in operators only.
+    ///
+    /// This is the C/C++ analogue of the C# predefined-type proof: it is what
+    /// separates `(value * 3) + 7` on `int` locals -- where no user code can
+    /// run and the result is a pure function of the operands -- from the same
+    /// spelling over class types, where `operator*` and `operator+` may be
+    /// user-defined, may throw, and may return an unrelated object.
+    ///
+    /// `allow_update` admits `++`/`--`, whose built-in form also writes its
+    /// operand; callers that need an evaluation-order-immaterial operand pass
+    /// `false`.
+    fn expression_is_fundamental(&self, node: Node<'tree>, allow_update: bool) -> bool {
+        let mut pending = vec![node];
+        while let Some(current) = pending.pop() {
+            match current.kind() {
+                "number_literal" | "char_literal" | "true" | "false" => {}
+                "identifier" => {
+                    let proven = nonempty_node_text(self.source, current)
+                        .and_then(|name| self.binding_value(name, current.start_byte()))
+                        .is_some_and(|value| self.fundamental_bindings.contains(&value));
+                    if !proven {
+                        return false;
+                    }
+                }
+                "parenthesized_expression" => {
+                    let Some(inner) = first_named_child(current) else {
+                        return false;
+                    };
+                    pending.push(inner);
+                }
+                "binary_expression" => {
+                    for field in ["left", "right"] {
+                        let Some(child) = current.child_by_field_name(field) else {
+                            return false;
+                        };
+                        pending.push(child);
+                    }
+                }
+                "unary_expression" => {
+                    let Some(child) = current.child_by_field_name("argument") else {
+                        return false;
+                    };
+                    pending.push(child);
+                }
+                "update_expression" if allow_update => {
+                    let Some(child) = current.child_by_field_name("argument") else {
+                        return false;
+                    };
+                    pending.push(child);
+                }
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// Whether evaluating `node` can be observed by the evaluation of a
+    /// sibling operand, so an unspecified relative operand order could change
+    /// the program's values.
+    ///
+    /// Reading a named object or a literal cannot be; neither can an
+    /// expression built only out of built-in operators over fundamental
+    /// operands. Anything else -- a call, an assignment, an increment, an
+    /// overloadable operator on a class type -- can be, and keeps the
+    /// evaluation-order gap standing.
+    fn operand_evaluation_is_observable(&self, node: Node<'tree>) -> bool {
+        if matches!(
+            node.kind(),
+            "identifier"
+                | "qualified_identifier"
+                | "this"
+                | "number_literal"
+                | "char_literal"
+                | "string_literal"
+                | "raw_string_literal"
+                | "concatenated_string"
+                | "true"
+                | "false"
+                | "null"
+                | "nullptr"
+        ) {
+            return false;
+        }
+        // Naming a member or an element evaluates its base and its subscript
+        // and then computes an address. The address computation itself is not
+        // an operation another operand can observe, so the access is observable
+        // exactly when one of the expressions it evaluates is -- provided no
+        // user code runs to produce the address. Class member access with `.`
+        // never runs user code: `operator.` cannot be declared in C++ at all.
+        // `->` and `[]` can be user-defined, so they qualify only where
+        // `memory_access_target` would already prove the built-in operator.
+        match node.kind() {
+            "field_expression" => {
+                let Some(base) = node.child_by_field_name("argument") else {
+                    return true;
+                };
+                if has_direct_token(node, "->") && !self.pointer_access_is_builtin(base) {
+                    return true;
+                }
+                return self.operand_evaluation_is_observable(base);
+            }
+            "subscript_expression" => {
+                let Some(base) = node.child_by_field_name("argument") else {
+                    return true;
+                };
+                if !self.base_is_array(base) {
+                    return true;
+                }
+                return self.operand_evaluation_is_observable(base)
+                    || cpp_subscript_indices(node)
+                        .iter()
+                        .any(|index| self.operand_evaluation_is_observable(*index));
+            }
+            _ => {}
+        }
+        !self.expression_is_fundamental(node, false)
+    }
+
+    /// Whether `base -> member` uses the built-in indirection operator.
+    ///
+    /// C has no `operator->` at all, and a C++ base declared with a pointer
+    /// declarator is a raw pointer, whose `->` is built in. Anything else may
+    /// resolve to a user-defined `operator->`, which is a call.
+    fn pointer_access_is_builtin(&self, base: Node<'tree>) -> bool {
+        if self.is_c_source {
+            return true;
+        }
+        base.kind() == "identifier"
+            && nonempty_node_text(self.source, base)
+                .and_then(|name| self.binding_value(name, base.start_byte()))
+                .is_some_and(|value| self.pointer_bindings.contains(&value))
+    }
+
+    /// Whether the unspecified relative evaluation order of `operands` can
+    /// change the program's values: at most one observable operand pins the
+    /// order down to a single meaning.
+    fn operand_order_is_material(&self, operands: &[Node<'tree>]) -> bool {
+        operands
+            .iter()
+            .filter(|operand| self.operand_evaluation_is_observable(**operand))
+            .count()
+            > 1
+    }
+
     fn emit_lexical_input_flow(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -1339,19 +2043,516 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         Ok(())
     }
 
-    fn add_declaration_initializer_gap(
+    /// The abstract location an access expression names, when this file can
+    /// structure it (#2666, #2665).
+    ///
+    /// A member or element target is a write to a *location*, not to a value,
+    /// so it publishes a `MemoryStore` and deliberately carries no
+    /// `Assignment` or `ValueFlow` edge. That separation keeps the
+    /// user-defined-conversion problem out of the heap stratum: the backward
+    /// points-to trace in `workspace_oracle/heap.rs` follows only value edges,
+    /// so a store cannot republish a pre-conversion object as the member's
+    /// content the way an unguarded value assignment would. The identity
+    /// question `cpp_identity_is_preserved` answers for a local therefore does
+    /// not need re-asking here -- it is answered by construction.
+    fn memory_access_target(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
         point: ProgramPointId,
+        access: Node<'tree>,
+    ) -> Result<Option<MemoryTarget>, CppLoweringError> {
+        match access.kind() {
+            "field_expression" => self.member_location(builder, point, access),
+            "subscript_expression" => self.element_location(builder, point, access),
+            _ => Ok(None),
+        }
+    }
+
+    fn member_location(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        access: Node<'tree>,
+    ) -> Result<Option<MemoryTarget>, CppLoweringError> {
+        let (Some(base), Some(name_node)) = (
+            access.child_by_field_name("argument"),
+            access.child_by_field_name("field"),
+        ) else {
+            return Ok(None);
+        };
+        // A `destructor_name`, `template_method`, or dependent field name does
+        // not name a data member.
+        if name_node.kind() != "field_identifier" {
+            return Ok(None);
+        }
+        let Some(name) = nonempty_node_text(self.source, name_node).map(Box::<str>::from) else {
+            return Ok(None);
+        };
+        let declaration = self
+            .access_owner_type(base)
+            .and_then(|owner| self.member_declaration_for(&owner, &name, access));
+        let member = self.member_locator(name_node, declaration.as_ref())?;
+        if declaration
+            .as_ref()
+            .is_some_and(|declaration| declaration.is_static)
+        {
+            let location = self.session.add_memory_location(
+                builder,
+                point,
+                MemoryLocationKind::Static { member },
+            )?;
+            return Ok(Some(MemoryTarget {
+                location,
+                kind: MemoryAccessKind::Static,
+                identity: MemoryIdentity::Resolved,
+            }));
+        }
+        // Without a base value this is not an instance access at all -- it
+        // names a member of a type this file could not resolve. Inventing a
+        // base object would invent an aliasing fact, so decline.
+        let Some(base_value) = self.access_base_value(builder, base)? else {
+            return Ok(None);
+        };
+        let location = self.session.add_memory_location(
+            builder,
+            point,
+            MemoryLocationKind::Field {
+                base: base_value,
+                member,
+            },
+        )?;
+        Ok(Some(MemoryTarget {
+            location,
+            kind: MemoryAccessKind::Field,
+            identity: if declaration.is_some() {
+                MemoryIdentity::Resolved
+            } else {
+                MemoryIdentity::Unresolved
+            },
+        }))
+    }
+
+    fn element_location(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        access: Node<'tree>,
+    ) -> Result<Option<MemoryTarget>, CppLoweringError> {
+        let Some(base) = access.child_by_field_name("argument") else {
+            return Ok(None);
+        };
+        let Some(base_value) = self.access_base_value(builder, base)? else {
+            return Ok(None);
+        };
+        // One subscript is the element's own index. A multi-dimensional or
+        // pack subscript names no single index expression, so the location
+        // stays index-less rather than adopting the first as the whole address.
+        let subscripts = cpp_subscript_indices(access);
+        let subscript = match subscripts.as_slice() {
+            [only] => Some(*only),
+            _ => None,
+        };
+        let index = match subscript {
+            Some(value) => Some(self.subscript_value(builder, value)?),
+            None => None,
+        };
+        let location = self.session.add_memory_location(
+            builder,
+            point,
+            MemoryLocationKind::Index {
+                base: base_value,
+                index,
+            },
+        )?;
+        Ok(Some(MemoryTarget {
+            location,
+            kind: MemoryAccessKind::Index,
+            // Two independent conditions, both required.
+            //
+            // The subscript must run no user code. C has no operator
+            // overloading at all, and a C++ base declared with an array
+            // declarator has no user-declarable `operator[]` either. Any other
+            // C++ base may resolve to a user-defined subscript operator, and
+            // nothing here proves which one runs.
+            //
+            // The index must also be a constant. A location is identified by
+            // its index *value*, and only a constant subscript is canonicalized
+            // to one value across occurrences -- so claiming resolution for
+            // `values[i]` would let a store and a load address two different
+            // elements while publishing no decline, and the solver would read
+            // that disconnection as a proven absence rather than as missing
+            // information. A confident wrong answer is worse than an honest
+            // partial.
+            //
+            // The two failures are reported differently: a class-typed base is
+            // a non-lowering this adapter decided on, a non-constant index is
+            // information this file does not have.
+            identity: if !self.base_is_array(base) {
+                MemoryIdentity::UserDefinedAccessor
+            } else if subscript.is_some_and(|subscript| {
+                cpp_expression_value_kind(subscript) == SemanticValueKind::Constant
+            }) {
+                MemoryIdentity::Resolved
+            } else {
+                MemoryIdentity::Unresolved
+            },
+        }))
+    }
+
+    /// The value a subscript denotes, canonicalized when it is a constant so
+    /// that every occurrence of `values[0]` names one element location.
+    fn subscript_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+    ) -> Result<ValueId, CppLoweringError> {
+        let kind = cpp_expression_value_kind(node);
+        if kind != SemanticValueKind::Constant {
+            return self.expression_value(builder, node, kind);
+        }
+        let Some(text) = nonempty_node_text(self.source, node) else {
+            return self.expression_value(builder, node, kind);
+        };
+        if let Some(value) = self.constant_index_values.get(text).copied() {
+            self.expression_values.insert(node.id(), value);
+            return Ok(value);
+        }
+        let value = self.expression_value(builder, node, kind)?;
+        self.constant_index_values.insert(text.into(), value);
+        Ok(value)
+    }
+
+    /// Whether subscripting `base` is the built-in subscript operator.
+    fn base_is_array(&self, base: Node<'tree>) -> bool {
+        if self.is_c_source {
+            return true;
+        }
+        base.kind() == "identifier"
+            && nonempty_node_text(self.source, base)
+                .and_then(|name| self.binding_value(name, base.start_byte()))
+                .is_some_and(|value| self.array_bindings.contains(&value))
+    }
+
+    /// The value an access is addressed through, or `None` when the base names
+    /// a type, a namespace, or an object this file does not bind.
+    fn access_base_value(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        base: Node<'tree>,
+    ) -> Result<Option<ValueId>, CppLoweringError> {
+        if base.kind() == "this" {
+            return Ok(self.receiver);
+        }
+        if base.kind() == "identifier"
+            && let Some(name) = nonempty_node_text(self.source, base)
+            && self.binding_value(name, base.start_byte()).is_none()
+        {
+            return Ok(None);
+        }
+        self.expression_value(builder, base, cpp_expression_value_kind(base))
+            .map(Some)
+    }
+
+    /// The type that declares the member an access names, when this file knows
+    /// it: the enclosing type for `this`, a bound object's declared type
+    /// spelling, or the identifier itself for a qualified static access.
+    fn access_owner_type(&self, base: Node<'tree>) -> Option<Box<str>> {
+        match base.kind() {
+            "this" => enclosing_type_node(base)
+                .and_then(|owner| declaration_container_name(self.source, owner)),
+            "parenthesized_expression" => self.access_owner_type(first_runtime_named_child(base)?),
+            // `a.b.c` names the type `b` was declared with, which is what makes
+            // an access path deeper than one hop resolve.
+            "field_expression" => {
+                let inner = base.child_by_field_name("argument")?;
+                let name = nonempty_node_text(self.source, base.child_by_field_name("field")?)?;
+                let owner = self.access_owner_type(inner)?;
+                self.member_declaration_for(&owner, name, base)?.type_name
+            }
+            // `items[0].value` names the array's element type, which is the
+            // base's declared type with its array declarator removed.
+            "subscript_expression" => self.access_owner_type(base.child_by_field_name("argument")?),
+            "identifier" => {
+                let name = nonempty_node_text(self.source, base)?;
+                if let Some(declared) = self.binding_type_name(name, base.start_byte()) {
+                    return Some(declared);
+                }
+                if self.binding_value(name, base.start_byte()).is_some() {
+                    // An object in scope whose declared type this file does not
+                    // know. Its members belong to some type, but not a named one.
+                    return None;
+                }
+                Some(Box::from(name))
+            }
+            _ => None,
+        }
+    }
+
+    fn member_declaration_for(
+        &self,
+        owner: &str,
+        name: &str,
+        access: Node<'tree>,
+    ) -> Option<MemberDeclaration> {
+        let key = TypeMemberKey {
+            namespace: enclosing_namespace_path(self.source, access),
+            owner: Box::from(owner),
+            name: Box::from(name),
+        };
+        self.member_declarations.get(&key)?.clone()
+    }
+
+    /// Anchor a member location to its *declaration* when one is known, so two
+    /// occurrences of the same member agree on one identity, and to the
+    /// occurrence otherwise.
+    fn member_locator(
+        &self,
+        occurrence: Node<'tree>,
+        declaration: Option<&MemberDeclaration>,
+    ) -> Result<SemanticLocator, CppLoweringError> {
+        let anchor = match declaration {
+            Some(declaration) => declaration.anchor,
+            None => source_anchor(occurrence, 0).map_err(CppLoweringError::Invalid)?,
+        };
+        let procedure = self.session.locator();
+        Ok(SemanticLocator::new(
+            procedure.mount(),
+            procedure.path().clone(),
+            procedure.language(),
+            procedure.declaration().clone(),
+            SemanticRole::MemoryLocation,
+            anchor,
+        ))
+    }
+
+    /// Publish a read of a member or an element as a `MemoryLoad` into the
+    /// access's own value, when the location can be structured.
+    ///
+    /// The load is the read-side symmetry of [`Self::emit_memory_store`]: a
+    /// member's identity is a location, not a value, so a read of one is a
+    /// load from that location rather than a value edge from a binding.
+    fn emit_memory_load(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        access: Node<'tree>,
     ) -> Result<(), CppLoweringError> {
+        let Some(load) = self.memory_access_target(builder, point, access)? else {
+            return self.decline_unstructured_access(builder, point, access);
+        };
+        let result = self.expression_value(builder, access, cpp_expression_value_kind(access))?;
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::MemoryLoad {
+                kind: load.kind,
+                location: load.location,
+                result,
+            },
+        )?;
+        self.add_memory_identity_gap(builder, point, load)
+    }
+
+    fn emit_memory_store(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        store: MemoryTarget,
+        target: Node<'tree>,
+        value: ValueId,
+    ) -> Result<(), CppLoweringError> {
+        self.append_effect(
+            builder,
+            point,
+            SemanticEffect::MemoryStore {
+                kind: store.kind,
+                location: store.location,
+                value,
+            },
+        )?;
+        // Writing through a parameter or `this` mutates storage this procedure
+        // did not create, so the write is a procedure *effect* its callers
+        // observe. This adapter publishes no such summary, and a caller that
+        // reads the same member afterwards would otherwise see a store list
+        // that is silently missing this write -- which the solver would read as
+        // a proven absence rather than as missing information. The decline is
+        // scoped to the location, so the value stratum is untouched, and it is
+        // deliberately asymmetric: *reading* a caller-owned object at a point
+        // is fully represented (#2665).
+        if !self.access_root_is_procedure_local(target) {
+            self.add_gap(
+                builder,
+                point,
+                SemanticGapSubject::MemoryLocation(store.location),
+                match store.kind {
+                    MemoryAccessKind::Index => SemanticCapability::IndexMemory,
+                    MemoryAccessKind::Static => SemanticCapability::StaticMemory,
+                    _ => SemanticCapability::FieldMemory,
+                },
+                SemanticGapKind::Unsupported,
+                "this write targets storage the procedure did not create, and writes through a parameter or receiver are not summarized as procedure effects",
+            )?;
+        }
+        self.add_memory_identity_gap(builder, point, store)
+    }
+
+    /// Whether an access names storage this procedure itself created.
+    ///
+    /// The walk follows the address chain to its root name: parentheses,
+    /// address-of and indirection, member access, and subscripting all address
+    /// into whatever their base addresses. A root that is a local binding names
+    /// storage of this frame; a parameter, `this`, or anything this file does
+    /// not bind names storage that outlives the call.
+    fn access_root_is_procedure_local(&self, node: Node<'tree>) -> bool {
+        let mut current = node;
+        loop {
+            match current.kind() {
+                "identifier" => {
+                    let Some(name) = nonempty_node_text(self.source, current) else {
+                        return false;
+                    };
+                    return self.local_at(name, current.start_byte()).is_some();
+                }
+                "new_expression" | "compound_literal_expression" => return true,
+                "parenthesized_expression" => {
+                    let Some(inner) = first_runtime_named_child(current) else {
+                        return false;
+                    };
+                    current = inner;
+                }
+                "field_expression"
+                | "subscript_expression"
+                | "pointer_expression"
+                | "cast_expression" => {
+                    let Some(base) = current.child_by_field_name("argument") else {
+                        return false;
+                    };
+                    current = base;
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    /// Decline an access whose location this file could not structure at all,
+    /// scoped to the access's own value rather than to the program point.
+    fn decline_unstructured_access(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        access: Node<'tree>,
+    ) -> Result<(), CppLoweringError> {
+        let result = self.expression_value(builder, access, cpp_expression_value_kind(access))?;
+        let (capability, detail) = if access.kind() == "subscript_expression" {
+            (
+                SemanticCapability::IndexMemory,
+                "subscripted base is not a bound object, so no element location addresses this read",
+            )
+        } else {
+            (
+                SemanticCapability::FieldMemory,
+                "member access base is not a bound object, so no field location addresses this read",
+            )
+        };
         self.add_gap(
             builder,
             point,
-            SemanticGapSubject::Point,
-            SemanticCapability::Assignments,
+            SemanticGapSubject::Value(result),
+            capability,
             SemanticGapKind::Unknown,
-            "initializer-to-object value transfer and aliasing are not represented",
+            detail,
         )
+    }
+
+    /// Publish the location's own identity gap when the occurrence was
+    /// structured but its declaration was not resolved.
+    ///
+    /// The subject is the location, not the point: a
+    /// [`SemanticGapSubject::MemoryLocation`] carries `MEMORY` impact and
+    /// leaves the value stratum alone, which is the whole reason the heap
+    /// stratum is separate from it.
+    fn add_memory_identity_gap(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        access: MemoryTarget,
+    ) -> Result<(), CppLoweringError> {
+        let capability = match access.kind {
+            MemoryAccessKind::Index => SemanticCapability::IndexMemory,
+            MemoryAccessKind::Static => SemanticCapability::StaticMemory,
+            _ => SemanticCapability::FieldMemory,
+        };
+        let (kind, detail) = match access.identity {
+            MemoryIdentity::Resolved => return Ok(()),
+            MemoryIdentity::UserDefinedAccessor => (
+                SemanticGapKind::Unsupported,
+                "subscripting a class-typed base resolves through a user-defined subscript operator, which is not lowered",
+            ),
+            MemoryIdentity::Unresolved if access.kind == MemoryAccessKind::Index => (
+                SemanticGapKind::Unknown,
+                "subscripted access is structured, but a non-constant index leaves the element identity unresolved",
+            ),
+            MemoryIdentity::Unresolved if access.kind == MemoryAccessKind::Static => (
+                SemanticGapKind::Unknown,
+                "static member access is structured, but its declaration identity is not resolved",
+            ),
+            MemoryIdentity::Unresolved => (
+                SemanticGapKind::Unknown,
+                "member access is structured, but its declaration identity is not resolved",
+            ),
+        };
+        self.add_gap(
+            builder,
+            point,
+            SemanticGapSubject::MemoryLocation(access.location),
+            capability,
+            kind,
+            detail,
+        )
+    }
+
+    /// Whether writing `target` stores the very object the written expression
+    /// denotes, so the assignment expression's own result is that object.
+    ///
+    /// This is the location-side half of [`cpp_identity_is_preserved`]: a
+    /// member write asks its member's declared type, an element write asks the
+    /// array's element type.
+    fn assignment_target_identity_is_preserved(&self, target: Node<'tree>) -> bool {
+        if self.is_c_source {
+            return true;
+        }
+        match target.kind() {
+            "field_expression" => {
+                let (Some(base), Some(name_node)) = (
+                    target.child_by_field_name("argument"),
+                    target.child_by_field_name("field"),
+                ) else {
+                    return false;
+                };
+                let Some(name) = nonempty_node_text(self.source, name_node) else {
+                    return false;
+                };
+                self.access_owner_type(base)
+                    .and_then(|owner| self.member_declaration_for(&owner, name, target))
+                    .is_some_and(|declaration| declaration.identity_preserved)
+            }
+            "subscript_expression" => target
+                .child_by_field_name("argument")
+                .filter(|base| base.kind() == "identifier")
+                .and_then(|base| {
+                    let name = nonempty_node_text(self.source, base)?;
+                    self.binding_value(name, base.start_byte())
+                })
+                .is_some_and(|value| self.fundamental_storage_bindings.contains(&value)),
+            _ => false,
+        }
+    }
+
+    /// The declared type name of a bound object, when its declaration named a
+    /// type by name.
+    fn binding_type_name(&self, name: &str, byte: usize) -> Option<Box<str>> {
+        let value = self.binding_value(name, byte)?;
+        self.binding_type_names.get(&value).cloned()
     }
 
     fn emit_declaration_identity(
@@ -1359,56 +2560,85 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         builder: &mut ProcedureCfgBuilder,
         declaration: Node<'tree>,
         terminal: ProgramPointId,
-    ) -> Result<bool, CppLoweringError> {
-        let mut every_initializer_modeled = true;
+    ) -> Result<(), CppLoweringError> {
         for declarator in cpp_local_declarators(declaration) {
-            let Some(name_node) = declarator_name_node(declarator) else {
-                every_initializer_modeled = false;
+            let initializer = cpp_declarator_initializer(declaration, declarator);
+            let target = declarator_name_node(declarator).and_then(|name_node| {
+                let name = nonempty_node_text(self.source, name_node)?;
+                self.local_declaration_value(name, name_node.start_byte())
+            });
+            let Some(target) = target else {
+                // The declared object was never preindexed as a local, so no
+                // effect can name it. Decline the transfer at the point.
+                if initializer.is_some() {
+                    self.declare_initializer_transfer_gap(builder, terminal, None)?;
+                }
                 continue;
             };
-            let Some(name) = nonempty_node_text(self.source, name_node) else {
-                every_initializer_modeled = false;
+            if self.identity_bindings.contains(&target) {
+                if let Some(initializer) = initializer {
+                    let source = self.expression_value(
+                        builder,
+                        initializer,
+                        cpp_expression_value_kind(initializer),
+                    )?;
+                    self.append_effect(
+                        builder,
+                        terminal,
+                        SemanticEffect::Assignment {
+                            target,
+                            value: source,
+                        },
+                    )?;
+                    self.append_effect(
+                        builder,
+                        terminal,
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::Local,
+                            source,
+                            target,
+                        },
+                    )?;
+                }
                 continue;
-            };
-            let Some(target) = self.local_declaration_value(name, name_node.start_byte()) else {
-                every_initializer_modeled = false;
-                continue;
-            };
+            }
             if let Some(kind) = cpp_local_allocation_kind(declaration, declarator) {
                 self.session
                     .add_allocation(builder, terminal, target, kind)?;
             }
-            let Some(initializer) = cpp_declarator_initializer(declaration, declarator) else {
-                continue;
-            };
-            if !self.identity_bindings.contains(&target) {
-                every_initializer_modeled = false;
-                continue;
+            if initializer.is_some() {
+                self.declare_initializer_transfer_gap(builder, terminal, Some(target))?;
             }
-            let source = self.expression_value(
-                builder,
-                initializer,
-                cpp_expression_value_kind(initializer),
-            )?;
-            self.append_effect(
-                builder,
-                terminal,
-                SemanticEffect::Assignment {
-                    target,
-                    value: source,
-                },
-            )?;
-            self.append_effect(
-                builder,
-                terminal,
-                SemanticEffect::ValueFlow {
-                    kind: ValueFlowKind::Local,
-                    source,
-                    target,
-                },
-            )?;
         }
-        Ok(every_initializer_modeled)
+        Ok(())
+    }
+
+    /// Decline one declared object's initializer transfer, scoped to that
+    /// object rather than to the whole declaration statement.
+    ///
+    /// A class-typed by-value initialization runs a constructor or a
+    /// user-defined conversion, so the initializer expression's value is not
+    /// the declared object and republishing it under the declared type would
+    /// misattribute the object the points-to trace reaches.
+    fn declare_initializer_transfer_gap(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        terminal: ProgramPointId,
+        target: Option<ValueId>,
+    ) -> Result<(), CppLoweringError> {
+        self.add_gap(
+            builder,
+            terminal,
+            target.map_or(SemanticGapSubject::Point, SemanticGapSubject::Value),
+            SemanticCapability::Assignments,
+            // Not `Unknown`: this adapter resolves no overloads and no
+            // user-defined conversions, by decision rather than for want of
+            // information about this program. Naming that decision lets a
+            // consumer report an explicit `unsupported (assignments)` decline
+            // instead of an indistinct partial result (#2666).
+            SemanticGapKind::Unsupported,
+            "initializer-to-object value transfer and aliasing are not represented: a by-value initialization of a non-fundamental type may construct, convert, copy, or move a distinct object",
+        )
     }
 
     fn step(
@@ -1587,7 +2817,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
             ("declaration", _) => {
                 let decision = self.point(builder, node, Vec::new())?;
-                if !self.is_c_source && declaration_may_construct_object(node) {
+                if self.declaration_runs_lifetime_code(node) {
                     self.add_implicit_operator_gaps(
                         builder,
                         decision,
@@ -1655,32 +2885,6 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         }
     }
 
-    /// Whether the relative evaluation order of an assignment's two operands
-    /// is observable.
-    ///
-    /// Order can matter only when one operand's evaluation has an effect the
-    /// other's evaluation could see. Evaluating a plain identifier that names
-    /// a binding of this procedure designates that object outright: it reads
-    /// no state, so an unsequenced sibling cannot change what it yields, and
-    /// the assignment has one meaning whichever order a compiler picks. Every
-    /// other target -- a dereference, a subscript, a field access, or a name
-    /// this lowering does not resolve to a binding -- evaluates state an
-    /// unsequenced effectful sibling may already have changed, so its order
-    /// stays a gap.
-    fn assignment_operand_order_is_observable(
-        &self,
-        left: Node<'tree>,
-        right: Node<'tree>,
-    ) -> bool {
-        let effectful = cpp_expression_may_have_side_effects(left, self.is_c_source)
-            || cpp_expression_may_have_side_effects(right, self.is_c_source);
-        let target_designates_binding = left.kind() == "identifier"
-            && nonempty_node_text(self.source, left)
-                .and_then(|name| self.binding_value(name, left.start_byte()))
-                .is_some();
-        effectful && !target_designates_binding
-    }
-
     /// Publish one guard fact for a decision this lowerer just made.
     ///
     /// Arms must already have been added as edges; the IR validator enforces
@@ -1736,7 +2940,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     node.kind() == "compound_statement" && node.id() != self.root_body_id;
                 let has_raii_cleanup = nested_scope
                     && !self.is_c_source
-                    && block_has_automatic_object(self.source, node);
+                    && block_has_automatic_object(self.source, self.trivial_types, node);
                 let has_vla_cleanup =
                     nested_scope && self.is_c_source && block_has_potential_vla(node);
                 if has_raii_cleanup || has_vla_cleanup {
@@ -1793,16 +2997,36 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let initializers = initializer_values(node);
                 let values = declaration_runtime_expressions(node);
                 let function_local_static = self.is_function_local_static(node, &values);
-                // A "declaration" reaching the non-static branch below models
-                // its own initializer transfer where the transfer is exact, so
-                // that branch decides its gap from what it actually emitted.
-                let initializer_gap_decided_below =
-                    node.kind() == "declaration" && !function_local_static;
-                if !initializers.is_empty()
-                    && !initializer_gap_decided_below
-                    && matches!(node.kind(), "declaration" | "field_declaration")
+                // A plain `declaration` reaching the non-static branch below
+                // publishes its transfers, or a decline scoped to the declared
+                // object, from `emit_declaration_identity`. A member
+                // declaration has no such lowering, and declining it is a
+                // decision: a by-value member initialization may construct,
+                // convert, copy, or move a distinct object.
+                if !initializers.is_empty() && node.kind() == "field_declaration" {
+                    self.add_gap(
+                        builder,
+                        entry,
+                        SemanticGapSubject::Point,
+                        SemanticCapability::Assignments,
+                        SemanticGapKind::Unsupported,
+                        "initializer-to-object value transfer and aliasing are not represented",
+                    )?;
+                }
+                // A function-local static is lowered by its own branch, which
+                // models no initializer transfer at all. That is missing
+                // information about this program rather than a decision, so it
+                // stays `Unknown`.
+                if !initializers.is_empty() && node.kind() == "declaration" && function_local_static
                 {
-                    self.add_declaration_initializer_gap(builder, entry)?;
+                    self.add_gap(
+                        builder,
+                        entry,
+                        SemanticGapSubject::Point,
+                        SemanticCapability::Assignments,
+                        SemanticGapKind::Unknown,
+                        "initializer-to-object value transfer and aliasing are not represented",
+                    )?;
                 }
                 if node.kind() == "field_initializer_list" && initializers.len() > 1 {
                     self.add_gap(
@@ -1814,7 +3038,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         "constructor initializers execute in base/member declaration order, which is unavailable here; written order is only a bounded lowering order",
                     )?;
                 }
-                if !self.is_c_source && declaration_may_construct_object(node) {
+                if self.declaration_runs_lifetime_code(node) {
                     self.add_implicit_lifetime_call_gaps(
                         builder,
                         entry,
@@ -1841,10 +3065,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 } else {
                     let terminal = if node.kind() == "declaration" {
                         let terminal = self.point(builder, node, Vec::new())?;
-                        let modeled = self.emit_declaration_identity(builder, node, terminal)?;
-                        if !initializers.is_empty() && !modeled {
-                            self.add_declaration_initializer_gap(builder, entry)?;
-                        }
+                        self.emit_declaration_identity(builder, node, terminal)?;
                         self.edge(builder, terminal, next)?;
                         Some(terminal)
                     } else {
@@ -1887,7 +3108,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                             SemanticGapSubject::Value(value),
                             SemanticCapability::Values,
                             SemanticGapImpacts::single(SemanticGapImpact::ReturnTransfer),
-                            SemanticGapKind::Unknown,
+                            SemanticGapKind::Unsupported,
                             if node.kind() == "co_return_statement" {
                                 "co_return value transfer is mediated by the coroutine promise"
                             } else {
@@ -1934,6 +3155,42 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let value = value_node
                     .map(|_| self.value(builder, terminal, SemanticValueKind::Exception))
                     .transpose()?;
+                // The exception object is copy-initialized from the operand,
+                // and its type *is* the operand's static type: unlike a
+                // declaration's initializer, a throw admits no user-defined
+                // conversion that could substitute an object of another type.
+                // The operand's value therefore flows into the exception
+                // object, which is what a handler's binding then observes.
+                // A class-typed operand may still run a copy or move
+                // constructor; that is declined below as an implicit lifetime
+                // call, which leaves the value edge standing rather than
+                // erasing it.
+                if let (Some(value_node), Some(value)) = (value_node, value) {
+                    let thrown = self.expression_value(
+                        builder,
+                        value_node,
+                        cpp_expression_value_kind(value_node),
+                    )?;
+                    self.append_effect(
+                        builder,
+                        terminal,
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::LanguageDefined,
+                            source: thrown,
+                            target: value,
+                        },
+                    )?;
+                    if !self.is_c_source
+                        && !self.expression_is_fundamental(value_node, false)
+                        && !self.expression_type_is_trivial(value_node)
+                    {
+                        self.add_implicit_lifetime_call_gaps(
+                            builder,
+                            terminal,
+                            "throwing copy-initializes the exception object, which may invoke a copy or move constructor",
+                        )?;
+                    }
+                }
                 self.append_effect(builder, terminal, SemanticEffect::Throw { value })?;
                 if let Some(value_node) = value_node {
                     stack.push(Work::Expression {
@@ -2060,7 +3317,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), CppLoweringError> {
         let condition = required_field(node, "condition")?;
-        let completion = if !self.is_c_source && syntax_has_automatic_object(self.source, condition)
+        let completion = if !self.is_c_source
+            && syntax_has_automatic_object(self.source, self.trivial_types, condition)
         {
             EdgeTarget::normal(self.normal_cleanup_boundary(
                 builder,
@@ -2125,8 +3383,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let body = required_field(node, "body")?;
         let condition_entry = self.point(builder, condition, Vec::new())?;
         let body_entry = self.point(builder, body, Vec::new())?;
-        let condition_declares_object =
-            !self.is_c_source && syntax_has_automatic_object(self.source, condition);
+        let condition_declares_object = !self.is_c_source
+            && syntax_has_automatic_object(self.source, self.trivial_types, condition);
         let exit_target = if condition_declares_object {
             EdgeTarget::normal(self.normal_cleanup_boundary(
                 builder,
@@ -2248,11 +3506,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .map(|update| self.point(builder, update, Vec::new()))
             .transpose()?;
         let initializer_declares_object = !self.is_c_source
-            && initializer
-                .is_some_and(|initializer| syntax_has_automatic_object(self.source, initializer));
+            && initializer.is_some_and(|initializer| {
+                syntax_has_automatic_object(self.source, self.trivial_types, initializer)
+            });
         let condition_declares_object = !self.is_c_source
-            && condition
-                .is_some_and(|condition| syntax_has_automatic_object(self.source, condition));
+            && condition.is_some_and(|condition| {
+                syntax_has_automatic_object(self.source, self.trivial_types, condition)
+            });
         let initializer_exit = if initializer_declares_object {
             EdgeTarget::normal(self.normal_cleanup_boundary(
                 builder,
@@ -2513,7 +3773,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 "contextual integral or enumeration conversion of a switch condition-declared object may invoke user-defined code",
             )?;
         }
-        let completion = if !self.is_c_source && syntax_has_automatic_object(self.source, condition)
+        let completion = if !self.is_c_source
+            && syntax_has_automatic_object(self.source, self.trivial_types, condition)
         {
             EdgeTarget::normal(self.normal_cleanup_boundary(
                 builder,
@@ -2622,8 +3883,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 dispatcher,
                 SemanticGapSubject::Point,
                 SemanticCapability::ExceptionalControlFlow,
-                SemanticGapKind::Unknown,
-                "catch type matching, base conversions, catch-all selection, and exception copying require type refinement",
+                // A deliberate non-lowering, not missing information: this
+                // adapter performs no C++ type matching, so which handler a
+                // thrown type selects is not decided here. It stays standing
+                // wherever an abort path runs user code -- a handler body is
+                // exactly such a path -- so naming it `Unsupported` surfaces the
+                // decline without discharging it where it protects an answer.
+                SemanticGapKind::Unsupported,
+                "catch type matching, base conversions, catch-all selection, and exception copying are not lowered",
             )?;
             for catch_entry in &catch_entries {
                 self.edge(
@@ -2649,18 +3916,16 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         };
 
         for ((catch, body), catch_entry) in catches.iter().zip(&catch_bodies).zip(&catch_entries) {
-            if catch
-                .child_by_field_name("parameters")
-                .is_some_and(|parameters| parameters.named_child_count() != 0)
+            if catch_clause_parameter(*catch)
+                .is_some_and(|parameter| self.catch_parameter_runs_lifetime_code(parameter))
             {
-                self.add_gap(
-                    builder,
-                    *catch_entry,
-                    SemanticGapSubject::Point,
-                    SemanticCapability::Values,
-                    SemanticGapKind::Unknown,
-                    "exception object binding, reference semantics, and copy construction are not represented",
-                )?;
+                // The parameter itself is bound in `emit_local_bindings`, and
+                // the shared handler-binding derivation (#2446) resolves that
+                // undefined local to the value the reaching `throw` carried.
+                // What is still unrepresented is the *construction* of the
+                // binding -- a catch by value runs a copy constructor, a catch
+                // of a base runs a derived-to-base conversion -- and that is a
+                // lifetime call, not a missing value.
                 self.add_implicit_lifetime_call_gaps(
                     builder,
                     *catch_entry,
@@ -2860,14 +4125,20 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             )?;
             return Ok(());
         };
-        self.add_gap(
-            builder,
-            entry,
-            SemanticGapSubject::Point,
-            SemanticCapability::NonLocalControl,
-            SemanticGapKind::Unknown,
-            "goto edge is represented, but legality and variable-lifetime effects across the jump require semantic refinement",
-        )?;
+        // The edge itself is represented. What is not is what a jump does to
+        // object lifetimes: it can leave a scope holding automatic objects
+        // whose destructors run, and it can jump over a variably modified
+        // declaration. A procedure with neither has no such effect to declare.
+        if self.raii_possible || self.vla_possible {
+            self.add_gap(
+                builder,
+                entry,
+                SemanticGapSubject::Point,
+                SemanticCapability::NonLocalControl,
+                SemanticGapKind::Unknown,
+                "goto edge is represented, but legality and variable-lifetime effects across the jump require semantic refinement",
+            )?;
+        }
         if self.raii_possible {
             self.add_raii_gaps(
                 builder,
@@ -3126,16 +4397,56 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         },
                     )?;
                 } else {
-                    self.add_gap(
-                        builder,
-                        assignment,
-                        SemanticGapSubject::Value(result),
-                        SemanticCapability::Values,
-                        SemanticGapKind::Unknown,
-                        "assignment target/value identity, aliasing, and overloaded assignment require type refinement",
-                    )?;
+                    // A member or element target writes a *location*, so it
+                    // becomes a `MemoryStore` against a structured location and
+                    // deliberately carries no value edge (#2666, #2665).
+                    let value =
+                        self.expression_value(builder, right, cpp_expression_value_kind(right))?;
+                    let store = if assignment_operator(node) == Some("=") {
+                        self.memory_access_target(builder, assignment, left)?
+                    } else {
+                        None
+                    };
+                    if let Some(store) = store {
+                        self.emit_memory_store(builder, assignment, store, left, value)?;
+                    } else {
+                        self.add_gap(
+                            builder,
+                            assignment,
+                            SemanticGapSubject::Point,
+                            SemanticCapability::Assignments,
+                            SemanticGapKind::Unsupported,
+                            "a dereference, a compound assignment, and an unbound target are not lowered into memory flow, so this write names no structured location",
+                        )?;
+                    }
+                    // The value of an assignment expression is the value that
+                    // was assigned, once no conversion can have replaced it --
+                    // the same question a declaration with an initializer asks,
+                    // put to the *target's* declared type. A statement-level
+                    // write never reads this result, and declining it
+                    // unconditionally opened the whole procedure's value-flow
+                    // snapshot over a value nothing observes.
+                    if self.assignment_target_identity_is_preserved(left) {
+                        self.append_effect(
+                            builder,
+                            assignment,
+                            SemanticEffect::Assignment {
+                                target: result,
+                                value,
+                            },
+                        )?;
+                    } else {
+                        self.add_gap(
+                            builder,
+                            assignment,
+                            SemanticGapSubject::Value(result),
+                            SemanticCapability::Values,
+                            SemanticGapKind::Unsupported,
+                            "assignment result identity is not represented: this adapter resolves no user-defined conversion or assignment operator",
+                        )?;
+                    }
                 }
-                if self.assignment_operand_order_is_observable(left, right) {
+                if self.operand_order_is_material(&[left, right]) {
                     self.add_gap(
                         builder,
                         assignment,
@@ -3145,7 +4456,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         "assignment operand evaluation order is C/C++-standard dependent; RHS-first lowering is only a deterministic bounded order without a configured language standard",
                     )?;
                 }
-                if assignment_operator(node).is_some_and(|operator| operator != "=") {
+                if assignment_operator(node).is_some_and(|operator| operator != "=")
+                    && !(self.expression_is_fundamental(left, false)
+                        && self.expression_is_fundamental(right, false))
+                {
                     self.add_implicit_operator_gaps(
                         builder,
                         assignment,
@@ -3284,6 +4598,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         value,
                     },
                 )?;
+                // Parentheses are pure grouping: the parenthesized expression
+                // denotes the very value the enclosed expression denotes, so
+                // the transfer is an exact flow, not only an assignment.
+                self.append_effect(
+                    builder,
+                    terminal,
+                    SemanticEffect::ValueFlow {
+                        kind: ValueFlowKind::LanguageDefined,
+                        source: value,
+                        target: result,
+                    },
+                )?;
                 self.edge(builder, terminal, next)?;
                 stack.push(Work::Expression {
                     node: value_node,
@@ -3299,25 +4625,109 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let children = runtime_expression_children(node);
                 self.schedule_expressions(builder, entry, &children, next, scope, stack)
             }
-            "binary_expression"
-            | "unary_expression"
-            | "update_expression"
-            | "subscript_expression"
-            | "field_expression"
-            | "pointer_expression"
-            | "cast_expression"
-            | "fold_expression" => {
-                if node.kind() == "field_expression" {
-                    self.add_gap(
+            // A read of a member or an element is a load from a *location*,
+            // not a value edge from a binding (#2666, #2665). The load is
+            // published at a terminal point the base reaches first, so the
+            // location's base value is already produced when the load runs.
+            "field_expression" | "subscript_expression" => {
+                let terminal = self.point(builder, node, Vec::new())?;
+                let children = runtime_expression_children(node);
+                // `operator.` cannot be declared in C++, so a `.` member access
+                // never runs user code. `->` on a raw pointer and `[]` on an
+                // array are the built-in operators, which is the same proof
+                // `memory_access_target` requires before it claims the location
+                // is resolved.
+                let base = node.child_by_field_name("argument");
+                let may_invoke_overload = match (node.kind(), base) {
+                    (_, None) => true,
+                    ("field_expression", Some(base)) => {
+                        has_direct_token(node, "->") && !self.pointer_access_is_builtin(base)
+                    }
+                    (_, Some(base)) => !self.base_is_array(base),
+                };
+                if !self.is_c_source && may_invoke_overload {
+                    self.add_implicit_operator_gaps(
                         builder,
-                        entry,
-                        SemanticGapSubject::Value(result),
-                        SemanticCapability::Values,
-                        SemanticGapKind::Unknown,
-                        "C++ field-load identity requires structured memory and declared-member refinement",
+                        terminal,
+                        "runtime operator or conversion may invoke user-defined code",
                     )?;
                 }
-                if !self.is_c_source && expression_may_invoke_overload(node) {
+                if node.kind() == "subscript_expression" && {
+                    let mut operands = vec![base.unwrap_or(node)];
+                    operands.extend(cpp_subscript_indices(node));
+                    operands.len() > 1 && self.operand_order_is_material(&operands)
+                } {
+                    self.add_gap(
+                        builder,
+                        terminal,
+                        SemanticGapSubject::Point,
+                        SemanticCapability::NormalControlFlow,
+                        SemanticGapKind::Unknown,
+                        "relative operand evaluation order is unspecified or language-version dependent; source order is only a bounded lowering order",
+                    )?;
+                }
+                self.emit_memory_load(builder, terminal, node)?;
+                self.edge(builder, terminal, next)?;
+                self.schedule_expressions(
+                    builder,
+                    entry,
+                    &children,
+                    EdgeTarget::normal(terminal),
+                    scope,
+                    stack,
+                )
+            }
+            "binary_expression" | "unary_expression" | "update_expression"
+            | "pointer_expression" | "cast_expression" | "fold_expression" => {
+                // Taking an object's address denotes that object: the pointer
+                // value's pointees are exactly the operand's, which is what
+                // makes `p = &original; p->f` and `original.f` name one
+                // location. The transfer is published as both an `Assignment`
+                // and an exact `LanguageDefined` flow, exactly as
+                // parenthesization is: the assignment states the denotation is
+                // the operand's, which is what the access-path resolver walks
+                // to root `p->f` at the object rather than at the pointer, and
+                // the flow states the transfer is language-defined rather than
+                // a user-written copy.
+                if node.kind() == "pointer_expression"
+                    && has_direct_token(node, "&")
+                    && let Some(operand) = node.child_by_field_name("argument")
+                {
+                    let terminal = self.point(builder, node, Vec::new())?;
+                    let source = self.expression_value(
+                        builder,
+                        operand,
+                        cpp_expression_value_kind(operand),
+                    )?;
+                    self.append_effect(
+                        builder,
+                        terminal,
+                        SemanticEffect::Assignment {
+                            target: result,
+                            value: source,
+                        },
+                    )?;
+                    self.append_effect(
+                        builder,
+                        terminal,
+                        SemanticEffect::ValueFlow {
+                            kind: ValueFlowKind::LanguageDefined,
+                            source,
+                            target: result,
+                        },
+                    )?;
+                    self.edge(builder, terminal, next)?;
+                    return self.schedule_expressions(
+                        builder,
+                        entry,
+                        &[operand],
+                        EdgeTarget::normal(terminal),
+                        scope,
+                        stack,
+                    );
+                }
+                let built_in_operator = self.expression_is_fundamental(node, true);
+                if !self.is_c_source && expression_may_invoke_overload(node) && !built_in_operator {
                     self.add_implicit_operator_gaps(
                         builder,
                         entry,
@@ -3328,7 +4738,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 if matches!(
                     node.kind(),
                     "binary_expression" | "subscript_expression" | "fold_expression"
-                ) && cpp_operand_order_is_observable(&children, self.is_c_source)
+                ) && children.len() > 1
+                    && self.operand_order_is_material(&children)
                 {
                     self.add_gap(
                         builder,
@@ -3339,45 +4750,40 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         "relative operand evaluation order is unspecified or language-version dependent; source order is only a bounded lowering order",
                     )?;
                 }
-                // An operator or conversion computes its result from the
-                // operands it was given, so every operand's value reaches the
-                // result. The transfer is language-defined rather than an
-                // identity: arithmetic, a comparison, and a conversion all
-                // produce a value of their own.
-                //
-                // The memory-shaped members of this group are deliberately
-                // excluded. A subscript, a field access, and a dereference
-                // read storage this adapter does not model, and their
-                // operands address that storage rather than becoming the
-                // result; they keep their own gaps instead.
-                if matches!(
-                    node.kind(),
-                    "binary_expression" | "unary_expression" | "cast_expression"
-                ) {
-                    let terminal = self.point(builder, node, Vec::new())?;
-                    let operands = children
-                        .iter()
-                        .map(|child| {
-                            self.expression_value(
-                                builder,
-                                *child,
-                                cpp_expression_value_kind(*child),
-                            )
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    self.session
-                        .append_language_defined_value_flows(builder, terminal, operands, result)?;
-                    self.edge(builder, terminal, next)?;
-                    return self.schedule_expressions(
-                        builder,
-                        entry,
-                        &children,
-                        EdgeTarget::normal(terminal),
-                        scope,
-                        stack,
-                    );
+                if !built_in_operator {
+                    return self
+                        .schedule_expressions(builder, entry, &children, next, scope, stack);
                 }
-                self.schedule_expressions(builder, entry, &children, next, scope, stack)
+                // A built-in operator over fundamental operands is a pure
+                // function of them: the result carries exactly what the
+                // operands carry, and no user code intervenes. The transfer
+                // is published at a terminal point the operands reach first,
+                // so the result is defined after every operand it derives from.
+                //
+                // The result is *derived from* every operand, not a copy of
+                // any one of them, so this is a joining `LanguageDefined`
+                // flow. An `Assignment` would be wrong twice over: it kills
+                // the target, so a second operand would erase what the first
+                // contributed, and it would claim the result is the operand
+                // object for the points-to trace.
+                let terminal = self.point(builder, node, Vec::new())?;
+                let operands = children
+                    .iter()
+                    .map(|child| {
+                        self.expression_value(builder, *child, cpp_expression_value_kind(*child))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.session
+                    .append_language_defined_value_flows(builder, terminal, operands, result)?;
+                self.edge(builder, terminal, next)?;
+                self.schedule_expressions(
+                    builder,
+                    entry,
+                    &children,
+                    EdgeTarget::normal(terminal),
+                    scope,
+                    stack,
+                )
             }
             "condition_clause" => {
                 let children = runtime_expression_children(node);
@@ -3385,7 +4791,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             }
             "initializer_list" => {
                 let children = runtime_expression_children(node);
-                if self.is_c_source && cpp_operand_order_is_observable(&children, self.is_c_source)
+                if self.is_c_source
+                    && children.len() > 1
+                    && self.operand_order_is_material(&children)
                 {
                     self.add_gap(
                         builder,
@@ -3611,7 +5019,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             )?;
         }
         let evaluations = call_operand_evaluations(node, function);
-        if cpp_operand_order_is_observable(&evaluations, self.is_c_source) {
+        if evaluations.len() > 1 && self.operand_order_is_material(&evaluations) {
             self.add_gap(
                 builder,
                 invoke,
@@ -3749,6 +5157,50 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         }
     }
 
+    /// Whether binding a catch clause's parameter runs user code.
+    ///
+    /// A handler that binds by reference or pointer binds the exception object
+    /// itself and constructs nothing. A handler that binds by value
+    /// copy-initializes from it, which runs a copy constructor unless the
+    /// handler type is fundamental or a proved-trivial class.
+    fn catch_parameter_runs_lifetime_code(&self, parameter: Node<'tree>) -> bool {
+        if self.is_c_source {
+            return false;
+        }
+        let Some(declarator) = parameter.child_by_field_name("declarator") else {
+            return true;
+        };
+        if cpp_declarator_preserves_identity(declarator) {
+            return false;
+        }
+        !parameter
+            .child_by_field_name("type")
+            .is_some_and(cpp_type_is_fundamental)
+            && !self
+                .trivial_types
+                .declaration_is_trivial(self.source, parameter)
+    }
+
+    /// Whether an expression's static type is a class this file proved
+    /// trivially constructible and destructible.
+    fn expression_type_is_trivial(&self, node: Node<'tree>) -> bool {
+        node.kind() == "identifier"
+            && nonempty_node_text(self.source, node)
+                .and_then(|name| self.binding_type_name(name, node.start_byte()))
+                .is_some_and(|name| self.trivial_types.contains(&name))
+    }
+
+    /// Whether initializing or destroying the objects `node` declares can run
+    /// user code.
+    ///
+    /// C has no constructors, destructors, or conversion functions at all, and
+    /// a C++ object of a proved-trivial type has none either.
+    fn declaration_runs_lifetime_code(&self, node: Node<'tree>) -> bool {
+        !self.is_c_source
+            && declaration_may_construct_object(node)
+            && !self.trivial_types.declaration_is_trivial(self.source, node)
+    }
+
     fn normal_cleanup_boundary(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
@@ -3807,7 +5259,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         !self.is_synthetic_procedure
             && node.kind() == "declaration"
             && has_storage_class(self.source, node, "static")
-            && (!values.is_empty() || (!self.is_c_source && declaration_may_construct_object(node)))
+            && (!values.is_empty() || (self.declaration_runs_lifetime_code(node)))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4019,21 +5471,29 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         point: ProgramPointId,
         context: &str,
     ) -> Result<(), CppLoweringError> {
-        for (capability, detail) in [
+        // Only the fabricated-call-site entry is a decision. The other three
+        // depend on constructed-object state and destructor definitions this
+        // file does not have, which is missing information, so they stay
+        // `Unknown` (#2666).
+        for (capability, kind, detail) in [
             (
                 SemanticCapability::CleanupControlFlow,
+                SemanticGapKind::Unknown,
                 "destruction order and cleanup routing depend on constructed-object state",
             ),
             (
                 SemanticCapability::ResourceManagement,
+                SemanticGapKind::Unknown,
                 "RAII release depends on inferred types, storage duration, and destructor definitions",
             ),
             (
                 SemanticCapability::Calls,
+                SemanticGapKind::Unsupported,
                 "implicit destructor invocations are not emitted as fabricated call sites",
             ),
             (
                 SemanticCapability::ExceptionalControlFlow,
+                SemanticGapKind::Unknown,
                 "destructor failure, noexcept termination, and unwinding interactions are not lowered",
             ),
         ] {
@@ -4042,7 +5502,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 point,
                 SemanticGapSubject::Point,
                 capability,
-                SemanticGapKind::Unknown,
+                kind,
                 &format!("{context}; {detail}"),
             )?;
         }
@@ -4096,17 +5556,24 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         point: ProgramPointId,
         context: &str,
     ) -> Result<(), CppLoweringError> {
-        for (capability, detail) in [
+        for (capability, kind, detail) in [
             (
                 SemanticCapability::Calls,
+                SemanticGapKind::Unsupported,
                 "implicit constructor/destructor/allocation calls are not fabricated",
             ),
+            // The abort edge stays `Unknown`. Naming it `Unsupported` would make
+            // it eligible for the implicit-abort discharge, and it is the only
+            // decline standing where a lifetime operation's *normal* effect is
+            // also unrepresented.
             (
                 SemanticCapability::ExceptionalControlFlow,
+                SemanticGapKind::Unknown,
                 "implicit lifetime operations may throw or terminate",
             ),
             (
                 SemanticCapability::ResourceManagement,
+                SemanticGapKind::Unknown,
                 "object lifetime and partial construction/destruction require type refinement",
             ),
         ] {
@@ -4115,7 +5582,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 point,
                 SemanticGapSubject::Point,
                 capability,
-                SemanticGapKind::Unknown,
+                kind,
                 &format!("{context}; {detail}"),
             )?;
         }
@@ -4133,7 +5600,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             point,
             SemanticGapSubject::Point,
             SemanticCapability::Calls,
-            SemanticGapKind::Unknown,
+            SemanticGapKind::Unsupported,
             &format!("{context}; overload resolution is not emitted as an implicit call site"),
         )?;
         self.add_gap(
@@ -4173,7 +5640,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             point,
             SemanticGapSubject::Point,
             SemanticCapability::Calls,
-            SemanticGapKind::Unknown,
+            SemanticGapKind::Unsupported,
             "coroutine promise, awaiter, allocation, and frame callbacks are not emitted as fabricated call sites",
         )?;
         self.add_gap(
@@ -4368,6 +5835,20 @@ fn cpp_declarator_preserves_identity(mut node: Node<'_>) -> bool {
     }
 }
 
+/// Whether a declared base type is a fundamental C/C++ type: an arithmetic
+/// type or an enumeration.
+///
+/// No user-defined constructor, conversion function, assignment operator, or
+/// overloaded operator can be associated with such a type. Copying an object
+/// of a fundamental type therefore transfers the value itself, and every
+/// operator applied to operands of fundamental type is the built-in one.
+fn cpp_type_is_fundamental(type_node: Node<'_>) -> bool {
+    matches!(
+        type_node.kind(),
+        "primitive_type" | "sized_type_specifier" | "enum_specifier"
+    )
+}
+
 /// The compile-time truth value a condition names, when the condition is a
 /// literal this lowering decodes exactly.
 ///
@@ -4512,106 +5993,91 @@ fn locator_is_c_source(locator: &SemanticLocator) -> bool {
         == Some("c")
 }
 
-/// Whether the declared type is a C++ scalar, for which a by-value copy
-/// reproduces the operand exactly.
-fn cpp_type_is_scalar(type_node: Node<'_>) -> bool {
-    matches!(
-        type_node.kind(),
-        "primitive_type" | "sized_type_specifier" | "enum_specifier"
-    )
-}
-
-/// Whether a value transfer into an entity declared by `type_node` and
-/// `declarator` reproduces the transferred value exactly.
+/// Whether a value transfer into the object `declarator` binds reproduces the
+/// transferred value exactly: the bound object is the very object its
+/// initializer, assigned expression, or returned expression denotes, with no
+/// user-defined constructor or conversion able to substitute a distinct object.
 ///
-/// A pointer or reference declarator names the operand's own object, so the
-/// transfer is exact by construction. C has no copy constructors, conversion
-/// functions, or move semantics, so every C by-value copy is exact as well. In
-/// C++ that only holds for scalars: a class, template, or deduced type may
-/// construct a distinct result object, which keeps its gap.
+/// Three independent structural proofs, any one of which suffices:
 ///
-/// An array declarator is aggregate initialization rather than a single-value
-/// transfer, so it is never exact by this rule.
+/// - a pointer or reference declarator binds the operand itself;
+/// - a fundamental base type (arithmetic or enumeration) admits no
+///   user-defined copy constructor, conversion function, or `operator=`;
+/// - a C translation unit has no user-defined conversions at all.
+///
+/// An array declarator, and any declarator that `cpp_local_allocation_kind`
+/// reports as introducing storage, is excluded: aggregate and class-typed
+/// storage is modelled by allocations and the heap stratum, not by a scalar
+/// value transfer, and a whole-object initializer is not one.
 fn cpp_value_transfer_is_exact(
-    type_node: Option<Node<'_>>,
+    declaration: Node<'_>,
     declarator: Node<'_>,
     is_c_source: bool,
 ) -> bool {
     if cpp_declarator_preserves_identity(declarator) {
         return true;
     }
-    if cpp_declarator_contains_kind(declarator, "array_declarator") {
+    if cpp_declarator_contains_kind(declarator, "array_declarator")
+        || cpp_local_allocation_kind(declaration, declarator).is_some()
+    {
         return false;
     }
-    is_c_source || type_node.is_some_and(cpp_type_is_scalar)
+    is_c_source
+        || declaration
+            .child_by_field_name("type")
+            .is_some_and(cpp_type_is_fundamental)
+}
+
+/// Whether the value `declarator` binds always has a fundamental type, so
+/// every built-in operator written over it resolves to the built-in operator
+/// rather than to an overload or a user-defined conversion.
+///
+/// Pointer, array, and function declarators are excluded: they redeclare the
+/// binding's type away from the fundamental base type, and operators over
+/// pointers reach through to memory this predicate says nothing about.
+fn cpp_binding_is_fundamental(declaration: Node<'_>, declarator: Node<'_>) -> bool {
+    !cpp_declarator_contains_kind(declarator, "pointer_declarator")
+        && !cpp_declarator_contains_kind(declarator, "array_declarator")
+        && !cpp_declarator_contains_kind(declarator, "function_declarator")
+        && !cpp_declarator_contains_kind(declarator, "reference_declarator")
+        && declaration
+            .child_by_field_name("type")
+            .is_some_and(cpp_type_is_fundamental)
 }
 
 fn cpp_declaration_value_transfer_is_exact(declaration: Node<'_>, is_c_source: bool) -> bool {
-    let type_node = declaration.child_by_field_name("type");
     cpp_local_declarators(declaration)
         .into_iter()
-        .any(|declarator| cpp_value_transfer_is_exact(type_node, declarator, is_c_source))
+        .any(|declarator| cpp_value_transfer_is_exact(declaration, declarator, is_c_source))
 }
 
+fn cpp_declaration_binds_fundamental_value(declaration: Node<'_>) -> bool {
+    cpp_local_declarators(declaration)
+        .into_iter()
+        .any(|declarator| cpp_binding_is_fundamental(declaration, declarator))
+}
+
+/// Whether a callable's return transfer reproduces the returned value exactly.
+///
+/// A callable is not a storage-introducing declaration, so this asks only the
+/// type-and-dialect question: a pointer or reference return declarator names
+/// the operand's own object, C has no user-defined conversions, and a C++
+/// fundamental return type admits no copy constructor or conversion function.
+/// A C++ class, template, or deduced return type keeps its conservative gap.
 fn cpp_callable_return_transfer_is_exact(callable: Node<'_>, is_c_source: bool) -> bool {
-    callable
-        .child_by_field_name("declarator")
-        .is_some_and(|declarator| {
-            cpp_value_transfer_is_exact(
-                callable.child_by_field_name("type"),
-                declarator,
-                is_c_source,
-            )
-        })
-}
-
-/// Whether evaluating this expression can write memory or invoke user code, so
-/// that an unsequenced sibling evaluation could observe a different program
-/// state depending on the order the two are evaluated in.
-///
-/// The walk stops at nested execution boundaries: a lambda body is not
-/// evaluated by the expression that names the closure.
-fn cpp_expression_may_have_side_effects(node: Node<'_>, is_c_source: bool) -> bool {
-    let mut stack = vec![node];
-    while let Some(current) = stack.pop() {
-        if matches!(
-            current.kind(),
-            "call_expression"
-                | "assignment_expression"
-                | "update_expression"
-                | "new_expression"
-                | "delete_expression"
-                | "throw_expression"
-                | "co_await_expression"
-                | "co_yield_expression"
-        ) {
-            return true;
-        }
-        // A C++ operand of class type can route almost any operator through
-        // user-defined code, so treat overloadable expressions as effectful
-        // there. C has no operator overloading.
-        if !is_c_source && expression_may_invoke_overload(current) {
-            return true;
-        }
-        if cpp_nested_execution_boundary(current) {
-            continue;
-        }
-        stack.extend(named_children(current));
+    let Some(declarator) = callable.child_by_field_name("declarator") else {
+        return false;
+    };
+    if cpp_declarator_preserves_identity(declarator) {
+        return true;
     }
-    false
-}
-
-/// Whether the relative evaluation order of `operands` is observable at all.
-///
-/// Order only matters when at least two unsequenced operand evaluations can
-/// interfere; a single effectful operand evaluated against pure siblings
-/// produces the same program state in every admissible order.
-fn cpp_operand_order_is_observable(operands: &[Node<'_>], is_c_source: bool) -> bool {
-    operands
-        .iter()
-        .filter(|operand| cpp_expression_may_have_side_effects(**operand, is_c_source))
-        .nth(1)
-        .is_some()
+    if cpp_declarator_contains_kind(declarator, "array_declarator") {
+        return false;
+    }
+    is_c_source
+        || callable
+            .child_by_field_name("type")
+            .is_some_and(cpp_type_is_fundamental)
 }
 
 fn cpp_declaration_is_function(declaration: Node<'_>) -> bool {
@@ -4669,6 +6135,13 @@ fn cpp_local_allocation_kind(
     if cpp_declarator_preserves_identity(declarator) {
         return None;
     }
+    // An array declarator introduces element storage whatever the element type
+    // is: `int values[2]` is as much an addressable object as `Holder items[2]`,
+    // and without its allocation row no element location has a base object to
+    // resolve to (#2665).
+    if cpp_declarator_contains_kind(declarator, "array_declarator") {
+        return Some(AllocationKind::Array);
+    }
     let type_node = declaration.child_by_field_name("type")?;
     if matches!(
         type_node.kind(),
@@ -4680,13 +6153,20 @@ fn cpp_local_allocation_kind(
     ) {
         return None;
     }
-    Some(
-        if cpp_declarator_contains_kind(declarator, "array_declarator") {
-            AllocationKind::Array
-        } else {
-            AllocationKind::Object
-        },
-    )
+    Some(AllocationKind::Object)
+}
+
+/// The index expressions a subscript names.
+///
+/// The C grammar puts one index in the `index` field; the C++ grammar wraps
+/// them in a `subscript_argument_list` under `indices`, which is why a walk
+/// that only read named children saw one opaque node where the index is.
+fn cpp_subscript_indices(access: Node<'_>) -> Vec<Node<'_>> {
+    debug_assert_eq!(access.kind(), "subscript_expression");
+    if let Some(indices) = access.child_by_field_name("indices") {
+        return named_children(indices);
+    }
+    access.child_by_field_name("index").into_iter().collect()
 }
 
 fn cpp_expression_value_kind(node: Node<'_>) -> SemanticValueKind {
@@ -4857,7 +6337,7 @@ fn condition_value_declaration(condition: Node<'_>) -> Option<Node<'_>> {
     (value.kind() == "declaration").then_some(value)
 }
 
-fn syntax_has_automatic_object(source: &str, root: Node<'_>) -> bool {
+fn syntax_has_automatic_object(source: &str, trivial: &TrivialTypeIndex, root: Node<'_>) -> bool {
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         if node.id() != root.id()
@@ -4867,6 +6347,7 @@ fn syntax_has_automatic_object(source: &str, root: Node<'_>) -> bool {
         }
         if matches!(node.kind(), "declaration" | "field_declaration")
             && declaration_may_construct_object(node)
+            && !trivial.declaration_is_trivial(source, node)
             && !["static", "extern", "thread_local"]
                 .into_iter()
                 .any(|storage| has_storage_class(source, node, storage))
@@ -4878,11 +6359,12 @@ fn syntax_has_automatic_object(source: &str, root: Node<'_>) -> bool {
     false
 }
 
-fn block_has_automatic_object(source: &str, block: Node<'_>) -> bool {
+fn block_has_automatic_object(source: &str, trivial: &TrivialTypeIndex, block: Node<'_>) -> bool {
     let mut stack = named_children(block);
     while let Some(node) = stack.pop() {
         if matches!(node.kind(), "declaration" | "field_declaration")
             && declaration_may_construct_object(node)
+            && !trivial.declaration_is_trivial(source, node)
             && !["static", "extern", "thread_local"]
                 .into_iter()
                 .any(|storage| has_storage_class(source, node, storage))
@@ -5355,5 +6837,216 @@ const fn completion_label(kind: CompletionKind) -> &'static str {
         CompletionKind::Break => "break",
         CompletionKind::Continue => "continue",
         CompletionKind::Yield => "yield",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::analyzer::LanguageDialect;
+    use crate::analyzer::tree_sitter_analyzer::{PreparedSourceOrigin, PreparedSyntaxSource};
+    use crate::text_utils::compute_line_starts;
+
+    /// Lower one C++ fixture and return the named procedure's parts.
+    fn lower_procedure_named(source: &str, procedure_name: &str) -> ProcedureSemanticsParts {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .expect("C++ grammar is valid");
+        let tree = parser.parse(source, None).expect("fixture parses");
+        let prepared = PreparedSyntaxTree::new(
+            PreparedSyntaxSource::Exact(Arc::<str>::from(source)),
+            tree,
+            compute_line_starts(source),
+            LanguageDialect::Standard(Language::Cpp),
+            PreparedSourceOrigin::Disk,
+            None,
+        );
+        let file = ProjectFile::new(std::env::temp_dir(), "fixture.cpp");
+        let SemanticOutcome::Complete { value, .. } = CppSemanticLowerer
+            .lower(
+                &file,
+                &prepared,
+                &SemanticBudget::default(),
+                &CancellationToken::default(),
+            )
+            .expect("C++ lowering succeeds")
+        else {
+            panic!("C++ fixture lowering must complete");
+        };
+        value
+            .into_iter()
+            .find(|parts| {
+                parts
+                    .locator
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some(procedure_name)
+            })
+            .unwrap_or_else(|| panic!("fixture declares procedure {procedure_name}"))
+    }
+
+    fn effects(parts: &ProcedureSemanticsParts) -> Vec<&SemanticEffect> {
+        parts
+            .points
+            .iter()
+            .flat_map(|point| point.events.iter())
+            .map(|event| &event.effect)
+            .collect()
+    }
+
+    /// A by-value scalar relay is a value transfer, not a decline (#2666, #2665).
+    #[test]
+    fn by_value_scalar_return_and_local_publish_value_flow_without_a_gap() {
+        const SOURCE: &str = r#"
+int produce();
+
+int relay(int value) {
+    return value;
+}
+
+void run() {
+    int result = relay(produce());
+}
+"#;
+
+        let relay = lower_procedure_named(SOURCE, "relay");
+        assert!(
+            effects(&relay).iter().any(|effect| matches!(
+                effect,
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Return,
+                    ..
+                }
+            )),
+            "a by-value fundamental return transfers its operand into the returned value: {:#?}",
+            relay.points
+        );
+        assert!(
+            relay.gaps.is_empty(),
+            "a fundamental-typed relay declines nothing: {:#?}",
+            relay.gaps
+        );
+
+        let run = lower_procedure_named(SOURCE, "run");
+        let run_effects = effects(&run);
+        let assigned = run_effects
+            .iter()
+            .find_map(|effect| match effect {
+                SemanticEffect::Assignment { target, value } => Some((*target, *value)),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!("the declared local is written by its initializer: {run_effects:#?}")
+            });
+        assert!(
+            run_effects.iter().any(|effect| matches!(
+                effect,
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Local,
+                    source,
+                    target,
+                } if (*target, *source) == assigned
+            )),
+            "the initializer's value also flows into the local: {run_effects:#?}"
+        );
+        assert!(
+            !run.gaps.iter().any(|gap| matches!(
+                gap.capability,
+                SemanticCapability::Values | SemanticCapability::Assignments
+            )),
+            "a fundamental-typed local initialized from a call declines no value or assignment; \
+             only the call target itself stays open to refinement: {:#?}",
+            run.gaps
+        );
+    }
+
+    /// A class-typed by-value initialization may construct, convert, copy or
+    /// move a distinct object, so it stays declined -- but the decline is this
+    /// adapter's decision (`Unsupported`), it names the declared object rather
+    /// than the statement, and it leaves the proven siblings alone (#2666).
+    #[test]
+    fn class_typed_by_value_initializer_declines_only_its_own_object() {
+        const SOURCE: &str = r#"
+struct Holder {
+    int value;
+};
+
+Holder produce() {
+    Holder made;
+    return made;
+}
+
+void run() {
+    Holder held = produce();
+    int plain = 1;
+}
+"#;
+
+        let run = lower_procedure_named(SOURCE, "run");
+        let declines: Vec<&SemanticGap> = run
+            .gaps
+            .iter()
+            .filter(|gap| gap.capability == SemanticCapability::Assignments)
+            .collect();
+        assert_eq!(
+            declines.len(),
+            1,
+            "only the class-typed initializer declines: {:#?}",
+            run.gaps
+        );
+        let decline = declines[0];
+        assert_eq!(
+            decline.kind,
+            SemanticGapKind::Unsupported,
+            "the conversion gate is a standing decision, not missing information: {decline:#?}"
+        );
+        assert!(
+            matches!(decline.subject, SemanticGapSubject::Value(_)),
+            "the decline names the declared object, not the whole point: {decline:#?}"
+        );
+        let run_effects = effects(&run);
+        assert!(
+            run_effects.iter().any(|effect| matches!(
+                effect,
+                SemanticEffect::ValueFlow {
+                    kind: ValueFlowKind::Local,
+                    ..
+                }
+            )),
+            "the fundamental-typed sibling local is still written: {run_effects:#?}"
+        );
+    }
+
+    /// An automatic object of a class that has no base, declares nothing but
+    /// data members of trivial type, and default-initializes none of them
+    /// runs no constructor and needs no destructor. Declining its cleanup or
+    /// its lifetime calls would claim code exists where none does (#2666).
+    #[test]
+    fn a_trivially_destructible_automatic_object_opens_no_lifetime_decline() {
+        const SOURCE: &str = r#"
+struct Trivial {
+    int value;
+};
+
+void run() {
+    Trivial local;
+    local.value = 1;
+}
+"#;
+
+        let run = lower_procedure_named(SOURCE, "run");
+        assert!(
+            !run.gaps.iter().any(|gap| matches!(
+                gap.capability,
+                SemanticCapability::ResourceManagement | SemanticCapability::CleanupControlFlow
+            )),
+            "a trivially destructible automatic object opens no RAII boundary: {:#?}",
+            run.gaps
+        );
     }
 }

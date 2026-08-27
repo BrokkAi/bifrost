@@ -1812,22 +1812,23 @@ func rangeSelfBinder(x []int) int {
         );
     }
 
-    const CPP_LOCAL_BINDER: &str = r#"
-int local_binder(int x) {
-    int total = 0;
-    return total + x;
-}
+    const RUBY_LOCAL_BINDER: &str = r#"
+def local_binder(x)
+  total = 0
+  total + x
+end
 "#;
 
     /// A language whose adapter declares no field-memory capability reports
     /// the property axis unsupported rather than silently empty. (Go carried
-    /// this pin until #2662 gave it field memory, and Rust until #2667.)
+    /// this pin until #2662 gave it field memory, Rust until #2667, and the
+    /// C family until #2666.)
     #[test]
     fn a_language_without_field_memory_reports_the_property_axis_unsupported() {
-        let fixture = Fixture::new(Language::Cpp, &[("src/main.cpp", CPP_LOCAL_BINDER)]);
+        let fixture = Fixture::new(Language::Ruby, &[("src/main.rb", RUBY_LOCAL_BINDER)]);
         let state = fixture.state(0);
         let derivation = procedure_containing(&state, |event| {
-            spelling(CPP_LOCAL_BINDER, event).contains("total")
+            spelling(RUBY_LOCAL_BINDER, event).contains("total")
         });
         assert!(
             derivation.completeness.reasons().contains(

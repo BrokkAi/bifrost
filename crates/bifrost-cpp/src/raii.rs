@@ -45,6 +45,12 @@ pub struct CppTemporaryFreeCallIndex<'a> {
     /// `None` when the file itself is unprovable (any preprocessor content
     /// can introduce declarations this index cannot see).
     facts: Option<HashMap<&'a str, NameFacts>>,
+    /// Names this file declares only as arrays of a provably trivially
+    /// destructible element type. Subscripting one is the built-in subscript
+    /// operator -- an array type has no user-declarable `operator[]` -- and it
+    /// yields an lvalue of that element type, so such an argument materializes
+    /// no more than a plain identifier does.
+    trivial_arrays: HashSet<&'a str>,
     /// Named nodes visited while building, for work accounting.
     visited_nodes: usize,
 }
@@ -53,6 +59,8 @@ impl<'a> CppTemporaryFreeCallIndex<'a> {
     /// Build the index from a parsed C++ translation unit.
     pub fn build(source: &'a str, root: Node<'a>) -> Self {
         let mut facts: HashMap<&'a str, NameFacts> = HashMap::default();
+        let mut trivial_arrays: HashSet<&'a str> = HashSet::default();
+        let mut rejected_arrays: HashSet<&'a str> = HashSet::default();
         let mut declaration_names: HashSet<usize> = HashSet::default();
         let mut provable_file = true;
         let mut visited_nodes = 0usize;
@@ -64,6 +72,12 @@ impl<'a> CppTemporaryFreeCallIndex<'a> {
                 // An include or macro can declare overloads and names this
                 // index cannot see; nothing in the file stays provable.
                 provable_file = false;
+            }
+            if matches!(
+                kind,
+                "declaration" | "parameter_declaration" | "field_declaration"
+            ) {
+                record_object_declarations(node, source, &mut trivial_arrays, &mut rejected_arrays);
             }
             if let Some(candidate) = free_function_candidate(node) {
                 declaration_names.insert(candidate.name.id());
@@ -83,9 +97,13 @@ impl<'a> CppTemporaryFreeCallIndex<'a> {
             let mut cursor = node.walk();
             stack.extend(node.named_children(&mut cursor));
         }
+        for name in &rejected_arrays {
+            trivial_arrays.remove(name);
+        }
         Self {
             source,
             facts: provable_file.then_some(facts),
+            trivial_arrays,
             visited_nodes,
         }
     }
@@ -124,7 +142,142 @@ impl<'a> CppTemporaryFreeCallIndex<'a> {
         let mut cursor = arguments.walk();
         arguments
             .named_children(&mut cursor)
-            .all(argument_is_trivially_shaped)
+            .all(|argument| self.argument_is_trivially_shaped(argument))
+    }
+
+    /// Argument shapes that cannot materialize a class-typed temporary given a
+    /// provably trivial parameter list: names, literals, member accesses
+    /// through `.`, subscripts of a provably trivial array, and nested calls
+    /// (which the caller's scan classifies independently).
+    fn argument_is_trivially_shaped(&self, argument: Node<'_>) -> bool {
+        let mut node = argument;
+        loop {
+            match node.kind() {
+                // Naming a member of an existing object with `.` yields an
+                // lvalue subobject and runs no user code -- `operator.` cannot
+                // be declared in C++ -- so the argument is exactly as
+                // temporary-free as the plain identifier below. `->` may
+                // resolve to a user-defined `operator->`, which is a call
+                // returning whatever it likes.
+                "field_expression" => {
+                    let Some(base) = node.child_by_field_name("argument") else {
+                        return false;
+                    };
+                    let mut cursor = node.walk();
+                    if node
+                        .children(&mut cursor)
+                        .any(|child| matches!(child.kind(), "->" | "->*"))
+                    {
+                        return false;
+                    }
+                    node = base;
+                }
+                "subscript_expression" => {
+                    let Some(base) = node.child_by_field_name("argument") else {
+                        return false;
+                    };
+                    if base.kind() != "identifier"
+                        || !self.trivial_arrays.contains(node_text(base, self.source))
+                    {
+                        return false;
+                    }
+                    let mut cursor = node.walk();
+                    let indices = node
+                        .named_children(&mut cursor)
+                        .filter(|child| child.id() != base.id())
+                        .collect::<Vec<_>>();
+                    if !indices
+                        .iter()
+                        .all(|index| self.subscript_is_trivially_shaped(*index))
+                    {
+                        return false;
+                    }
+                    node = base;
+                }
+                "parenthesized_expression" => {
+                    let mut cursor = node.walk();
+                    let mut children = node.named_children(&mut cursor);
+                    let (Some(inner), None) = (children.next(), children.next()) else {
+                        return false;
+                    };
+                    node = inner;
+                }
+                "identifier"
+                | "number_literal"
+                | "char_literal"
+                | "string_literal"
+                | "concatenated_string"
+                | "true"
+                | "false"
+                | "null"
+                | "nullptr" => return true,
+                "call_expression" => return true,
+                _ => return false,
+            }
+        }
+    }
+
+    /// A subscript operand, which the C++ grammar wraps in a
+    /// `subscript_argument_list` and the C grammar leaves bare.
+    fn subscript_is_trivially_shaped(&self, node: Node<'_>) -> bool {
+        if node.kind() != "subscript_argument_list" {
+            return self.argument_is_trivially_shaped(node);
+        }
+        let mut cursor = node.walk();
+        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+        children
+            .iter()
+            .all(|child| self.argument_is_trivially_shaped(*child))
+    }
+}
+
+/// Record whether `declaration` declares names as arrays of a provably
+/// trivially destructible element type.
+///
+/// A name declared any other way anywhere in the file is rejected: this index
+/// is name-based and has no scopes, so a second meaning for one name makes
+/// every occurrence of it unprovable.
+fn record_object_declarations<'a>(
+    declaration: Node<'a>,
+    source: &'a str,
+    trivial_arrays: &mut HashSet<&'a str>,
+    rejected: &mut HashSet<&'a str>,
+) {
+    let element_is_trivial = declaration
+        .child_by_field_name("type")
+        .is_some_and(|node| TRIVIAL_TYPE_KINDS.contains(&node.kind()));
+    let mut cursor = declaration.walk();
+    let declarators = declaration
+        .children_by_field_name("declarator", &mut cursor)
+        .collect::<Vec<_>>();
+    for declarator in declarators {
+        let mut current = declarator;
+        let mut is_array = false;
+        // A declarator this walk does not recognize -- a function, a pointer, a
+        // reference -- names no array, and it must not stop the other
+        // declarators of the same declaration from being recorded.
+        let name = loop {
+            match current.kind() {
+                "array_declarator" | "init_declarator" => {
+                    is_array |= current.kind() == "array_declarator";
+                    match current.child_by_field_name("declarator") {
+                        Some(inner) => current = inner,
+                        None => break None,
+                    }
+                }
+                "identifier" => break Some(current),
+                _ => break None,
+            }
+        };
+        let Some(name) = name else {
+            continue;
+        };
+        let name = node_text(name, source);
+        if is_array && element_is_trivial && !rejected.contains(name) {
+            trivial_arrays.insert(name);
+        } else {
+            rejected.insert(name);
+        }
     }
 }
 
@@ -223,36 +376,6 @@ fn is_callee_position(node: Node<'_>) -> bool {
                 .child_by_field_name("function")
                 .is_some_and(|function| function.id() == node.id())
     })
-}
-
-/// Argument shapes that cannot materialize a class-typed temporary given a
-/// provably trivial parameter list: names, literals, and nested calls (which
-/// the caller's scan classifies independently).
-fn argument_is_trivially_shaped(argument: Node<'_>) -> bool {
-    let mut node = argument;
-    loop {
-        match node.kind() {
-            "parenthesized_expression" => {
-                let mut cursor = node.walk();
-                let mut children = node.named_children(&mut cursor);
-                let (Some(inner), None) = (children.next(), children.next()) else {
-                    return false;
-                };
-                node = inner;
-            }
-            "identifier"
-            | "number_literal"
-            | "char_literal"
-            | "string_literal"
-            | "concatenated_string"
-            | "true"
-            | "false"
-            | "null"
-            | "nullptr" => return true,
-            "call_expression" => return true,
-            _ => return false,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -558,6 +681,55 @@ void run() {
 }
 "#,
             &[("dfb_source()", true), ("dfb_sink((dfb_source()))", true)],
+        );
+    }
+
+    /// #2666: an lvalue subobject named through `.`, and a subscript of a name
+    /// this file declares only as an array of arithmetic element type, are the
+    /// built-in operators. Both yield an lvalue and run no user code, so they
+    /// are exactly as temporary-free as the identifier they are rooted at.
+    #[test]
+    fn member_access_and_trivial_array_subscript_arguments_are_provable() {
+        assert_calls(
+            r#"
+struct Holder {
+    int value;
+};
+
+void consume(int value) {}
+
+void run() {
+    Holder holder;
+    int values[2];
+    consume(holder.value);
+    consume(values[0]);
+}
+"#,
+            &[
+                ("consume(holder.value)", true),
+                ("consume(values[0])", true),
+            ],
+        );
+    }
+
+    /// Near miss: a subscript whose base this file does not declare as an
+    /// array of arithmetic element type may resolve through a user-defined
+    /// `operator[]`, which can materialize a class-typed temporary.
+    #[test]
+    fn subscript_of_an_unproven_base_stays_unproven() {
+        assert_calls(
+            r#"
+struct Table {
+    int &operator[](int index);
+};
+
+void consume(int value) {}
+
+void run(Table table) {
+    consume(table[0]);
+}
+"#,
+            &[("consume(table[0])", false)],
         );
     }
 }

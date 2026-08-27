@@ -448,6 +448,12 @@ enum LocalBinding {
     Other,
     KnownUnrelated,
     TargetReceiver,
+    /// The symbol's visible constructor assignments name two different
+    /// classes. This inference is flow-insensitive, so it cannot say which
+    /// assignment reaches a later use; the symbol stays declared and
+    /// unresolved rather than taking whichever class was seen first (#2717,
+    /// the TypeScript edition of the #2495 rule).
+    Conflicted,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2784,6 +2790,7 @@ fn member_object_match_status(
     }) {
         return match binding {
             LocalBinding::TargetReceiver => ReceiverMatchStatus::Proven,
+            LocalBinding::Conflicted => ReceiverMatchStatus::Unproven,
             LocalBinding::KnownUnrelated if ctx.language == Language::TypeScript => {
                 receiver_fact_match_status(node, ctx)
             }
@@ -2938,11 +2945,23 @@ pub fn simple_identifier_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a
 
 fn infer_receiver_binding(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<LocalBinding> {
     let value = node.child_by_field_name("value")?;
-    if expression_is_target_constructor(value, ctx)
-        || expression_resolves_to_target_owner(value, ctx)
-        || has_target_type_annotation(node, ctx)
-    {
+    // A declared type survives reassignment -- the compiler holds every later
+    // write to it -- so annotation evidence needs no reassignment check.
+    if has_target_type_annotation(node, ctx) {
         return Some(LocalBinding::TargetReceiver);
+    }
+    let value_names_target = expression_is_target_constructor(value, ctx)
+        || expression_resolves_to_target_owner(value, ctx);
+    if value_names_target || value.kind() == "new_expression" {
+        let (reassigned_target, reassigned_other) = reassignment_class_evidence(node, ctx);
+        let names_target = value_names_target || reassigned_target;
+        let names_other = !value_names_target || reassigned_other;
+        if names_target && names_other {
+            return Some(LocalBinding::Conflicted);
+        }
+        if names_target {
+            return Some(LocalBinding::TargetReceiver);
+        }
     }
     let name = node.child_by_field_name("name")?;
     if name.kind() == "identifier"
@@ -2963,6 +2982,75 @@ fn infer_receiver_binding(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<LocalBind
             .copied()
             .unwrap_or(LocalBinding::Other)
     })
+}
+
+/// Whether other visible assignments to this declarator's symbol name the
+/// target class (`.0`) or a different class (`.1`).
+///
+/// The walk covers the binding's own scope subtree -- the nearest enclosing
+/// scope node for a lexical declaration, the nearest function or program node
+/// for a `var` -- so it sees a write inside a nested block or closure. A write
+/// in a nested scope that redeclares the name is counted anyway: the cost of
+/// that imprecision is a proven row degrading to unproven, never the reverse.
+/// An assignment whose right side carries no class evidence (a call, a
+/// parameter, an arbitrary expression) contributes nothing: absence of
+/// evidence is not conflicting evidence, the same rule the Python inference
+/// applies (#2495).
+fn reassignment_class_evidence(declarator: Node<'_>, ctx: &ScanCtx<'_>) -> (bool, bool) {
+    let Some(name) = declarator
+        .child_by_field_name("name")
+        .filter(|name| name.kind() == "identifier")
+        .map(|name| slice(name, ctx.source))
+    else {
+        return (false, false);
+    };
+    let function_scoped = declarator
+        .parent()
+        .is_some_and(|parent| parent.kind() == "variable_declaration");
+    let mut root = declarator;
+    while let Some(parent) = root.parent() {
+        root = parent;
+        let is_function = matches!(
+            root.kind(),
+            "arrow_function"
+                | "function_expression"
+                | "generator_function"
+                | "function_declaration"
+                | "generator_function_declaration"
+                | "method_definition"
+                | "program"
+        );
+        if is_function || (!function_scoped && root.kind() == "statement_block") {
+            break;
+        }
+    }
+
+    let (mut saw_target, mut saw_other) = (false, false);
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "assignment_expression"
+            && let Some(left) = node.child_by_field_name("left")
+            && left.kind() == "identifier"
+            && slice(left, ctx.source) == name
+            && let Some(right) = node.child_by_field_name("right")
+        {
+            if expression_is_target_constructor(right, ctx)
+                || expression_resolves_to_target_owner(right, ctx)
+            {
+                saw_target = true;
+            } else if right.kind() == "new_expression" {
+                saw_other = true;
+            }
+            if saw_target && saw_other {
+                break;
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    (saw_target, saw_other)
 }
 
 fn expression_is_target_constructor(node: Node<'_>, ctx: &ScanCtx<'_>) -> bool {

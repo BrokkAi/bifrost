@@ -2889,6 +2889,15 @@ type UsageGraphExactSites = HashMap<UsageGraphSiteKey, BTreeSet<UsageGraphEndpoi
 /// root and depth one is the complete graph.
 pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageGraphResult {
     let _scope = profiling::scope("searchtools::usage_graph");
+    // One request boundary for the whole scan. The exact layer resolves every
+    // file's occurrence batch through the definition resolver, and each batch
+    // opens its own nested AnalyzerQueryScope; without this outer scope the
+    // per-request memos (definition candidates by fq name, prepared syntax,
+    // parent units, query file states) are discarded at every file boundary,
+    // and the shrinking-scope walk re-issues the same definitions(fqn) SQL
+    // lookups across files -- 32.5k calls for 2.7k distinct names on the
+    // issue #2679 reproduction, 12x pure repetition.
+    let _analyzer_query = AnalyzerQueryScope::new(analyzer);
     assert!(params.depth > 0, "usage_graph depth must be positive");
 
     let rooted = params.paths.is_some();
@@ -3162,6 +3171,27 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
                 });
         }
 
+        // The structural exact table below is only ever probed at the site
+        // keys of AMBIGUOUS legacy edges (unique_graph_unit is None), so the
+        // fallback scan only needs those sites' lines. Scanning every
+        // admitted file resolved every occurrence in the workspace to serve
+        // those probes -- 41.8k occurrence resolutions on the issue #2679
+        // reproduction, most of the diff's whole cost.
+        let structural_exact_sites: Vec<(ProjectFile, BTreeSet<usize>)> = {
+            let mut by_file: BTreeMap<ProjectFile, BTreeSet<usize>> = BTreeMap::new();
+            for ((ecosystem, _from_name, to_name), sites) in &legacy_edges {
+                let endpoint_key = (*ecosystem, to_name.clone());
+                if unique_graph_unit(&endpoints_by_name[&endpoint_key]).is_none() {
+                    for site in sites {
+                        if let Some(file) = scan_files_by_path.get(&site.path) {
+                            by_file.entry(file.clone()).or_default().insert(site.line);
+                        }
+                    }
+                }
+            }
+            by_file.into_iter().collect()
+        };
+
         let mut next = BTreeSet::new();
         for ((ecosystem, from_name, to_name), sites) in legacy_edges {
             let endpoint_key = (ecosystem, to_name.clone());
@@ -3290,7 +3320,8 @@ pub fn usage_graph(analyzer: &dyn IAnalyzer, params: UsageGraphParams) -> UsageG
                 }
                 if !structural_exact_loaded {
                     structural_exact_loaded = true;
-                    let structural = ReferenceEngine::new().scan_file_edges(analyzer, &scan_files);
+                    let structural = ReferenceEngine::new()
+                        .scan_file_edges_at_lines(analyzer, &structural_exact_sites);
                     if !structural.completeness.is_complete() {
                         incomplete.insert((
                             "exact_reference_join_incomplete".to_string(),

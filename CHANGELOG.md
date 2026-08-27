@@ -62,6 +62,20 @@ projection and its commit history does not contain every source commit.
   stores and loads when their targets are structurally known. Array literals
   now carry allocation identities, allowing a later write to one exact element
   to replace the element's prior value instead of conservatively retaining it.
+- The shipped Python standard-library semantic pack now activates by default
+  when a workspace declares a compatible CPython version in `.python-version`
+  or `pyproject.toml`. Unsupported constraints, unavailable packs, and version
+  mismatches remain explicit diagnostics rather than guessed activation.
+- TypeScript call-target selection now recognizes members of classes with
+  private constructors as closed dispatch and refuses conflicting local
+  receiver assignments. Supported reference-flow policies can therefore reach
+  complete finding and clean outcomes for TypeScript while open or structurally
+  unresolved calls remain explicitly incomplete.
+- Exact reference scans now retain request-scoped resolution state across the
+  whole scan, resolve structural fallback data only for ambiguous sites that
+  need it, and process independent files in parallel. Large `scan_usages` and
+  `analyze_diff` workloads no longer repeat whole-workspace resolution work per
+  file or occurrence.
 
 ### Fixed
 
@@ -73,11 +87,23 @@ projection and its commit history does not contain every source commit.
   branch conditions and literal-bounded counted-loop entries with published
   guard facts, and publishes evaluation-order and initializer gaps only where
   the order or transfer is genuinely unmodeled. C++ calls that elide a
-  defaulted argument now carry an explicit unsupported-binding gap. On the
-  DataFlowBench C taint kernel this moves decided core assertions from 2 to 28
-  of 48 with no wrong decisions; the remaining incompleteness is the
-  undeclared struct, pointer, and array memory model and function-pointer
-  dispatch.
+  defaulted argument now carry an explicit unsupported-binding gap.
+- C and C++ data-flow and taint analysis gained a heap stratum on top of that
+  scalar repair: member, static, and array-element accesses lower into heap
+  reads and writes whose identity is the member's own declaration, and a
+  `throw` binds its operand to the handler parameter that observes it. Many C
+  and C++ flows that previously stayed inconclusive now resolve. Where the
+  analyzer deliberately does not model a construct -- a class-typed by-value
+  copy or conversion, a user-defined subscript operator, a write through a
+  parameter -- it reports a precise decline scoped to that value or location,
+  naming the unsupported capability, instead of an indistinct partial result.
+  Constant branch conditions and literal-bounded counted loops also fold for
+  the C family, so an infeasible branch and a provably entered loop no longer
+  report taint no execution can carry. On the DataFlowBench taint kernels this
+  moves decided core assertions from 2 to 41 of 50 for C and from 2 to 30 of 56
+  for C++ with no wrong decisions; the remaining incompleteness is
+  function-pointer and virtual dispatch and the callable-shaped strata behind
+  them.
 - Fixed the 0.10.6 `analyze_diff` performance regression on Rust workspaces:
   reference resolution rebuilt a whole-file lexical scope index for every
   occurrence it inspected, so review-sized Rust diffs no longer completed
@@ -97,6 +123,10 @@ projection and its commit history does not contain every source commit.
 - A one-shot `--tool` run now detects that its parent process died, cancels
   the in-flight analysis, and exits, instead of surviving as an orphan
   consuming a full core after the caller's timeout kill.
+- RMCP response delivery now remains ordered through the transport timing
+  barrier, so a later response cannot finish its measured boundary while an
+  earlier delivery is still pending. This removes intermittent incomplete
+  timing profiles from otherwise successful benchmark runs.
 - Bound persisted workspace queries to immutable worktree revisions, preserving
   retained-analyzer results across concurrent worktree publication and avoiding
   large temporary candidate tables during Java reverse-reference analysis.

@@ -211,6 +211,37 @@ pub(super) fn callable_shape<'tree>(
     ))
 }
 
+/// Whether the class body holding this member declares a `private
+/// constructor`.
+///
+/// TypeScript has no `final` keyword; a private constructor is the language's
+/// own statement that the class cannot be extended (`class D extends C`
+/// refuses to compile), so no subclass, and therefore no override of the
+/// member, exists. That is the same closed-dispatch declaration Java spells
+/// `final` and Python spells `@final` (#2717). The caller gates this on the
+/// TypeScript dialect: JavaScript has no accessibility modifiers, so no JS
+/// class can make the statement.
+pub(super) fn enclosing_class_has_private_constructor(source: &str, node: Node<'_>) -> bool {
+    let Some(class_body) = node.parent().filter(|parent| parent.kind() == "class_body") else {
+        return false;
+    };
+    let mut cursor = class_body.walk();
+    class_body.named_children(&mut cursor).any(|member| {
+        member.kind() == "method_definition"
+            && member
+                .child_by_field_name("name")
+                .and_then(|name| nonempty_node_text(source, name))
+                .is_some_and(|name| name == "constructor")
+            && {
+                let mut modifiers = member.walk();
+                member.children(&mut modifiers).any(|child| {
+                    child.kind() == "accessibility_modifier"
+                        && nonempty_node_text(source, child).is_some_and(|text| text == "private")
+                })
+            }
+    })
+}
+
 pub(super) fn callable_field_belongs_to_procedure(
     callable_kind: &str,
     field: Option<&str>,

@@ -972,6 +972,7 @@ tests/fixtures/policy-substrate-p0/
   policies/
     acme-validated-value-reaches-store.rqlp         reference policy A (Java)
     acme-validated-value-reaches-store-python.rqlp  reference policy A (Python)
+    acme-validated-value-reaches-store-typescript.rqlp  reference policy A (TypeScript)
     acme-pure-has-no-network-io.rqlp                reference policy B
   semantic-models/
     acme-http-client.json                           the reviewed effect model
@@ -983,6 +984,10 @@ tests/fixtures/policy-substrate-p0/
   flow/python/finding_app.py                        one proven violating path
   flow/python/clean_app.py                          validated directly, plus the near miss
   flow/python/inconclusive_app.py                   the two shapes Python cannot conclude
+  flow/typescript/api.ts                            the same APIs and near miss, private constructors
+  flow/typescript/finding_app.ts                    one proven violating path
+  flow/typescript/clean_app.ts                      validated directly, plus the near miss
+  flow/typescript/inconclusive_app.ts               the two shapes TypeScript cannot conclude
   effects/java/api/                                 the @Pure marker and the modeled API
   effects/java/finding/App.java                     a direct and a transitive effect
   effects/java/clean/App.java                       a proven-clean call graph
@@ -1144,6 +1149,28 @@ Two Python shapes still exit 2, and `flow/python/inconclusive_app.py` carries
 both: a keyword actual (`store.put(value=value)`), which has no formal to map
 onto as a value-flow input, and a kill that runs inside a workspace helper
 rather than on the observed value's own path.
+
+#### The same policy on TypeScript
+
+`acme-validated-value-reaches-store-typescript.rqlp` is again the same document
+with `(language typescript)`, and it reaches the same verdicts over
+`flow/typescript/`: exit 1 with one finding on `store.put(value)` and none on
+the near-miss `cache.put(value)`, and exit 0 on the validated tree.
+
+The same two facts carry it. The receiver's type is evident at the call — an
+annotated parameter (`store: AcmeStore`), a `const` assigned exactly one
+visible constructor call, a direct `new AcmeStore().put(...)` chain, the class
+name itself for a static member, or `this` inside the owner — and a local two
+assignments give two different classes returns no proven row rather than a
+guess. And the target's dispatch is closed. TypeScript has no `final` keyword;
+its own statement that a class cannot be extended is a `private constructor`,
+which is what the fixture classes declare. Make the constructors public and
+the same tree reports the same finding but refuses the clean verdict, exactly
+as Java without `final` and Python without `@final` would.
+
+Two TypeScript shapes still exit 2, and `flow/typescript/inconclusive_app.ts`
+carries both: a receiver typed by a structural interface, whose implementation
+set no declaration closes, and the same helper-run kill as Python.
 
 ### Binding the actual passed to a named formal
 
@@ -1577,7 +1604,7 @@ than explained from a differently-modeled run.
 
 | Capability | Today | Boundary |
 | --- | --- | --- |
-| Exact call selection | `call-sites-to :proof proven` over an `inside-decl` seed | Java and Python both answer. Python proves the row whenever the receiver's type is evident at the call — annotated, constructed in the same procedure, or `self` — and returns nothing rather than a guess when it is not. A clean *flow* verdict additionally needs the target's dispatch closed, which on Python means `@final` |
+| Exact call selection | `call-sites-to :proof proven` over an `inside-decl` seed | Java, Python, and TypeScript all answer. Python and TypeScript prove the row whenever the receiver's type is evident at the call — annotated, constructed in the same procedure, or `self`/`this` — and return nothing rather than a guess when it is not. A clean *flow* verdict additionally needs the target's dispatch closed: `final` on Java, `@final` on Python, and a `private constructor` on TypeScript, the language's own statement that the class cannot be extended |
 | Actual-to-formal binding | `call-input :parameter-name` binds positional and named syntax exactly, and `(argument :name "...")` is a value-flow port for flow and taint endpoints, which both editions of reference policy A bind through | The port needs the callee's parameter list, so an unresolved callee degrades the endpoint rather than binding; a formal the resolved target does not declare is a diagnostic, and a declared receiver such as Python's `self` is not a formal; a keyword actual reaches the port only through the unproven structural relation, so a tree that writes one cannot be clean; and every resolved dispatch candidate must agree that the name reaches this operand, so a call through an interface whose implementations name the formal differently is refused |
 | Declared effects | `declared_effects` on a procedure summary, propagated with depth, certainty, timing, and coverage | Path-conditional effects are a P0 non-goal; effect timing is the pack's declaration, not an inference about scheduling syntax |
 | Annotation markers | The normalized `decorators` role | Matches the written annotation name, not a resolved annotation type |

@@ -96,11 +96,21 @@ pub(super) fn enumerate_procedures<'tree>(
         }
 
         let mut procedure_context = None;
-        if let Some((mut kind, mut segment_kind, body, properties)) = callable_shape(node) {
+        if let Some((mut kind, mut segment_kind, body, mut properties)) = callable_shape(node) {
             let name = callable_name(prepared.source(), node);
             if name.as_deref() == Some("constructor") {
                 kind = ProcedureKind::Constructor;
                 segment_kind = DeclarationSegmentKind::Constructor;
+            }
+            // A private constructor is TypeScript's closed-dispatch statement:
+            // the class cannot be extended, so no override of its members
+            // exists (#2717). JavaScript has no accessibility modifiers, so
+            // the dialect gate is exact, not conservative.
+            if language.language() == Language::TypeScript
+                && node.kind() == "method_definition"
+                && enclosing_class_has_private_constructor(prepared.source(), node)
+            {
+                properties.dispatch_extensibility = DispatchExtensibility::Closed;
             }
             let anchor = source_anchor(node, 0).map_err(SemanticProviderError::invalid_identity)?;
             let identity = match inventory.allocate_procedure(

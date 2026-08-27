@@ -2721,6 +2721,16 @@ fn procedure_matches_definition(procedure: &ProcedureSemantics, definition: &Cod
     };
     name == definition.identifier()
         || (procedure.kind() == ProcedureKind::Constructor && name == definition.short_name())
+        // A JS/TS static member's declaration identity carries a `$static`
+        // suffix (`read$static`); its semantic procedure is the class method
+        // `read` with `is_static`. Both spellings assert the same fact, so
+        // accept the stripped name exactly when the procedure declares static
+        // (#2717).
+        || (procedure.properties().is_static
+            && definition
+                .identifier()
+                .strip_suffix("$static")
+                .is_some_and(|stripped| name == stripped))
 }
 
 fn exact_external_procedure_target(

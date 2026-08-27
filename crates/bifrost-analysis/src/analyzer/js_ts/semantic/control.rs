@@ -1385,7 +1385,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 access,
                 MemoryLocationKind::Field { base, member },
             )?;
-            if !established_plain_base {
+            // A member read in callee position asks the call's own question:
+            // which procedure does this property name here. The call site
+            // publishes that question itself (its Calls, CallableReferences,
+            // and DynamicDispatch gaps name prototype, accessor, proxy, and
+            // runtime mutation explicitly), and the workspace dispatch
+            // resolver answers it, so a second field-identity gap on the same
+            // read would keep the answered question open forever (#2717).
+            let callee_position = node.parent().is_some_and(|parent| {
+                parent.kind() == "call_expression"
+                    && parent.child_by_field_name("function") == Some(node)
+            });
+            if !established_plain_base && !callee_position {
                 self.add_field_identity_gap(builder, access, location)?;
             }
             self.append_effect(
