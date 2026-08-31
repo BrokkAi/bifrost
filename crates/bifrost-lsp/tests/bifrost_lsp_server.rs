@@ -462,6 +462,119 @@ fn bifrost_lsp_server_indexes_all_startup_workspace_folders() {
     );
 }
 
+/// A session over several workspace folders persists its analyzer database to
+/// the machine-local cache root, and puts nothing inside the folders it opened.
+///
+/// Every other spawn in this suite pins `BIFROST_CACHE_DIR`, which short-
+/// circuits the cache-location funnel, so no other test can show where a server
+/// decides to write. This one lets the funnel run and only relocates the
+/// machine cache root, which is what a real multi-root session resolves.
+#[test]
+fn bifrost_lsp_server_persists_multi_root_session_to_the_machine_cache_root() {
+    let temp = TempDir::new().expect("tempdir");
+    let workspace = temp.path().canonicalize().expect("canon temp");
+    let cache_temp = TempDir::new().expect("cache tempdir");
+    let cache_root = cache_temp.path().canonicalize().expect("canon cache temp");
+    let root_a = workspace.join("service-a");
+    let root_b = workspace.join("service-b");
+    fs::create_dir_all(&root_a).expect("create service-a");
+    fs::create_dir_all(&root_b).expect("create service-b");
+    fs::write(
+        root_a.join("Alpha.java"),
+        "class AlphaRoot {\n    void alphaOnly() {}\n}\n",
+    )
+    .expect("write Alpha.java");
+    fs::write(
+        root_b.join("Beta.java"),
+        "class BetaRoot {\n    void betaOnly() {}\n}\n",
+    )
+    .expect("write Beta.java");
+
+    let mut server = LspServer::spawn_with_machine_cache_root(&workspace, &cache_root);
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "processId": null,
+            "rootUri": null,
+            "workspaceFolders": [
+                {"uri": uri_for(&root_a), "name": "service-a"},
+                {"uri": uri_for(&root_b), "name": "service-b"}
+            ],
+            "capabilities": {"workspace": {"workspaceFolders": true}}
+        }
+    }));
+    assert_eq!(server.read_message()["id"], 1);
+    server.notify_value(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
+
+    // Answering a query over both folders proves the workspace finished
+    // indexing, so the database is on disk by the time we look for it.
+    server.notify_value(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "workspace/symbol",
+        "params": {"query": "Only"}
+    }));
+    let symbols_response = server.read_message();
+    let symbols = symbols_response["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected workspace symbols, got {symbols_response}"));
+    assert!(
+        symbols.iter().any(|symbol| symbol["name"] == "alphaOnly")
+            && symbols.iter().any(|symbol| symbol["name"] == "betaOnly"),
+        "both folders should be indexed: {symbols:#?}"
+    );
+    server.shutdown_with_id(3);
+
+    let databases = analyzer_databases_under(&cache_root);
+    assert_eq!(
+        databases.len(),
+        1,
+        "a multi-root session writes exactly one database under its machine cache root: \
+         {databases:#?}"
+    );
+    let database = &databases[0];
+    assert!(
+        database
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name.to_string_lossy().starts_with("service-a-")),
+        "the database directory should be named for the workspace's root set: {}",
+        database.display()
+    );
+    for folder in [&root_a, &root_b, &workspace] {
+        assert!(
+            !folder.join(".bifrost").exists(),
+            "no opened folder may host the shared database: {}",
+            folder.display()
+        );
+    }
+}
+
+/// Every analyzer database file at or below `root`, found with an explicit
+/// stack rather than recursion.
+fn analyzer_databases_under(root: &Path) -> Vec<PathBuf> {
+    let wanted = brokk_bifrost_analysis::cache_db::cache_db_file_name();
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.file_name().is_some_and(|name| name == wanted) {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
 #[test]
 fn bifrost_lsp_server_runs_rql_queries_across_all_workspace_folders() {
     let temp = TempDir::new().expect("tempdir");

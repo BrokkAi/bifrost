@@ -379,6 +379,42 @@ func B() {
     }
 
     #[test]
+    fn go_semantic_diagnostics_bound_range_names_stay_inside_the_loop() {
+        let fixture = fixture(&[(
+            "main.go",
+            r#"
+package main
+
+func Run(values []int) {
+    for _, item := range values {
+        _ = item
+    }
+    _ = item
+    for missing = range values {}
+}
+"#,
+        )]);
+
+        let diagnostics = fixture.diagnostics_for("main.go");
+        assert_eq!(2, diagnostics.len(), "{diagnostics:#?}");
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.kind == GO_UNRECOGNIZED_SYMBOL)
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("item"))
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("missing"))
+        );
+    }
+
+    #[test]
     fn go_semantic_diagnostics_scan_assignment_lhs_references() {
         let fixture = fixture(&[(
             "main.go",

@@ -10,7 +10,8 @@ use super::error::OracleContractError;
 use super::limits::OracleLimits;
 use super::model::{
     AbstractLocation, AbstractObject, AccessPathAtPoint, AliasQuery, DispatchBoundaryKind,
-    OracleCallContext, StoreAtPoint, ValueAtPoint,
+    FreshObjectPublication, FreshObjectPublicationQuery, OracleCallContext, StoreAtPoint,
+    ValueAtPoint,
 };
 
 /// A materialization-local identity for one derivation relation.
@@ -62,6 +63,7 @@ pub enum OracleRelationOwner {
     PointsTo(Box<ValueAtPoint>),
     Locations(Box<AccessPathAtPoint>),
     Alias(Box<AliasQuery>),
+    FreshObjectPublications(Box<FreshObjectPublicationQuery>),
     StrongUpdate(Box<StoreAtPoint>),
 }
 
@@ -76,6 +78,9 @@ impl OracleRelationOwner {
             Self::PointsTo(value) => evidence.procedure() == value.point().procedure(),
             Self::Locations(access) => evidence.procedure() == access.point().procedure(),
             Self::Alias(query) => evidence.procedure() == query.left().point().procedure(),
+            Self::FreshObjectPublications(query) => {
+                evidence.procedure() == query.observation().procedure()
+            }
             Self::StrongUpdate(store) => evidence.procedure() == store.store().point().procedure(),
         }
     }
@@ -91,6 +96,7 @@ pub enum OracleRelationKind {
     PointsTo,
     Location,
     Alias,
+    Publication,
     Escape,
     LanguageDefined,
 }
@@ -335,6 +341,10 @@ impl OracleRelationHandle {
 
     pub fn record(&self) -> &OracleRelationRecord {
         &self.arena.records[self.id.index()]
+    }
+
+    pub(super) fn arena(&self) -> &OracleRelationArena {
+        &self.arena
     }
 
     /// Query-local identity used only to total-order retained handles whose
@@ -650,6 +660,19 @@ impl OracleSet<AbstractLocation> {
         I: IntoIterator<Item = OracleCandidate<AbstractLocation>>,
     {
         Self::bounded(candidates, coverage, limits.alias_breadth())
+    }
+}
+
+impl OracleSet<FreshObjectPublication> {
+    pub fn bounded_publications<I>(
+        candidates: I,
+        coverage: CandidateCoverage,
+        limits: OracleLimits,
+    ) -> Self
+    where
+        I: IntoIterator<Item = OracleCandidate<FreshObjectPublication>>,
+    {
+        Self::bounded(candidates, coverage, limits.provenance_records())
     }
 }
 

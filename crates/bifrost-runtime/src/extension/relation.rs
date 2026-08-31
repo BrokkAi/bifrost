@@ -275,12 +275,27 @@ impl SemanticGapReason {
 ///
 /// `new` sorts the reasons using the canonical extension order and retains at
 /// most [`MAX_RETAINED_SEMANTIC_GAP_REASONS`] entries. A summary must contain
-/// at least one retained reason; `truncated` is true exactly when
-/// `omitted_count` is nonzero.
+/// at least one retained reason.
+///
+/// In an extension query response, this summary describes the selected
+/// semantic frontier, independently of the caller's relation-traversal
+/// budgets. For the same workspace generation, seed, relation set, and
+/// direction, changing enforced limits such as `max_nodes`, `max_edges`, or
+/// `max_traversal_steps` can change the snapshot's completion without changing
+/// this summary. [`Self::truncated`] reports only
+/// whether the fixed reason-retention limit omitted reasons; it does not report
+/// whether relation traversal completed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SemanticGapReasonSummary {
     pub reasons: Box<[SemanticGapReason]>,
+    /// Whether the fixed reason-retention limit omitted one or more semantic
+    /// gap reasons.
+    ///
+    /// This flag is true exactly when [`Self::omitted_count`] is nonzero. It is
+    /// independent of relation-traversal completion: inspect
+    /// [`SemanticRelationSnapshot::status`] and budget boundary kinds to learn
+    /// whether an enforced caller-supplied limit stopped the query.
     pub truncated: bool,
     pub omitted_count: u64,
 }
@@ -506,6 +521,15 @@ pub struct SemanticRelationBoundary {
     pub evidence: Box<[SemanticEvidence]>,
     /// Source-backed explanations are meaningful only for a missing-semantic
     /// frontier. Other boundary kinds leave this optional field absent.
+    ///
+    /// The summary is a property of the selected semantic frontier, not of how
+    /// far the bounded relation traversal completed. For the same semantic
+    /// generation, seed, scope, relation set, and direction, changing an
+    /// enforced node, edge, or traversal-step limit can change the snapshot
+    /// status and retained graph while leaving this value unchanged. A summary
+    /// whose [`SemanticGapReasonSummary::truncated`] flag is set exceeded the
+    /// fixed reason-retention limit; that flag never means the relation
+    /// traversal itself was truncated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason_summary: Option<SemanticGapReasonSummary>,
 }

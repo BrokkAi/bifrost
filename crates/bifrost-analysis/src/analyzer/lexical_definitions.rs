@@ -100,6 +100,19 @@ pub(crate) fn formal_parameter_slots_for_owner(
     formal_parameter_slots_for_owner_bounded(language, owner, source, || true)
 }
 
+/// Return formal parameter slots together with the exact declaration node that
+/// produced each slot. The node is retained from the same binding traversal as
+/// the slot, so callers that already hold the prepared tree can attach
+/// structural identities without joining by ranges, names, or ordinals.
+pub(crate) fn formal_parameter_slots_for_owner_with_nodes<'tree>(
+    language: Language,
+    owner: Node<'tree>,
+    source: &str,
+) -> Option<Vec<(FormalParameterSlot, Node<'tree>)>> {
+    formal_parameter_slots_for_owner_with_nodes_bounded(language, owner, source, || true)
+        .map(|(layout, nodes)| layout.slots.into_iter().zip(nodes).collect())
+}
+
 /// Metered form of [`formal_parameter_slots_for_owner`] for receiver
 /// resolution. Every syntax node or child inspected by parameter/decorator
 /// discovery must first pass `scope_step`; `None` therefore means either the
@@ -110,6 +123,16 @@ pub(crate) fn formal_parameter_slots_for_owner_bounded(
     source: &str,
     mut scope_step: impl FnMut() -> bool,
 ) -> Option<FormalParameterLayout> {
+    formal_parameter_slots_for_owner_with_nodes_bounded(language, owner, source, &mut scope_step)
+        .map(|(layout, _)| layout)
+}
+
+fn formal_parameter_slots_for_owner_with_nodes_bounded<'tree>(
+    language: Language,
+    owner: Node<'tree>,
+    source: &str,
+    mut scope_step: impl FnMut() -> bool,
+) -> Option<(FormalParameterLayout, Vec<Node<'tree>>)> {
     if !scope_step() || !is_parameter_owner(language, owner.kind()) {
         return None;
     }
@@ -147,7 +170,7 @@ pub(crate) fn formal_parameter_slots_for_owner_bounded(
         )
     });
 
-    let mut slots: Vec<FormalParameterSlot> = Vec::new();
+    let mut slots: Vec<(FormalParameterSlot, Node<'tree>)> = Vec::new();
     for binding in bindings {
         let Some(name) = source.get(binding.name.byte_range()) else {
             continue;
@@ -158,7 +181,7 @@ pub(crate) fn formal_parameter_slots_for_owner_bounded(
         let default_range = parameter_default_range(language, binding.declaration);
         let can_share_slot = language != Language::Go;
         if can_share_slot
-            && let Some(slot) = slots.last_mut()
+            && let Some((slot, _)) = slots.last_mut()
             && slot.declaration_range.start_byte == declaration_range.start_byte
             && slot.declaration_range.end_byte == declaration_range.end_byte
             && slot.receiver == receiver
@@ -169,19 +192,26 @@ pub(crate) fn formal_parameter_slots_for_owner_bounded(
             slot.variadic = slot.variadic.or(variadic);
             continue;
         }
-        slots.push(FormalParameterSlot {
-            names: vec![name.to_owned()],
-            declaration_range,
-            receiver,
-            variadic,
-            default_range,
-        });
+        slots.push((
+            FormalParameterSlot {
+                names: vec![name.to_owned()],
+                declaration_range,
+                receiver,
+                variadic,
+                default_range,
+            },
+            binding.declaration,
+        ));
     }
 
-    Some(FormalParameterLayout {
-        slots,
-        python_binding,
-    })
+    let (slots, nodes): (Vec<_>, Vec<_>) = slots.into_iter().unzip();
+    Some((
+        FormalParameterLayout {
+            slots,
+            python_binding,
+        },
+        nodes,
+    ))
 }
 
 /// The decorators that bind `owner` are the `decorator` children of the

@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "pack_id": "bifrost.go.testify.assert",
+  "version": "1.0.0",
+  "producer": {
+    "name": "bifrost",
+    "version": "0.10.6"
+  },
+  "language": "go",
+  "ecosystem": "go-module",
+  "compatibility": {
+    "bifrost": ">=0.10.6, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "https://pkg.go.dev/github.com/stretchr/testify/assert",
+    "revision": "v1.11.1"
+  },
+  "license": "MIT",
+  "completeness": "complete",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "go.testify.assert.conditional-result-refinements",
+      "activation": [
+        {
+          "module": {
+            "name": "github.com/stretchr/testify",
+            "version": "=1.11.1"
+          }
+        }
+      ],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "assert.no-error",
+            "target": {
+              "path": "assert/assertions.go",
+              "symbol": "github.com/stretchr/testify/assert.NoError(t TestingT, err error, msgAndArgs ...interface{})",
+              "has_receiver": false,
+              "variadic": true,
+              "parameter_count": 3
+            },
+            "completeness": "complete",
+            "normal_result_count": 1,
+            "transfers": [],
+            "conditional_result_refinements": [
+              {
+                "result_ordinal": 0,
+                "outcome": true,
+                "parameter_ordinal": 1,
+                "predicate": "null",
+                "proof_effect": "establishes"
+              },
+              {
+                "result_ordinal": 0,
+                "outcome": false,
+                "parameter_ordinal": 1,
+                "predicate": "null",
+                "proof_effect": "does_not_establish"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

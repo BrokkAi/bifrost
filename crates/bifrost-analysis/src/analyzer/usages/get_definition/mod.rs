@@ -79,8 +79,8 @@ use crate::analyzer::usages::scala_graph::{
 };
 use crate::analyzer::{
     AliasResolver, AnalyzerDefinitionLookup, AnalyzerQueryScope, BoundedDefinitionLookup,
-    CSharpAnalyzer, CodeUnit, CppAnalyzer, DeclarationKind, GoAnalyzer, IAnalyzer,
-    ImportAnalysisProvider, ImportInfo, JavaAnalyzer, Language, ModuleBindingEventKind,
+    CSharpAnalyzer, CodeUnit, CppAnalyzer, DeclarationKind, DispatchExtensibility, GoAnalyzer,
+    IAnalyzer, ImportAnalysisProvider, ImportInfo, JavaAnalyzer, Language, ModuleBindingEventKind,
     ModuleBindingTimeline, PhpAnalyzer, ProjectFile, PythonAnalyzer, Range, RubyAnalyzer,
     RustAnalyzer, ScalaAnalyzer, cpp_include_paths, cpp_node_text, csharp_callable_arity,
     resolve_analyzer, resolve_include_targets,
@@ -132,6 +132,7 @@ mod call_sites;
 mod cpp;
 mod csharp;
 mod go;
+pub(crate) use go::parse_go_tree;
 pub(crate) mod java;
 pub(crate) mod js_ts;
 mod kotlin;
@@ -440,9 +441,140 @@ impl NavigationLookupOutcome {
 #[derive(Debug, Clone)]
 pub struct CallTargetLookupOutcome {
     pub outcome: DefinitionLookupOutcome,
+    /// Structured classification of how the resolved callable supplies its
+    /// receiver, retained from the same language-resolution pass that produced
+    /// `outcome`. This shapes model applicability without identifying a method
+    /// target.
+    pub(crate) call_application: CallApplicationKind,
+    /// Exact declaration-side evidence about whether the selected callable can
+    /// dispatch beyond itself. `None` means the resolver did not prove it.
+    pub(crate) dispatch_extensibility: Option<DispatchExtensibility>,
+    /// Canonical external callee identity carried from the exact declaration
+    /// proof that selected it, together with every call-shape fact needed to
+    /// bind a model. This is stronger than recovering a name or arity from
+    /// `outcome` and the structural call independently: presence proves one
+    /// modeled callable rather than merely a spelling that crossed the
+    /// workspace boundary.
+    pub(crate) exact_external_call: Option<ExactExternalCallProof>,
     pub structure_unavailable: bool,
     pub unproven_link_unit: bool,
     pub truncated: bool,
+}
+
+/// One resolver-owned proof for an exact external callable and its applicable
+/// call shape.
+///
+/// The canonical callee, receiver application, dispatch extensibility, and
+/// effective argument count must travel together. In particular, a Go call
+/// with one written argument can supply several effective arguments when that
+/// argument is an exact modeled multi-result call, while a JS/TS direct named
+/// import has no receiver even though its package identity is not written at
+/// the call site. Consumers must not rebuild these facts from separate display,
+/// structural, or semantic representations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExactExternalCallProof {
+    canonical_callee: Box<str>,
+    call_application: CallApplicationKind,
+    dispatch_extensibility: Option<DispatchExtensibility>,
+    parameter_count: u32,
+}
+
+impl ExactExternalCallProof {
+    pub(crate) fn go_package_function(
+        canonical_callee: impl Into<Box<str>>,
+        parameter_count: u32,
+    ) -> Self {
+        Self {
+            canonical_callee: canonical_callee.into(),
+            call_application: CallApplicationKind::PackageFunction,
+            dispatch_extensibility: None,
+            parameter_count,
+        }
+    }
+
+    pub(crate) fn go_concrete_receiver(
+        canonical_callee: impl Into<Box<str>>,
+        parameter_count: u32,
+    ) -> Self {
+        Self {
+            canonical_callee: canonical_callee.into(),
+            call_application: CallApplicationKind::BoundReceiver,
+            dispatch_extensibility: Some(DispatchExtensibility::Closed),
+            parameter_count,
+        }
+    }
+
+    pub(crate) fn js_ts_direct_named_import(
+        module_specifier: &str,
+        imported_name: &str,
+        parameter_count: u32,
+    ) -> Self {
+        assert!(
+            !module_specifier.is_empty(),
+            "an imported module must be named"
+        );
+        assert!(
+            !imported_name.is_empty(),
+            "an imported callable must be named"
+        );
+        Self {
+            canonical_callee: format!("{module_specifier}.{imported_name}").into_boxed_str(),
+            call_application: CallApplicationKind::PackageFunction,
+            dispatch_extensibility: None,
+            parameter_count,
+        }
+    }
+
+    pub(crate) fn canonical_callee(&self) -> &str {
+        &self.canonical_callee
+    }
+
+    pub(crate) const fn call_application(&self) -> CallApplicationKind {
+        self.call_application
+    }
+
+    pub(crate) const fn dispatch_extensibility(&self) -> Option<DispatchExtensibility> {
+        self.dispatch_extensibility
+    }
+
+    pub(crate) const fn parameter_count(&self) -> u32 {
+        self.parameter_count
+    }
+
+    pub(crate) const fn has_receiver(&self) -> bool {
+        matches!(self.call_application, CallApplicationKind::BoundReceiver)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum CallApplicationKind {
+    /// `p.F(args...)`: no receiver participates in the callable contract.
+    PackageFunction,
+    /// `v.M(args...)`: the selected method is bound to the written value.
+    BoundReceiver,
+    /// A receiver selection is present, but resolution did not distinguish a
+    /// bound value method from a type method expression.
+    ReceiverBindingUnknown,
+    #[default]
+    Unknown,
+}
+
+struct DefinitionResolution {
+    outcome: DefinitionLookupOutcome,
+    call_application: CallApplicationKind,
+    dispatch_extensibility: Option<DispatchExtensibility>,
+    exact_external_call: Option<ExactExternalCallProof>,
+}
+
+impl From<DefinitionLookupOutcome> for DefinitionResolution {
+    fn from(outcome: DefinitionLookupOutcome) -> Self {
+        Self {
+            outcome,
+            call_application: CallApplicationKind::Unknown,
+            dispatch_extensibility: None,
+            exact_external_call: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -498,6 +630,16 @@ pub const DECLARATION_OR_IMPORT_SITE_DIAGNOSTIC_KIND: &str = "declaration_or_imp
 /// in the file is not evidence that the label can bind to it.
 pub const GO_LITERAL_OWNER_UNRESOLVED_DIAGNOSTIC_KIND: &str = "go_literal_owner_unresolved";
 
+/// Positive Go declaration facts prove that the selected package name is not
+/// one public function applicable to this ordinary argument list.
+pub const GO_MODELED_PACKAGE_CALL_NOT_APPLICABLE_DIAGNOSTIC_KIND: &str =
+    "go_modeled_package_call_not_applicable";
+
+/// A Go declaration model mentions the selected package name, but conflicts
+/// or missing call-shape facts prevent a positive or negative callable proof.
+pub const GO_MODELED_PACKAGE_CALL_UNPROVEN_DIAGNOSTIC_KIND: &str =
+    "go_modeled_package_call_unproven";
+
 /// A `macro_rules!` matcher was found but no arm consumed the invocation.
 pub const MACRO_MATCHER_FAILED_DIAGNOSTIC_KIND: &str = "macro_matcher_failed";
 
@@ -529,6 +671,7 @@ pub fn is_adjudicated_answer_diagnostic_kind(kind: &str) -> bool {
         LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND
             | PREDECLARED_SYMBOL_REFERENCE_DIAGNOSTIC_KIND
             | DECLARATION_OR_IMPORT_SITE_DIAGNOSTIC_KIND
+            | GO_MODELED_PACKAGE_CALL_NOT_APPLICABLE_DIAGNOSTIC_KIND
             | MACRO_MATCHER_FAILED_DIAGNOSTIC_KIND
             | MACRO_MATCHER_DISAGREEMENT_DIAGNOSTIC_KIND
             | MACRO_FRAGMENT_NO_NAMESPACE_DIAGNOSTIC_KIND
@@ -826,6 +969,169 @@ pub fn resolve_call_target_batch_with_source(
     source: Arc<str>,
     cancellation: Option<&CancellationToken>,
 ) -> Vec<CallTargetLookupOutcome> {
+    let _scope = profiling::scope("get_definition::resolve_call_target_batch");
+    if profiling::enabled() {
+        profiling::note(format!("request_count={}", requests.len()));
+    }
+    if language_for_file(&file) == Language::Go {
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let mut context = DefinitionBatchContext::new(analyzer, scope.token(), requests.len() > 1);
+        context.sources.insert(file.clone(), Ok(source));
+        debug_assert!(
+            requests.iter().all(|request| request.file == file),
+            "one call-target source batch must contain requests for that source file"
+        );
+
+        // Namespace discovery is one all-or-nothing bounded answer for this
+        // source file. Never let a stopped session publish partial aliases or
+        // dot imports into the batch cache. Exact target lookup then receives
+        // a fresh session per request so one expensive call cannot make later
+        // answers depend on request order.
+        if let Some(go) = resolve_analyzer::<GoAnalyzer>(analyzer)
+            && let Ok(source) = context.source(&file)
+            && let Some(tree) = context.tree(&file, Language::Go, &source)
+        {
+            let namespace_session =
+                ResolutionSession::bounded(ReceiverAnalysisBudget::default(), cancellation);
+            let definitions = go::AnalyzerGoDefinitionProvider::bounded(
+                go,
+                &namespace_session,
+                analyzer.semantic_model_overlay(),
+            );
+            let namespace = DefinitionBatchContext::build_go_context(
+                &definitions,
+                context.token,
+                go,
+                &file,
+                &source,
+                &tree,
+            );
+            match namespace_session.finish(namespace) {
+                BoundedResolution::Complete { value, .. } => {
+                    context.go_contexts.insert(file.clone(), value);
+                }
+                BoundedResolution::Exceeded { limit, .. } => {
+                    return requests
+                        .into_iter()
+                        .map(|_| CallTargetLookupOutcome {
+                            outcome: no_definition(
+                                "resolution_budget_exceeded",
+                                format!(
+                                    "Go call-target namespace resolution exceeded its {} budget",
+                                    limit.as_str()
+                                ),
+                            ),
+                            call_application: CallApplicationKind::Unknown,
+                            dispatch_extensibility: None,
+                            exact_external_call: None,
+                            structure_unavailable: false,
+                            unproven_link_unit: false,
+                            truncated: true,
+                        })
+                        .collect();
+                }
+                BoundedResolution::Cancelled { .. } => {
+                    return requests
+                        .into_iter()
+                        .map(|_| CallTargetLookupOutcome {
+                            outcome: no_definition(
+                                "cancelled",
+                                "Go call-target namespace resolution was cancelled",
+                            ),
+                            call_application: CallApplicationKind::Unknown,
+                            dispatch_extensibility: None,
+                            exact_external_call: None,
+                            structure_unavailable: false,
+                            unproven_link_unit: false,
+                            truncated: false,
+                        })
+                        .collect();
+                }
+            }
+        }
+        return requests
+            .into_iter()
+            .map(|request| {
+                let session =
+                    ResolutionSession::bounded(ReceiverAnalysisBudget::default(), cancellation);
+                let resolution = resolve_one_with_evidence(
+                    analyzer,
+                    token,
+                    &mut context,
+                    request,
+                    None,
+                    cancellation,
+                    true,
+                    Some(&session),
+                );
+                let (resolution, truncated) = match session.finish(resolution) {
+                    BoundedResolution::Complete { value, .. } => (value, false),
+                    BoundedResolution::Exceeded { limit, .. } => (
+                        no_definition(
+                            "resolution_budget_exceeded",
+                            format!(
+                                "Go call-target resolution exceeded its {} budget",
+                                limit.as_str()
+                            ),
+                        )
+                        .into(),
+                        true,
+                    ),
+                    BoundedResolution::Cancelled { .. } => (
+                        no_definition("cancelled", "Go call-target resolution was cancelled")
+                            .into(),
+                        false,
+                    ),
+                };
+                CallTargetLookupOutcome {
+                    outcome: resolution.outcome,
+                    call_application: resolution.call_application,
+                    dispatch_extensibility: resolution.dispatch_extensibility,
+                    exact_external_call: resolution.exact_external_call,
+                    structure_unavailable: false,
+                    unproven_link_unit: false,
+                    truncated,
+                }
+            })
+            .collect();
+    }
+    if matches!(
+        language_for_file(&file),
+        Language::JavaScript | Language::TypeScript
+    ) {
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let mut context = DefinitionBatchContext::new(analyzer, scope.token(), requests.len() > 1);
+        context.sources.insert(file.clone(), Ok(source));
+        debug_assert!(
+            requests.iter().all(|request| request.file == file),
+            "one call-target source batch must contain requests for that source file"
+        );
+        return requests
+            .into_iter()
+            .take_while(|_| !cancellation.is_some_and(CancellationToken::is_cancelled))
+            .map(|request| {
+                let resolution = resolve_one_with_evidence(
+                    analyzer,
+                    token,
+                    &mut context,
+                    request,
+                    None,
+                    cancellation,
+                    true,
+                    None,
+                );
+                CallTargetLookupOutcome {
+                    outcome: resolution.outcome,
+                    call_application: resolution.call_application,
+                    dispatch_extensibility: resolution.dispatch_extensibility,
+                    exact_external_call: resolution.exact_external_call,
+                    structure_unavailable: false,
+                    unproven_link_unit: false,
+                    truncated: false,
+                }
+            })
+            .collect();
+    }
     if language_for_file(&file) != Language::Cpp {
         let outcomes = match cancellation {
             Some(cancellation) => resolve_definition_batch_with_source_and_cancellation(
@@ -841,6 +1147,9 @@ pub fn resolve_call_target_batch_with_source(
             .into_iter()
             .map(|outcome| CallTargetLookupOutcome {
                 outcome,
+                call_application: CallApplicationKind::Unknown,
+                dispatch_extensibility: None,
+                exact_external_call: None,
                 structure_unavailable: false,
                 unproven_link_unit: false,
                 truncated: false,
@@ -862,6 +1171,9 @@ pub fn resolve_call_target_batch_with_source(
     )
     .into_iter()
     .map(|outcome| CallTargetLookupOutcome {
+        call_application: CallApplicationKind::Unknown,
+        dispatch_extensibility: None,
+        exact_external_call: None,
         structure_unavailable: outcome.structure_unavailable,
         unproven_link_unit: outcome.unproven_link_unit,
         truncated: outcome.truncated,
@@ -1065,25 +1377,40 @@ impl<'a> DefinitionBatchContext<'a> {
             .clone()
     }
 
-    fn go_context(
+    fn go_context_with_provider(
         &mut self,
+        definitions: &dyn go::GoDefinitionProvider,
         token: QueryToken<'_>,
         go: &GoAnalyzer,
         file: &ProjectFile,
         source: &str,
         tree: &Tree,
     ) -> &GoDefinitionContext {
-        self.go_contexts.entry(file.clone()).or_insert_with(|| {
-            let definitions =
-                go::AnalyzerGoDefinitionProvider::new(go, self.analyzer.semantic_model_overlay());
-            let (aliases, dot_imports) =
-                go::go_definition_import_namespaces(&definitions, token, go, file);
-            GoDefinitionContext {
-                package: go.canonical_package_name_from_tree(file, source, tree.root_node()),
-                aliases,
-                dot_imports,
-            }
-        })
+        if definitions.session().is_some() {
+            return self.go_contexts.get(file).expect(
+                "bounded Go namespace context must complete before exact request resolution",
+            );
+        }
+        self.go_contexts
+            .entry(file.clone())
+            .or_insert_with(|| Self::build_go_context(definitions, token, go, file, source, tree))
+    }
+
+    fn build_go_context(
+        definitions: &dyn go::GoDefinitionProvider,
+        token: QueryToken<'_>,
+        go: &GoAnalyzer,
+        file: &ProjectFile,
+        source: &str,
+        tree: &Tree,
+    ) -> GoDefinitionContext {
+        let (aliases, dot_imports) =
+            go::go_definition_import_namespaces(definitions, token, go, file);
+        GoDefinitionContext {
+            package: go.canonical_package_name_from_tree(file, source, tree.root_node()),
+            aliases,
+            dot_imports,
+        }
     }
 
     fn scala_context(
@@ -1289,6 +1616,30 @@ fn resolve_one<'a>(
     cancellation: Option<&CancellationToken>,
     allow_rust_field_receiver_lexical: bool,
 ) -> DefinitionLookupOutcome {
+    resolve_one_with_evidence(
+        analyzer,
+        token,
+        context,
+        request,
+        operation,
+        cancellation,
+        allow_rust_field_receiver_lexical,
+        None,
+    )
+    .outcome
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_one_with_evidence<'a>(
+    analyzer: &'a dyn IAnalyzer,
+    token: QueryToken<'_>,
+    context: &mut DefinitionBatchContext<'a>,
+    request: DefinitionLookupRequest,
+    operation: Option<NavigationOperation>,
+    cancellation: Option<&CancellationToken>,
+    allow_rust_field_receiver_lexical: bool,
+    go_session: Option<&ResolutionSession>,
+) -> DefinitionResolution {
     let _scope = profiling::scope("get_definition::resolve_one");
     let language = language_for_file(&request.file);
     context.bounded_support.set_language(language);
@@ -1300,7 +1651,8 @@ fn resolve_one<'a>(
             DefinitionLookupStatus::UnsupportedLanguage,
             "unsupported_language",
             format!("{language:?} get_definition is not implemented yet"),
-        );
+        )
+        .into();
     }
 
     let source = {
@@ -1312,7 +1664,8 @@ fn resolve_one<'a>(
                     DefinitionLookupStatus::NotFound,
                     "file_read_failed",
                     message,
-                );
+                )
+                .into();
             }
         }
     };
@@ -1337,7 +1690,8 @@ fn resolve_one<'a>(
                     DefinitionLookupStatus::InvalidLocation,
                     "invalid_location",
                     message,
-                );
+                )
+                .into();
             }
         }
     };
@@ -1378,12 +1732,15 @@ fn resolve_one<'a>(
                 LexicalBindingResolution::Parameter(definition)
                 | LexicalBindingResolution::OtherLocal(definition),
             ) => {
-                return finish_lookup_outcome(lexical_definition_outcome(definition), site);
+                return finish_lookup_outcome(lexical_definition_outcome(definition), site).into();
             }
             None => {}
         }
     }
     let _dispatch_scope = profiling::scope("get_definition::language_dispatch");
+    let mut call_application = CallApplicationKind::Unknown;
+    let mut dispatch_extensibility = None;
+    let mut exact_external_call = None;
     let resolved = match language {
         Language::Rust => {
             if let Some(cancellation) = cancellation {
@@ -1432,47 +1789,86 @@ fn resolve_one<'a>(
                 )
             }
         }
-        Language::JavaScript | Language::TypeScript => js_ts::resolve_js_ts(
-            analyzer,
-            context,
-            &request.file,
-            language,
-            &source,
-            tree.as_ref(),
-            &site,
-        ),
+        Language::JavaScript | Language::TypeScript => {
+            let mut outcome = js_ts::resolve_js_ts(
+                analyzer,
+                context,
+                &request.file,
+                language,
+                &source,
+                tree.as_ref(),
+                &site,
+            );
+            if outcome.status == DefinitionLookupStatus::UnresolvableImportBoundary
+                && let Some(proof) = tree.as_ref().and_then(|tree| {
+                    let imports = &context
+                        .js_ts_contexts
+                        .get(&(request.file.clone(), language))?
+                        .imports;
+                    js_ts::exact_direct_named_import_call(source.as_ref(), tree, &site, imports)
+                })
+            {
+                let mut reference = outcome.reference.take().unwrap_or_else(|| site.clone());
+                reference.text = proof.canonical_callee().to_owned();
+                outcome.reference = Some(reference);
+                call_application = proof.call_application();
+                dispatch_extensibility = proof.dispatch_extensibility();
+                exact_external_call = Some(proof);
+            }
+            outcome
+        }
         Language::Go => {
-            let go = resolve_analyzer::<GoAnalyzer>(analyzer);
-            let selector = tree
-                .as_ref()
-                .and_then(|tree| go_selector_descriptor(tree.root_node(), &site));
-            let resolution = go.and_then(|go| {
-                let tree = tree.as_ref()?;
-                let batch = context.go_context(token, go, &request.file, &source, tree);
-                Some(resolve_go_reference_with_namespaces(
-                    tree.root_node(),
-                    &source,
-                    &batch.package,
-                    &batch.aliases,
-                    &batch.dot_imports,
-                    &site,
-                    selector.as_ref(),
-                ))
-            });
-            if let Some(go_analyzer) = go {
-                go::resolve_go(
-                    analyzer,
-                    &go::AnalyzerGoDefinitionProvider::new(
+            if let Some(go_analyzer) = resolve_analyzer::<GoAnalyzer>(analyzer) {
+                let definitions = match go_session {
+                    Some(session) => go::AnalyzerGoDefinitionProvider::bounded(
+                        go_analyzer,
+                        session,
+                        analyzer.semantic_model_overlay(),
+                    ),
+                    None => go::AnalyzerGoDefinitionProvider::new(
                         go_analyzer,
                         analyzer.semantic_model_overlay(),
                     ),
+                };
+                let selector = tree.as_ref().and_then(|tree| match go_session {
+                    Some(_) => go_selector_descriptor_with_scope(tree.root_node(), &site, || {
+                        definitions.scope_step()
+                    }),
+                    None => go_selector_descriptor(tree.root_node(), &site),
+                });
+                let namespace_resolution = tree.as_ref().map(|tree| {
+                    let batch = context.go_context_with_provider(
+                        &definitions,
+                        token,
+                        go_analyzer,
+                        &request.file,
+                        &source,
+                        tree,
+                    );
+                    resolve_go_reference_with_namespaces(
+                        tree.root_node(),
+                        &source,
+                        &batch.package,
+                        &batch.aliases,
+                        &batch.dot_imports,
+                        &site,
+                        selector.as_ref(),
+                    )
+                });
+                let resolution = go::resolve_go(
+                    analyzer,
+                    &definitions,
                     &request.file,
                     &source,
                     tree.as_ref(),
                     &site,
                     selector.as_ref(),
-                    resolution,
-                )
+                    namespace_resolution,
+                );
+                call_application = resolution.call_application;
+                dispatch_extensibility = resolution.dispatch_extensibility;
+                exact_external_call = resolution.exact_external_call;
+                resolution.outcome
             } else {
                 no_definition("go_analyzer_unavailable", "Go analyzer is unavailable")
             }
@@ -1569,7 +1965,12 @@ fn resolve_one<'a>(
         resolved
     };
 
-    finish_lookup_outcome(resolved, site)
+    DefinitionResolution {
+        outcome: finish_lookup_outcome(resolved, site),
+        call_application,
+        dispatch_extensibility,
+        exact_external_call,
+    }
 }
 
 fn finish_lookup_outcome(
@@ -2265,18 +2666,22 @@ mod tests {
         let tree = parse_tree_for_language(&file, Language::Go, source).expect("parse Go source");
         let scope = AnalyzerQueryScope::new(analyzer);
         let mut context = DefinitionBatchContext::new(analyzer, scope.token(), true);
+        let definitions =
+            go::AnalyzerGoDefinitionProvider::new(go, analyzer.semantic_model_overlay());
 
         {
             let scope = AnalyzerQueryScope::new(analyzer);
             let token = scope.token();
-            let first = context.go_context(token, go, &file, source, &tree);
+            let first =
+                context.go_context_with_provider(&definitions, token, go, &file, source, &tree);
             assert_eq!(first.package, "consumer");
             assert_eq!(first.aliases.len(), 1);
         }
         let second_aliases = {
             let scope = AnalyzerQueryScope::new(analyzer);
             let token = scope.token();
-            let second = context.go_context(token, go, &file, source, &tree);
+            let second =
+                context.go_context_with_provider(&definitions, token, go, &file, source, &tree);
             assert_eq!(second.package, "consumer");
             second.aliases.len()
         };

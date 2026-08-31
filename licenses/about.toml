@@ -9,6 +9,7 @@ accepted = [
     "ISC",
     "BSL-1.0",
     "CC0-1.0",
+    "CDLA-Permissive-2.0",
 ]
 
 # Union of the targets used by the GitHub binary and Python-wheel release
@@ -16,7 +17,6 @@ accepted = [
 # notice report that can accompany every current prebuilt artifact.
 targets = [
     "x86_64-unknown-linux-gnu",
-    "x86_64-unknown-linux-musl",
     "aarch64-unknown-linux-gnu",
     "aarch64-linux-android",
     "x86_64-apple-darwin",

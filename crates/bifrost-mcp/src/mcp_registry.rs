@@ -2,7 +2,15 @@ use crate::mcp_common::{McpRenderOptions, McpServerSpec, build_server_spec_with_
 use serde_json::Value;
 use std::collections::HashSet;
 
-const SEARCHTOOLS_ORDER: &[&str] = &["symbol", "workspace", "extended", "text", "slopcop", "cli"];
+const SEARCHTOOLS_ORDER: &[&str] = &[
+    "symbol",
+    "workspace",
+    "diff",
+    "extended",
+    "text",
+    "slopcop",
+    "cli",
+];
 
 const DISCOVERY_ROUTING_INSTRUCTIONS: &str = "Source-code analysis and repository navigation. Search this server for its advertised language-aware and repository-aware tools. Depending on the selected mode, tools cover symbols, structure, policies, quality, text, or workspace control. Use them when text search cannot reliably answer a structural or cross-file question. Check result completeness before you claim all results or no results.";
 
@@ -61,11 +69,11 @@ fn expand_toolset(
     resolution: &mut ServerSpecResolution,
 ) -> Result<(), String> {
     match name {
-        "symbol" | "workspace" | "text" | "extended" | "slopcop" | "cli" => {
+        "symbol" | "workspace" | "diff" | "text" | "extended" | "slopcop" | "cli" => {
             append_named_toolset(name, render_options, resolution)
         }
         "core" => {
-            for alias in ["symbol", "workspace"] {
+            for alias in ["symbol", "workspace", "diff"] {
                 expand_toolset(alias, render_options, resolution)?;
             }
             Ok(())
@@ -111,6 +119,9 @@ fn discovery_instructions(effective_toolsets: &HashSet<String>) -> String {
                 " Symbol tools search declarations and summaries, read symbol source, find usages and definitions, inspect types and usage graphs, and rename symbols."
             }
             "workspace" => " Workspace tools refresh indexed state and manage workspace selection.",
+            "diff" => {
+                " Diff tools explain semantic patch effects, suggest test scopes, compare cyclomatic complexity, and find changed functions without a complete structured call path from tests."
+            }
             "extended" => {
                 " Structural tools run CodeQuery and RQL, inspect symbol locations and ancestors, rank related files, inspect Git history, and evaluate repository policies."
             }
@@ -132,6 +143,7 @@ fn descriptors_for_toolset(name: &str, render_options: McpRenderOptions) -> Vec<
     match name {
         "symbol" => crate::mcp_core::symbol_tool_descriptors(render_options.render_line_numbers),
         "workspace" => crate::mcp_core::workspace_tool_descriptors(),
+        "diff" => crate::mcp_diff::diff_tool_descriptors(),
         "text" => crate::mcp_text::text_tool_descriptors(),
         "extended" => crate::mcp_extended::extended_tool_descriptors(),
         "slopcop" => crate::mcp_slopcop::slopcop_tool_descriptors(),
@@ -195,6 +207,19 @@ mod tests {
             .collect()
     }
 
+    fn diff_tool_names() -> Vec<String> {
+        [
+            "analyze_diff",
+            "blast_radius",
+            "cyclomatic_complexity",
+            "missing_tests",
+            "score_diff",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    }
+
     #[test]
     fn composition_deduplicates_and_preserves_first_occurrence() {
         let mut expected: Vec<String> = [
@@ -207,7 +232,22 @@ mod tests {
         .collect();
         expected.extend(symbol_tool_names());
         expected.extend(workspace_tool_names());
+        expected.extend(diff_tool_names());
         assert_eq!(tool_names("text|core|text"), expected);
+    }
+
+    #[test]
+    fn diff_and_core_advertise_the_endpoint_tools_once() {
+        assert_eq!(tool_names("diff"), diff_tool_names());
+
+        let mut expected = symbol_tool_names();
+        expected.extend(workspace_tool_names());
+        expected.extend(diff_tool_names());
+        assert_eq!(tool_names("core"), expected);
+
+        let slopcop = tool_names("slopcop");
+        assert!(!slopcop.contains(&"analyze_diff".to_string()));
+        assert!(!slopcop.contains(&"blast_radius".to_string()));
     }
 
     #[test]
@@ -245,8 +285,10 @@ mod tests {
         let installed = resolve_server_spec("core").expect("installed server spec");
         assert!(installed.instructions.contains("Symbol tools"));
         assert!(installed.instructions.contains("Workspace tools"));
+        assert!(installed.instructions.contains("Diff tools"));
         assert_eq!(installed.instructions.matches("Symbol tools").count(), 1);
         assert_eq!(installed.instructions.matches("Workspace tools").count(), 1);
+        assert_eq!(installed.instructions.matches("Diff tools").count(), 1);
     }
 
     #[test]

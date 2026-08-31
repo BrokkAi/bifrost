@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "pack_id": "bifrost.go.stdlib.errors",
+  "version": "1.0.0",
+  "producer": {
+    "name": "bifrost",
+    "version": "0.10.5"
+  },
+  "language": "go",
+  "ecosystem": "go",
+  "compatibility": {
+    "bifrost": ">=0.10.5, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "https://pkg.go.dev/errors",
+    "revision": "go1.27.0"
+  },
+  "license": "BSD-3-Clause",
+  "completeness": "complete",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "go.stdlib.errors.conditional-result-refinements",
+      "activation": [{}],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "errors.is",
+            "target": {
+              "path": "src/errors/wrap.go",
+              "symbol": "errors.Is(err, target error)",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "normal_result_count": 1,
+            "transfers": [],
+            "conditional_result_refinements": [
+              {
+                "result_ordinal": 0,
+                "outcome": false,
+                "parameter_ordinal": 0,
+                "predicate": "null",
+                "proof_effect": "does_not_establish"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

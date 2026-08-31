@@ -4149,6 +4149,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 callee,
                 receiver,
                 arguments: argument_values.into_boxed_slice(),
+                normal_results: Box::new([]),
                 result: Some(result),
                 thrown: Some(thrown),
                 declared_targets: resolution.clone(),
@@ -5172,6 +5173,21 @@ mod tests {
                 value.len()
             )
         })
+    }
+
+    #[test]
+    fn python_attribute_gaps_do_not_claim_non_rejoining_provenance() {
+        let parts = lower_fixture_named("def read(value):\n    return value.field\n", Some("read"));
+        let gap = parts
+            .gaps
+            .iter()
+            .find(|gap| {
+                gap.capability == SemanticCapability::ExceptionalControlFlow
+                    && gap.detail.as_ref()
+                        == "attribute lookup, descriptor execution, and missing-attribute failures are not lowered"
+            })
+            .expect("the Python attribute publishes its implicit-exception gap");
+        assert_eq!(gap.discharge, SemanticGapDischarge::None);
     }
 
     fn value_for_node(

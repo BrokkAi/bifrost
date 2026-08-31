@@ -5,8 +5,8 @@ use crate::analyzer::usages::js_ts_graph::{
     browser_global_property_shape, unbound_browser_global_property,
 };
 use brokk_bifrost_js_ts::imports::{
-    require_call_module_specifier, resolve_js_ts_direct_import_candidates,
-    resolve_js_ts_module_binding_candidates,
+    npm_package_of_module_specifier, require_call_module_specifier,
+    resolve_js_ts_direct_import_candidates, resolve_js_ts_module_binding_candidates,
 };
 use brokk_bifrost_js_ts::providers::JsTsSource;
 use brokk_bifrost_js_ts::syntax::parse_js_ts_tree;
@@ -25,7 +25,7 @@ use brokk_bifrost_js_ts::syntax::{
 use brokk_bifrost_js_ts::ts_owners::{
     TsReceiverResolution, jsts_constructor_owner_candidates, jsts_enclosing_function_scope,
     jsts_identifier_candidates, jsts_member_candidates, node_text_matches,
-    ts_call_expression_callees, ts_direct_object_literal_value,
+    ts_binding_is_assigned_before, ts_call_expression_callees, ts_direct_object_literal_value,
     ts_expand_call_return_property_owners, ts_nodes_for_code_unit, ts_parameter_name_node,
     ts_receiver_owner_candidates_at_byte, ts_resolve_type_node_to_property_owner_outcome,
     ts_resolve_type_text_to_property_owners, ts_unwrap_expression,
@@ -313,6 +313,88 @@ fn prefer_js_ts_alias_representatives(
 fn js_ts_alias_preference(unit: &CodeUnit) -> (usize, String) {
     let fq_name = unit.fq_name();
     (fq_name.matches('.').count(), fq_name)
+}
+
+/// Exact external callable selected by one direct static named import.
+///
+/// Every admitted fact comes from the tree-sitter import binder, lexical
+/// binding index, and call-expression fields. The local callee spelling is not
+/// an identity: the returned proof names the import's module specifier and
+/// imported symbol, and only when the import is the one unshadowed,
+/// unreassigned program binding at this call site.
+pub(super) fn exact_direct_named_import_call(
+    source: &str,
+    tree: &Tree,
+    site: &ResolvedReferenceSite,
+    imports: &JsTsImportBinder,
+) -> Option<ExactExternalCallProof> {
+    let root = tree.root_node();
+    let callee = smallest_named_node_covering(root, site.focus_start_byte, site.focus_end_byte)?;
+    if callee.kind() != "identifier" {
+        return None;
+    }
+    let call = callee.parent()?;
+    if call.kind() != "call_expression"
+        || call
+            .child_by_field_name("function")
+            .is_none_or(|function| function.id() != callee.id())
+    {
+        return None;
+    }
+
+    let local_name = source.get(callee.byte_range())?;
+    if imports.has_competing_static_imports(local_name) || imports.was_truncated(local_name) {
+        return None;
+    }
+    let mut bindings = imports.direct_bindings_for(local_name);
+    let binding = bindings.next()?;
+    if bindings.next().is_some() || binding.kind != ImportKind::Named {
+        return None;
+    }
+    let imported_name = binding.imported_name.as_deref()?;
+    npm_package_of_module_specifier(&binding.module_specifier)?;
+
+    let lexical_bindings = JsTsLexicalBindingIndex::build(root, source);
+    if !lexical_bindings.is_program_binding_at(local_name, callee.start_byte(), root)
+        || lexical_bindings.is_program_binding_reassigned(local_name, root)
+    {
+        return None;
+    }
+    let binding_ranges =
+        lexical_bindings.binding_identifier_ranges_at(local_name, callee.start_byte());
+    if binding_ranges.len() != 1 || !jsts_binding_range_belongs_to_import(root, binding_ranges[0]) {
+        return None;
+    }
+
+    let arguments = call.child_by_field_name("arguments")?;
+    let parameter_count = {
+        let mut cursor = arguments.walk();
+        u32::try_from(arguments.named_children(&mut cursor).count()).ok()?
+    };
+    Some(ExactExternalCallProof::js_ts_direct_named_import(
+        &binding.module_specifier,
+        imported_name,
+        parameter_count,
+    ))
+}
+
+fn jsts_binding_range_belongs_to_import(root: Node<'_>, range: Range) -> bool {
+    let Some(mut node) = smallest_named_node_covering(root, range.start_byte, range.end_byte)
+    else {
+        return false;
+    };
+    loop {
+        if node.kind() == "import_statement" {
+            return true;
+        }
+        if node.id() == root.id() {
+            return false;
+        }
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        node = parent;
+    }
 }
 
 pub(super) fn resolve_js_ts(
@@ -748,6 +830,27 @@ pub(super) fn resolve_js_ts(
                     format!("`{reference}` did not resolve to a precise JS/TS receiver"),
                 );
             }
+            ReceiverAnalysisOutcome::Unknown
+                if language == Language::TypeScript
+                    && jsts_enclosing_function_scope(tree.root_node(), site.focus_start_byte)
+                        .is_some_and(|scope| {
+                            ts_binding_is_assigned_before(
+                                scope,
+                                source,
+                                qualifier,
+                                site.focus_start_byte,
+                            )
+                        }) =>
+            {
+                // The shared receiver provider observed an unknown value in
+                // this binding's write history. Do not let owner-candidate
+                // fallbacks erase that typed uncertainty and resurrect the
+                // receiver's annotation as an exact nominal owner (#2495).
+                return no_definition(
+                    "receiver_analysis_not_precise",
+                    format!("`{reference}` did not resolve to a precise JS/TS receiver"),
+                );
+            }
             ReceiverAnalysisOutcome::Precise(_) | ReceiverAnalysisOutcome::Unknown => {}
         }
         let new_receiver_candidates = jsts_local_new_receiver_owner_candidates(
@@ -849,6 +952,24 @@ pub(super) fn resolve_js_ts(
             );
             if !exact_global.is_empty() {
                 return js_ts_candidates_outcome(analyzer, exact_global);
+            }
+            if let Some(target) = analyzer.semantic_model_overlay().and_then(|model| {
+                model
+                    .typescript_global_member_target(qualifier, name)
+                    .map(|symbol| symbol.id.clone())
+            }) {
+                if !support.file_identifier(file, qualifier).is_empty() {
+                    return no_definition(
+                        "workspace_internal",
+                        format!("`{reference}` is declared in this workspace"),
+                    );
+                }
+                // gated upstream: the structured file-identifier check above
+                // proved that the receiver is not declared in this workspace.
+                trace::record_named_boundary_with_target(reference.to_owned(), target);
+                return boundary_unchecked(format!(
+                    "`{reference}` resolves to an active TypeScript declaration-model member"
+                ));
             }
         } else {
             let exact_project = jsts_exact_dotted_candidates(
@@ -3185,6 +3306,12 @@ fn ts_parameter_annotation_receiver_owners(
         if !node_text_matches(name, source, receiver) {
             continue;
         }
+        if ts_binding_is_assigned_before(function, source, receiver, site.focus_start_byte) {
+            // TypeScript annotations are structural. After a write, the
+            // annotation cannot establish the receiver's nominal owner; the
+            // general write-folding path must prove the new value instead.
+            continue;
+        }
         let Some(type_node) = parameter.child_by_field_name("type") else {
             continue;
         };
@@ -3280,7 +3407,8 @@ fn jsts_local_new_receiver_owner_candidates(
 /// walk is flow-insensitive, so it cannot say which write reaches the use, and
 /// the symbol stays unresolved rather than taking the last write seen (#2717,
 /// the TypeScript edition of the #2495 rule). A write with no resolvable
-/// owners keeps the pre-existing behavior of clearing the answer.
+/// owners is an unknown write and conflicts permanently: a later resolved
+/// owner cannot erase earlier uncertainty.
 enum LocalReceiverWrites {
     Unseen,
     Owners(Vec<CodeUnit>),
@@ -3289,6 +3417,10 @@ enum LocalReceiverWrites {
 
 impl LocalReceiverWrites {
     fn record(&mut self, owners: Vec<CodeUnit>) {
+        if owners.is_empty() {
+            *self = LocalReceiverWrites::Conflicted;
+            return;
+        }
         match self {
             LocalReceiverWrites::Conflicted => {}
             LocalReceiverWrites::Owners(previous)
@@ -3342,26 +3474,22 @@ fn jsts_collect_local_new_receiver_owner_candidates(
         if node.kind() == "variable_declarator"
             && let Some(name) = node.child_by_field_name("name")
             && node_text_matches(name, source, receiver)
+            && let Some(value) = node.child_by_field_name("value")
         {
-            let owners = node
-                .child_by_field_name("value")
-                .map(|value| {
-                    jsts_local_receiver_value_owner_candidates(
-                        analyzer,
-                        host,
-                        support,
-                        file,
-                        language,
-                        source,
-                        root,
-                        imports,
-                        aliases,
-                        value,
-                        before_byte,
-                        depth + 1,
-                    )
-                })
-                .unwrap_or_default();
+            let owners = jsts_local_receiver_value_owner_candidates(
+                analyzer,
+                host,
+                support,
+                file,
+                language,
+                source,
+                root,
+                imports,
+                aliases,
+                value,
+                before_byte,
+                depth + 1,
+            );
             state.record(owners);
         }
 

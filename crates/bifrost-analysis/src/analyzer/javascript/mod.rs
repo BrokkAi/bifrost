@@ -8,7 +8,6 @@ use crate::analyzer::js_ts::diagnostics::collect_javascript_semantic_diagnostics
 use crate::analyzer::js_ts::providers::{self, JsTsMemoSource};
 use crate::analyzer::js_ts::{
     contains_tests as js_ts_contains_tests, path_contains_tests as js_ts_path_contains_tests,
-    source_contains_tests as js_ts_source_contains_tests,
     synthesize_hydrated_module as synthesize_js_ts_hydrated_module_unit,
     synthesize_summary_module as synthesize_js_ts_summary_module_unit,
 };
@@ -68,11 +67,11 @@ impl LanguageAdapter for JavascriptAdapter {
         &self,
         state: &crate::analyzer::tree_sitter_analyzer::FileState,
     ) -> bool {
-        js_ts_source_contains_tests(&state.source)
+        state.contains_tests
     }
 
-    fn hydrate_contains_tests(&self, stored: bool, file: &ProjectFile, source: &str) -> bool {
-        stored || js_ts_path_contains_tests(file) || js_ts_source_contains_tests(source)
+    fn hydrate_contains_tests(&self, stored: bool, file: &ProjectFile, _source: &str) -> bool {
+        stored || js_ts_path_contains_tests(file)
     }
 
     fn synthesize_hydrated_units(
@@ -121,7 +120,7 @@ impl LanguageAdapter for JavascriptAdapter {
         _tree: &Tree,
         _parsed: &crate::analyzer::tree_sitter_analyzer::ParsedFile,
     ) -> bool {
-        js_ts_contains_tests(file, source)
+        js_ts_contains_tests(file, source, _tree)
     }
 
     fn parse_file(
@@ -298,6 +297,13 @@ impl JavascriptAnalyzer {
     }
 }
 impl ImportAnalysisProvider for JavascriptAnalyzer {
+    fn file_dependency_facts_for_files(
+        &self,
+        files: &[ProjectFile],
+    ) -> Option<crate::hash::HashMap<ProjectFile, crate::analyzer::FileDependencyFacts>> {
+        Some(self.inner.bulk_file_dependency_facts(files.iter().cloned()))
+    }
+
     fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();
@@ -802,5 +808,21 @@ impl crate::analyzer::AnalyzerTestHooks for JavascriptAnalyzer {
 
     fn workspace_path_scan_count_for_test(&self) -> usize {
         self.inner.test_hooks().workspace_path_scan_count_for_test()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hydration_uses_persisted_facts_and_path_conventions_only() {
+        let production = ProjectFile::new("/tmp/project", "src/runtime.js");
+        let test_file = ProjectFile::new("/tmp/project", "test/parallel/test-runtime.js");
+        let source = r#"describe("runtime", () => {});"#;
+
+        assert!(!JavascriptAdapter.hydrate_contains_tests(false, &production, source));
+        assert!(JavascriptAdapter.hydrate_contains_tests(true, &production, ""));
+        assert!(JavascriptAdapter.hydrate_contains_tests(false, &test_file, ""));
     }
 }

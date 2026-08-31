@@ -195,13 +195,6 @@ pub fn validate_row_selector_plan(
             |literal| matches!(literal, RowLiteral::ConstrainedEnum(value) if value == expected),
         )
     };
-    let integer = |field: &str, expected: u64| {
-        has_literal_predicate(
-            &predicates,
-            field,
-            |literal| matches!(literal, RowLiteral::Integer(value) if *value == expected),
-        )
-    };
     let boolean = |field: &str, expected: bool| {
         has_literal_predicate(
             &predicates,
@@ -221,7 +214,8 @@ pub fn validate_row_selector_plan(
     ) || has_literal_predicate(&predicates, "formal_index", |literal| {
         matches!(literal, RowLiteral::Integer(_))
     });
-    let requirements = [
+    let declared = lowered.declared_call_binding.as_ref() == Some(&lowered.output_binding);
+    let mut requirements = vec![
         ("model_id eq stable model identity", model),
         (
             "semantic_target_id is-not-null",
@@ -230,30 +224,6 @@ pub fn validate_row_selector_plan(
         (
             "signature_id is-not-null",
             has_not_null_predicate(&predicates, "signature_id"),
-        ),
-        (
-            "dispatch_outcome eq resolved",
-            constrained("dispatch_outcome", "resolved"),
-        ),
-        (
-            "dispatch_coverage eq exhaustive",
-            constrained("dispatch_coverage", "exhaustive"),
-        ),
-        (
-            "dispatch_proof eq proven",
-            constrained("dispatch_proof", "proven"),
-        ),
-        (
-            "dispatch_completeness eq complete",
-            constrained("dispatch_completeness", "complete"),
-        ),
-        (
-            "dispatch_target_count eq 1",
-            integer("dispatch_target_count", 1),
-        ),
-        (
-            "dispatch_targets_truncated eq false",
-            boolean("dispatch_targets_truncated", false),
         ),
         ("formal_name or formal_index exact selector", formal),
         ("mapping eq exact", constrained("mapping", "exact")),
@@ -267,6 +237,32 @@ pub fn validate_row_selector_plan(
             has_not_null_predicate(&predicates, "argument_id"),
         ),
     ];
+    if declared {
+        requirements.extend([
+            (
+                "pack_id is-not-null",
+                has_not_null_predicate(&predicates, "pack_id"),
+            ),
+            (
+                "model_record_id is-not-null",
+                has_not_null_predicate(&predicates, "model_record_id"),
+            ),
+            (
+                "model_proof is-not-null",
+                has_not_null_predicate(&predicates, "model_proof"),
+            ),
+            (
+                "model_completeness eq complete",
+                constrained("model_completeness", "complete"),
+            ),
+            (
+                "model_ambiguous eq false",
+                boolean("model_ambiguous", false),
+            ),
+        ]);
+    } else {
+        requirements.push(("selector_exact eq true", boolean("selector_exact", true)));
+    }
     let missing = requirements
         .into_iter()
         .filter_map(|(requirement, present)| (!present).then_some(requirement))
@@ -274,8 +270,9 @@ pub fn validate_row_selector_plan(
     if !missing.is_empty() {
         return Err(RelationalAssertionPlanError::InvalidRowSelectorOutput {
             detail: format!(
-                "`{}` lacks required exact call-binding predicates: {}",
+                "`{}` lacks required {} call-binding predicates: {}",
                 lowered.output_binding.as_str(),
+                if declared { "declared" } else { "exact" },
                 missing.join(", ")
             ),
         });

@@ -23,14 +23,21 @@
 use std::path::Path;
 use std::sync::Arc;
 
+#[cfg(test)]
+use std::cell::Cell;
+
 use brokk_bifrost_analysis::CancellationToken;
+use brokk_bifrost_analysis::analyzer::packs_document::load_workspace_packs_config_at;
 use brokk_bifrost_analysis::analyzer::{
-    AnalyzerConfig, FilesystemProject, Project, WorkspaceAnalyzer,
+    AnalyzerQueryScope, FilesystemProject, Project, WorkspaceAnalyzer,
 };
 
 use crate::budget::{PolicyBatchBudget, PolicyBudget};
 use crate::catalog::{CatalogRegistryLimits, TaintCatalogRegistry};
-use crate::coordinator::PolicyEvaluationInput;
+use crate::coordinator::{
+    PolicyEvaluationInput, activate_owned_policy_workspace, owned_policy_analyzer_config,
+    policy_budget_for_workspace, ready_policy_semantic_model_snapshot,
+};
 use crate::evaluator::{DefaultPolicyEvaluator, PolicyEvaluationContext, PolicyEvaluator};
 use crate::finding_identity::PolicyFindingId;
 use crate::registry::{PolicyRegistry, PolicyRegistryLimits};
@@ -42,6 +49,16 @@ use super::model::{ExplainError, ExplanationLimits, PolicyExplanation};
 use super::near_miss::{NearMissCandidates, PolicyNearMissRanking, rank_near_misses};
 use super::why::explain_finding;
 use super::why_not::{ExplanationCandidate, explain_candidate};
+
+#[cfg(test)]
+thread_local! {
+    static OWNED_WORKSPACE_BUILD_COUNT: Cell<u64> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn owned_workspace_build_count_for_test() -> u64 {
+    OWNED_WORKSPACE_BUILD_COUNT.with(Cell::get)
+}
 
 /// Which question a host is asking about one policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,8 +162,89 @@ fn with_one_policy<T>(
             root.display()
         ))
     })?;
+    check_explanation_cancellation(cancellation)?;
+    if policy_inputs.is_empty() {
+        return Err(ExplainError::AmbiguousPolicySelection { selected: 0 });
+    }
+    let owned = match workspace {
+        Some(_) => None,
+        None => {
+            #[cfg(test)]
+            OWNED_WORKSPACE_BUILD_COUNT.with(|count| count.set(count.get() + 1));
+            let project = FilesystemProject::new(&root).map_err(|error| {
+                unavailable(format!(
+                    "failed to construct the analyzer project {}: {error}",
+                    root.display()
+                ))
+            })?;
+            let project: Arc<dyn Project> = Arc::new(project);
+            // Persisted for the same reason the coordinator's fallback is: an
+            // explanation over a live root should read the cache the ordinary
+            // run already warmed rather than re-parse the workspace.
+            Some(
+                WorkspaceAnalyzer::build_persisted(project, owned_policy_analyzer_config())
+                    .map_err(|error| {
+                        unavailable(format!(
+                            "failed to build the analyzer workspace at {}: {error}",
+                            root.display()
+                        ))
+                    })?,
+            )
+        }
+    };
+    let workspace = workspace
+        .or(owned.as_ref())
+        .expect("either the caller supplied a workspace or one was built");
+    let uncancelled = CancellationToken::default();
+    let semantic_cancellation = cancellation.unwrap_or(&uncancelled);
+    let workspace_activation = match owned.as_ref() {
+        Some(owned_workspace) => {
+            match load_workspace_packs_config_at(&root) {
+                // Ordinary evaluation diagnoses a malformed document and then
+                // evaluates without any semantic publication. An explanation
+                // must still be able to recover a finding retained by that
+                // unreliable run.
+                Err(_) => None,
+                Ok(config) => {
+                    // Activation-construction failures have the same normal-run
+                    // recovery: diagnose there, and explain here under a pinned
+                    // absence rather than changing which findings are reachable.
+                    activate_owned_policy_workspace(
+                        &root,
+                        owned_workspace,
+                        config.as_ref(),
+                        semantic_cancellation,
+                    )
+                    .unwrap_or_default()
+                }
+            }
+        }
+        None => None,
+    };
+    check_explanation_cancellation(cancellation)?;
+    let active_semantic_model_snapshot = match owned.as_ref() {
+        Some(_) => ready_policy_semantic_model_snapshot(workspace_activation.as_ref()),
+        None => workspace.analyzer().active_semantic_model_snapshot(),
+    };
+    // Pin both a successful activation and a deliberate absence for the whole
+    // question. A host publication that races an explanation must not change
+    // the model set between its prefix executions or finding re-evaluation.
+    let _semantic_model_scope = AnalyzerQueryScope::with_active_semantic_model_snapshot(
+        workspace.analyzer(),
+        active_semantic_model_snapshot,
+    );
+    // Normal evaluation resolves qualified policy locators only after the
+    // analyzer and semantic publication are ready. Explanation must cross the
+    // same loaded-policy boundary or an otherwise runnable policy can fail here
+    // solely because the host omitted its analyzer.
     let mut registry = open_registry(&root)?;
-    register_inputs(&mut registry, policy_inputs)?;
+    register_inputs(
+        &mut registry,
+        policy_inputs,
+        workspace.analyzer(),
+        cancellation,
+    )?;
+    check_explanation_cancellation(cancellation)?;
     let selected = registry.policies().len();
     if selected != 1 {
         return Err(ExplainError::AmbiguousPolicySelection { selected });
@@ -155,26 +253,6 @@ fn with_one_policy<T>(
         .policies()
         .next()
         .expect("a registry holding one policy yields it");
-
-    let owned = match workspace {
-        Some(_) => None,
-        None => {
-            let project = FilesystemProject::new(&root).map_err(|error| {
-                unavailable(format!(
-                    "failed to construct the analyzer project {}: {error}",
-                    root.display()
-                ))
-            })?;
-            let project: Arc<dyn Project> = Arc::new(project);
-            Some(
-                WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
-                    .expect("ephemeral workspace should build"),
-            )
-        }
-    };
-    let workspace = workspace
-        .or(owned.as_ref())
-        .expect("either the caller supplied a workspace or one was built");
     let owned_flow_state = flow_state
         .is_none()
         .then(brokk_bifrost_flow::FlowWorkspaceState::new);
@@ -191,7 +269,9 @@ fn with_one_policy<T>(
     };
     // The same per-policy budget an ordinary run would use, scaled the same
     // way, so a re-executed prefix is bounded exactly as the original was.
-    let mut budget = PolicyBatchBudget::default().per_policy().to_owned();
+    let mut budget =
+        policy_budget_for_workspace(*PolicyBatchBudget::default().per_policy(), Some(workspace));
+    check_explanation_cancellation(cancellation)?;
     answer(policy, &context, &mut budget)
 }
 
@@ -209,11 +289,12 @@ fn with_one_policy<T>(
 /// be unfindable -- an explanation surface that silently disagreed with the
 /// report it exists to explain.
 ///
-/// What it does not do is activate semantic-model packs: activation belongs to
-/// the host that owns the analyzer's lifecycle, and re-activating here would
-/// race it. A finding that exists only because an activated pack modeled a
-/// call is therefore reported as [`ExplainError::FindingNotFound`] rather than
-/// explained from a differently-modeled run.
+/// The host entry point activates every semantic source for an analyzer it
+/// owns, or pins the active snapshot of a caller-owned analyzer. This public
+/// dispatch boundary also freezes that selected publication for both targets.
+/// The snapshot reaches selector queries and every production evaluator adapter,
+/// so a model-backed finding is re-evaluated under the same model authority as
+/// an ordinary policy run.
 ///
 /// # Errors
 ///
@@ -226,6 +307,14 @@ pub fn explain_loaded_policy(
     budget: &mut PolicyBudget,
     limits: &ExplanationLimits,
 ) -> Result<PolicyExplanation, ExplainError> {
+    let active_semantic_model_snapshot = context.analyzer.active_semantic_model_snapshot();
+    // This public reuse boundary may be called without `with_one_policy`'s
+    // host scope. Freeze one publication for every target so candidate prefix
+    // executions and finding adapters cannot observe different model sets.
+    let _semantic_model_scope = AnalyzerQueryScope::with_active_semantic_model_snapshot(
+        context.analyzer,
+        active_semantic_model_snapshot.clone(),
+    );
     match target {
         ExplanationTarget::Finding(finding_id) => {
             let taint = context.workspace.map_or_else(
@@ -234,16 +323,19 @@ pub fn explain_loaded_policy(
                     ProductionTaintPolicyEvaluator::prepare(
                         std::iter::once(policy),
                         workspace,
-                        Ok(None),
+                        Ok(active_semantic_model_snapshot.clone()),
                         context.cancellation,
                         budget,
                     )
                 },
             );
-            let typestate = ProductionTypestatePolicyEvaluator::default();
+            let typestate = ProductionTypestatePolicyEvaluator::with_active_semantic_model_snapshot(
+                active_semantic_model_snapshot.clone(),
+            );
             let run = DefaultPolicyEvaluator::new()
                 .with_taint(&taint)
                 .with_typestate(&typestate)
+                .with_active_semantic_model_snapshot(active_semantic_model_snapshot)
                 .evaluate(policy, context, budget)
                 .map_err(|error| {
                     unavailable(format!("the policy could not be evaluated: {error:?}"))
@@ -279,20 +371,29 @@ fn open_registry(root: &Path) -> Result<PolicyRegistry, ExplainError> {
 fn register_inputs(
     registry: &mut PolicyRegistry,
     policy_inputs: &[PolicyEvaluationInput],
+    analyzer: &dyn brokk_bifrost_analysis::analyzer::IAnalyzer,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<(), ExplainError> {
     for input in policy_inputs {
+        check_explanation_cancellation(cancellation)?;
         match input {
             PolicyEvaluationInput::WorkspaceFile(path) => {
-                registry.load_policy_path(path).map_err(|error| {
-                    unavailable(format!(
-                        "failed to load the policy file {}: {error}",
-                        path.display()
-                    ))
-                })?;
+                registry
+                    .load_policy_path_with_analyzer(path, analyzer)
+                    .map_err(|error| {
+                        unavailable(format!(
+                            "failed to load the policy file {}: {error}",
+                            path.display()
+                        ))
+                    })?;
             }
             PolicyEvaluationInput::Embedded { identity, source } => {
                 registry
-                    .register_policy_bytes(identity.clone(), source.as_bytes())
+                    .register_policy_bytes_with_analyzer(
+                        identity.clone(),
+                        source.as_bytes(),
+                        analyzer,
+                    )
                     .map_err(|error| {
                         unavailable(format!("failed to register a policy source: {error}"))
                     })?;
@@ -300,6 +401,23 @@ fn register_inputs(
         }
     }
     Ok(())
+}
+
+/// Match the coordinator's front-door treatment of explicit cancellation.
+///
+/// A timeout is not an ordinary cancellation: normal evaluation preserves it
+/// as a structured incomplete outcome, so the explanation adapters retain
+/// their existing bounded-query handling for that case.
+fn check_explanation_cancellation(
+    cancellation: Option<&CancellationToken>,
+) -> Result<(), ExplainError> {
+    let Some(cancellation) = cancellation else {
+        return Ok(());
+    };
+    if !cancellation.is_cancelled() || cancellation.is_timed_out() {
+        return Ok(());
+    }
+    Err(unavailable("policy explanation cancelled".to_string()))
 }
 
 fn unavailable(message: String) -> ExplainError {

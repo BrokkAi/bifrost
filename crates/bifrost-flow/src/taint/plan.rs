@@ -69,9 +69,19 @@ pub struct TaintSanitizerBinding {
     point: ProgramPointHandle,
     phase: ValueFlowObservationPhase,
     event_index: u32,
+    /// The carrier whose taint is established by the sanitizer input port.
+    /// For a call-bound sanitizer, the effect is applied while this carrier is
+    /// mapped across the call boundary. The caller-side carrier remains
+    /// available on the call-to-return edge, so an unused sanitizer result does
+    /// not clear the original value.
     carrier: ValueFlowCarrierId,
+    /// The carrier established by the sanitizer output port. This is retained
+    /// as part of the binding identity and validated against the same value
+    /// flow plan. It identifies the output path for the call-bound effect.
+    output: ValueFlowCarrierId,
     removed: TaintClassSet,
-    resolved: bool,
+    proven: bool,
+    complete: bool,
 }
 
 impl TaintSanitizerBinding {
@@ -82,13 +92,26 @@ impl TaintSanitizerBinding {
         carrier: ValueFlowCarrierId,
         removed: TaintClassSet,
     ) -> Self {
+        Self::resolved_with_output(point, phase, event_index, carrier, carrier, removed)
+    }
+
+    pub const fn resolved_with_output(
+        point: ProgramPointHandle,
+        phase: ValueFlowObservationPhase,
+        event_index: u32,
+        carrier: ValueFlowCarrierId,
+        output: ValueFlowCarrierId,
+        removed: TaintClassSet,
+    ) -> Self {
         Self {
             point,
             phase,
             event_index,
             carrier,
+            output,
             removed,
-            resolved: true,
+            proven: true,
+            complete: true,
         }
     }
 
@@ -99,13 +122,46 @@ impl TaintSanitizerBinding {
         carrier: ValueFlowCarrierId,
         removed: TaintClassSet,
     ) -> Self {
+        Self::unresolved_with_output(point, phase, event_index, carrier, carrier, removed)
+    }
+
+    pub const fn unresolved_with_output(
+        point: ProgramPointHandle,
+        phase: ValueFlowObservationPhase,
+        event_index: u32,
+        carrier: ValueFlowCarrierId,
+        output: ValueFlowCarrierId,
+        removed: TaintClassSet,
+    ) -> Self {
         Self {
             point,
             phase,
             event_index,
             carrier,
+            output,
             removed,
-            resolved: false,
+            proven: false,
+            complete: false,
+        }
+    }
+
+    pub const fn proven_incomplete_with_output(
+        point: ProgramPointHandle,
+        phase: ValueFlowObservationPhase,
+        event_index: u32,
+        carrier: ValueFlowCarrierId,
+        output: ValueFlowCarrierId,
+        removed: TaintClassSet,
+    ) -> Self {
+        Self {
+            point,
+            phase,
+            event_index,
+            carrier,
+            output,
+            removed,
+            proven: true,
+            complete: false,
         }
     }
 
@@ -121,6 +177,10 @@ impl TaintSanitizerBinding {
         self.carrier
     }
 
+    pub const fn output(&self) -> ValueFlowCarrierId {
+        self.output
+    }
+
     pub const fn event_index(&self) -> u32 {
         self.event_index
     }
@@ -130,7 +190,11 @@ impl TaintSanitizerBinding {
     }
 
     pub const fn is_resolved(&self) -> bool {
-        self.resolved
+        self.complete
+    }
+
+    pub const fn is_proven(&self) -> bool {
+        self.proven
     }
 }
 
@@ -319,6 +383,13 @@ impl TaintAnalysisPlan {
                 sanitizer.removed.universe(),
                 universe.hash(),
             )?;
+            validate_carrier_binding(
+                &value_flow,
+                sanitizer.point(),
+                sanitizer.output,
+                sanitizer.removed.universe(),
+                universe.hash(),
+            )?;
         }
         for transform in &transforms {
             validate_carrier_binding(
@@ -330,8 +401,13 @@ impl TaintAnalysisPlan {
             )?;
         }
         let identity = TaintEdgeFunction::identity(&universe);
+        // Only in-place bindings are phase transfers. A distinct input/output
+        // pair is consumed by the call/return boundary mapping in the taint
+        // client; putting it in a phase slot would kill the caller's original
+        // value even when the sanitizer result is unused.
         let mut ordered = sanitizers
             .iter()
+            .filter(|sanitizer| sanitizer.carrier() == sanitizer.output())
             .map(OrderedTaintTransfer::Sanitizer)
             .chain(transforms.iter().map(OrderedTaintTransfer::Transform))
             .collect::<Vec<_>>();
@@ -352,15 +428,20 @@ impl TaintAnalysisPlan {
                 &identity,
             );
             match event {
-                OrderedTaintTransfer::Sanitizer(sanitizer) if sanitizer.is_resolved() => {
+                OrderedTaintTransfer::Sanitizer(sanitizer) if sanitizer.is_proven() => {
                     transfer.function = transfer
                         .function
                         .compose(&TaintEdgeFunction::kill(sanitizer.removed()));
                 }
-                OrderedTaintTransfer::Sanitizer(_) => transfer.complete = false,
+                OrderedTaintTransfer::Sanitizer(_) => {}
                 OrderedTaintTransfer::Transform(transform) => {
                     transfer.function = transfer.function.compose(transform.function());
                 }
+            }
+            if let OrderedTaintTransfer::Sanitizer(sanitizer) = event
+                && !sanitizer.is_resolved()
+            {
+                transfer.complete = false;
             }
         }
         phase_transfers.sort_by(compare_resolved_transfers);
@@ -617,8 +698,10 @@ fn compare_sanitizers(
         .then_with(|| left.phase.cmp(&right.phase))
         .then_with(|| left.event_index.cmp(&right.event_index))
         .then_with(|| left.carrier.cmp(&right.carrier))
+        .then_with(|| left.output.cmp(&right.output))
         .then_with(|| left.removed.cmp(&right.removed))
-        .then_with(|| left.resolved.cmp(&right.resolved))
+        .then_with(|| left.proven.cmp(&right.proven))
+        .then_with(|| left.complete.cmp(&right.complete))
 }
 
 fn compare_transforms(
@@ -957,20 +1040,31 @@ fn remap_sanitizers(
         .iter()
         .map(|binding| {
             let carrier = remapped_carrier(&analysis.value_flow, value_flow, binding.carrier)?;
-            Ok(if binding.resolved {
-                TaintSanitizerBinding::resolved(
+            Ok(if binding.complete {
+                TaintSanitizerBinding::resolved_with_output(
                     binding.point.clone(),
                     binding.phase,
                     binding.event_index,
                     carrier,
+                    remapped_carrier(&analysis.value_flow, value_flow, binding.output)?,
+                    binding.removed.clone(),
+                )
+            } else if binding.proven {
+                TaintSanitizerBinding::proven_incomplete_with_output(
+                    binding.point.clone(),
+                    binding.phase,
+                    binding.event_index,
+                    carrier,
+                    remapped_carrier(&analysis.value_flow, value_flow, binding.output)?,
                     binding.removed.clone(),
                 )
             } else {
-                TaintSanitizerBinding::unresolved(
+                TaintSanitizerBinding::unresolved_with_output(
                     binding.point.clone(),
                     binding.phase,
                     binding.event_index,
                     carrier,
+                    remapped_carrier(&analysis.value_flow, value_flow, binding.output)?,
                     binding.removed.clone(),
                 )
             })
@@ -1008,9 +1102,12 @@ fn same_sanitizers(left: &TaintAnalysisPlan, right: &TaintAnalysisPlan) -> bool 
                     && left_binding.phase == right_binding.phase
                     && left_binding.event_index == right_binding.event_index
                     && left_binding.removed == right_binding.removed
-                    && left_binding.resolved == right_binding.resolved
+                    && left_binding.proven == right_binding.proven
+                    && left_binding.complete == right_binding.complete
                     && left.value_flow.carrier_key(left_binding.carrier)
                         == right.value_flow.carrier_key(right_binding.carrier)
+                    && left.value_flow.carrier_key(left_binding.output)
+                        == right.value_flow.carrier_key(right_binding.output)
             })
 }
 

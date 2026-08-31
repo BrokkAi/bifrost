@@ -200,7 +200,7 @@ fn run_case(
         error,
     })?;
     let project: Arc<dyn Project> = Arc::new(project);
-    let workspace = brokk_bifrost_analysis::analyzer::WorkspaceAnalyzer::build_ephemeral(
+    let workspace = brokk_bifrost_analysis::analyzer::WorkspaceAnalyzer::build_ephemeral_footgun(
         project,
         AnalyzerConfig::default(),
     )

@@ -1,6 +1,29 @@
 use super::*;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 
+fn result_contract_artifact_file(value: &PipelineValue) -> Option<&ProjectFile> {
+    match value {
+        PipelineValue::CallShape(shape) => Some(&shape.report.outcome.file),
+        PipelineValue::CallResultContract(contract) => Some(contract.file()),
+        PipelineValue::ResultContractUse(result_use) => Some(result_use.file()),
+        PipelineValue::ResultContractFailureUse(result_use) => Some(result_use.file()),
+        _ => None,
+    }
+}
+
+fn semantic_artifact_window_file<'a>(
+    value: &'a PipelineValue,
+    step: &QueryStep,
+) -> Option<&'a ProjectFile> {
+    if matches!(step, QueryStep::DecoratorBindings(_)) {
+        return match value {
+            PipelineValue::StructuralMatch(seed) => Some(&seed.file),
+            _ => None,
+        };
+    }
+    result_contract_artifact_file(value)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn apply_plan_step(
     step: &QueryStep,
@@ -87,6 +110,9 @@ pub(super) fn apply_plan_step(
                     | PipelineValue::CallArgument(_)
                     | PipelineValue::CallBinding(_)
                     | PipelineValue::CallEffect(_)
+                    | PipelineValue::CallResultContract(_)
+                    | PipelineValue::ResultContractUse(_)
+                    | PipelineValue::ResultContractFailureUse(_)
                     | PipelineValue::ProcedureEffect(_)
                     | PipelineValue::CallableSignature(_)
                     | PipelineValue::SignatureParameter(_)
@@ -169,6 +195,9 @@ pub(super) fn apply_plan_step(
                                 | PipelineValue::CallArgument(_)
                                 | PipelineValue::CallBinding(_)
                                 | PipelineValue::CallEffect(_)
+                                | PipelineValue::CallResultContract(_)
+                                | PipelineValue::ResultContractUse(_)
+                                | PipelineValue::ResultContractFailureUse(_)
                                 | PipelineValue::ProcedureEffect(_)
                                 | PipelineValue::CallableSignature(_)
                                 | PipelineValue::SignatureParameter(_)
@@ -263,6 +292,9 @@ pub(super) fn apply_plan_step(
                         | PipelineValue::CallArgument(_)
                         | PipelineValue::CallBinding(_)
                         | PipelineValue::CallEffect(_)
+                        | PipelineValue::CallResultContract(_)
+                        | PipelineValue::ResultContractUse(_)
+                        | PipelineValue::ResultContractFailureUse(_)
                         | PipelineValue::ProcedureEffect(_)
                         | PipelineValue::CallableSignature(_)
                         | PipelineValue::SignatureParameter(_)
@@ -957,15 +989,93 @@ pub(super) fn apply_pipeline_step(
         }
         return (Vec::new(), true, false);
     }
+    let window_result_contract_artifacts = matches!(
+        step,
+        QueryStep::ResultContractCalls
+            | QueryStep::CallResultContracts
+            | QueryStep::ResultContractUses
+            | QueryStep::ResultContractOperationUses
+            | QueryStep::ResultContractFailureUses(_)
+    ) && semantic
+        .as_ref()
+        .is_some_and(SemanticQueryContext::can_start_artifact_windows);
+    let window_decorated_parameter_artifacts = matches!(step, QueryStep::DecoratorBindings(_))
+        && semantic
+            .as_ref()
+            .is_some_and(SemanticQueryContext::can_start_artifact_windows);
+    let window_semantic_artifacts =
+        window_result_contract_artifacts || window_decorated_parameter_artifacts;
+    let mut rows = rows;
+    let window_result_contract_candidates = matches!(step, QueryStep::ResultContractCalls);
+    let sort_result_contract_rows =
+        window_result_contract_candidates || window_result_contract_artifacts;
+    let sort_artifact_rows = sort_result_contract_rows || window_decorated_parameter_artifacts;
+    if sort_artifact_rows {
+        rows.sort_by(|left, right| {
+            semantic_artifact_window_file(&left.value, step)
+                .cmp(&semantic_artifact_window_file(&right.value, step))
+        });
+    }
+    let mut artifact_window_file: Option<ProjectFile> = None;
+    let mut artifact_window_has_policy_row = false;
+    let mut result_contract_file_prepared = false;
     let mut instrumentation = instrumentation;
 
     let mut indexed_declarations = indexed_declarations;
-    'rows: for row in rows {
+    let mut rows = rows.into_iter();
+    'rows: while let Some(row) = rows.next() {
         if output.len() >= max_step_outputs {
             break;
         }
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            if window_semantic_artifacts {
+                semantic
+                    .as_mut()
+                    .expect("windowed semantic context exists")
+                    .release_artifact_window();
+                flow_state_cache.release_file_window();
+                control_relation_cache.release_file_window();
+            }
+            if sort_result_contract_rows {
+                call_cache.effects.release_file_window();
+            }
             return (output, true, receiver_truncated);
+        }
+        let mut opened_result_contract_file = false;
+        if sort_artifact_rows {
+            let file = semantic_artifact_window_file(&row.value, step)
+                .expect("windowed steps accept only artifact-backed rows");
+            if artifact_window_file.as_ref() != Some(file) {
+                if artifact_window_file.is_some() {
+                    if window_semantic_artifacts {
+                        if artifact_window_has_policy_row {
+                            semantic
+                                .as_mut()
+                                .expect("windowed semantic context exists")
+                                .retain_artifact_window_dependencies();
+                        }
+                        semantic
+                            .as_mut()
+                            .expect("windowed semantic context exists")
+                            .release_artifact_window();
+                        flow_state_cache.release_file_window();
+                        control_relation_cache.release_file_window();
+                    }
+                    if window_result_contract_candidates {
+                        call_cache.effects.release_file_window();
+                    }
+                }
+                artifact_window_file = Some(file.clone());
+                artifact_window_has_policy_row = false;
+                result_contract_file_prepared = false;
+                opened_result_contract_file = window_result_contract_candidates;
+                if window_semantic_artifacts {
+                    semantic
+                        .as_mut()
+                        .expect("windowed semantic context exists")
+                        .start_artifact_window(file.clone());
+                }
+            }
         }
         if let Some(instrumentation) = instrumentation.as_deref_mut() {
             instrumentation.rows_visited = instrumentation.rows_visited.saturating_add(1);
@@ -976,6 +1086,41 @@ pub(super) fn apply_pipeline_step(
                 .is_some_and(|semantic| !semantic_row_seed_generations_current(semantic, &row))
         {
             continue;
+        }
+        if matches!(step, QueryStep::ResultContractCalls) {
+            let PipelineValue::CallShape(shape) = &row.value else {
+                unreachable!("result_contract_calls accepts only call-shape rows");
+            };
+            let file = &shape.report.outcome.file;
+            if opened_result_contract_file || !result_contract_file_prepared {
+                let mut file_shapes = Vec::new();
+                file_shapes.push(shape);
+                file_shapes.extend(
+                    rows.as_slice()
+                        .iter()
+                        .take_while(|candidate| {
+                            matches!(
+                                &candidate.value,
+                                PipelineValue::CallShape(candidate_shape)
+                                    if candidate_shape.report.outcome.file == *file
+                            )
+                        })
+                        .map(|candidate| {
+                            let PipelineValue::CallShape(candidate_shape) = &candidate.value else {
+                                unreachable!("result_contract_calls accepts only call-shape rows");
+                            };
+                            candidate_shape
+                        }),
+                );
+                effects::prepare_result_contract_call_lookups(
+                    analyzer,
+                    &mut call_cache.effects,
+                    limits,
+                    cancellation,
+                    &file_shapes,
+                );
+                result_contract_file_prepared = true;
+            }
         }
         let mut row_exhausted = false;
         if let (
@@ -1779,7 +1924,21 @@ pub(super) fn apply_pipeline_step(
                     seed,
                     &mut enclosing_declarations,
                     semantic.as_mut(),
-                );
+                )
+                .into_iter()
+                .filter(|expansion| match &expansion.value {
+                    PipelineValue::DecoratedParameter(value) => {
+                        filter
+                            .module
+                            .as_deref()
+                            .is_none_or(|module| value.row.module.as_deref() == Some(module))
+                            && filter.imported_name.as_deref().is_none_or(|imported_name| {
+                                value.row.imported_name.as_deref() == Some(imported_name)
+                            })
+                    }
+                    _ => true,
+                })
+                .collect::<Vec<_>>();
                 if expansions.iter().any(|expansion| {
                     matches!(
                         &expansion.value,
@@ -1787,6 +1946,10 @@ pub(super) fn apply_pipeline_step(
                             if value.row.completion != "complete"
                                 || value.row.coverage != "complete"
                     )
+                }) && !diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == CodeQueryDiagnosticCode::EnvironmentDerivationIncomplete
+                        && diagnostic.language == seed.language.config_label()
+                        && diagnostic.message == "decorator_bindings retained one or more parameter rows whose decorator binding or parameter-port identity is incomplete"
                 }) {
                     diagnostics.push(CodeQueryDiagnostic {
                         code: CodeQueryDiagnosticCode::EnvironmentDerivationIncomplete,
@@ -1797,20 +1960,6 @@ pub(super) fn apply_pipeline_step(
                     });
                 }
                 expansions
-                    .into_iter()
-                    .filter(|expansion| match &expansion.value {
-                        PipelineValue::DecoratedParameter(value) => {
-                            filter
-                                .module
-                                .as_deref()
-                                .is_none_or(|module| value.row.module.as_deref() == Some(module))
-                                && filter.imported_name.as_deref().is_none_or(|imported_name| {
-                                    value.row.imported_name.as_deref() == Some(imported_name)
-                                })
-                        }
-                        _ => true,
-                    })
-                    .collect()
             }
             (PipelineValue::CallSite(site), QueryStep::CallShape) => {
                 call_shape::call_shape_expansions_for_input(
@@ -1914,6 +2063,24 @@ pub(super) fn apply_pipeline_step(
             (PipelineValue::CallShape(value), QueryStep::CallArgumentGroups) => {
                 call_shape::call_argument_group_expansions(value)
             }
+            (PipelineValue::CallShape(value), QueryStep::CallResults) => semantic
+                .as_mut()
+                .map(|semantic| {
+                    let outcome = &value.report.outcome;
+                    semantic
+                        .call_results_at_source(
+                            &outcome.file,
+                            outcome.range,
+                            &outcome.site_id,
+                            &outcome.site_ast_id,
+                        )
+                        .into_iter()
+                        .map(SemanticPipelineValue::CallResult)
+                        .map(PipelineValue::Semantic)
+                        .map(pipeline_expansion)
+                        .collect()
+                })
+                .unwrap_or_default(),
             (PipelineValue::CallArgumentGroup(value), QueryStep::CallArguments) => {
                 call_shape::call_argument_expansions(value)
             }
@@ -1928,6 +2095,74 @@ pub(super) fn apply_pipeline_step(
                     value,
                 )
             }
+            (PipelineValue::CallShape(value), QueryStep::ResultContractCalls) => {
+                effects::result_contract_call_expansions(
+                    analyzer,
+                    &mut call_cache.effects,
+                    diagnostics,
+                    value,
+                )
+            }
+            (PipelineValue::CallShape(value), QueryStep::CallResultContracts) => {
+                effects::call_result_contract_expansions(
+                    analyzer,
+                    workspace.expect("result-contract validation requires a semantic workspace"),
+                    semantic
+                        .as_mut()
+                        .expect("semantic context exists for semantic steps"),
+                    &mut call_cache.effects,
+                    flow_state_cache,
+                    cancellation,
+                    diagnostics,
+                    value,
+                )
+            }
+            (PipelineValue::CallResultContract(value), QueryStep::ResultContractUses) => {
+                effects::result_contract_use_expansions(
+                    analyzer,
+                    workspace.expect("result-contract validation requires a semantic workspace"),
+                    semantic
+                        .as_mut()
+                        .expect("semantic context exists for semantic steps"),
+                    &mut call_cache.effects,
+                    flow_state_cache,
+                    limits,
+                    cancellation,
+                    diagnostics,
+                    value,
+                )
+            }
+            (PipelineValue::CallResultContract(value), QueryStep::ResultContractOperationUses) => {
+                effects::result_contract_operation_use_expansions(
+                    analyzer,
+                    workspace.expect("result-contract validation requires a semantic workspace"),
+                    semantic
+                        .as_mut()
+                        .expect("semantic context exists for semantic steps"),
+                    &mut call_cache.effects,
+                    flow_state_cache,
+                    limits,
+                    cancellation,
+                    diagnostics,
+                    value,
+                )
+            }
+            (
+                PipelineValue::CallResultContract(value),
+                QueryStep::ResultContractFailureUses(filter),
+            ) => effects::result_contract_failure_use_expansions(
+                analyzer,
+                workspace.expect("failure-use projection requires a semantic workspace"),
+                semantic
+                    .as_mut()
+                    .expect("semantic context exists for semantic steps"),
+                &mut call_cache.effects,
+                flow_state_cache,
+                cancellation,
+                diagnostics,
+                filter,
+                value,
+            ),
             (PipelineValue::Declaration(declaration), QueryStep::ProcedureEffects) => {
                 effects::procedure_effect_expansions(
                     analyzer,
@@ -2665,7 +2900,15 @@ pub(super) fn apply_pipeline_step(
             }
             _ => unreachable!("query step domains are validated before execution"),
         };
-        if semantic
+        // The base and summary result-contract projections are total relations. The base step
+        // emits a modeled contract or terminal uncertainty row for every call
+        // shape, and optional use validation preserves every contract row even
+        // when its semantic answer is open. The generic semantic stop would
+        // otherwise retain the first exhausted row and silently omit the rest.
+        if !matches!(
+            step,
+            QueryStep::CallResultContracts | QueryStep::ResultContractUses
+        ) && semantic
             .as_ref()
             .is_some_and(|service| service.work().budget_exhausted)
         {
@@ -2686,6 +2929,20 @@ pub(super) fn apply_pipeline_step(
             if !expansion.budgeted {
                 budget.pipeline_rows += 1;
             }
+            if (window_result_contract_artifacts
+                && matches!(
+                    &expansion.value,
+                    PipelineValue::CallResultContract(value)
+                        if !value.terminal && value.result_ordinal.is_some()
+                ))
+                || (window_decorated_parameter_artifacts
+                    && matches!(
+                        &expansion.value,
+                        PipelineValue::DecoratedParameter(value) if value.semantic.is_some()
+                    ))
+            {
+                artifact_window_has_policy_row = true;
+            }
             let traces = row
                 .traces
                 .iter()
@@ -2704,6 +2961,24 @@ pub(super) fn apply_pipeline_step(
             exhausted = true;
             break;
         }
+    }
+
+    if window_semantic_artifacts {
+        if artifact_window_has_policy_row {
+            semantic
+                .as_mut()
+                .expect("windowed semantic context exists")
+                .retain_artifact_window_dependencies();
+        }
+        semantic
+            .as_mut()
+            .expect("windowed semantic context exists")
+            .release_artifact_window();
+        flow_state_cache.release_file_window();
+        control_relation_cache.release_file_window();
+    }
+    if sort_result_contract_rows {
+        call_cache.effects.release_file_window();
     }
 
     if step == &QueryStep::ImportersOf

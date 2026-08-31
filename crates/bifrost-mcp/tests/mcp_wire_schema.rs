@@ -20,6 +20,9 @@
 mod common;
 
 use brokk_bifrost_analysis::Language;
+use brokk_bifrost_mcp::benchmark_api::{
+    BENCHMARK_MCP_REQUEST_BUDGET_SECS, MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV,
+};
 use common::InlineTestProject;
 use jsonschema::Validator;
 use serde_json::{Value, json};
@@ -521,6 +524,17 @@ impl WireSession {
     }
 
     fn spawn(revision: &'static str, mut command: Command) -> Self {
+        // A wire-schema test asserts message shape, not cold-start latency.
+        // Left at the production default, a first call made during the
+        // workspace build is held to COLD_WORKSPACE_REQUEST_BUDGET (4.5s), so
+        // suite saturation would fail a schema assertion for box load. Two
+        // tests prove the cold-start claim deliberately instead, on a reserved
+        // machine -- see `apply_test_request_budget` in
+        // `crates/bifrost-mcp/tests/bifrost_mcp_server.rs`.
+        command.env(
+            MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV,
+            BENCHMARK_MCP_REQUEST_BUDGET_SECS.to_string(),
+        );
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

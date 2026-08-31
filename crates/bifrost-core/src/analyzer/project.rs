@@ -1,5 +1,6 @@
 use crate::analyzer::common::language_for_file;
 use crate::analyzer::{Language, ProjectFile};
+use crate::gitblob;
 use crate::path_normalization::NormalizePath;
 use crate::util::throttled_log::ThrottledLog;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
@@ -302,7 +303,7 @@ pub trait Project: Send + Sync {
     /// buffer content pushed in by `textDocument/did{Open,Change}`
     /// notifications.
     fn read_source(&self, file: &ProjectFile) -> io::Result<String> {
-        decode_disk_source(std::fs::read(file.abs_path())?)
+        decode_source_bytes(std::fs::read(file.abs_path())?)
     }
 
     /// Read source only when it fits in `max_bytes`, without allocating the
@@ -323,7 +324,7 @@ pub trait Project: Send + Sync {
         if source.len() > max_bytes {
             return Ok(None);
         }
-        decode_disk_source(source).map(Some)
+        decode_source_bytes(source).map(Some)
     }
 
     /// Capture source text and its disk/overlay identity in one read.
@@ -375,7 +376,14 @@ pub trait Project: Send + Sync {
     }
 }
 
-fn decode_disk_source(bytes: Vec<u8>) -> io::Result<String> {
+/// Decode source bytes the way every disk-backed [`Project`] does: legacy
+/// non-UTF-8 text is admitted lossily and NUL-bearing binary data is rejected.
+///
+/// Public because a project can obtain a file's bytes from somewhere other than
+/// the filesystem -- an immutable revision image reads them out of the Git
+/// object database -- and the two readings of one file must not decode
+/// differently.
+pub fn decode_source_bytes(bytes: Vec<u8>) -> io::Result<String> {
     if bytes.contains(&0) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -797,18 +805,21 @@ impl Project for FilesystemProject {
         file.abs_path().is_file().then_some(file)
     }
 
+    /// Both ignore probes read the listing and never keep it, so they take the
+    /// shared handle: a per-probe `all_files` clone copies the whole workspace
+    /// listing to answer one path.
     fn is_gitignored(&self, rel_path: &Path) -> bool {
         let file = ProjectFile::new(self.root.clone(), rel_path.to_path_buf());
         file.exists()
             && self
-                .all_files()
+                .all_files_shared()
                 .map(|files| !files.contains(&file))
                 .unwrap_or(false)
     }
 
     fn is_bifrostignored(&self, rel_path: &Path) -> bool {
         let file = ProjectFile::new(self.root.clone(), rel_path.to_path_buf());
-        self.all_files()
+        self.all_files_shared()
             .and_then(|files| {
                 self.bifrost_ignore_matcher(&files)
                     .map(|matcher| matcher.is_ignored(&file))
@@ -905,10 +916,33 @@ pub struct MultiRootProject {
     root: PathBuf,
     roots: Vec<FilesystemProject>,
     languages: BTreeSet<Language>,
+    persistence_dir: Option<PathBuf>,
 }
 
 impl MultiRootProject {
     pub fn new(roots: impl IntoIterator<Item = PathBuf>) -> io::Result<Self> {
+        Self::build(roots, None)
+    }
+
+    /// A multi-root project whose persisted database lives under `cache_root`
+    /// rather than under the machine cache root `BIFROST_CACHE_ROOT` or the
+    /// platform names (see [`gitblob::multiroot_persistence_dir`]).
+    ///
+    /// A host that places its own caches, and a test that must not depend on
+    /// the environment of the process it shares with every other test, says
+    /// where the cache goes instead of setting a variable for the whole
+    /// process.
+    pub fn with_cache_root(
+        roots: impl IntoIterator<Item = PathBuf>,
+        cache_root: PathBuf,
+    ) -> io::Result<Self> {
+        Self::build(roots, Some(cache_root.into_os_string()))
+    }
+
+    fn build(
+        roots: impl IntoIterator<Item = PathBuf>,
+        cache_root: Option<std::ffi::OsString>,
+    ) -> io::Result<Self> {
         let mut roots = roots
             .into_iter()
             .map(|root| root.canonicalize().map(NormalizePath::normalize))
@@ -928,6 +962,15 @@ impl MultiRootProject {
                 "multi-root project roots do not share a filesystem ancestor",
             )
         })?;
+        // The parsed facts of N repositories share one database safely: a blob
+        // row is keyed by content oid, language storage key and generation, and
+        // never by the repository a file came from, so the same file analyzed
+        // from two checkouts is one row and a differing file is two. The rows
+        // that *are* workspace-shaped key on `WorkspaceId::for_root`, which
+        // this project reports as its common ancestor, so they cannot collide
+        // with another workspace's. A different set of roots hashes to a
+        // different directory and therefore to a different database.
+        let persistence_dir = gitblob::multiroot_persistence_dir_with_overrides(&roots, cache_root);
         let roots = roots
             .iter()
             .map(FilesystemProject::new)
@@ -940,6 +983,7 @@ impl MultiRootProject {
             root,
             roots,
             languages,
+            persistence_dir,
         })
     }
 
@@ -1068,7 +1112,7 @@ impl Project for MultiRootProject {
     }
 
     fn persistence_root(&self) -> Option<&Path> {
-        None
+        self.persistence_dir.as_deref()
     }
 }
 
@@ -1096,8 +1140,16 @@ pub fn collect_workspace_files(root: &Path) -> io::Result<BTreeSet<ProjectFile>>
             .ok_or_else(|| io::Error::other("repository has no working directory"))?;
         let canonical_root = root.canonicalize()?.normalize();
         let canonical_workdir = workdir.canonicalize()?.normalize();
+        // An ancestor repository can own this root. The `strip_prefix` filter
+        // below already discards everything outside it, so scoping the
+        // enumeration to the subtree yields the same listing at a cost
+        // proportional to the workspace instead of the ancestor repository.
         let active_paths =
-            crate::gitblob::all_working_tree_paths(&repo).map_err(io::Error::other)?;
+            match crate::gitblob::subtree_pathspec(&canonical_workdir, &canonical_root) {
+                Some(subtree) => crate::gitblob::working_tree_paths_under(&repo, &subtree),
+                None => crate::gitblob::all_working_tree_paths(&repo),
+            }
+            .map_err(io::Error::other)?;
         let mut files = BTreeSet::new();
         for rel in active_paths {
             let absolute = canonical_workdir.join(rel);
@@ -1799,8 +1851,13 @@ mod tests {
             "packages/app/src/db/mod.rs",
             "pub fn connection() {}\n",
         );
+        write_file(&repo_root, "packages/lib/tracked.rs", "fn tracked() {}\n");
         crate::gitblob::test_repo::commit_all(&repo, "tracked app source");
         write_file(&repo_root, ".gitignore", "db/\n");
+        // The enumeration is scoped to the workspace subtree. Tracked and
+        // untracked files on both sides of that boundary pin the membership.
+        write_file(&repo_root, "packages/app/untracked.rs", "fn app() {}\n");
+        write_file(&repo_root, "packages/lib/untracked.rs", "fn lib() {}\n");
         let app_root = repo_root.join("packages/app");
 
         let rels: BTreeSet<String> = collect_workspace_files(&app_root)
@@ -1809,7 +1866,10 @@ mod tests {
             .map(|file| file.rel_path().to_string_lossy().replace('\\', "/"))
             .collect();
 
-        assert_eq!(rels, BTreeSet::from(["src/db/mod.rs".to_string()]));
+        assert_eq!(
+            rels,
+            BTreeSet::from(["src/db/mod.rs".to_string(), "untracked.rs".to_string()])
+        );
     }
 
     #[test]
@@ -1968,6 +2028,49 @@ mod tests {
         let project = FileSetProject::new(root.clone(), [PathBuf::from("A.java")]);
         assert_eq!(project.root(), root.normalize());
         assert!(project.persistence_root().is_none());
+    }
+
+    /// A multi-root session has no repository of its own, but it does have a
+    /// persistence identity: the machine-local directory named by its root set.
+    #[test]
+    fn multi_root_project_persists_under_the_machine_cache_root() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let first = root.join("service-a");
+        let second = root.join("service-b");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let cache_root = root.join("machine-cache");
+
+        let project =
+            MultiRootProject::with_cache_root([first.clone(), second.clone()], cache_root.clone())
+                .unwrap();
+        let persistence_root = project
+            .persistence_root()
+            .expect("a multi-root project persists")
+            .to_path_buf();
+
+        assert!(
+            persistence_root.starts_with(&cache_root),
+            "expected a machine-local directory, got {}",
+            persistence_root.display()
+        );
+        assert!(
+            !persistence_root.starts_with(&first) && !persistence_root.starts_with(&second),
+            "no member repository may host the shared database: {}",
+            persistence_root.display()
+        );
+        assert_eq!(
+            MultiRootProject::with_cache_root([second, first], cache_root)
+                .unwrap()
+                .persistence_root(),
+            Some(persistence_root.as_path()),
+            "the same folders in the other order are the same workspace"
+        );
+        assert!(
+            !persistence_root.exists(),
+            "constructing a project must not create cache directories"
+        );
     }
 
     #[test]

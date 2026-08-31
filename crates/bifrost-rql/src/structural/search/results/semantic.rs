@@ -259,6 +259,7 @@ pub enum CodeQueryFlowPortSymbol {
     Receiver,
     Parameter { ordinal: u32 },
     NormalReturn,
+    IndexedNormalReturn { ordinal: u32 },
     ExceptionalReturn,
     Capture { slot: u32 },
 }
@@ -597,10 +598,10 @@ pub struct CodeQueryControlRelation {
 /// decision it sits on -- and its `id` is the wire id a `program_point` row
 /// publishes.
 ///
-/// The two edge columns are the reason the row exists. A constant condition
-/// keeps only one arm after lowering folds the other away, so the absent column
-/// is exactly the evidence that a branch could not execute; nothing else in the
-/// frozen artifact records it.
+/// The edge and target columns are the reason the row exists. A constant
+/// condition keeps only one arm after lowering folds the other away, so the
+/// absent columns are exactly the evidence that a branch could not execute;
+/// nothing else in the frozen artifact records it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CodeQueryGuard {
     pub id: String,
@@ -618,6 +619,24 @@ pub struct CodeQueryGuard {
     /// For a constant condition, the value it always takes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub constant: Option<bool>,
+    /// For a null comparison, whether a null subject takes the true edge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub null_on_true: Option<bool>,
+    /// For a null comparison, the program point entered when the subject is
+    /// null. Equal to either `true_target_id` or `false_target_id` according
+    /// to `null_on_true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub null_target_id: Option<String>,
+    /// For a comparison against a constant, whether the comparison is an
+    /// inequality rather than an equality.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub equality_negated: Option<bool>,
+    /// The procedure-local value ID of the constant in a constant comparison.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub constant_value: Option<u64>,
+    /// The stable structured-syntax digest for an opaque predicate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opaque_digest: Option<u64>,
     /// The procedure-local value the condition tests, when the predicate names
     /// one. Absent for a constant condition, which tests nothing.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -626,13 +645,44 @@ pub struct CodeQueryGuard {
     /// row's `id`. Absent when lowering emitted no such edge.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub true_edge_id: Option<String>,
+    /// The program point entered when the condition holds; equal to a
+    /// `program_point` row's `id`. Absent with `true_edge_id`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub true_target_id: Option<String>,
     /// The successor taken when the condition does not hold; equal to a
     /// `control_edge` row's `id`. Absent when lowering emitted no such edge.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub false_edge_id: Option<String>,
+    /// The program point entered when the condition does not hold; equal to a
+    /// `program_point` row's `id`. Absent with `false_edge_id`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub false_target_id: Option<String>,
     /// `proven` or `unproven`, from the guard's own IR evidence row.
     pub proof: &'static str,
     /// `complete` or `partial`, from the guard's own IR evidence row.
+    pub completeness: &'static str,
+}
+
+/// One normal result port of one exact semantic call site.
+///
+/// `site_id` joins back to the structural `call_shape` row. `call_id` keeps
+/// path-specialized semantic executions distinct, while `ordinal` and
+/// `value_id` expose the language-level result position and its procedure-local
+/// value identity for joins with state events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CodeQueryCallResult {
+    pub id: String,
+    pub site_id: String,
+    pub site_ast_id: String,
+    pub call_id: String,
+    pub procedure_id: String,
+    pub point_id: String,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub ordinal: u64,
+    pub value_id: u64,
+    pub proof: &'static str,
     pub completeness: &'static str,
 }
 

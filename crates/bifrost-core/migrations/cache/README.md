@@ -76,3 +76,12 @@ Migration `0032-revisioned-workspace-projections.sql` replaces mutable
 language-wide workspace rows with immutable, worktree-keyed revisions. Blob
 facts remain shared while each analyzer pins path, package, anchor, and path
 symbol queries to the revision it captured.
+
+Migration `0033-intern-blob-ids.sql` interns each `(blob_oid, lang)` pair as an
+integer `blobs.id` and rekeys content-addressed analyzer facts to that ID.
+
+Migration `0034-relational-structural-facts.sql` replaces the opaque bincode
+structural-facts snapshot with a manifest and normalized node, structural-role,
+and occurrence-role rows. The relational schema retains the existing
+whole-file hydration behavior while making the persisted facts queryable by
+SQLite.

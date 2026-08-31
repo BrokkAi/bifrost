@@ -490,6 +490,7 @@ impl FoundryEntry {
                 path: self.target.artifact_path.clone(),
                 symbol: self.target.signature.symbol(&self.target.member),
                 has_receiver: self.boundary.has_receiver,
+                variadic: false,
                 parameter_count: self.boundary.parameter_count,
             },
             completeness: match self.completeness {
@@ -497,10 +498,16 @@ impl FoundryEntry {
                 FoundryCompleteness::Complete => Completeness::Complete,
             },
             covers_overrides: false,
+            normal_continuation_absent: false,
+            normal_result_count: None,
             locations: Vec::new(),
             transfers: self.transfers.clone(),
             effects: Vec::new(),
             declared_effects: Vec::new(),
+            preconditions: None,
+            result_contracts: Vec::new(),
+            conditional_result_refinements: Vec::new(),
+            normal_return_refinements: Vec::new(),
         })
     }
 
@@ -737,6 +744,9 @@ pub fn render_transfer(transfer: &AuthoredSummaryTransfer) -> String {
     };
     let output = match &transfer.output {
         AuthoredSummaryOutput::NormalReturn {} => "normal_return".to_owned(),
+        AuthoredSummaryOutput::IndexedNormalReturn { ordinal } => {
+            format!("normal_return[{ordinal}]")
+        }
         AuthoredSummaryOutput::Receiver {} => "receiver".to_owned(),
         AuthoredSummaryOutput::Capture { location } => format!("capture[{location}]"),
         AuthoredSummaryOutput::Heap { location } => format!("heap[{location}]"),

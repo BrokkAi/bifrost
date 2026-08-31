@@ -552,6 +552,7 @@ fn pack_source(
                         path: language.source_path().to_owned(),
                         symbol: language.symbol(shape),
                         has_receiver: entry.boundary.has_receiver,
+                        variadic: false,
                         // The entry's own declared count, not the rendered one:
                         // a disagreement between the two is the entry's claim
                         // to answer for, and the production compiler is what
@@ -560,10 +561,16 @@ fn pack_source(
                     },
                     completeness,
                     covers_overrides: false,
+                    normal_continuation_absent: false,
+                    normal_result_count: None,
                     locations: Vec::new(),
                     transfers: entry.transfers.clone(),
                     effects: Vec::new(),
                     declared_effects: Vec::new(),
+                    preconditions: None,
+                    result_contracts: Vec::new(),
+                    conditional_result_refinements: Vec::new(),
+                    normal_return_refinements: Vec::new(),
                 }],
             },
         }],
@@ -578,6 +585,9 @@ fn pack_source(
 fn rendered_output(output: &AuthoredSummaryOutput) -> String {
     match output {
         AuthoredSummaryOutput::NormalReturn {} => "normal_return".to_owned(),
+        AuthoredSummaryOutput::IndexedNormalReturn { ordinal } => {
+            format!("normal_return[{ordinal}]")
+        }
         AuthoredSummaryOutput::ExceptionalReturn {} => "exceptional_return".to_owned(),
         AuthoredSummaryOutput::Receiver {} => "receiver".to_owned(),
         AuthoredSummaryOutput::Capture { location } => format!("capture[{location}]"),

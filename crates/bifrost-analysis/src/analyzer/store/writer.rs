@@ -17,6 +17,61 @@ use super::{
 
 const WRITER_QUEUE_CAPACITY: usize = 64;
 
+/// How the writer actor thread spends its life.
+///
+/// One actor owns the write connection for a cache path, so a saturated writer
+/// and an under-fed writer look identical from the caller's side: both show up
+/// as a slow `execute`. These separate the two, which is the difference between
+/// "tune SQLite" and "the writer is waiting for the parse pool".
+///
+/// Process-global, and deliberately so: a caller wants "what did the writer do
+/// while my phase ran", which it gets from the difference of two [`snapshot`]s.
+/// Two consequences follow. Concurrent phases against one cache share these
+/// counters, so their differences overlap rather than partition. And only
+/// [`StoreWriter::Persistent`] has an actor at all, so an ephemeral store
+/// reports zero busy time -- absence of a writer, not an idle one.
+pub(crate) mod attribution {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub(crate) static BUSY_NANOS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static IDLE_NANOS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static JOBS: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn record_idle(elapsed: std::time::Duration) {
+        IDLE_NANOS.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_job(elapsed: std::time::Duration) {
+        BUSY_NANOS.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+        JOBS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[derive(Clone, Copy)]
+    pub(crate) struct WriterAttribution {
+        pub(crate) busy_nanos: u64,
+        pub(crate) idle_nanos: u64,
+        pub(crate) jobs: u64,
+    }
+
+    pub(crate) fn snapshot() -> WriterAttribution {
+        WriterAttribution {
+            busy_nanos: BUSY_NANOS.load(Ordering::Relaxed),
+            idle_nanos: IDLE_NANOS.load(Ordering::Relaxed),
+            jobs: JOBS.load(Ordering::Relaxed),
+        }
+    }
+
+    impl WriterAttribution {
+        pub(crate) fn since(self, earlier: Self) -> Self {
+            Self {
+                busy_nanos: self.busy_nanos.saturating_sub(earlier.busy_nanos),
+                idle_nanos: self.idle_nanos.saturating_sub(earlier.idle_nanos),
+                jobs: self.jobs.saturating_sub(earlier.jobs),
+            }
+        }
+    }
+}
+
 type WriterJob = Box<dyn FnOnce(&mut Connection) + Send + 'static>;
 type WriterSlot = Arc<Mutex<Weak<PersistentWriter>>>;
 
@@ -193,11 +248,17 @@ impl PersistentWriter {
                 loop {
                     let message = match pending.pop_front() {
                         Some(message) => message,
-                        None => match receiver.recv() {
-                            Ok(message) => message,
-                            Err(_) => break,
-                        },
+                        None => {
+                            let idle = std::time::Instant::now();
+                            let received = receiver.recv();
+                            attribution::record_idle(idle.elapsed());
+                            match received {
+                                Ok(message) => message,
+                                Err(_) => break,
+                            }
+                        }
                     };
+                    let busy = std::time::Instant::now();
                     match message {
                         WriterMessage::Execute(job) => job(&mut conn),
                         WriterMessage::Repair(first) => {
@@ -225,6 +286,7 @@ impl PersistentWriter {
                             let _ = transactions;
                         }
                     }
+                    attribution::record_job(busy.elapsed());
                 }
                 ON_ANALYZER_WRITER_THREAD.with(|active| active.set(false));
             })

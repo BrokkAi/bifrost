@@ -1302,6 +1302,10 @@ const fn is_zero(value: &u64) -> bool {
 }
 
 #[cfg(test)]
+#[path = "../../../../test-support/scratch_cache.rs"]
+mod scratch_cache;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;

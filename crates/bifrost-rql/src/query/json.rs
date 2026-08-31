@@ -3,8 +3,9 @@ use super::ir::{
     CodeQueryPlan, CodeQueryPlanSource, CodeQuerySeed, ControlRelationFilter,
     DeclarationStateFilter, DecoratorBindingFilter, EdgeFilter, ExportFilter, ExportSeed,
     FlowRelationFilter, GenerationSiteFilter, GenerationSiteSeed, HierarchyTraversal,
-    OccurrenceFilter, OccurrenceSeed, PathSeed, Pattern, QueryStep, RewritePathFilter, ScopeFilter,
-    ScopeSeed, StateEventFilter, StringPredicate, UNATTRIBUTED_TIER_LABEL,
+    OccurrenceFilter, OccurrenceSeed, PathSeed, Pattern, QueryStep, ResultContractFailureUseFilter,
+    RewritePathFilter, ScopeFilter, ScopeSeed, StateEventFilter, StringPredicate,
+    UNATTRIBUTED_TIER_LABEL,
 };
 use super::schema::{
     CallTraversalCompleteness, QueryStepField, reference_kind_label, usage_proof_label,
@@ -316,6 +317,37 @@ pub(super) fn flow_relation_filter_to_json(filter: &FlowRelationFilter) -> Map<S
                     .certainties
                     .iter()
                     .map(|certainty| json!(certainty.label()))
+                    .collect(),
+            ),
+        );
+    }
+    object
+}
+
+pub(super) fn result_contract_failure_use_filter_to_json(
+    filter: &ResultContractFailureUseFilter,
+) -> Map<String, Value> {
+    let mut object = Map::new();
+    if !filter.provenances.is_empty() {
+        object.insert(
+            QueryStepField::FailureUseProvenances.label().to_string(),
+            Value::Array(
+                filter
+                    .provenances
+                    .iter()
+                    .map(|provenance| json!(provenance.label()))
+                    .collect(),
+            ),
+        );
+    }
+    if !filter.consumers.is_empty() {
+        object.insert(
+            QueryStepField::FailureUseConsumers.label().to_string(),
+            Value::Array(
+                filter
+                    .consumers
+                    .iter()
+                    .map(|consumer| json!(consumer.label()))
                     .collect(),
             ),
         );
@@ -755,10 +787,15 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         | QueryStep::ReceiverOutcome
         | QueryStep::ReceiverEvidence
         | QueryStep::CallShape
+        | QueryStep::CallResults
         | QueryStep::CallArgumentGroups
         | QueryStep::CallArguments
         | QueryStep::CallBindings
         | QueryStep::CallEffects
+        | QueryStep::ResultContractCalls
+        | QueryStep::CallResultContracts
+        | QueryStep::ResultContractUses
+        | QueryStep::ResultContractOperationUses
         | QueryStep::ProcedureEffects
         | QueryStep::CallableSignature
         | QueryStep::SignatureParameters
@@ -784,6 +821,9 @@ fn query_step_to_json(step: &QueryStep) -> Value {
         }
         QueryStep::FlowRelationsOf(filter) => {
             object.extend(flow_relation_filter_to_json(filter));
+        }
+        QueryStep::ResultContractFailureUses(filter) => {
+            object.extend(result_contract_failure_use_filter_to_json(filter));
         }
         QueryStep::ControlRelations(filter) => {
             object.extend(control_relation_filter_to_json(filter));

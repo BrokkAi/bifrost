@@ -5,7 +5,8 @@
 //! its method set, with nothing written at either declaration site.
 
 use crate::declarations::{
-    determine_go_package_name, go_field_declaration_is_embedded, go_node_text,
+    determine_go_package_name, go_field_declaration_is_embedded, go_identifier_is_exported,
+    go_node_text, is_predeclared_go_type,
 };
 use crate::imports::{default_go_import_local_name, go_import_path};
 use crate::packages::canonical_go_package_name;
@@ -35,9 +36,60 @@ struct GoTypeInfo {
     method_set: MethodSet,
     pointer_method_set: MethodSet,
     own_method_names: HashSet<String>,
+    /// Every method this type declares itself, in declaration order: the key
+    /// that decides satisfaction and the plain identifier that joins the key
+    /// back to the declaration's own `CodeUnit`.
+    declared_methods: Vec<DeclaredMethod>,
+    /// The `CodeUnit` of each declared method, once [`GoHierarchyBuilder::
+    /// resolve_member_units`] has joined `declared_methods` against the
+    /// analyzer's declarations. A method whose declaration the index never
+    /// recorded is simply absent, which removes it from the member family
+    /// rather than guessing a unit for it.
+    method_units: HashMap<MethodKey, CodeUnit>,
     embedded: Vec<EmbeddedType>,
     alias_target: Option<String>,
     has_type_terms: bool,
+}
+
+/// One method declaration as the satisfaction pass reads it.
+#[derive(Clone, Debug)]
+struct DeclaredMethod {
+    key: MethodKey,
+    identifier: String,
+}
+
+/// One member-level family edge: the member at the other end of the edge and
+/// the type that declares it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GoMemberFamilyEdge {
+    pub member: CodeUnit,
+    pub owner: CodeUnit,
+}
+
+/// What this index can state about one Go method's interface family.
+///
+/// Go has no override chains and nothing is written at either declaration
+/// site: a type satisfies an interface exactly when its method set covers the
+/// interface's. The member family is that same proof read one level down --
+/// which of the satisfying type's methods answers each interface method --
+/// so an edge exists only where the two method keys are equal, never where
+/// two names merely agree.
+#[derive(Clone, Debug)]
+pub enum GoMemberFamily {
+    /// The member is not a Go method this index recorded, so it has no
+    /// interface family to state.
+    NotTracked,
+    /// The member is a method this index recorded, but the satisfaction pass
+    /// did not enumerate its family exhaustively: a source file did not parse,
+    /// the workspace exceeded the satisfaction pair cap, or the owning
+    /// interface carries type terms the pass skips.
+    NotEnumerable,
+    /// The complete family over the indexed workspace: the interface methods
+    /// this member implements, and the members that implement it.
+    Proven {
+        implements: Vec<GoMemberFamilyEdge>,
+        implemented_by: Vec<GoMemberFamilyEdge>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -56,6 +108,21 @@ pub struct GoHierarchyIndex {
     direct_ancestors: HashMap<String, Vec<CodeUnit>>,
     direct_descendants: HashMap<String, HashSet<CodeUnit>>,
     supported: HashSet<String>,
+    /// Concrete method -> the interface methods it implements.
+    member_implements: HashMap<String, Vec<GoMemberFamilyEdge>>,
+    /// Interface method -> the concrete methods that implement it. Built by
+    /// indexing the same pair vector `member_implements` is built from, so the
+    /// two directions cannot disagree.
+    member_implemented_by: HashMap<String, Vec<GoMemberFamilyEdge>>,
+    /// Methods whose family the satisfaction pass enumerated.
+    tracked_methods: HashSet<String>,
+    /// Methods of an interface the satisfaction pass skipped, so their family
+    /// was never enumerated even though the declaration was recorded.
+    unenumerated_methods: HashSet<String>,
+    /// Whether the satisfaction pass saw the whole workspace. False when a
+    /// file did not parse or the pair cap fired, in which case no member's
+    /// family can be stated as exhaustive.
+    enumeration_complete: bool,
     #[cfg(any(test, feature = "test-support"))]
     relations: Vec<TypeRelation>,
 }
@@ -89,6 +156,33 @@ impl GoHierarchyIndex {
         self.supported.contains(&code_unit.fq_name())
     }
 
+    /// One method's complete interface family, or the honest reason this index
+    /// cannot state it.
+    pub fn member_family(&self, member: &CodeUnit) -> GoMemberFamily {
+        let fq_name = member.fq_name();
+        if self.unenumerated_methods.contains(&fq_name) {
+            return GoMemberFamily::NotEnumerable;
+        }
+        if !self.tracked_methods.contains(&fq_name) {
+            return GoMemberFamily::NotTracked;
+        }
+        if !self.enumeration_complete {
+            return GoMemberFamily::NotEnumerable;
+        }
+        GoMemberFamily::Proven {
+            implements: self
+                .member_implements
+                .get(&fq_name)
+                .cloned()
+                .unwrap_or_default(),
+            implemented_by: self
+                .member_implemented_by
+                .get(&fq_name)
+                .cloned()
+                .unwrap_or_default(),
+        }
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     #[allow(dead_code)]
     pub fn relations(&self) -> &[TypeRelation] {
@@ -113,6 +207,10 @@ struct GoHierarchyBuilder<'a> {
     types: HashMap<String, GoTypeInfo>,
     aliases: HashMap<String, String>,
     alias_units: HashMap<String, CodeUnit>,
+    /// Whether every analyzed Go file was read and parsed. A skipped file can
+    /// hold a type that satisfies an interface, so the member family it would
+    /// have contributed to is not exhaustive.
+    all_files_parsed: bool,
     #[cfg(any(test, feature = "test-support"))]
     relations: Vec<TypeRelation>,
 }
@@ -131,6 +229,7 @@ impl<'a> GoHierarchyBuilder<'a> {
             types: HashMap::default(),
             aliases: HashMap::default(),
             alias_units: HashMap::default(),
+            all_files_parsed: true,
             #[cfg(any(test, feature = "test-support"))]
             relations: Vec::new(),
         }
@@ -144,6 +243,7 @@ impl<'a> GoHierarchyBuilder<'a> {
         self.resolve_aliases();
         self.propagate_type_terms();
         self.promote_embedded_methods();
+        self.resolve_member_units();
     }
 
     fn finish(self) -> GoHierarchyIndex {
@@ -152,11 +252,11 @@ impl<'a> GoHierarchyBuilder<'a> {
         #[cfg(any(test, feature = "test-support"))]
         let mut relations = self.relations;
 
-        let interfaces: Vec<_> = self
+        let interfaces: Vec<(String, GoTypeInfo)> = self
             .types
-            .values()
-            .filter(|info| info.kind == GoTypeKind::Interface)
-            .cloned()
+            .iter()
+            .filter(|(_fqn, info)| info.kind == GoTypeKind::Interface)
+            .map(|(fqn, info)| (fqn.clone(), info.clone()))
             .collect();
 
         for info in self.types.values() {
@@ -172,15 +272,45 @@ impl<'a> GoHierarchyBuilder<'a> {
             .count();
         let interface_count = interfaces
             .iter()
-            .filter(|info| !info.has_type_terms && !info.method_set.methods.is_empty())
+            .filter(|(_fqn, info)| !info.has_type_terms && !info.method_set.methods.is_empty())
             .count();
-        if concrete_count.saturating_mul(interface_count) <= MAX_STRUCTURAL_SATISFACTION_PAIRS {
-            for concrete in self
-                .types
-                .values()
-                .filter(|info| info.kind == GoTypeKind::Concrete && info.alias_target.is_none())
-            {
-                for interface in &interfaces {
+        let dispatch_units = dispatch_member_units(&self.types);
+        let mut member_implements: HashMap<String, Vec<GoMemberFamilyEdge>> = HashMap::default();
+        let mut member_implemented_by: HashMap<String, Vec<GoMemberFamilyEdge>> =
+            HashMap::default();
+        // Every method key required by an interface the satisfaction pass
+        // skips. A method that answers one of those keys has a family the pass
+        // never enumerated -- on the interface's side because its declaration
+        // was skipped, and on the implementor's side because the forward edge
+        // to it was never emitted -- so both ends say so instead of publishing
+        // a set that silently omits the skipped interface.
+        let skipped_interface_keys: HashSet<MethodKey> = interfaces
+            .iter()
+            .filter(|(_fqn, info)| info.has_type_terms)
+            .flat_map(|(_fqn, info)| info.method_set.methods.iter().cloned())
+            .collect();
+        let mut tracked_methods = HashSet::default();
+        let mut unenumerated_methods = HashSet::default();
+        for info in self.types.values() {
+            for (key, member) in &info.method_units {
+                let unenumerable = (info.kind == GoTypeKind::Interface && info.has_type_terms)
+                    || skipped_interface_keys.contains(key);
+                if unenumerable {
+                    unenumerated_methods.insert(member.fq_name());
+                } else {
+                    tracked_methods.insert(member.fq_name());
+                }
+            }
+        }
+
+        let pairs_within_cap =
+            concrete_count.saturating_mul(interface_count) <= MAX_STRUCTURAL_SATISFACTION_PAIRS;
+        if pairs_within_cap {
+            for (concrete_fqn, concrete) in self.types.iter().filter(|(_fqn, info)| {
+                info.kind == GoTypeKind::Concrete && info.alias_target.is_none()
+            }) {
+                let concrete_dispatch = dispatch_units.get(concrete_fqn);
+                for (interface_fqn, interface) in &interfaces {
                     if interface.has_type_terms
                         || interface.method_set.methods.len() == EMPTY_INTERFACE_DESCENDANT_CAP
                     {
@@ -195,16 +325,28 @@ impl<'a> GoHierarchyBuilder<'a> {
                             &interface.unit,
                         );
                     }
+                    let (Some(concrete_dispatch), Some(interface_dispatch)) =
+                        (concrete_dispatch, dispatch_units.get(interface_fqn))
+                    else {
+                        continue;
+                    };
+                    record_member_family(
+                        &mut member_implements,
+                        &mut member_implemented_by,
+                        &interface.method_set,
+                        interface_dispatch,
+                        concrete_dispatch,
+                    );
                 }
             }
         }
 
         if interface_count.saturating_mul(interface_count) <= MAX_STRUCTURAL_SATISFACTION_PAIRS {
-            for candidate in interfaces
+            for (_candidate_fqn, candidate) in interfaces
                 .iter()
-                .filter(|info| !info.has_type_terms && info.alias_target.is_none())
+                .filter(|(_fqn, info)| !info.has_type_terms && info.alias_target.is_none())
             {
-                for interface in &interfaces {
+                for (_interface_fqn, interface) in &interfaces {
                     if interface.has_type_terms
                         || interface.method_set.methods.len() == EMPTY_INTERFACE_DESCENDANT_CAP
                         || interface.unit == candidate.unit
@@ -249,10 +391,23 @@ impl<'a> GoHierarchyBuilder<'a> {
             }
         }
 
+        for edges in member_implements
+            .values_mut()
+            .chain(member_implemented_by.values_mut())
+        {
+            edges.sort_by(|left, right| left.member.cmp(&right.member));
+            edges.dedup();
+        }
+
         GoHierarchyIndex {
             direct_ancestors,
             direct_descendants,
             supported,
+            member_implements,
+            member_implemented_by,
+            tracked_methods,
+            unenumerated_methods,
+            enumeration_complete: self.all_files_parsed && pairs_within_cap,
             #[cfg(any(test, feature = "test-support"))]
             relations,
         }
@@ -266,6 +421,7 @@ impl<'a> GoHierarchyBuilder<'a> {
         let mut declared_names = HashMap::default();
         for file in files {
             let Ok(source) = self.index.project().read_source(&file) else {
+                self.all_files_parsed = false;
                 continue;
             };
             let mut parser = Parser::new();
@@ -273,9 +429,11 @@ impl<'a> GoHierarchyBuilder<'a> {
                 .set_language(&tree_sitter_go::LANGUAGE.into())
                 .is_err()
             {
+                self.all_files_parsed = false;
                 continue;
             }
             let Some(tree) = parser.parse(source.as_str(), None) else {
+                self.all_files_parsed = false;
                 continue;
             };
             let declared_name = determine_go_package_name(tree.root_node(), &source);
@@ -349,6 +507,8 @@ impl<'a> GoHierarchyBuilder<'a> {
             method_set: MethodSet::new(unit.clone()),
             pointer_method_set: MethodSet::new(unit.clone()),
             own_method_names: HashSet::default(),
+            declared_methods: Vec::new(),
+            method_units: HashMap::default(),
             unit,
             kind,
             embedded: Vec::new(),
@@ -360,7 +520,7 @@ impl<'a> GoHierarchyBuilder<'a> {
     fn collect_type_details(&mut self) {
         self.collect_aliases();
         let mut embedded_by_type: HashMap<String, Vec<EmbeddedType>> = HashMap::default();
-        let mut methods_by_type: HashMap<String, Vec<MethodKey>> = HashMap::default();
+        let mut methods_by_type: HashMap<String, Vec<DeclaredMethod>> = HashMap::default();
         let mut has_type_terms = HashSet::default();
 
         for file in &self.files {
@@ -424,7 +584,8 @@ impl<'a> GoHierarchyBuilder<'a> {
         for (fqn, methods) in methods_by_type {
             if let Some(info) = self.types.get_mut(&fqn) {
                 for method in methods {
-                    info.method_set.insert(method);
+                    info.method_set.insert(method.key.clone());
+                    info.declared_methods.push(method);
                 }
             }
         }
@@ -480,7 +641,7 @@ impl<'a> GoHierarchyBuilder<'a> {
         file: &ParsedGoFile,
         node: Node<'_>,
         embedded: &mut Vec<EmbeddedType>,
-        methods: &mut Vec<MethodKey>,
+        methods: &mut Vec<DeclaredMethod>,
         has_type_terms: &mut HashSet<String>,
     ) {
         let mut cursor = node.walk();
@@ -543,7 +704,7 @@ impl<'a> GoHierarchyBuilder<'a> {
     }
 
     fn collect_methods(&mut self) {
-        let mut additions: Vec<(String, bool, MethodKey)> = Vec::new();
+        let mut additions: Vec<(String, bool, DeclaredMethod)> = Vec::new();
         for file in &self.files {
             let mut stack = vec![file.root.root_node()];
             while let Some(node) = stack.pop() {
@@ -566,11 +727,12 @@ impl<'a> GoHierarchyBuilder<'a> {
                 && info.kind == GoTypeKind::Concrete
             {
                 if pointer_receiver {
-                    info.pointer_method_set.insert(method);
+                    info.pointer_method_set.insert(method.key.clone());
                 } else {
-                    info.own_method_names.insert(method.name.clone());
-                    info.method_set.insert(method);
+                    info.own_method_names.insert(method.key.name.clone());
+                    info.method_set.insert(method.key.clone());
                 }
+                info.declared_methods.push(method);
             }
         }
     }
@@ -579,7 +741,7 @@ impl<'a> GoHierarchyBuilder<'a> {
         &self,
         file: &ParsedGoFile,
         node: Node<'_>,
-    ) -> Option<(String, bool, MethodKey)> {
+    ) -> Option<(String, bool, DeclaredMethod)> {
         let receiver = node.child_by_field_name("receiver")?;
         let receiver_type = receiver_type_node(receiver)?;
         let pointer_receiver = receiver_type.kind() == "pointer_type";
@@ -588,6 +750,56 @@ impl<'a> GoHierarchyBuilder<'a> {
             self.type_token(file, ty)
         })?;
         Some((receiver_fqn, pointer_receiver, method))
+    }
+
+    /// Join every declared method key to the `CodeUnit` the analyzer recorded
+    /// for that declaration.
+    ///
+    /// The join is by owning type and terminal identifier rather than by a
+    /// reconstructed fully-qualified name, because a Go method lives in a file
+    /// of its own: `direct_children` reads one file's children, and a package
+    /// routinely declares `type Worker` in one file and `func (Worker) Run` in
+    /// another. Go has no method overloading, so an owner and an identifier
+    /// name at most one method, and the key that decides satisfaction is
+    /// carried alongside rather than rebuilt from the unit.
+    fn resolve_member_units(&mut self) {
+        let mut by_owner: HashMap<(String, String), CodeUnit> = HashMap::default();
+        for file in &self.files {
+            for unit in self.index.declarations(&file.file) {
+                if !unit.is_function() {
+                    continue;
+                }
+                let Some(owner) = unit.owner_identifier() else {
+                    continue;
+                };
+                let key = (
+                    format!("{}.{owner}", file.package_name),
+                    unit.identifier().to_string(),
+                );
+                by_owner.entry(key).or_insert(unit);
+            }
+        }
+        let resolved: Vec<(String, HashMap<MethodKey, CodeUnit>)> = self
+            .types
+            .iter()
+            .map(|(fqn, info)| {
+                let units = info
+                    .declared_methods
+                    .iter()
+                    .filter_map(|declared| {
+                        by_owner
+                            .get(&(fqn.clone(), declared.identifier.clone()))
+                            .map(|unit| (declared.key.clone(), unit.clone()))
+                    })
+                    .collect();
+                (fqn.clone(), units)
+            })
+            .collect();
+        for (fqn, units) in resolved {
+            if let Some(info) = self.types.get_mut(&fqn) {
+                info.method_units = units;
+            }
+        }
     }
 
     fn resolve_aliases(&mut self) {
@@ -851,16 +1063,17 @@ fn method_key(
     source: &str,
     package_name: &str,
     mut type_token: impl FnMut(Node<'_>) -> String,
-) -> Option<MethodKey> {
+) -> Option<DeclaredMethod> {
     let name_node = node.child_by_field_name("name")?;
-    let name = go_node_text(name_node, source).trim();
-    if name.is_empty() {
+    let identifier = go_node_text(name_node, source).trim();
+    if identifier.is_empty() {
         return None;
     }
-    let name = if is_exported_go_identifier(name) {
-        name.to_string()
+    let identifier = identifier.to_string();
+    let name = if go_identifier_is_exported(&identifier) {
+        identifier.clone()
     } else {
-        format!("{package_name}.{name}")
+        format!("{package_name}.{identifier}")
     };
     let mut tokens = Vec::new();
     if let Some(parameters) = node.child_by_field_name("parameters") {
@@ -877,7 +1090,10 @@ fn method_key(
         };
         tokens.push(format!("results({})", result_types.join(",")));
     }
-    Some(MethodKey::new(name, Some(tokens.join(" "))))
+    Some(DeclaredMethod {
+        key: MethodKey::new(name, Some(tokens.join(" "))),
+        identifier,
+    })
 }
 
 fn parameter_type_tokens(
@@ -1141,40 +1357,6 @@ fn path_suffix_matches(path: &std::path::Path, suffix: &str) -> bool {
     parent == suffix || parent.ends_with(&format!("/{suffix}"))
 }
 
-fn is_exported_go_identifier(name: &str) -> bool {
-    name.chars()
-        .next()
-        .is_some_and(|first| first.is_uppercase())
-}
-
-fn is_predeclared_go_type(name: &str) -> bool {
-    matches!(
-        name,
-        "any"
-            | "bool"
-            | "byte"
-            | "comparable"
-            | "complex64"
-            | "complex128"
-            | "error"
-            | "float32"
-            | "float64"
-            | "int"
-            | "int8"
-            | "int16"
-            | "int32"
-            | "int64"
-            | "rune"
-            | "string"
-            | "uint"
-            | "uint8"
-            | "uint16"
-            | "uint32"
-            | "uint64"
-            | "uintptr"
-    )
-}
-
 fn channel_direction(node: Node<'_>) -> &'static str {
     let mut chan_start = None;
     let mut arrow_start = None;
@@ -1210,6 +1392,150 @@ fn external_qualified_type_token(file: &ParsedGoFile, node: Node<'_>) -> Option<
 
 fn method_set_satisfies(candidate: &MethodSet, required: &MethodSet) -> bool {
     candidate.satisfies_with(required, |candidate, required| candidate == required)
+}
+
+/// Every method key each type answers, and the declaration that answers it.
+///
+/// This is the *dispatch* surface, which is deliberately wider than the value
+/// method set the type relation above is built from. A Go method with a
+/// pointer receiver is not in `T`'s method set, so `T` does not satisfy the
+/// interface -- but `*T` does, and the code that runs when the interface
+/// method is called is still that pointer-receiver declaration. Class-
+/// hierarchy analysis asks which members could run, so it must see them; the
+/// subtype relation asks whether `T` itself is assignable, so it must not.
+///
+/// A key the type does not declare is resolved through the embedding graph
+/// breadth-first, and only when exactly one embedded type answers it at the
+/// nearest depth -- the same shallowest-and-unique rule Go promotion uses, and
+/// the same one [`struct_promoted_methods`] applies to the key set. A name the
+/// type redeclares with a different signature shadows the embedded method
+/// rather than promoting it.
+fn dispatch_member_units(
+    types: &HashMap<String, GoTypeInfo>,
+) -> HashMap<String, HashMap<MethodKey, GoMemberFamilyEdge>> {
+    types
+        .iter()
+        .map(|(fqn, info)| {
+            let mut units: HashMap<MethodKey, GoMemberFamilyEdge> = info
+                .method_units
+                .iter()
+                .map(|(key, member)| {
+                    (
+                        key.clone(),
+                        GoMemberFamilyEdge {
+                            member: member.clone(),
+                            owner: info.unit.clone(),
+                        },
+                    )
+                })
+                .collect();
+            for key in info
+                .method_set
+                .methods
+                .iter()
+                .chain(info.pointer_method_set.methods.iter())
+            {
+                if units.contains_key(key) {
+                    continue;
+                }
+                if let Some(promoted) = promoted_member(types, info, key) {
+                    units.insert(key.clone(), promoted);
+                }
+            }
+            (fqn.clone(), units)
+        })
+        .collect()
+}
+
+/// The single embedded declaration that answers `key` on `info`, at the
+/// nearest embedding depth. `None` when the type shadows the name, when no
+/// embedded type answers, or when two answer at the same depth -- the
+/// ambiguity Go itself rejects.
+fn promoted_member(
+    types: &HashMap<String, GoTypeInfo>,
+    info: &GoTypeInfo,
+    key: &MethodKey,
+) -> Option<GoMemberFamilyEdge> {
+    if info.own_method_names.contains(&key.name) {
+        return None;
+    }
+    let mut frontier: Vec<(String, Vec<String>)> = info
+        .embedded
+        .iter()
+        .map(|embedded| (embedded.fqn.clone(), Vec::new()))
+        .collect();
+    while !frontier.is_empty() {
+        let mut found: Vec<GoMemberFamilyEdge> = Vec::new();
+        let mut next = Vec::new();
+        for (fqn, path) in frontier {
+            if path.contains(&fqn) {
+                continue;
+            }
+            let Some(embedded_info) = types.get(&fqn) else {
+                continue;
+            };
+            if let Some(member) = embedded_info.method_units.get(key) {
+                found.push(GoMemberFamilyEdge {
+                    member: member.clone(),
+                    owner: embedded_info.unit.clone(),
+                });
+                continue;
+            }
+            let mut next_path = path;
+            next_path.push(fqn);
+            for nested in &embedded_info.embedded {
+                next.push((nested.fqn.clone(), next_path.clone()));
+            }
+        }
+        if found.len() == 1 {
+            return found.pop();
+        }
+        if !found.is_empty() {
+            return None;
+        }
+        frontier = next;
+    }
+    None
+}
+
+/// Record the member-level family of one satisfying (concrete type,
+/// interface) pair, in both directions from the same pass.
+///
+/// The pair contributes edges only when the concrete type's dispatch surface
+/// answers *every* method the interface requires, which is the same covering
+/// condition [`method_set_satisfies`] states for types, evaluated over the
+/// dispatch surface. Each edge then joins the declaration that requires the
+/// key to the declaration that answers it: two declarations whose method keys
+/// -- name plus resolved parameter and result type tokens -- are equal.
+fn record_member_family(
+    member_implements: &mut HashMap<String, Vec<GoMemberFamilyEdge>>,
+    member_implemented_by: &mut HashMap<String, Vec<GoMemberFamilyEdge>>,
+    required: &MethodSet,
+    interface_dispatch: &HashMap<MethodKey, GoMemberFamilyEdge>,
+    concrete_dispatch: &HashMap<MethodKey, GoMemberFamilyEdge>,
+) {
+    if !required
+        .methods
+        .iter()
+        .all(|key| concrete_dispatch.contains_key(key))
+    {
+        return;
+    }
+    for key in &required.methods {
+        let (Some(declared), Some(implementor)) =
+            (interface_dispatch.get(key), concrete_dispatch.get(key))
+        else {
+            continue;
+        };
+        member_implements
+            .entry(implementor.member.fq_name())
+            .or_default()
+            .push(declared.clone());
+        member_implemented_by
+            .entry(declared.member.fq_name())
+            .or_default()
+            .push(implementor.clone());
+    }
 }
 
 fn record_structural_relation(

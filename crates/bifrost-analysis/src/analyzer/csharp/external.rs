@@ -1223,6 +1223,7 @@ impl CSharpAssemblyPackProducer {
                     is_static: member.is_static,
                     is_abstract: member.is_abstract,
                     is_virtual: member.is_virtual,
+                    callable_family_complete: false,
                     signature: Some(Signature {
                         type_parameters: member.type_parameters.clone(),
                         parameters: parameter_types

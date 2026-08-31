@@ -45,8 +45,9 @@ use crate::NavigationOperation;
 use crate::analyzer::semantic::WorkspaceRelativePath;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerQueryScope, BIFROST_IGNORE_FILE_NAME, BuildProgressEvent,
-    BuildProgressPhase, FilesystemProject, IndexWarmer, MultiRootProject, OverlayProject, Project,
-    ProjectFile, PythonAnalyzerConfig, PythonEnvironmentConfig, WorkspaceAnalyzer,
+    BuildProgressPhase, EmptyAnalyzer, FilesystemProject, IndexWarmer, MultiRootProject,
+    OverlayProject, Project, ProjectFile, PythonAnalyzerConfig, PythonEnvironmentConfig,
+    WorkspaceAnalyzer,
     packs_document::{
         WORKSPACE_PACKS_DOCUMENT_PATH, WorkspacePacksConfig, load_workspace_packs_config_at,
         workspace_pack_ecosystems,
@@ -1786,10 +1787,14 @@ fn run_rql_query_result(
                     CodeQueryResultValue::MemberFamilyEdge { value } => &value.path,
                     CodeQueryResultValue::ReceiverEvidence { value } => &value.path,
                     CodeQueryResultValue::CallShape { value } => &value.path,
+                    CodeQueryResultValue::CallResult { value } => &value.path,
                     CodeQueryResultValue::CallArgumentGroup { value } => &value.path,
                     CodeQueryResultValue::CallArgument { value } => &value.path,
                     CodeQueryResultValue::CallBinding { value } => &value.path,
                     CodeQueryResultValue::CallEffect { value } => &value.path,
+                    CodeQueryResultValue::CallResultContract { value } => &value.path,
+                    CodeQueryResultValue::ResultContractUse { value } => &value.path,
+                    CodeQueryResultValue::ResultContractFailureUse { value } => &value.path,
                     CodeQueryResultValue::ProcedureEffect { value } => &value.path,
                     CodeQueryResultValue::CallableSignature { value } => &value.path,
                     CodeQueryResultValue::SignatureParameter { value } => &value.path,
@@ -4085,6 +4090,15 @@ fn build_workspace_for_lsp(
     progress: Option<&StartupProgress>,
     python_pack: Option<&LspPythonPackConfig>,
 ) -> Result<WorkspaceAnalyzer, String> {
+    // A session with no workspace roots has nothing to analyze and no identity
+    // to persist under: it *is* the empty analyzer, so build it directly rather
+    // than asking the engine for a store at all. The engine hard-errors on a
+    // persisted build over a project with no `persistence_root`, and after the
+    // multi-root work only `NoWorkspaceProject` (the zero-roots rebuild in
+    // `prepare_workspace_rebuild`) can still reach here rootless.
+    if project.persistence_root().is_none() {
+        return Ok(WorkspaceAnalyzer::Empty(EmptyAnalyzer::new(project)));
+    }
     let config = lsp_analyzer_config(python_pack);
     let workspace = match progress {
         Some(progress) => {
@@ -4487,6 +4501,45 @@ mod tests {
     use super::*;
     use lsp_types::notification::Progress;
     use serde_json::json;
+
+    /// A session with zero workspace roots has nothing to analyze and no
+    /// identity to cache under, so it must build the empty analyzer directly
+    /// rather than asking the engine for a persisted store it would refuse.
+    /// This is the shape `prepare_workspace_rebuild` produces when an editor
+    /// removes the last folder: `NoWorkspaceProject` under the same overlay a
+    /// rooted rebuild uses.
+    #[test]
+    fn zero_root_rebuild_builds_an_empty_analyzer_with_no_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let project: Arc<dyn Project> =
+            Arc::new(OverlayProject::new(Arc::new(NoWorkspaceProject::new(root))));
+        assert!(project.persistence_root().is_none());
+
+        let workspace = build_workspace_for_lsp(project, None, None)
+            .expect("a zero-root rebuild must not fail the session");
+
+        assert!(
+            workspace.persisted_store_path().is_none(),
+            "an empty session must persist nothing"
+        );
+        assert!(matches!(workspace, WorkspaceAnalyzer::Empty(_)));
+        assert!(
+            workspace
+                .analyzer()
+                .definitions("anything")
+                .next()
+                .is_none()
+        );
+        assert!(
+            workspace
+                .analyzer()
+                .project()
+                .all_files()
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     #[test]
     fn runtime_configuration_accepts_direct_and_nested_full_snapshots() {
@@ -4923,8 +4976,9 @@ mod tests {
         )
         .unwrap();
         let project: Arc<dyn Project> = Arc::new(FilesystemProject::new(temp.path()).unwrap());
-        let workspace = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
-            .expect("ephemeral workspace should build");
+        let workspace =
+            WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
+                .expect("ephemeral workspace should build");
         let range = CodeQueryRange {
             start_line: 1,
             start_column: 1,
@@ -5022,8 +5076,9 @@ mod tests {
         )
         .unwrap();
         let project: Arc<dyn Project> = Arc::new(FilesystemProject::new(temp.path()).unwrap());
-        let workspace = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
-            .expect("ephemeral workspace should build");
+        let workspace =
+            WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
+                .expect("ephemeral workspace should build");
         let parameter_range = CodeQueryRange {
             start_line: 1,
             start_column: 26,
@@ -5049,6 +5104,7 @@ mod tests {
                         decorator_range,
                         owner_id: Some("Controller.handle".to_string()),
                         procedure_id: Some("procedure".to_string()),
+                        value_id: Some("value".to_string()),
                         parameter_ordinal: Some(0),
                         port_id: Some("procedure:parameter:0".to_string()),
                         decorator_name: "Query".to_string(),
@@ -5088,6 +5144,7 @@ mod tests {
             value.pointer("/results/0/decorator_range"),
             Some(&serde_json::to_value(decorator_range).unwrap())
         );
+        assert_eq!(value.pointer("/results/0/value_id"), Some(&json!("value")));
         assert_eq!(
             value.pointer("/results/0/parameter_ordinal"),
             Some(&json!(0))

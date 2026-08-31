@@ -1734,6 +1734,32 @@ fn call_shape_projects_typed_group_and_argument_rows() {
 }
 
 #[test]
+fn call_results_project_typed_indexed_normal_ports() {
+    let rql = CodeQuery::from_sexp(r#"(call-results (call-shape (call :callee "open")))"#)
+        .expect("call result RQL");
+    assert_eq!(rql.validate_steps().unwrap(), QueryValueKind::CallResult);
+    assert_eq!(rql.schema_version, SCHEMA_VERSION);
+
+    let json = parse_ok(json!({
+        "schema_version": SCHEMA_VERSION,
+        "match": { "kind": "call", "callee": { "name": "open" } },
+        "steps": [
+            { "op": "call_shape" },
+            { "op": "call_results" }
+        ]
+    }));
+    assert_eq!(json.validate_steps().unwrap(), QueryValueKind::CallResult);
+    assert_eq!(rql.to_canonical_json(), json.to_canonical_json());
+
+    let wrong = CodeQuery::from_json(&json!({
+        "match": { "kind": "call" },
+        "steps": [{ "op": "call_results" }]
+    }))
+    .expect_err("call_results must reject a structural upstream");
+    assert!(wrong.message.contains("requires call_shape"), "{wrong:?}");
+}
+
+#[test]
 fn call_bindings_project_typed_actual_to_formal_rows() {
     let rql = CodeQuery::from_sexp(r#"(call-bindings (call-shape (call :callee "run")))"#)
         .expect("call binding RQL");
@@ -1874,6 +1900,258 @@ fn effect_steps_project_typed_call_and_procedure_effect_rows() {
         }));
         assert_eq!(files.validate_steps().unwrap(), QueryValueKind::File);
     }
+}
+
+#[test]
+fn call_result_contracts_project_a_typed_row_from_call_shape() {
+    let rql = CodeQuery::from_sexp(r#"(call-result-contracts (call-shape (call :callee "Open")))"#)
+        .expect("call result contract RQL");
+    assert_eq!(
+        rql.validate_steps().unwrap(),
+        QueryValueKind::CallResultContract
+    );
+
+    let json = parse_ok(json!({
+        "schema_version": SCHEMA_VERSION,
+        "match": { "kind": "call", "callee": { "name": "Open" } },
+        "steps": [
+            { "op": "call_shape" },
+            { "op": "call_result_contracts" }
+        ]
+    }));
+    assert_eq!(
+        json.validate_steps().unwrap(),
+        QueryValueKind::CallResultContract
+    );
+    assert_eq!(rql.to_canonical_json(), json.to_canonical_json());
+
+    let wrong = CodeQuery::from_json(&json!({
+        "match": { "kind": "call" },
+        "steps": [{ "op": "call_result_contracts" }]
+    }))
+    .expect_err("call_result_contracts must reject a structural upstream");
+    assert!(
+        wrong.message.contains("requires call_shape"),
+        "{}",
+        wrong.message
+    );
+
+    let files = parse_ok(json!({
+        "match": { "kind": "call", "callee": { "name": "Open" } },
+        "steps": [
+            { "op": "call_shape" },
+            { "op": "call_result_contracts" },
+            { "op": "file_of" }
+        ]
+    }));
+    assert_eq!(files.validate_steps().unwrap(), QueryValueKind::File);
+}
+
+#[test]
+fn result_contract_uses_enriches_a_contract_row_without_changing_its_type() {
+    let rql = CodeQuery::from_sexp(
+        r#"(result-contract-uses (call-result-contracts (call-shape (call :callee "Open"))))"#,
+    )
+    .expect("result contract use validation RQL");
+    assert_eq!(
+        rql.validate_steps().unwrap(),
+        QueryValueKind::CallResultContract
+    );
+
+    let json = parse_ok(json!({
+        "schema_version": SCHEMA_VERSION,
+        "match": { "kind": "call", "callee": { "name": "Open" } },
+        "steps": [
+            { "op": "call_shape" },
+            { "op": "call_result_contracts" },
+            { "op": "result_contract_uses" }
+        ]
+    }));
+    assert_eq!(
+        json.validate_steps().unwrap(),
+        QueryValueKind::CallResultContract
+    );
+    assert_eq!(rql.to_canonical_json(), json.to_canonical_json());
+
+    let wrong = CodeQuery::from_json(&json!({
+        "match": { "kind": "call" },
+        "steps": [
+            { "op": "call_shape" },
+            { "op": "result_contract_uses" }
+        ]
+    }))
+    .expect_err("result_contract_uses must reject a call-shape upstream");
+    assert!(
+        wrong.message.contains("requires call_result_contract"),
+        "{}",
+        wrong.message
+    );
+}
+
+#[test]
+fn result_contract_operation_uses_project_typed_operation_rows() {
+    let rql = CodeQuery::from_sexp(
+        r#"(result-contract-operation-uses (call-result-contracts (call-shape (call :callee "Open"))))"#,
+    )
+    .expect("result contract operation-use RQL");
+    assert_eq!(
+        rql.validate_steps().unwrap(),
+        QueryValueKind::ResultContractUse
+    );
+
+    let json = parse_ok(json!({
+        "schema_version": SCHEMA_VERSION,
+        "match": { "kind": "call", "callee": { "name": "Open" } },
+        "steps": [
+            { "op": "call_shape" },
+            { "op": "call_result_contracts" },
+            { "op": "result_contract_operation_uses" }
+        ]
+    }));
+    assert_eq!(
+        json.validate_steps().unwrap(),
+        QueryValueKind::ResultContractUse
+    );
+    assert_eq!(rql.to_canonical_json(), json.to_canonical_json());
+
+    let files = parse_ok(json!({
+        "match": { "kind": "call", "callee": { "name": "Open" } },
+        "steps": [
+            { "op": "call_shape" },
+            { "op": "call_result_contracts" },
+            { "op": "result_contract_operation_uses" },
+            { "op": "file_of" }
+        ]
+    }));
+    assert_eq!(files.validate_steps().unwrap(), QueryValueKind::File);
+
+    let wrong = CodeQuery::from_json(&json!({
+        "match": { "kind": "call" },
+        "steps": [
+            { "op": "call_shape" },
+            { "op": "result_contract_operation_uses" }
+        ]
+    }))
+    .expect_err("result_contract_operation_uses must reject a call-shape upstream");
+    assert!(
+        wrong.message.contains("requires call_result_contract"),
+        "{}",
+        wrong.message
+    );
+}
+
+#[test]
+fn result_contract_failure_uses_project_typed_filtered_rows() {
+    let rql = CodeQuery::from_sexp(
+        r#"(result-contract-failure-uses
+              :provenance [condition-result distinct-zero-binding unknown]
+              :consumer [return returned-call-argument]
+              (call-result-contracts (call-shape (call :callee "Open"))))"#,
+    )
+    .expect("result contract failure-use RQL");
+    assert_eq!(
+        rql.validate_steps().unwrap(),
+        QueryValueKind::ResultContractFailureUse
+    );
+    assert_eq!(
+        rql.plan.steps.last(),
+        Some(&QueryStep::ResultContractFailureUses(
+            ResultContractFailureUseFilter {
+                provenances: vec![
+                    FailureUseProvenance::ConditionResult,
+                    FailureUseProvenance::DistinctZeroBinding,
+                    FailureUseProvenance::Unknown,
+                ],
+                consumers: vec![
+                    FailureUseConsumer::Return,
+                    FailureUseConsumer::ReturnedCallArgument,
+                ],
+            }
+        ))
+    );
+
+    let json = parse_ok(json!({
+        "schema_version": SCHEMA_VERSION,
+        "match": { "kind": "call", "callee": { "name": "Open" } },
+        "steps": [
+            { "op": "call_shape" },
+            { "op": "call_result_contracts" },
+            {
+                "op": "result_contract_failure_uses",
+                "provenance": ["condition_result", "distinct_zero_binding", "unknown"],
+                "consumer": ["return", "returned_call_argument"]
+            }
+        ]
+    }));
+    assert_eq!(rql.to_canonical_json(), json.to_canonical_json());
+
+    let files = parse_ok(json!({
+        "match": { "kind": "call", "callee": { "name": "Open" } },
+        "steps": [
+            { "op": "call_shape" },
+            { "op": "call_result_contracts" },
+            { "op": "result_contract_failure_uses" },
+            { "op": "file_of" }
+        ]
+    }));
+    assert_eq!(files.validate_steps().unwrap(), QueryValueKind::File);
+
+    let wrong = CodeQuery::from_json(&json!({
+        "match": { "kind": "call" },
+        "steps": [
+            { "op": "call_shape" },
+            { "op": "result_contract_failure_uses" }
+        ]
+    }))
+    .expect_err("failure-use projection must reject a call-shape upstream");
+    assert!(
+        wrong.message.contains("requires call_result_contract"),
+        "{}",
+        wrong.message
+    );
+
+    let invalid = CodeQuery::from_json(&json!({
+        "match": { "kind": "call" },
+        "steps": [
+            { "op": "call_shape" },
+            { "op": "call_result_contracts" },
+            { "op": "result_contract_failure_uses", "provenance": ["same_name"] }
+        ]
+    }))
+    .expect_err("free-form failure provenance must not enter the typed plan");
+    assert!(invalid.message.contains("failure-use provenance"));
+    assert!(invalid.path.ends_with(".provenance[0]"), "{}", invalid.path);
+}
+
+#[test]
+fn result_contract_calls_preserve_call_shape_type_for_positive_discovery() {
+    let rql = CodeQuery::from_sexp(
+        r#"(result-contract-calls (call-shape (call :callee (name "Open"))))"#,
+    )
+    .expect("result contract call discovery RQL");
+    assert_eq!(rql.validate_steps().unwrap(), QueryValueKind::CallShape);
+
+    let json = parse_ok(json!({
+        "schema_version": SCHEMA_VERSION,
+        "match": { "kind": "call", "callee": { "name": "Open" } },
+        "steps": [
+            { "op": "call_shape" },
+            { "op": "result_contract_calls" }
+        ]
+    }));
+    assert_eq!(json.validate_steps().unwrap(), QueryValueKind::CallShape);
+    assert_eq!(rql.to_canonical_json(), json.to_canonical_json());
+
+    let wrong = CodeQuery::from_json(&json!({
+        "match": { "kind": "call" },
+        "steps": [{ "op": "result_contract_calls" }]
+    }))
+    .expect_err("result_contract_calls must reject a structural upstream");
+    assert!(
+        wrong.message.contains("requires call_shape"),
+        "{}",
+        wrong.message
+    );
 }
 
 #[test]

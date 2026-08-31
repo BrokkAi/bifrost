@@ -2,8 +2,9 @@
 
 use crate::analyzer::semantic::{
     EvidenceCompleteness, EvidenceHandle, EvidenceId, OracleContractError, ProcedureHandle,
-    ProofStatus, SemanticBudget, SemanticBudgetExceeded, SemanticExecutionBudget,
-    SemanticProviderError, SemanticRequest, SemanticWork, ValueHandle, ValueId,
+    ProofStatus, SemanticArtifactCollector, SemanticBudget, SemanticBudgetExceeded,
+    SemanticExecutionBudget, SemanticProviderError, SemanticRequest, SemanticWork, ValueHandle,
+    ValueId,
 };
 
 #[derive(Debug)]
@@ -16,6 +17,7 @@ pub(super) struct WorkStager {
     pub(super) budget: SemanticBudget,
     pub(super) work: SemanticWork,
     execution: Option<SemanticExecutionBudget>,
+    artifact_collector: Option<SemanticArtifactCollector>,
 }
 
 impl WorkStager {
@@ -24,6 +26,7 @@ impl WorkStager {
             budget: request.budget.clone(),
             work: SemanticWork::default(),
             execution: request.execution_budget().cloned(),
+            artifact_collector: request.artifact_collector().cloned(),
         }
     }
 
@@ -31,11 +34,15 @@ impl WorkStager {
         &'a mut self,
         cancellation: &'a crate::CancellationToken,
     ) -> SemanticRequest<'a> {
-        match &self.execution {
+        let request = match &self.execution {
             Some(execution) => {
                 SemanticRequest::with_execution_budget(&mut self.budget, cancellation, execution)
             }
             None => SemanticRequest::new(&mut self.budget, cancellation),
+        };
+        match &self.artifact_collector {
+            Some(collector) => request.with_artifact_collector(collector),
+            None => request,
         }
     }
 
@@ -112,4 +119,26 @@ pub(super) fn value_handle(
     procedure
         .value_handle(id)
         .ok_or_else(|| SemanticProviderError::internal("semantic effect has a stale value ID"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::CancellationToken;
+
+    #[test]
+    fn work_stager_propagates_the_complete_artifact_collector() {
+        let collector = SemanticArtifactCollector::new();
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let request =
+            SemanticRequest::new(&mut budget, &cancellation).with_artifact_collector(&collector);
+        let mut staged = WorkStager::new(&request);
+        let nested = staged.request(&cancellation);
+        let propagated = nested
+            .artifact_collector()
+            .expect("staged workspace-oracle requests retain the collector");
+
+        assert!(propagated.shares_state(&collector));
+    }
 }

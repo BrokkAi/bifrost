@@ -2097,7 +2097,10 @@ where
                                 .exit()
                                 .project_matched_return(transfer)
                                 .map_err(SummaryDataflowError::from)?;
-                            let MatchedReturnProjection::Edge(return_edge) = projection else {
+                            let MatchedReturnProjection::Edge {
+                                edge: return_edge, ..
+                            } = projection
+                            else {
                                 continue;
                             };
                             let return_key = TransferKey {

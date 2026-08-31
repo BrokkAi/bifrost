@@ -18,11 +18,14 @@ Its background activation scheduler reads `.bifrost/packs.json`: an absent
 document selects compatible packs from ecosystems serving languages present in
 the workspace, a configured document selects its `ecosystems`, and an empty
 array explicitly disables dependency-pack activation. An omitted `catalog` is
-ephemeral; a configured catalog must be workspace-relative. Activation never
-downloads packs or dependencies, and compatibility plus `review_required`
-gates remain in force. Policy-capable responses expose the activation mode and
-decisions so missing, incompatible, disabled, or incomplete packs cannot look
-like a clean negative.
+ephemeral; a configured catalog must be workspace-relative. Activation through
+the generic catalog contract does not download packs or dependencies, and
+compatibility plus `review_required` gates remain in force. The released
+`brokk-bifrost` facade separately opts into fetching the immutable matching
+public release bundle only for an exact generated production miss; set
+`BIFROST_SEMANTIC_PACK_DOWNLOAD=off` to disable that path. Policy-capable
+responses expose the activation mode and decisions so missing, incompatible,
+disabled, or incomplete packs cannot look like a clean negative.
 
 ## Editor Integrations
 

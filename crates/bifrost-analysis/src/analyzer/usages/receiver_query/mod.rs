@@ -24,6 +24,7 @@ use crate::analyzer::usages::get_definition::{
 };
 use crate::analyzer::usages::get_type::{
     TypeLookupOutcome, TypeLookupStatus, TypeLookupType, java::resolve_java_type_bounded,
+    resolve_js_ts_type_bounded,
 };
 use crate::analyzer::usages::receiver_analysis::{
     ReceiverAnalysisBudget, ReceiverAnalysisOutcome, ReceiverAnalysisReport, ReceiverAnalysisWork,
@@ -650,6 +651,7 @@ impl<'a> ReceiverQueryService<'a> {
                 }
                 let analysis = provider.resolve_receiver(input_node, ledger.remaining_budget());
                 finalize_legacy_report(
+                    self.analyzer,
                     values_report(operation, file, language, input_node, source, analysis),
                     gate,
                     &mut ledger,
@@ -699,11 +701,82 @@ impl<'a> ReceiverQueryService<'a> {
                     ));
                 }
                 let analysis = provider.resolve_receiver(receiver, ledger.remaining_budget());
-                finalize_legacy_report(
-                    values_report(operation, file, language, receiver, source, analysis),
-                    gate,
-                    &mut ledger,
-                )
+                let mut report =
+                    values_report(operation, file, language, receiver, source, analysis);
+                if !legacy_external_module_identity_is_precise(&report.analysis) {
+                    let reference_site =
+                        structural_reference_site(file, source, node_range(receiver));
+                    let resolution = resolve_js_ts_type_bounded(
+                        self.analyzer,
+                        &self.definitions,
+                        file,
+                        language,
+                        source,
+                        Some(tree),
+                        &reference_site,
+                        ledger.remaining_budget(),
+                        cancellation,
+                    );
+                    let type_outcome = match charge_bounded_resolution(&mut ledger, resolution)? {
+                        CompatibilityOutcome::Complete(outcome) => Some(outcome),
+                        CompatibilityOutcome::Exceeded(limit) => {
+                            return Ok(budget_report(operation, report.site, ledger.work(), limit));
+                        }
+                    };
+                    if let Some(type_outcome) = type_outcome {
+                        let model_values = projected_type_definitions(&type_outcome)
+                            .filter(|definition| definition.is_synthetic())
+                            .cloned()
+                            .map(ReceiverValue::InstanceType)
+                            .collect::<Vec<_>>();
+                        if !model_values.is_empty() {
+                            report.analysis = ReceiverQueryAnalysis::Values(receiver_type_outcome(
+                                type_outcome.status,
+                                model_values,
+                            ));
+                        } else if let SemanticReceiverGate::Available {
+                            points_to,
+                            evidence,
+                            ..
+                        } = &gate
+                            && let Some(workspace) = self.workspace
+                        {
+                            let projection = project_receiver_values(
+                                workspace,
+                                points_to,
+                                &type_outcome,
+                                &[],
+                                false,
+                                cancellation,
+                                &mut ledger,
+                            )?;
+                            let projection = match projection {
+                                CompatibilityOutcome::Complete(projection) => projection,
+                                CompatibilityOutcome::Exceeded(limit) => {
+                                    return Ok(budget_report(
+                                        operation,
+                                        report.site,
+                                        ledger.work(),
+                                        limit,
+                                    ));
+                                }
+                            };
+                            if !projection.values.is_empty() {
+                                report.analysis = ReceiverQueryAnalysis::Values(
+                                    receiver_type_outcome(type_outcome.status, projection.values),
+                                );
+                                report.candidates_truncated |= projection.truncated;
+                                if !evidence.supports_precise()
+                                    || projection.truncated
+                                    || projection.multiple_identities
+                                {
+                                    neutral_incomplete(&mut report.analysis);
+                                }
+                            }
+                        }
+                    }
+                }
+                finalize_legacy_report(self.analyzer, report, gate, &mut ledger)
             }
             ReceiverQueryOperation::MemberTargets => {
                 let Some(member_expression) = provider.member_expression_at_site(input_node) else {
@@ -791,6 +864,7 @@ impl<'a> ReceiverQueryService<'a> {
                     Some(member_report.member_name),
                 );
                 finalize_legacy_report(
+                    self.analyzer,
                     ReceiverQueryReport {
                         operation,
                         site,
@@ -2059,12 +2133,13 @@ fn structural_member_is_statically_bound_data_member(
 }
 
 fn finalize_legacy_report(
+    analyzer: &dyn IAnalyzer,
     report: ReceiverQueryReport,
     gate: SemanticReceiverGate,
     ledger: &mut ReceiverWorkLedger,
 ) -> ReceiverQueryReport {
     let compatibility_limit = ledger.charge_analysis(report.work).err();
-    let mut report = apply_semantic_gate(report, gate);
+    let mut report = apply_semantic_gate(analyzer, report, gate);
     if let Some(limit) = compatibility_limit {
         neutral_exceeded(&mut report.analysis, limit);
     }
@@ -2073,6 +2148,7 @@ fn finalize_legacy_report(
 }
 
 fn apply_semantic_gate(
+    analyzer: &dyn IAnalyzer,
     mut report: ReceiverQueryReport,
     gate: SemanticReceiverGate,
 ) -> ReceiverQueryReport {
@@ -2098,7 +2174,15 @@ fn apply_semantic_gate(
             }
         }
         SemanticReceiverGate::Unavailable { unsupported, .. } => {
-            if let Some(capability) = unsupported {
+            if legacy_external_module_identity_is_precise(&report.analysis)
+                || legacy_external_model_identity_is_precise(analyzer, &report.analysis)
+                || legacy_external_import_ambiguity(&report.analysis)
+            {
+                // Static import syntax independently proves either one package
+                // module object or an explicit competing/truncated boundary,
+                // even when neutral value-flow has no external-value row.
+                // Member/type claims still require a declaration or model.
+            } else if let Some(capability) = unsupported {
                 neutral_unsupported(&mut report.analysis, capability.label());
             } else {
                 neutral_unknown(&mut report.analysis);
@@ -2109,6 +2193,55 @@ fn apply_semantic_gate(
         }
     }
     report
+}
+
+fn legacy_external_import_ambiguity(analysis: &ReceiverQueryAnalysis) -> bool {
+    matches!(
+        analysis,
+        ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::Ambiguous(values))
+            if values.is_empty()
+    )
+}
+
+fn legacy_external_model_identity_is_precise(
+    analyzer: &dyn IAnalyzer,
+    analysis: &ReceiverQueryAnalysis,
+) -> bool {
+    let ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::Precise(values)) = analysis else {
+        return false;
+    };
+    let Some(overlay) = analyzer.semantic_model_overlay() else {
+        return false;
+    };
+    !values.is_empty()
+        && values.iter().all(|value| {
+            let ReceiverValue::InstanceType(unit) = value else {
+                return false;
+            };
+            if !unit.is_synthetic() {
+                return false;
+            }
+            let fq_name = unit.fq_name();
+            let matched = overlay.symbols_named(&fq_name);
+            matched.disposition
+                == crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
+                && matched.records[0].qualified_name == fq_name
+                && !matched.records[0].provenance.ambiguous
+                && matched.records[0].provenance.completeness
+                    == crate::analyzer::semantic_model::SemanticModelCompleteness::Complete
+        })
+}
+
+fn legacy_external_module_identity_is_precise(analysis: &ReceiverQueryAnalysis) -> bool {
+    matches!(
+        analysis,
+        ReceiverQueryAnalysis::Values(ReceiverAnalysisOutcome::Precise(values))
+            if !values.is_empty()
+                && values.iter().all(|value| matches!(
+                    value,
+                    ReceiverValue::ModuleOrExportObject(unit) if unit.is_synthetic()
+                ))
+    )
 }
 
 fn retain_neutral_backed_values(

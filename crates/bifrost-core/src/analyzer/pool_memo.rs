@@ -554,20 +554,33 @@ where
         )
     }
 
-    /// Forget `key`'s cell.
+    /// Forget `key`'s cell if it is still `cell`.
     ///
     /// For a memo whose *values* live somewhere else -- a bounded moka cache,
     /// say -- the cell is in-flight coordination, not storage. Retaining it
     /// would pin one `Arc<V>` per key ever asked and quietly defeat the bound
     /// the value cache exists to enforce. A caller that publishes the built
-    /// value elsewhere therefore publishes first and removes second: a thread
-    /// still holding the old cell rides the completed build, and one arriving
-    /// after the removal finds the published value.
-    pub fn remove(&self, key: &K) {
-        self.cells
+    /// value elsewhere therefore publishes first and removes second.
+    ///
+    /// The identity check is required even after publication. A slow holder of
+    /// an old completed cell can resume after that cell was removed and a new
+    /// one was installed for the same key (for example, after bounded-cache
+    /// eviction). Key-only removal would detach the new in-flight build and
+    /// permit a third concurrent build for that key (#2795).
+    pub fn remove_cell(&self, key: &K, cell: &Arc<PoolSafeMemo<V>>) -> bool {
+        let mut cells = self
+            .cells
             .write()
-            .expect("keyed pool memo write lock poisoned")
-            .remove(key);
+            .expect("keyed pool memo write lock poisoned");
+        if cells
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, cell))
+        {
+            cells.remove(key);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -1108,6 +1121,22 @@ mod tests {
             assert!(Arc::ptr_eq(answer, &answers[0]));
             assert_eq!(**answer, 7);
         }
+    }
+
+    /// An old holder must not remove the replacement coordinator installed
+    /// after its own cell was retired. Bounded-cache rejection or eviction can
+    /// make this ABA sequence ordinary: C1 publishes, C1 is removed, a miss
+    /// installs C2, then a delayed C1 waiter reaches its cleanup (#2795).
+    #[test]
+    fn stale_holder_cannot_remove_a_replacement_keyed_cell() {
+        let memo: KeyedPoolSafeMemo<&str, usize> = KeyedPoolSafeMemo::new();
+        let first = memo.cell(&"hot");
+        assert!(memo.remove_cell(&"hot", &first));
+
+        let replacement = memo.cell(&"hot");
+        assert!(!Arc::ptr_eq(&first, &replacement));
+        assert!(!memo.remove_cell(&"hot", &first));
+        assert!(Arc::ptr_eq(&replacement, &memo.cell(&"hot")));
     }
 
     /// Single flight is per key, not global: two keys asked at once must both

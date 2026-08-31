@@ -51,3 +51,21 @@
   :selector (rql-file :path "queries/deferred.rql")
   :binding return-value
   :supersedes [])
+
+; Exact call-binding policy sugar keeps model member and receiver identities opaque.
+(policy
+  :id "bifrost.security.modeled-call"
+  :name "Modeled call"
+  :message "Example"
+  :severity warning
+  :analysis
+    (analysis
+      :type assertion
+      (bind :name calls
+        :query (rql
+          (call-bindings (call-shape (call :callee "send")))))
+      (call :over calls
+        :resolves-to member.widget.send
+        :receiver-type type.widget
+        :proof exact)
+      (call-argument :over calls :formal-name "timeout")))

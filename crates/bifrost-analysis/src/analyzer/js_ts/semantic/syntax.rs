@@ -480,15 +480,6 @@ pub(super) fn missing_field(node: Node<'_>, field: &str) -> TsLoweringError {
     ))
 }
 
-pub(super) fn node_range(node: Node<'_>) -> Range {
-    Range {
-        start_byte: node.start_byte(),
-        end_byte: node.end_byte(),
-        start_line: node.start_position().row + 1,
-        end_line: node.end_position().row + 1,
-    }
-}
-
 pub(super) fn js_ts_local_scope(node: Node<'_>) -> Option<(usize, usize)> {
     let is_var = node
         .parent()

@@ -66,11 +66,11 @@ use git2::{ObjectType, Oid};
 use rayon::prelude::*;
 use regex::RegexBuilder;
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::hash::Hash;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use tree_sitter::{Language as TsLanguage, ParseOptions, Parser, Tree};
@@ -132,6 +132,18 @@ const PREPARED_SYNTAX_BYTES_PER_SOURCE_BYTE: usize = 16;
 // Charged on top of the source estimate so an empty or tiny file still costs
 // something: without it a workspace of empty files would be unbounded.
 const PREPARED_SYNTAX_STORE_ENTRY_OVERHEAD_BYTES: usize = 512;
+
+/// Conservatively estimate the retained source-and-tree footprint of one
+/// prepared syntax snapshot.
+///
+/// Keep non-store owners on the same admission estimate as the retained
+/// prepared-syntax cache. The estimate includes the pinned source text as
+/// well as tree-sitter's subtree arena and a fixed allocation allowance.
+pub(crate) fn prepared_syntax_retained_bytes(source_bytes: usize) -> usize {
+    source_bytes
+        .saturating_mul(PREPARED_SYNTAX_BYTES_PER_SOURCE_BYTE)
+        .saturating_add(PREPARED_SYNTAX_STORE_ENTRY_OVERHEAD_BYTES)
+}
 // ~32 MiB of source at the multiplier above. That comfortably holds the whole
 // Rust candidate set of a Bifrost-sized workspace (~23 MiB across the 662
 // candidates of the #1450 repro), so a warm scan reparses nothing, while a
@@ -185,6 +197,14 @@ const STORE_WRITE_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
 // worker busy for tens of minutes after all ordinary files finish (issue #1690).
 // Bound each complete-file parse so one blob cannot hold the workspace build open.
 const COMPLETE_FILE_PARSE_BUDGET: Duration = Duration::from_secs(10);
+/// Name any file whose whole analysis takes longer than this.
+///
+/// [`COMPLETE_FILE_PARSE_BUDGET`] bounds the tree-sitter parse but not the
+/// adapter walk that follows it, so one file can still hold a build open long
+/// after every other worker has finished. On Godot that tail is 77 percent of
+/// the C++ parse phase while fifteen workers idle. Without the file's name a
+/// reader sees only a slow build and reaches for the persistence knobs.
+const SLOW_FILE_ANALYSIS_NOTE_NANOS: usize = 5_000_000_000;
 
 enum BoundedParse {
     Complete(Tree),
@@ -354,6 +374,13 @@ pub(crate) struct AnalyzerStoreContext {
     /// build. This is consumed by the delegate constructor and must not be
     /// retained by the long-lived workspace build context.
     pub(crate) workspace_snapshot: Option<Arc<WorkspaceBuildSnapshot>>,
+    /// Whether the most recent full workspace enumeration completed. A
+    /// package-membership hit remains useful when this is false, but an exact
+    /// miss cannot prove absence from the current workspace.
+    pub(crate) workspace_listing_complete: bool,
+    /// The blob ids an immutable revision image's own tree walk already
+    /// resolved, if this build analyzes one. See [`RevisionBlobIdentities`].
+    pub(crate) revision_blobs: Option<Arc<RevisionBlobIdentities>>,
     pub(crate) live_paths: Arc<LivePathMap>,
     pub(crate) generations: Arc<HashMap<String, GenerationId>>,
     /// Shared by every language delegate the same build fans out to. See
@@ -462,6 +489,110 @@ impl WorkspaceBuildSnapshot {
     }
 }
 
+/// The Git blob ids of one immutable revision image, taken from the tree walk
+/// that exported it.
+///
+/// A revision image is written into a temporary directory that holds no Git
+/// repository, so `resolve_live_oids` finds no identity source there and would
+/// otherwise re-read and re-hash every exported byte to recover an id the
+/// exporter already had in hand. The exporter walks the revision's tree, and a
+/// tree entry carries its blob id, so the whole inventory is free.
+pub(crate) struct RevisionBlobIdentities {
+    /// Keyed by the workspace-relative path the export wrote, which is exactly
+    /// the `rel_path` the image's `FileSetProject` names that file by.
+    entries: HashMap<std::path::PathBuf, RevisionBlob>,
+}
+
+struct RevisionBlob {
+    oid: Oid,
+    /// Whether a debug build re-hashes this file's bytes and asserts they hash
+    /// to `oid`. See [`RevisionBlobIdentities::oid_for`].
+    sampled: bool,
+}
+
+/// One entry in this many, in sorted path order starting at the first, carries
+/// the debug re-hash assertion. Starting at the first entry means every
+/// immutable test fixture in the repository -- all of them far smaller than the
+/// stride -- checks at least one file, while a monorepo revision pays the
+/// re-hash for well under two percent of its files.
+const REVISION_BLOB_ASSERTION_STRIDE: usize = 64;
+
+impl RevisionBlobIdentities {
+    /// `written` names the files whose bytes the image put on disk; `named_only`
+    /// names the rest, which the image serves from the repository's object
+    /// database instead.
+    ///
+    /// Only a written entry can carry the re-hash assertion, because only a
+    /// written entry has a second, independently produced copy of the bytes to
+    /// compare against. Re-reading a named-only entry through the object
+    /// database would compare the blob id to itself.
+    pub(crate) fn new(
+        mut written: Vec<(std::path::PathBuf, Oid)>,
+        named_only: Vec<(std::path::PathBuf, Oid)>,
+    ) -> Self {
+        written.sort_unstable();
+        // The path-restricted exporters union several selections, so one path
+        // can be offered twice. A repeated path always carries the same blob
+        // id -- both come from the same tree entry -- so keeping the first is
+        // not a choice between disagreeing answers.
+        written.dedup_by(|left, right| left.0 == right.0);
+        let mut entries: HashMap<std::path::PathBuf, RevisionBlob> = written
+            .into_iter()
+            .enumerate()
+            .map(|(index, (path, oid))| {
+                (
+                    path,
+                    RevisionBlob {
+                        oid,
+                        sampled: index % REVISION_BLOB_ASSERTION_STRIDE == 0,
+                    },
+                )
+            })
+            .collect();
+        for (path, oid) in named_only {
+            entries.insert(
+                path,
+                RevisionBlob {
+                    oid,
+                    sampled: false,
+                },
+            );
+        }
+        Self { entries }
+    }
+
+    /// The revision's blob id for `file`, or `None` when this image does not
+    /// name it.
+    ///
+    /// A sampled entry is verified against the bytes on disk in debug builds,
+    /// in the model of the `FqName` round-trip assertion: the inventory and the
+    /// export are produced by one tree walk, so a disagreement is a construction
+    /// bug that must fail where it is introduced rather than silently publish
+    /// facts under the wrong content key.
+    pub(crate) fn oid_for(&self, file: &ProjectFile) -> Option<Oid> {
+        let entry = self.entries.get(file.rel_path())?;
+        if entry.sampled {
+            debug_assert!(
+                Self::sampled_bytes_agree(file, entry.oid),
+                "revision inventory names {} as blob {} but its exported bytes hash differently",
+                file.abs_path().display(),
+                entry.oid,
+            );
+        }
+        Some(entry.oid)
+    }
+
+    /// Whether `file`'s bytes on disk hash to `oid`. Only ever asked of a
+    /// written entry; an unreadable file passes, because a missing write is a
+    /// different failure that the read itself reports.
+    fn sampled_bytes_agree(file: &ProjectFile, oid: Oid) -> bool {
+        let Ok(bytes) = std::fs::read(file.abs_path()) else {
+            return true;
+        };
+        Oid::hash_object(ObjectType::Blob, &bytes) == Ok(oid)
+    }
+}
+
 pub(crate) struct StructuralSnapshotKey {
     oid: Oid,
     lang: String,
@@ -503,15 +634,73 @@ fn persistent_store_context_with_automatic_gc(
                 ))
             })?
         }
-        None => AnalyzerStore::open_ephemeral()
-            .map_err(|error| error.context("opening the ephemeral analyzer store"))?,
+        None => {
+            return Err(StoreError::new(rootless_persistence_message(
+                project.root(),
+            )));
+        }
     };
     Ok(store_context_from_store(project, store, automatic_gc))
+}
+
+/// Report a persisted build over a project with no persistence identity, with
+/// its exits ordered by how much reuse they preserve.
+///
+/// Silently opening a throwaway store here was the old behavior and the reason
+/// this message exists: a caller that asked for persistence got a database that
+/// was deleted on drop, so every run re-parsed the whole world and nothing said
+/// so. The ephemeral door is still open, but only through the footgun
+/// constructor, where the caller states the intent.
+fn rootless_persistence_message(root: &std::path::Path) -> String {
+    format!(
+        "cannot build a persisted analyzer over {}: this project has no persistence root, so \
+         there is no identity to cache under.\n\
+         A persisted build reuses content-addressed facts across runs; a project with no \
+         persistence root has nowhere to put them, and a store that is discarded on drop is not \
+         what was asked for.\n\
+         1. Analyze through a rooted project. A FilesystemProject over the checkout persists to \
+         the shared cache at the primary repository root, and every linked worktree shares it.\n\
+         2. For a whole immutable revision, use the shared revision cache: \
+         RevisionExport::build_workspace, or build_revision_analyzer. A fact keyed by blob id \
+         describes those bytes for every consumer, so the revision's blobs stay warm.\n\
+         3. If the view really is session-only or partial (a changed-file-scoped set, a checkout \
+         you must leave byte-identical, cold-build measurement), say so with \
+         WorkspaceAnalyzer::build_ephemeral_footgun. A partial file set must not become a \
+         workspace's cached picture of itself.\n\
+         4. For a multi-root host whose root set resolves to no machine cache directory, set \
+         BIFROST_CACHE_ROOT=<writable local root>; Bifrost derives one root-set-specific child \
+         under it.",
+        root.display(),
+    )
+}
+
+/// Store context for one immutable revision image whose parsed facts belong in
+/// the repository's shared content-addressed cache.
+///
+/// The store is supplied by the caller rather than derived from the project,
+/// because a revision image's root is a self-deleting export directory: the
+/// cache that serves it is the one at the *original* repository root, and no
+/// funnel from the export path can find it. Automatic garbage collection is
+/// off for the same reason -- reachability is computed from the analyzed root,
+/// and the export directory holds no Git repository to compute it from.
+pub(crate) fn revision_image_store_context(
+    project: &dyn Project,
+    store: Arc<AnalyzerStore>,
+) -> AnalyzerStoreContext {
+    store_context_from_shared_store(project, store, false)
 }
 
 fn store_context_from_store(
     project: &dyn Project,
     store: AnalyzerStore,
+    automatic_gc: bool,
+) -> AnalyzerStoreContext {
+    store_context_from_shared_store(project, Arc::new(store), automatic_gc)
+}
+
+fn store_context_from_shared_store(
+    project: &dyn Project,
+    store: Arc<AnalyzerStore>,
     automatic_gc: bool,
 ) -> AnalyzerStoreContext {
     let liveness = gitblob::discover(project.root())
@@ -523,11 +712,13 @@ fn store_context_from_store(
         crate::analyzer::store::gc::AnalyzerGcCoordinator::disabled()
     };
     AnalyzerStoreContext {
-        store: Arc::new(store),
+        store,
         workspace_id: crate::analyzer::store::WorkspaceId::for_root(project.root()),
         gc: Arc::new(gc),
         liveness,
         workspace_snapshot: None,
+        workspace_listing_complete: true,
+        revision_blobs: None,
         live_paths: Arc::new(LivePathMap::trust_filesystem_generation()),
         generations: Arc::new(HashMap::default()),
         build_abort: Arc::new(BuildAbort::default()),
@@ -751,6 +942,32 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     fn default_package_anchor(&self) -> Option<PackageAnchor> {
         None
     }
+    /// The anchor used to publish a parsed file's package membership even when
+    /// the file contains no persisted declarations. `None` means declaration
+    /// facts alone define this language's workspace package inventory.
+    fn workspace_file_package_anchor(&self) -> Option<PackageAnchor> {
+        None
+    }
+    /// Whether this language has any non-source workspace inputs that can
+    /// change the canonical identity of its declarations.
+    fn has_workspace_package_identity_inputs(&self) -> bool {
+        false
+    }
+    /// Whether a non-source `file` contributes to this language's canonical
+    /// workspace package identity. An unsaved overlay of such an input cannot
+    /// be represented by package rows built from the disk workspace, so exact
+    /// package misses cease to be authoritative for that request snapshot.
+    fn workspace_package_identity_input(&self, _file: &ProjectFile) -> bool {
+        false
+    }
+    /// Additional import spellings for one canonical workspace package.
+    ///
+    /// The canonical row remains authoritative declaration identity. Aliases
+    /// are package-membership rows only, for language layouts such as Go's
+    /// `vendor` directories where source imports a structured path suffix.
+    fn workspace_package_aliases(&self, _file: &ProjectFile, _canonical: &FqName) -> Vec<FqName> {
+        Vec::new()
+    }
     /// Resolve `anchor` to the live package prefix it names for `file`. `None`
     /// means this adapter cannot place that anchor, which makes the unit fall
     /// back to a fully persisted name. `content_qualifier` is the unit's stored
@@ -811,30 +1028,32 @@ pub trait LanguageAdapter: Send + Sync + 'static {
     }
     fn extract_call_receiver(&self, reference: &str) -> Option<String>;
     fn parse_file(&self, file: &ProjectFile, source: &str, tree: &Tree) -> ParsedFile;
-    /// Extra row-sets this blob contributes under storage language keys other
-    /// than [`LanguageAdapter::storage_language_key_for_file`]'s answer.
+    /// Every reading of this blob: the file's own, plus any extra row-sets it
+    /// contributes under storage language keys other than
+    /// [`LanguageAdapter::storage_language_key_for_file`]'s answer.
     ///
     /// One blob normally has one reading, and the default says so. C++ is the
     /// exception: a header has no compilation language of its own, so its
     /// blob has both a C and a C++ reading, and the two disagree about where a
     /// tag declared inside an aggregate member list lives (issue #1970). The
     /// adapter returns the second reading only when it actually differs from
-    /// `primary`, which is what makes "no rows under the other key" mean
+    /// the first, which is what makes "no rows under the other key" mean
     /// "identical to the primary" rather than "not computed yet".
     ///
-    /// Called once per blob parse, on the same tree the primary walk used, so
-    /// an implementor must not re-parse. The result is persisted under each
-    /// returned key at that key's own store generation and is never hydrated
-    /// back into the file's own state.
-    fn additional_projections(
+    /// The readings arrive together because everything they share -- the tree,
+    /// its parent index, and every fact family the second reading's dialect
+    /// does not change -- is then computed once (Milestone 3b of
+    /// `.agents/plans/immutable-revision-persisted-fact-reuse.md`). Called once
+    /// per blob parse, on one tree, so an implementor must not re-parse. Each
+    /// extra reading is persisted under its returned key at that key's own
+    /// store generation and is never hydrated back into the file's own state.
+    fn parse_file_with_projections(
         &self,
         file: &ProjectFile,
         source: &str,
         tree: &Tree,
-        primary: &ParsedFile,
-    ) -> Vec<(&'static str, ParsedFile)> {
-        let _ = (file, source, tree, primary);
-        Vec::new()
+    ) -> (ParsedFile, Vec<(&'static str, ParsedFile)>) {
+        (self.parse_file(file, source, tree), Vec::new())
     }
     fn definition_priority(&self, _code_unit: &CodeUnit) -> i32 {
         0
@@ -970,8 +1189,8 @@ pub struct FileState {
     pub(crate) parse_complete: bool,
     /// Row-sets this same blob contributes under storage language keys other
     /// than the file's own, produced by
-    /// [`LanguageAdapter::additional_projections`] and persisted alongside the
-    /// primary row-set (see `write_parsed_blob_tx`).
+    /// [`LanguageAdapter::parse_file_with_projections`] and persisted alongside
+    /// the primary row-set (see `write_parsed_blob_tx`).
     ///
     /// Empty for every language but C++, and empty on a hydrated state: a
     /// projection is a write-side product of one parse, never a hydration
@@ -1187,6 +1406,7 @@ enum PreparedSyntaxPreparation {
 pub(crate) struct HierarchyDeclarationFacts {
     pub(crate) declaration: CodeUnit,
     pub(crate) primary_range: Option<Range>,
+    pub(crate) in_test_region: bool,
     pub(crate) imports: Arc<[ImportInfo]>,
     pub(crate) raw_supertypes: Arc<[String]>,
     storage_key: Option<HierarchyStorageKey>,
@@ -1195,6 +1415,7 @@ pub(crate) struct HierarchyDeclarationFacts {
 pub(crate) struct ImportFileFacts {
     pub(crate) package_name: String,
     pub(crate) imports: Vec<ImportInfo>,
+    pub(crate) contains_tests: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1212,6 +1433,14 @@ struct AnalyzerRuntimeState {
     fresh_parse_errors: HashMap<ProjectFile, Vec<crate::analyzer::ParseError>>,
     dirty_file_states: Mutex<HashMap<FileStateCacheKey, DirtyFileState>>,
     dirty_path_symbol_rows: Mutex<HashMap<ProjectFile, (String, PathSymbolRow)>>,
+    /// Whether this generation accounts for every workspace package file.
+    /// Positive package rows remain usable when false; only absence loses
+    /// authority. Incremental generations may clear but never restore it.
+    workspace_package_inventory_complete: bool,
+    /// Content identities of the non-source inputs that qualified this
+    /// generation's workspace declarations. Request overlays are authoritative
+    /// only when their digest agrees with this exact baseline.
+    workspace_package_identity_input_digests: HashMap<ProjectFile, [u8; 32]>,
     seeded_file_states: Vec<(FileStateCacheKey, Arc<FileState>)>,
     persistence_stats: PersistBatchStats,
     /// Include-driven claim relation for this generation (#1837): analyzed file
@@ -1266,10 +1495,14 @@ impl AnalyzerRuntimeState {
         dirty_path_symbol_rows: HashMap<ProjectFile, (String, PathSymbolRow)>,
         seeded_file_states: Vec<(FileStateCacheKey, Arc<FileState>)>,
     ) -> Self {
+        let workspace_package_inventory_complete =
+            dirty_file_states.is_empty() && dirty_path_symbol_rows.is_empty();
         Self {
             fresh_parse_errors,
             dirty_file_states: Mutex::new(dirty_file_states),
             dirty_path_symbol_rows: Mutex::new(dirty_path_symbol_rows),
+            workspace_package_inventory_complete,
+            workspace_package_identity_input_digests: HashMap::default(),
             seeded_file_states,
             persistence_stats: PersistBatchStats::default(),
             claim_edges: HashMap::default(),
@@ -1286,6 +1519,8 @@ impl AnalyzerRuntimeState {
             fresh_parse_errors,
             dirty_file_states,
             dirty_path_symbol_rows,
+            workspace_package_inventory_complete,
+            workspace_package_identity_input_digests,
             seeded_file_states,
             persistence_stats,
             claim_edges,
@@ -1307,6 +1542,9 @@ impl AnalyzerRuntimeState {
             .expect("dirty path-symbol mutex poisoned") = dirty_path_symbol_rows
             .into_inner()
             .expect("dirty path-symbol mutex poisoned");
+        self.workspace_package_inventory_complete &= workspace_package_inventory_complete;
+        self.workspace_package_identity_input_digests
+            .extend(workspace_package_identity_input_digests);
         self.seeded_file_states.extend(seeded_file_states);
         self.seeded_file_states
             .truncate(SOURCE_SNAPSHOT_FILE_STATE_INDEX_CAPACITY);
@@ -1315,6 +1553,10 @@ impl AnalyzerRuntimeState {
         self.tier_demand.absorb(tier_demand);
         self.claim_import_reads
             .fetch_add(claim_import_reads.into_inner(), Ordering::Relaxed);
+    }
+
+    fn mark_workspace_package_inventory_incomplete(&mut self) {
+        self.workspace_package_inventory_complete = false;
     }
 
     fn seed_snapshot_file_states(&self, cache: &mut SourceSnapshotFileStateIndex) {
@@ -1460,10 +1702,7 @@ trait ByteBounded {
 
 impl ByteBounded for Arc<PreparedSyntaxTree> {
     fn estimated_bytes(&self) -> usize {
-        self.source()
-            .len()
-            .saturating_mul(PREPARED_SYNTAX_BYTES_PER_SOURCE_BYTE)
-            .saturating_add(PREPARED_SYNTAX_STORE_ENTRY_OVERHEAD_BYTES)
+        prepared_syntax_retained_bytes(self.source().len())
     }
 }
 
@@ -2286,6 +2525,23 @@ impl QueryReadCache {
             .find_map(|context| context.cancellation().cloned())
     }
 
+    fn active_semantic_model_overlay(
+        &self,
+    ) -> Option<Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>> {
+        self.contexts
+            .iter()
+            .rev()
+            .find_map(|context| context.semantic_model_overlay_override_for_current_thread())
+    }
+
+    fn active_semantic_model_snapshot(
+        &self,
+    ) -> Option<Option<Arc<crate::analyzer::semantic_model::ActiveSemanticModelSnapshot>>> {
+        self.contexts.iter().rev().find_map(|context| {
+            context.active_semantic_model_snapshot_override_for_current_thread()
+        })
+    }
+
     #[cfg(test)]
     fn analyzed_live_files(&self) -> Option<Vec<ProjectFile>> {
         if !self.is_active() {
@@ -2432,6 +2688,56 @@ impl<T> BoundedFileCache<T> {
 pub use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
 
 use crate::analyzer::semantic::ids::StableDigest;
+
+/// Isolated cost of the extra readings
+/// [`LanguageAdapter::parse_file_with_projections`] produces beyond the file's
+/// own, summed over the parse fan-out.
+///
+/// The work sits per file inside the rayon workers, so a plain
+/// `profiling::scope` there would emit one interleaved BEGIN/END pair per file
+/// from every worker at once. These counters accumulate lock-free instead and
+/// are reported once per parse batch, the way `RustScanPhaseTimings` reports
+/// its phases. They are keyed by language because `WorkspaceAnalyzer::build`
+/// runs one build thread per language concurrently, so a single global would
+/// mix the languages together. The adapter that produces an extra reading
+/// records its own span, because only the adapter knows which part of its work
+/// the extra reading is.
+const ADDITIONAL_PROJECTION_LANGUAGES: usize = Language::Kotlin as usize + 1;
+static ADDITIONAL_PROJECTION_NANOS: [AtomicU64; ADDITIONAL_PROJECTION_LANGUAGES] =
+    [const { AtomicU64::new(0) }; ADDITIONAL_PROJECTION_LANGUAGES];
+static ADDITIONAL_PROJECTION_FILES: [AtomicUsize; ADDITIONAL_PROJECTION_LANGUAGES] =
+    [const { AtomicUsize::new(0) }; ADDITIONAL_PROJECTION_LANGUAGES];
+static ADDITIONAL_PROJECTION_PUBLISHED: [AtomicUsize; ADDITIONAL_PROJECTION_LANGUAGES] =
+    [const { AtomicUsize::new(0) }; ADDITIONAL_PROJECTION_LANGUAGES];
+
+pub(crate) fn record_additional_projection(
+    language: Language,
+    started: Option<Instant>,
+    published: usize,
+) {
+    let Some(started) = started else {
+        return;
+    };
+    let index = language as usize;
+    let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    ADDITIONAL_PROJECTION_NANOS[index].fetch_add(nanos, Ordering::Relaxed);
+    ADDITIONAL_PROJECTION_FILES[index].fetch_add(1, Ordering::Relaxed);
+    ADDITIONAL_PROJECTION_PUBLISHED[index].fetch_add(published, Ordering::Relaxed);
+}
+
+/// Report this language's running `additional_projections` total. Cumulative
+/// over the process, so the value after the last batch is the build's total.
+fn note_additional_projection_totals(language: Language) {
+    profiling::note_with(|| {
+        let index = language as usize;
+        format!(
+            "additional_projections[{language:?}] cumulative files={} published={} total_ms={:.1}",
+            ADDITIONAL_PROJECTION_FILES[index].load(Ordering::Relaxed),
+            ADDITIONAL_PROJECTION_PUBLISHED[index].load(Ordering::Relaxed),
+            ADDITIONAL_PROJECTION_NANOS[index].load(Ordering::Relaxed) as f64 / 1_000_000.0,
+        )
+    });
+}
 
 pub struct TreeSitterAnalyzer<A> {
     project: Arc<dyn Project>,
@@ -2904,11 +3210,18 @@ where
     pub(crate) fn language_content_identity(&self) -> StableDigest {
         let overlays = self.project.overlay_content();
         let language = self.adapter.language();
-        let mut overlay_paths = Vec::new();
+        let mut overlay_paths = self
+            .state
+            .workspace_package_identity_input_digests
+            .iter()
+            .map(|(file, digest)| (crate::path_utils::rel_path_string(file), *digest))
+            .collect::<BTreeMap<_, _>>();
         if let Some(overlays) = overlays.as_deref() {
             for (file, digest) in overlays.entries() {
-                if crate::analyzer::common::language_for_file(file) == language {
-                    overlay_paths.push((crate::path_utils::rel_path_string(file), digest));
+                if crate::analyzer::common::language_for_file(file) == language
+                    || self.adapter.workspace_package_identity_input(file)
+                {
+                    overlay_paths.insert(crate::path_utils::rel_path_string(file), *digest);
                 }
             }
         }
@@ -2917,7 +3230,7 @@ where
             self.live_snapshot().content_digest(overlays.as_deref()),
             overlay_paths
                 .iter()
-                .map(|(path, digest)| (path.as_str(), *digest)),
+                .map(|(path, digest)| (path.as_str(), digest)),
         )
     }
 
@@ -3020,31 +3333,32 @@ where
         })
     }
 
-    pub(crate) fn load_structural_facts_snapshot(
+    pub(crate) fn load_structural_facts_rows(
         &self,
         key: &StructuralSnapshotKey,
-        snapshot_version: i64,
-    ) -> Result<Option<Vec<u8>>, StoreError> {
-        self.store_context.store.load_structural_facts_snapshot(
+        facts_version: i64,
+    ) -> Result<Option<crate::analyzer::structural::facts::PersistedStructuralFacts>, StoreError>
+    {
+        self.store_context.store.load_structural_facts_rows(
             key.oid,
             &key.lang,
             key.generation,
-            snapshot_version,
+            facts_version,
         )
     }
 
-    pub(crate) fn persist_structural_facts_snapshot(
+    pub(crate) fn persist_structural_facts_rows(
         &self,
         key: &StructuralSnapshotKey,
-        snapshot_version: i64,
-        payload: &[u8],
+        facts_version: i64,
+        facts: crate::analyzer::structural::facts::PersistedStructuralFacts,
     ) -> Result<bool, StoreError> {
-        self.store_context.store.upsert_structural_facts_snapshot(
+        self.store_context.store.upsert_structural_facts_rows(
             key.oid,
             &key.lang,
             key.generation,
-            snapshot_version,
-            payload,
+            facts_version,
+            facts,
         )
     }
 
@@ -3062,6 +3376,60 @@ where
 
     pub fn adapter(&self) -> &A {
         self.adapter.as_ref()
+    }
+
+    pub(crate) fn workspace_package_inventory_complete(&self) -> bool {
+        if !self.state.workspace_package_inventory_complete {
+            return false;
+        }
+        let Some(overlays) = self.project.overlay_content() else {
+            return true;
+        };
+        if overlays.entries().iter().any(|(file, _)| {
+            crate::analyzer::common::language_for_file(file) == self.adapter.language()
+        }) {
+            return false;
+        }
+        if !self.adapter.has_workspace_package_identity_inputs() {
+            return true;
+        }
+        overlays.entries().iter().all(|(file, digest)| {
+            !self.adapter.workspace_package_identity_input(file)
+                || self
+                    .state
+                    .workspace_package_identity_input_digests
+                    .get(file)
+                    == Some(digest)
+        })
+    }
+
+    /// Whether the package-qualified identities stored for this analyzer can be
+    /// returned by a request snapshot.
+    ///
+    /// A package-identity input such as Go's `go.mod` can rekey every source
+    /// declaration below it without changing any source blob OID. A cloned
+    /// request project deliberately does not rebuild the workspace, so its
+    /// persisted and transient declaration rows still carry the disk identity.
+    /// Until a real update reprojects those rows, suppress every positive
+    /// declaration answer instead of mixing the request's package namespace
+    /// with stale disk-qualified bodies.
+    pub(crate) fn workspace_declaration_identities_authoritative(&self) -> bool {
+        if !self.adapter.has_workspace_package_identity_inputs() {
+            return true;
+        }
+        self.project
+            .overlay_content()
+            .as_deref()
+            .is_none_or(|overlays| {
+                overlays.entries().iter().all(|(file, digest)| {
+                    !self.adapter.workspace_package_identity_input(file)
+                        || self
+                            .state
+                            .workspace_package_identity_input_digests
+                            .get(file)
+                            == Some(digest)
+                })
+            })
     }
 
     /// Build the analyzer for the next generation out of an already-reconciled
@@ -3245,16 +3613,18 @@ where
             BoundedParse::Cancelled => unreachable!("no cancellation token supplied"),
             BoundedParse::Rejected => return None,
         };
-        let mut parsed = adapter.parse_file(file, &source, &tree);
-        // Asked before the file scope is added: `add_file_scope` contributes
-        // the identical module unit to every reading of one blob, so an
-        // implementor comparing its projection against `parsed` compares only
-        // what the language walk itself produced.
-        let projections = adapter.additional_projections(file, &source, &tree, &parsed);
+        // Every reading of this blob at once, and before the file scope is
+        // added: `add_file_scope` contributes the identical module unit to
+        // every reading, so an implementor comparing its readings against each
+        // other compares only what the language walk itself produced.
+        let (mut parsed, projections) = adapter.parse_file_with_projections(file, &source, &tree);
         parsed.add_file_scope(file, &source);
         let contains_tests = adapter.contains_tests(file, &source, &tree, &parsed);
-        let mut parse_errors = Vec::new();
-        collect_parse_errors(tree.root_node(), &mut parse_errors);
+        let parse_errors = {
+            let mut errors = Vec::new();
+            collect_parse_errors(tree.root_node(), &mut errors);
+            Some(errors)
+        };
         let additional_projections = projections
             .into_iter()
             .map(|(storage_key, mut projection)| {
@@ -3272,8 +3642,14 @@ where
             })
             .collect();
 
+        // The source travels in the `FileState` for the rest of this build and
+        // is dropped when the state is persisted: the store has never held a
+        // source column (see `.agents/plans/ANALYZER_SQLITE_STORE_EXECPLAN.md`;
+        // reads go to the working tree first, then the Git object database).
+        // `payload_bytes` counts it in flight and `persisted_payload_bytes`
+        // subtracts it again before `blob_payload_costs` is written.
         let mut state =
-            Self::file_state_from_parsed(source, parsed, contains_tests, Some(parse_errors), true);
+            Self::file_state_from_parsed(source, parsed, contains_tests, parse_errors, true);
         state.additional_projections = additional_projections;
         Some(state)
     }
@@ -3323,6 +3699,9 @@ where
     }
 
     pub fn structural_parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return None;
+        }
         if code_unit.is_module() {
             return None;
         }
@@ -3338,6 +3717,9 @@ where
     }
 
     pub fn top_level_file_scope_parent_of(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return None;
+        }
         if code_unit.is_module() {
             return None;
         }
@@ -3383,7 +3765,7 @@ where
             .build()
             .expect("failed to build analyzer thread pool");
 
-        pool.install(|| {
+        let states = pool.install(|| {
             files
                 .into_par_iter()
                 .map_init(
@@ -3407,7 +3789,9 @@ where
                     },
                 )
                 .collect::<Vec<_>>()
-        })
+        });
+        note_additional_projection_totals(adapter.language());
+        states
     }
 
     fn analyze_prepare_and_persist_files(
@@ -3436,6 +3820,11 @@ where
         let producer_progress = progress.clone();
         let in_flight = Arc::new(Mutex::new(PreparedInFlight::default()));
         let mut stats = PersistBatchStats::default();
+        let timing_enabled = profiling::enabled();
+        let mut prepared_channel_recv_elapsed = Duration::ZERO;
+        let mut prepared_channel_recvs = 0usize;
+        let blob_persistence_elapsed = Cell::new(Duration::ZERO);
+        let blob_persistence_batches = Cell::new(0usize);
         let limits = PersistBatchLimits::PRODUCTION;
         stats.configured_max_in_flight_items = config
             .parallelism()
@@ -3450,10 +3839,25 @@ where
         // it here and re-raising it from inside the scope's own closure sends
         // the original payload up instead.
         let producer_panic: Mutex<Option<Box<dyn std::any::Any + Send>>> = Mutex::new(None);
+        // Where this phase's wall time went, reported below. The clocks run
+        // whether or not timing is on: two `Instant::now` calls against a
+        // multi-millisecond parse are unmeasurable, and always collecting them
+        // means the reported split is the one the ordinary build produced
+        // rather than one a measurement mode perturbed. `send_block_nanos` is
+        // summed over all workers, so divide by parallelism to compare it with
+        // the wall clock.
+        let phase_start = std::time::Instant::now();
+        let writer_before = crate::analyzer::store::writer::attribution::snapshot();
+        let send_block_nanos = AtomicUsize::new(0);
+        let analyze_nanos = AtomicUsize::new(0);
+        let recv_wait_nanos = std::cell::Cell::new(0u128);
+        let persist_call_nanos = std::cell::Cell::new(0u128);
         std::thread::scope(|scope| {
             let producer_tx = prepared_tx.clone();
             let producer_in_flight = Arc::clone(&in_flight);
             let producer_panic = &producer_panic;
+            let send_block_nanos = &send_block_nanos;
+            let analyze_nanos = &analyze_nanos;
             scope.spawn(move || {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     pool.install(|| {
@@ -3479,49 +3883,54 @@ where
                                 store_context
                                     .build_tier_access
                                     .record_tier_access(InformationTier::Syntax);
-                                let result =
-                                    match Self::analyze_file(parser, adapter, project, &file) {
-                                        Some(state) => {
-                                            let state = Arc::new(state);
-                                            if Self::should_inject_preparation_failure_for_test(
-                                                &file,
+                                let analyze_start = std::time::Instant::now();
+                                let analyzed = Self::analyze_file(parser, adapter, project, &file);
+                                let analyze_elapsed = analyze_start.elapsed().as_nanos() as usize;
+                                if analyze_elapsed >= SLOW_FILE_ANALYSIS_NOTE_NANOS {
+                                    profiling::note(format!(
+                                        "slow_file_analysis {} elapsed_ms={:.1}",
+                                        file.rel_path().display(),
+                                        analyze_elapsed as f64 / 1.0e6
+                                    ));
+                                }
+                                analyze_nanos.fetch_add(analyze_elapsed, Ordering::Relaxed);
+                                let result = match analyzed {
+                                    Some(state) => {
+                                        let state = Arc::new(state);
+                                        if Self::should_inject_preparation_failure_for_test(&file) {
+                                            PreparedAnalysis::PreparationFailed {
+                                                file,
+                                                state,
+                                                error: "injected preparation failure".to_string(),
+                                            }
+                                        } else {
+                                            match AnalyzerStore::prepare_parsed_blob(
+                                                oid,
+                                                &storage_key,
+                                                generation,
+                                                adapter,
+                                                Arc::clone(&state),
                                             ) {
-                                                PreparedAnalysis::PreparationFailed {
+                                                Ok(mut prepared) => {
+                                                    Self::inject_prepared_failure_for_test(
+                                                        &file,
+                                                        &mut prepared,
+                                                    );
+                                                    PreparedAnalysis::Ready {
+                                                        file,
+                                                        prepared: Box::new(prepared),
+                                                    }
+                                                }
+                                                Err(error) => PreparedAnalysis::PreparationFailed {
                                                     file,
                                                     state,
-                                                    error: "injected preparation failure"
-                                                        .to_string(),
-                                                }
-                                            } else {
-                                                match AnalyzerStore::prepare_parsed_blob(
-                                                    oid,
-                                                    &storage_key,
-                                                    generation,
-                                                    adapter,
-                                                    Arc::clone(&state),
-                                                ) {
-                                                    Ok(mut prepared) => {
-                                                        Self::inject_prepared_failure_for_test(
-                                                            &file,
-                                                            &mut prepared,
-                                                        );
-                                                        PreparedAnalysis::Ready {
-                                                            file,
-                                                            prepared: Box::new(prepared),
-                                                        }
-                                                    }
-                                                    Err(error) => {
-                                                        PreparedAnalysis::PreparationFailed {
-                                                            file,
-                                                            state,
-                                                            error: error.to_string(),
-                                                        }
-                                                    }
-                                                }
+                                                    error: error.to_string(),
+                                                },
                                             }
                                         }
-                                        None => PreparedAnalysis::Unparseable(file),
-                                    };
+                                    }
+                                    None => PreparedAnalysis::Unparseable(file),
+                                };
                                 if let Some(progress) = producer_progress.as_ref() {
                                     let current = completed.fetch_add(1, Ordering::Relaxed) + 1;
                                     let file = match &result {
@@ -3546,9 +3955,14 @@ where
                                         .expect("prepared in-flight mutex poisoned")
                                         .add(prepared.payload_bytes());
                                 }
+                                let send_start = std::time::Instant::now();
                                 producer_tx
                                     .send(result)
                                     .expect("persistence receiver should remain connected");
+                                send_block_nanos.fetch_add(
+                                    send_start.elapsed().as_nanos() as usize,
+                                    Ordering::Relaxed,
+                                );
                             },
                         );
                     });
@@ -3574,8 +3988,19 @@ where
                     return;
                 }
                 let prepared = std::mem::take(pending);
+                let persist_start = std::time::Instant::now();
                 let (outcomes, batch_stats) =
                     store_context.store.persist_prepared_blobs(prepared, limits);
+                // One clock feeds both reports: the phase split below and the
+                // profiling line's per-batch persistence total.
+                let persist_elapsed = persist_start.elapsed();
+                persist_call_nanos.set(persist_call_nanos.get() + persist_elapsed.as_nanos());
+                blob_persistence_elapsed.set(
+                    blob_persistence_elapsed
+                        .get()
+                        .saturating_add(persist_elapsed),
+                );
+                blob_persistence_batches.set(blob_persistence_batches.get().saturating_add(1));
                 *persist_completed = persist_completed.saturating_add(
                     batch_stats
                         .committed_blobs
@@ -3632,7 +4057,17 @@ where
             loop {
                 let message = match deferred.take() {
                     Some(message) => Ok(message),
-                    None => prepared_rx.recv(),
+                    None => {
+                        let recv_start = std::time::Instant::now();
+                        let received = prepared_rx.recv();
+                        // As above: one clock, both reports.
+                        let recv_elapsed = recv_start.elapsed();
+                        recv_wait_nanos.set(recv_wait_nanos.get() + recv_elapsed.as_nanos());
+                        prepared_channel_recv_elapsed =
+                            prepared_channel_recv_elapsed.saturating_add(recv_elapsed);
+                        prepared_channel_recvs = prepared_channel_recvs.saturating_add(1);
+                        received
+                    }
                 };
                 match message {
                     Ok(PreparedAnalysis::AllStarted) => {
@@ -3744,9 +4179,19 @@ where
         debug_assert_eq!(in_flight.current_payload_bytes, 0);
         stats.peak_in_flight_items = in_flight.peak_items;
         stats.peak_in_flight_payload_bytes = in_flight.peak_payload_bytes;
-        if profiling::enabled() {
+        if timing_enabled {
+            let language = adapter.language().config_label();
+            profiling::duration(
+                format!("analyze_prepare_and_persist.prepared_channel_recv[{language}]"),
+                prepared_channel_recv_elapsed,
+            );
+            profiling::duration(
+                format!("analyze_prepare_and_persist.blob_persistence[{language}]"),
+                blob_persistence_elapsed.get(),
+            );
             profiling::note(format!(
-                "persist_transactions={} failed_attempts={} committed_blobs={} failed_blobs={} logical_rows={} prepared_bytes={} peak_batch_blobs={} peak_batch_rows={} peak_batch_bytes={} peak_in_flight_items={} peak_in_flight_bytes={} configured_max_in_flight_items={}",
+                "language={language} prepared_channel_recvs={prepared_channel_recvs} blob_persistence_batches={} persist_transactions={} failed_attempts={} committed_blobs={} failed_blobs={} logical_rows={} prepared_bytes={} peak_batch_blobs={} peak_batch_rows={} peak_batch_bytes={} peak_in_flight_items={} peak_in_flight_bytes={} configured_max_in_flight_items={}",
+                blob_persistence_batches.get(),
                 stats.transactions,
                 stats.failed_transaction_attempts,
                 stats.committed_blobs,
@@ -3760,7 +4205,32 @@ where
                 stats.peak_in_flight_payload_bytes,
                 stats.configured_max_in_flight_items,
             ));
+            // Parse and persistence overlap, so neither one's own duration says
+            // which of them set the phase's length. These four totals do.
+            // `writer_busy` against `phase_ms` says whether the single SQLite
+            // writer was saturated; `producer_send_block` says whether workers
+            // waited on it; `analyze_ms_total` against `phase_ms * workers`
+            // says whether the parse pool was busy at all. Reading only the
+            // in-flight peak invites the opposite conclusion: it sits at its
+            // derived bound whenever one flush is in progress, whatever the
+            // pool is doing.
+            let elapsed_ms = phase_start.elapsed().as_secs_f64() * 1000.0;
+            let writer =
+                crate::analyzer::store::writer::attribution::snapshot().since(writer_before);
+            let workers = config.parallelism().max(1) as f64;
+            profiling::note(format!(
+                "persist_attribution files={total} phase_ms={elapsed_ms:.1} worker_thread_ms={:.1} writer_busy_ms={:.1} writer_idle_ms={:.1} writer_jobs={} consumer_persist_ms={:.1} consumer_recv_wait_ms={:.1} producer_send_block_ms={:.1} analyze_ms_total={:.1} workers={workers}",
+                elapsed_ms * workers,
+                writer.busy_nanos as f64 / 1.0e6,
+                writer.idle_nanos as f64 / 1.0e6,
+                writer.jobs,
+                persist_call_nanos.get() as f64 / 1.0e6,
+                recv_wait_nanos.get() as f64 / 1.0e6,
+                send_block_nanos.load(Ordering::Relaxed) as f64 / 1.0e6,
+                analyze_nanos.load(Ordering::Relaxed) as f64 / 1.0e6,
+            ));
         }
+        note_additional_projection_totals(adapter.language());
         stats
     }
 
@@ -3870,9 +4340,17 @@ where
 
         let workspace_snapshot = store_context.workspace_snapshot.as_deref();
         let liveness = store_context.liveness.as_ref();
+        let revision_blobs = store_context.revision_blobs.as_deref();
         let plan_one = |file: &ProjectFile| -> Result<PlannedLiveOid, String> {
             let has_overlay = project.has_overlay(file);
-            if !file.exists() && !has_overlay {
+            let revision_oid = revision_blobs.and_then(|blobs| blobs.oid_for(file));
+            // An immutable revision image names every analyzer-visible file of
+            // the revision but writes only the analyzers' configuration inputs
+            // to disk; the rest are served from the repository's object
+            // database. Absence from the filesystem is therefore not absence
+            // from the revision, and dropping such a file here would make the
+            // analyzer's picture of the revision silently partial.
+            if revision_oid.is_none() && !file.exists() && !has_overlay {
                 return Ok(None);
             }
             if let Some(snapshot) = workspace_snapshot
@@ -3885,6 +4363,13 @@ where
                 let oid = Oid::hash_object(ObjectType::Blob, source.as_bytes())
                     .map_err(|err| err.to_string())?;
                 (oid, LivePathEntry::overlay(file.clone(), oid))
+            } else if let Some(oid) = revision_oid {
+                // The tree walk that exported this immutable image already
+                // named this file's blob, so there is nothing to hash: the
+                // export directory is written once and never edited, and the
+                // identity is the revision's by definition rather than an
+                // observation of the bytes that happen to be on disk.
+                (oid, LivePathEntry::filesystem_hashed(file.clone(), oid))
             } else if let Some(liveness) = liveness {
                 // Point resolution hashes the bytes currently on disk, so an
                 // incremental update observes the edit that triggered it.
@@ -4001,24 +4486,24 @@ where
         ));
         let workspace_snapshot = store_context.workspace_snapshot.as_deref();
 
-        let analyzable_files: Vec<_> = {
+        let (analyzable_files, enumeration_complete): (Vec<_>, bool) = {
             let _scope = profiling::scope(format!(
                 "TreeSitterAnalyzer::{:?}::enumerate_files",
                 adapter.language()
             ));
-            workspace_snapshot
-                .map(|snapshot| {
-                    project
-                        .analyzable_files_from(snapshot.files(), adapter.language())
-                        .unwrap_or_default()
-                })
-                .unwrap_or_else(|| {
-                    project
-                        .analyzable_files(adapter.language())
-                        .unwrap_or_default()
-                })
-                .into_iter()
-                .collect()
+            let files = match workspace_snapshot {
+                Some(snapshot) => {
+                    project.analyzable_files_from(snapshot.files(), adapter.language())
+                }
+                None => project.analyzable_files(adapter.language()),
+            };
+            match files {
+                Ok(files) => (
+                    files.into_iter().collect(),
+                    store_context.workspace_listing_complete,
+                ),
+                Err(_) => (Vec::new(), false),
+            }
         };
         if let Some(progress) = progress.as_ref() {
             progress(BuildProgressEvent::new(
@@ -4048,6 +4533,9 @@ where
                 },
             )
         };
+        if !enumeration_complete {
+            state.mark_workspace_package_inventory_incomplete();
+        }
         // Another language already panicked: every phase below is work whose
         // only effect is to postpone that panic reaching the caller (#2359).
         if store_context.build_abort.is_aborted() {
@@ -4077,15 +4565,16 @@ where
                 "TreeSitterAnalyzer::{:?}::sync_path_symbol_units",
                 adapter.language()
             ));
+            let (dirty, package_inventory_complete) =
+                Self::sync_path_symbol_units(adapter, &indexed_files, store_context);
             state
                 .dirty_path_symbol_rows
                 .lock()
                 .expect("dirty path-symbol mutex poisoned")
-                .extend(Self::sync_path_symbol_units(
-                    adapter,
-                    &indexed_files,
-                    store_context,
-                ));
+                .extend(dirty);
+            if !package_inventory_complete {
+                state.mark_workspace_package_inventory_incomplete();
+            }
         }
 
         if let Some(progress) = progress.as_ref() {
@@ -4098,10 +4587,42 @@ where
                 None,
             ));
         }
+        state.workspace_package_identity_input_digests =
+            Self::workspace_package_identity_input_digests(project, adapter, workspace_snapshot);
         store_context
             .gc
             .schedule(project.root(), Arc::clone(&store_context.store));
         state
+    }
+
+    /// Snapshot the non-source inputs that qualified this generation's
+    /// declarations. Package hydration is defined against the filesystem
+    /// generation, not a later request overlay, so these bytes deliberately
+    /// bypass `Project::read_source`.
+    fn workspace_package_identity_input_digests(
+        project: &dyn Project,
+        adapter: &A,
+        workspace_snapshot: Option<&WorkspaceBuildSnapshot>,
+    ) -> HashMap<ProjectFile, [u8; 32]> {
+        let files = match workspace_snapshot {
+            Some(snapshot) => Cow::Borrowed(snapshot.files()),
+            None => match project.all_files_shared() {
+                Ok(files) => Cow::Owned((*files).clone()),
+                Err(_) => return HashMap::default(),
+            },
+        };
+        files
+            .iter()
+            .filter(|file| adapter.workspace_package_identity_input(file))
+            .filter_map(|file| {
+                std::fs::read(file.abs_path()).ok().map(|source| {
+                    (
+                        file.clone(),
+                        crate::analyzer::canonical_hash::sha256_bytes(&source),
+                    )
+                })
+            })
+            .collect()
     }
 
     /// Every workspace file whose extension no language claims: the universe
@@ -4306,13 +4827,26 @@ where
             edges.extend(round_edges);
 
             let closed = Self::closed_claim_set(adapter, &edges, &claimable);
-            frontier = closed
+            let unvisited = closed
                 .into_iter()
                 .filter(|file| visited.insert(file.clone()))
-                // Applied here rather than to the whole claimable universe: this
-                // set is small, and the ignore probe is a per-path listing scan.
-                .filter(|file| !project.is_bifrostignored(file.rel_path()))
-                .collect();
+                .collect::<Vec<_>>();
+            // The probe is a per-path listing scan, so its cost is the product of
+            // this round's newly claimed files and the ignore rules. The span is
+            // measured over the whole round rather than per file: it is the only
+            // way to see the product, and "this set is small" below is the
+            // assumption it exists to check.
+            frontier = {
+                let _scope = crate::profiling::scope_with(|| {
+                    format!("claim.bifrostignore_probe[{} files]", unvisited.len())
+                });
+                unvisited
+                    .into_iter()
+                    // Applied here rather than to the whole claimable universe: this
+                    // set is small, and the ignore probe is a per-path listing scan.
+                    .filter(|file| !project.is_bifrostignored(file.rel_path()))
+                    .collect()
+            };
             if frontier.is_empty() {
                 break;
             }
@@ -4467,11 +5001,18 @@ where
                     } else {
                         fact.package_tail.clone()
                     };
+                    for alias in adapter.workspace_package_aliases(project_file, &full_package) {
+                        record_package(alias, file)?;
+                    }
                     record_package(full_package, file)?;
                 }
             }
             if let Some(unit) = adapter.path_synthetic_module_unit(project_file) {
-                record_package(unit.package_fq(), file)?;
+                let canonical = unit.package_fq();
+                for alias in adapter.workspace_package_aliases(project_file, &canonical) {
+                    record_package(alias, file)?;
+                }
+                record_package(canonical, file)?;
             }
         }
 
@@ -4503,7 +5044,7 @@ where
         adapter: &A,
         files: &[ProjectFile],
         store_context: &AnalyzerStoreContext,
-    ) -> HashMap<ProjectFile, (String, PathSymbolRow)> {
+    ) -> (HashMap<ProjectFile, (String, PathSymbolRow)>, bool) {
         let snapshot = store_context.live_paths.snapshot();
         let mut rows_by_language: HashMap<
             String,
@@ -4528,6 +5069,7 @@ where
                 .push((file.clone(), workspace_file, path_symbol));
         }
         let mut dirty = HashMap::default();
+        let mut package_inventory_complete = true;
         for (lang, entries) in rows_by_language {
             let files = entries
                 .iter()
@@ -4538,14 +5080,16 @@ where
                 .filter_map(|(_, _, row)| row.clone())
                 .collect::<Vec<_>>();
             let blob_oids = files.iter().map(|file| file.blob_oid).collect::<Vec<_>>();
-            let relations = store_context
-                .store
-                .workspace_content_package_facts(
-                    &lang,
-                    store_context.generations[&lang],
-                    &blob_oids,
-                )
-                .and_then(|facts| Self::workspace_snapshot_relations(adapter, &entries, &facts));
+            let relations = store_context.store.workspace_content_package_facts(
+                &lang,
+                store_context.generations[&lang],
+                &blob_oids,
+                adapter.workspace_file_package_anchor(),
+            );
+            let relations = relations.and_then(|facts| {
+                package_inventory_complete &= facts.complete;
+                Self::workspace_snapshot_relations(adapter, &entries, &facts.facts)
+            });
             let mut persisted = false;
             if let Ok((packages, package_files, package_edges, anchors)) = relations {
                 for attempt in 0..=STORE_WRITE_IMMEDIATE_RETRIES {
@@ -4573,6 +5117,7 @@ where
                 }
             }
             if !persisted {
+                package_inventory_complete = false;
                 dirty.extend(
                     entries
                         .into_iter()
@@ -4580,7 +5125,7 @@ where
                 );
             }
         }
-        dirty
+        (dirty, package_inventory_complete)
     }
 
     /// Replace one storage language's complete workspace membership, including
@@ -4669,6 +5214,7 @@ where
         store_context: &AnalyzerStoreContext,
         workspace_snapshots: &mut WorkspaceSnapshots,
         dirty: &mut HashMap<ProjectFile, (String, PathSymbolRow)>,
+        package_inventory_complete: &mut bool,
     ) {
         let storage_languages = adapter
             .storage_language_keys()
@@ -4701,8 +5247,16 @@ where
                 );
                 store_context
                     .store
-                    .workspace_content_package_facts(lang, generations[lang], &[blob_oid])
-                    .and_then(|facts| Self::workspace_snapshot_relations(adapter, &[entry], &facts))
+                    .workspace_content_package_facts(
+                        lang,
+                        generations[lang],
+                        &[blob_oid],
+                        adapter.workspace_file_package_anchor(),
+                    )
+                    .and_then(|facts| {
+                        *package_inventory_complete &= facts.complete;
+                        Self::workspace_snapshot_relations(adapter, &[entry], &facts.facts)
+                    })
             } else {
                 Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new()))
             };
@@ -4734,6 +5288,7 @@ where
             if !persisted && let Some((lang, row)) = replacement {
                 dirty.insert(file.clone(), (lang.to_string(), row));
             }
+            *package_inventory_complete &= persisted;
         }
     }
 
@@ -4771,12 +5326,14 @@ where
         let mut fresh_parse_errors = HashMap::default();
         let mut seeded_file_states = Vec::new();
         let mut persistence_stats = PersistBatchStats::default();
+        let mut workspace_package_inventory_complete = true;
         let oid_plan = {
             let _scope = profiling::scope("reconcile.resolve_live_oids");
             Self::resolve_live_oids(project, &files, config, store_context, replace_live_paths)
         };
         match oid_plan {
             Ok(file_oids) => {
+                workspace_package_inventory_complete &= file_oids.len() == files.len();
                 let all_blob_keys: Vec<_> = files
                     .iter()
                     .filter_map(|file| {
@@ -4857,6 +5414,8 @@ where
                         let storage_key = adapter.storage_language_key_for_file(&file);
                         match outcome {
                             Some((state, error)) => {
+                                workspace_package_inventory_complete &=
+                                    error.is_none() && state.parse_complete;
                                 let blob_outcome = if error.is_some() {
                                     RepresentativeBlobOutcome::Dirty
                                 } else {
@@ -4894,6 +5453,7 @@ where
                                 parsed_files.insert(file);
                             }
                             None => {
+                                workspace_package_inventory_complete = false;
                                 representative_blob_outcomes.insert(
                                     (oid, storage_key.to_string()),
                                     RepresentativeBlobOutcome::Unparseable,
@@ -4915,6 +5475,7 @@ where
                         dirty_path_symbol_rows,
                         seeded_file_states,
                     );
+                    state.mark_workspace_package_inventory_incomplete();
                     state.persistence_stats = persistence_stats;
                     return state;
                 }
@@ -4951,8 +5512,10 @@ where
                     store_context,
                 ) {
                     let Some(state) = state else {
+                        workspace_package_inventory_complete = false;
                         continue;
                     };
+                    workspace_package_inventory_complete &= state.parse_complete;
                     let mut seed_key = None;
                     if let Some(oid) = file_oids.get(&file).copied() {
                         let storage_key = adapter.storage_language_key_for_file(&file);
@@ -4980,6 +5543,7 @@ where
                 }
             }
             Err(error) => {
+                workspace_package_inventory_complete = false;
                 profiling::note(format!(
                     "resolve_live_oids failed; reconciling {:?} without live identities: {error}",
                     adapter.language()
@@ -5027,6 +5591,9 @@ where
             dirty_path_symbol_rows,
             seeded_file_states,
         );
+        if !workspace_package_inventory_complete {
+            state.mark_workspace_package_inventory_incomplete();
+        }
         state.persistence_stats = persistence_stats;
         state
     }
@@ -5388,7 +5955,8 @@ where
     }
 
     /// The second reading of `file`'s blob stored under `storage_key`, when
-    /// this adapter wrote one (see [`LanguageAdapter::additional_projections`]).
+    /// this adapter wrote one (see
+    /// [`LanguageAdapter::parse_file_with_projections`]).
     ///
     /// `None` means no rows exist under that key for this blob, which by that
     /// method's contract means the reading is identical to the file's own
@@ -6123,6 +6691,24 @@ where
             .collect()
     }
 
+    pub(crate) fn bulk_file_dependency_facts(
+        &self,
+        files: impl IntoIterator<Item = ProjectFile>,
+    ) -> HashMap<ProjectFile, crate::analyzer::FileDependencyFacts> {
+        self.bulk_import_facts(files)
+            .into_iter()
+            .map(|(file, facts)| {
+                (
+                    file,
+                    crate::analyzer::FileDependencyFacts {
+                        imports: facts.imports,
+                        contains_tests: Some(facts.contains_tests),
+                    },
+                )
+            })
+            .collect()
+    }
+
     pub(crate) fn bulk_import_facts(
         &self,
         files: impl IntoIterator<Item = ProjectFile>,
@@ -6156,6 +6742,7 @@ where
                     ImportFileFacts {
                         package_name: state.package_name.clone(),
                         imports: state.imports.clone(),
+                        contains_tests: state.contains_tests,
                     },
                 );
             } else {
@@ -6183,6 +6770,7 @@ where
                     ImportFileFacts {
                         package_name: facts.package_name,
                         imports: facts.imports,
+                        contains_tests: facts.contains_tests,
                     },
                 )
             })
@@ -6199,6 +6787,7 @@ where
                     ImportFileFacts {
                         package_name: state.package_name,
                         imports: state.imports,
+                        contains_tests: state.contains_tests,
                     },
                 );
             }
@@ -6566,7 +7155,19 @@ where
     ) -> Option<FileState> {
         // This parses `file` as this adapter's language and writes the result
         // under its storage key, so a foreign file must not reach the store at
-        // all. See `storage_key_and_generation`.
+        // all. See `storage_key_and_generation`. The owning guards all
+        // discriminate on `storage_language_key_for_file`, so an adapter
+        // override that answers its own key for a foreign file (the #2748
+        // contract violation) slips past every one of them; assert the
+        // contract itself here.
+        debug_assert!(
+            crate::analyzer::common::language_for_file(file) == self.adapter.language()
+                || (self.adapter.claims_included_files()
+                    && crate::analyzer::common::has_unclaimed_extension(file)),
+            "parse_and_store_transient must not parse foreign file {} as {}",
+            file.rel_path().display(),
+            self.adapter.language().config_label(),
+        );
         let (storage_key, generation) = self.storage_key_and_generation(file)?;
         let mut parser = Self::build_parser(self.adapter.parser_language());
         let state = Self::analyze_source(&mut parser, self.adapter.as_ref(), file, source)?;
@@ -6745,6 +7346,9 @@ where
     /// asking declaration. With no scope open there is no memo and the
     /// behaviour is exactly the unmemoized lookup.
     pub(crate) fn definition_parent_unit(&self, code_unit: &CodeUnit) -> Option<CodeUnit> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return None;
+        }
         let owner_fq_name = crate::analyzer::i_analyzer::default_parent_fq_name(code_unit)?;
         let parent_units = self.active_query_cache_handle(|cache| &cache.parent_units);
         let cached = parent_units.as_ref().and_then(|parent_units| {
@@ -7785,6 +8389,9 @@ where
     }
 
     pub(crate) fn forward_definition_fqn(&self, fq_name: &str) -> Vec<CodeUnit> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return Vec::new();
+        }
         match self.sql_bounded_definitions_vec(fq_name) {
             Ok(definitions) => definitions,
             Err(error) => {
@@ -7799,6 +8406,9 @@ where
     }
 
     pub(crate) fn forward_path_module_fqn(&self, fq_name: &str) -> Option<Vec<CodeUnit>> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return Some(Vec::new());
+        }
         let normalized = self.adapter.normalize_full_name(fq_name);
         match self.sql_path_symbol_units(fq_name, &normalized) {
             Ok(units) => Some(units),
@@ -7814,6 +8424,9 @@ where
         file: &ProjectFile,
         identifier: &str,
     ) -> Vec<CodeUnit> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return Vec::new();
+        }
         let Some(state) = self.fetch_file_state(file) else {
             return Vec::new();
         };
@@ -7830,6 +8443,9 @@ where
     }
 
     pub(crate) fn forward_direct_children(&self, owner: &CodeUnit) -> Vec<CodeUnit> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return Vec::new();
+        }
         <Self as CodeUnitIndex>::direct_children(self, owner)
     }
 
@@ -7841,6 +8457,9 @@ where
         owner: &CodeUnit,
         limit: usize,
     ) -> LimitedQueryRows<CodeUnit> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return LimitedQueryRows::complete(Vec::new(), 0);
+        }
         if limit == 0 || (owner.is_module() && self.adapter.language() == Language::Java) {
             return LimitedQueryRows::incomplete(Vec::new(), 0);
         }
@@ -7903,10 +8522,16 @@ where
     }
 
     pub(crate) fn forward_package_exists(&self, package: &str) -> bool {
+        if !self.workspace_declaration_identities_authoritative() {
+            return false;
+        }
         self.persisted_package_exists(package)
     }
 
     pub(crate) fn forward_fqn_prefix_exists(&self, prefix: &str) -> bool {
+        if !self.workspace_declaration_identities_authoritative() {
+            return false;
+        }
         let nested = format!("{prefix}.");
         let matches = |unit: &CodeUnit| {
             unit.package_name() == prefix
@@ -8046,19 +8671,19 @@ where
         self.relational_workspace_snapshots.load_full()
     }
 
-    fn capture_relational_workspace_snapshots(&self) -> Arc<WorkspaceSnapshots> {
+    fn capture_relational_workspace_snapshots(&self) -> (Arc<WorkspaceSnapshots>, bool) {
         let storage_languages = self.storage_language_keys_for_queries();
-        Arc::new(
-            self.store_query_or_record(
-                self.store_context.store.workspace_snapshots_for_langs(
-                    &self.store_context.workspace_id,
-                    &storage_languages,
-                    self.store_context.generations.as_ref(),
-                ),
-                "capturing relational workspace identities",
-            )
-            .unwrap_or_default(),
-        )
+        match self.store_query_or_record(
+            self.store_context.store.workspace_snapshots_for_langs(
+                &self.store_context.workspace_id,
+                &storage_languages,
+                self.store_context.generations.as_ref(),
+            ),
+            "capturing relational workspace identities",
+        ) {
+            Some(snapshots) => (Arc::new(snapshots), true),
+            None => (Arc::new(WorkspaceSnapshots::default()), false),
+        }
     }
 
     fn sql_all_declarations_with_primary_ranges_vec(
@@ -8115,6 +8740,9 @@ where
         &self,
         kind: CodeUnitType,
     ) -> Option<Vec<HierarchyDeclarationFacts>> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return Some(Vec::new());
+        }
         let rows = self.store_query_or_record(
             self.store_context
                 .store
@@ -8137,16 +8765,22 @@ where
                     lang: row.candidate.lang.clone(),
                     unit_key: row.candidate.unit_key,
                 };
-                (row.candidate, (row.primary_range, storage_key))
+                (
+                    row.candidate,
+                    (row.primary_range, row.in_test_region, storage_key),
+                )
             }))
             .into_iter()
             .map(
-                |(declaration, (primary_range, storage_key))| HierarchyDeclarationFacts {
-                    declaration,
-                    primary_range,
-                    imports: Arc::default(),
-                    raw_supertypes: Arc::default(),
-                    storage_key: Some(storage_key),
+                |(declaration, (primary_range, in_test_region, storage_key))| {
+                    HierarchyDeclarationFacts {
+                        declaration,
+                        primary_range,
+                        in_test_region,
+                        imports: Arc::default(),
+                        raw_supertypes: Arc::default(),
+                        storage_key: Some(storage_key),
+                    }
                 },
             )
             .collect::<Vec<_>>();
@@ -8166,9 +8800,11 @@ where
                         });
                         let raw_supertypes =
                             state.raw_supertypes.get(&unit).cloned().unwrap_or_default();
+                        let in_test_region = state.test_region_units.contains(&unit);
                         HierarchyDeclarationFacts {
                             declaration: unit,
                             primary_range,
+                            in_test_region,
                             imports: Arc::from(state.imports.clone()),
                             raw_supertypes: Arc::from(raw_supertypes),
                             storage_key: None,
@@ -8182,6 +8818,7 @@ where
                 .map(|declaration| HierarchyDeclarationFacts {
                     declaration,
                     primary_range: None,
+                    in_test_region: false,
                     imports: Arc::default(),
                     raw_supertypes: Arc::default(),
                     storage_key: None,
@@ -8196,6 +8833,9 @@ where
         &self,
         facts: &mut [HierarchyDeclarationFacts],
     ) -> Option<()> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return None;
+        }
         let keys = facts
             .iter()
             .filter_map(|facts| facts.storage_key.clone())
@@ -8748,6 +9388,9 @@ where
     /// supplies the extra index keys; the row filter below stays authoritative
     /// because a prefix range also admits spellings that are not decorations.
     pub(crate) fn lookup_declarations_by_identifier(&self, identifier: &str) -> BTreeSet<CodeUnit> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return BTreeSet::new();
+        }
         let langs = self.storage_language_keys_for_queries();
         let names = |unit: &CodeUnit| identifier_addresses_target(unit, identifier);
         let mut rows = self
@@ -8812,6 +9455,9 @@ where
         file: &ProjectFile,
         identifier: &str,
     ) -> BTreeSet<CodeUnit> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return BTreeSet::new();
+        }
         let Some((storage_key, _generation)) = self.storage_key_and_generation(file) else {
             return BTreeSet::new();
         };
@@ -8851,6 +9497,9 @@ where
         limit: usize,
         continue_query: impl FnMut() -> bool,
     ) -> LimitedQueryRows<CodeUnit> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return LimitedQueryRows::complete(Vec::new(), 0);
+        }
         let langs = self.storage_language_keys_for_queries();
         let persisted = self
             .store_query_or_record(
@@ -8882,6 +9531,9 @@ where
         limit: usize,
         mut continue_query: impl FnMut() -> bool,
     ) -> LimitedQueryRows<CodeUnit> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return LimitedQueryRows::complete(Vec::new(), 0);
+        }
         if limit == 0 || !continue_query() {
             return LimitedQueryRows::incomplete(Vec::new(), 0);
         }
@@ -8945,6 +9597,9 @@ where
         limit: usize,
         continue_query: impl FnMut() -> bool,
     ) -> LimitedQueryRows<CodeUnit> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return LimitedQueryRows::complete(Vec::new(), 0);
+        }
         let langs = self.storage_language_keys_for_queries();
         let persisted = self
             .store_query_or_record(
@@ -8969,11 +9624,18 @@ where
         )
     }
 
-    pub(crate) fn lookup_declarations_by_persisted_fqn(
+    /// Persisted exact/normalized declaration lookup for a generation cache.
+    /// A transient store failure is reported but never returned as an
+    /// authoritative empty result, so callers can decline to publish it
+    /// (#2795).
+    pub(crate) fn try_lookup_declarations_by_persisted_fqn(
         &self,
         fqn: &str,
         normalized: bool,
-    ) -> BTreeSet<CodeUnit> {
+    ) -> Option<BTreeSet<CodeUnit>> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return Some(BTreeSet::new());
+        }
         use crate::analyzer::store::PersistedLookupKey;
         let key = if normalized {
             PersistedLookupKey::NormalizedFqn
@@ -8985,19 +9647,17 @@ where
         } else {
             fqn.to_string()
         };
-        let rows = self
-            .store_query_or_record(
-                self.store_context
-                    .store
-                    .declaration_candidate_rows_by_lookup_key_for_langs(
-                        &self.storage_language_keys_for_queries(),
-                        self.store_context.generations.as_ref(),
-                        key,
-                        &lookup,
-                    ),
-                format!("querying declarations by persisted name `{lookup}`"),
-            )
-            .unwrap_or_default();
+        let rows = self.store_query_or_record(
+            self.store_context
+                .store
+                .declaration_candidate_rows_by_lookup_key_for_langs(
+                    &self.storage_language_keys_for_queries(),
+                    self.store_context.generations.as_ref(),
+                    key,
+                    &lookup,
+                ),
+            format!("querying declarations by persisted name `{lookup}`"),
+        )?;
         let mut matches: BTreeSet<_> = self.resolve_candidate_rows(rows).into_iter().collect();
         matches.extend(self.dirty_units_matching(false, |unit| {
             let candidate = if normalized {
@@ -9015,10 +9675,9 @@ where
                     unit.fq_name()
                 };
                 candidate == lookup
-            })
-            .unwrap_or_default(),
+            })?,
         );
-        matches
+        Some(matches)
     }
 
     pub(crate) fn lookup_declarations_by_persisted_fqn_limited(
@@ -9028,6 +9687,9 @@ where
         limit: usize,
         continue_query: impl FnMut() -> bool,
     ) -> LimitedQueryRows<CodeUnit> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return LimitedQueryRows::complete(Vec::new(), 0);
+        }
         use crate::analyzer::store::PersistedLookupKey;
         let key = if normalized {
             PersistedLookupKey::NormalizedFqn
@@ -9239,6 +9901,52 @@ where
         self.resolve_candidate_rows(rows)
             .into_iter()
             .any(|unit| unit.package_name() == package)
+    }
+
+    /// Conservatively gate a later exact C# FQN lookup without hydrating any
+    /// declarations. The workspace membership view carries live-blob and
+    /// generation filtering, and an unpublished declaration can add a true
+    /// result. An overlay that removes the last declaration from a package can
+    /// leave a stale `true` from the persisted snapshot; that is deliberately
+    /// safe because this method only decides whether to perform the later
+    /// structured FQN probe. It never turns a possible match into absence.
+    ///
+    /// A persisted miss is authoritative only when this analyzer accounts for
+    /// every workspace package file. Partial package projection leaves the
+    /// exact declaration indexes usable, so an incomplete inventory returns a
+    /// conservative, cacheable `Some(true)` and lets C# perform the structured
+    /// FQN probe. `None` is reserved for a store failure, which the generation
+    /// cache must not publish as an answer (#2795). Callers that require exact
+    /// overlay semantics use [`Self::persisted_package_exists`].
+    pub(crate) fn try_persisted_package_may_exist(&self, package: &str) -> Option<bool> {
+        let (authoritative_states, _) = self.authoritative_file_states_for_queries();
+        if authoritative_states.iter().any(|state| {
+            state
+                .declarations
+                .iter()
+                .any(|unit| !unit.is_file_scope() && unit.package_name() == package)
+        }) {
+            return Some(true);
+        }
+        if !self.workspace_package_inventory_complete() {
+            return Some(true);
+        }
+        self.store_query_or_record(
+            self.store_context.store.workspace_package_exists_for_langs(
+                &self.storage_language_keys_for_queries(),
+                self.store_context.generations.as_ref(),
+                self.selected_workspace_snapshots().as_ref(),
+                package,
+            ),
+            format!("querying persisted package membership for `{package}`"),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn delete_workspace_package_membership_for_test(&self, package: &str) {
+        self.store_context
+            .store
+            .delete_workspace_package_membership_for_test(package);
     }
 
     /// The persisted path of `search_definitions_by_suffix_pattern`. Its
@@ -10002,6 +10710,9 @@ where
     }
 
     pub(crate) fn raw_supertypes_of(&self, code_unit: &CodeUnit) -> Vec<String> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return Vec::new();
+        }
         let Some(state) = self.fetch_file_state(code_unit.source()) else {
             return Vec::new();
         };
@@ -10028,6 +10739,9 @@ where
         code_unit: &CodeUnit,
         limit: usize,
     ) -> LimitedQueryRows<String> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return LimitedQueryRows::complete(Vec::new(), 0);
+        }
         if limit == 0 {
             return LimitedQueryRows::incomplete(Vec::new(), 0);
         }
@@ -10071,6 +10785,9 @@ where
         code_unit: &CodeUnit,
         limit: usize,
     ) -> LimitedQueryRows<String> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return LimitedQueryRows::complete(Vec::new(), 0);
+        }
         if limit == 0 {
             return LimitedQueryRows::incomplete(Vec::new(), 0);
         }
@@ -10172,6 +10889,9 @@ where
     }
 
     pub(crate) fn class_declarations_in_package(&self, package_name: &str) -> Vec<CodeUnit> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return Vec::new();
+        }
         let mut matches = self.persisted_top_level_classes_in_package(package_name);
         matches.extend(self.dirty_units_matching(false, |unit| {
             unit.is_class() && unit.package_name() == package_name
@@ -10284,6 +11004,19 @@ where
     /// coarse cache lock stays off the row loop.
     pub(crate) fn active_query_cancellation(&self) -> Option<CancellationToken> {
         self.query_read_cache_lock().active_cancellation()
+    }
+
+    pub(crate) fn active_query_semantic_model_overlay(
+        &self,
+    ) -> Option<Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>> {
+        self.query_read_cache_lock().active_semantic_model_overlay()
+    }
+
+    pub(crate) fn active_query_semantic_model_snapshot(
+        &self,
+    ) -> Option<Option<Arc<crate::analyzer::semantic_model::ActiveSemanticModelSnapshot>>> {
+        self.query_read_cache_lock()
+            .active_semantic_model_snapshot()
     }
 
     fn query_read_cache_write(&self) -> std::sync::RwLockWriteGuard<'_, QueryReadCache> {
@@ -10411,6 +11144,9 @@ where
         file: &ProjectFile,
         ranges: &[Range],
     ) -> Option<Vec<Option<CodeUnit>>> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return Some(vec![None; ranges.len()]);
+        }
         self.enclosing_code_unit_query_count
             .fetch_add(ranges.len(), Ordering::Relaxed);
         if ranges.is_empty() {
@@ -10474,6 +11210,9 @@ where
     }
 
     pub(crate) fn signatures_vec_of(&self, code_unit: &CodeUnit) -> Vec<String> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return Vec::new();
+        }
         let signatures = self.signatures_limited(code_unit, usize::MAX);
         if signatures.complete {
             signatures.rows
@@ -10489,6 +11228,9 @@ where
         code_unit: &CodeUnit,
         limit: usize,
     ) -> LimitedQueryRows<String> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return LimitedQueryRows::complete(Vec::new(), 0);
+        }
         if limit == 0 {
             return LimitedQueryRows::incomplete(Vec::new(), 0);
         }
@@ -10533,6 +11275,9 @@ where
     }
 
     pub(crate) fn signature_metadata_vec_of(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return Vec::new();
+        }
         self.fetch_file_state(code_unit.source())
             .and_then(|state| state.signature_metadata.get(code_unit).cloned())
             .unwrap_or_default()
@@ -10543,6 +11288,9 @@ where
         code_unit: &CodeUnit,
         limit: usize,
     ) -> LimitedQueryRows<SignatureMetadata> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return LimitedQueryRows::complete(Vec::new(), 0);
+        }
         if limit == 0 {
             return LimitedQueryRows::incomplete(Vec::new(), 0);
         }
@@ -10593,6 +11341,9 @@ where
         code_unit: &CodeUnit,
         limit: usize,
     ) -> LimitedQueryRows<Range> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return LimitedQueryRows::complete(Vec::new(), 0);
+        }
         if limit == 0 {
             return LimitedQueryRows::incomplete(Vec::new(), 0);
         }
@@ -11003,6 +11754,18 @@ where
             fanout.push(Some(index));
         }
 
+        if !self.workspace_declaration_identities_authoritative() {
+            return RelationalBatchOutcome::Complete(
+                requests
+                    .iter()
+                    .map(|request| RelationalDefinitionResult {
+                        ordinal: request.ordinal,
+                        value: RelationalDefinitionValue::empty_for(&request.query),
+                    })
+                    .collect(),
+            );
+        }
+
         let storage_languages = self.storage_language_keys_for_queries();
         // Capture the mutable overlay once. The store applies it after all
         // relational rows have been hydrated but before committing the read
@@ -11096,6 +11859,9 @@ where
     }
 
     fn enclosing_code_unit(&self, file: &ProjectFile, range: &Range) -> Option<CodeUnit> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return None;
+        }
         self.enclosing_code_unit_query_count
             .fetch_add(1, Ordering::Relaxed);
         if range.start_byte >= range.end_byte {
@@ -11170,6 +11936,9 @@ where
     }
 
     fn top_level_declarations(&self, file: &ProjectFile) -> Vec<CodeUnit> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return Vec::new();
+        }
         self.fetch_file_state(file)
             .map(|state| {
                 state
@@ -11183,6 +11952,9 @@ where
     }
 
     fn summary_file_projection(&self, file: &ProjectFile) -> Option<Arc<SummaryFileProjection>> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return None;
+        }
         let _scope = profiling::scope(format!(
             "TreeSitterAnalyzer::{:?}::summary_file_projection",
             self.adapter.language()
@@ -11348,6 +12120,9 @@ where
     }
 
     fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return Box::new(std::iter::empty());
+        }
         Box::new(
             self.sql_all_declarations_vec()
                 .unwrap_or_default()
@@ -11356,15 +12131,24 @@ where
     }
 
     fn all_declarations_with_primary_ranges(&self) -> Vec<(CodeUnit, Option<Range>)> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return Vec::new();
+        }
         self.sql_all_declarations_with_primary_ranges_vec()
             .unwrap_or_default()
     }
 
     fn materialization_records(&self, file: &ProjectFile) -> Vec<MaterializationRecord> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return Vec::new();
+        }
         self.materialization_records_of(file)
     }
 
     fn location_declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return BTreeSet::new();
+        }
         self.structural_file_state(file)
             .map(|state| {
                 state
@@ -11378,6 +12162,9 @@ where
     }
 
     fn declarations(&self, file: &ProjectFile) -> BTreeSet<CodeUnit> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return BTreeSet::new();
+        }
         self.fetch_file_state(file)
             .or_else(|| self.fetch_file_state_from_current_source(file))
             .map(|state| {
@@ -11392,6 +12179,9 @@ where
     }
 
     fn definitions(&self, fq_name: &str) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return Box::new(std::iter::empty());
+        }
         let definitions = match self.sql_definitions_vec(fq_name) {
             Ok(definitions) => definitions,
             Err(error) => {
@@ -11403,6 +12193,9 @@ where
     }
 
     fn direct_children(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return Vec::new();
+        }
         if code_unit.is_module() && self.adapter.language() == Language::Java {
             return self.class_declarations_in_package(&code_unit.fq_name());
         }
@@ -11411,6 +12204,9 @@ where
     }
 
     fn direct_children_in_file(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return Vec::new();
+        }
         self.fetch_file_state(code_unit.source())
             .and_then(|state| {
                 let mut children = state.children.get(code_unit).cloned()?;
@@ -11421,6 +12217,9 @@ where
     }
 
     fn ranges(&self, code_unit: &CodeUnit) -> Vec<Range> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return Vec::new();
+        }
         self.source_snapshot_file_state(code_unit.source())
             .or_else(|| self.fetch_file_state(code_unit.source()))
             .and_then(|state| state.ranges.get(code_unit).cloned())
@@ -11432,6 +12231,9 @@ where
     }
 
     fn location_ranges(&self, code_unit: &CodeUnit) -> Vec<Range> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return Vec::new();
+        }
         self.structural_file_state(code_unit.source())
             .and_then(|state| state.ranges.get(code_unit).cloned())
             .unwrap_or_default()
@@ -11443,6 +12245,9 @@ where
         max_ranges: usize,
         cancellation: &crate::CancellationToken,
     ) -> (Vec<Range>, usize, bool) {
+        if !self.workspace_declaration_identities_authoritative() {
+            return (Vec::new(), 0, false);
+        }
         if max_ranges == 0 || cancellation.is_cancelled() {
             return (Vec::new(), 0, true);
         }
@@ -11455,12 +12260,18 @@ where
     }
 
     fn get_skeleton(&self, code_unit: &CodeUnit) -> Option<String> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return None;
+        }
         let mut rendered = String::new();
         self.render_skeleton_recursive(code_unit, "", false, &mut rendered);
         (!rendered.is_empty()).then(|| rendered.trim_end().to_string())
     }
 
     fn get_skeleton_header(&self, code_unit: &CodeUnit) -> Option<String> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return None;
+        }
         let mut rendered = String::new();
         self.render_skeleton_recursive(code_unit, "", true, &mut rendered);
         (!rendered.is_empty()).then(|| rendered.trim_end().to_string())
@@ -11476,6 +12287,9 @@ where
     }
 
     fn get_sources(&self, code_unit: &CodeUnit, include_comments: bool) -> BTreeSet<String> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return BTreeSet::new();
+        }
         let mut ranges = if code_unit.is_function() {
             let _scope = profiling::scope("TreeSitterAnalyzer::get_sources::definitions");
             let mut grouped = Vec::new();
@@ -11497,6 +12311,9 @@ where
     }
 
     fn search_definitions(&self, pattern: &str, auto_quote: bool) -> BTreeSet<CodeUnit> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return BTreeSet::new();
+        }
         self.sql_search_definitions(pattern, auto_quote)
             .unwrap_or_default()
     }
@@ -11507,11 +12324,17 @@ where
         terminal_identifiers: &[String],
         _language: Language,
     ) -> BTreeSet<CodeUnit> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return BTreeSet::new();
+        }
         self.sql_search_definitions_by_suffix_pattern(pattern, terminal_identifiers)
             .unwrap_or_default()
     }
 
     fn lookup_candidates_by_short_name(&self, symbol: &str) -> BTreeSet<CodeUnit> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return BTreeSet::new();
+        }
         self.sql_lookup_candidates_by_short_name(symbol)
             .unwrap_or_default()
     }
@@ -11521,14 +12344,20 @@ where
     }
 
     fn has_complete_symbol_lookup_index(&self) -> bool {
-        true
+        self.workspace_declaration_identities_authoritative()
     }
 
     fn signatures(&self, code_unit: &CodeUnit) -> Vec<String> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return Vec::new();
+        }
         self.signatures_vec_of(code_unit)
     }
 
     fn signature_metadata(&self, code_unit: &CodeUnit) -> Vec<SignatureMetadata> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return Vec::new();
+        }
         self.signature_metadata_vec_of(code_unit)
     }
 }
@@ -11579,6 +12408,18 @@ where
         TreeSitterAnalyzer::active_query_cancellation(self)
     }
 
+    fn active_query_semantic_model_overlay(
+        &self,
+    ) -> Option<Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>> {
+        TreeSitterAnalyzer::active_query_semantic_model_overlay(self)
+    }
+
+    fn active_query_semantic_model_snapshot(
+        &self,
+    ) -> Option<Option<Arc<crate::analyzer::semantic_model::ActiveSemanticModelSnapshot>>> {
+        TreeSitterAnalyzer::active_query_semantic_model_snapshot(self)
+    }
+
     fn begin_streaming_file_read(&self, file: &ProjectFile) {
         TreeSitterAnalyzer::begin_streaming_file_read(self, file);
     }
@@ -11596,6 +12437,9 @@ where
     }
 
     fn declaration_syntax_kind(&self, code_unit: &CodeUnit) -> Option<&'static str> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return None;
+        }
         let scope = crate::analyzer::AnalyzerQueryScope::new(self);
         let syntax = self.prepared_syntax(scope.token(), code_unit.source())?;
         let mut node = syntax.declaration_node(code_unit)?;
@@ -11621,6 +12465,12 @@ where
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
         if changed_files.is_empty() {
             return self.clone();
+        }
+        if changed_files
+            .iter()
+            .any(|file| self.adapter.workspace_package_identity_input(file))
+        {
+            return self.update_all();
         }
 
         let mut store_context = self.store_context.clone();
@@ -11686,6 +12536,10 @@ where
                 dirty_path_symbol_rows,
             },
         );
+        state.workspace_package_inventory_complete &=
+            self.state.workspace_package_inventory_complete;
+        state.workspace_package_identity_input_digests =
+            self.state.workspace_package_identity_input_digests.clone();
         if new_claimable_file_appeared {
             claim_roots.extend(
                 live.all_paths()
@@ -11719,6 +12573,7 @@ where
             &store_context,
             &mut relational_workspace_snapshots,
             &mut dirty_path_symbol_rows,
+            &mut state.workspace_package_inventory_complete,
         );
         *state
             .dirty_path_symbol_rows
@@ -11746,14 +12601,25 @@ where
     fn update_all(&self) -> Self {
         let mut store_context = self.store_context.clone();
         store_context.live_paths = Arc::new(self.store_context.live_paths.fork());
-        let state = Self::build_state(
+        store_context.workspace_snapshot = WorkspaceBuildSnapshot::capture(
+            self.project.as_ref(),
+            store_context.liveness.as_deref(),
+            &[self.adapter.language()],
+        );
+        store_context.workspace_listing_complete = store_context.workspace_snapshot.is_some();
+        let mut state = Self::build_state(
             self.project.as_ref(),
             self.adapter.as_ref(),
             &self.config,
             None,
             &store_context,
         );
-        let relational_workspace_snapshots = self.capture_relational_workspace_snapshots();
+        store_context.workspace_snapshot = None;
+        let (relational_workspace_snapshots, snapshots_complete) =
+            self.capture_relational_workspace_snapshots();
+        if !snapshots_complete {
+            state.mark_workspace_package_inventory_incomplete();
+        }
         Self::from_state(
             Arc::clone(&self.project),
             Arc::clone(&self.adapter),
@@ -11813,7 +12679,9 @@ where
     fn structural_fact_providers(
         &self,
     ) -> Vec<&dyn crate::analyzer::structural::StructuralFactProvider> {
-        if self.adapter.structural_spec().is_some() {
+        if self.workspace_declaration_identities_authoritative()
+            && self.adapter.structural_spec().is_some()
+        {
             vec![self]
         } else {
             Vec::new()
@@ -11855,6 +12723,9 @@ where
     }
 
     fn compute_cognitive_complexities(&self, file: &ProjectFile) -> Vec<(CodeUnit, u32)> {
+        if !self.workspace_declaration_identities_authoritative() {
+            return Vec::new();
+        }
         let Some(config) = self.adapter.cognitive_complexity_config() else {
             return Vec::new();
         };
@@ -11921,6 +12792,9 @@ where
         patterns: &SearchSymbolPatternBatch,
         cancellation: Option<&CancellationToken>,
     ) -> SearchSymbolCandidates {
+        if !self.workspace_declaration_identities_authoritative() {
+            return SearchSymbolCandidates::complete(Vec::new(), 0);
+        }
         self.sql_search_symbol_candidates(patterns, cancellation)
             .unwrap_or_else(|| SearchSymbolCandidates::complete(Vec::new(), 0))
     }
@@ -11949,6 +12823,36 @@ impl<A> crate::analyzer::AnalyzerTestHooks for TreeSitterAnalyzer<A>
 where
     A: LanguageAdapter,
 {
+    fn arm_selector_continuation_semantic_cache_invalidation_for_test(&self) {
+        self.semantic_cache
+            .arm_selector_continuation_invalidation_for_test();
+    }
+
+    fn invalidate_selector_continuation_semantic_cache_if_armed_for_test(&self) {
+        self.semantic_cache
+            .invalidate_selector_continuation_if_armed_for_test();
+    }
+
+    fn selector_continuation_semantic_cache_revivals_for_test(&self) -> u64 {
+        self.semantic_cache
+            .selector_continuation_revivals_for_test()
+    }
+
+    fn arm_evaluation_root_continuation_semantic_cache_invalidation_for_test(&self) {
+        self.semantic_cache
+            .arm_evaluation_root_continuation_invalidation_for_test();
+    }
+
+    fn invalidate_evaluation_root_continuation_semantic_cache_if_armed_for_test(&self) {
+        self.semantic_cache
+            .invalidate_evaluation_root_continuation_if_armed_for_test();
+    }
+
+    fn evaluation_root_continuation_semantic_cache_revivals_for_test(&self) -> u64 {
+        self.semantic_cache
+            .evaluation_root_continuation_revivals_for_test()
+    }
+
     fn reset_definition_candidates_query_count_for_test(&self) {
         TreeSitterAnalyzer::reset_definition_candidates_query_count_for_test(self);
     }
@@ -12012,6 +12916,20 @@ where
 
     fn bulk_candidate_hydration_count_for_test(&self) -> usize {
         TreeSitterAnalyzer::bulk_hydration_count_for_test(self)
+    }
+
+    fn reset_java_usage_evidence_cache_stats_for_test(&self) {
+        self.snapshot_caches()
+            .java_usage_evidence()
+            .reset_stats_for_test();
+    }
+
+    fn java_usage_evidence_cache_stats_for_test(
+        &self,
+    ) -> crate::analyzer::JavaUsageEvidenceCacheStats {
+        self.snapshot_caches()
+            .java_usage_evidence()
+            .stats_for_test()
     }
 
     fn reset_workspace_path_scan_count_for_test(&self) {
@@ -13056,6 +13974,92 @@ mod tests {
     }
 
     #[test]
+    fn revision_supplied_blob_ids_replace_hashing_the_exported_bytes() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        // `src/First.java` sorts first, so it is the entry the sampled debug
+        // assertion checks, and its inventory id must therefore be the honest
+        // hash of what is on disk. `src/Second.java` carries the proof: its
+        // inventory id names bytes the file does not hold, so a resolution that
+        // hashed the file would report the disk id instead.
+        let first = temp_file(&root, "src/First.java");
+        first.write("class First {}\n").expect("first source");
+        let first_oid =
+            Oid::hash_object(ObjectType::Blob, b"class First {}\n").expect("first blob id");
+        let second = temp_file(&root, "src/Second.java");
+        second.write("class OnDisk {}\n").expect("second source");
+        let second_disk_oid =
+            Oid::hash_object(ObjectType::Blob, b"class OnDisk {}\n").expect("disk blob id");
+        let second_revision_oid =
+            Oid::hash_object(ObjectType::Blob, b"class InTheRevision {}\n").expect("revision id");
+
+        let project = TestProject::new(&root, Language::Java);
+        let mut store_context = ephemeral_store_context(&project).unwrap();
+        store_context.revision_blobs = Some(Arc::new(RevisionBlobIdentities::new(
+            vec![
+                (first.rel_path().to_path_buf(), first_oid),
+                (second.rel_path().to_path_buf(), second_revision_oid),
+            ],
+            Vec::new(),
+        )));
+
+        let resolved = TreeSitterAnalyzer::<JavaAdapter>::resolve_live_oids(
+            &project,
+            &[first.clone(), second.clone()],
+            &AnalyzerConfig::default(),
+            &store_context,
+            true,
+        )
+        .expect("revision identities resolve");
+
+        assert_eq!(resolved.get(&first), Some(&first_oid));
+        assert_eq!(
+            resolved.get(&second),
+            Some(&second_revision_oid),
+            "the revision's inventory decides identity; hashing would have reported \
+             {second_disk_oid}"
+        );
+        // The identity is also what every later query reads, without a stat.
+        assert_eq!(
+            store_context
+                .live_paths
+                .snapshot()
+                .validated_oid_for_path(&second),
+            Some(second_revision_oid)
+        );
+    }
+
+    /// The sampled re-hash is the only thing standing between a mis-assembled
+    /// inventory and facts published under the wrong content key, so prove it
+    /// fires. Debug-only: the assertion is compiled out of a release build by
+    /// design, and this test would then never panic.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "exported bytes hash differently")]
+    fn a_sampled_revision_blob_id_that_disagrees_with_the_export_is_rejected() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let only = temp_file(&root, "src/Only.java");
+        only.write("class Only {}\n").expect("only source");
+        let wrong = Oid::hash_object(ObjectType::Blob, b"class Other {}\n").expect("wrong blob id");
+
+        let project = TestProject::new(&root, Language::Java);
+        let mut store_context = ephemeral_store_context(&project).unwrap();
+        store_context.revision_blobs = Some(Arc::new(RevisionBlobIdentities::new(
+            vec![(only.rel_path().to_path_buf(), wrong)],
+            Vec::new(),
+        )));
+
+        let _ = TreeSitterAnalyzer::<JavaAdapter>::resolve_live_oids(
+            &project,
+            &[only],
+            &AnalyzerConfig::default(),
+            &store_context,
+            true,
+        );
+    }
+
+    #[test]
     fn persisted_epoch_publication_failure_is_returned_from_analyzer_construction() {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("canonical temp dir");
@@ -13080,6 +14084,8 @@ mod tests {
             gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
             liveness: None,
             workspace_snapshot: None,
+            workspace_listing_complete: true,
+            revision_blobs: None,
             live_paths: Arc::new(LivePathMap::default()),
             generations: Arc::new(HashMap::default()),
             build_abort: Arc::new(BuildAbort::default()),
@@ -13524,6 +14530,8 @@ mod tests {
             gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
             liveness: None,
             workspace_snapshot: None,
+            workspace_listing_complete: true,
+            revision_blobs: None,
             live_paths: Arc::new(LivePathMap::default()),
             generations: Arc::new(HashMap::default()),
             build_abort: Arc::new(BuildAbort::default()),
@@ -13641,6 +14649,8 @@ mod tests {
             gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
             liveness: None,
             workspace_snapshot: None,
+            workspace_listing_complete: true,
+            revision_blobs: None,
             live_paths: Arc::new(LivePathMap::default()),
             generations: Arc::new(HashMap::default()),
             build_abort: Arc::new(BuildAbort::default()),
@@ -13733,6 +14743,8 @@ mod tests {
             gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
             liveness: None,
             workspace_snapshot: None,
+            workspace_listing_complete: true,
+            revision_blobs: None,
             live_paths,
             generations: Arc::new(HashMap::from_iter([(
                 "python".to_string(),
@@ -13963,6 +14975,42 @@ mod tests {
                 .map(|unit| unit.fq_name())
                 .collect::<Vec<String>>()
         );
+    }
+
+    #[test]
+    fn rendered_definition_lookup_reaches_an_empty_mounted_prefix() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        let file = temp_file(&root, "foo.rs");
+        file.write(
+            "pub struct Foo;\nimpl Foo {\n    pub fn target(&self) {}\n    pub fn other(&self) {}\n}\n",
+        )
+            .expect("write Rust fixture");
+        let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Rust));
+        let analyzer = TreeSitterAnalyzer::new(project, RustAdapter);
+
+        let target = analyzer
+            .declarations(&file)
+            .into_iter()
+            .find(|unit| unit.is_function() && unit.identifier() == "target")
+            .expect("fixture declares Foo.target");
+
+        assert_eq!(target.fq_name(), "Foo.target");
+        assert_eq!(
+            vec![target.clone()],
+            CodeUnitIndex::definitions(&analyzer, "Foo.target").collect::<Vec<_>>(),
+            "an anchored declaration at an empty package prefix must remain addressable"
+        );
+
+        let scope = Arc::new(crate::analyzer::AnalyzerQueryContext::default());
+        analyzer.begin_query(&scope);
+        analyzer.prefetch_definitions(&["Foo.target".to_string(), "Foo.other".to_string()]);
+        assert_eq!(
+            vec![target],
+            CodeUnitIndex::definitions(&analyzer, "Foo.target").collect::<Vec<_>>(),
+            "batched lookup must retain the same empty-prefix declaration"
+        );
+        analyzer.end_query(&scope);
     }
 
     /// #1774: every caller of the non-persisted workspace declaration scan used
@@ -14410,6 +15458,8 @@ mod tests {
             gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
             liveness: None,
             workspace_snapshot: None,
+            workspace_listing_complete: true,
+            revision_blobs: None,
             live_paths,
             generations: Arc::new(HashMap::from_iter([(
                 "python".to_string(),
@@ -14498,6 +15548,8 @@ mod tests {
             gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
             liveness: None,
             workspace_snapshot: None,
+            workspace_listing_complete: true,
+            revision_blobs: None,
             live_paths,
             generations: Arc::new(HashMap::from_iter([(
                 "python".to_string(),
@@ -15750,6 +16802,8 @@ mod tests {
             gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
             liveness: None,
             workspace_snapshot: None,
+            workspace_listing_complete: true,
+            revision_blobs: None,
             live_paths,
             generations: Arc::new(HashMap::from_iter([(
                 "python".to_string(),
@@ -16158,6 +17212,8 @@ mod tests {
             gc: Arc::new(crate::analyzer::store::gc::AnalyzerGcCoordinator::default()),
             liveness: None,
             workspace_snapshot: None,
+            workspace_listing_complete: true,
+            revision_blobs: None,
             live_paths: Arc::new(LivePathMap::default()),
             generations: Arc::new(HashMap::default()),
             build_abort: Arc::new(BuildAbort::default()),

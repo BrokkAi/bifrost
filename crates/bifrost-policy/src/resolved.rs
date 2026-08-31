@@ -972,6 +972,7 @@ pub enum ResolvedTypestateBinding {
     MatchedValue,
     Receiver,
     ReturnValue,
+    ResultIndex { index: u32 },
     ArgumentIndex { index: u32 },
     ArgumentName { name: String },
 }
@@ -2775,6 +2776,7 @@ fn endpoint_binding_to_port(binding: &PolicyEndpointBinding) -> PolicyPort {
         PolicyEndpointBinding::MatchedValue => PolicyPort::MatchedValue,
         PolicyEndpointBinding::Receiver => PolicyPort::Receiver,
         PolicyEndpointBinding::ReturnValue => PolicyPort::ReturnValue,
+        PolicyEndpointBinding::ResultIndex { index } => PolicyPort::ResultIndex { index: *index },
         PolicyEndpointBinding::ArgumentIndex { index } => {
             PolicyPort::ArgumentIndex { index: *index }
         }
@@ -2789,6 +2791,9 @@ fn resolved_binding_to_endpoint(binding: &ResolvedTypestateBinding) -> PolicyEnd
         ResolvedTypestateBinding::MatchedValue => PolicyEndpointBinding::MatchedValue,
         ResolvedTypestateBinding::Receiver => PolicyEndpointBinding::Receiver,
         ResolvedTypestateBinding::ReturnValue => PolicyEndpointBinding::ReturnValue,
+        ResolvedTypestateBinding::ResultIndex { index } => {
+            PolicyEndpointBinding::ResultIndex { index: *index }
+        }
         ResolvedTypestateBinding::ArgumentIndex { index } => {
             PolicyEndpointBinding::ArgumentIndex { index: *index }
         }
@@ -2803,6 +2808,9 @@ fn seed_binding_to_resolved(binding: &TypestateSeedBinding) -> ResolvedTypestate
         TypestateSeedBinding::MatchedValue => ResolvedTypestateBinding::MatchedValue,
         TypestateSeedBinding::Receiver => ResolvedTypestateBinding::Receiver,
         TypestateSeedBinding::ReturnValue => ResolvedTypestateBinding::ReturnValue,
+        TypestateSeedBinding::ResultIndex { index } => {
+            ResolvedTypestateBinding::ResultIndex { index: *index }
+        }
         TypestateSeedBinding::ArgumentIndex { index } => {
             ResolvedTypestateBinding::ArgumentIndex { index: *index }
         }

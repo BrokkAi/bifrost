@@ -872,7 +872,7 @@ fn headroom_summary(samples: &[ExecutionSample]) -> Option<IdealizedHeadroomSumm
 }
 
 fn benchmark_workspace(project: Arc<dyn Project>) -> WorkspaceAnalyzer {
-    WorkspaceAnalyzer::build_ephemeral(
+    WorkspaceAnalyzer::build_ephemeral_footgun(
         project,
         AnalyzerConfig {
             parallelism: Some(1),
@@ -1309,7 +1309,7 @@ fn run_case(
     );
     let project: Arc<dyn Project> = Arc::new(TestProject::new(root.to_path_buf(), language));
     let build_started = Instant::now();
-    let workspace = WorkspaceAnalyzer::build_ephemeral(
+    let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
         project,
         AnalyzerConfig {
             parallelism: Some(1),

@@ -491,7 +491,7 @@ mod tests {
             .write("missingValue;\n")
             .unwrap();
         let project = Arc::new(TestProject::new(root.clone(), Language::JavaScript));
-        let analyzer = crate::analyzer::WorkspaceAnalyzer::build_ephemeral(
+        let analyzer = crate::analyzer::WorkspaceAnalyzer::build_ephemeral_footgun(
             project,
             crate::analyzer::AnalyzerConfig::default(),
         )

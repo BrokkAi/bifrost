@@ -1,4 +1,7 @@
 use super::*;
+use crate::analyzer::semantic::{
+    DurablePortIdentity, ProcedureLocalLocator, SemanticArtifactLeaseCharge, ValueId,
+};
 
 #[derive(Debug)]
 pub struct DetailedCodeQueryResult {
@@ -6,6 +9,76 @@ pub struct DetailedCodeQueryResult {
     pub work: CodeQueryExecutionWork,
     pub evidence: Vec<DetailedCodeQueryEvidence>,
     pub profile: Option<QueryExecutionProfile>,
+    pub(in crate::structural::search) semantic_receipt: Option<CodeQuerySemanticReceipt>,
+}
+
+/// Identity-preserving semantic charge produced by an opted-in detailed
+/// query.
+///
+/// Policy compilation is a semantic consumer after endpoint selection. It
+/// needs the budget's artifact/file identities; flattening this value to
+/// public work counters would make the compiler pay those materializations
+/// again. Receipt-enabled result-contract windows also retain the exact
+/// complete artifact dependency allocations behind usable rows. The policy
+/// consumer must either atomically admit those dependencies under its own
+/// physical-memory authority or drop the receipt.
+pub struct CodeQuerySemanticReceipt {
+    budget: SemanticBudgetCharge,
+    execution_before: SemanticExecutionBudgetSnapshot,
+    execution_charge: SemanticExecutionBudgetCharge,
+    artifact_charge: SemanticArtifactLeaseCharge,
+}
+
+impl CodeQuerySemanticReceipt {
+    pub(crate) fn new(
+        budget: SemanticBudgetCharge,
+        execution_before: SemanticExecutionBudgetSnapshot,
+        execution_charge: SemanticExecutionBudgetCharge,
+        artifact_charge: SemanticArtifactLeaseCharge,
+    ) -> Self {
+        Self {
+            budget,
+            execution_before,
+            execution_charge,
+            artifact_charge,
+        }
+    }
+
+    pub fn budget_charge(&self) -> &SemanticBudgetCharge {
+        &self.budget
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        SemanticBudgetCharge,
+        SemanticExecutionBudgetSnapshot,
+        SemanticExecutionBudgetCharge,
+        SemanticArtifactLeaseCharge,
+    ) {
+        (
+            self.budget,
+            self.execution_before,
+            self.execution_charge,
+            self.artifact_charge,
+        )
+    }
+}
+
+impl std::fmt::Debug for CodeQuerySemanticReceipt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CodeQuerySemanticReceipt")
+            .field("budget", &self.budget)
+            .field("execution_before", &self.execution_before)
+            .field("execution_charge", &self.execution_charge)
+            .field("artifact_dependency_count", &self.artifact_charge.len())
+            .field(
+                "artifact_dependency_retained_bytes",
+                &self.artifact_charge.retained_bytes(),
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,6 +92,27 @@ pub struct DetailedCodeQueryEvidence {
     pub identities: DetailedCodeQueryProvenanceIdentities,
     pub source_slice_sha256: Option<[u8; 32]>,
     pub provenance: Vec<DetailedCodeQueryProvenanceEvidence>,
+    /// Runtime-only semantic identity for one exact decorated-parameter row.
+    ///
+    /// The locator and durable port identity retain no artifact materialization
+    /// or other runtime allocation. The corresponding artifact dependency is
+    /// carried by `CodeQuerySemanticReceipt` when this is populated.
+    pub decorated_parameter: Option<DetailedCodeQueryDecoratedParameterEvidence>,
+}
+
+/// Exact semantic selection evidence for a decorated parameter.
+///
+/// This is intentionally outside the serializable row model. A policy
+/// consumer may use the procedure-local value locator and port identity after
+/// continuing the semantic artifact receipt; it must not join the row through
+/// ranges, names, decorator text, or syntax ordinals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetailedCodeQueryDecoratedParameterEvidence {
+    pub procedure_id: String,
+    pub value_id: String,
+    pub port_id: String,
+    pub value_locator: ProcedureLocalLocator<ValueId>,
+    pub port: DurablePortIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -240,6 +334,7 @@ mod value_domain {
         EffectReason, EffectTiming,
     };
     use crate::analyzer::usages::get_definition::trace::TraceCompleteness;
+    use crate::query::{FailureUseConsumer, FailureUseProvenance};
     use crate::structural::search::results::environment::CodeQueryCandidateRef;
     use crate::structural::search::{dispatch, member_family, receiver, render};
     use brokk_bifrost_core::analyzer::Language;
@@ -353,6 +448,18 @@ mod value_domain {
     pub(super) const CANDIDATE_COVERAGE: &[&str] = CandidateCoverage::LABELS;
     pub(super) const EVIDENCE_PROOF: &[&str] = ProofStatus::LABELS;
     pub(super) const EVIDENCE_COMPLETENESS: &[&str] = EvidenceCompleteness::LABELS;
+    pub(super) const MODEL_ORIGIN: &[&str] = &[
+        "workspace_source",
+        "exact_generated_output",
+        "dependency_source",
+        "dependency_binary",
+        "prebuilt_api_index",
+        "declarative_model",
+    ];
+    pub(super) const MODEL_PROOF: &[&str] = &["authored_anchor", "exact_artifact", "pack_fact"];
+    pub(super) const MODEL_COMPLETENESS: &[&str] = &["partial", "complete"];
+    pub(super) const TARGET_ORIGIN: &[&str] = &["source", "semantic_model"];
+    pub(super) const SELECTOR_PROOF: &[&str] = &["derived", "authored_summary"];
     pub(super) const DISPATCH_BOUNDARY_KIND: &[&str] = DispatchBoundaryKind::LABELS;
 
     pub(super) const MEMBER_FAMILY_OUTCOME: &[&str] = MemberFamilyOutcome::LABELS;
@@ -380,6 +487,22 @@ mod value_domain {
     pub(super) const EFFECT_DERIVATION: &[&str] = EffectDerivation::LABELS;
     pub(super) const EFFECT_REASON: &[&str] = EffectReason::LABELS;
     pub(super) const EFFECT_COVERAGE: &[&str] = EffectCoverage::LABELS;
+    pub(super) const RESULT_CONTRACT_PREDICATE: &[&str] = &["null", "non_null"];
+    pub(super) const RESULT_USE_VALIDATION: &[&str] =
+        &["unused", "satisfied", "violated", "unknown"];
+    pub(super) const RESULT_CONTRACT_USE_KIND: &[&str] = &[
+        "dereference",
+        "field",
+        "index",
+        "receiver_call",
+        "call_argument",
+    ];
+    pub(super) const RESULT_CONTRACT_USE_TIMING: &[&str] = &["direct", "deferred", "captured"];
+    pub(super) const OPERATION_APPLICABILITY: &[&str] = &["required", "not_required", "unknown"];
+    pub(super) const RESULT_USE_GUARD: &[&str] =
+        &["guarded", "unguarded", "not_applicable", "unknown"];
+    pub(super) const FAILURE_USE_PROVENANCE: &[&str] = FailureUseProvenance::LABELS;
+    pub(super) const FAILURE_USE_CONSUMER: &[&str] = FailureUseConsumer::LABELS;
 
     pub(super) const SIGNATURE_COVERAGE: &[&str] = SignatureCoverage::LABELS;
     pub(super) const DECORATOR_BINDING_STATUS: &[&str] = decorator_binding::BINDING_STATUS;
@@ -897,9 +1020,31 @@ detailed_row_domains! {
                     CodeQueryRowField::required("id", Scalar::StableId),
                     CodeQueryRowField::required("site_id", Scalar::StableId),
                     CodeQueryRowField::required("site_ast_id", Scalar::StableId),
+                    CodeQueryRowField::optional("callee_name", Scalar::String),
                     CodeQueryRowField::required_enum("call_kind", value_domain::CALL_KIND),
                     CodeQueryRowField::required_enum("coverage", value_domain::CALL_SHAPE_COVERAGE),
                     CodeQueryRowField::required("group_count", Scalar::Integer),
+                    CodeQueryRowField::required("argument_count", Scalar::Integer),
+        ],
+    },
+    CallResult => "call_result" {
+        display_range: |value| Some(value.range),
+        identities: Primary,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("site_id", Scalar::StableId),
+                    CodeQueryRowField::required("site_ast_id", Scalar::StableId),
+                    CodeQueryRowField::required("call_id", Scalar::StableId),
+                    CodeQueryRowField::required("procedure_id", Scalar::StableId),
+                    CodeQueryRowField::required("point_id", Scalar::StableId),
+                    CodeQueryRowField::required_enum("language", value_domain::LANGUAGE),
+                    CodeQueryRowField::required("ordinal", Scalar::Integer),
+                    CodeQueryRowField::required("value_id", Scalar::Integer),
+                    CodeQueryRowField::required_enum("proof", value_domain::EVIDENCE_PROOF),
+                    CodeQueryRowField::required_enum(
+                        "completeness",
+                        value_domain::EVIDENCE_COMPLETENESS
+                    ),
         ],
     },
     CallArgumentGroup => "call_argument_group" {
@@ -940,6 +1085,7 @@ detailed_row_domains! {
                     CodeQueryRowField::optional("argument_id", Scalar::StableId),
                     CodeQueryRowField::optional("target_id", Scalar::DeclarationIdentity),
                     CodeQueryRowField::optional("semantic_target_id", Scalar::StableId),
+                    CodeQueryRowField::optional_enum("target_origin", value_domain::TARGET_ORIGIN),
                     CodeQueryRowField::required_enum("dispatch_outcome", value_domain::DISPATCH_OUTCOME),
                     CodeQueryRowField::required_enum("dispatch_coverage", value_domain::CANDIDATE_COVERAGE),
                     CodeQueryRowField::optional_enum("dispatch_proof", value_domain::EVIDENCE_PROOF),
@@ -949,9 +1095,41 @@ detailed_row_domains! {
                     ),
                     CodeQueryRowField::required("dispatch_target_count", Scalar::Integer),
                     CodeQueryRowField::required("dispatch_targets_truncated", Scalar::Boolean),
+                    CodeQueryRowField::required("selector_exact", Scalar::Boolean),
+                    CodeQueryRowField::optional_enum("selector_proof", value_domain::SELECTOR_PROOF),
+                    CodeQueryRowField::optional("selector_summary_id", Scalar::String),
+                    CodeQueryRowField::optional("selector_summary_model_id", Scalar::String),
+                    CodeQueryRowField::optional("selector_summary_pack_id", Scalar::String),
+                    CodeQueryRowField::optional("selector_summary_active_set_hash", Scalar::String),
+                    CodeQueryRowField::optional("selector_summary_pack_digest", Scalar::String),
+                    CodeQueryRowField::optional("selector_summary_pack_version", Scalar::String),
+                    CodeQueryRowField::optional("selector_summary_record_id", Scalar::String),
+                    CodeQueryRowField::optional_enum("selector_summary_origin", value_domain::MODEL_ORIGIN),
+                    CodeQueryRowField::optional_enum("selector_summary_model_proof", value_domain::MODEL_PROOF),
+                    CodeQueryRowField::optional_enum("selector_summary_completeness", value_domain::MODEL_COMPLETENESS),
+                    CodeQueryRowField::optional("selector_summary_producer", Scalar::String),
+                    CodeQueryRowField::optional("selector_summary_producer_version", Scalar::String),
                     CodeQueryRowField::optional("signature_id", Scalar::StableId),
                     CodeQueryRowField::optional("model_id", Scalar::String),
+                    CodeQueryRowField::optional("receiver_type_id", Scalar::StableId),
                     CodeQueryRowField::optional("pack_id", Scalar::String),
+                    CodeQueryRowField::optional("model_active_set_hash", Scalar::String),
+                    CodeQueryRowField::optional("model_pack_digest", Scalar::String),
+                    CodeQueryRowField::optional("model_pack_version", Scalar::String),
+                    CodeQueryRowField::optional("model_record_id", Scalar::String),
+                    CodeQueryRowField::optional("model_activation_status", Scalar::String),
+                    CodeQueryRowField::optional("model_activation_reason", Scalar::String),
+                    CodeQueryRowField::optional("model_activation_source_kind", Scalar::String),
+                    CodeQueryRowField::optional("model_activation_source_id", Scalar::String),
+                    CodeQueryRowField::optional_enum("model_origin", value_domain::MODEL_ORIGIN),
+                    CodeQueryRowField::optional_enum("model_proof", value_domain::MODEL_PROOF),
+                    CodeQueryRowField::optional_enum(
+                        "model_completeness",
+                        value_domain::MODEL_COMPLETENESS,
+                    ),
+                    CodeQueryRowField::optional("model_ambiguous", Scalar::Boolean),
+                    CodeQueryRowField::optional("model_producer", Scalar::String),
+                    CodeQueryRowField::optional("model_producer_version", Scalar::String),
                     CodeQueryRowField::optional("actual_index", Scalar::Integer),
                     CodeQueryRowField::optional("actual_name", Scalar::String),
                     CodeQueryRowField::optional("formal_index", Scalar::Integer),
@@ -1006,6 +1184,141 @@ detailed_row_domains! {
                     CodeQueryRowField::required("arm_count", Scalar::Integer),
                     CodeQueryRowField::required("modeled_arm_count", Scalar::Integer),
                     CodeQueryRowField::required("terminal", Scalar::Boolean),
+        ],
+    },
+    CallResultContract => "call_result_contract" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("site_id", Scalar::StableId),
+                    CodeQueryRowField::required("site_ast_id", Scalar::StableId),
+                    CodeQueryRowField::optional("target_id", Scalar::StableId),
+                    CodeQueryRowField::optional("callee_id", Scalar::DeclarationIdentity),
+                    CodeQueryRowField::optional("callee_symbol", Scalar::String),
+                    CodeQueryRowField::optional("result_ordinal", Scalar::Integer),
+                    CodeQueryRowField::optional("condition_result_ordinal", Scalar::Integer),
+                    CodeQueryRowField::optional_enum(
+                        "predicate",
+                        value_domain::RESULT_CONTRACT_PREDICATE
+                    ),
+                    CodeQueryRowField::optional_enum(
+                        "result_success_predicate",
+                        value_domain::RESULT_CONTRACT_PREDICATE
+                    ),
+                    CodeQueryRowField::optional_enum("proof", value_domain::EFFECT_PROOF),
+                    CodeQueryRowField::required_enum("coverage", value_domain::EFFECT_COVERAGE),
+                    CodeQueryRowField::optional_enum("reason", value_domain::EFFECT_REASON),
+                    CodeQueryRowField::optional("pack_id", Scalar::String),
+                    CodeQueryRowField::optional("model_id", Scalar::String),
+                    CodeQueryRowField::optional("summary_id", Scalar::String),
+                    CodeQueryRowField::required("arm_count", Scalar::Integer),
+                    CodeQueryRowField::required("modeled_arm_count", Scalar::Integer),
+                    CodeQueryRowField::required("terminal", Scalar::Boolean),
+                    CodeQueryRowField::optional("result_use_count", Scalar::Integer),
+                    CodeQueryRowField::optional(
+                        "unguarded_result_use_count",
+                        Scalar::Integer
+                    ),
+                    CodeQueryRowField::optional_enum(
+                        "use_validation",
+                        value_domain::RESULT_USE_VALIDATION
+                    ),
+                    CodeQueryRowField::optional_enum(
+                        "use_validation_coverage",
+                        value_domain::EFFECT_COVERAGE
+                    ),
+                    CodeQueryRowField::required("success_guard_count", Scalar::Integer),
+                    CodeQueryRowField::required("fresh_allocation", Scalar::Boolean),
+                    CodeQueryRowField::required("member_contract_count", Scalar::Integer),
+        ],
+    },
+    ResultContractUse => "result_contract_use" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("acquisition_id", Scalar::StableId),
+                    CodeQueryRowField::required("acquisition_site_id", Scalar::StableId),
+                    CodeQueryRowField::required("acquisition_site_ast_id", Scalar::StableId),
+                    CodeQueryRowField::required("operation_point_id", Scalar::StableId),
+                    CodeQueryRowField::optional("operation_site_id", Scalar::StableId),
+                    CodeQueryRowField::optional("operation_site_ast_id", Scalar::StableId),
+                    CodeQueryRowField::optional("ast_id", Scalar::StableId),
+                    CodeQueryRowField::required("result_ordinal", Scalar::Integer),
+                    CodeQueryRowField::optional("condition_result_ordinal", Scalar::Integer),
+                    CodeQueryRowField::optional_enum(
+                        "acquisition_predicate",
+                        value_domain::RESULT_CONTRACT_PREDICATE
+                    ),
+                    CodeQueryRowField::optional_enum(
+                        "result_success_predicate",
+                        value_domain::RESULT_CONTRACT_PREDICATE
+                    ),
+                    CodeQueryRowField::optional_enum(
+                        "required_predicate",
+                        value_domain::RESULT_CONTRACT_PREDICATE
+                    ),
+                    CodeQueryRowField::required_enum(
+                        "use_kind",
+                        value_domain::RESULT_CONTRACT_USE_KIND
+                    ),
+                    CodeQueryRowField::required_enum(
+                        "timing",
+                        value_domain::RESULT_CONTRACT_USE_TIMING
+                    ),
+                    CodeQueryRowField::required_enum(
+                        "applicability",
+                        value_domain::OPERATION_APPLICABILITY
+                    ),
+                    CodeQueryRowField::required_enum(
+                        "guard",
+                        value_domain::RESULT_USE_GUARD
+                    ),
+                    CodeQueryRowField::required_enum("coverage", value_domain::EFFECT_COVERAGE),
+                    CodeQueryRowField::optional("member", Scalar::String),
+                    CodeQueryRowField::optional("parameter_count", Scalar::Integer),
+                    CodeQueryRowField::optional("parameter_ordinal", Scalar::Integer),
+                    CodeQueryRowField::optional("pack_id", Scalar::String),
+                    CodeQueryRowField::optional("model_id", Scalar::String),
+                    CodeQueryRowField::optional("summary_id", Scalar::String),
+        ],
+    },
+    ResultContractFailureUse => "result_contract_failure_use" {
+        display_range: |value| Some(value.range),
+        identities: None,
+        fields: [
+                    CodeQueryRowField::required("id", Scalar::StableId),
+                    CodeQueryRowField::required("acquisition_id", Scalar::StableId),
+                    CodeQueryRowField::required("acquisition_site_id", Scalar::StableId),
+                    CodeQueryRowField::required("acquisition_site_ast_id", Scalar::StableId),
+                    CodeQueryRowField::required("procedure_id", Scalar::StableId),
+                    CodeQueryRowField::required("condition_result_ordinal", Scalar::Integer),
+                    CodeQueryRowField::optional("condition_value_id", Scalar::Integer),
+                    CodeQueryRowField::optional("failure_edge_id", Scalar::StableId),
+                    CodeQueryRowField::required("consumer_point_id", Scalar::StableId),
+                    CodeQueryRowField::optional("consumer_call_id", Scalar::StableId),
+                    CodeQueryRowField::optional("consumer_site_id", Scalar::StableId),
+                    CodeQueryRowField::optional("consumer_site_ast_id", Scalar::StableId),
+                    CodeQueryRowField::optional("ast_id", Scalar::StableId),
+                    CodeQueryRowField::required("operand_value_id", Scalar::Integer),
+                    CodeQueryRowField::optional("binding_value_id", Scalar::Integer),
+                    CodeQueryRowField::optional("establishment_point_id", Scalar::StableId),
+                    CodeQueryRowField::optional("establishment_value_id", Scalar::Integer),
+                    CodeQueryRowField::required_enum(
+                        "failure_provenance",
+                        value_domain::FAILURE_USE_PROVENANCE
+                    ),
+                    CodeQueryRowField::required_enum(
+                        "consumer",
+                        value_domain::FAILURE_USE_CONSUMER
+                    ),
+                    CodeQueryRowField::optional("argument_ordinal", Scalar::Integer),
+                    CodeQueryRowField::required_enum("proof", value_domain::EFFECT_PROOF),
+                    CodeQueryRowField::required_enum("coverage", value_domain::EFFECT_COVERAGE),
+                    CodeQueryRowField::optional("pack_id", Scalar::String),
+                    CodeQueryRowField::optional("model_id", Scalar::String),
+                    CodeQueryRowField::optional("summary_id", Scalar::String),
         ],
     },
     ProcedureEffect => "procedure_effect" {
@@ -1087,6 +1400,7 @@ detailed_row_domains! {
                     CodeQueryRowField::required_enum("language", value_domain::LANGUAGE),
                     CodeQueryRowField::optional("owner_id", Scalar::StableId),
                     CodeQueryRowField::optional("procedure_id", Scalar::StableId),
+                    CodeQueryRowField::optional("value_id", Scalar::StableId),
                     CodeQueryRowField::optional("parameter_ordinal", Scalar::Integer),
                     CodeQueryRowField::optional("port_id", Scalar::StableId),
                     CodeQueryRowField::required("decorator_name", Scalar::String),
@@ -1147,7 +1461,7 @@ detailed_row_domains! {
         ],
     },
     ReceiverEvidence => "receiver_evidence" {
-        display_range: |_value| None,
+        display_range: |value| Some(value.range),
         identities: None,
         fields: [
                     CodeQueryRowField::required("id", Scalar::StableId),
@@ -1161,6 +1475,8 @@ detailed_row_domains! {
                         value_domain::RECEIVER_EVIDENCE_KIND
                     ),
                     CodeQueryRowField::optional("declaration_id", Scalar::DeclarationIdentity),
+                    CodeQueryRowField::optional("model_id", Scalar::String),
+                    CodeQueryRowField::optional("pack_id", Scalar::String),
                     CodeQueryRowField::optional("factory_id", Scalar::DeclarationIdentity),
                     CodeQueryRowField::required_enum("proof", value_domain::RECEIVER_EVIDENCE_PROOF),
                     CodeQueryRowField::required_enum("completeness", value_domain::RECEIVER_COVERAGE),
@@ -1541,9 +1857,17 @@ detailed_row_domains! {
                     CodeQueryRowField::required_enum("language", value_domain::LANGUAGE),
                     CodeQueryRowField::required("point_id", Scalar::StableId),
                     CodeQueryRowField::required_enum("predicate", value_domain::GUARD_PREDICATE),
+                    CodeQueryRowField::optional("constant", Scalar::Boolean),
+                    CodeQueryRowField::optional("null_on_true", Scalar::Boolean),
+                    CodeQueryRowField::optional("null_target_id", Scalar::StableId),
+                    CodeQueryRowField::optional("equality_negated", Scalar::Boolean),
+                    CodeQueryRowField::optional("constant_value", Scalar::Integer),
+                    CodeQueryRowField::optional("opaque_digest", Scalar::Integer),
                     CodeQueryRowField::optional("subject_value", Scalar::Integer),
                     CodeQueryRowField::optional("true_edge_id", Scalar::StableId),
+                    CodeQueryRowField::optional("true_target_id", Scalar::StableId),
                     CodeQueryRowField::optional("false_edge_id", Scalar::StableId),
+                    CodeQueryRowField::optional("false_target_id", Scalar::StableId),
                     CodeQueryRowField::required_enum("proof", value_domain::EVIDENCE_PROOF),
                     CodeQueryRowField::required_enum(
                         "completeness",
@@ -1988,6 +2312,43 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::CallShape { value }, "group_count") => {
             Some(Scalar::Integer(value.group_count as u64))
         }
+        (CodeQueryResultValue::CallShape { value }, "callee_name") => {
+            value.callee_name.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::CallShape { value }, "argument_count") => {
+            Some(Scalar::Integer(value.argument_count as u64))
+        }
+        (CodeQueryResultValue::CallResult { value }, "id") => Some(Scalar::StableId(&value.id)),
+        (CodeQueryResultValue::CallResult { value }, "site_id") => {
+            Some(Scalar::StableId(&value.site_id))
+        }
+        (CodeQueryResultValue::CallResult { value }, "site_ast_id") => {
+            Some(Scalar::StableId(&value.site_ast_id))
+        }
+        (CodeQueryResultValue::CallResult { value }, "call_id") => {
+            Some(Scalar::StableId(&value.call_id))
+        }
+        (CodeQueryResultValue::CallResult { value }, "procedure_id") => {
+            Some(Scalar::StableId(&value.procedure_id))
+        }
+        (CodeQueryResultValue::CallResult { value }, "point_id") => {
+            Some(Scalar::StableId(&value.point_id))
+        }
+        (CodeQueryResultValue::CallResult { value }, "language") => {
+            Some(Scalar::ConstrainedEnum(value.language))
+        }
+        (CodeQueryResultValue::CallResult { value }, "ordinal") => {
+            Some(Scalar::Integer(value.ordinal))
+        }
+        (CodeQueryResultValue::CallResult { value }, "value_id") => {
+            Some(Scalar::Integer(value.value_id))
+        }
+        (CodeQueryResultValue::CallResult { value }, "proof") => {
+            Some(Scalar::ConstrainedEnum(value.proof))
+        }
+        (CodeQueryResultValue::CallResult { value }, "completeness") => {
+            Some(Scalar::ConstrainedEnum(value.completeness))
+        }
         (CodeQueryResultValue::CallArgumentGroup { value }, "id") => {
             Some(Scalar::StableId(&value.id))
         }
@@ -2149,6 +2510,9 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::DecoratedParameter { value }, "procedure_id") => {
             value.procedure_id.as_deref().map(Scalar::StableId)
         }
+        (CodeQueryResultValue::DecoratedParameter { value }, "value_id") => {
+            value.value_id.as_deref().map(Scalar::StableId)
+        }
         (CodeQueryResultValue::DecoratedParameter { value }, "parameter_ordinal") => value
             .parameter_ordinal
             .map(|ordinal| Scalar::Integer(ordinal as u64)),
@@ -2206,6 +2570,9 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::CallBinding { value }, "semantic_target_id") => {
             value.semantic_target_id.as_deref().map(Scalar::StableId)
         }
+        (CodeQueryResultValue::CallBinding { value }, "target_origin") => {
+            value.target_origin.map(Scalar::ConstrainedEnum)
+        }
         (CodeQueryResultValue::CallBinding { value }, "dispatch_outcome") => {
             Some(Scalar::ConstrainedEnum(value.dispatch_outcome))
         }
@@ -2224,14 +2591,111 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::CallBinding { value }, "dispatch_targets_truncated") => {
             Some(Scalar::Boolean(value.dispatch_targets_truncated))
         }
+        (CodeQueryResultValue::CallBinding { value }, "selector_exact") => {
+            Some(Scalar::Boolean(value.selector_exact))
+        }
+        (CodeQueryResultValue::CallBinding { value }, "selector_proof") => {
+            value.selector_proof.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::CallBinding { value }, "selector_summary_id") => {
+            value.selector_summary_id.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::CallBinding { value }, "selector_summary_model_id") => value
+            .selector_summary_model_id
+            .as_deref()
+            .map(Scalar::String),
+        (CodeQueryResultValue::CallBinding { value }, "selector_summary_pack_id") => value
+            .selector_summary_pack_id
+            .as_deref()
+            .map(Scalar::String),
+        (CodeQueryResultValue::CallBinding { value }, "selector_summary_active_set_hash") => value
+            .selector_summary_active_set_hash
+            .as_deref()
+            .map(Scalar::String),
+        (CodeQueryResultValue::CallBinding { value }, "selector_summary_pack_digest") => value
+            .selector_summary_pack_digest
+            .as_deref()
+            .map(Scalar::String),
+        (CodeQueryResultValue::CallBinding { value }, "selector_summary_pack_version") => value
+            .selector_summary_pack_version
+            .as_deref()
+            .map(Scalar::String),
+        (CodeQueryResultValue::CallBinding { value }, "selector_summary_record_id") => value
+            .selector_summary_record_id
+            .as_deref()
+            .map(Scalar::String),
+        (CodeQueryResultValue::CallBinding { value }, "selector_summary_origin") => {
+            value.selector_summary_origin.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::CallBinding { value }, "selector_summary_model_proof") => value
+            .selector_summary_model_proof
+            .map(Scalar::ConstrainedEnum),
+        (CodeQueryResultValue::CallBinding { value }, "selector_summary_completeness") => value
+            .selector_summary_completeness
+            .map(Scalar::ConstrainedEnum),
+        (CodeQueryResultValue::CallBinding { value }, "selector_summary_producer") => value
+            .selector_summary_producer
+            .as_deref()
+            .map(Scalar::String),
+        (CodeQueryResultValue::CallBinding { value }, "selector_summary_producer_version") => value
+            .selector_summary_producer_version
+            .as_deref()
+            .map(Scalar::String),
         (CodeQueryResultValue::CallBinding { value }, "signature_id") => {
             value.signature_id.as_deref().map(Scalar::StableId)
         }
         (CodeQueryResultValue::CallBinding { value }, "model_id") => {
             value.model_id.as_deref().map(Scalar::String)
         }
+        (CodeQueryResultValue::CallBinding { value }, "receiver_type_id") => {
+            value.receiver_type_id.as_deref().map(Scalar::StableId)
+        }
         (CodeQueryResultValue::CallBinding { value }, "pack_id") => {
             value.pack_id.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::CallBinding { value }, "model_active_set_hash") => {
+            value.model_active_set_hash.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::CallBinding { value }, "model_pack_digest") => {
+            value.model_pack_digest.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::CallBinding { value }, "model_pack_version") => {
+            value.model_pack_version.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::CallBinding { value }, "model_record_id") => {
+            value.model_record_id.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::CallBinding { value }, "model_activation_status") => {
+            value.model_activation_status.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::CallBinding { value }, "model_activation_reason") => {
+            value.model_activation_reason.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::CallBinding { value }, "model_activation_source_kind") => value
+            .model_activation_source_kind
+            .as_deref()
+            .map(Scalar::String),
+        (CodeQueryResultValue::CallBinding { value }, "model_activation_source_id") => value
+            .model_activation_source_id
+            .as_deref()
+            .map(Scalar::String),
+        (CodeQueryResultValue::CallBinding { value }, "model_origin") => {
+            value.model_origin.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::CallBinding { value }, "model_proof") => {
+            value.model_proof.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::CallBinding { value }, "model_completeness") => {
+            value.model_completeness.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::CallBinding { value }, "model_ambiguous") => {
+            value.model_ambiguous.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::CallBinding { value }, "model_producer") => {
+            value.model_producer.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::CallBinding { value }, "model_producer_version") => {
+            value.model_producer_version.as_deref().map(Scalar::String)
         }
         (CodeQueryResultValue::CallBinding { value }, "actual_index") => value
             .actual_index
@@ -2328,6 +2792,236 @@ fn project_code_query_row_field<'a>(
         }
         (CodeQueryResultValue::CallEffect { value }, "terminal") => {
             Some(Scalar::Boolean(value.terminal))
+        }
+        (CodeQueryResultValue::CallResultContract { value }, "id") => {
+            Some(Scalar::StableId(&value.id))
+        }
+        (CodeQueryResultValue::CallResultContract { value }, "site_id") => {
+            Some(Scalar::StableId(&value.site_id))
+        }
+        (CodeQueryResultValue::CallResultContract { value }, "site_ast_id") => {
+            Some(Scalar::StableId(&value.site_ast_id))
+        }
+        (CodeQueryResultValue::CallResultContract { value }, "target_id") => {
+            value.target_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::CallResultContract { value }, "callee_id") => value
+            .callee
+            .as_ref()
+            .and_then(|callee| callee.id.as_deref())
+            .map(Scalar::DeclarationIdentity),
+        (CodeQueryResultValue::CallResultContract { value }, "callee_symbol") => {
+            value.callee_symbol.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::CallResultContract { value }, "result_ordinal") => value
+            .result_ordinal
+            .map(|ordinal| Scalar::Integer(u64::from(ordinal))),
+        (CodeQueryResultValue::CallResultContract { value }, "condition_result_ordinal") => value
+            .condition_result_ordinal
+            .map(|ordinal| Scalar::Integer(u64::from(ordinal))),
+        (CodeQueryResultValue::CallResultContract { value }, "predicate") => {
+            value.predicate.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::CallResultContract { value }, "result_success_predicate") => {
+            value.result_success_predicate.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::CallResultContract { value }, "proof") => {
+            value.proof.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::CallResultContract { value }, "coverage") => {
+            Some(Scalar::ConstrainedEnum(value.coverage))
+        }
+        (CodeQueryResultValue::CallResultContract { value }, "reason") => {
+            value.reason.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::CallResultContract { value }, "pack_id") => {
+            value.pack_id.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::CallResultContract { value }, "model_id") => {
+            value.model_id.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::CallResultContract { value }, "summary_id") => {
+            value.summary_id.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::CallResultContract { value }, "arm_count") => {
+            Some(Scalar::Integer(value.arm_count as u64))
+        }
+        (CodeQueryResultValue::CallResultContract { value }, "modeled_arm_count") => {
+            Some(Scalar::Integer(value.modeled_arm_count as u64))
+        }
+        (CodeQueryResultValue::CallResultContract { value }, "terminal") => {
+            Some(Scalar::Boolean(value.terminal))
+        }
+        (CodeQueryResultValue::CallResultContract { value }, "result_use_count") => value
+            .result_use_count
+            .map(|count| Scalar::Integer(count as u64)),
+        (CodeQueryResultValue::CallResultContract { value }, "unguarded_result_use_count") => value
+            .unguarded_result_use_count
+            .map(|count| Scalar::Integer(count as u64)),
+        (CodeQueryResultValue::CallResultContract { value }, "use_validation") => {
+            value.use_validation.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::CallResultContract { value }, "use_validation_coverage") => {
+            value.use_validation_coverage.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::CallResultContract { value }, "success_guard_count") => {
+            Some(Scalar::Integer(value.success_guard_count as u64))
+        }
+        (CodeQueryResultValue::CallResultContract { value }, "fresh_allocation") => {
+            Some(Scalar::Boolean(value.fresh_allocation))
+        }
+        (CodeQueryResultValue::CallResultContract { value }, "member_contract_count") => {
+            Some(Scalar::Integer(value.member_contract_count as u64))
+        }
+        (CodeQueryResultValue::ResultContractUse { value }, "id") => {
+            Some(Scalar::StableId(&value.id))
+        }
+        (CodeQueryResultValue::ResultContractUse { value }, "acquisition_id") => {
+            Some(Scalar::StableId(&value.acquisition_id))
+        }
+        (CodeQueryResultValue::ResultContractUse { value }, "acquisition_site_id") => {
+            Some(Scalar::StableId(&value.acquisition_site_id))
+        }
+        (CodeQueryResultValue::ResultContractUse { value }, "acquisition_site_ast_id") => {
+            Some(Scalar::StableId(&value.acquisition_site_ast_id))
+        }
+        (CodeQueryResultValue::ResultContractUse { value }, "operation_point_id") => {
+            Some(Scalar::StableId(&value.operation_point_id))
+        }
+        (CodeQueryResultValue::ResultContractUse { value }, "operation_site_id") => {
+            value.operation_site_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::ResultContractUse { value }, "operation_site_ast_id") => {
+            value.operation_site_ast_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::ResultContractUse { value }, "ast_id") => {
+            value.ast_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::ResultContractUse { value }, "result_ordinal") => {
+            Some(Scalar::Integer(u64::from(value.result_ordinal)))
+        }
+        (CodeQueryResultValue::ResultContractUse { value }, "condition_result_ordinal") => value
+            .condition_result_ordinal
+            .map(|ordinal| Scalar::Integer(u64::from(ordinal))),
+        (CodeQueryResultValue::ResultContractUse { value }, "acquisition_predicate") => {
+            value.acquisition_predicate.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::ResultContractUse { value }, "result_success_predicate") => {
+            value.result_success_predicate.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::ResultContractUse { value }, "required_predicate") => {
+            value.required_predicate.map(Scalar::ConstrainedEnum)
+        }
+        (CodeQueryResultValue::ResultContractUse { value }, "use_kind") => {
+            Some(Scalar::ConstrainedEnum(value.use_kind))
+        }
+        (CodeQueryResultValue::ResultContractUse { value }, "timing") => {
+            Some(Scalar::ConstrainedEnum(value.timing))
+        }
+        (CodeQueryResultValue::ResultContractUse { value }, "applicability") => {
+            Some(Scalar::ConstrainedEnum(value.applicability))
+        }
+        (CodeQueryResultValue::ResultContractUse { value }, "guard") => {
+            Some(Scalar::ConstrainedEnum(value.guard))
+        }
+        (CodeQueryResultValue::ResultContractUse { value }, "coverage") => {
+            Some(Scalar::ConstrainedEnum(value.coverage))
+        }
+        (CodeQueryResultValue::ResultContractUse { value }, "member") => {
+            value.member.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::ResultContractUse { value }, "parameter_count") => value
+            .parameter_count
+            .map(|count| Scalar::Integer(u64::from(count))),
+        (CodeQueryResultValue::ResultContractUse { value }, "parameter_ordinal") => value
+            .parameter_ordinal
+            .map(|ordinal| Scalar::Integer(u64::from(ordinal))),
+        (CodeQueryResultValue::ResultContractUse { value }, "pack_id") => {
+            value.pack_id.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::ResultContractUse { value }, "model_id") => {
+            value.model_id.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::ResultContractUse { value }, "summary_id") => {
+            value.summary_id.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::ResultContractFailureUse { value }, "id") => {
+            Some(Scalar::StableId(&value.id))
+        }
+        (CodeQueryResultValue::ResultContractFailureUse { value }, "acquisition_id") => {
+            Some(Scalar::StableId(&value.acquisition_id))
+        }
+        (CodeQueryResultValue::ResultContractFailureUse { value }, "acquisition_site_id") => {
+            Some(Scalar::StableId(&value.acquisition_site_id))
+        }
+        (CodeQueryResultValue::ResultContractFailureUse { value }, "acquisition_site_ast_id") => {
+            Some(Scalar::StableId(&value.acquisition_site_ast_id))
+        }
+        (CodeQueryResultValue::ResultContractFailureUse { value }, "procedure_id") => {
+            Some(Scalar::StableId(&value.procedure_id))
+        }
+        (CodeQueryResultValue::ResultContractFailureUse { value }, "condition_result_ordinal") => {
+            Some(Scalar::Integer(u64::from(value.condition_result_ordinal)))
+        }
+        (CodeQueryResultValue::ResultContractFailureUse { value }, "condition_value_id") => {
+            value.condition_value_id.map(Scalar::Integer)
+        }
+        (CodeQueryResultValue::ResultContractFailureUse { value }, "failure_edge_id") => {
+            value.failure_edge_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::ResultContractFailureUse { value }, "consumer_point_id") => {
+            Some(Scalar::StableId(&value.consumer_point_id))
+        }
+        (CodeQueryResultValue::ResultContractFailureUse { value }, "consumer_call_id") => {
+            value.consumer_call_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::ResultContractFailureUse { value }, "consumer_site_id") => {
+            value.consumer_site_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::ResultContractFailureUse { value }, "consumer_site_ast_id") => {
+            value.consumer_site_ast_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::ResultContractFailureUse { value }, "ast_id") => {
+            value.ast_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::ResultContractFailureUse { value }, "operand_value_id") => {
+            Some(Scalar::Integer(value.operand_value_id))
+        }
+        (CodeQueryResultValue::ResultContractFailureUse { value }, "binding_value_id") => {
+            value.binding_value_id.map(Scalar::Integer)
+        }
+        (CodeQueryResultValue::ResultContractFailureUse { value }, "establishment_point_id") => {
+            value
+                .establishment_point_id
+                .as_deref()
+                .map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::ResultContractFailureUse { value }, "establishment_value_id") => {
+            value.establishment_value_id.map(Scalar::Integer)
+        }
+        (CodeQueryResultValue::ResultContractFailureUse { value }, "failure_provenance") => {
+            Some(Scalar::ConstrainedEnum(value.failure_provenance))
+        }
+        (CodeQueryResultValue::ResultContractFailureUse { value }, "consumer") => {
+            Some(Scalar::ConstrainedEnum(value.consumer))
+        }
+        (CodeQueryResultValue::ResultContractFailureUse { value }, "argument_ordinal") => value
+            .argument_ordinal
+            .map(|ordinal| Scalar::Integer(u64::from(ordinal))),
+        (CodeQueryResultValue::ResultContractFailureUse { value }, "proof") => {
+            Some(Scalar::ConstrainedEnum(value.proof))
+        }
+        (CodeQueryResultValue::ResultContractFailureUse { value }, "coverage") => {
+            Some(Scalar::ConstrainedEnum(value.coverage))
+        }
+        (CodeQueryResultValue::ResultContractFailureUse { value }, "pack_id") => {
+            value.pack_id.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::ResultContractFailureUse { value }, "model_id") => {
+            value.model_id.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::ResultContractFailureUse { value }, "summary_id") => {
+            value.summary_id.as_deref().map(Scalar::String)
         }
         (CodeQueryResultValue::ProcedureEffect { value }, "id") => {
             Some(Scalar::StableId(&value.id))
@@ -2561,6 +3255,12 @@ fn project_code_query_row_field<'a>(
             .declaration_id
             .as_deref()
             .map(Scalar::DeclarationIdentity),
+        (CodeQueryResultValue::ReceiverEvidence { value }, "model_id") => {
+            value.model_id.as_deref().map(Scalar::String)
+        }
+        (CodeQueryResultValue::ReceiverEvidence { value }, "pack_id") => {
+            value.pack_id.as_deref().map(Scalar::String)
+        }
         (CodeQueryResultValue::ReceiverEvidence { value }, "factory_id") => {
             value.factory_id.as_deref().map(Scalar::DeclarationIdentity)
         }
@@ -3031,14 +3731,36 @@ fn project_code_query_row_field<'a>(
         (CodeQueryResultValue::Guard { value }, "predicate") => {
             Some(Scalar::ConstrainedEnum(value.predicate))
         }
+        (CodeQueryResultValue::Guard { value }, "constant") => value.constant.map(Scalar::Boolean),
+        (CodeQueryResultValue::Guard { value }, "null_on_true") => {
+            value.null_on_true.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::Guard { value }, "null_target_id") => {
+            value.null_target_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::Guard { value }, "equality_negated") => {
+            value.equality_negated.map(Scalar::Boolean)
+        }
+        (CodeQueryResultValue::Guard { value }, "constant_value") => {
+            value.constant_value.map(Scalar::Integer)
+        }
+        (CodeQueryResultValue::Guard { value }, "opaque_digest") => {
+            value.opaque_digest.map(Scalar::Integer)
+        }
         (CodeQueryResultValue::Guard { value }, "subject_value") => {
             value.subject_value.map(Scalar::Integer)
         }
         (CodeQueryResultValue::Guard { value }, "true_edge_id") => {
             value.true_edge_id.as_deref().map(Scalar::StableId)
         }
+        (CodeQueryResultValue::Guard { value }, "true_target_id") => {
+            value.true_target_id.as_deref().map(Scalar::StableId)
+        }
         (CodeQueryResultValue::Guard { value }, "false_edge_id") => {
             value.false_edge_id.as_deref().map(Scalar::StableId)
+        }
+        (CodeQueryResultValue::Guard { value }, "false_target_id") => {
+            value.false_target_id.as_deref().map(Scalar::StableId)
         }
         (CodeQueryResultValue::Guard { value }, "proof") => {
             Some(Scalar::ConstrainedEnum(value.proof))
@@ -3186,6 +3908,10 @@ pub enum DetailedCodeQueryKey {
         id: String,
         site_id: String,
     },
+    CallResult {
+        id: String,
+        site_id: String,
+    },
     CallArgumentGroup {
         id: String,
         site_id: String,
@@ -3201,6 +3927,18 @@ pub enum DetailedCodeQueryKey {
     CallEffect {
         id: String,
         site_id: String,
+    },
+    CallResultContract {
+        id: String,
+        site_id: String,
+    },
+    ResultContractUse {
+        id: String,
+        acquisition_id: String,
+    },
+    ResultContractFailureUse {
+        id: String,
+        acquisition_id: String,
     },
     ProcedureEffect {
         id: String,
@@ -3332,6 +4070,10 @@ pub enum DetailedCodeQueryKey {
 }
 
 impl DetailedCodeQueryResult {
+    pub fn take_semantic_receipt(&mut self) -> Option<CodeQuerySemanticReceipt> {
+        self.semantic_receipt.take()
+    }
+
     pub(in super::super) fn assert_invariants(&self) {
         if let Some(profile) = &self.profile {
             assert!(
@@ -3403,6 +4145,36 @@ impl DetailedCodeQueryResult {
                 );
                 assert_eq!(candidate.semantic_key, wire_id);
             }
+            if let Some(sidecar) = &evidence.decorated_parameter {
+                let CodeQueryResultValue::DecoratedParameter { value } = &result.value else {
+                    panic!("decorated-parameter sidecar must accompany a decorated row");
+                };
+                assert_eq!(evidence.domain, DetailedCodeQueryDomain::DecoratedParameter);
+                assert_eq!(
+                    sidecar.procedure_id,
+                    value.procedure_id.as_deref().unwrap_or_default()
+                );
+                assert_eq!(
+                    sidecar.value_id,
+                    value.value_id.as_deref().unwrap_or_default()
+                );
+                assert_eq!(
+                    sidecar.port_id,
+                    value.port_id.as_deref().unwrap_or_default()
+                );
+                assert_eq!(value.completion, "complete");
+                assert_eq!(value.coverage, "complete");
+                assert!(matches!(
+                    sidecar.port,
+                    crate::analyzer::semantic::DurablePortIdentity::Parameter { ordinal }
+                        if value.parameter_ordinal == Some(ordinal as usize)
+                ));
+            } else if evidence.domain != DetailedCodeQueryDomain::DecoratedParameter {
+                // The sidecar is deliberately scoped to the exact decorated
+                // parameter result family and never leaks through another
+                // detailed evidence constructor.
+                assert!(evidence.decorated_parameter.is_none());
+            }
             assert_detailed_terminal_identities(evidence.domain, &evidence.identities);
             let _ = &evidence.file;
             assert_eq!(
@@ -3470,6 +4242,34 @@ fn detailed_semantic_identity(
             DetailedCodeQueryKey::ControlEdge {
                 id: value.id.clone(),
                 procedure_id: value.procedure_id.clone(),
+            },
+        )),
+        CodeQueryResultValue::CallResult { value } => Some((
+            DetailedCodeQueryDomain::CallResult,
+            DetailedCodeQueryKey::CallResult {
+                id: value.id.clone(),
+                site_id: value.site_id.clone(),
+            },
+        )),
+        CodeQueryResultValue::CallResultContract { value } => Some((
+            DetailedCodeQueryDomain::CallResultContract,
+            DetailedCodeQueryKey::CallResultContract {
+                id: value.id.clone(),
+                site_id: value.site_id.clone(),
+            },
+        )),
+        CodeQueryResultValue::ResultContractUse { value } => Some((
+            DetailedCodeQueryDomain::ResultContractUse,
+            DetailedCodeQueryKey::ResultContractUse {
+                id: value.id.clone(),
+                acquisition_id: value.acquisition_id.clone(),
+            },
+        )),
+        CodeQueryResultValue::ResultContractFailureUse { value } => Some((
+            DetailedCodeQueryDomain::ResultContractFailureUse,
+            DetailedCodeQueryKey::ResultContractFailureUse {
+                id: value.id.clone(),
+                acquisition_id: value.acquisition_id.clone(),
             },
         )),
         CodeQueryResultValue::TypestateFinding { value } => Some((
@@ -3589,6 +4389,7 @@ fn semantic_wire_id(key: &DetailedCodeQueryKey) -> Option<&str> {
         DetailedCodeQueryKey::Procedure { id }
         | DetailedCodeQueryKey::ProgramPoint { id, .. }
         | DetailedCodeQueryKey::ControlEdge { id, .. }
+        | DetailedCodeQueryKey::CallResult { id, .. }
         | DetailedCodeQueryKey::TypestateFinding { id }
         | DetailedCodeQueryKey::TypestateWitness { id, .. }
         | DetailedCodeQueryKey::FlowEndpoint { id }
@@ -3613,6 +4414,9 @@ fn semantic_wire_id(key: &DetailedCodeQueryKey) -> Option<&str> {
         | DetailedCodeQueryKey::CallArgument { .. }
         | DetailedCodeQueryKey::CallBinding { .. }
         | DetailedCodeQueryKey::CallEffect { .. }
+        | DetailedCodeQueryKey::CallResultContract { .. }
+        | DetailedCodeQueryKey::ResultContractUse { .. }
+        | DetailedCodeQueryKey::ResultContractFailureUse { .. }
         | DetailedCodeQueryKey::ProcedureEffect { .. }
         | DetailedCodeQueryKey::CallableSignature { .. }
         | DetailedCodeQueryKey::SignatureParameter { .. }

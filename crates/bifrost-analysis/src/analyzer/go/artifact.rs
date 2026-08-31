@@ -1,6 +1,7 @@
 use super::GO_MODULE_SCOPE_SEGMENT;
 use super::declarations::{
-    collect_go_import_infos, determine_go_package_name, go_node_text, go_structured_type_identity,
+    collect_go_import_infos, determine_go_package_name, go_identifier_is_exported, go_node_text,
+    go_structured_type_identity, is_predeclared_go_type,
 };
 use super::dependency_discovery::DiscoveredGoPackage;
 use crate::CancellationToken;
@@ -708,39 +709,18 @@ fn augment_go_api_surface(
                 }
                 let mut promoted = promoted.expect("unique promoted member has a candidate");
                 promoted.fact.owner = owner_id.clone();
+                let (parameter_types, parameter_variadics, generic_arity, return_type) =
+                    member_identity_signature_parts(promoted.fact.signature.as_ref());
                 promoted.fact.id = member_declaration_id(MemberIdentity {
                     owner_id: &owner_id,
                     kind: promoted.fact.member_kind,
                     is_static: promoted.fact.is_static,
-                    parameter_arity: promoted
-                        .fact
-                        .signature
-                        .as_ref()
-                        .map_or(0, |signature| signature.parameters.len()),
+                    parameter_arity: parameter_types.len(),
                     name: &promoted.fact.name,
-                    generic_arity: promoted
-                        .fact
-                        .signature
-                        .as_ref()
-                        .map_or(0, |signature| signature.type_parameters.len()),
-                    parameter_types: &promoted
-                        .fact
-                        .signature
-                        .as_ref()
-                        .map(|signature| {
-                            signature
-                                .parameters
-                                .iter()
-                                .map(|parameter| parameter.r#type.clone())
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default(),
-                    parameter_variadics: &[],
-                    return_type: promoted
-                        .fact
-                        .signature
-                        .as_ref()
-                        .and_then(|signature| signature.returns.as_ref()),
+                    generic_arity,
+                    parameter_types: &parameter_types,
+                    parameter_variadics: &parameter_variadics,
+                    return_type,
                 });
                 members.push(promoted);
                 if members.len() >= limits.max_records {
@@ -1195,7 +1175,7 @@ fn collect_type_draft(
         (_, "interface_type") => TypeKind::Interface,
         _ => TypeKind::Class,
     };
-    let exported = go_name_is_exported(name);
+    let exported = go_identifier_is_exported(name);
     if types.len() >= limits.max_records {
         diagnostics.warning(
             "limit.records",
@@ -1310,7 +1290,7 @@ fn collect_struct_members(
             names
         };
         for name in names {
-            let exported = go_name_is_exported(&name);
+            let exported = go_identifier_is_exported(&name);
             push_member(
                 owner_id,
                 name.clone(),
@@ -1372,7 +1352,7 @@ fn collect_interface_members(
             diagnostics,
             &parsed.path,
         );
-        let exported = go_name_is_exported(&name);
+        let exported = go_identifier_is_exported(&name);
         push_member(
             owner_id,
             name.clone(),
@@ -1459,7 +1439,7 @@ fn collect_callable_draft(
         diagnostics,
         &parsed.path,
     );
-    let exported = go_name_is_exported(&name);
+    let exported = go_identifier_is_exported(&name);
     push_member(
         &owner_id,
         name.clone(),
@@ -1535,7 +1515,7 @@ fn collect_value_drafts(
             if name.is_empty() {
                 continue;
             }
-            let exported = go_name_is_exported(&name);
+            let exported = go_identifier_is_exported(&name);
             push_member(
                 &owner_id,
                 name.clone(),
@@ -1587,22 +1567,8 @@ fn push_member(
         );
         return;
     }
-    let parameter_types = signature
-        .as_ref()
-        .map(|signature| {
-            signature
-                .parameters
-                .iter()
-                .map(|parameter| parameter.r#type.clone())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let return_type = signature
-        .as_ref()
-        .and_then(|signature| signature.returns.as_ref());
-    let generic_arity = signature
-        .as_ref()
-        .map_or(0, |signature| signature.type_parameters.len());
+    let (parameter_types, parameter_variadics, generic_arity, return_type) =
+        member_identity_signature_parts(signature.as_ref());
     let id = member_declaration_id(MemberIdentity {
         owner_id,
         kind: member_kind,
@@ -1611,7 +1577,7 @@ fn push_member(
         name: &name,
         generic_arity,
         parameter_types: &parameter_types,
-        parameter_variadics: &[],
+        parameter_variadics: &parameter_variadics,
         return_type,
     });
     let referenced_type_ids = signature
@@ -1636,6 +1602,7 @@ fn push_member(
             is_static,
             is_abstract,
             is_virtual: is_abstract,
+            callable_family_complete: false,
             signature,
             receiver,
             extension_receiver: None,
@@ -1647,6 +1614,28 @@ fn push_member(
         surface,
         referenced_type_ids,
     });
+}
+
+fn member_identity_signature_parts(
+    signature: Option<&Signature>,
+) -> (Vec<TypeRef>, Vec<bool>, usize, Option<&TypeRef>) {
+    let Some(signature) = signature else {
+        return (Vec::new(), Vec::new(), 0, None);
+    };
+    (
+        signature
+            .parameters
+            .iter()
+            .map(|parameter| parameter.r#type.clone())
+            .collect(),
+        signature
+            .parameters
+            .iter()
+            .map(|parameter| parameter.variadic)
+            .collect(),
+        signature.type_parameters.len(),
+        signature.returns.as_ref(),
+    )
 }
 
 fn callable_signature(
@@ -2175,7 +2164,7 @@ fn resolve_nominal(path: &[&str], context: &TypeContext<'_>) -> Option<TypeRef> 
         });
     }
     let name = if path.len() == 1 {
-        if go_builtin_type(first) {
+        if is_predeclared_go_type(first) {
             first.to_owned()
         } else {
             format!("{}.{}", context.package, first)
@@ -2281,35 +2270,7 @@ fn channel_direction(node: Node<'_>) -> ChannelDirection {
     }
 }
 
-fn go_builtin_type(name: &str) -> bool {
-    matches!(
-        name,
-        "any"
-            | "bool"
-            | "byte"
-            | "comparable"
-            | "complex64"
-            | "complex128"
-            | "error"
-            | "float32"
-            | "float64"
-            | "int"
-            | "int8"
-            | "int16"
-            | "int32"
-            | "int64"
-            | "rune"
-            | "string"
-            | "uint"
-            | "uint8"
-            | "uint16"
-            | "uint32"
-            | "uint64"
-            | "uintptr"
-    )
-}
-
-fn method_receiver(node: Node<'_>, source: &str) -> Option<(String, bool, Vec<String>)> {
+pub(super) fn method_receiver(node: Node<'_>, source: &str) -> Option<(String, bool, Vec<String>)> {
     let receiver = node.child_by_field_name("receiver")?;
     let mut cursor = receiver.walk();
     let parameter = receiver
@@ -2548,10 +2509,6 @@ fn artifact_locator(path: &str, symbol: &str) -> Locator {
     }
 }
 
-fn go_name_is_exported(name: &str) -> bool {
-    name.chars().next().is_some_and(char::is_uppercase)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2585,6 +2542,36 @@ mod tests {
         let (diagnostics, suppressed) = diagnostics.finish();
         assert_eq!(suppressed, 0);
         (facts.0, facts.1, diagnostics)
+    }
+
+    #[test]
+    fn producer_member_identity_distinguishes_variadic_shape() {
+        let (_, fixed, fixed_diagnostics) = facts("package api\nfunc Call(value any) {}\n");
+        let (_, variadic, variadic_diagnostics) =
+            facts("package api\nfunc Call(value ...any) {}\n");
+        assert!(fixed_diagnostics.is_empty(), "{fixed_diagnostics:#?}");
+        assert!(variadic_diagnostics.is_empty(), "{variadic_diagnostics:#?}");
+
+        let [fixed] = fixed.as_slice() else {
+            panic!("one fixed declaration: {fixed:#?}");
+        };
+        let [variadic] = variadic.as_slice() else {
+            panic!("one variadic declaration: {variadic:#?}");
+        };
+        let fixed_parameter = &fixed
+            .signature
+            .as_ref()
+            .expect("fixed signature")
+            .parameters[0];
+        let variadic_parameter = &variadic
+            .signature
+            .as_ref()
+            .expect("variadic signature")
+            .parameters[0];
+        assert_eq!(fixed_parameter.r#type, variadic_parameter.r#type);
+        assert!(!fixed_parameter.variadic);
+        assert!(variadic_parameter.variadic);
+        assert_ne!(fixed.id, variadic.id);
     }
 
     #[test]

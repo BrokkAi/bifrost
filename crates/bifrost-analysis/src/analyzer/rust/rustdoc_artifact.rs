@@ -941,6 +941,7 @@ fn produce_document(
             is_static,
             is_abstract: matches!(&item.inner, ItemEnum::Function(function) if !function.has_body),
             is_virtual: false,
+            callable_family_complete: false,
             signature,
             receiver: None,
             extension_receiver: None,

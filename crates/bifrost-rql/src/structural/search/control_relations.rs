@@ -460,6 +460,13 @@ impl Default for ControlRelationTraversalCache {
 }
 
 impl ControlRelationTraversalCache {
+    /// Release procedure relations for a completed artifact-independent file
+    /// window. The request-wide algorithm budget and diagnostic deduplication
+    /// remain cumulative.
+    pub(super) fn release_file_window(&mut self) {
+        self.procedures.clear();
+    }
+
     /// Derive (or replay) the control relations of one procedure.
     pub(super) fn for_procedure(
         &mut self,
@@ -467,18 +474,27 @@ impl ControlRelationTraversalCache {
         generation: u64,
         cancellation: Option<&CancellationToken>,
     ) -> Arc<ProcedureControlRelations> {
-        if let Some(cached) = self.procedures.get(&procedure.handle) {
+        self.for_handle(&procedure.handle, generation, cancellation)
+    }
+
+    pub(super) fn for_handle(
+        &mut self,
+        procedure: &ProcedureHandle,
+        generation: u64,
+        cancellation: Option<&CancellationToken>,
+    ) -> Arc<ProcedureControlRelations> {
+        if let Some(cached) = self.procedures.get(procedure) {
             return Arc::clone(cached);
         }
         let token = cancellation.cloned().unwrap_or_default();
         let derived = Arc::new(control_relations_for_procedure(
-            &procedure.handle,
+            procedure,
             generation,
             &token,
             &mut self.budget,
         ));
         self.procedures
-            .insert(procedure.handle.clone(), Arc::clone(&derived));
+            .insert(procedure.clone(), Arc::clone(&derived));
         derived
     }
 

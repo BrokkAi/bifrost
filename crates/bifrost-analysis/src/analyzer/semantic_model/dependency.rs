@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
 
 use crate::CancellationToken;
@@ -7,11 +8,12 @@ use crate::analyzer::topology::DependencyScope;
 use crate::hash::{HashSet, set_with_capacity};
 
 use super::{
-    ArtifactProducerLimits, AuthoredSemanticModelPack, CatalogError, CatalogPackSourceKind,
-    CompilerOptions, Completeness, ExactArtifact, ExactSourceEntry, ExternalArtifactKind,
-    GeneratedProduction, GeneratedProductionKey, Producer, ProducerDiagnostic,
-    ProducerDiagnosticSeverity, SEMANTIC_MODEL_SCHEMA_VERSION, SemanticModelActivationEvidence,
-    SemanticModelActivationRequest, SemanticPackCatalog, SemanticPackSelectorQuery, compile_pack,
+    ArtifactProducerLimits, AuthoredSemanticModelPack, CatalogCandidate, CatalogError,
+    CatalogPackSourceKind, CompilerOptions, Completeness, Diagnostic, ExactArtifact,
+    ExactSourceEntry, ExternalArtifactKind, GeneratedProduction, GeneratedProductionKey,
+    PackExtractionAccounting, Producer, ProducerDiagnostic, ProducerDiagnosticSeverity,
+    SEMANTIC_MODEL_SCHEMA_VERSION, SemanticModelActivationEvidence, SemanticModelActivationRequest,
+    SemanticPackCatalog, SemanticPackSelectorQuery, compile_pack,
     producer::{read_exact_artifact_while, read_exact_source_set_while},
 };
 
@@ -307,6 +309,28 @@ pub trait DependencyResolver: Send + Sync {
     ) {
     }
 
+    /// Prepare the dependencies this resolver discovered. Most ecosystems
+    /// produce the complete exact dependency surface. A resolver may instead
+    /// select only compatible installed packs when its configured discovery
+    /// mode deliberately supplied coordinate evidence without source
+    /// artifacts.
+    fn prepare(
+        &self,
+        _config: &crate::analyzer::AnalyzerConfig,
+        catalog: &SemanticPackCatalog,
+        dependencies: &[ResolvedDependency],
+        limits: &DependencyPackLimits,
+        cancellation: Option<&CancellationToken>,
+    ) -> DependencyPackPreparationOutcome {
+        prepare_dependency_semantic_packs(
+            catalog,
+            self.adapter(),
+            dependencies,
+            limits,
+            cancellation,
+        )
+    }
+
     /// Discover this ecosystem's exact local dependencies.
     fn resolve(
         &self,
@@ -326,8 +350,9 @@ pub struct ExactDependencyArtifact {
 }
 
 impl ExactDependencyArtifact {
-    #[cfg(test)]
-    pub(crate) fn from_exact(
+    /// Pair an exact artifact read with the dependency role and ecosystem
+    /// kind that the adapter will use during production.
+    pub fn from_exact(
         role: DependencyArtifactRole,
         kind: ExternalArtifactKind,
         module: Option<String>,
@@ -381,6 +406,83 @@ pub struct DependencyPackProduction {
     pub suppressed_diagnostics: usize,
 }
 
+/// The exact, compiled result of producing one dependency semantic pack.
+///
+/// This is deliberately separate from catalog installation. Release tooling
+/// and runtime preparation must compile the same bytes and derive the same
+/// identity, while each caller remains responsible for where those bytes are
+/// installed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledDependencyProduction {
+    pub key: GeneratedProductionKey,
+    pub compiled: super::CompiledSemanticModelPack,
+    pub completeness: Completeness,
+    pub diagnostics: Vec<ProducerDiagnostic>,
+    pub suppressed_diagnostics: usize,
+}
+
+/// Why exact dependency production did not return a compiled pack.
+///
+/// Producer diagnostics are retained on every producer-related variant so a
+/// runtime caller can preserve the existing bounded diagnostic behavior while
+/// release tooling can report the same extraction evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DependencyProductionFailure {
+    NoPack {
+        diagnostics: Vec<ProducerDiagnostic>,
+        suppressed_diagnostics: usize,
+    },
+    InvalidOutput {
+        code: String,
+        message: String,
+        diagnostics: Vec<ProducerDiagnostic>,
+        suppressed_diagnostics: usize,
+    },
+    Compilation {
+        diagnostics: Vec<Diagnostic>,
+        producer_diagnostics: Vec<ProducerDiagnostic>,
+        suppressed_diagnostics: usize,
+    },
+    Cancelled {
+        diagnostics: Vec<ProducerDiagnostic>,
+        suppressed_diagnostics: usize,
+    },
+}
+
+/// A process-wide, host-installed attempt to acquire one exact generated
+/// production. The callback may install bytes into `catalog`, but cannot hand
+/// a pack directly to preparation. Preparation always re-reads the catalog
+/// after this hook, which keeps catalog verification authoritative.
+pub type GeneratedProductionAcquisitionHook =
+    fn(&SemanticPackCatalog, &GeneratedProductionKey) -> Result<(), String>;
+
+static GENERATED_PRODUCTION_ACQUISITION_HOOK: OnceLock<
+    RwLock<Option<GeneratedProductionAcquisitionHook>>,
+> = OnceLock::new();
+
+fn acquisition_hook_slot() -> &'static RwLock<Option<GeneratedProductionAcquisitionHook>> {
+    GENERATED_PRODUCTION_ACQUISITION_HOOK.get_or_init(|| RwLock::new(None))
+}
+
+/// Install or clear the process-wide exact-production acquisition hook.
+///
+/// The previous hook is returned so a caller that temporarily owns process
+/// configuration, such as a test harness, can restore it exactly.
+pub fn set_generated_production_acquisition_hook(
+    hook: Option<GeneratedProductionAcquisitionHook>,
+) -> Option<GeneratedProductionAcquisitionHook> {
+    let mut slot = acquisition_hook_slot()
+        .write()
+        .expect("generated-production acquisition hook mutex poisoned");
+    std::mem::replace(&mut *slot, hook)
+}
+
+fn generated_production_acquisition_hook() -> Option<GeneratedProductionAcquisitionHook> {
+    *acquisition_hook_slot()
+        .read()
+        .expect("generated-production acquisition hook mutex poisoned")
+}
+
 pub trait DependencyPackAdapter {
     fn adapter_name(&self) -> &str;
     fn adapter_version(&self) -> &str;
@@ -397,6 +499,147 @@ pub trait DependencyPackAdapter {
         limits: &ArtifactProducerLimits,
         cancellation: Option<&CancellationToken>,
     ) -> DependencyPackProduction;
+}
+
+/// Derive the canonical key for one exact dependency production.
+///
+/// The digest includes the adapter identity, normalized dependency evidence,
+/// exact artifact digests, and every production-affecting limit. It excludes
+/// filesystem paths and modification times, allowing equal inputs from
+/// separate workspaces to share a generated production.
+pub fn generated_production_key(
+    adapter: &dyn DependencyPackAdapter,
+    dependency: &ResolvedDependency,
+    artifacts: &[ExactDependencyArtifact],
+    limits: &DependencyPackLimits,
+) -> Result<GeneratedProductionKey, CatalogError> {
+    let input_digest = dependency_input_digest(adapter, dependency, artifacts, limits);
+    let producer = adapter.producer();
+    GeneratedProductionKey::new(
+        input_digest,
+        producer.name,
+        producer.version,
+        SEMANTIC_MODEL_SCHEMA_VERSION,
+    )
+}
+
+/// Produce and compile one exact dependency semantic pack.
+///
+/// This is the single production path shared by runtime preparation and
+/// release qualification. It validates the adapter's declared identity,
+/// binds every activation selector to the exact input digest, and applies the
+/// same compiler options used by runtime preparation.
+pub fn compile_exact_dependency_production(
+    adapter: &dyn DependencyPackAdapter,
+    dependency: &ResolvedDependency,
+    artifacts: &[ExactDependencyArtifact],
+    limits: &DependencyPackLimits,
+    cancellation: Option<&CancellationToken>,
+) -> Result<CompiledDependencyProduction, DependencyProductionFailure> {
+    if is_cancelled(cancellation) {
+        return Err(DependencyProductionFailure::Cancelled {
+            diagnostics: Vec::new(),
+            suppressed_diagnostics: 0,
+        });
+    }
+
+    let producer = adapter.producer();
+    let key =
+        generated_production_key(adapter, dependency, artifacts, limits).map_err(|error| {
+            DependencyProductionFailure::InvalidOutput {
+                code: "production.identity".to_owned(),
+                message: error.to_string(),
+                diagnostics: Vec::new(),
+                suppressed_diagnostics: 0,
+            }
+        })?;
+    let production = {
+        let _scope =
+            crate::profiling::scope_with(|| format!("semantic_pack.produce[{}]", dependency.id));
+        adapter.produce(dependency, artifacts, &limits.producer, cancellation)
+    };
+    let producer_diagnostics = production.diagnostics;
+    let suppressed_diagnostics = production.suppressed_diagnostics;
+    let production_has_errors = producer_diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity == ProducerDiagnosticSeverity::Error)
+        || suppressed_diagnostics > 0;
+    let Some(mut pack) = production.pack else {
+        return Err(DependencyProductionFailure::NoPack {
+            diagnostics: producer_diagnostics,
+            suppressed_diagnostics,
+        });
+    };
+    if production_has_errors {
+        pack.completeness = Completeness::Partial;
+    }
+    if pack.producer != producer || pack.schema_version != SEMANTIC_MODEL_SCHEMA_VERSION {
+        return Err(DependencyProductionFailure::InvalidOutput {
+            code: "production.identity_mismatch".to_owned(),
+            message: "adapter output does not match its declared producer or schema identity"
+                .to_owned(),
+            diagnostics: producer_diagnostics,
+            suppressed_diagnostics,
+        });
+    }
+    if pack.language != dependency.evidence.language
+        || pack.ecosystem != dependency.evidence.ecosystem
+    {
+        return Err(DependencyProductionFailure::InvalidOutput {
+            code: "production.evidence_mismatch".to_owned(),
+            message: "adapter output language or ecosystem does not match dependency evidence"
+                .to_owned(),
+            diagnostics: producer_diagnostics,
+            suppressed_diagnostics,
+        });
+    }
+    if pack.shards.iter().any(|shard| shard.activation.is_empty()) {
+        return Err(DependencyProductionFailure::InvalidOutput {
+            code: "production.activation_missing".to_owned(),
+            message: "adapter output contains a shard without activation selectors".to_owned(),
+            diagnostics: producer_diagnostics,
+            suppressed_diagnostics,
+        });
+    }
+    for shard in &mut pack.shards {
+        for selector in &mut shard.activation {
+            selector.artifact_sha256 = Some(key.input_digest().to_owned());
+        }
+    }
+    let completeness = pack.completeness;
+    if is_cancelled(cancellation) {
+        return Err(DependencyProductionFailure::Cancelled {
+            diagnostics: producer_diagnostics,
+            suppressed_diagnostics,
+        });
+    }
+    let compiled = {
+        let _scope =
+            crate::profiling::scope_with(|| format!("semantic_pack.compile[{}]", dependency.id));
+        match compile_pack(&pack, &limits.compiler) {
+            Ok(compiled) => compiled,
+            Err(diagnostics) => {
+                return Err(DependencyProductionFailure::Compilation {
+                    diagnostics,
+                    producer_diagnostics,
+                    suppressed_diagnostics,
+                });
+            }
+        }
+    };
+    if is_cancelled(cancellation) {
+        return Err(DependencyProductionFailure::Cancelled {
+            diagnostics: producer_diagnostics,
+            suppressed_diagnostics,
+        });
+    }
+    Ok(CompiledDependencyProduction {
+        key,
+        compiled,
+        completeness,
+        diagnostics: producer_diagnostics,
+        suppressed_diagnostics,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -794,7 +1037,7 @@ pub fn prepare_dependency_semantic_packs(
             continue;
         }
         if dependency.artifacts.is_empty() || !adapter.can_produce(dependency) {
-            match compatible_installed_pack(catalog, dependency) {
+            match compatible_installed_pack(catalog, dependency, &mut diagnostics) {
                 Ok(Some(installed)) => {
                     evidence.push(installed.evidence.clone());
                     installed_packs.push(installed);
@@ -972,20 +1215,14 @@ pub fn prepare_dependency_semantic_packs(
             continue;
         }
 
-        let producer = adapter.producer();
-        let input_digest = dependency_input_digest(adapter, dependency, &exact_artifacts, limits);
-        let key = match GeneratedProductionKey::new(
-            input_digest.clone(),
-            producer.name.clone(),
-            producer.version.clone(),
-            SEMANTIC_MODEL_SCHEMA_VERSION,
-        ) {
+        let key = match generated_production_key(adapter, dependency, &exact_artifacts, limits) {
             Ok(key) => key,
             Err(error) => {
                 diagnostics.catalog(Some(&dependency.id), "production.identity", error);
                 continue;
             }
         };
+        let input_digest = key.input_digest().to_owned();
         if is_cancelled(cancellation) {
             cancelled = true;
             break;
@@ -1062,31 +1299,117 @@ pub fn prepare_dependency_semantic_packs(
             }
         }
 
-        let production = {
-            let _scope = crate::profiling::scope_with(|| {
-                format!("semantic_pack.produce[{}]", dependency.id)
-            });
-            adapter.produce(dependency, &exact_artifacts, &limits.producer, cancellation)
+        if let Some(acquire) = generated_production_acquisition_hook() {
+            if is_cancelled(cancellation) {
+                cancelled = true;
+                break;
+            }
+            if let Err(error) = acquire(catalog, &key) {
+                diagnostics.warning(
+                    "production.acquire",
+                    Some(&dependency.id),
+                    format!("could not acquire exact generated production: {error}"),
+                );
+            }
+            // The provider can only attempt installation. Re-read through the
+            // ordinary verified catalog path before falling back to production.
+            match reusable_generated_pack(catalog, &key, dependency, &input_digest) {
+                Ok(Some(prepared)) => {
+                    record_reused_generated_pack(
+                        prepared,
+                        dependency,
+                        &mut diagnostics,
+                        &mut evidence,
+                        &mut packs,
+                        &mut profile,
+                    );
+                    continue;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    diagnostics.catalog(Some(&dependency.id), "catalog.lookup", error);
+                    continue;
+                }
+            }
+        }
+
+        let production = match compile_exact_dependency_production(
+            adapter,
+            dependency,
+            &exact_artifacts,
+            limits,
+            cancellation,
+        ) {
+            Ok(production) => production,
+            Err(failure) => {
+                let was_cancelled =
+                    matches!(&failure, DependencyProductionFailure::Cancelled { .. });
+                match failure {
+                    DependencyProductionFailure::NoPack {
+                        diagnostics: producer_diagnostics,
+                        suppressed_diagnostics,
+                    }
+                    | DependencyProductionFailure::Cancelled {
+                        diagnostics: producer_diagnostics,
+                        suppressed_diagnostics,
+                    } => {
+                        diagnostics.suppressed = diagnostics
+                            .suppressed
+                            .saturating_add(suppressed_diagnostics);
+                        for diagnostic in producer_diagnostics {
+                            diagnostics.producer(Some(&dependency.id), diagnostic);
+                        }
+                    }
+                    DependencyProductionFailure::InvalidOutput {
+                        code,
+                        message,
+                        diagnostics: producer_diagnostics,
+                        suppressed_diagnostics,
+                    } => {
+                        diagnostics.suppressed = diagnostics
+                            .suppressed
+                            .saturating_add(suppressed_diagnostics);
+                        for diagnostic in producer_diagnostics {
+                            diagnostics.producer(Some(&dependency.id), diagnostic);
+                        }
+                        diagnostics.error(&code, Some(&dependency.id), None, message);
+                    }
+                    DependencyProductionFailure::Compilation {
+                        diagnostics: compiler_diagnostics,
+                        producer_diagnostics,
+                        suppressed_diagnostics,
+                    } => {
+                        diagnostics.suppressed = diagnostics
+                            .suppressed
+                            .saturating_add(suppressed_diagnostics);
+                        for diagnostic in producer_diagnostics {
+                            diagnostics.producer(Some(&dependency.id), diagnostic);
+                        }
+                        for diagnostic in compiler_diagnostics {
+                            diagnostics.error_location(
+                                &diagnostic.code,
+                                Some(&dependency.id),
+                                Some(diagnostic.path),
+                                diagnostic.message,
+                            );
+                        }
+                    }
+                }
+                if was_cancelled {
+                    cancelled = true;
+                    break;
+                }
+                continue;
+            }
         };
-        let production_has_errors = production
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.severity == ProducerDiagnosticSeverity::Error)
-            || production.suppressed_diagnostics > 0;
-        let production_has_diagnostics = !production.diagnostics.is_empty();
         diagnostics.suppressed = diagnostics
             .suppressed
             .saturating_add(production.suppressed_diagnostics);
-        for diagnostic in production.diagnostics {
+        let production_has_diagnostics = !production.diagnostics.is_empty();
+        for diagnostic in production.diagnostics.iter().cloned() {
             diagnostics.producer(Some(&dependency.id), diagnostic);
         }
-        let Some(mut pack) = production.pack else {
-            continue;
-        };
-        if production_has_errors {
-            pack.completeness = Completeness::Partial;
-        }
-        if pack.completeness == Completeness::Partial && !production_has_diagnostics {
+        if production.completeness == Completeness::Partial && !production_has_diagnostics {
             diagnostics.error(
                 "production.partial",
                 Some(&dependency.id),
@@ -1094,84 +1417,22 @@ pub fn prepare_dependency_semantic_packs(
                 "dependency producer returned partial semantic coverage",
             );
         }
-        if pack.producer != producer || pack.schema_version != SEMANTIC_MODEL_SCHEMA_VERSION {
-            diagnostics.error(
-                "production.identity_mismatch",
-                Some(&dependency.id),
-                None,
-                "adapter output does not match its declared producer or schema identity",
-            );
-            continue;
-        }
-        if pack.language != dependency.evidence.language
-            || pack.ecosystem != dependency.evidence.ecosystem
-        {
-            diagnostics.error(
-                "production.evidence_mismatch",
-                Some(&dependency.id),
-                None,
-                "adapter output language or ecosystem does not match dependency evidence",
-            );
-            continue;
-        }
-        if pack.shards.iter().any(|shard| shard.activation.is_empty()) {
-            diagnostics.error(
-                "production.activation_missing",
-                Some(&dependency.id),
-                None,
-                "adapter output contains a shard without activation selectors",
-            );
-            continue;
-        }
-        for shard in &mut pack.shards {
-            for selector in &mut shard.activation {
-                selector.artifact_sha256 = Some(input_digest.clone());
-            }
-        }
-        let completeness = pack.completeness;
-        if is_cancelled(cancellation) {
-            cancelled = true;
-            break;
-        }
-        let compiled_result = {
-            let _scope = crate::profiling::scope_with(|| {
-                format!("semantic_pack.compile[{}]", dependency.id)
-            });
-            compile_pack(&pack, &limits.compiler)
-        };
-        let compiled = match compiled_result {
-            Ok(compiled) => compiled,
-            Err(compile_diagnostics) => {
-                for diagnostic in compile_diagnostics {
-                    diagnostics.error_location(
-                        &diagnostic.code,
-                        Some(&dependency.id),
-                        Some(diagnostic.path),
-                        diagnostic.message,
-                    );
-                }
-                continue;
-            }
-        };
-        if is_cancelled(cancellation) {
-            cancelled = true;
-            break;
-        }
         let install = {
             let _scope = crate::profiling::scope_with(|| {
                 format!("semantic_pack.install[{}]", dependency.id)
             });
-            catalog.install_generated(&key, &compiled)
+            catalog.install_generated(&production.key, &production.compiled)
         };
         match install {
             Ok(installed) => {
-                let activation_evidence = activation_evidence(dependency, &input_digest);
+                let activation_evidence =
+                    activation_evidence(dependency, production.key.input_digest());
                 evidence.push(activation_evidence.clone());
                 packs.push(PreparedDependencyPack {
                     dependency_id: dependency.id.clone(),
                     production: installed.production,
                     status: DependencyPackPreparationStatus::Generated,
-                    completeness,
+                    completeness: production.completeness,
                     evidence: activation_evidence,
                 });
                 profile.generated_packs += 1;
@@ -1187,6 +1448,28 @@ pub fn prepare_dependency_semantic_packs(
             None,
             "dependency semantic-pack preparation was cancelled",
         );
+    }
+    // The `complete` conjunction below refuses silently through its count-
+    // mismatch arm when a dependency produced neither a generated pack nor an
+    // installed pack (for example, a truncated tail past `max_dependencies`).
+    // Name every such dependency before that arm folds it into a bare bool.
+    let accounted_dependencies: HashSet<&str> = packs
+        .iter()
+        .map(|pack| pack.dependency_id.as_str())
+        .chain(
+            installed_packs
+                .iter()
+                .map(|pack| pack.dependency_id.as_str()),
+        )
+        .collect();
+    for dependency in dependencies {
+        if !accounted_dependencies.contains(dependency.id.as_str()) {
+            diagnostics.warning(
+                "preparation.unaccounted-dependency",
+                Some(&dependency.id),
+                "dependency preparation produced neither a generated pack nor an installed pack",
+            );
+        }
     }
     let complete = !cancelled
         && dependencies.len() <= limits.max_dependencies
@@ -1205,6 +1488,119 @@ pub fn prepare_dependency_semantic_packs(
         evidence,
         diagnostics: diagnostics.diagnostics,
         suppressed_diagnostics: diagnostics.suppressed,
+        complete,
+        cancelled,
+        profile,
+    }
+}
+
+/// Select compatible trusted catalog packs for exact dependency coordinates
+/// without reading dependency artifacts or producing generated packs.
+///
+/// This is the bounded preparation half of evidence-only discovery. A
+/// dependency that has no compatible installed pack is an intentional no-op:
+/// the mode asks which reviewed packs the catalog can serve, not for a complete
+/// generated model of every dependency in the build. An activation-ready local
+/// installation is trusted; a reviewed partial subset is trusted only from a
+/// Bifrost-shipped source. Any untrusted matching local installation refuses
+/// the dependency's evidence so it cannot piggyback when runtime queries the
+/// coordinate again. Exact-version near misses remain visible as warnings,
+/// while catalog failures make the preparation incomplete.
+pub fn prepare_compatible_installed_semantic_packs(
+    catalog: &SemanticPackCatalog,
+    dependencies: &[ResolvedDependency],
+    limits: &DependencyPackLimits,
+    cancellation: Option<&CancellationToken>,
+) -> DependencyPackPreparationOutcome {
+    let mut diagnostics = BoundedDependencyDiagnostics::new(limits);
+    let mut installed_packs = Vec::new();
+    let mut evidence = Vec::new();
+    let mut profile = DependencyPackPreparationProfile::default();
+    let mut cancelled = false;
+    let mut failed = false;
+
+    let dependency_limit = dependencies.len().min(limits.max_dependencies);
+    if dependencies.len() > dependency_limit {
+        failed = true;
+        diagnostics.error(
+            "limit.dependencies",
+            None,
+            None,
+            format!(
+                "dependency count exceeds configured limit {}",
+                limits.max_dependencies
+            ),
+        );
+    }
+
+    for dependency in &dependencies[..dependency_limit] {
+        if is_cancelled(cancellation) {
+            cancelled = true;
+            break;
+        }
+        profile.dependencies_considered += 1;
+        if dependency.id.is_empty() {
+            failed = true;
+            diagnostics.error(
+                "dependency.identity",
+                None,
+                None,
+                "resolved dependency identity must not be empty",
+            );
+            continue;
+        }
+        match compatible_curated_installed_pack(catalog, dependency) {
+            Ok(Some(installed)) => {
+                evidence.push(installed.evidence.clone());
+                installed_packs.push(installed);
+                profile.installed_packs += 1;
+            }
+            Ok(None) => match installed_pack_query(dependency)
+                .map(|query| catalog.version_near_misses(&query))
+            {
+                Some(Ok(near_misses)) => {
+                    for near_miss in near_misses {
+                        diagnostics.warning(
+                            "dependency.pack_version_mismatch",
+                            Some(&dependency.id),
+                            near_miss.describe(),
+                        );
+                    }
+                }
+                Some(Err(error)) => {
+                    failed = true;
+                    diagnostics.catalog(Some(&dependency.id), "catalog.lookup", error);
+                }
+                None => {}
+            },
+            Err(error) => {
+                failed = true;
+                diagnostics.catalog(Some(&dependency.id), "catalog.lookup", error);
+            }
+        }
+    }
+
+    if cancelled {
+        failed = true;
+        diagnostics.error(
+            "preparation.cancelled",
+            None,
+            None,
+            "dependency semantic-pack preparation was cancelled",
+        );
+    }
+    // Curated evidence does not claim a complete model of each dependency.
+    // Reviewed partial packs (for example, a declaration subset paired with a
+    // complete behavior pack) are therefore useful compatible selections in
+    // this mode even though full dependency production would refuse them.
+    let complete = !failed && dependencies.len() <= limits.max_dependencies;
+    let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
+    DependencyPackPreparationOutcome {
+        packs: Vec::new(),
+        installed_packs,
+        evidence,
+        diagnostics,
+        suppressed_diagnostics,
         complete,
         cancelled,
         profile,
@@ -1251,7 +1647,7 @@ fn reusable_generated_pack(
 }
 
 /// The evidence-only catalog query for one dependency, or `None` when the
-/// dependency carries no exact package or toolchain version. Version-exact
+/// dependency carries no exact package, module, or toolchain version. Version-exact
 /// selection (#1884) starts here: a versionless dependency never consults
 /// installed packs, and the same query later names version near misses.
 fn installed_pack_query(dependency: &ResolvedDependency) -> Option<SemanticPackSelectorQuery> {
@@ -1261,6 +1657,12 @@ fn installed_pack_query(dependency: &ResolvedDependency) -> Option<SemanticPackS
         .as_ref()
         .and_then(|coordinate| coordinate.version.as_ref())
         .is_some()
+        || dependency
+            .evidence
+            .module
+            .as_ref()
+            .and_then(|coordinate| coordinate.version.as_ref())
+            .is_some()
         || dependency
             .evidence
             .toolchain
@@ -1287,14 +1689,79 @@ fn installed_pack_query(dependency: &ResolvedDependency) -> Option<SemanticPackS
 fn compatible_installed_pack(
     catalog: &SemanticPackCatalog,
     dependency: &ResolvedDependency,
+    diagnostics: &mut BoundedDependencyDiagnostics,
 ) -> Result<Option<PreparedInstalledDependencyPack>, CatalogError> {
-    let Some(query) = installed_pack_query(dependency) else {
+    let Some((installed, not_activation_ready)) =
+        compatible_installed_pack_evaluation(catalog, dependency)?
+    else {
         return Ok(None);
     };
-    let mut manifest_digests = Vec::new();
-    let mut all_complete = true;
-    let mut activation_ready = true;
-    let mut gaps = 0usize;
+    for message in not_activation_ready {
+        diagnostics.warning(
+            "installed.not-activation-ready",
+            Some(&dependency.id),
+            message,
+        );
+    }
+    Ok(Some(installed))
+}
+
+fn compatible_installed_pack_evaluation(
+    catalog: &SemanticPackCatalog,
+    dependency: &ResolvedDependency,
+) -> Result<Option<(PreparedInstalledDependencyPack, Vec<String>)>, CatalogError> {
+    let candidates = compatible_installed_pack_candidates(catalog, dependency)?;
+    let not_activation_ready = candidates
+        .iter()
+        .filter(|candidate| !candidate.activation_ready)
+        .map(|candidate| candidate.not_activation_ready.clone())
+        .collect();
+    Ok(prepared_installed_pack(dependency, &candidates)
+        .map(|installed| (installed, not_activation_ready)))
+}
+
+/// Curated partial declaration subsets are trusted only when Bifrost shipped
+/// them. A locally installed partial pack still needs the ordinary extraction
+/// accounting that makes it activation-ready; curated evidence must not turn
+/// an arbitrary partial installation into trusted semantics.
+fn compatible_curated_installed_pack(
+    catalog: &SemanticPackCatalog,
+    dependency: &ResolvedDependency,
+) -> Result<Option<PreparedInstalledDependencyPack>, CatalogError> {
+    let mut candidates = compatible_installed_pack_candidates(catalog, dependency)?;
+    if candidates.iter().any(|candidate| {
+        !candidate.activation_ready && candidate.source_kind == CatalogPackSourceKind::Installed
+    }) {
+        return Ok(None);
+    }
+    candidates.retain(|candidate| {
+        candidate.activation_ready
+            || matches!(
+                candidate.source_kind,
+                CatalogPackSourceKind::PreShipped | CatalogPackSourceKind::Embedded
+            )
+    });
+    Ok(prepared_installed_pack(dependency, &candidates))
+}
+
+#[derive(Debug)]
+struct InstalledPackCandidateEvaluation {
+    manifest_digest: String,
+    completeness: Completeness,
+    gaps: usize,
+    activation_ready: bool,
+    source_kind: CatalogPackSourceKind,
+    not_activation_ready: String,
+}
+
+fn compatible_installed_pack_candidates(
+    catalog: &SemanticPackCatalog,
+    dependency: &ResolvedDependency,
+) -> Result<Vec<InstalledPackCandidateEvaluation>, CatalogError> {
+    let Some(query) = installed_pack_query(dependency) else {
+        return Ok(Vec::new());
+    };
+    let mut candidates = Vec::new();
     let mut accounted_manifests: HashSet<String> = set_with_capacity(4);
     for candidate in catalog.candidates(&query)? {
         if !matches!(
@@ -1307,32 +1774,87 @@ fn compatible_installed_pack(
         }
         if accounted_manifests.insert(candidate.manifest_digest().to_owned()) {
             let extraction = catalog.extraction_accounting(candidate.manifest_digest())?;
-            all_complete &= candidate.completeness() == Completeness::Complete;
-            activation_ready &=
+            let candidate_ready =
                 super::pack_is_activation_ready(candidate.completeness(), extraction.as_ref());
-            gaps = gaps.saturating_add(
-                extraction
+            candidates.push(InstalledPackCandidateEvaluation {
+                manifest_digest: candidate.manifest_digest().to_owned(),
+                completeness: candidate.completeness(),
+                gaps: extraction
                     .as_ref()
                     .map_or(0, |accounting| accounting.gaps.len()),
-            );
+                activation_ready: candidate_ready,
+                source_kind: candidate.source_kind(),
+                not_activation_ready: if candidate_ready {
+                    String::new()
+                } else {
+                    describe_not_activation_ready(&candidate, extraction.as_ref())
+                },
+            });
         }
-        manifest_digests.push(candidate.manifest_digest().to_owned());
     }
+    Ok(candidates)
+}
+
+fn prepared_installed_pack(
+    dependency: &ResolvedDependency,
+    candidates: &[InstalledPackCandidateEvaluation],
+) -> Option<PreparedInstalledDependencyPack> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let mut manifest_digests = candidates
+        .iter()
+        .map(|candidate| candidate.manifest_digest.clone())
+        .collect::<Vec<_>>();
     manifest_digests.sort();
     manifest_digests.dedup();
-    Ok(
-        (!manifest_digests.is_empty()).then(|| PreparedInstalledDependencyPack {
-            dependency_id: dependency.id.clone(),
-            manifest_digests,
-            completeness: if all_complete {
-                Completeness::Complete
-            } else {
-                Completeness::Partial
-            },
-            gaps,
-            activation_ready,
-            evidence: dependency.evidence.clone(),
-        }),
+    Some(PreparedInstalledDependencyPack {
+        dependency_id: dependency.id.clone(),
+        manifest_digests,
+        completeness: if candidates
+            .iter()
+            .all(|candidate| candidate.completeness == Completeness::Complete)
+        {
+            Completeness::Complete
+        } else {
+            Completeness::Partial
+        },
+        gaps: candidates.iter().map(|candidate| candidate.gaps).sum(),
+        activation_ready: candidates
+            .iter()
+            .all(|candidate| candidate.activation_ready),
+        evidence: dependency.evidence.clone(),
+    })
+}
+
+/// Explain why one installed candidate is not activation-ready. This is only
+/// called when `pack_is_activation_ready` returned false, which requires
+/// `completeness != Complete`, so the accounting breakdown is the only
+/// variable part.
+fn describe_not_activation_ready(
+    candidate: &CatalogCandidate,
+    extraction: Option<&PackExtractionAccounting>,
+) -> String {
+    let reason = match extraction {
+        None => "no extraction accounting".to_owned(),
+        Some(accounting) if accounting.suppressed_reject_count != 0 => format!(
+            "suppressed rejects {} != 0",
+            accounting.suppressed_reject_count
+        ),
+        Some(accounting) if accounting.error_reject_count != 0 => {
+            format!("error rejects {} != 0", accounting.error_reject_count)
+        }
+        Some(accounting) => format!(
+            "named gaps {} != reject count {}",
+            accounting.gaps.len(),
+            accounting.reject_count
+        ),
+    };
+    format!(
+        "installed pack source {} manifest {} completeness {:?} is not activation-ready: {reason}",
+        candidate.source_id(),
+        candidate.manifest_digest(),
+        candidate.completeness(),
     )
 }
 
@@ -1393,6 +1915,22 @@ fn dependency_input_digest(
     lower_hex_string(&hasher.finish())
 }
 
+/// Hash every limit that can change the compiled bytes of a generated
+/// production, so callers with different but content-equivalent limits still
+/// converge on the same identity.
+///
+/// `producer.max_diagnostics` and `producer.max_diagnostic_message_bytes` are
+/// deliberately excluded: `BoundedProducerDiagnostics` only ever grows or
+/// truncates the separate diagnostics side-channel (see producer.rs), never
+/// the pack's declarations, members, or shard bytes, so raising either bound
+/// cannot change what a production means. Excluding them keeps a release
+/// bundle -- which must size its diagnostics cap to name every reject
+/// (`MAX_SOURCE_SET_FILES` in release_bundle.rs) -- reusable by an ordinary
+/// workspace's default-limits production of the exact same dependency and
+/// artifacts; hashing them in would make every pre-shipped generated
+/// production unreachable by runtime lookups, forcing every workspace to
+/// re-derive it locally under the interactive-safety-bounded default instead
+/// of reusing the bundle's fully-accounted one.
 fn hash_production_profile(hasher: &mut CanonicalHasher, limits: &DependencyPackLimits) {
     let producer = limits.producer;
     for (field, value) in [
@@ -1401,11 +1939,6 @@ fn hash_production_profile(hasher: &mut CanonicalHasher, limits: &DependencyPack
         (
             "producer_max_signature_depth",
             producer.max_signature_depth as u64,
-        ),
-        ("producer_max_diagnostics", producer.max_diagnostics as u64),
-        (
-            "producer_max_diagnostic_message_bytes",
-            producer.max_diagnostic_message_bytes as u64,
         ),
         (
             "compiler_max_source_bytes",
@@ -1557,6 +2090,21 @@ impl BoundedDependencyDiagnostics {
 
     fn catalog(&mut self, dependency_id: Option<&str>, code: &str, error: CatalogError) {
         self.error(code, dependency_id, None, error.to_string());
+    }
+
+    fn warning(
+        &mut self,
+        code: impl Into<String>,
+        dependency_id: Option<&str>,
+        message: impl Into<String>,
+    ) {
+        self.push(DependencyPackDiagnostic {
+            severity: DependencyPackDiagnosticSeverity::Warning,
+            code: code.into(),
+            dependency_id: dependency_id.map(str::to_owned),
+            location: None,
+            message: message.into(),
+        });
     }
 
     fn error(

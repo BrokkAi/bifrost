@@ -17,6 +17,7 @@ use crate::java::graph_support::{
     JavaSource, java_switch_selector_expression, resolve_java_usage_type_components_in,
 };
 use crate::java::structural::expression_name_node;
+use brokk_bifrost_core::CancellationToken;
 use brokk_bifrost_core::analyzer::model::{CodeUnit, ProjectFile};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_core::analyzer::tree_walk::{TreeWalkAction, walk_tree_iterative};
@@ -30,7 +31,7 @@ use brokk_bifrost_core::hash::HashMap;
 use brokk_bifrost_core::text_utils::compute_line_starts;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
-use tree_sitter::{Node, Parser};
+use tree_sitter::{Node, Parser, Tree};
 
 /// Identifies one resolved call shape: the fully qualified name of the type the
 /// call is dispatched on, the called method's name, and the argument count that
@@ -48,6 +49,68 @@ pub struct ScanState<'a> {
     pub unproven_hits: &'a mut BTreeSet<UsageHit>,
     pub raw_match_count: &'a mut usize,
     pub limit_exceeded: &'a mut bool,
+}
+
+/// The exact reason a per-file evidence build cannot be published.
+///
+/// A complete zero-hit scan is represented by [`JavaFileUsageEvidence`] with
+/// empty hit sets. It must not be confused with one of these omissions: an
+/// omission means that the scan could not establish an exact answer for the
+/// file and is therefore not cacheable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JavaFileEvidenceOmission {
+    SourceRead,
+    ParserSetup,
+    Parse,
+    StoreProvider,
+    ClassRange,
+    RelationalFrontier,
+    UnavailableCapability,
+    InternalSafetyCap,
+}
+
+/// Immutable, uncapped semantic evidence for one Java file and one target
+/// specification.
+///
+/// `UsageHit` owns its source snippet and enclosing declaration, so this value
+/// remains valid after the parser and request-local relational frontier are
+/// dropped. The two sets intentionally retain proven and unproven rows
+/// separately; request-level budgets and projections are applied by the
+/// analysis layer after this value is acquired.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JavaFileUsageEvidence {
+    pub hits: BTreeSet<UsageHit>,
+    pub unproven_hits: BTreeSet<UsageHit>,
+    pub raw_match_count: usize,
+}
+
+impl JavaFileUsageEvidence {
+    pub fn empty() -> Self {
+        Self {
+            hits: BTreeSet::new(),
+            unproven_hits: BTreeSet::new(),
+            raw_match_count: 0,
+        }
+    }
+}
+
+/// Result of one uncapped Java file evidence build.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JavaFileEvidenceBuildOutcome {
+    Complete(JavaFileUsageEvidence),
+    Omitted(JavaFileEvidenceOmission),
+    Cancelled,
+}
+
+/// Parser-backed immutable inputs shared by every semantic operation in one
+/// evidence build. In particular, source text, its tree, line starts, and
+/// class ranges are prepared once and never rebuilt during the scan.
+pub struct PreparedJavaFile {
+    source: String,
+    tree: Tree,
+    line_starts: Vec<usize>,
+    class_ranges: ClassRangeIndex,
+    target_present: bool,
 }
 
 pub struct ReturnTypeCaches<'a> {
@@ -105,7 +168,7 @@ impl ScanCtx<'_> {
 
 pub fn scan_file(
     java: &dyn JavaSource,
-    token: QueryToken<'_>,
+    _token: QueryToken<'_>,
     graph: &JavaGraphSource<'_>,
     file: &ProjectFile,
     spec: &TargetSpec,
@@ -118,33 +181,164 @@ pub fn scan_file(
     let Ok(source) = file.read_to_string() else {
         return;
     };
-    if source.is_empty() {
-        return;
-    }
-
-    let mut parser = Parser::new();
-    if parser
-        .set_language(&tree_sitter_java::LANGUAGE.into())
-        .is_err()
-    {
-        return;
-    }
-    let Some(tree) = parser.parse(source.as_str(), None) else {
+    let Ok(prepared) = prepare_file(graph, file, spec, source) else {
         return;
     };
-    if !tree_contains_target_terminal(tree.root_node(), &source, &spec.member_name) {
+    scan_prepared_file(java, graph, file, spec, return_caches, &prepared, state);
+}
+
+/// Build exact, uncapped evidence for one Java file.
+///
+/// This is the adapter seam used by analysis-side cache acquisition. The
+/// scan deliberately uses the existing graph resolver and frontier-backed
+/// questions, but it never receives a request hit limit. A limit trip is
+/// therefore an internal safety failure and cannot become a cacheable value.
+pub fn scan_file_evidence(
+    java: &dyn JavaSource,
+    _token: QueryToken<'_>,
+    graph: &JavaGraphSource<'_>,
+    file: &ProjectFile,
+    spec: &TargetSpec,
+    return_caches: &ReturnTypeCaches<'_>,
+    cancellation: &CancellationToken,
+) -> JavaFileEvidenceBuildOutcome {
+    if cancellation.is_cancelled() {
+        return JavaFileEvidenceBuildOutcome::Cancelled;
+    }
+    if graph.hierarchy.is_none() {
+        return JavaFileEvidenceBuildOutcome::Omitted(
+            JavaFileEvidenceOmission::UnavailableCapability,
+        );
+    }
+    // Cacheable evidence must be built from the analyzer generation's exact
+    // source, not a later filesystem read that can race the snapshot key.
+    // Read the live file only to distinguish an unavailable source from an
+    // unavailable indexed provider; never use it as evidence here.
+    let source = match graph.index.indexed_source(file) {
+        Some(source) => source,
+        None => {
+            let omission = if file.read_to_string().is_ok() {
+                JavaFileEvidenceOmission::StoreProvider
+            } else {
+                JavaFileEvidenceOmission::SourceRead
+            };
+            return JavaFileEvidenceBuildOutcome::Omitted(omission);
+        }
+    };
+    let prepared = match prepare_file(graph, file, spec, source) {
+        Ok(prepared) => prepared,
+        Err(omission) => return JavaFileEvidenceBuildOutcome::Omitted(omission),
+    };
+    if cancellation.is_cancelled() {
+        return JavaFileEvidenceBuildOutcome::Cancelled;
+    }
+
+    let mut hits = BTreeSet::new();
+    let mut unproven_hits = BTreeSet::new();
+    let mut raw_match_count = 0usize;
+    let mut limit_exceeded = false;
+    let mut state = ScanState {
+        // Evidence must include every hit. Keeping this at usize::MAX means
+        // the request-level maximum cannot truncate or poison publication.
+        max_usages: usize::MAX,
+        hits: &mut hits,
+        unproven_hits: &mut unproven_hits,
+        raw_match_count: &mut raw_match_count,
+        limit_exceeded: &mut limit_exceeded,
+    };
+    scan_prepared_file(
+        java,
+        graph,
+        file,
+        spec,
+        return_caches,
+        &prepared,
+        &mut state,
+    );
+    if cancellation.is_cancelled() {
+        return JavaFileEvidenceBuildOutcome::Cancelled;
+    }
+    if limit_exceeded {
+        return JavaFileEvidenceBuildOutcome::Omitted(JavaFileEvidenceOmission::InternalSafetyCap);
+    }
+    JavaFileEvidenceBuildOutcome::Complete(JavaFileUsageEvidence {
+        hits,
+        unproven_hits,
+        raw_match_count,
+    })
+}
+
+fn prepare_file(
+    graph: &JavaGraphSource<'_>,
+    file: &ProjectFile,
+    spec: &TargetSpec,
+    source: String,
+) -> Result<PreparedJavaFile, JavaFileEvidenceOmission> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_java::LANGUAGE.into())
+        .map_err(|_| JavaFileEvidenceOmission::ParserSetup)?;
+    let tree = parser
+        .parse(source.as_str(), None)
+        .ok_or(JavaFileEvidenceOmission::Parse)?;
+    let line_starts = compute_line_starts(&source);
+    let target_present =
+        tree_contains_target_terminal(tree.root_node(), &source, &spec.member_name);
+    let class_ranges = if target_present {
+        build_class_ranges(graph.index, file)?
+    } else {
+        ClassRangeIndex::from_class_spans(std::iter::empty())
+    };
+    Ok(PreparedJavaFile {
+        source,
+        tree,
+        line_starts,
+        class_ranges,
+        target_present,
+    })
+}
+
+fn build_class_ranges(
+    index: &dyn brokk_bifrost_core::analyzer::CodeUnitIndex,
+    file: &ProjectFile,
+) -> Result<ClassRangeIndex, JavaFileEvidenceOmission> {
+    let mut spans = Vec::new();
+    for unit in index
+        .declarations(file)
+        .into_iter()
+        .filter(CodeUnit::is_class)
+    {
+        let ranges = index.ranges(&unit);
+        if ranges.is_empty() {
+            return Err(JavaFileEvidenceOmission::ClassRange);
+        }
+        spans.extend(ranges.into_iter().map(|range| (unit.clone(), range)));
+    }
+    Ok(ClassRangeIndex::from_class_spans(spans))
+}
+
+fn scan_prepared_file(
+    java: &dyn JavaSource,
+    graph: &JavaGraphSource<'_>,
+    file: &ProjectFile,
+    spec: &TargetSpec,
+    return_caches: &ReturnTypeCaches<'_>,
+    prepared: &PreparedJavaFile,
+    state: &mut ScanState<'_>,
+) {
+    if !prepared.target_present {
         return;
     }
-    let line_starts = compute_line_starts(&source);
+    let token = graph.token;
     let mut bindings = LocalInferenceEngine::new(LocalInferenceConfig::default());
     seed_class_binding(java, token, graph, file, spec, &mut bindings);
     let mut ctx = ScanCtx {
         java,
         graph,
         file,
-        source: &source,
-        root: tree.root_node(),
-        line_starts: &line_starts,
+        source: &prepared.source,
+        root: prepared.tree.root_node(),
+        line_starts: &prepared.line_starts,
         spec,
         bindings: &mut bindings,
         hits: state.hits,
@@ -152,7 +346,7 @@ pub fn scan_file(
         raw_match_count: state.raw_match_count,
         max_usages: state.max_usages,
         limit_exceeded: state.limit_exceeded,
-        class_ranges: ClassRangeIndex::build(graph.index, file),
+        class_ranges: prepared.class_ranges.clone(),
         method_call_return_cache: RefCell::new(HashMap::default()),
         receiver_target_match_cache: RefCell::new(HashMap::default()),
         method_return_cache: return_caches.method_return,
@@ -161,7 +355,7 @@ pub fn scan_file(
         enclosing_cache: HashMap::default(),
         class_scope_depths: Vec::new(),
     };
-    scan_node(tree.root_node(), token, &mut ctx);
+    scan_node(prepared.tree.root_node(), token, &mut ctx);
 }
 
 /// Whether this parsed file contains the target's terminal symbol at all.

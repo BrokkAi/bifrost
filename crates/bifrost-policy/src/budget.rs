@@ -45,6 +45,11 @@ const MAX_FACT_NODES_HARD_CAP: usize = 16 * MAX_FACT_NODES;
 /// bytes; 1 per 6 gives ~1.8x headroom for denser languages (#1771).
 const SOURCE_BYTES_PER_SCALED_FACT_NODE: u64 = 6;
 const SCALED_SCAN_HEADROOM: u64 = 2;
+// Semantic source work is charged for every exact source-backed semantic
+// request, so it is not the same quantity as the structural workspace scan.
+// Keep its calibration independent: a corpus measurement may raise this lane
+// without also widening structural scans or semantic graph traversal.
+const SCALED_SEMANTIC_SOURCE_WORK_PER_SOURCE_BYTE: u64 = 2;
 const MAX_SEMANTIC_MATERIALIZED_FILES: usize = 256;
 const MAX_SEMANTIC_SOURCE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SEMANTIC_ROWS_PER_DIMENSION: usize = 1_000_000;
@@ -98,10 +103,12 @@ const MAX_SEMANTIC_TRAVERSAL_STEPS_HARD_CAP: usize = 16 * MAX_SEMANTIC_TRAVERSAL
 // `max_rows_per_dimension` is granted to every row dimension, so it must admit
 // that largest one.  The semantic provider's own defaults agree about the
 // shape: `NestedEntries` is 8,000,000 against `ProgramPoints` at 1,000,000.
-// `query_limits` publishes this lane per dimension so a query runs against the
-// audited number rather than the executor's memory-shaped estimate of it
-// (#2523); the grant itself stays one uniform quantity, which is what the
-// measurement above calibrates.
+// `query_limits` publishes this lane per dimension so every retained-row lane
+// runs against the audited number rather than the executor's memory-shaped
+// estimate (#2523). `nested_entries` also uses the authored uniform number when
+// there is no table because it mixes retained entries with transient traversal;
+// the grant itself stays one uniform quantity, which is what the measurement
+// above calibrates.
 //
 // The peak measured 9,187,328 rows, 0.79 rows per source byte.  Three rows per
 // two source bytes is 1.9x that, matching the ~1.8x headroom of the
@@ -268,14 +275,20 @@ impl PolicyBudget {
     /// derives a single row density for the audited workspace, and
     /// `selector_compiler::semantic_work_limits` has always granted it to
     /// every row dimension. Publishing it per dimension says which layer owns
-    /// these lanes. Without it the executor re-derives them from
-    /// `max_retained_bytes` instead, splitting half of that lane across the
-    /// row dimensions and pricing `nested_entries` at one 96-byte
-    /// `SemanticLocator` per entry -- while a nested entry is a CFG adjacency
-    /// offset, a call argument, an evidence source, or one bounded traversal
-    /// step. On google/gson that estimate capped the lane at 11,650 rows
-    /// against an audited 2,944,018, and reference policy B's second bind
-    /// stopped after 6 of its 98 marked procedures (#2523).
+    /// these lanes and prevents memory-shaped estimates from narrowing the
+    /// homogeneous retained-row dimensions. It also preserves each shared
+    /// ledger remainder when a live selector session replaces this initial
+    /// uniform table.
+    ///
+    /// #2523 exposed that, without a table, the executor priced every
+    /// `nested_entries` unit as one 96-byte `SemanticLocator`, even though a
+    /// unit can instead be a CFG adjacency offset, call argument, evidence
+    /// source, or bounded traversal step. On google/gson that estimate capped
+    /// the lane at 11,650 rows against an audited 2,944,018, and reference
+    /// policy B's second bind stopped after 6 of its 98 marked procedures. The
+    /// executor now keeps the authored uniform limit for that heterogeneous
+    /// lane even without a table; the table remains authoritative for every
+    /// policy-owned lane.
     ///
     /// The memory bound is unchanged, because it was never the estimate:
     /// query-side materialization charges each artifact's measured retained
@@ -307,14 +320,17 @@ impl PolicyBudget {
     /// explicitly widened budget is never narrowed.  `max_pipeline_rows` bounds
     /// per-query memory rather than workspace volume and stays fixed.
     ///
-    /// The semantic file and byte lanes follow the same measured volume as the
-    /// scan lanes because a policy compile materializes program semantics for
-    /// the whole audited corpus, not for one interactive query (#1936).  The row
-    /// and retention lanes take their own measured densities per source byte,
-    /// from a corpus-scale run on OWASP BenchmarkJava; see the constants above
-    /// for the measurement and the headroom.  The traversal lane keeps the
-    /// byte-lane ratio it has had since #1936: its measured peak sits below even
-    /// its fixed default, so a measured density would only lower it.
+    /// The semantic file lane follows the scan-file volume because a policy
+    /// compile materializes program semantics for the whole audited corpus, not
+    /// for one interactive query (#1936).  Semantic source work has a separate
+    /// multiplier because one source file can be read by multiple exact
+    /// semantic requests.  The row and retention lanes take their own measured
+    /// densities per source byte, from a corpus-scale run on OWASP BenchmarkJava;
+    /// see the constants above for the measurement and the headroom.  The
+    /// traversal lane keeps the historic 2x workspace-volume ratio from #1936,
+    /// independent of the semantic source-work multiplier: its measured peak
+    /// sits below even its fixed default, so a measured density would only lower
+    /// it.
     ///
     /// The findings lane follows the audited file count for the same reason
     /// (#2471): it is one request's total output cap, so a fixed value makes a
@@ -322,8 +338,11 @@ impl PolicyBudget {
     pub fn scaled_for_workspace(mut self, total_source_bytes: u64, total_files: usize) -> Self {
         let scaled_fact_nodes =
             saturating_usize(total_source_bytes / SOURCE_BYTES_PER_SCALED_FACT_NODE);
-        let scaled_source_bytes =
+        let scaled_scan_source_bytes =
             saturating_usize(total_source_bytes.saturating_mul(SCALED_SCAN_HEADROOM));
+        let scaled_semantic_source_bytes = saturating_usize(
+            total_source_bytes.saturating_mul(SCALED_SEMANTIC_SOURCE_WORK_PER_SOURCE_BYTE),
+        );
         let scaled_files = total_files.saturating_mul(SCALED_SCAN_HEADROOM as usize);
 
         self.query.max_fact_nodes = self
@@ -334,7 +353,7 @@ impl PolicyBudget {
         self.query.max_scanned_source_bytes = self
             .query
             .max_scanned_source_bytes
-            .max(scaled_source_bytes)
+            .max(scaled_scan_source_bytes)
             .min(MAX_SCANNED_SOURCE_BYTES_HARD_CAP);
         self.query.max_scanned_files = self
             .query
@@ -352,7 +371,7 @@ impl PolicyBudget {
             .query
             .semantic
             .max_source_bytes
-            .max(scaled_source_bytes)
+            .max(scaled_semantic_source_bytes)
             .min(MAX_SEMANTIC_SOURCE_BYTES_HARD_CAP);
         // The row and retention lanes take their measured per-source-byte
         // densities.  Both are at least their fixed defaults, because the
@@ -376,16 +395,21 @@ impl PolicyBudget {
             .max_retained_bytes
             .max(scaled_semantic_retained_bytes)
             .min(MAX_SEMANTIC_RETAINED_BYTES_HARD_CAP);
-        // The traversal lane keeps the byte-lane ratio: how many default
-        // semantic byte budgets the scaled byte lane spans, multiplied before
-        // dividing so a corpus between one and two budgets does not floor to 1
-        // (#1936).  The ratio is at least 1 because the byte lane's default is a
-        // floor, and at most 16 because it was clamped to 16x just above, so the
-        // u128 product cannot overflow and the result respects the hard cap.
-        let scaled_semantic_bytes = self.query.semantic.max_source_bytes;
+        // The traversal lane keeps #1936's historic 2x workspace-volume basis,
+        // not the semantic source-work lane.  This is how many default semantic
+        // byte budgets that basis spans, multiplied before dividing so a corpus
+        // between one and two budgets does not floor to 1.  Clamp the source
+        // basis to the semantic byte range so the ratio stays between 1 and 16,
+        // the u128 product cannot overflow, and the result respects the hard
+        // cap.  A future source-work calibration therefore cannot silently
+        // increase graph traversal.
+        let traversal_source_basis = scaled_scan_source_bytes.clamp(
+            MAX_SEMANTIC_SOURCE_BYTES,
+            MAX_SEMANTIC_SOURCE_BYTES_HARD_CAP,
+        );
         let scaled_traversal_steps = {
             let scaled = (MAX_SEMANTIC_TRAVERSAL_STEPS as u128)
-                .saturating_mul(scaled_semantic_bytes as u128)
+                .saturating_mul(traversal_source_basis as u128)
                 / (MAX_SEMANTIC_SOURCE_BYTES as u128);
             usize::try_from(scaled)
                 .unwrap_or(usize::MAX)
@@ -1400,7 +1424,10 @@ mod tests {
         let semantic = scaled.query_limits().semantic;
         assert_eq!(semantic.max_materialized_files, 3_144);
         assert!(semantic.max_materialized_files > MAX_SEMANTIC_MATERIALIZED_FILES);
-        assert_eq!(semantic.max_source_bytes, 80_000_000);
+        assert_eq!(
+            semantic.max_source_bytes,
+            40_000_000 * SCALED_SEMANTIC_SOURCE_WORK_PER_SOURCE_BYTE as usize
+        );
         assert!(semantic.max_source_bytes > MAX_SEMANTIC_SOURCE_BYTES);
         // The row and retention lanes take their calibrated densities (the
         // row lane clamps: 40MB of source at 1.5 rows per byte exceeds its
@@ -1415,13 +1442,14 @@ mod tests {
             40_000_000 * SCALED_SEMANTIC_RETAINED_BYTES_PER_SOURCE_BYTE as usize
         );
         assert!(semantic.max_retained_bytes < MAX_SEMANTIC_RETAINED_BYTES_HARD_CAP);
-        // The traversal lane keeps the byte-lane ratio, 80_000_000 / 16MiB,
-        // multiplied before dividing.  Flooring the ratio to whole default byte
-        // budgets left the first real corpus run (ratio 1.38) at its floor, and
-        // every category abstained (#1936).
+        // The traversal lane keeps the historic 2x workspace-volume ratio,
+        // independent of the semantic source-work multiplier.  Flooring the
+        // ratio to whole default byte budgets left the first real corpus run
+        // (ratio 1.38) at its floor, and every category abstained (#1936).
         assert_eq!(
             semantic.max_traversal_steps,
-            (1_000_000_u128 * 80_000_000 / (16 * 1024 * 1024)) as usize
+            (MAX_SEMANTIC_TRAVERSAL_STEPS as u128 * (40_000_000 * SCALED_SCAN_HEADROOM) as u128
+                / MAX_SEMANTIC_SOURCE_BYTES as u128) as usize
         );
 
         // The measured corpus itself: OWASP BenchmarkJava at 007786f86, 2770
@@ -1457,6 +1485,100 @@ mod tests {
         PolicyBudget::builder()
             .with_query_limits(scaled.query_limits())
             .expect("scaled semantic lanes stay within the builder hard caps");
+    }
+
+    #[test]
+    fn semantic_source_work_has_an_independent_scale_floor_and_cap() {
+        let workspace_source_bytes = 40_000_000_u64;
+        let query = PolicyBudget::default()
+            .scaled_for_workspace(workspace_source_bytes, 1_000)
+            .query_limits();
+        let expected_semantic_source = saturating_usize(
+            workspace_source_bytes.saturating_mul(SCALED_SEMANTIC_SOURCE_WORK_PER_SOURCE_BYTE),
+        )
+        .clamp(
+            MAX_SEMANTIC_SOURCE_BYTES,
+            MAX_SEMANTIC_SOURCE_BYTES_HARD_CAP,
+        );
+        assert_eq!(query.semantic.max_source_bytes, expected_semantic_source);
+        assert_eq!(
+            query.max_scanned_source_bytes, MAX_SCANNED_SOURCE_BYTES,
+            "the structural lane keeps its own larger floor"
+        );
+        assert_ne!(
+            query.semantic.max_source_bytes, query.max_scanned_source_bytes,
+            "semantic source work and structural scanning are separate lanes"
+        );
+
+        let small = PolicyBudget::default().scaled_for_workspace(1, 1);
+        assert_eq!(
+            small.query_limits().semantic.max_source_bytes,
+            MAX_SEMANTIC_SOURCE_BYTES,
+            "the default remains the semantic source-work floor"
+        );
+        let enormous = PolicyBudget::default().scaled_for_workspace(u64::MAX, usize::MAX);
+        assert_eq!(
+            enormous.query_limits().semantic.max_source_bytes,
+            MAX_SEMANTIC_SOURCE_BYTES_HARD_CAP,
+            "saturating source work still clamps to the builder hard cap"
+        );
+    }
+
+    #[test]
+    fn scaling_preserves_independently_widened_semantic_limits() {
+        let custom_source_bytes = 8 * MAX_SEMANTIC_SOURCE_BYTES;
+        let custom_traversal_steps = 3 * MAX_SEMANTIC_TRAVERSAL_STEPS;
+        let host_widened = PolicyBudget::builder()
+            .with_query_limits(CodeQueryExecutionLimits {
+                semantic: CodeQuerySemanticLimits {
+                    max_source_bytes: custom_source_bytes,
+                    max_traversal_steps: custom_traversal_steps,
+                    ..CodeQuerySemanticLimits::default()
+                },
+                ..CodeQueryExecutionLimits::default()
+            })
+            .expect("independently widened semantic lanes are valid")
+            .build()
+            .unwrap();
+
+        let semantic = host_widened
+            .scaled_for_workspace(1024 * 1024, 50)
+            .query_limits()
+            .semantic;
+        assert_eq!(semantic.max_source_bytes, custom_source_bytes);
+        assert_eq!(semantic.max_traversal_steps, custom_traversal_steps);
+    }
+
+    #[test]
+    fn widening_semantic_source_work_does_not_widen_traversal() {
+        let workspace_source_bytes = 40_000_000_u64;
+        let baseline = PolicyBudget::default()
+            .scaled_for_workspace(workspace_source_bytes, 1_000)
+            .query_limits()
+            .semantic;
+        let source_widened = PolicyBudget::builder()
+            .with_query_limits(CodeQueryExecutionLimits {
+                semantic: CodeQuerySemanticLimits {
+                    max_source_bytes: MAX_SEMANTIC_SOURCE_BYTES_HARD_CAP,
+                    ..CodeQuerySemanticLimits::default()
+                },
+                ..CodeQueryExecutionLimits::default()
+            })
+            .expect("the semantic source-work hard cap is a valid host limit")
+            .build()
+            .unwrap()
+            .scaled_for_workspace(workspace_source_bytes, 1_000)
+            .query_limits()
+            .semantic;
+
+        assert_eq!(
+            source_widened.max_source_bytes,
+            MAX_SEMANTIC_SOURCE_BYTES_HARD_CAP
+        );
+        assert_eq!(
+            source_widened.max_traversal_steps, baseline.max_traversal_steps,
+            "traversal follows the historic 2x workspace basis, not the source-work grant"
+        );
     }
 
     /// The request-wide output lane must follow the audited workspace, or a

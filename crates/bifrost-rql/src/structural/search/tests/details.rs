@@ -3,7 +3,9 @@ use super::*;
 /// Parameter decorator rows keep the decorator application anchored to its
 /// parameter while resolving aliased imports structurally. A same-named
 /// decoy remains a separate binding, so policies can select the module target
-/// without relying on the local spelling (#2644).
+/// without relying on the local spelling (#2644). Concrete method and
+/// constructor parameters must carry the complete semantic owner, ordinal,
+/// and value-port identity; syntax-only rows remain explicitly incomplete.
 #[test]
 fn decorated_parameter_rows_expose_aliased_import_identity_and_near_miss() {
     let source = r#"
@@ -11,19 +13,16 @@ import { Query as NestQuery } from "@nestjs/common";
 import { Query as DecoyQuery } from "./decoy";
 
 class Controller {
-    method(@NestQuery() @DecoyQuery() @Unknown() value: string, other: string) {}
+    constructor(@NestQuery() @DecoyQuery() id: string, other: string) {}
+
+    method(@NestQuery() @DecoyQuery() @Unknown() value: string, @NestQuery() page: number) {}
 }
 "#;
-    let temp = tempfile::tempdir().expect("temp dir");
-    let root = temp.path().canonicalize().expect("canonical root");
-    ProjectFile::new(root.clone(), PathBuf::from("app.ts"))
-        .write(source)
-        .expect("write TypeScript source");
-    let workspace = WorkspaceAnalyzer::build_ephemeral(
-        Arc::new(TestProject::new(root, Language::TypeScript)),
-        AnalyzerConfig::default(),
-    )
-    .expect("ephemeral TypeScript workspace should build");
+    let project = InlineTestProject::new()
+        .file("app.ts", source)
+        .file("decoy.ts", "export function Query() {}\n")
+        .build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
     let query = CodeQuery::from_json(&json!({
         "match": { "kind": "parameter" },
         "steps": [{ "op": "decorator_bindings" }],
@@ -36,7 +35,7 @@ class Controller {
         &brokk_bifrost_flow::FlowWorkspaceState::new(),
         &query,
     );
-    assert_eq!(result.results.len(), 3, "{}", result.render_text());
+    assert_eq!(result.results.len(), 6, "{}", result.render_text());
     let rows = result
         .results
         .iter()
@@ -47,18 +46,100 @@ class Controller {
         .collect::<Vec<_>>();
     let nest = rows
         .iter()
-        .find(|row| row.module.as_deref() == Some("@nestjs/common"))
-        .expect("aliased NestQuery row");
+        .filter(|row| row.module.as_deref() == Some("@nestjs/common"))
+        .collect::<Vec<_>>();
+    assert_eq!(nest.len(), 3, "{rows:#?}");
+    assert!(
+        nest.iter().all(|row| {
+            row.decorator_name == "NestQuery"
+                && row.imported_name.as_deref() == Some("Query")
+                && row.binding_status == "imported"
+                && row.owner_id.is_some()
+                && row.procedure_id.is_some()
+                && row.value_id.is_some()
+                && row.parameter_ordinal.is_some()
+                && row.port_id.is_some()
+                && row.completion == "complete"
+                && row.coverage == "complete"
+        }),
+        "NestQuery rows must be complete: {nest:#?}"
+    );
+    let mut nest_ordinals = nest
+        .iter()
+        .map(|row| row.parameter_ordinal.expect("complete parameter ordinal"))
+        .collect::<Vec<_>>();
+    nest_ordinals.sort_unstable();
+    assert_eq!(nest_ordinals, vec![0, 0, 1], "{nest:#?}");
+    let same_ordinal = nest
+        .iter()
+        .filter(|row| row.parameter_ordinal == Some(0))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        same_ordinal.len(),
+        2,
+        "constructor and method ordinal zero: {nest:#?}"
+    );
+    assert_ne!(same_ordinal[0].owner_id, same_ordinal[1].owner_id);
+    assert_ne!(same_ordinal[0].procedure_id, same_ordinal[1].procedure_id);
+    assert_ne!(same_ordinal[0].value_id, same_ordinal[1].value_id);
+    assert_ne!(same_ordinal[0].port_id, same_ordinal[1].port_id);
+    let mut nest_procedures = nest
+        .iter()
+        .map(|row| row.procedure_id.as_ref().expect("complete procedure id"))
+        .collect::<Vec<_>>();
+    nest_procedures.sort_unstable();
+    nest_procedures.dedup();
+    assert_eq!(
+        nest_procedures.len(),
+        2,
+        "constructor and method owners: {nest:#?}"
+    );
+
     let decoy = rows
         .iter()
-        .find(|row| row.module.as_deref() == Some("./decoy"))
-        .expect("same-named decoy row");
-    assert_eq!(nest.decorator_name, "NestQuery");
-    assert_eq!(nest.imported_name.as_deref(), Some("Query"));
-    assert_eq!(nest.binding_status, "imported");
-    assert_eq!(decoy.decorator_name, "DecoyQuery");
-    assert_eq!(decoy.imported_name.as_deref(), Some("Query"));
-    assert_eq!(decoy.binding_status, "imported");
+        .filter(|row| row.module.as_deref() == Some("./decoy"))
+        .collect::<Vec<_>>();
+    assert_eq!(decoy.len(), 2, "{rows:#?}");
+    assert!(
+        decoy.iter().all(|row| {
+            row.decorator_name == "DecoyQuery"
+                && row.imported_name.as_deref() == Some("Query")
+                && row.binding_status == "imported"
+                && row.completion == "complete"
+                && row.coverage == "complete"
+                && row.owner_id.is_some()
+                && row.procedure_id.is_some()
+                && row.value_id.is_some()
+                && row.parameter_ordinal.is_some()
+                && row.port_id.is_some()
+        }),
+        "decoy rows must be complete: {decoy:#?}"
+    );
+
+    // Two decorators on one parameter share the exact semantic parameter
+    // identity while retaining distinct decorator identities.
+    for decoy_row in &decoy {
+        let matching_nest = nest
+            .iter()
+            .find(|row| row.parameter_id == decoy_row.parameter_id)
+            .expect("each decoy decorator has its NestQuery decorator");
+        assert_ne!(matching_nest.decorator_id, decoy_row.decorator_id);
+        assert_eq!(matching_nest.owner_id, decoy_row.owner_id);
+        assert_eq!(matching_nest.procedure_id, decoy_row.procedure_id);
+        assert_eq!(matching_nest.value_id, decoy_row.value_id);
+        assert_eq!(matching_nest.parameter_ordinal, decoy_row.parameter_ordinal);
+        assert_eq!(matching_nest.port_id, decoy_row.port_id);
+        assert_eq!(matching_nest.range, decoy_row.range);
+        assert_eq!(
+            matching_nest.range.start_column,
+            matching_nest.decorator_range.start_column
+        );
+        assert!(matching_nest.range.end_column > matching_nest.decorator_range.end_column);
+        assert!(
+            decoy_row.decorator_range.start_column > matching_nest.decorator_range.start_column
+        );
+    }
+
     let unknown = rows
         .iter()
         .find(|row| row.decorator_name == "Unknown")
@@ -67,15 +148,12 @@ class Controller {
     assert_eq!(unknown.completion, "incomplete");
     assert_eq!(unknown.coverage, "partial");
     assert!(unknown.reason.is_some());
-    assert_eq!(nest.parameter_id, decoy.parameter_id);
-    assert_ne!(nest.decorator_id, decoy.decorator_id);
-    assert_eq!(nest.range.start_line, nest.range.end_line);
-    assert_eq!(nest.range.start_column, nest.decorator_range.start_column);
-    assert!(nest.range.end_column > nest.decorator_range.end_column);
-    assert!(decoy.decorator_range.start_column > nest.decorator_range.start_column);
+    assert!(unknown.owner_id.is_some());
+    assert!(unknown.procedure_id.is_some());
+    assert!(unknown.value_id.is_some());
+    assert!(unknown.parameter_ordinal.is_some());
+    assert!(unknown.port_id.is_some());
     assert!(rows.iter().all(|row| row.decorator_id.is_some()));
-    assert!(rows.iter().all(|row| row.parameter_ordinal.is_some()));
-    assert!(rows.iter().all(|row| row.port_id.is_some()));
 
     let filtered_query = CodeQuery::from_json(&json!({
         "match": { "kind": "parameter" },
@@ -91,17 +169,84 @@ class Controller {
         &brokk_bifrost_flow::FlowWorkspaceState::new(),
         &filtered_query,
     );
-    assert_eq!(filtered.results.len(), 1, "{}", filtered.render_text());
+    assert_eq!(filtered.results.len(), 3, "{}", filtered.render_text());
+    assert_eq!(filtered.completion(), CodeQueryCompletion::Complete);
+    assert!(
+        filtered.results.iter().all(|item| {
+            let CodeQueryResultValue::DecoratedParameter { value } = &item.value else {
+                return false;
+            };
+            value.module.as_deref() == Some("@nestjs/common")
+                && value.imported_name.as_deref() == Some("Query")
+                && value.completion == "complete"
+                && value.coverage == "complete"
+                && value.procedure_id.is_some()
+                && value.value_id.is_some()
+                && value.parameter_ordinal.is_some()
+                && value.port_id.is_some()
+        }),
+        "filtered rows must be complete: {}",
+        filtered.render_text()
+    );
+}
+
+#[test]
+fn decorated_parameter_without_semantic_procedure_stays_incomplete() {
+    let source = r#"
+import { Query as NestQuery } from "@nestjs/common";
+
+interface Contract {
+    method(@NestQuery() value: string): void;
+}
+"#;
+    let project = InlineTestProject::new().file("app.ts", source).build();
+    let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+    let query = CodeQuery::from_json(&json!({
+        "match": { "kind": "parameter" },
+        "steps": [{
+            "op": "decorator_bindings",
+            "module": "@nestjs/common",
+            "imported_name": "Query"
+        }],
+        "result_detail": "full"
+    }))
+    .expect("decorator binding query");
+
+    let result = execute_workspace(
+        &workspace,
+        &brokk_bifrost_flow::FlowWorkspaceState::new(),
+        &query,
+    );
+    let [item] = result.results.as_slice() else {
+        panic!(
+            "expected one decorated interface parameter: {}",
+            result.render_text()
+        );
+    };
+    let CodeQueryResultValue::DecoratedParameter { value } = &item.value else {
+        panic!("expected decorated parameter row, got {:?}", item.value);
+    };
+    assert_eq!(value.binding_status, "imported");
+    assert_eq!(value.module.as_deref(), Some("@nestjs/common"));
+    assert_eq!(value.imported_name.as_deref(), Some("Query"));
+    assert!(value.owner_id.is_some());
+    assert!(value.parameter_ordinal.is_none());
+    assert!(value.procedure_id.is_none());
+    assert!(value.value_id.is_none());
+    assert!(value.port_id.is_none());
+    assert_eq!(value.completion, "incomplete");
+    assert_eq!(value.coverage, "partial");
+    assert!(
+        value
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("no semantic Parameter value")),
+        "row: {value:#?}"
+    );
     assert!(matches!(
-        filtered.completion(),
+        result.completion(),
         CodeQueryCompletion::Incomplete { .. }
     ));
-    let filtered_row = match &filtered.results[0].value {
-        CodeQueryResultValue::DecoratedParameter { value } => value,
-        other => panic!("expected decorated parameter row, got {other:?}"),
-    };
-    assert_eq!(filtered_row.module.as_deref(), Some("@nestjs/common"));
-    assert_eq!(filtered_row.imported_name.as_deref(), Some("Query"));
 }
 
 #[test]
@@ -555,6 +700,8 @@ export function caller(service: Service) { service.run(1, 2); }
     assert_eq!(shape_row.call_kind, "method");
     assert_eq!(shape_row.coverage, "exact");
     assert_eq!(shape_row.group_count, 1);
+    assert_eq!(shape_row.callee_name.as_deref(), Some("run"));
+    assert_eq!(shape_row.argument_count, 2);
     assert_eq!(shape_row.id, shape_row.site_id);
     assert!(!shape_row.site_ast_id.is_empty());
     assert!(shape_row.callee_range.is_some());
@@ -999,7 +1146,7 @@ public class Caller {
     ProjectFile::new(root.clone(), "Caller.cs")
         .write(source)
         .expect("write source");
-    let workspace = WorkspaceAnalyzer::build_ephemeral(
+    let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
         Arc::new(TestProject::new(root, Language::CSharp)),
         AnalyzerConfig::default(),
     )
@@ -1063,7 +1210,7 @@ public class Caller {
     ProjectFile::new(root.clone(), "Usage.cs")
         .write(usage)
         .expect("write usage");
-    let workspace = WorkspaceAnalyzer::build_ephemeral(
+    let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
         Arc::new(TestProject::new(root, Language::CSharp)),
         AnalyzerConfig::default(),
     )
@@ -1401,6 +1548,64 @@ fn every_enum_row_field_publishes_a_usable_value_domain() {
     }
 }
 
+#[test]
+fn result_contract_use_schema_exposes_exact_call_argument_identity() {
+    let fields = DetailedCodeQueryDomain::ResultContractUse.row_fields();
+    let use_kind = fields
+        .iter()
+        .find(|field| field.name == "use_kind")
+        .expect("result-contract use kind field");
+    assert!(
+        use_kind
+            .value_domain
+            .expect("use kind has a finite domain")
+            .admits("call_argument")
+    );
+    let parameter_ordinal = fields
+        .iter()
+        .find(|field| field.name == "parameter_ordinal")
+        .expect("result-contract call-argument ordinal field");
+    assert_eq!(
+        parameter_ordinal.scalar_type,
+        CodeQueryRowScalarType::Integer
+    );
+    assert!(parameter_ordinal.nullable);
+    assert_eq!(parameter_ordinal.value_domain, None);
+}
+
+#[test]
+fn result_contract_failure_use_schema_separates_call_and_structural_site_identity() {
+    let fields = DetailedCodeQueryDomain::ResultContractFailureUse.row_fields();
+    for name in [
+        "consumer_call_id",
+        "consumer_site_id",
+        "consumer_site_ast_id",
+    ] {
+        let field = fields
+            .iter()
+            .find(|field| field.name == name)
+            .unwrap_or_else(|| panic!("missing failure-use identity field `{name}`"));
+        assert_eq!(field.scalar_type, CodeQueryRowScalarType::StableId);
+        assert!(field.nullable);
+    }
+    let provenance = fields
+        .iter()
+        .find(|field| field.name == "failure_provenance")
+        .expect("failure provenance field avoids the result-envelope provenance key");
+    let domain = provenance
+        .value_domain
+        .expect("failure provenance has a finite registered domain");
+    for label in [
+        "condition_result",
+        "distinct_zero_binding",
+        "distinct_binding",
+        "independent",
+        "unknown",
+    ] {
+        assert!(domain.admits(label), "missing failure provenance `{label}`");
+    }
+}
+
 /// `declaration.kind` is refined to a normalized structural kind when the seed
 /// matched the declaration's own span and otherwise falls back to the code
 /// unit's coarse type, so its published domain must be exactly the union of the
@@ -1571,7 +1776,7 @@ fn effect_row_domains_project_their_registered_surface_without_an_active_pack() 
     ProjectFile::new(root.clone(), PathBuf::from("App.java"))
         .write(source)
         .expect("write source");
-    let workspace = WorkspaceAnalyzer::build_ephemeral(
+    let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
         Arc::new(TestProject::new(root, Language::Java)),
         AnalyzerConfig::default(),
     )

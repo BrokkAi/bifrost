@@ -2,8 +2,13 @@ use super::super::ir::{CallSiteHandle, ProcedureHandle};
 use super::super::provider::{SemanticOutcome, SemanticProviderError, SemanticRequest};
 use super::call::CallBindings;
 use super::dispatch::{DispatchCandidate, DispatchResult};
-use super::heap::{AliasResult, LocationResult, PointsToResult, UpdateEligibility};
-use super::model::{AccessPathAtPoint, AliasQuery, OracleCallContext, StoreAtPoint, ValueAtPoint};
+use super::heap::{
+    AliasResult, FreshObjectPublicationResult, LocationResult, PointsToResult, UpdateEligibility,
+};
+use super::model::{
+    AccessPathAtPoint, AliasQuery, FreshObjectPublicationQuery, OracleCallContext, StoreAtPoint,
+    ValueAtPoint,
+};
 use super::value_flow::ValueFlowSnapshot;
 
 /// Location-first whole-program dispatch over one exact semantic call site.
@@ -52,6 +57,12 @@ pub trait HeapOracle {
         query: &AliasQuery,
         request: &mut SemanticRequest<'_>,
     ) -> Result<SemanticOutcome<AliasResult>, SemanticProviderError>;
+
+    fn fresh_object_publications(
+        &self,
+        query: &FreshObjectPublicationQuery,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<FreshObjectPublicationResult>, SemanticProviderError>;
 
     fn update_eligibility(
         &self,

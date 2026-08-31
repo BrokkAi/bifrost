@@ -17,7 +17,7 @@ use super::ir::{
     ControlEdge, Evidence, EvidenceCompleteness, FormalMultiplicity, MemoryLocation,
     MemoryLocationKind, ProcedureSemantics, ProgramPoint, ProofStatus, SemanticArtifact,
     SemanticCallSite, SemanticEffect, SemanticEvent, SemanticGap, SemanticGapSubject,
-    SemanticValue, SemanticValueKind, SourceMapping,
+    SemanticValue, SemanticValueKind, SourceMapping, ValueFlowKind,
 };
 use super::{
     DispatchBoundaryKind, IcfgBoundary, IcfgBoundaryKind, IcfgEdge, IcfgLimitKind, IcfgNodeKey,
@@ -518,6 +518,7 @@ fn write_value(writer: &mut dyn fmt::Write, value: &SemanticValue) -> fmt::Resul
         | SemanticValueKind::Receiver { .. }
         | SemanticValueKind::Return
         | SemanticValueKind::Temporary
+        | SemanticValueKind::Address
         | SemanticValueKind::Constant
         | SemanticValueKind::Exception
         | SemanticValueKind::Callable
@@ -645,9 +646,16 @@ fn write_call_site(writer: &mut dyn fmt::Write, call_site: &SemanticCallSite) ->
         writer.write_char(')')?;
     }
     writer.write_char(')')?;
+    writer.write_str(" :normal-results [")?;
+    for (index, result) in call_site.normal_results.iter().enumerate() {
+        if index > 0 {
+            writer.write_char(' ')?;
+        }
+        write!(writer, "{result}")?;
+    }
     write!(
         writer,
-        " :result {} :thrown {} :declared-targets (",
+        "] :result {} :thrown {} :declared-targets (",
         optional_id(call_site.result),
         optional_id(call_site.thrown),
     )?;
@@ -670,10 +678,19 @@ fn write_call_site(writer: &mut dyn fmt::Write, call_site: &SemanticCallSite) ->
 fn write_source_mapping(writer: &mut dyn fmt::Write, mapping: &SourceMapping) -> fmt::Result {
     write!(
         writer,
-        "(source-mapping :id {} :kind {} :locator (locator ",
+        "(source-mapping :id {} :kind {}",
         mapping.id,
         quoted(mapping.kind.label()),
     )?;
+    if let Some(identity) = mapping.ast_identity {
+        write!(
+            writer,
+            " :ast-identity (structural-node :content {} :node-id {})",
+            identity.content(),
+            identity.normalized_node_id(),
+        )?;
+    }
+    writer.write_str(" :locator (locator ")?;
     write_locator(writer, &mapping.locator)?;
     writer.write_str("))")
 }
@@ -851,6 +868,12 @@ fn write_event(writer: &mut dyn fmt::Write, index: usize, event: &SemanticEvent)
                 " :flow-kind {} :flow-source {source} :target {target}",
                 quoted(kind.label())
             )?;
+            if let ValueFlowKind::IndexedReturn { ordinal } = kind {
+                write!(writer, " :result-index {ordinal}")?;
+            }
+        }
+        SemanticEffect::ValueUse { kind, value } => {
+            write!(writer, " :use-kind {} :value {value}", quoted(kind.label()))?;
         }
         SemanticEffect::Allocation { allocation } => {
             write!(writer, " :allocation {allocation}")?;
@@ -1339,7 +1362,8 @@ mod tests {
         SemanticBudget, SemanticCapabilities, SemanticCapability, SemanticEvent, SemanticGapId,
         SemanticGapImpacts, SemanticIrVersion, SemanticLanguage, SemanticLocator, SemanticRole,
         SemanticWork, SourceAnchor, SourceMappingId, SourceMappingKind, SourcePosition,
-        SourceRevision, SourceSpan, StableDigest, WorkspaceMountId, WorkspaceRelativePath,
+        SourceRevision, SourceSpan, StableDigest, StructuralNodeIdentity, WorkspaceMountId,
+        WorkspaceRelativePath,
     };
 
     #[test]
@@ -1477,6 +1501,22 @@ mod tests {
         assert!(scope < local_id, "{}", first.semantic_ir);
         assert!(!first.semantic_ir.contains("/Users/"));
         assert_balanced(&first.semantic_ir);
+    }
+
+    #[test]
+    fn source_mapping_renders_exact_structural_identity() {
+        let key = fixture_key();
+        let mut mapping = fixture_procedure(&key, 0).source_mappings.remove(0);
+        mapping.ast_identity = Some(StructuralNodeIdentity::new(key.revision().content(), 17));
+        let mut rendered = String::new();
+
+        write_source_mapping(&mut rendered, &mapping).expect("source mapping renders");
+
+        assert!(rendered.contains(&format!(
+            ":ast-identity (structural-node :content {} :node-id 17)",
+            key.revision().content()
+        )));
+        assert_balanced(&rendered);
     }
 
     #[test]
@@ -1645,6 +1685,7 @@ mod tests {
                 super::super::ids::ValueId::new(1),
                 super::super::ir::ArgumentDomain::Positional,
             )]),
+            normal_results: Box::new([]),
             result: None,
             thrown: None,
             declared_targets: CallableTargetResolution::ExceededBudget(Box::new([
@@ -2166,6 +2207,7 @@ mod tests {
             id: source,
             locator,
             kind: SourceMappingKind::Exact,
+            ast_identity: None,
         }];
         parts.evidence_rows = vec![Evidence {
             id: evidence,

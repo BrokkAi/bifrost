@@ -5,7 +5,6 @@ use crate::analyzer::{AnalyzerConfig, AnalyzerQueryScope, DeclarationId, QuerySc
 use crate::cancellation::CancellationToken;
 use brokk_bifrost_core::analyzer::BoundedDefinitionLookup;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
-use std::time::Duration;
 
 fn is_zero(value: &usize) -> bool {
     *value == 0
@@ -28,13 +27,6 @@ pub struct ScanUsagesByReferenceParams {
     /// `same_owner_sites`. See #1014 facet B.
     #[serde(default)]
     pub include_same_owner: bool,
-    /// Override the default wall-clock budget for this call. Interactive callers should leave this
-    /// unset; a batch/background caller issuing one scan per checkout rather than serving
-    /// keystrokes can request more time for a large workspace. A value above
-    /// [`SCAN_USAGES_MAX_DURATION_CEILING`] runs under that ceiling instead, and the result
-    /// reports the substitution in [`ScanUsagesScope::max_duration_clamped`].
-    #[serde(default)]
-    pub max_duration_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,9 +39,6 @@ pub struct ScanUsagesByLocationParams {
     /// See [`ScanUsagesByReferenceParams::include_same_owner`].
     #[serde(default)]
     pub include_same_owner: bool,
-    /// See [`ScanUsagesByReferenceParams::max_duration_secs`].
-    #[serde(default)]
-    pub max_duration_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,26 +105,6 @@ pub struct ScanUsagesScope {
     pub paths_omitted: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ignored_paths: Option<usize>,
-    /// Present only when the caller's `max_duration_secs` exceeded
-    /// [`SCAN_USAGES_MAX_DURATION_CEILING`] and the scan therefore ran under a shorter deadline
-    /// than it asked for. Absent means the requested budget was applied unchanged.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_duration_clamped: Option<ScanUsagesDurationClamp>,
-}
-
-/// The wall-clock budget a scan actually ran under when it differs from the requested one.
-///
-/// A scan that stops at a deadline reports `incomplete_reason: time_budget`, which on its own
-/// cannot tell a caller whether the scan spent the budget it asked for. This block names both
-/// numbers so a caller tuning scans by observed behavior can see that the shortfall came from the
-/// server ceiling, not from the work.
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-pub struct ScanUsagesDurationClamp {
-    /// The `max_duration_secs` the request asked for.
-    pub requested_secs: u64,
-    /// The ceiling that replaced it, in seconds. Always
-    /// [`SCAN_USAGES_MAX_DURATION_CEILING`].
-    pub applied_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -584,7 +553,7 @@ impl<'a> TestFileExclusion<'a> {
 /// is declared `#[cfg(test)] mod tests;` by its parent, so neither path rule
 /// fires. It is a lookup into the per-language module index rather than a
 /// per-file hydration, so it keeps the membership set cheap to build.
-fn is_test_like_file(
+pub(crate) fn is_test_like_file(
     analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
     path: &str,
@@ -824,10 +793,7 @@ impl ScanUsagesQueryScope {
         self.path_filter.is_none()
     }
 
-    fn result_scope(
-        &self,
-        max_duration_clamped: Option<ScanUsagesDurationClamp>,
-    ) -> ScanUsagesScope {
+    fn result_scope(&self) -> ScanUsagesScope {
         let (paths, paths_omitted) = self
             .path_filter
             .as_deref()
@@ -839,7 +805,6 @@ impl ScanUsagesQueryScope {
             paths,
             paths_omitted,
             ignored_paths: some_if_nonzero(self.ignored_paths),
-            max_duration_clamped,
         }
     }
 }
@@ -855,90 +820,16 @@ pub(super) struct IndexedResolvedScanTarget {
 #[derive(Debug, Clone)]
 pub(crate) struct ScanUsagesExecutionContext {
     cancellation: CancellationToken,
-    max_duration_clamped: Option<ScanUsagesDurationClamp>,
     max_candidate_files: usize,
     max_path_scoped_candidate_files: usize,
     max_source_bytes: usize,
     max_callsites: usize,
 }
 
-// Leave two seconds of the five-second product envelope for cooperative
-// shutdown, rendering, response delivery, and short non-interruptible cache
-// lookups that may already be in flight when the deadline is observed.
-//
-// This default bounds interactive work. Batch callers that need a more complete
-// large-workspace scan can use the explicit max_duration_secs override.
-const SCAN_USAGES_MAX_DURATION: Duration = Duration::from_secs(3);
-
-/// Upper bound on a caller-requested `max_duration_secs` override (see
-/// [`ScanUsagesByReferenceParams::max_duration_secs`]). Keeps a budget override an escape hatch for
-/// large-workspace batch callers, not a way to opt out of bounded execution entirely.
-///
-/// A request above this bound is not refused, because the ceiling is a server policy rather than a
-/// malformed argument. It runs under the ceiling and the result names both numbers in
-/// [`ScanUsagesScope::max_duration_clamped`] (#1886).
-pub const SCAN_USAGES_MAX_DURATION_CEILING: Duration = Duration::from_secs(300);
-
-/// Compatibility marker returned by [`disable_time_budget_for_test`].
-///
-/// Test-support builds already omit the implicit wall-clock budget. The marker keeps older
-/// focused tests source compatible and records that they do not test the interactive deadline.
-#[cfg(any(test, feature = "test-support"))]
-#[doc(hidden)]
-pub struct ScanUsagesTimeBudgetGuard;
-
-/// Marks a focused test as independent of the implicit interactive wall-clock deadline.
-///
-/// All test-support builds omit that implicit deadline. An explicit `max_duration_secs` or
-/// caller cancellation deadline still applies. Production builds always use the real default.
-#[cfg(any(test, feature = "test-support"))]
-#[doc(hidden)]
-pub fn disable_time_budget_for_test() -> ScanUsagesTimeBudgetGuard {
-    ScanUsagesTimeBudgetGuard
-}
-
-fn scan_usages_cancellation_with_budget(
-    cancellation: CancellationToken,
-    max_duration: Option<Duration>,
-) -> CancellationToken {
-    #[cfg(any(test, feature = "test-support"))]
-    if max_duration.is_none() {
-        // Correctness tests must not depend on host load. Explicit duration overrides and
-        // deadlines already present on `cancellation` remain active.
-        return cancellation;
-    }
-
-    let max_duration = max_duration
-        .unwrap_or(SCAN_USAGES_MAX_DURATION)
-        .min(SCAN_USAGES_MAX_DURATION_CEILING);
-    cancellation.with_timeout(max_duration)
-}
-
-/// Describes the ceiling substitution when a caller asked for more time than the server grants.
-///
-/// `None` when the request left `max_duration_secs` unset or stayed within the ceiling: in both
-/// cases the scan ran under exactly the budget the caller expected.
-fn scan_usages_duration_clamp(max_duration: Option<Duration>) -> Option<ScanUsagesDurationClamp> {
-    let requested = max_duration?;
-    if requested <= SCAN_USAGES_MAX_DURATION_CEILING {
-        return None;
-    }
-    Some(ScanUsagesDurationClamp {
-        requested_secs: requested.as_secs(),
-        applied_secs: SCAN_USAGES_MAX_DURATION_CEILING.as_secs(),
-    })
-}
-
 impl ScanUsagesExecutionContext {
-    /// `max_duration`, when `Some`, overrides [`SCAN_USAGES_MAX_DURATION`] for this call (clamped to
-    /// [`SCAN_USAGES_MAX_DURATION_CEILING`]) -- see `max_duration_secs` on the request params.
-    pub(crate) fn with_cancellation_and_max_duration(
-        cancellation: CancellationToken,
-        max_duration: Option<Duration>,
-    ) -> Self {
+    pub(crate) fn with_cancellation(cancellation: CancellationToken) -> Self {
         Self {
-            cancellation: scan_usages_cancellation_with_budget(cancellation, max_duration),
-            max_duration_clamped: scan_usages_duration_clamp(max_duration),
+            cancellation,
             ..Self::default()
         }
     }
@@ -961,7 +852,6 @@ impl ScanUsagesExecutionContext {
     ) -> Self {
         Self {
             cancellation,
-            max_duration_clamped: None,
             max_candidate_files,
             max_path_scoped_candidate_files,
             max_source_bytes,
@@ -973,8 +863,7 @@ impl ScanUsagesExecutionContext {
 impl Default for ScanUsagesExecutionContext {
     fn default() -> Self {
         Self {
-            cancellation: scan_usages_cancellation_with_budget(CancellationToken::default(), None),
-            max_duration_clamped: None,
+            cancellation: CancellationToken::default(),
             max_candidate_files: DEFAULT_MAX_FILES,
             max_path_scoped_candidate_files: SCAN_USAGES_PATH_SCOPED_MAX_FILES,
             max_source_bytes: SCAN_USAGES_MAX_SOURCE_BYTES,
@@ -1975,12 +1864,11 @@ pub fn scan_usages_by_reference_with_cancellation(
 ) -> ScanUsagesResult {
     let scope = AnalyzerQueryScope::new(analyzer);
     let token = scope.token();
-    let max_duration = params.max_duration_secs.map(Duration::from_secs);
     scan_usages_by_reference_with_context(
         analyzer,
         token,
         params,
-        &ScanUsagesExecutionContext::with_cancellation_and_max_duration(cancellation, max_duration),
+        &ScanUsagesExecutionContext::with_cancellation(cancellation),
     )
 }
 
@@ -2025,12 +1913,11 @@ pub fn scan_usages_by_location_with_cancellation(
 ) -> ScanUsagesResult {
     let scope = AnalyzerQueryScope::new(analyzer);
     let token = scope.token();
-    let max_duration = params.max_duration_secs.map(Duration::from_secs);
     scan_usages_by_location_with_context(
         analyzer,
         token,
         params,
-        &ScanUsagesExecutionContext::with_cancellation_and_max_duration(cancellation, max_duration),
+        &ScanUsagesExecutionContext::with_cancellation(cancellation),
     )
 }
 
@@ -2138,11 +2025,7 @@ fn scan_usages_backend_on_pool(
     if context.cancellation.is_cancelled() {
         let mut entries = incomplete_requests(symbols, targets, context.interruption_reason());
         entries.sort_by_key(ScanUsagesWorkEntry::index);
-        return render_scan_usages_with_budget(
-            entries,
-            query_scope.result_scope(context.max_duration_clamped),
-            surface,
-        );
+        return render_scan_usages_with_budget(entries, query_scope.result_scope(), surface);
     }
 
     // When the caller scopes the query to `paths`, the answer can only live in those files, so
@@ -2168,33 +2051,21 @@ fn scan_usages_backend_on_pool(
     if context.cancellation.is_cancelled() {
         let mut entries = incomplete_requests(symbols, targets, context.interruption_reason());
         entries.sort_by_key(ScanUsagesWorkEntry::index);
-        return render_scan_usages_with_budget(
-            entries,
-            query_scope.result_scope(context.max_duration_clamped),
-            surface,
-        );
+        return render_scan_usages_with_budget(entries, query_scope.result_scope(), surface);
     }
 
     let test_files = test_file_exclusion(analyzer, include_tests);
     if context.cancellation.is_cancelled() {
         let mut entries = incomplete_requests(symbols, targets, context.interruption_reason());
         entries.sort_by_key(ScanUsagesWorkEntry::index);
-        return render_scan_usages_with_budget(
-            entries,
-            query_scope.result_scope(context.max_duration_clamped),
-            surface,
-        );
+        return render_scan_usages_with_budget(entries, query_scope.result_scope(), surface);
     }
     let reference_only_sibling_extensions =
         present_reference_only_sibling_extensions_by_language(analyzer);
     if context.cancellation.is_cancelled() {
         let mut entries = incomplete_requests(symbols, targets, context.interruption_reason());
         entries.sort_by_key(ScanUsagesWorkEntry::index);
-        return render_scan_usages_with_budget(
-            entries,
-            query_scope.result_scope(context.max_duration_clamped),
-            surface,
-        );
+        return render_scan_usages_with_budget(entries, query_scope.result_scope(), surface);
     }
 
     let mut work_entries = Vec::new();
@@ -2761,11 +2632,7 @@ fn scan_usages_backend_on_pool(
     }
 
     work_entries.sort_by_key(ScanUsagesWorkEntry::index);
-    render_scan_usages_with_budget(
-        work_entries,
-        query_scope.result_scope(context.max_duration_clamped),
-        surface,
-    )
+    render_scan_usages_with_budget(work_entries, query_scope.result_scope(), surface)
 }
 
 /// A definition node in the workspace usage graph.
@@ -5731,7 +5598,6 @@ mod tests {
                 include_tests: false,
                 paths: None,
                 include_same_owner: false,
-                max_duration_secs: None,
             },
         );
 
@@ -5771,7 +5637,6 @@ mod tests {
                 include_tests: false,
                 paths: None,
                 include_same_owner: false,
-                max_duration_secs: None,
             },
         )
     }
@@ -5930,7 +5795,6 @@ mod tests {
                 include_tests: true,
                 paths: None,
                 include_same_owner: false,
-                max_duration_secs: None,
             },
             cancellation,
         )
@@ -5952,7 +5816,6 @@ mod tests {
                 include_tests: true,
                 paths: None,
                 include_same_owner: false,
-                max_duration_secs: None,
             },
             cancellation,
         )

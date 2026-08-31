@@ -4918,6 +4918,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     .into_iter()
                     .map(|value| SemanticCallArgument::direct(value, ArgumentDomain::Positional))
                     .collect(),
+                normal_results: Box::new([]),
                 result: Some(result),
                 thrown: Some(thrown),
                 declared_targets: resolution.clone(),

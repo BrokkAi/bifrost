@@ -183,6 +183,18 @@ pub(crate) fn resolved_policy_to_json(
         Value::Array(sorted_manifests(match_manifests)?),
     );
     object.insert("precedence".to_string(), precedence_to_json(precedence));
+    let locator_resolutions = super::locator::resolved_locator_metadata(definition);
+    if !locator_resolutions.is_empty() {
+        object.insert(
+            "resolved_locators".to_string(),
+            Value::Array(
+                locator_resolutions
+                    .into_iter()
+                    .map(super::canonical::resolved_locator_to_json)
+                    .collect(),
+            ),
+        );
+    }
     Ok(value)
 }
 
@@ -822,6 +834,9 @@ fn endpoint_binding_to_json(binding: &PolicyEndpointBinding) -> Value {
         PolicyEndpointBinding::MatchedValue => json!({ "type": "matched_value" }),
         PolicyEndpointBinding::Receiver => json!({ "type": "receiver" }),
         PolicyEndpointBinding::ReturnValue => json!({ "type": "return_value" }),
+        PolicyEndpointBinding::ResultIndex { index } => {
+            json!({ "type": "result_index", "index": index })
+        }
         PolicyEndpointBinding::ArgumentIndex { index } => {
             json!({ "type": "argument_index", "index": index })
         }
@@ -856,6 +871,9 @@ fn policy_port_to_json(port: &PolicyPort) -> Value {
         PolicyPort::MatchedValue => json!({ "type": "matched_value" }),
         PolicyPort::Receiver => json!({ "type": "receiver" }),
         PolicyPort::ReturnValue => json!({ "type": "return_value" }),
+        PolicyPort::ResultIndex { index } => {
+            json!({ "type": "result_index", "index": index })
+        }
         PolicyPort::ArgumentIndex { index } => {
             json!({ "type": "argument_index", "index": index })
         }
@@ -870,6 +888,9 @@ fn resolved_typestate_binding_to_json(binding: &ResolvedTypestateBinding) -> Val
         ResolvedTypestateBinding::MatchedValue => json!({ "type": "matched_value" }),
         ResolvedTypestateBinding::Receiver => json!({ "type": "receiver" }),
         ResolvedTypestateBinding::ReturnValue => json!({ "type": "return_value" }),
+        ResolvedTypestateBinding::ResultIndex { index } => {
+            json!({ "type": "result_index", "index": index })
+        }
         ResolvedTypestateBinding::ArgumentIndex { index } => {
             json!({ "type": "argument_index", "index": index })
         }
@@ -883,6 +904,9 @@ fn typestate_call_binding_to_json(binding: &TypestateCallBinding) -> Value {
     match binding {
         TypestateCallBinding::Receiver => json!({ "type": "receiver" }),
         TypestateCallBinding::ReturnValue => json!({ "type": "return_value" }),
+        TypestateCallBinding::ResultIndex { index } => {
+            json!({ "type": "result_index", "index": index })
+        }
         TypestateCallBinding::ArgumentIndex { index } => {
             json!({ "type": "argument_index", "index": index })
         }

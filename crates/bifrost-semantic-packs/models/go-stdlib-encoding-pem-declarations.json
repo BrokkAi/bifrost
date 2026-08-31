@@ -1,0 +1,229 @@
+{
+  "schema_version": 1,
+  "pack_id": "bifrost.go.stdlib.encoding-pem-declarations",
+  "version": "1.0.0",
+  "producer": {
+    "name": "bifrost",
+    "version": "0.10.7"
+  },
+  "language": "go",
+  "ecosystem": "go",
+  "compatibility": {
+    "bifrost": ">=0.10.7, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "https://pkg.go.dev/encoding/pem",
+    "revision": "go1.26.0"
+  },
+  "license": "BSD-3-Clause",
+  "completeness": "partial",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "go.stdlib.encoding-pem.declarations",
+      "activation": [{}],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "type.523ee6b9392fc5418155ad19c06446eb7eaceddbc940e19a6b37c264962f1bab",
+            "name": "encoding/pem",
+            "type_kind": "module",
+            "visibility": "package",
+            "is_abstract": false,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [],
+            "aliases": [
+              "pem"
+            ],
+            "extension_surfaces": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "encoding/pem/pem.go",
+              "symbol": "encoding/pem"
+            }
+          },
+          {
+            "id": "type.502f31c39e30446071dc33aad9163f6dbce9fd0dd0cdbe6c02f6d9c35f4f84c3",
+            "name": "encoding/pem.Block",
+            "type_kind": "struct",
+            "visibility": "public",
+            "is_abstract": false,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [],
+            "aliases": [],
+            "extension_surfaces": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "encoding/pem/pem.go",
+              "symbol": "encoding/pem.Block"
+            }
+          }
+        ],
+        "members": [
+          {
+            "id": "member.3f0d9ca8f7462d2cdc7d21d1d70e04cf37acbadff593bc8319c0b80e28924389",
+            "owner": "type.502f31c39e30446071dc33aad9163f6dbce9fd0dd0cdbe6c02f6d9c35f4f84c3",
+            "name": "Type",
+            "member_kind": "field",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "string",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "encoding/pem/pem.go",
+              "symbol": "encoding/pem.Block.Type"
+            }
+          },
+          {
+            "id": "member.f6a87143d5cd7d9bfc4a9fe7b1b960b3087cfd166e3e8b34900d0d1a32ce48b4",
+            "owner": "type.502f31c39e30446071dc33aad9163f6dbce9fd0dd0cdbe6c02f6d9c35f4f84c3",
+            "name": "Headers",
+            "member_kind": "field",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [],
+              "returns": {
+                "kind": "map",
+                "key": {
+                  "kind": "named",
+                  "name": "string",
+                  "arguments": [],
+                  "nullable": false
+                },
+                "value": {
+                  "kind": "named",
+                  "name": "string",
+                  "arguments": [],
+                  "nullable": false
+                }
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "encoding/pem/pem.go",
+              "symbol": "encoding/pem.Block.Headers"
+            }
+          },
+          {
+            "id": "member.5aaed0395fdc8573e6c6c4921dc6ec3efbab63b17f4f429a65afa78916809ee8",
+            "owner": "type.502f31c39e30446071dc33aad9163f6dbce9fd0dd0cdbe6c02f6d9c35f4f84c3",
+            "name": "Bytes",
+            "member_kind": "field",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [],
+              "returns": {
+                "kind": "slice",
+                "element": {
+                  "kind": "named",
+                  "name": "byte",
+                  "arguments": [],
+                  "nullable": false
+                }
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "encoding/pem/pem.go",
+              "symbol": "encoding/pem.Block.Bytes"
+            }
+          },
+          {
+            "id": "member.bb759c857a5e84d42a5a6028af28ff437269463c0abd0a5fe73529d904c0cbf8",
+            "owner": "type.523ee6b9392fc5418155ad19c06446eb7eaceddbc940e19a6b37c264962f1bab",
+            "name": "Decode",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "data",
+                  "type": {
+                    "kind": "slice",
+                    "element": {
+                      "kind": "named",
+                      "name": "byte",
+                      "arguments": [],
+                      "nullable": false
+                    }
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ],
+              "returns": {
+                "kind": "tuple",
+                "elements": [
+                  {
+                    "kind": "pointer",
+                    "element": {
+                      "kind": "declared",
+                      "id": "type.502f31c39e30446071dc33aad9163f6dbce9fd0dd0cdbe6c02f6d9c35f4f84c3",
+                      "arguments": [],
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "kind": "slice",
+                    "element": {
+                      "kind": "named",
+                      "name": "byte",
+                      "arguments": [],
+                      "nullable": false
+                    }
+                  }
+                ]
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "encoding/pem/pem.go",
+              "symbol": "encoding/pem.Decode"
+            }
+          }
+        ],
+        "relations": []
+      }
+    }
+  ]
+}

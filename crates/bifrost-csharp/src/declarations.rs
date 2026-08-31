@@ -17,6 +17,7 @@ use crate::syntax::{
     csharp_attribute_type_names, csharp_constant_pattern_type_candidate, csharp_has_modifier,
     csharp_member_access_type_receiver, csharp_type_node_identity, csharp_type_reference_root,
 };
+use crate::test_detection::csharp_method_has_runnable_test_attribute;
 
 /// Whether `kind` is tree-sitter-c-sharp's identifier leaf kind. C# spells its
 /// verbatim-identifier escape as a leading `@` (`@class`), carried verbatim in
@@ -161,8 +162,7 @@ impl CSharpVisitor<'_, '_> {
     }
 
     fn namespace_scope_path(&self, node: Node<'_>) -> Option<Vec<String>> {
-        let name_node = node.child_by_field_name("name")?;
-        csharp_namespace_path(name_node, self.source)
+        csharp_namespace_path_from_declaration(node, self.source)
     }
 
     fn visit_node<'tree>(
@@ -232,49 +232,11 @@ impl CSharpVisitor<'_, '_> {
         scope: &CSharpScope,
         stack: &mut Vec<CSharpWork<'tree>>,
     ) {
-        let Some(name_node) = node.child_by_field_name("name") else {
+        let Some((code_unit, name, identity_name)) =
+            csharp_type_code_unit(self.file, self.source, node, scope)
+        else {
             return;
         };
-        let name = cs_ident_text(name_node, self.source);
-        if name.is_empty() {
-            return;
-        }
-
-        let arity = node
-            .child_by_field_name("type_parameters")
-            .or_else(|| first_named_child_of_kind(node, "type_parameter_list"))
-            .map_or(0, count_type_parameters);
-        let identity_name = if arity == 0 {
-            name.to_string()
-        } else {
-            format!("{name}`{arity}")
-        };
-        let short_name = if let Some(enclosing) = &scope.enclosing_type {
-            format!("{}${identity_name}", enclosing.unit.short_name())
-        } else {
-            identity_name.clone()
-        };
-        // A nested type joins its parent with a literal `$` in C#'s legacy
-        // convention (issue #1121-style nesting, same spelling as cpp/java's
-        // JVM-derived binary names), which is exactly what `SegmentKind::Nested`
-        // renders regardless of the preceding segment's kind; a top-level type
-        // hangs off the namespace-path `Package` chain as a plain `Type`.
-        let fq = match &scope.enclosing_type {
-            Some(enclosing) => enclosing
-                .unit
-                .fq()
-                .clone()
-                .with_pushed(cs_segment(&identity_name, SegmentKind::Nested)),
-            None => csharp_package_fq(&scope.package_name)
-                .with_pushed(cs_segment(&identity_name, SegmentKind::Type)),
-        };
-        let code_unit = CodeUnit::new_fq(
-            self.file.clone(),
-            CodeUnitType::Class,
-            scope.package_name.clone(),
-            short_name,
-            fq,
-        );
         self.parsed.add_code_unit(
             code_unit.clone(),
             node,
@@ -294,7 +256,7 @@ impl CSharpVisitor<'_, '_> {
             SignatureMetadata::new(csharp_type_signature(node, self.source), Vec::new())
                 .with_type_parameters(csharp_declaration_type_parameters(node, self.source)),
         );
-        self.visit_primary_constructor(node, scope, &code_unit, name);
+        self.visit_primary_constructor(node, scope, &code_unit, &name);
 
         if let Some(body) = cs_type_body(node) {
             let mut lexical_scope = scope.lexical_scope.clone();
@@ -306,7 +268,7 @@ impl CSharpVisitor<'_, '_> {
                     lexical_scope,
                     enclosing_type: Some(CSharpEnclosingType {
                         unit: code_unit,
-                        declared_name: name.to_string(),
+                        declared_name: name,
                     }),
                 },
                 stack,
@@ -319,6 +281,9 @@ impl CSharpVisitor<'_, '_> {
             return;
         };
         let parent = &enclosing.unit;
+        if csharp_method_has_runnable_test_attribute(node, self.source) {
+            self.parsed.mark_test_region(parent);
+        }
         let Some(name_node) = node.child_by_field_name("name") else {
             return;
         };
@@ -637,6 +602,58 @@ impl CSharpVisitor<'_, '_> {
                 .with_dispatch_extensibility(DispatchExtensibility::Closed),
         );
     }
+}
+
+fn csharp_namespace_path_from_declaration(node: Node<'_>, source: &str) -> Option<Vec<String>> {
+    let name_node = node.child_by_field_name("name")?;
+    csharp_namespace_path(name_node, source)
+}
+
+fn csharp_type_code_unit(
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'_>,
+    scope: &CSharpScope,
+) -> Option<(CodeUnit, String, String)> {
+    let name_node = node.child_by_field_name("name")?;
+    let name = cs_ident_text(name_node, source);
+    if name.is_empty() {
+        return None;
+    }
+    let arity = node
+        .child_by_field_name("type_parameters")
+        .or_else(|| first_named_child_of_kind(node, "type_parameter_list"))
+        .map_or(0, count_type_parameters);
+    let identity_name = if arity == 0 {
+        name.to_string()
+    } else {
+        format!("{name}`{arity}")
+    };
+    let short_name = if let Some(enclosing) = &scope.enclosing_type {
+        format!("{}${identity_name}", enclosing.unit.short_name())
+    } else {
+        identity_name.clone()
+    };
+    let fq = match &scope.enclosing_type {
+        Some(enclosing) => enclosing
+            .unit
+            .fq()
+            .clone()
+            .with_pushed(cs_segment(&identity_name, SegmentKind::Nested)),
+        None => csharp_package_fq(&scope.package_name)
+            .with_pushed(cs_segment(&identity_name, SegmentKind::Type)),
+    };
+    Some((
+        CodeUnit::new_fq(
+            file.clone(),
+            CodeUnitType::Class,
+            scope.package_name.clone(),
+            short_name,
+            fq,
+        ),
+        name.to_string(),
+        identity_name,
+    ))
 }
 
 fn count_type_parameters(node: Node<'_>) -> usize {
@@ -1431,5 +1448,48 @@ fn last_named_child(node: Node<'_>) -> Option<Node<'_>> {
         None
     } else {
         node.named_child(count - 1)
+    }
+}
+
+#[cfg(test)]
+mod structured_supertype_tests {
+    use super::*;
+    use std::path::PathBuf;
+    use tree_sitter::Parser;
+
+    /// The structured hierarchy facts the coarse file graph follows from a
+    /// declaration to the files declaring its bases: a qualified generic base
+    /// keeps its arity suffix, and a fully qualified interface keeps its
+    /// namespace.
+    #[test]
+    fn qualified_generic_supertypes_are_recorded_with_their_arity() {
+        let source = r#"
+namespace Example.Feature;
+
+public class Outer<T> : Example.Base<Example.Model.Value>, System.IDisposable {
+    public void Dispose() {}
+}
+"#;
+        let file = ProjectFile::new(PathBuf::from("/workspace"), "src/Feature.cs");
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
+            .expect("C# grammar");
+        let tree = parser.parse(source, None).expect("C# tree");
+
+        let parsed = parse_csharp_file(&file, source, &tree);
+        let outer = parsed
+            .declarations()
+            .iter()
+            .find(|unit| unit.short_name() == "Outer`1")
+            .expect("outer declaration");
+
+        assert_eq!(
+            parsed.raw_supertypes.get(outer),
+            Some(&vec![
+                "Example.Base`1".to_string(),
+                "System.IDisposable".to_string(),
+            ])
+        );
     }
 }

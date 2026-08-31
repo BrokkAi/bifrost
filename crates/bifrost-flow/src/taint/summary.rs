@@ -257,9 +257,11 @@ enum StablePropagationTransfer {
         point: ProgramPointId,
         phase: ValueFlowObservationPhase,
         event_index: u32,
-        carrier: ValueFlowCarrierKey,
+        input: ValueFlowCarrierKey,
+        output: ValueFlowCarrierKey,
         removed: StableTaintClassSet,
-        resolved: bool,
+        proven: bool,
+        complete: bool,
     },
     Transform {
         point: ProgramPointId,
@@ -294,9 +296,13 @@ impl TaintPropagationEventMatchKey {
             .saturating_add(self.transfers.iter().fold(0usize, |total, transfer| {
                 total.saturating_add(match transfer {
                     StablePropagationTransfer::Sanitizer {
-                        carrier, removed, ..
-                    } => carrier
+                        input,
+                        output,
+                        removed,
+                        ..
+                    } => input
                         .retained_bytes()
+                        .saturating_add(output.retained_bytes())
                         .saturating_add(removed.retained_bytes()),
                     StablePropagationTransfer::Transform {
                         carrier, function, ..
@@ -902,13 +908,19 @@ impl TaintContractSet {
                     point: binding.point().id(),
                     phase: binding.phase(),
                     event_index: binding.event_index(),
-                    carrier: plan
+                    input: plan
                         .value_flow()
                         .carrier_key(binding.carrier())
                         .ok_or(TaintTransferSummaryError::InvalidPlan)?
                         .clone(),
+                    output: plan
+                        .value_flow()
+                        .carrier_key(binding.output())
+                        .ok_or(TaintTransferSummaryError::InvalidPlan)?
+                        .clone(),
                     removed: StableTaintClassSet::from_live(binding.removed(), plan.universe())?,
-                    resolved: binding.is_resolved(),
+                    proven: binding.is_proven(),
+                    complete: binding.is_resolved(),
                 });
         }
         for binding in plan.transforms() {

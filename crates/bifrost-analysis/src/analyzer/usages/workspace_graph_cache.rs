@@ -95,6 +95,7 @@ pub(crate) enum WorkspaceUsageGraphCacheLifecycle {
 
 pub(crate) enum WorkspaceUsageGraphCacheBuildOutcome {
     Complete(WorkspaceUsageRankingGraph),
+    Incomplete(WorkspaceUsageRankingGraph),
     Cancelled,
 }
 
@@ -104,6 +105,9 @@ pub(crate) enum WorkspaceUsageGraphCacheAcquisition {
         lifecycle: WorkspaceUsageGraphCacheLifecycle,
         wait: CompleteValueWait,
     },
+    /// Useful partial evidence that is deliberately not published to the
+    /// complete-value cache.
+    Incomplete(Arc<WorkspaceUsageRankingGraph>),
     Cancelled,
     Stale,
 }
@@ -217,6 +221,9 @@ impl SnapshotWorkspaceUsageGraphCache {
                             wait,
                         }
                     }
+                    WorkspaceUsageGraphCacheBuildOutcome::Incomplete(graph) => {
+                        WorkspaceUsageGraphCacheAcquisition::Incomplete(Arc::new(graph))
+                    }
                     WorkspaceUsageGraphCacheBuildOutcome::Cancelled => {
                         WorkspaceUsageGraphCacheAcquisition::Cancelled
                     }
@@ -288,6 +295,9 @@ mod tests {
             WorkspaceUsageGraphCacheAcquisition::Ready {
                 graph, lifecycle, ..
             } => (graph, lifecycle),
+            WorkspaceUsageGraphCacheAcquisition::Incomplete(_) => {
+                panic!("complete test graph unexpectedly incomplete")
+            }
             WorkspaceUsageGraphCacheAcquisition::Cancelled => panic!("unexpected cancellation"),
             WorkspaceUsageGraphCacheAcquisition::Stale => panic!("unexpected stale result"),
         }
@@ -320,6 +330,32 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(1, builds.load(Ordering::SeqCst));
         assert_eq!(1, cache.len_for_test());
+    }
+
+    #[test]
+    fn incomplete_usage_graph_is_returned_but_never_cached() {
+        let cache = SnapshotWorkspaceUsageGraphCache::default();
+        let builds = AtomicUsize::new(0);
+        let cancellation = CancellationToken::default();
+
+        for _ in 0..2 {
+            let acquisition = cache.acquire(
+                key(91),
+                &cancellation,
+                || {
+                    builds.fetch_add(1, Ordering::SeqCst);
+                    WorkspaceUsageGraphCacheBuildOutcome::Incomplete(empty_graph())
+                },
+                || true,
+            );
+            assert!(matches!(
+                acquisition,
+                WorkspaceUsageGraphCacheAcquisition::Incomplete(_)
+            ));
+        }
+
+        assert_eq!(2, builds.load(Ordering::SeqCst));
+        assert_eq!(0, cache.len_for_test());
     }
 
     #[test]

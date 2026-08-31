@@ -3,7 +3,7 @@ pub mod gc;
 pub mod liveness;
 pub mod query;
 mod relational_query;
-mod writer;
+pub(crate) mod writer;
 pub(crate) use relational_query::RelationalStoreOutcome;
 
 use std::borrow::Cow;
@@ -45,6 +45,10 @@ use crate::CancellationToken;
 use crate::analyzer::fq_name::{FqName, SegmentKind, segment_interner};
 use crate::analyzer::model::MAX_SIGNATURE_METADATA_COLUMN_BYTES;
 use crate::analyzer::structural::DeclaredVisibility;
+use crate::analyzer::structural::facts::{
+    PersistedCallSite, PersistedOccurrenceRole, PersistedSpan, PersistedStructuralFacts,
+    PersistedStructuralNode, PersistedStructuralRole,
+};
 use crate::analyzer::structural::materialization::{
     MaterializationRecord, MaterializationRecordPayload,
 };
@@ -238,8 +242,7 @@ AND EXISTS (
   SELECT 1
   FROM blobs AS active_blob
   LEFT JOIN analysis_epochs AS active_epoch ON active_epoch.lang = active_blob.lang
-  WHERE active_blob.blob_oid = meta.blob_oid
-    AND active_blob.lang = meta.lang
+  WHERE active_blob.id = meta.blob_id
     AND active_blob.generation = COALESCE(active_epoch.generation, 0)
 )";
 
@@ -274,26 +277,25 @@ AND EXISTS (
   SELECT 1
   FROM blobs AS active_blob
   LEFT JOIN analysis_epochs AS active_epoch ON active_epoch.lang = active_blob.lang
-  WHERE active_blob.blob_oid = meta.blob_oid
-    AND active_blob.lang = meta.lang
+  WHERE active_blob.id = meta.blob_id
     AND active_blob.generation = COALESCE(active_epoch.generation, 0)
 )
 AND
 meta.stored_unit_count = (
   SELECT COUNT(*) FROM code_units AS units
-  WHERE units.blob_oid = meta.blob_oid AND units.lang = meta.lang
+  WHERE units.blob_id = meta.blob_id
 )
 AND meta.range_count = (
   SELECT COUNT(*) FROM unit_ranges AS ranges
-  WHERE ranges.blob_oid = meta.blob_oid AND ranges.lang = meta.lang
+  WHERE ranges.blob_id = meta.blob_id
 )
 AND meta.signature_count = (
   SELECT COUNT(*) FROM unit_signatures AS signatures
-  WHERE signatures.blob_oid = meta.blob_oid AND signatures.lang = meta.lang
+  WHERE signatures.blob_id = meta.blob_id
 )
 AND meta.signature_metadata_count = (
   SELECT COUNT(*) FROM unit_signature_metadata AS metadata
-  WHERE metadata.blob_oid = meta.blob_oid AND metadata.lang = meta.lang
+  WHERE metadata.blob_id = meta.blob_id
 )
 AND (SELECT
 "
@@ -306,7 +308,7 @@ AND (SELECT
         }
         writeln!(
             condition,
-            "COALESCE(MAX(CASE WHEN manifest.fact_kind = {} THEN manifest.row_count END), 0) = (\n    SELECT COUNT(*) FROM {} AS facts\n    WHERE facts.blob_oid = meta.blob_oid AND facts.lang = meta.lang\n  )",
+            "COALESCE(MAX(CASE WHEN manifest.fact_kind = {} THEN manifest.row_count END), 0) = (\n    SELECT COUNT(*) FROM {} AS facts\n    WHERE facts.blob_id = meta.blob_id\n  )",
             descriptor.kind as i64, descriptor.table
         )
         .expect("write optional fact integrity SQL");
@@ -314,63 +316,58 @@ AND (SELECT
     let known_kinds = optional_fact_kind_list();
     write!(
         condition,
-        "  AND COUNT(manifest.fact_kind) =\n      COUNT(CASE WHEN manifest.fact_kind IN ({known_kinds}) THEN 1 END)\n  FROM blob_optional_fact_manifest AS manifest\n  WHERE manifest.blob_oid = meta.blob_oid AND manifest.lang = meta.lang\n)\n"
+        "  AND COUNT(manifest.fact_kind) =\n      COUNT(CASE WHEN manifest.fact_kind IN ({known_kinds}) THEN 1 END)\n  FROM blob_optional_fact_manifest AS manifest\n  WHERE manifest.blob_id = meta.blob_id\n)\n"
     )
     .expect("write optional fact integrity guard");
     condition.push_str(
         "
 AND meta.supertype_count = (
   SELECT COUNT(*) FROM unit_supertypes AS supertypes
-  WHERE supertypes.blob_oid = meta.blob_oid AND supertypes.lang = meta.lang
+  WHERE supertypes.blob_id = meta.blob_id
 )
 AND meta.child_count = (
   SELECT COUNT(*) FROM unit_children AS children
-  WHERE children.blob_oid = meta.blob_oid AND children.lang = meta.lang
+  WHERE children.blob_id = meta.blob_id
 )
 AND meta.import_statement_count = (
   SELECT COUNT(*) FROM import_statements AS statements
-  WHERE statements.blob_oid = meta.blob_oid AND statements.lang = meta.lang
+  WHERE statements.blob_id = meta.blob_id
 )
 AND meta.type_identifier_count = (
   SELECT COUNT(*) FROM reference_identifiers AS identifiers
-  WHERE identifiers.blob_oid = meta.blob_oid AND identifiers.lang = meta.lang
+  WHERE identifiers.blob_id = meta.blob_id
 )
 AND EXISTS (
   SELECT 1 FROM blob_reference_fact_manifests AS reference_manifest
-  WHERE reference_manifest.blob_oid = meta.blob_oid
-    AND reference_manifest.lang = meta.lang
+  WHERE reference_manifest.blob_id = meta.blob_id
     AND reference_manifest.epoch = 1
     AND reference_manifest.identifier_count = meta.type_identifier_count
 )
 AND NOT EXISTS (
   SELECT 1 FROM code_units AS units
-  WHERE units.blob_oid = meta.blob_oid AND units.lang = meta.lang
+  WHERE units.blob_id = meta.blob_id
     AND (
       (units.fq_segment_count = 0) <> (units.exact_fqn_tail IS NULL)
       OR units.fq_segment_count <> (
         SELECT COUNT(*) FROM code_unit_fq_segments AS segments
-        WHERE segments.blob_oid = units.blob_oid
-          AND segments.lang = units.lang
+        WHERE segments.blob_id = units.blob_id
           AND segments.unit_key = units.unit_key
       )
       OR units.fq_segment_bytes <> COALESCE((
         SELECT SUM(length(CAST(segments.seg_kind AS BLOB))
                    + length(CAST(segments.segment AS BLOB)))
         FROM code_unit_fq_segments AS segments
-        WHERE segments.blob_oid = units.blob_oid
-          AND segments.lang = units.lang
+        WHERE segments.blob_id = units.blob_id
           AND segments.unit_key = units.unit_key
       ), 0)
       OR (units.fq_segment_count > 0 AND 0 <> (
         SELECT MIN(segments.seg_ordinal) FROM code_unit_fq_segments AS segments
-        WHERE segments.blob_oid = units.blob_oid
-          AND segments.lang = units.lang
+        WHERE segments.blob_id = units.blob_id
           AND segments.unit_key = units.unit_key
       ))
       OR (units.fq_segment_count > 0 AND units.fq_segment_count - 1 <> (
         SELECT MAX(segments.seg_ordinal) FROM code_unit_fq_segments AS segments
-        WHERE segments.blob_oid = units.blob_oid
-          AND segments.lang = units.lang
+        WHERE segments.blob_id = units.blob_id
           AND segments.unit_key = units.unit_key
       ))
     )
@@ -714,6 +711,7 @@ impl GenerationId {
 pub(crate) struct ImportFacts {
     pub(crate) package_name: String,
     pub(crate) imports: Vec<ImportInfo>,
+    pub(crate) contains_tests: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -788,6 +786,7 @@ impl LimitedQueryByteBudget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CandidatePrimaryRangeRow<I = FqIdentityHeader> {
     pub(crate) candidate: CandidateRow<I>,
+    pub(crate) in_test_region: bool,
     pub(crate) primary_range: Option<Range>,
 }
 
@@ -886,6 +885,15 @@ pub(crate) struct WorkspaceContentPackageFact {
     pub(crate) anchor: Option<PackageAnchor>,
     pub(crate) content_qualifier: String,
     pub(crate) package_tail: FqName,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkspaceContentPackageFacts {
+    pub(crate) facts: Vec<WorkspaceContentPackageFact>,
+    /// Whether every requested blob contributed an exact package identity.
+    /// Missing facts make package absence non-authoritative, but must not keep
+    /// the workspace file snapshot (and its valid declarations) unpublished.
+    pub(crate) complete: bool,
 }
 
 type PathSymbolRowsResult = Result<Vec<(String, PathSymbolRow)>>;
@@ -1352,16 +1360,17 @@ fn workspace_content_package_facts_sql(oid_count: usize) -> String {
         .join(", ");
     format!(
         "WITH package_units AS (
-           SELECT units.blob_oid, units.lang, units.fq_anchor_kind,
+           SELECT keys.blob_oid, units.blob_id, units.lang, units.fq_anchor_kind,
                   units.fq_anchor_pop, units.content_qualifier,
                   units.package_fqn_tail, units.fq_package_tail_segments,
                   MIN(units.unit_key) AS unit_key
-           FROM live_declarations AS units
-           WHERE units.lang = ?
-             AND units.blob_oid IN ({placeholders})
+           FROM blobs AS keys
+           JOIN live_declarations AS units ON units.blob_id = keys.id
+           WHERE keys.lang = ?
+             AND keys.blob_oid IN ({placeholders})
              AND units.package_fqn_tail IS NOT NULL
              AND units.fq_package_tail_segments IS NOT NULL
-           GROUP BY units.blob_oid, units.lang, units.fq_anchor_kind,
+           GROUP BY units.blob_id, units.fq_anchor_kind,
                     units.fq_anchor_pop, units.content_qualifier,
                     units.package_fqn_tail, units.fq_package_tail_segments
          )
@@ -1372,8 +1381,7 @@ fn workspace_content_package_facts_sql(oid_count: usize) -> String {
                 segments.seg_ordinal, segments.seg_kind, segments.segment
          FROM package_units AS packages
          LEFT JOIN code_unit_fq_segments AS segments
-           ON segments.blob_oid = packages.blob_oid
-          AND segments.lang = packages.lang
+           ON segments.blob_id = packages.blob_id
           AND segments.unit_key = packages.unit_key
           AND segments.seg_ordinal < packages.fq_package_tail_segments
          ORDER BY packages.blob_oid, packages.fq_anchor_kind,
@@ -1388,7 +1396,8 @@ impl AnalyzerStore {
         lang: &str,
         generation: GenerationId,
         blob_oids: &[Oid],
-    ) -> Result<Vec<WorkspaceContentPackageFact>> {
+        file_package_anchor: Option<PackageAnchor>,
+    ) -> Result<WorkspaceContentPackageFacts> {
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_current_generation(&tx, lang, generation)?;
@@ -1436,6 +1445,14 @@ impl AnalyzerStore {
             })?;
             rows.extend(mapped.collect::<std::result::Result<Vec<RawRow>, _>>()?);
         }
+        let file_content_packages: HashMap<String, String> = if file_package_anchor.is_some() {
+            read_import_metadata_bulk(&tx, lang, &requested_blobs)?
+                .into_iter()
+                .map(|(oid, (package_name, _contains_tests))| (oid, package_name))
+                .collect()
+        } else {
+            HashMap::default()
+        };
         tx.commit()?;
 
         let interner = segment_interner();
@@ -1522,7 +1539,33 @@ impl AnalyzerStore {
         if let Some((key, package_tail)) = current {
             finish(&mut facts, key, package_tail)?;
         }
-        Ok(facts)
+        let mut complete = true;
+        if let Some(anchor) = file_package_anchor {
+            let mut covered_blobs = facts
+                .iter()
+                .map(|fact| fact.blob_oid)
+                .collect::<HashSet<_>>();
+            for oid_text in &requested_blobs {
+                let Some(content_qualifier) = file_content_packages.get(oid_text) else {
+                    continue;
+                };
+                let blob_oid = Oid::from_str(oid_text)?;
+                if covered_blobs.insert(blob_oid) {
+                    facts.push(WorkspaceContentPackageFact {
+                        blob_oid,
+                        anchor: Some(anchor),
+                        content_qualifier: content_qualifier.clone(),
+                        package_tail: FqName::new(),
+                    });
+                }
+            }
+            complete = requested_blobs.iter().all(|oid_text| {
+                Oid::from_str(oid_text)
+                    .ok()
+                    .is_some_and(|oid| covered_blobs.contains(&oid))
+            });
+        }
+        Ok(WorkspaceContentPackageFacts { facts, complete })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2330,9 +2373,9 @@ impl AnalyzerStore {
             "SELECT COALESCE(SUM(costs.payload_bytes), 0)
              FROM blobs
              JOIN blob_meta AS meta
-               ON meta.blob_oid = blobs.blob_oid AND meta.lang = blobs.lang
+               ON meta.blob_id = blobs.id
              LEFT JOIN blob_payload_costs AS costs
-               ON costs.blob_oid = blobs.blob_oid AND costs.lang = blobs.lang
+               ON costs.blob_id = blobs.id
              WHERE blobs.lang = ?1 AND blobs.generation = ?2
                AND meta.is_complete = 1",
         )?;
@@ -2524,127 +2567,316 @@ impl AnalyzerStore {
         Ok(exists)
     }
 
-    pub(crate) fn load_structural_facts_snapshot(
+    pub(crate) fn load_structural_facts_rows(
         &self,
         oid: Oid,
         lang: &str,
         generation: GenerationId,
-        snapshot_version: i64,
-    ) -> Result<Option<Vec<u8>>> {
-        if snapshot_version <= 0 {
+        facts_version: i64,
+    ) -> Result<Option<PersistedStructuralFacts>> {
+        if facts_version <= 0 {
             return Err(StoreError::new(format!(
-                "invalid structural facts snapshot version {snapshot_version}"
+                "invalid structural facts version {facts_version}"
             )));
         }
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_current_generation(&tx, lang, generation)?;
         let sql = format!(
-            "SELECT snapshot.payload
-             FROM structural_facts_snapshots AS snapshot
+            "SELECT facts.blob_id, facts.source_bytes, facts.node_count, facts.role_count,
+                    facts.occurrence_role_count
+             FROM structural_fact_manifests AS facts
              JOIN blob_meta AS meta
-               ON meta.blob_oid = snapshot.blob_oid AND meta.lang = snapshot.lang
-             WHERE snapshot.blob_oid = ?1 AND snapshot.lang = ?2
-               AND snapshot.snapshot_version = ?3
+               ON meta.blob_id = facts.blob_id
+             WHERE facts.blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
+               AND facts.facts_version = ?3
                AND {PARSED_BLOB_COMPLETE_CONDITION}"
         );
-        let payload = tx
-            .query_row(
-                &sql,
-                params![oid.to_string(), lang, snapshot_version],
-                |row| row.get(0),
-            )
+        let manifest = tx
+            .query_row(&sql, params![oid.to_string(), lang, facts_version], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, u32>(1)?,
+                    row.get::<_, usize>(2)?,
+                    row.get::<_, usize>(3)?,
+                    row.get::<_, usize>(4)?,
+                ))
+            })
             .optional()?;
+        let Some((blob_id, source_bytes, node_count, role_count, occurrence_role_count)) = manifest
+        else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let nodes = {
+            let mut statement = tx.prepare_cached(
+                "SELECT node_id, kind, boolean_value, construct, start_byte, end_byte,
+                        parent_node_id, name_start_byte, name_end_byte, subtree_end,
+                        call_kind, call_coverage, continues_callee_groups
+                 FROM structural_fact_nodes
+                 WHERE blob_id = ?1
+                 ORDER BY node_id",
+            )?;
+            let rows = statement.query_map([blob_id], |row| {
+                let call_kind = row.get::<_, Option<String>>(10)?;
+                let call_coverage = row.get::<_, Option<String>>(11)?;
+                let continues_callee_groups = row.get::<_, Option<i64>>(12)?;
+                let call_site = match (call_kind, call_coverage, continues_callee_groups) {
+                    (None, None, None) => None,
+                    (call_kind, Some(coverage), Some(continues)) => Some(PersistedCallSite {
+                        call_kind,
+                        coverage,
+                        continues_callee_groups: continues != 0,
+                    }),
+                    _ => {
+                        return Err(rusqlite::Error::FromSqlConversionFailure(
+                            10,
+                            rusqlite::types::Type::Text,
+                            Box::new(StoreError::new(
+                                "incomplete persisted structural call-site fields",
+                            )),
+                        ));
+                    }
+                };
+                Ok(PersistedStructuralNode {
+                    node_id: row.get(0)?,
+                    kind: row.get(1)?,
+                    boolean_value: row.get::<_, Option<i64>>(2)?.map(|value| value != 0),
+                    construct: row.get(3)?,
+                    span: PersistedSpan {
+                        start: row.get(4)?,
+                        end: row.get(5)?,
+                    },
+                    parent: row.get(6)?,
+                    name: persisted_optional_span(row, 7, 8)?,
+                    subtree_end: row.get(9)?,
+                    call_site,
+                })
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let roles = {
+            let mut statement = tx.prepare_cached(
+                "SELECT source_node_id, ordinal, role, spread,
+                        keyword_start_byte, keyword_end_byte, target_node_id,
+                        target_start_byte, target_end_byte, name_start_byte, name_end_byte
+                 FROM structural_fact_roles
+                 WHERE blob_id = ?1
+                 ORDER BY source_node_id, ordinal",
+            )?;
+            let rows = statement.query_map([blob_id], |row| {
+                Ok(PersistedStructuralRole {
+                    source_node_id: row.get(0)?,
+                    ordinal: row.get(1)?,
+                    role: row.get(2)?,
+                    spread: row.get::<_, i64>(3)? != 0,
+                    keyword: persisted_optional_span(row, 4, 5)?,
+                    node: row.get(6)?,
+                    span: PersistedSpan {
+                        start: row.get(7)?,
+                        end: row.get(8)?,
+                    },
+                    name: persisted_optional_span(row, 9, 10)?,
+                })
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let occurrence_roles = {
+            let mut statement = tx.prepare_cached(
+                "SELECT node_id, ordinal, role
+                 FROM structural_fact_occurrence_roles
+                 WHERE blob_id = ?1
+                 ORDER BY node_id, ordinal",
+            )?;
+            let rows = statement.query_map([blob_id], |row| {
+                Ok(PersistedOccurrenceRole {
+                    node_id: row.get(0)?,
+                    ordinal: row.get(1)?,
+                    role: row.get(2)?,
+                })
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
         tx.commit()?;
-        Ok(payload)
+        if nodes.len() != node_count
+            || roles.len() != role_count
+            || occurrence_roles.len() != occurrence_role_count
+        {
+            return Ok(None);
+        }
+        Ok(Some(PersistedStructuralFacts {
+            source_bytes,
+            nodes,
+            roles,
+            occurrence_roles,
+        }))
     }
 
-    /// Store the current structural snapshot when the corresponding parsed
-    /// blob is still complete in `generation`. Older snapshot versions for
-    /// the blob are discarded so rebuildable cache rows cannot accumulate.
+    /// Store the current structural facts when the corresponding parsed blob
+    /// is still complete in `generation`. Older versions for the blob are
+    /// discarded so rebuildable cache rows cannot accumulate.
     /// Returns false when the parent parsed blob is absent or incomplete.
-    pub(crate) fn upsert_structural_facts_snapshot(
+    pub(crate) fn upsert_structural_facts_rows(
         &self,
         oid: Oid,
         lang: &str,
         generation: GenerationId,
-        snapshot_version: i64,
-        payload: &[u8],
+        facts_version: i64,
+        facts: PersistedStructuralFacts,
     ) -> Result<bool> {
-        if snapshot_version <= 0 {
+        if facts_version <= 0 {
             return Err(StoreError::new(format!(
-                "invalid structural facts snapshot version {snapshot_version}"
+                "invalid structural facts version {facts_version}"
             )));
         }
         let lang = lang.to_string();
-        let payload = payload.to_vec();
         self.conn.execute(move |conn| {
             let lang = lang.as_str();
-            let payload = payload.as_slice();
-            // This transaction reads the existing snapshot/cost before replacing
+            // This transaction reads the existing facts/cost before replacing
             // them. Acquire the writer slot up front so a concurrent cache writer
             // cannot commit between the read and a deferred write upgrade, which
             // would surface as SQLITE_BUSY_SNAPSHOT and leave a one-file hole.
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             require_current_generation(&tx, lang, generation)?;
             let complete_sql = format!(
-                "SELECT 1 FROM blob_meta AS meta
-             WHERE meta.blob_oid = ?1 AND meta.lang = ?2
+                "SELECT meta.blob_id FROM blob_meta AS meta
+             JOIN blobs ON blobs.id = meta.blob_id
+             WHERE blobs.blob_oid = ?1 AND blobs.lang = ?2
                AND {PARSED_BLOB_COMPLETE_CONDITION}"
             );
             let oid = oid.to_string();
-            let complete = tx
-                .query_row(&complete_sql, params![oid, lang], |_| Ok(()))
-                .optional()?
-                .is_some();
-            if !complete {
+            let blob_id = tx
+                .query_row(&complete_sql, params![oid, lang], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .optional()?;
+            let Some(blob_id) = blob_id else {
                 tx.commit()?;
                 return Ok(false);
-            }
+            };
 
-            let previous_snapshot_bytes = tx.query_row(
-                "SELECT COALESCE(SUM(length(payload)), 0)
-             FROM structural_facts_snapshots
-             WHERE blob_oid = ?1 AND lang = ?2",
-                params![oid, lang],
-                |row| row.get::<_, usize>(0),
-            )?;
+            let previous_fact_bytes =
+                tx.query_row(structural_fact_payload_bytes_sql(), [blob_id], |row| {
+                    row.get::<_, usize>(0)
+                })?;
             let previous_payload_cost = tx
                 .query_row(
                     "SELECT payload_bytes FROM blob_payload_costs
-                 WHERE blob_oid = ?1 AND lang = ?2",
-                    params![oid, lang],
+                 WHERE blob_id = ?1",
+                    [blob_id],
                     |row| row.get::<_, usize>(0),
                 )
                 .optional()?;
             tx.execute(
-                "DELETE FROM structural_facts_snapshots
-             WHERE blob_oid = ?1 AND lang = ?2",
-                params![oid, lang],
+                "DELETE FROM structural_fact_manifests
+                 WHERE blob_id = ?1",
+                [blob_id],
             )?;
             tx.execute(
-                "INSERT INTO structural_facts_snapshots(
-               blob_oid, lang, snapshot_version, payload
-             ) VALUES(?1, ?2, ?3, ?4)",
-                params![oid, lang, snapshot_version, payload],
+                "INSERT INTO structural_fact_manifests(
+                   blob_id, facts_version, source_bytes, node_count,
+                   role_count, occurrence_role_count
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    blob_id,
+                    facts_version,
+                    facts.source_bytes,
+                    usize_to_i64(facts.nodes.len())?,
+                    usize_to_i64(facts.roles.len())?,
+                    usize_to_i64(facts.occurrence_roles.len())?,
+                ],
             )?;
 
-            if previous_payload_cost.is_some_and(|cost| cost >= previous_snapshot_bytes) {
+            {
+                let mut insert = tx.prepare_cached(
+                    "INSERT INTO structural_fact_nodes(
+                       blob_id, node_id, kind, boolean_value, construct,
+                       start_byte, end_byte, parent_node_id, name_start_byte,
+                       name_end_byte, subtree_end, call_kind, call_coverage,
+                       continues_callee_groups
+                     ) VALUES(
+                       ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                       ?12, ?13, ?14
+                     )",
+                )?;
+                for node in &facts.nodes {
+                    insert.execute(params![
+                        blob_id,
+                        node.node_id,
+                        node.kind,
+                        node.boolean_value.map(bool_to_i64),
+                        node.construct,
+                        node.span.start,
+                        node.span.end,
+                        node.parent,
+                        node.name.map(|span| span.start),
+                        node.name.map(|span| span.end),
+                        node.subtree_end,
+                        node.call_site
+                            .as_ref()
+                            .and_then(|site| site.call_kind.as_deref()),
+                        node.call_site.as_ref().map(|site| site.coverage.as_str()),
+                        node.call_site
+                            .as_ref()
+                            .map(|site| bool_to_i64(site.continues_callee_groups)),
+                    ])?;
+                }
+            }
+            {
+                let mut insert = tx.prepare_cached(
+                    "INSERT INTO structural_fact_roles(
+                       blob_id, source_node_id, ordinal, role, spread,
+                       keyword_start_byte, keyword_end_byte, target_node_id,
+                       target_start_byte, target_end_byte, name_start_byte, name_end_byte
+                     ) VALUES(
+                       ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
+                     )",
+                )?;
+                for role in &facts.roles {
+                    insert.execute(params![
+                        blob_id,
+                        role.source_node_id,
+                        role.ordinal,
+                        role.role,
+                        bool_to_i64(role.spread),
+                        role.keyword.map(|span| span.start),
+                        role.keyword.map(|span| span.end),
+                        role.node,
+                        role.span.start,
+                        role.span.end,
+                        role.name.map(|span| span.start),
+                        role.name.map(|span| span.end),
+                    ])?;
+                }
+            }
+            {
+                let mut insert = tx.prepare_cached(
+                    "INSERT INTO structural_fact_occurrence_roles(
+                       blob_id, node_id, ordinal, role
+                     ) VALUES(?1, ?2, ?3, ?4)",
+                )?;
+                for role in &facts.occurrence_roles {
+                    insert.execute(params![blob_id, role.node_id, role.ordinal, role.role,])?;
+                }
+            }
+
+            let fact_bytes = persisted_structural_fact_payload_bytes(&facts);
+
+            if previous_payload_cost.is_some_and(|cost| cost >= previous_fact_bytes) {
                 tx.execute(
                     "UPDATE blob_payload_costs
-                 SET payload_bytes = payload_bytes - ?3 + ?4
-                 WHERE blob_oid = ?1 AND lang = ?2",
+                 SET payload_bytes = payload_bytes - ?2 + ?3
+                 WHERE blob_id = ?1",
                     params![
-                        oid,
-                        lang,
-                        usize_to_i64(previous_snapshot_bytes)?,
-                        usize_to_i64(payload.len())?,
+                        blob_id,
+                        usize_to_i64(previous_fact_bytes)?,
+                        usize_to_i64(fact_bytes)?,
                     ],
                 )?;
             } else {
                 tx.execute(
-                    "DELETE FROM blob_payload_costs WHERE blob_oid = ?1 AND lang = ?2",
-                    params![oid, lang],
+                    "DELETE FROM blob_payload_costs WHERE blob_id = ?1",
+                    [blob_id],
                 )?;
                 update_blob_payload_cost_tx(&tx, &oid, lang)?;
             }
@@ -2670,7 +2902,7 @@ impl AnalyzerStore {
         let lang = lang.to_string();
         self.conn.execute(move |conn| {
             conn.execute(
-                "UPDATE blob_meta SET is_complete = 0 WHERE blob_oid = ?1 AND lang = ?2",
+                "UPDATE blob_meta SET is_complete = 0 WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)",
                 params![oid.to_string(), lang],
             )
             .expect("mark parsed blob incomplete")
@@ -3155,11 +3387,11 @@ impl AnalyzerStore {
         }
         for (lang, lang_entries) in by_lang {
             let oids = unique_oid_strings(&lang_entries);
-            let packages_by_oid = read_content_packages_bulk(&tx, &lang, &oids)?;
+            let metadata_by_oid = read_import_metadata_bulk(&tx, &lang, &oids)?;
             let imports_by_oid = read_import_infos_bulk(&tx, &lang, &oids)?;
             for (file, oid) in lang_entries {
                 let oid = oid.to_string();
-                let Some(package_name) = packages_by_oid.get(&oid) else {
+                let Some((package_name, contains_tests)) = metadata_by_oid.get(&oid) else {
                     continue;
                 };
                 out.insert(
@@ -3167,6 +3399,7 @@ impl AnalyzerStore {
                     ImportFacts {
                         package_name: adapter.hydrate_content_qualifier(package_name, &file),
                         imports: imports_by_oid.get(&oid).cloned().unwrap_or_default(),
+                        contains_tests: adapter.hydrate_contains_tests(*contains_tests, &file, ""),
                     },
                 );
             }
@@ -3323,8 +3556,9 @@ impl AnalyzerStore {
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_current_generation(&tx, lang, generation)?;
-        let result =
-            read_content_packages_bulk(&tx, lang, &[oid.to_string()])?.remove(&oid.to_string());
+        let result = read_import_metadata_bulk(&tx, lang, &[oid.to_string()])?
+            .remove(&oid.to_string())
+            .map(|(package_name, _)| package_name);
         tx.commit()?;
         Ok(result)
     }
@@ -3351,7 +3585,7 @@ impl AnalyzerStore {
                         ELSE NULL
                     END
              FROM blob_meta AS meta
-             WHERE meta.blob_oid = ?1 AND meta.lang = ?2
+             WHERE meta.blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
                AND {PARSED_BLOB_COMPLETE_CONDITION}"
         );
         let mut statement = tx.prepare_cached(&sql)?;
@@ -3408,8 +3642,8 @@ impl AnalyzerStore {
                     END
              FROM code_units AS units
              JOIN blob_meta AS meta
-               ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
-             WHERE units.blob_oid = ?1 AND units.lang = ?2
+               ON meta.blob_id = units.blob_id
+             WHERE units.blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
                AND units.top_level_ordinal IS NOT NULL
                AND {PARSED_BLOB_COMPLETE_CONDITION}
              ORDER BY units.top_level_ordinal
@@ -3468,7 +3702,7 @@ impl AnalyzerStore {
         let meta_sql = format!(
             "SELECT meta.import_statement_count
              FROM blob_meta AS meta
-             WHERE meta.blob_oid = ?1 AND meta.lang = ?2
+             WHERE meta.blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
                AND {PARSED_BLOB_COMPLETE_CONDITION}"
         );
         let Some(import_count) = tx
@@ -3491,7 +3725,7 @@ impl AnalyzerStore {
                       + COALESCE(length(CAST(alias AS BLOB)), 0),
                     {IMPORT_STATEMENT_COLUMNS}
              FROM import_statements
-             WHERE blob_oid = ?1 AND lang = ?2
+             WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
              ORDER BY ordinal
              LIMIT ?3"
         );
@@ -3646,7 +3880,17 @@ impl AnalyzerStore {
         } else {
             "units.in_declarations = 1"
         };
-        let mut conn = self.read_conn_for_workspace(workspace_snapshots)?;
+        let _probe_scope = crate::profiling::scope_with(|| {
+            format!(
+                "store.rendered_definition_candidates[{}][{} components]",
+                langs.join(","),
+                components.len()
+            )
+        });
+        let mut conn = {
+            let _conn_scope = crate::profiling::scope("store.rdc.read_conn");
+            self.read_conn_for_workspace(workspace_snapshots)?
+        };
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
         let mut rows = Vec::new();
@@ -3683,6 +3927,12 @@ impl AnalyzerStore {
                         );
                         let mut statement = tx.prepare_cached(sql)?;
                         for (_, component) in matching_components {
+                            let _point_scope = crate::profiling::scope_with(|| {
+                                format!(
+                                    "store.rdc.point[{lang}][{tail_match:?}][anchored={anchored}][{}#{}]",
+                                    component.prefix, component.tail
+                                )
+                            });
                             let complete = if anchored {
                                 collect_rendered_definition_candidate_rows(
                                     &mut statement,
@@ -3855,11 +4105,13 @@ impl AnalyzerStore {
         let sql = candidate_rows_sql_with_membership(
             "units",
             "FROM code_units AS units
+             JOIN blobs AS keys
+               ON keys.id = units.blob_id
              JOIN blob_meta AS meta
-               ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang",
+               ON meta.blob_id = units.blob_id",
             &format!("units.lang = ?1 AND units.identifier IN ({placeholders})"),
             "(units.in_declarations = 1 OR units.in_definition_lookup = 1)",
-            "units.blob_oid, units.unit_key",
+            "keys.blob_oid, units.unit_key",
         );
         let values: Vec<&dyn ToSql> = identifiers
             .iter()
@@ -3920,11 +4172,13 @@ impl AnalyzerStore {
         let sql = limited_candidate_rows_sql_with_membership(
             "units",
             "FROM code_units AS units
+             JOIN blobs AS keys
+               ON keys.id = units.blob_id
              JOIN blob_meta AS meta
-               ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang",
+               ON meta.blob_id = units.blob_id",
             "units.lang = ?1 AND units.identifier = ?2",
             "(units.in_declarations = 1 OR units.in_definition_lookup = 1)",
-            &["units.blob_oid", "units.unit_key"],
+            &["keys.blob_oid", "units.unit_key"],
         );
         let sql = format!("{sql} LIMIT ?3");
         let rows = candidate_rows_for_languages_limited(
@@ -4059,13 +4313,15 @@ impl AnalyzerStore {
             "child",
             "FROM code_units AS owner
              JOIN unit_children AS edge
-               ON edge.blob_oid = owner.blob_oid AND edge.lang = owner.lang
+               ON edge.blob_id = owner.blob_id
               AND edge.parent_key = owner.unit_key
              JOIN code_units AS child
-               ON child.blob_oid = edge.blob_oid AND child.lang = edge.lang
+               ON child.blob_id = edge.blob_id
               AND child.unit_key = edge.child_key
+             JOIN blobs AS keys
+               ON keys.id = child.blob_id
              JOIN blob_meta AS meta
-               ON meta.blob_oid = child.blob_oid AND meta.lang = child.lang",
+               ON meta.blob_id = child.blob_id",
             &format!(
                 "owner.lang = ?1 AND owner.{owner_column} = ?2
                  AND owner.in_declarations = 1 AND child.identifier = ?3"
@@ -4102,19 +4358,21 @@ impl AnalyzerStore {
             "child",
             "FROM code_units AS owner
              JOIN unit_children AS edge
-               ON edge.blob_oid = owner.blob_oid AND edge.lang = owner.lang
+               ON edge.blob_id = owner.blob_id
               AND edge.parent_key = owner.unit_key
              JOIN code_units AS child
-               ON child.blob_oid = edge.blob_oid AND child.lang = edge.lang
+               ON child.blob_id = edge.blob_id
               AND child.unit_key = edge.child_key
+             JOIN blobs AS keys
+               ON keys.id = child.blob_id
              JOIN blob_meta AS meta
-               ON meta.blob_oid = child.blob_oid AND meta.lang = child.lang",
+               ON meta.blob_id = child.blob_id",
             &format!(
                 "owner.lang = ?1 AND owner.{owner_column} = ?2
                  AND owner.in_declarations = 1 AND child.identifier = ?3"
             ),
             "child.in_declarations = 1",
-            &["child.blob_oid", "child.unit_key"],
+            &["keys.blob_oid", "child.unit_key"],
         );
         let sql = format!("{sql} LIMIT ?4");
         let rows = candidate_rows_for_languages_limited(
@@ -4168,7 +4426,7 @@ impl AnalyzerStore {
         // prefix. Unlike LIKE, '%' and '_' in a legal package name remain data.
         let upper = format!("{package}/");
         let cursor_predicate = if after.is_some() {
-            "AND (units.content_qualifier, units.blob_oid, units.unit_key) > (?5, ?6, ?7)"
+            "AND (units.content_qualifier, keys.blob_oid, units.unit_key) > (?5, ?6, ?7)"
         } else {
             ""
         };
@@ -4180,7 +4438,7 @@ impl AnalyzerStore {
         );
         let sql = declaration_candidate_sql_with_order(
             &predicate,
-            "units.content_qualifier, units.blob_oid, units.unit_key",
+            "units.content_qualifier, keys.blob_oid, units.unit_key",
         );
         let sql = format!("{sql} LIMIT ?{}", if after.is_some() { 8 } else { 5 });
         let mut statement = tx.prepare(&sql)?;
@@ -4344,12 +4602,10 @@ impl AnalyzerStore {
     /// Hydrate the full search-candidate projection for the declaration keys a
     /// pattern batch already matched.
     ///
-    /// The projection is fetched one *blob* at a time rather than one unit at a
-    /// time. `code_units` is keyed by `(blob_oid, lang, unit_key)`, so a blob is
-    /// an index range scan, and the work is proportional to the number of files
-    /// in the answer instead of either the number of matched units (which
-    /// degrades to tens of thousands of point lookups when a pattern is broad)
-    /// or the whole workspace projection.
+    /// The projection is fetched in exact `(language, blob, unit)` tuple batches.
+    /// `code_units` is keyed by `(blob_id, unit_key)`, so each requested tuple is
+    /// a primary-key seek, and the work is proportional to the matched units
+    /// instead of rescanning every declaration in a matched blob or language.
     pub(crate) fn search_candidate_rows_for_keys(
         &self,
         langs: &[String],
@@ -4360,42 +4616,54 @@ impl AnalyzerStore {
         if keys.is_empty() {
             return Ok(LimitedQueryRows::complete(Vec::new(), 0));
         }
-        let mut wanted: HashMap<(usize, Oid), HashSet<i64>> = HashMap::default();
+        let mut requested = Vec::with_capacity(keys.len());
+        let mut seen = HashSet::default();
         for key in keys {
-            wanted
-                .entry((key.lang_index, key.blob_oid))
-                .or_default()
-                .insert(key.unit_key);
+            let Some(lang) = langs.get(key.lang_index) else {
+                continue;
+            };
+            let tuple = (lang.clone(), key.blob_oid, key.unit_key);
+            if seen.insert(tuple.clone()) {
+                requested.push(tuple);
+            }
         }
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
-        let sql = search_candidate_sql("units.lang = ?1 AND units.blob_oid = ?2");
-        let mut stmt = tx.prepare_cached(&sql)?;
+        if requested.is_empty() {
+            tx.commit()?;
+            return Ok(LimitedQueryRows::complete(Vec::new(), 0));
+        }
         let mut out = Vec::new();
         let mut inspected = 0usize;
         let mut complete = true;
-        for ((lang_index, blob_oid), unit_keys) in &wanted {
+        for chunk in requested.chunks(SEARCH_CANDIDATE_KEY_BATCH_SIZE) {
             if cancellation.is_some_and(CancellationToken::is_cancelled) {
                 complete = false;
                 break;
             }
-            let Some(lang) = langs.get(*lang_index) else {
-                continue;
-            };
-            let mut query = stmt.query(rusqlite::params![lang, blob_oid.to_string()])?;
+            let padded = padded_search_candidate_key_arity(chunk.len());
+            let sql = search_candidate_key_set_sql(padded);
+            let mut parameters = Vec::with_capacity(padded * 3);
+            for (lang, blob_oid, unit_key) in chunk {
+                parameters.push(rusqlite::types::Value::Text(lang.clone()));
+                parameters.push(rusqlite::types::Value::Text(blob_oid.to_string()));
+                parameters.push(rusqlite::types::Value::Integer(*unit_key));
+            }
+            parameters.resize(padded * 3, rusqlite::types::Value::Null);
+            let mut stmt = tx.prepare_cached(&sql)?;
+            let mut query = stmt.query(params_from_iter(parameters.iter()))?;
             while let Some(row) = query.next()? {
                 inspected = inspected.saturating_add(1);
-                // `unit_key` is column 2 of the shared candidate projection.
-                // Testing it before materializing keeps a blob's unmatched
-                // declarations from allocating their signature text.
-                if !unit_keys.contains(&row.get::<_, i64>(2)?) {
-                    continue;
+                if inspected.is_multiple_of(CANDIDATE_ROWS_PER_CANCELLATION_POLL)
+                    && cancellation.is_some_and(CancellationToken::is_cancelled)
+                {
+                    complete = false;
+                    break;
                 }
                 out.push(search_candidate_row_from_row(row)?);
             }
         }
-        drop(stmt);
         if !complete || cancellation.is_some_and(CancellationToken::is_cancelled) {
             tx.commit()?;
             return Ok(LimitedQueryRows::incomplete(Vec::new(), inspected));
@@ -4475,21 +4743,7 @@ impl AnalyzerStore {
         let mut conn = self.read_conn_for_workspace(workspace_snapshots)?;
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
-        let sql = candidate_rows_sql_with_membership_and_projection(
-            "units",
-            "FROM live_definition_exact_names AS names
-             JOIN code_units AS units
-               ON units.blob_oid = names.blob_oid
-              AND units.lang = names.lang
-              AND units.unit_key = names.unit_key
-             JOIN blob_meta AS meta
-               ON meta.blob_oid = units.blob_oid
-              AND meta.lang = units.lang",
-            "names.lang = ?1 AND names.source_kind <> 'path'",
-            "units.in_declarations = 1",
-            "names.rel_path, units.blob_oid, units.unit_key",
-            ", names.rel_path",
-        );
+        let sql = mounted_declaration_sql();
         let mut statement = tx.prepare_cached(&sql)?;
         let mut out = Vec::new();
         for lang in langs {
@@ -4544,26 +4798,28 @@ impl AnalyzerStore {
         let tx = conn.transaction()?;
         require_generation_map(&tx, generations, langs.iter().map(String::as_str))?;
         let sql = format!(
-            "SELECT units.blob_oid, units.lang, units.unit_key, units.kind, units.short_name,
+            "SELECT keys.blob_oid, units.lang, units.unit_key, units.kind, units.short_name,
                     units.content_qualifier, units.signature, units.synthetic,
                     units.is_type_alias, units.top_level_ordinal, units.in_declarations,
                     units.in_definition_lookup, units.fq_anchor_kind, units.fq_anchor_pop,
                     units.fq_package_tail_segments, units.fq_segment_count,
                     units.exact_fqn_tail, units.fq_segment_bytes,
                     units.normalized_fqn_tail,
+                    units.in_test_region,
                     primary_range.start_byte, primary_range.end_byte,
                     primary_range.start_line, primary_range.end_line
              FROM code_units AS units
+             JOIN blobs AS keys
+               ON keys.id = units.blob_id
              JOIN blob_meta AS meta
-               ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
+               ON meta.blob_id = units.blob_id
              LEFT JOIN unit_ranges AS primary_range
-               ON primary_range.blob_oid = units.blob_oid
-              AND primary_range.lang = units.lang
+               ON primary_range.blob_id = units.blob_id
               AND primary_range.unit_key = units.unit_key
               AND primary_range.ordinal = 0
              WHERE units.lang = ?1 AND units.kind = ?2 AND units.in_declarations = 1
                AND {PARSED_BLOB_COMPLETE_CONDITION}
-             ORDER BY units.blob_oid, units.unit_key"
+             ORDER BY keys.blob_oid, units.unit_key"
         );
         let kind = code_unit_kind_to_i64(kind);
         let mut statement = tx.prepare_cached(&sql)?;
@@ -4769,14 +5025,13 @@ impl AnalyzerStore {
         ] {
             let sql = format!(
                 "SELECT COUNT(*)
-                 FROM {table} AS rows
-                 JOIN blobs AS active_blob
-                   ON active_blob.blob_oid = rows.blob_oid
-                  AND active_blob.lang = rows.lang
+                 FROM blobs AS keys
+                 JOIN {table} AS rows
+                   ON rows.blob_id = keys.id
                  LEFT JOIN analysis_epochs AS active_epoch
-                   ON active_epoch.lang = active_blob.lang
-                 WHERE rows.blob_oid = ?1 AND rows.lang = ?2
-                   AND active_blob.generation = COALESCE(active_epoch.generation, 0)"
+                   ON active_epoch.lang = keys.lang
+                 WHERE keys.blob_oid = ?1 AND keys.lang = ?2
+                   AND keys.generation = COALESCE(active_epoch.generation, 0)"
             );
             total = total.saturating_add(
                 tx.query_row(&sql, params![oid, lang], |row| row.get::<_, usize>(0))?,
@@ -4803,7 +5058,6 @@ impl AnalyzerStore {
                    AND NOT EXISTS (
                      SELECT 1 FROM workspace_file_versions AS files
                      WHERE files.blob_oid = blobs.blob_oid
-                       AND files.lang = blobs.lang
                    )",
                 )?;
                 let rows = stmt.query_map([], |row| {
@@ -4839,6 +5093,56 @@ impl AnalyzerStore {
     pub(crate) fn reclaim_stale_generations(&self, max_logical_rows: usize) -> Result<usize> {
         self.conn
             .execute(move |conn| reclaim_stale_generations_conn(conn, max_logical_rows))
+    }
+
+    /// Drop every workspace projection row belonging to `workspace_id`.
+    ///
+    /// An immutable revision image is a workspace only for the length of one
+    /// request: its root is a self-deleting export directory, so the rows that
+    /// mount its files (`workspace_heads`, `workspace_revisions`, and the
+    /// `workspace_file_versions` tree that cascades from a revision) describe a
+    /// path that no longer exists once the request ends. The parsed blob facts
+    /// the same build published stay, because those are keyed by content and
+    /// are exactly what the next consumer of this cache reuses.
+    ///
+    /// Returns the number of `workspace_revisions` rows removed; the file
+    /// versions and their package, edge, anchor and path-symbol rows follow
+    /// through `ON DELETE CASCADE`.
+    pub(crate) fn delete_workspace_projection(&self, workspace_id: &WorkspaceId) -> Result<usize> {
+        let workspace_id = workspace_id.as_str().to_string();
+        self.conn.execute(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute(
+                "DELETE FROM workspace_heads WHERE workspace_id = ?1",
+                params![workspace_id],
+            )?;
+            let revisions = tx.execute(
+                "DELETE FROM workspace_revisions WHERE workspace_id = ?1",
+                params![workspace_id],
+            )?;
+            tx.commit()?;
+            Ok(revisions)
+        })
+    }
+
+    /// Test hook: remove one package's membership rows while retaining its
+    /// live files and declaration facts.
+    ///
+    /// This synthesizes a partial workspace package projection without making
+    /// the exact FQN indexes partial, the recovery shape exercised by C#'s
+    /// conservative namespace gate. Production reconciliation does not expose
+    /// an API for publishing this deliberately inconsistent intermediate
+    /// state.
+    #[cfg(test)]
+    pub(crate) fn delete_workspace_package_membership_for_test(&self, package: &str) {
+        let package = package.to_string();
+        self.conn.execute(move |conn| {
+            conn.execute(
+                "DELETE FROM workspace_file_package_rows WHERE package_name = ?1",
+                [package],
+            )
+            .expect("delete workspace package membership")
+        });
     }
 
     pub fn seconds_since_gc(&self) -> Result<Option<i64>> {
@@ -4879,8 +5183,10 @@ impl AnalyzerStore {
         module_path: &str,
     ) -> Result<Vec<Oid>> {
         self.rust_fact_blobs(
-            "SELECT DISTINCT blob_oid FROM rust_import_targets
-             WHERE lang = ?1 AND module_path = ?2",
+            "SELECT DISTINCT keys.blob_oid
+             FROM rust_import_targets AS facts
+             JOIN blobs AS keys ON keys.id = facts.blob_id
+             WHERE facts.lang = ?1 AND facts.module_path = ?2",
             lang,
             module_path,
         )
@@ -4906,8 +5212,10 @@ impl AnalyzerStore {
     /// `rust_exports`, and the seed of an export-chain walk.
     pub(crate) fn rust_export_blobs(&self, lang: &str, exported_name: &str) -> Result<Vec<Oid>> {
         self.rust_fact_blobs(
-            "SELECT DISTINCT blob_oid FROM rust_exports
-             WHERE lang = ?1 AND exported_name = ?2",
+            "SELECT DISTINCT keys.blob_oid
+             FROM rust_exports AS facts
+             JOIN blobs AS keys ON keys.id = facts.blob_id
+             WHERE facts.lang = ?1 AND facts.exported_name = ?2",
             lang,
             exported_name,
         )
@@ -4922,8 +5230,12 @@ impl AnalyzerStore {
     /// before it can decide whether to read them.
     pub(crate) fn rust_include_host_blobs(&self, lang: &str) -> Result<Vec<Oid>> {
         let conn = self.read_conn()?;
-        let mut stmt = conn
-            .prepare_cached("SELECT DISTINCT blob_oid FROM rust_include_edges WHERE lang = ?1")?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT DISTINCT keys.blob_oid
+                 FROM rust_include_edges AS facts
+                 JOIN blobs AS keys ON keys.id = facts.blob_id
+                 WHERE facts.lang = ?1",
+        )?;
         let rows = stmt.query_map(params![lang], |row| row.get::<_, String>(0))?;
         let mut blobs = Vec::new();
         for row in rows {
@@ -4944,8 +5256,10 @@ impl AnalyzerStore {
     /// `relative_path` against its own directory.
     pub(crate) fn rust_include_blobs(&self, lang: &str, file_name: &str) -> Result<Vec<Oid>> {
         self.rust_fact_blobs(
-            "SELECT DISTINCT blob_oid FROM rust_include_edges
-             WHERE lang = ?1 AND file_name = ?2",
+            "SELECT DISTINCT keys.blob_oid
+             FROM rust_include_edges AS facts
+             JOIN blobs AS keys ON keys.id = facts.blob_id
+             WHERE facts.lang = ?1 AND facts.file_name = ?2",
             lang,
             file_name,
         )
@@ -4963,8 +5277,10 @@ impl AnalyzerStore {
     ) -> Result<Vec<(Oid, u32)>> {
         let conn = self.read_conn()?;
         let mut stmt = conn.prepare_cached(
-            "SELECT blob_oid, context_mask FROM rust_identifier_occurrences
-             WHERE lang = ?1 AND identifier = ?2",
+            "SELECT keys.blob_oid, facts.context_mask
+             FROM rust_identifier_occurrences AS facts
+             JOIN blobs AS keys ON keys.id = facts.blob_id
+             WHERE facts.lang = ?1 AND facts.identifier = ?2",
         )?;
         let rows = stmt.query_map(params![lang, identifier], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
@@ -5058,8 +5374,10 @@ impl AnalyzerStore {
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
-                "SELECT DISTINCT blob_oid FROM rust_modules
-                 WHERE lang = ? AND blob_oid IN ({placeholders})"
+                "SELECT DISTINCT keys.blob_oid
+                 FROM blobs AS keys
+                 JOIN rust_modules AS facts ON facts.blob_id = keys.id
+                 WHERE keys.lang = ? AND keys.blob_oid IN ({placeholders})"
             );
             let mut stmt = conn.prepare_cached(&sql)?;
             let parameters = std::iter::once(lang).chain(chunk.iter().map(String::as_str));
@@ -5098,11 +5416,13 @@ impl AnalyzerStore {
                 .collect::<Vec<_>>()
                 .join(", ");
             let mut stmt = conn.prepare_cached(&format!(
-                "SELECT blob_oid, parent_ordinal, module_name, path_attribute, imports_macros,
-                        body_start, body_end
-                 FROM rust_module_scopes
-                 WHERE lang = ? AND blob_oid IN ({placeholders})
-                 ORDER BY blob_oid, ordinal"
+                "SELECT keys.blob_oid, facts.parent_ordinal, facts.module_name,
+                        facts.path_attribute, facts.imports_macros,
+                        facts.body_start, facts.body_end
+                 FROM blobs AS keys
+                 JOIN rust_module_scopes AS facts ON facts.blob_id = keys.id
+                 WHERE keys.lang = ? AND keys.blob_oid IN ({placeholders})
+                 ORDER BY keys.blob_oid, facts.ordinal"
             ))?;
             let rows = stmt.query_map(
                 params_from_iter(std::iter::once(lang).chain(chunk.iter().map(String::as_str))),
@@ -5122,11 +5442,13 @@ impl AnalyzerStore {
                     .push(scope?);
             }
             let mut stmt = conn.prepare_cached(&format!(
-                "SELECT blob_oid, scope_ordinal, module_name, path_attribute, visibility,
-                        imports_macros, test_gated, declaration_start, declaration_end
-                 FROM rust_module_routes
-                 WHERE lang = ? AND blob_oid IN ({placeholders})
-                 ORDER BY blob_oid, ordinal"
+                "SELECT keys.blob_oid, facts.scope_ordinal, facts.module_name,
+                        facts.path_attribute, facts.visibility, facts.imports_macros,
+                        facts.test_gated, facts.declaration_start, facts.declaration_end
+                 FROM blobs AS keys
+                 JOIN rust_module_routes AS facts ON facts.blob_id = keys.id
+                 WHERE keys.lang = ? AND keys.blob_oid IN ({placeholders})
+                 ORDER BY keys.blob_oid, facts.ordinal"
             ))?;
             let rows = stmt.query_map(
                 params_from_iter(std::iter::once(lang).chain(chunk.iter().map(String::as_str))),
@@ -5146,10 +5468,12 @@ impl AnalyzerStore {
                     .push(route?);
             }
             let mut stmt = conn.prepare_cached(&format!(
-                "SELECT blob_oid, route_ordinal, macro_name, invocation_start
-                 FROM rust_module_route_gates
-                 WHERE lang = ? AND blob_oid IN ({placeholders})
-                 ORDER BY blob_oid, route_ordinal, gate_ordinal"
+                "SELECT keys.blob_oid, facts.route_ordinal, facts.macro_name,
+                        facts.invocation_start
+                 FROM blobs AS keys
+                 JOIN rust_module_route_gates AS facts ON facts.blob_id = keys.id
+                 WHERE keys.lang = ? AND keys.blob_oid IN ({placeholders})
+                 ORDER BY keys.blob_oid, facts.route_ordinal, facts.gate_ordinal"
             ))?;
             let rows = stmt.query_map(
                 params_from_iter(std::iter::once(lang).chain(chunk.iter().map(String::as_str))),
@@ -5167,10 +5491,12 @@ impl AnalyzerStore {
                 attach_rust_module_route_gate(&mut facts.routes, route_ordinal, gate)?;
             }
             let mut stmt = conn.prepare_cached(&format!(
-                "SELECT blob_oid, macro_name, visible_after, scope_start, scope_end, passthrough
-                 FROM rust_item_macros
-                 WHERE lang = ? AND blob_oid IN ({placeholders})
-                 ORDER BY blob_oid, ordinal"
+                "SELECT keys.blob_oid, facts.macro_name, facts.visible_after,
+                        facts.scope_start, facts.scope_end, facts.passthrough
+                 FROM blobs AS keys
+                 JOIN rust_item_macros AS facts ON facts.blob_id = keys.id
+                 WHERE keys.lang = ? AND keys.blob_oid IN ({placeholders})
+                 ORDER BY keys.blob_oid, facts.ordinal"
             ))?;
             let rows = stmt.query_map(
                 params_from_iter(std::iter::once(lang).chain(chunk.iter().map(String::as_str))),
@@ -5206,11 +5532,11 @@ impl AnalyzerStore {
     }
 }
 
-const RUST_MODULE_IMPORT_CANDIDATE_BLOBS_SQL: &str = "SELECT DISTINCT occurrence.blob_oid
+const RUST_MODULE_IMPORT_CANDIDATE_BLOBS_SQL: &str = "SELECT DISTINCT keys.blob_oid
      FROM rust_identifier_occurrences AS occurrence
      JOIN rust_import_targets AS import_target
-       ON import_target.blob_oid = occurrence.blob_oid
-      AND import_target.lang = occurrence.lang
+       ON import_target.blob_id = occurrence.blob_id
+     JOIN blobs AS keys ON keys.id = occurrence.blob_id
      WHERE occurrence.lang = ?1
        AND occurrence.identifier = ?2
        AND (import_target.imported_name = ?2
@@ -5218,7 +5544,33 @@ const RUST_MODULE_IMPORT_CANDIDATE_BLOBS_SQL: &str = "SELECT DISTINCT occurrence
             OR import_target.module_path LIKE '%::' || ?2)";
 
 fn declaration_candidate_sql(predicate: &str) -> String {
-    declaration_candidate_sql_with_order(predicate, "units.blob_oid, units.unit_key")
+    declaration_candidate_sql_with_order(predicate, "keys.blob_oid, units.unit_key")
+}
+
+/// `mounted_declaration_rows_for_langs`'s query. Named so
+/// `mounted_declaration_scan_seeks_live_workspace_files` can plan it.
+///
+/// `live_mounted_declarations` carries every predicate the other candidate
+/// queries spell out at the call site -- blob liveness and epoch generation,
+/// declaration membership, and the anchor mounting that makes `rel_path` the
+/// path this reading was mounted under -- so language scope is the only
+/// condition left here, and the blob-completeness `EXISTS` the other shapes
+/// bolt on is the liveness the view already joins through. There is no
+/// `ORDER BY`: both callers sort and dedup the hydrated units in Rust
+/// (`resolve_mounted_candidate_rows`), and sorting a workspace-sized result in
+/// SQLite only bought a TEMP B-TREE.
+fn mounted_declaration_sql() -> String {
+    candidate_rows_sql_with_membership_projection_and_completeness(
+        "units",
+        "FROM live_mounted_declarations AS units
+         JOIN blobs AS keys
+           ON keys.id = units.blob_id",
+        "units.lang = ?1",
+        "TRUE",
+        "TRUE",
+        "",
+        ", units.rel_path",
+    )
 }
 
 /// `declaration_candidate_rows_by_identifier_prefix_for_langs`'s query. Named
@@ -5227,11 +5579,13 @@ fn identifier_prefix_candidate_sql() -> String {
     candidate_rows_sql_with_membership(
         "units",
         "FROM code_units AS units
+         JOIN blobs AS keys
+           ON keys.id = units.blob_id
          JOIN blob_meta AS meta
-           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang",
+           ON meta.blob_id = units.blob_id",
         "units.lang = ?1 AND units.identifier >= ?2 AND units.identifier < ?3",
         "(units.in_declarations = 1 OR units.in_definition_lookup = 1)",
-        "units.blob_oid, units.unit_key",
+        "keys.blob_oid, units.unit_key",
     )
 }
 
@@ -5239,11 +5593,13 @@ fn identifier_candidate_for_blob_sql() -> String {
     candidate_rows_sql_with_membership(
         "units",
         "FROM code_units AS units
+         JOIN blobs AS keys
+           ON keys.id = units.blob_id
          JOIN blob_meta AS meta
-           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang",
-        "units.lang = ?1 AND units.identifier = ?2 AND units.blob_oid = ?3",
+           ON meta.blob_id = units.blob_id",
+        "units.lang = ?1 AND units.identifier = ?2 AND keys.blob_oid = ?3",
         "(units.in_declarations = 1 OR units.in_definition_lookup = 1)",
-        "units.blob_oid, units.unit_key",
+        "keys.blob_oid, units.unit_key",
     )
 }
 
@@ -5251,11 +5607,13 @@ fn limited_identifier_candidate_for_blob_sql() -> String {
     limited_candidate_rows_sql_with_membership(
         "units",
         "FROM code_units AS units
+         JOIN blobs AS keys
+           ON keys.id = units.blob_id
          JOIN blob_meta AS meta
-           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang",
-        "units.lang = ?1 AND units.identifier = ?2 AND units.blob_oid = ?3",
+           ON meta.blob_id = units.blob_id",
+        "units.lang = ?1 AND units.identifier = ?2 AND keys.blob_oid = ?3",
         "(units.in_declarations = 1 OR units.in_definition_lookup = 1)",
-        &["units.blob_oid", "units.unit_key"],
+        &["keys.blob_oid", "units.unit_key"],
     )
 }
 
@@ -5280,11 +5638,13 @@ fn limited_declaration_candidate_sql(predicate: &str) -> String {
     limited_candidate_rows_sql_with_membership(
         "units",
         "FROM code_units AS units
+         JOIN blobs AS keys
+           ON keys.id = units.blob_id
          JOIN blob_meta AS meta
-           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang",
+           ON meta.blob_id = units.blob_id",
         predicate,
         "units.in_declarations = 1",
-        &["units.blob_oid", "units.unit_key"],
+        &["keys.blob_oid", "units.unit_key"],
     )
 }
 
@@ -5292,8 +5652,10 @@ fn declaration_candidate_sql_with_order(predicate: &str, order_by: &str) -> Stri
     candidate_rows_sql_with_membership(
         "units",
         "FROM code_units AS units
+         JOIN blobs AS keys
+           ON keys.id = units.blob_id
          JOIN blob_meta AS meta
-           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang",
+           ON meta.blob_id = units.blob_id",
         predicate,
         "units.in_declarations = 1",
         order_by,
@@ -5306,7 +5668,7 @@ fn candidate_rows_sql(candidate_alias: &str, from_clause: &str, predicate: &str)
         from_clause,
         predicate,
         &format!("{candidate_alias}.in_declarations = 1"),
-        &format!("{candidate_alias}.blob_oid, {candidate_alias}.unit_key"),
+        &format!("keys.blob_oid, {candidate_alias}.unit_key"),
     )
 }
 
@@ -5335,7 +5697,7 @@ fn limited_candidate_rows_sql_with_membership(
     order_by: &[&str],
 ) -> String {
     let row_bytes = format!(
-        "length(CAST({candidate_alias}.blob_oid AS BLOB))
+        "length(CAST(keys.blob_oid AS BLOB))
          + length(CAST({candidate_alias}.lang AS BLOB))
          + length(CAST({candidate_alias}.short_name AS BLOB))
          + length(CAST({candidate_alias}.content_qualifier AS BLOB))
@@ -5362,7 +5724,7 @@ fn limited_candidate_rows_sql_with_membership(
         .join(", ");
     format!(
         "WITH bounded AS MATERIALIZED (
-           SELECT {candidate_alias}.blob_oid, {candidate_alias}.lang,
+           SELECT keys.blob_oid, {candidate_alias}.lang,
                   {candidate_alias}.unit_key, {candidate_alias}.kind,
                   {candidate_alias}.short_name, {candidate_alias}.content_qualifier,
                   {candidate_alias}.signature, {candidate_alias}.synthetic,
@@ -5433,7 +5795,7 @@ fn candidate_rows_sql_with_membership_projection_and_completeness(
         format!("ORDER BY {order_by}")
     };
     format!(
-        "SELECT {candidate_alias}.blob_oid, {candidate_alias}.lang, {candidate_alias}.unit_key,
+        "SELECT keys.blob_oid, {candidate_alias}.lang, {candidate_alias}.unit_key,
                 {candidate_alias}.kind, {candidate_alias}.short_name,
                 {candidate_alias}.content_qualifier, {candidate_alias}.signature,
                 {candidate_alias}.synthetic, {candidate_alias}.is_type_alias,
@@ -5458,20 +5820,20 @@ fn definition_order_candidate_sql(view: &str, predicate: &str, membership: &str)
         &format!(
             "FROM {view} AS names
          JOIN code_units AS units
-           ON units.blob_oid = names.blob_oid
-          AND units.lang = names.lang
+           ON units.blob_id = names.blob_id
           AND units.unit_key = names.unit_key
+         JOIN blobs AS keys
+           ON keys.id = units.blob_id
          JOIN blob_meta AS meta
-           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang"
+           ON meta.blob_id = units.blob_id"
         ),
         predicate,
         membership,
-        "units.blob_oid, units.unit_key, names.prefix",
+        "keys.blob_oid, units.unit_key, names.prefix",
         ",
                 (SELECT MIN(ranges.start_byte)
                  FROM unit_ranges AS ranges
-                 WHERE ranges.blob_oid = units.blob_oid
-                   AND ranges.lang = units.lang
+                 WHERE ranges.blob_id = units.blob_id
                    AND ranges.unit_key = units.unit_key) AS first_start_byte,
                 names.prefix",
     )
@@ -5607,8 +5969,7 @@ fn component_definition_candidate_projection(
             ",
              (SELECT MIN(ranges.start_byte)
               FROM unit_ranges AS ranges
-              WHERE ranges.blob_oid = units.blob_oid
-                AND ranges.lang = units.lang
+              WHERE ranges.blob_id = units.blob_id
                 AND ranges.unit_key = units.unit_key) AS first_start_byte,
              {mounted_prefix} AS mounted_prefix,
              {request_index} AS request_index"
@@ -5630,24 +5991,27 @@ fn build_point_component_definition_candidate_sql(
             }
             RenderedTailMatch::NormalizedStored => "code_units AS units",
         };
+        // The anchor package seek must stay the outermost loop. Left to its own cost
+        // model the planner drives from workspace_files, which enumerates every
+        // per-language workspace file version for each probe (#2742). CROSS JOIN is
+        // SQLite's documented directive to keep the written join order.
         component_definition_candidate_projection(
             &format!(
                 "FROM workspace_file_anchors AS anchors
-             JOIN workspace_files AS files
+             CROSS JOIN workspace_files AS files
                ON files.lang = anchors.lang
               AND files.generation = anchors.generation
               AND files.file_id = anchors.file_id
-             JOIN {unit_source}
-               ON units.blob_oid = files.blob_oid
-              AND units.lang = files.lang
+             CROSS JOIN blobs AS keys
+               ON keys.blob_oid = files.blob_oid
+              AND keys.lang = files.lang
+              AND keys.generation = ?2
+             CROSS JOIN {unit_source}
+               ON units.blob_id = keys.id
               AND units.fq_anchor_kind = anchors.anchor_kind
               AND units.fq_anchor_pop = anchors.anchor_pop
-             JOIN blobs AS active_blob
-               ON active_blob.blob_oid = units.blob_oid
-              AND active_blob.lang = units.lang
-              AND active_blob.generation = ?2
              JOIN blob_meta AS meta
-               ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang"
+               ON meta.blob_id = units.blob_id"
             ),
             &format!(
                 "anchors.lang = ?1
@@ -5672,12 +6036,11 @@ fn build_point_component_definition_candidate_sql(
         component_definition_candidate_projection(
             &format!(
                 "FROM {unit_source}
-             JOIN blobs AS active_blob
-               ON active_blob.blob_oid = units.blob_oid
-              AND active_blob.lang = units.lang
-              AND active_blob.generation = ?2
+             JOIN blobs AS keys
+               ON keys.id = units.blob_id
+              AND keys.generation = ?2
              JOIN blob_meta AS meta
-               ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang"
+               ON meta.blob_id = units.blob_id"
             ),
             &format!(
                 "units.lang = ?1
@@ -5687,9 +6050,9 @@ fn build_point_component_definition_candidate_sql(
                  AND EXISTS (
                    SELECT 1
                    FROM workspace_files AS files
-                   WHERE files.lang = units.lang
+                   WHERE files.lang = keys.lang
                      AND files.generation = ?2
-                     AND files.blob_oid = units.blob_oid
+                     AND files.blob_oid = keys.blob_oid
                  )"
             ),
             membership,
@@ -5744,23 +6107,24 @@ fn point_anchor_only_definition_candidate_sql(membership: &str) -> &'static str 
             } else {
                 "(units.in_declarations = 1 OR units.in_definition_lookup = 1)"
             };
+            // Same join-order constraint as the anchored component lookup (#2742):
+            // the package seek is the selective entry point and must stay outermost.
             component_definition_candidate_projection(
                 "FROM workspace_file_anchors AS anchors
-                 JOIN workspace_files AS files
+                 CROSS JOIN workspace_files AS files
                    ON files.lang = anchors.lang
                   AND files.generation = anchors.generation
                   AND files.file_id = anchors.file_id
-                 JOIN code_units AS units
-                   ON units.blob_oid = files.blob_oid
-                  AND units.lang = files.lang
+                 CROSS JOIN blobs AS keys
+                   ON keys.blob_oid = files.blob_oid
+                  AND keys.lang = files.lang
+                  AND keys.generation = ?2
+                 CROSS JOIN code_units AS units
+                   ON units.blob_id = keys.id
                   AND units.fq_anchor_kind = anchors.anchor_kind
                   AND units.fq_anchor_pop = anchors.anchor_pop
-                 JOIN blobs AS active_blob
-                   ON active_blob.blob_oid = units.blob_oid
-                  AND active_blob.lang = units.lang
-                  AND active_blob.generation = ?2
                  JOIN blob_meta AS meta
-                   ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang",
+                   ON meta.blob_id = units.blob_id",
                 "anchors.lang = ?1
                  AND anchors.generation = ?2
                  AND anchors.package_name = ?3
@@ -5797,28 +6161,31 @@ fn batch_component_definition_candidate_sql(
             }
             RenderedTailMatch::NormalizedStored => "code_units AS units",
         };
+        // The materialized request rows must drive the anchor package seek, and that
+        // seek must stay above the file and unit loops. Without the directive the
+        // planner enumerates every per-language workspace file version and every
+        // anchored unit in it before it consults a request prefix (#2742).
         component_definition_candidate_projection(
             &format!(
                 "FROM requests
-             JOIN workspace_file_anchors AS anchors
+             CROSS JOIN workspace_file_anchors AS anchors
                ON anchors.lang = ?2
               AND anchors.generation = ?3
               AND anchors.package_name = requests.prefix
-             JOIN workspace_files AS files
+             CROSS JOIN workspace_files AS files
                ON files.lang = anchors.lang
               AND files.generation = anchors.generation
               AND files.file_id = anchors.file_id
-             JOIN {unit_source}
-               ON units.blob_oid = files.blob_oid
-              AND units.lang = files.lang
+             CROSS JOIN blobs AS keys
+               ON keys.blob_oid = files.blob_oid
+              AND keys.lang = files.lang
+              AND keys.generation = ?3
+             CROSS JOIN {unit_source}
+               ON units.blob_id = keys.id
               AND units.fq_anchor_kind = anchors.anchor_kind
               AND units.fq_anchor_pop = anchors.anchor_pop
-             JOIN blobs AS active_blob
-               ON active_blob.blob_oid = units.blob_oid
-              AND active_blob.lang = units.lang
-              AND active_blob.generation = ?3
              JOIN blob_meta AS meta
-               ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang"
+               ON meta.blob_id = units.blob_id"
             ),
             &format!(
                 "requests.anchored = 1
@@ -5845,12 +6212,11 @@ fn batch_component_definition_candidate_sql(
                 "FROM requests
              JOIN {unit_source}
                ON units.lang = ?2
-             JOIN blobs AS active_blob
-               ON active_blob.blob_oid = units.blob_oid
-              AND active_blob.lang = units.lang
-              AND active_blob.generation = ?3
+             JOIN blobs AS keys
+               ON keys.id = units.blob_id
+              AND keys.generation = ?3
              JOIN blob_meta AS meta
-               ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang"
+               ON meta.blob_id = units.blob_id"
             ),
             &format!(
                 "requests.anchored = 0
@@ -5861,9 +6227,9 @@ fn batch_component_definition_candidate_sql(
                  AND EXISTS (
                    SELECT 1
                    FROM workspace_files AS files
-                   WHERE files.lang = units.lang
+                   WHERE files.lang = keys.lang
                      AND files.generation = ?3
-                     AND files.blob_oid = units.blob_oid
+                     AND files.blob_oid = keys.blob_oid
                  )"
             ),
             membership,
@@ -5883,27 +6249,27 @@ fn batch_component_definition_candidate_sql(
 }
 
 fn batch_anchor_only_definition_candidate_sql(membership: &str) -> String {
+    // Same join-order constraint as the anchored batch component lookup (#2742).
     let select = component_definition_candidate_projection(
         "FROM requests
-         JOIN workspace_file_anchors AS anchors
+         CROSS JOIN workspace_file_anchors AS anchors
            ON anchors.lang = ?2
           AND anchors.generation = ?3
           AND anchors.package_name = requests.prefix
-         JOIN workspace_files AS files
+         CROSS JOIN workspace_files AS files
            ON files.lang = anchors.lang
           AND files.generation = anchors.generation
           AND files.file_id = anchors.file_id
-         JOIN code_units AS units
-           ON units.blob_oid = files.blob_oid
-          AND units.lang = files.lang
+         CROSS JOIN blobs AS keys
+           ON keys.blob_oid = files.blob_oid
+          AND keys.lang = files.lang
+          AND keys.generation = ?3
+         CROSS JOIN code_units AS units
+           ON units.blob_id = keys.id
           AND units.fq_anchor_kind = anchors.anchor_kind
           AND units.fq_anchor_pop = anchors.anchor_pop
-         JOIN blobs AS active_blob
-           ON active_blob.blob_oid = units.blob_oid
-          AND active_blob.lang = units.lang
-          AND active_blob.generation = ?3
          JOIN blob_meta AS meta
-           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang",
+           ON meta.blob_id = units.blob_id",
         "requests.anchored = 1
          AND requests.normalized = 0
          AND requests.tail = ''
@@ -6525,19 +6891,19 @@ impl RustModuleRouteRows {
 /// paths so both persist exactly the same rows.
 fn insert_rust_fact_rows(
     tx: &Transaction<'_>,
-    oid: &str,
+    blob_id: i64,
     lang: &str,
     rows: &RustFactRows,
 ) -> Result<()> {
     if !rows.exports.is_empty() {
         let mut stmt = tx.prepare_cached(
             "INSERT OR IGNORE INTO rust_exports(
-               blob_oid, lang, ordinal, exported_name, source_path, imported_name, is_glob
+               blob_id, lang, ordinal, exported_name, source_path, imported_name, is_glob
              ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )?;
         for row in &rows.exports {
             stmt.execute(params![
-                oid,
+                blob_id,
                 lang,
                 row.ordinal,
                 row.exported_name,
@@ -6550,14 +6916,14 @@ fn insert_rust_fact_rows(
     if !rows.import_targets.is_empty() {
         let mut stmt = tx.prepare_cached(
             "INSERT OR IGNORE INTO rust_import_targets(
-               blob_oid, lang, ordinal, module_path, bound_name, imported_name, is_glob,
+               blob_id, lang, ordinal, module_path, bound_name, imported_name, is_glob,
                is_extern_crate, visibility, cfg_condition, owner_module, owner_start,
                owner_end, local_start, local_end
              ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         )?;
         for row in &rows.import_targets {
             stmt.execute(params![
-                oid,
+                blob_id,
                 lang,
                 row.ordinal,
                 row.module_path,
@@ -6578,12 +6944,12 @@ fn insert_rust_fact_rows(
     if !rows.modules.is_empty() {
         let mut stmt = tx.prepare_cached(
             "INSERT OR IGNORE INTO rust_modules(
-               blob_oid, lang, ordinal, module_name, is_inline, start_byte, end_byte
+               blob_id, lang, ordinal, module_name, is_inline, start_byte, end_byte
              ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )?;
         for row in &rows.modules {
             stmt.execute(params![
-                oid,
+                blob_id,
                 lang,
                 row.ordinal,
                 row.module_name,
@@ -6596,24 +6962,24 @@ fn insert_rust_fact_rows(
     if !rows.identifier_occurrences.is_empty() {
         let mut stmt = tx.prepare_cached(
             "INSERT OR IGNORE INTO rust_identifier_occurrences(
-               blob_oid, lang, identifier, context_mask
+               blob_id, lang, identifier, context_mask
              ) VALUES(?1, ?2, ?3, ?4)",
         )?;
         for (identifier, context_mask) in &rows.identifier_occurrences {
-            stmt.execute(params![oid, lang, identifier, context_mask])?;
+            stmt.execute(params![blob_id, lang, identifier, context_mask])?;
         }
     }
     let routes = &rows.module_routes;
     if !routes.scopes.is_empty() {
         let mut stmt = tx.prepare_cached(
             "INSERT OR IGNORE INTO rust_module_scopes(
-               blob_oid, lang, ordinal, parent_ordinal, module_name, path_attribute,
+               blob_id, lang, ordinal, parent_ordinal, module_name, path_attribute,
                imports_macros, body_start, body_end
              ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )?;
         for row in &routes.scopes {
             stmt.execute(params![
-                oid,
+                blob_id,
                 lang,
                 row.ordinal,
                 row.parent_ordinal,
@@ -6628,13 +6994,13 @@ fn insert_rust_fact_rows(
     if !routes.routes.is_empty() {
         let mut stmt = tx.prepare_cached(
             "INSERT OR IGNORE INTO rust_module_routes(
-               blob_oid, lang, ordinal, scope_ordinal, module_name, path_attribute,
+               blob_id, lang, ordinal, scope_ordinal, module_name, path_attribute,
                visibility, imports_macros, test_gated, declaration_start, declaration_end
              ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         )?;
         for row in &routes.routes {
             stmt.execute(params![
-                oid,
+                blob_id,
                 lang,
                 row.ordinal,
                 row.scope_ordinal,
@@ -6651,12 +7017,12 @@ fn insert_rust_fact_rows(
     if !routes.gates.is_empty() {
         let mut stmt = tx.prepare_cached(
             "INSERT OR IGNORE INTO rust_module_route_gates(
-               blob_oid, lang, route_ordinal, gate_ordinal, macro_name, invocation_start
+               blob_id, lang, route_ordinal, gate_ordinal, macro_name, invocation_start
              ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
         )?;
         for (route_ordinal, gate_ordinal, macro_name, invocation_start) in &routes.gates {
             stmt.execute(params![
-                oid,
+                blob_id,
                 lang,
                 route_ordinal,
                 gate_ordinal,
@@ -6668,13 +7034,13 @@ fn insert_rust_fact_rows(
     if !routes.item_macros.is_empty() {
         let mut stmt = tx.prepare_cached(
             "INSERT OR IGNORE INTO rust_item_macros(
-               blob_oid, lang, ordinal, macro_name, visible_after, scope_start, scope_end,
+               blob_id, lang, ordinal, macro_name, visible_after, scope_start, scope_end,
                passthrough
              ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )?;
         for row in &routes.item_macros {
             stmt.execute(params![
-                oid,
+                blob_id,
                 lang,
                 row.ordinal,
                 row.macro_name,
@@ -6688,18 +7054,18 @@ fn insert_rust_fact_rows(
     if !rows.include_edges.is_empty() {
         let mut edge_stmt = tx.prepare_cached(
             "INSERT OR IGNORE INTO rust_include_edges(
-               blob_oid, lang, ordinal, relative_path, file_name, include_start
+               blob_id, lang, ordinal, relative_path, file_name, include_start
              ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
         )?;
         let mut binding_stmt = tx.prepare_cached(
             "INSERT OR IGNORE INTO rust_include_host_bindings(
-               blob_oid, lang, edge_ordinal, ordinal, local_name, module_specifier,
+               blob_id, lang, edge_ordinal, ordinal, local_name, module_specifier,
                imported_name, scope_start, kind
              ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )?;
         for edge in &rows.include_edges {
             edge_stmt.execute(params![
-                oid,
+                blob_id,
                 lang,
                 edge.ordinal,
                 edge.relative_path,
@@ -6708,7 +7074,7 @@ fn insert_rust_fact_rows(
             ])?;
             for binding in &edge.host_bindings {
                 binding_stmt.execute(params![
-                    oid,
+                    blob_id,
                     lang,
                     edge.ordinal,
                     binding.ordinal,
@@ -6736,7 +7102,7 @@ fn read_rust_usage_facts(conn: &Connection, oid: &str, lang: &str) -> Result<Rus
     {
         let mut stmt = conn.prepare_cached(
             "SELECT exported_name, source_path, imported_name, is_glob FROM rust_exports
-             WHERE blob_oid = ?1 AND lang = ?2 ORDER BY ordinal",
+             WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2) ORDER BY ordinal",
         )?;
         let rows = stmt.query_map(params![oid, lang], |row| {
             Ok(RustExportFact {
@@ -6757,7 +7123,7 @@ fn read_rust_usage_facts(conn: &Connection, oid: &str, lang: &str) -> Result<Rus
                     owner_module, owner_start, owner_end, local_start, local_end,
                     cfg_condition, is_extern_crate
              FROM rust_import_targets
-             WHERE blob_oid = ?1 AND lang = ?2 ORDER BY ordinal",
+             WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2) ORDER BY ordinal",
         )?;
         let rows = stmt.query_map(params![oid, lang], |row| {
             Ok((
@@ -6810,7 +7176,7 @@ fn read_rust_usage_facts(conn: &Connection, oid: &str, lang: &str) -> Result<Rus
     {
         let mut stmt = conn.prepare_cached(
             "SELECT module_name, is_inline, start_byte, end_byte FROM rust_modules
-             WHERE blob_oid = ?1 AND lang = ?2 ORDER BY ordinal",
+             WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2) ORDER BY ordinal",
         )?;
         let rows = stmt.query_map(params![oid, lang], |row| {
             Ok((
@@ -6834,7 +7200,7 @@ fn read_rust_usage_facts(conn: &Connection, oid: &str, lang: &str) -> Result<Rus
     {
         let mut stmt = conn.prepare_cached(
             "SELECT identifier, context_mask FROM rust_identifier_occurrences
-             WHERE blob_oid = ?1 AND lang = ?2 ORDER BY identifier",
+             WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2) ORDER BY identifier",
         )?;
         let rows = stmt.query_map(params![oid, lang], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
@@ -6878,7 +7244,7 @@ fn read_rust_include_edges(
     {
         let mut stmt = conn.prepare_cached(
             "SELECT relative_path, file_name, include_start FROM rust_include_edges
-             WHERE blob_oid = ?1 AND lang = ?2 ORDER BY ordinal",
+             WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2) ORDER BY ordinal",
         )?;
         let rows = stmt.query_map(params![oid, lang], |row| {
             Ok((
@@ -6903,7 +7269,7 @@ fn read_rust_include_edges(
     let mut stmt = conn.prepare_cached(
         "SELECT edge_ordinal, local_name, module_specifier, imported_name, scope_start, kind
          FROM rust_include_host_bindings
-         WHERE blob_oid = ?1 AND lang = ?2 ORDER BY edge_ordinal, ordinal",
+         WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2) ORDER BY edge_ordinal, ordinal",
     )?;
     let rows = stmt.query_map(params![oid, lang], |row| {
         Ok((
@@ -6949,7 +7315,7 @@ fn read_rust_module_route_facts(
             "SELECT parent_ordinal, module_name, path_attribute, imports_macros,
                     body_start, body_end
              FROM rust_module_scopes
-             WHERE blob_oid = ?1 AND lang = ?2 ORDER BY ordinal",
+             WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2) ORDER BY ordinal",
         )?;
         let rows = stmt.query_map(params![oid, lang], |row| {
             decode_rust_module_scope_row(row, 0)
@@ -6963,7 +7329,7 @@ fn read_rust_module_route_facts(
             "SELECT scope_ordinal, module_name, path_attribute, visibility, imports_macros,
                     test_gated, declaration_start, declaration_end
              FROM rust_module_routes
-             WHERE blob_oid = ?1 AND lang = ?2 ORDER BY ordinal",
+             WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2) ORDER BY ordinal",
         )?;
         let rows = stmt.query_map(params![oid, lang], |row| {
             decode_rust_module_route_row(row, 0)
@@ -6976,7 +7342,7 @@ fn read_rust_module_route_facts(
         let mut stmt = conn.prepare_cached(
             "SELECT route_ordinal, macro_name, invocation_start
              FROM rust_module_route_gates
-             WHERE blob_oid = ?1 AND lang = ?2 ORDER BY route_ordinal, gate_ordinal",
+             WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2) ORDER BY route_ordinal, gate_ordinal",
         )?;
         let rows = stmt.query_map(params![oid, lang], |row| {
             decode_rust_module_route_gate_row(row, 0)
@@ -6990,7 +7356,7 @@ fn read_rust_module_route_facts(
         let mut stmt = conn.prepare_cached(
             "SELECT macro_name, visible_after, scope_start, scope_end, passthrough
              FROM rust_item_macros
-             WHERE blob_oid = ?1 AND lang = ?2 ORDER BY ordinal",
+             WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2) ORDER BY ordinal",
         )?;
         let rows = stmt.query_map(params![oid, lang], |row| decode_rust_item_macro_row(row, 0))?;
         for row in rows {
@@ -7663,19 +8029,18 @@ fn optional_fact_counts(
 
 fn insert_optional_fact_manifest(
     tx: &Transaction<'_>,
-    oid: &str,
-    lang: &str,
+    blob_id: i64,
     counts: OptionalFactCounts,
 ) -> Result<()> {
     let mut stmt = tx.prepare_cached(
-        "INSERT INTO blob_optional_fact_manifest(blob_oid, lang, fact_kind, row_count)
-         VALUES(?1, ?2, ?3, ?4)",
+        "INSERT INTO blob_optional_fact_manifest(blob_id, fact_kind, row_count)
+         VALUES(?1, ?2, ?3)",
     )?;
     for descriptor in OPTIONAL_FACT_DESCRIPTORS {
         let kind = descriptor.kind;
         let count = counts.get(kind);
         if count > 0 {
-            stmt.execute(params![oid, lang, kind as i64, usize_to_i64(count)?])?;
+            stmt.execute(params![blob_id, kind as i64, usize_to_i64(count)?])?;
         }
     }
     Ok(())
@@ -7804,21 +8169,21 @@ impl ImportRows {
 
 fn insert_import_rows(
     tx: &Transaction<'_>,
-    oid: &str,
+    blob_id: i64,
     lang: &str,
     rows: &ImportRows,
 ) -> Result<()> {
     {
         let mut stmt = tx.prepare_cached(
             "INSERT OR IGNORE INTO import_statements(
-               blob_oid, lang, ordinal, statement, is_wildcard, is_global,
+               blob_id, lang, ordinal, statement, is_wildcard, is_global,
                identifier, alias, path_kind, declaration_start_byte,
                binder_start, binder_end
              ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         )?;
         for row in &rows.statements {
             stmt.execute(params![
-                oid,
+                blob_id,
                 lang,
                 row.ordinal,
                 row.statement,
@@ -7836,22 +8201,22 @@ fn insert_import_rows(
     {
         let mut stmt = tx.prepare_cached(
             "INSERT OR IGNORE INTO import_path_segments(
-               blob_oid, lang, ordinal, seg_ordinal, segment
+               blob_id, lang, ordinal, seg_ordinal, segment
              ) VALUES(?1, ?2, ?3, ?4, ?5)",
         )?;
         for (ordinal, seg_ordinal, segment) in &rows.segments {
-            stmt.execute(params![oid, lang, ordinal, seg_ordinal, segment])?;
+            stmt.execute(params![blob_id, lang, ordinal, seg_ordinal, segment])?;
         }
     }
     {
         let mut stmt = tx.prepare_cached(
             "INSERT OR IGNORE INTO import_lexical_scopes(
-               blob_oid, lang, ordinal, scope_ordinal, start_byte, end_byte
+               blob_id, lang, ordinal, scope_ordinal, start_byte, end_byte
              ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
         )?;
         for (ordinal, scope_ordinal, start_byte, end_byte) in &rows.scopes {
             stmt.execute(params![
-                oid,
+                blob_id,
                 lang,
                 ordinal,
                 scope_ordinal,
@@ -7862,11 +8227,11 @@ fn insert_import_rows(
     }
     let mut stmt = tx.prepare_cached(
         "INSERT OR IGNORE INTO import_lexical_prefixes(
-           blob_oid, lang, ordinal, prefix_ordinal, prefix
+           blob_id, lang, ordinal, prefix_ordinal, prefix
          ) VALUES(?1, ?2, ?3, ?4, ?5)",
     )?;
     for (ordinal, prefix_ordinal, prefix) in &rows.prefixes {
-        stmt.execute(params![oid, lang, ordinal, prefix_ordinal, prefix])?;
+        stmt.execute(params![blob_id, lang, ordinal, prefix_ordinal, prefix])?;
     }
     Ok(())
 }
@@ -8240,14 +8605,22 @@ fn write_prepared_blob_rows_tx(
     // Every statement in this batch path is connection-cached: a cold reconcile
     // writes hundreds of blobs per transaction and re-preparing ~25 statements
     // per blob was a measured writer-CPU cost (issue #2326).
+    //
+    // The DELETE is what clears the blob's previous publication: every fact
+    // table cascades from `blobs`, directly or through `code_units`,
+    // `import_statements` or `blob_meta`. The INSERT then mints a FRESH id, so
+    // an id is only ever valid inside the transaction that read it. Nothing
+    // outside this database holds one; see
+    // `.agents/plans/store-blob-id-interning.md`.
     tx.prepare_cached("DELETE FROM blobs WHERE blob_oid = ?1 AND lang = ?2")?
         .execute(params![oid, lang])?;
     tx.prepare_cached("INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, ?2, ?3)")?
         .execute(params![oid, lang, generation.0])?;
+    let blob_id = tx.last_insert_rowid();
     {
         let mut stmt = tx.prepare_cached(
             "INSERT OR IGNORE INTO code_units(
-               blob_oid, lang, unit_key, kind, short_name, identifier, content_qualifier,
+               blob_id, lang, unit_key, kind, short_name, identifier, content_qualifier,
                exact_fqn, normalized_fqn, simple_type_name, signature, synthetic,
                is_type_alias, top_level_ordinal, in_declarations, in_definition_lookup,
                in_test_region, fq_segment_count, fq_segment_bytes,
@@ -8261,7 +8634,7 @@ fn write_prepared_blob_rows_tx(
         )?;
         for row in &blob.units {
             stmt.execute(params![
-                oid,
+                blob_id,
                 lang,
                 row.key,
                 row.kind,
@@ -8294,25 +8667,25 @@ fn write_prepared_blob_rows_tx(
     {
         let mut stmt = tx.prepare_cached(
             "INSERT INTO unit_visibility_containers(
-               blob_oid, lang, unit_key, container_ordinal,
+               blob_id, lang, unit_key, container_ordinal,
                exact_container_tail, normalized_container_tail
              ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
         )?;
         for row in &blob.units {
             for (ordinal, exact, normalized) in &row.visibility_containers {
-                stmt.execute(params![oid, lang, row.key, ordinal, exact, normalized])?;
+                stmt.execute(params![blob_id, lang, row.key, ordinal, exact, normalized])?;
             }
         }
     }
     {
         let mut stmt = tx.prepare_cached(
             "INSERT INTO code_unit_fq_segments(
-               blob_oid, lang, unit_key, seg_ordinal, seg_kind, segment
+               blob_id, lang, unit_key, seg_ordinal, seg_kind, segment
              ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
         )?;
         for row in &blob.units {
             for (ordinal, kind, segment) in &row.relational_fq_segments {
-                stmt.execute(params![oid, lang, row.key, ordinal, kind, segment])?;
+                stmt.execute(params![blob_id, lang, row.key, ordinal, kind, segment])?;
             }
         }
     }
@@ -8323,107 +8696,109 @@ fn write_prepared_blob_rows_tx(
         }};
     }
     insert_rows!(
-        "INSERT OR IGNORE INTO unit_ranges(blob_oid, lang, unit_key, ordinal, start_byte, end_byte, start_line, end_line) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT OR IGNORE INTO unit_ranges(blob_id, lang, unit_key, ordinal, start_byte, end_byte, start_line, end_line) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         &blob.ranges,
         |stmt, row| {
-            stmt.execute(params![oid, lang, row.0, row.1, row.2, row.3, row.4, row.5])?;
+            stmt.execute(params![
+                blob_id, lang, row.0, row.1, row.2, row.3, row.4, row.5
+            ])?;
         }
     );
     insert_rows!(
-        "INSERT OR IGNORE INTO unit_signatures(blob_oid, lang, unit_key, ordinal, text) VALUES(?1, ?2, ?3, ?4, ?5)",
+        "INSERT OR IGNORE INTO unit_signatures(blob_id, lang, unit_key, ordinal, text) VALUES(?1, ?2, ?3, ?4, ?5)",
         &blob.signatures,
         |stmt, row| {
-            stmt.execute(params![oid, lang, row.0, row.1, row.2])?;
+            stmt.execute(params![blob_id, lang, row.0, row.1, row.2])?;
         }
     );
     insert_rows!(
         signature_metadata_insert_sql(),
         &blob.signature_metadata,
         |stmt, row| {
-            row.2.insert(&mut stmt, oid, lang, row.0, row.1)?;
+            row.2.insert(&mut stmt, blob_id, lang, row.0, row.1)?;
         }
     );
     insert_rows!(
-        "INSERT OR IGNORE INTO unit_cpp_template_metadata(blob_oid, lang, unit_key, metadata) VALUES(?1, ?2, ?3, ?4)",
+        "INSERT OR IGNORE INTO unit_cpp_template_metadata(blob_id, lang, unit_key, metadata) VALUES(?1, ?2, ?3, ?4)",
         &blob.cpp_template_metadata,
         |stmt, row| {
-            stmt.execute(params![oid, lang, row.0, row.1])?;
+            stmt.execute(params![blob_id, lang, row.0, row.1])?;
         }
     );
     insert_rows!(
-        "INSERT OR IGNORE INTO unit_supertypes(blob_oid, lang, unit_key, ordinal, raw, lookup_path) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT OR IGNORE INTO unit_supertypes(blob_id, lang, unit_key, ordinal, raw, lookup_path) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
         &blob.supertypes,
         |stmt, row| {
-            stmt.execute(params![oid, lang, row.0, row.1, row.2, row.3])?;
+            stmt.execute(params![blob_id, lang, row.0, row.1, row.2, row.3])?;
         }
     );
     insert_rows!(
-        "INSERT OR IGNORE INTO unit_children(blob_oid, lang, parent_key, child_key, ordinal) VALUES(?1, ?2, ?3, ?4, ?5)",
+        "INSERT OR IGNORE INTO unit_children(blob_id, lang, parent_key, child_key, ordinal) VALUES(?1, ?2, ?3, ?4, ?5)",
         &blob.children,
         |stmt, row| {
-            stmt.execute(params![oid, lang, row.0, row.1, row.2])?;
+            stmt.execute(params![blob_id, lang, row.0, row.1, row.2])?;
         }
     );
-    insert_import_rows(tx, oid, lang, &blob.imports)?;
+    insert_import_rows(tx, blob_id, lang, &blob.imports)?;
     insert_rows!(
-        "INSERT OR IGNORE INTO scala_exports(blob_oid, lang, owner_key, ordinal, info) VALUES(?1, ?2, ?3, ?4, ?5)",
+        "INSERT OR IGNORE INTO scala_exports(blob_id, lang, owner_key, ordinal, info) VALUES(?1, ?2, ?3, ?4, ?5)",
         &blob.scala_exports,
         |stmt, row| {
-            stmt.execute(params![oid, lang, row.0, row.1, row.2])?;
+            stmt.execute(params![blob_id, lang, row.0, row.1, row.2])?;
         }
     );
     insert_rows!(
-        "INSERT OR IGNORE INTO reference_identifiers(blob_oid, lang, identifier) VALUES(?1, ?2, ?3)",
+        "INSERT OR IGNORE INTO reference_identifiers(blob_id, lang, identifier) VALUES(?1, ?2, ?3)",
         &blob.type_identifiers,
         |stmt, row| {
-            stmt.execute(params![oid, lang, row])?;
+            stmt.execute(params![blob_id, lang, row])?;
         }
     );
     insert_rows!(
-        "INSERT OR IGNORE INTO ruby_method_dispatch_modes(blob_oid, lang, unit_key, mode) VALUES(?1, ?2, ?3, ?4)",
+        "INSERT OR IGNORE INTO ruby_method_dispatch_modes(blob_id, lang, unit_key, mode) VALUES(?1, ?2, ?3, ?4)",
         &blob.ruby_dispatch_modes,
         |stmt, row| {
-            stmt.execute(params![oid, lang, row.0, row.1])?;
+            stmt.execute(params![blob_id, lang, row.0, row.1])?;
         }
     );
     insert_rows!(
-        "INSERT OR IGNORE INTO materialization_records(blob_oid, lang, ordinal, unit_key, payload) VALUES(?1, ?2, ?3, ?4, ?5)",
+        "INSERT OR IGNORE INTO materialization_records(blob_id, lang, ordinal, unit_key, payload) VALUES(?1, ?2, ?3, ?4, ?5)",
         &blob.materialization_records,
         |stmt, row| {
-            stmt.execute(params![oid, lang, row.0, row.1, row.2])?;
+            stmt.execute(params![blob_id, lang, row.0, row.1, row.2])?;
         }
     );
     insert_rows!(
-        "INSERT OR IGNORE INTO scala_traits(blob_oid, lang, unit_key) VALUES(?1, ?2, ?3)",
+        "INSERT OR IGNORE INTO scala_traits(blob_id, lang, unit_key) VALUES(?1, ?2, ?3)",
         &blob.scala_traits,
         |stmt, row| {
-            stmt.execute(params![oid, lang, row])?;
+            stmt.execute(params![blob_id, lang, row])?;
         }
     );
-    insert_rust_fact_rows(tx, oid, lang, &blob.rust_facts)?;
+    insert_rust_fact_rows(tx, blob_id, lang, &blob.rust_facts)?;
     tx.prepare_cached("INSERT OR IGNORE INTO reference_fact_epochs(lang, epoch) VALUES(?1, 1)")?
         .execute([lang])?;
     tx.prepare_cached(
-        "INSERT INTO blob_reference_fact_manifests(blob_oid, lang, epoch, identifier_count)
+        "INSERT INTO blob_reference_fact_manifests(blob_id, lang, epoch, identifier_count)
          VALUES(?1, ?2, 1, ?3)
-         ON CONFLICT(blob_oid, lang) DO UPDATE SET
+         ON CONFLICT(blob_id) DO UPDATE SET
            epoch = excluded.epoch,
            identifier_count = excluded.identifier_count",
     )?
     .execute(params![
-        oid,
+        blob_id,
         lang,
         usize_to_i64(blob.type_identifiers.len())?
     ])?;
     tx.prepare_cached(
         "INSERT OR IGNORE INTO blob_meta(
-           blob_oid, lang, contains_tests, content_package, stored_unit_count,
+           blob_id, lang, contains_tests, content_package, stored_unit_count,
            range_count, signature_count, signature_metadata_count, supertype_count,
            child_count, import_statement_count, type_identifier_count, is_complete
          ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1)",
     )?
     .execute(params![
-        oid,
+        blob_id,
         lang,
         blob.contains_tests,
         blob.content_package,
@@ -8438,8 +8813,7 @@ fn write_prepared_blob_rows_tx(
     ])?;
     insert_optional_fact_manifest(
         tx,
-        oid,
-        lang,
+        blob_id,
         optional_fact_counts(
             blob.cpp_template_metadata.len(),
             blob.ruby_dispatch_modes.len(),
@@ -8451,12 +8825,12 @@ fn write_prepared_blob_rows_tx(
     let integrity_condition = PARSED_BLOB_INTEGRITY_CONDITION.as_str();
     let integrity_sql = format!(
         "SELECT 1 FROM blob_meta AS meta
-         WHERE meta.blob_oid = ?1 AND meta.lang = ?2
+         WHERE meta.blob_id = ?1
            AND {integrity_condition}"
     );
     let complete = tx
         .prepare_cached(&integrity_sql)?
-        .query_row(params![oid, lang], |_| Ok(()))
+        .query_row(params![blob_id], |_| Ok(()))
         .optional()?
         .is_some();
     if !complete {
@@ -8464,7 +8838,7 @@ fn write_prepared_blob_rows_tx(
             "prepared blob {oid}/{lang} failed post-write integrity validation"
         )));
     }
-    insert_blob_payload_cost_tx(tx, oid, lang, blob.persisted_payload_bytes())?;
+    insert_blob_payload_cost_tx(tx, blob_id, blob.persisted_payload_bytes())?;
     Ok(())
 }
 
@@ -8579,14 +8953,17 @@ struct RawUnitRow {
     fq: Option<RelationalUnitFq>,
 }
 
-const RAW_UNIT_COLUMNS: &str = "blob_oid, unit_key, kind, content_qualifier, signature, synthetic,
+/// The unit columns a raw row decodes, WITHOUT the blob key: `blob_oid` lives
+/// only in `blobs` now, so every caller projects it from the registry row it
+/// already joins and puts it first.
+const RAW_UNIT_COLUMNS: &str = "unit_key, kind, content_qualifier, signature, synthetic,
      is_type_alias, top_level_ordinal, in_declarations, in_definition_lookup,
      in_test_region, fq_anchor_kind, fq_anchor_pop, fq_package_tail_segments,
      fq_segment_count, exact_fqn_tail, fq_segment_bytes, normalized_fqn_tail";
 
 fn raw_unit_columns_sql(alias: &str) -> String {
     format!(
-        "{alias}.blob_oid, {alias}.unit_key, {alias}.kind,
+        "keys.blob_oid, {alias}.unit_key, {alias}.kind,
          {alias}.content_qualifier, {alias}.signature, {alias}.synthetic,
          {alias}.is_type_alias, {alias}.top_level_ordinal,
          {alias}.in_declarations, {alias}.in_definition_lookup,
@@ -8680,10 +9057,12 @@ fn attach_raw_unit_fq_segments(
 
 fn raw_unit_fq_segments_sql(placeholders: &str) -> String {
     format!(
-        "SELECT blob_oid, unit_key, seg_ordinal, seg_kind, segment
-         FROM code_unit_fq_segments
-         WHERE lang = ? AND blob_oid IN ({placeholders})
-         ORDER BY blob_oid, unit_key, seg_ordinal"
+        "SELECT keys.blob_oid, facts.unit_key, facts.seg_ordinal, facts.seg_kind,
+                facts.segment
+         FROM blobs AS keys
+         JOIN code_unit_fq_segments AS facts ON facts.blob_id = keys.id
+         WHERE keys.lang = ? AND keys.blob_oid IN ({placeholders})
+         ORDER BY keys.blob_oid, facts.unit_key, facts.seg_ordinal"
     )
 }
 
@@ -8918,10 +9297,12 @@ fn type_aliases_for_file_conn<A: LanguageAdapter>(
     let unit_columns = raw_unit_columns_sql("units");
     let sql = format!(
         "SELECT {unit_columns}
-         FROM code_units AS units
+         FROM blobs AS keys
+         JOIN code_units AS units
+           ON units.blob_id = keys.id
          JOIN blob_meta AS meta
-           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
-         WHERE units.blob_oid = ?1 AND units.lang = ?2 AND units.is_type_alias = 1
+           ON meta.blob_id = units.blob_id
+         WHERE keys.blob_oid = ?1 AND keys.lang = ?2 AND units.is_type_alias = 1
            AND {PARSED_BLOB_COMPLETE_CONDITION}
          ORDER BY units.unit_key"
     );
@@ -8962,14 +9343,15 @@ fn enclosing_declarations_for_range_conn<A: LanguageAdapter>(
     let sql = format!(
         "SELECT {unit_columns},
                 ranges.start_byte, ranges.end_byte, ranges.start_line, ranges.end_line
-         FROM code_units AS units
+         FROM blobs AS keys
+         JOIN code_units AS units
+           ON units.blob_id = keys.id
          JOIN blob_meta AS meta
-           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
+           ON meta.blob_id = units.blob_id
          JOIN unit_ranges AS ranges
-           ON ranges.blob_oid = units.blob_oid
-          AND ranges.lang = units.lang
+           ON ranges.blob_id = units.blob_id
           AND ranges.unit_key = units.unit_key
-         WHERE units.blob_oid = ?1 AND units.lang = ?2 AND units.in_declarations = 1
+         WHERE keys.blob_oid = ?1 AND keys.lang = ?2 AND units.in_declarations = 1
            AND ranges.start_byte <= ?3 AND ranges.end_byte >= ?4
            AND {PARSED_BLOB_COMPLETE_CONDITION}
          ORDER BY units.unit_key, ranges.ordinal"
@@ -9095,14 +9477,15 @@ fn enclosing_declarations_for_file_sql() -> String {
     format!(
         "SELECT {unit_columns},
                 ranges.start_byte, ranges.end_byte, ranges.start_line, ranges.end_line
-         FROM code_units AS units
+         FROM blobs AS keys
+         CROSS JOIN code_units AS units
          CROSS JOIN blob_meta AS meta
          CROSS JOIN unit_ranges AS ranges
-         WHERE units.blob_oid = meta.blob_oid AND units.lang = meta.lang
-           AND ranges.blob_oid = units.blob_oid
-           AND ranges.lang = units.lang
+         WHERE units.blob_id = keys.id
+           AND units.blob_id = meta.blob_id
+           AND ranges.blob_id = units.blob_id
            AND ranges.unit_key = units.unit_key
-           AND units.blob_oid = ?1 AND units.lang = ?2 AND units.in_declarations = 1
+           AND keys.blob_oid = ?1 AND keys.lang = ?2 AND units.in_declarations = 1
            AND {PARSED_BLOB_COMPLETE_CONDITION}
          ORDER BY units.unit_key, ranges.ordinal"
     )
@@ -9304,10 +9687,10 @@ fn read_blob_meta<A: LanguageAdapter>(
                     {optional_fact_projection}
              FROM blob_meta AS meta
              LEFT JOIN blob_optional_fact_manifest AS manifest
-               ON manifest.blob_oid = meta.blob_oid AND manifest.lang = meta.lang
-             WHERE meta.blob_oid = ?1 AND meta.lang = ?2
+               ON manifest.blob_id = meta.blob_id
+             WHERE meta.blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
                AND {PARSED_BLOB_COMPLETE_CONDITION}
-             GROUP BY meta.blob_oid, meta.lang"
+             GROUP BY meta.blob_id"
             ),
             params![oid, lang],
             |row| {
@@ -9344,7 +9727,7 @@ fn read_summary_projection_meta(
         "SELECT stored_unit_count, range_count, signature_count, child_count,
                 import_statement_count
          FROM blob_meta AS meta
-         WHERE meta.blob_oid = ?1 AND meta.lang = ?2
+         WHERE meta.blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
            AND {PARSED_BLOB_COMPLETE_CONDITION}"
     );
     let row: Option<(i64, i64, i64, i64, i64)> = conn
@@ -9375,7 +9758,7 @@ fn read_summary_projection_meta(
 fn read_type_identifiers(conn: &Connection, oid: &str, lang: &str) -> Result<HashSet<String>> {
     let mut stmt = conn.prepare(
         "SELECT identifier FROM reference_identifiers
-         WHERE blob_oid = ?1 AND lang = ?2",
+         WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)",
     )?;
     let rows = stmt.query_map(params![oid, lang], |row| row.get::<_, String>(0))?;
     let mut out = HashSet::default();
@@ -9486,17 +9869,18 @@ fn read_blob_meta_bulk(conn: &Connection, lang: &str, oids: &[String]) -> Result
         }
         let placeholders = chunk_placeholders(chunk);
         let sql = format!(
-            "SELECT meta.blob_oid, contains_tests, content_package, stored_unit_count,
+            "SELECT keys.blob_oid, contains_tests, content_package, stored_unit_count,
                     range_count, signature_count, signature_metadata_count, supertype_count,
                     child_count, import_statement_count, type_identifier_count,
                     {optional_fact_projection}
-             FROM blob_meta AS meta
+             FROM blobs AS keys
+             JOIN blob_meta AS meta ON meta.blob_id = keys.id
              LEFT JOIN blob_optional_fact_manifest AS manifest
-               ON manifest.blob_oid = meta.blob_oid AND manifest.lang = meta.lang
-             WHERE meta.lang = ? AND meta.blob_oid IN ({placeholders})
+               ON manifest.blob_id = meta.blob_id
+             WHERE keys.lang = ? AND keys.blob_oid IN ({placeholders})
                AND {PARSED_BLOB_COMPLETE_CONDITION}
-             GROUP BY meta.blob_oid, meta.lang
-             ORDER BY meta.blob_oid"
+             GROUP BY meta.blob_id
+             ORDER BY keys.blob_oid"
         );
         let params = chunk_params(lang, chunk);
         let mut stmt = conn.prepare_cached(&sql)?;
@@ -9531,10 +9915,11 @@ fn read_blob_meta_bulk(conn: &Connection, lang: &str, oids: &[String]) -> Result
         }
         let placeholders = chunk_placeholders(chunk);
         let sql = format!(
-            "SELECT blob_oid, identifier
-             FROM reference_identifiers
-             WHERE lang = ? AND blob_oid IN ({placeholders})
-             ORDER BY blob_oid, identifier"
+            "SELECT keys.blob_oid, facts.identifier
+             FROM blobs AS keys
+             JOIN reference_identifiers AS facts ON facts.blob_id = keys.id
+             WHERE keys.lang = ? AND keys.blob_oid IN ({placeholders})
+             ORDER BY keys.blob_oid, facts.identifier"
         );
         let params = chunk_params(lang, chunk);
         let mut stmt = conn.prepare_cached(&sql)?;
@@ -9551,11 +9936,11 @@ fn read_blob_meta_bulk(conn: &Connection, lang: &str, oids: &[String]) -> Result
     Ok(out)
 }
 
-fn read_content_packages_bulk(
+fn read_import_metadata_bulk(
     conn: &Connection,
     lang: &str,
     oids: &[String],
-) -> Result<HashMap<String, String>> {
+) -> Result<HashMap<String, (String, bool)>> {
     let mut out = HashMap::default();
     for chunk in oids.chunks(900) {
         if chunk.is_empty() {
@@ -9563,20 +9948,25 @@ fn read_content_packages_bulk(
         }
         let placeholders = chunk_placeholders(chunk);
         let sql = format!(
-            "SELECT meta.blob_oid, meta.content_package
-             FROM blob_meta AS meta
-             WHERE meta.lang = ? AND meta.blob_oid IN ({placeholders})
+            "SELECT keys.blob_oid, meta.content_package, meta.contains_tests
+             FROM blobs AS keys
+             JOIN blob_meta AS meta ON meta.blob_id = keys.id
+             WHERE keys.lang = ? AND keys.blob_oid IN ({placeholders})
                AND {PARSED_BLOB_COMPLETE_CONDITION}
-             ORDER BY meta.blob_oid"
+             ORDER BY keys.blob_oid"
         );
         let params = chunk_params(lang, chunk);
         let mut stmt = conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? != 0,
+            ))
         })?;
         for row in rows {
-            let (oid, package_name) = row?;
-            out.insert(oid, package_name);
+            let (oid, package_name, contains_tests) = row?;
+            out.insert(oid, (package_name, contains_tests));
         }
     }
     Ok(out)
@@ -9594,10 +9984,11 @@ fn read_unit_rows_bulk(
         }
         let placeholders = chunk_placeholders(chunk);
         let sql = format!(
-            "SELECT {RAW_UNIT_COLUMNS}
-             FROM code_units
-             WHERE lang = ? AND blob_oid IN ({placeholders})
-             ORDER BY blob_oid, unit_key"
+            "SELECT keys.blob_oid, {RAW_UNIT_COLUMNS}
+             FROM blobs AS keys
+             JOIN code_units AS units ON units.blob_id = keys.id
+             WHERE keys.lang = ? AND keys.blob_oid IN ({placeholders})
+             ORDER BY keys.blob_oid, units.unit_key"
         );
         let params = chunk_params(lang, chunk);
         let mut stmt = conn.prepare_cached(&sql)?;
@@ -9715,10 +10106,11 @@ fn attach_import_path_children(
             ("import_lexical_scopes", "start_byte, end_byte"),
         ] {
             let sql = format!(
-                "SELECT blob_oid, ordinal, {value_columns}
-                 FROM {table}
-                 WHERE lang = ? AND blob_oid IN ({placeholders})
-                 ORDER BY blob_oid, ordinal"
+                "SELECT keys.blob_oid, facts.ordinal, {value_columns}
+                 FROM blobs AS keys
+                 JOIN {table} AS facts ON facts.blob_id = keys.id
+                 WHERE keys.lang = ? AND keys.blob_oid IN ({placeholders})
+                 ORDER BY keys.blob_oid, facts.ordinal"
             );
             let mut stmt = conn.prepare_cached(&sql)?;
             let mut query = stmt.query(rusqlite::params_from_iter(params.iter()))?;
@@ -9758,16 +10150,17 @@ fn read_import_infos_bulk(
         }
         let placeholders = chunk_placeholders(chunk);
         let sql = format!(
-            "SELECT imports.blob_oid, imports.statement, imports.is_wildcard,
+            "SELECT keys.blob_oid, imports.statement, imports.is_wildcard,
                     imports.is_global, imports.identifier, imports.alias,
                     imports.path_kind, imports.declaration_start_byte,
                     imports.binder_start, imports.binder_end
-             FROM import_statements AS imports
+             FROM blobs AS keys
+             JOIN import_statements AS imports ON imports.blob_id = keys.id
              JOIN blob_meta AS meta
-               ON meta.blob_oid = imports.blob_oid AND meta.lang = imports.lang
-             WHERE imports.lang = ? AND imports.blob_oid IN ({placeholders})
+               ON meta.blob_id = imports.blob_id
+             WHERE keys.lang = ? AND keys.blob_oid IN ({placeholders})
                AND {PARSED_BLOB_COMPLETE_CONDITION}
-             ORDER BY imports.blob_oid, imports.ordinal"
+             ORDER BY keys.blob_oid, imports.ordinal"
         );
         let params = chunk_params(lang, chunk);
         let mut stmt = conn.prepare_cached(&sql)?;
@@ -9798,9 +10191,11 @@ fn read_scala_exports_bulk(
         }
         let placeholders = chunk_placeholders(chunk);
         let sql = format!(
-            "SELECT blob_oid, owner_key, info FROM scala_exports
-             WHERE lang = ? AND blob_oid IN ({placeholders})
-             ORDER BY blob_oid, owner_key, ordinal"
+            "SELECT keys.blob_oid, facts.owner_key, facts.info
+             FROM blobs AS keys
+             JOIN scala_exports AS facts ON facts.blob_id = keys.id
+             WHERE keys.lang = ? AND keys.blob_oid IN ({placeholders})
+             ORDER BY keys.blob_oid, facts.owner_key, facts.ordinal"
         );
         let params = chunk_params(lang, chunk);
         let mut stmt = conn.prepare_cached(&sql)?;
@@ -9831,9 +10226,11 @@ fn read_materialization_records_bulk(
         }
         let placeholders = chunk_placeholders(chunk);
         let sql = format!(
-            "SELECT blob_oid, unit_key, payload FROM materialization_records
-             WHERE lang = ? AND blob_oid IN ({placeholders})
-             ORDER BY blob_oid, ordinal"
+            "SELECT keys.blob_oid, facts.unit_key, facts.payload
+             FROM blobs AS keys
+             JOIN materialization_records AS facts ON facts.blob_id = keys.id
+             WHERE keys.lang = ? AND keys.blob_oid IN ({placeholders})
+             ORDER BY keys.blob_oid, facts.ordinal"
         );
         let params = chunk_params(lang, chunk);
         let mut stmt = conn.prepare_cached(&sql)?;
@@ -9883,9 +10280,11 @@ fn read_unit_string_vec_bulk(
         }
         let placeholders = chunk_placeholders(chunk);
         let sql = format!(
-            "SELECT blob_oid, unit_key, {value_column} FROM {table}
-             WHERE lang = ? AND blob_oid IN ({placeholders})
-             ORDER BY blob_oid, unit_key, ordinal"
+            "SELECT keys.blob_oid, facts.unit_key, facts.{value_column}
+             FROM blobs AS keys
+             JOIN {table} AS facts ON facts.blob_id = keys.id
+             WHERE keys.lang = ? AND keys.blob_oid IN ({placeholders})
+             ORDER BY keys.blob_oid, facts.unit_key, facts.ordinal"
         );
         let params = chunk_params(lang, chunk);
         let mut stmt = conn.prepare_cached(&sql)?;
@@ -9917,10 +10316,11 @@ fn read_signature_metadata_bulk(
         let placeholders = chunk_placeholders(chunk);
         let columns = signature_metadata_value_columns_sql("metadata");
         let sql = format!(
-            "SELECT metadata.blob_oid, metadata.unit_key, {columns}
-             FROM unit_signature_metadata AS metadata
-             WHERE metadata.lang = ? AND metadata.blob_oid IN ({placeholders})
-             ORDER BY metadata.blob_oid, metadata.unit_key, metadata.ordinal"
+            "SELECT keys.blob_oid, metadata.unit_key, {columns}
+             FROM blobs AS keys
+             JOIN unit_signature_metadata AS metadata ON metadata.blob_id = keys.id
+             WHERE keys.lang = ? AND keys.blob_oid IN ({placeholders})
+             ORDER BY keys.blob_oid, metadata.unit_key, metadata.ordinal"
         );
         let params = chunk_params(lang, chunk);
         let mut stmt = conn.prepare_cached(&sql)?;
@@ -9951,9 +10351,11 @@ fn read_cpp_template_metadata_bulk(
         }
         let placeholders = chunk_placeholders(chunk);
         let sql = format!(
-            "SELECT blob_oid, unit_key, metadata FROM unit_cpp_template_metadata
-             WHERE lang = ? AND blob_oid IN ({placeholders})
-             ORDER BY blob_oid, unit_key"
+            "SELECT keys.blob_oid, facts.unit_key, facts.metadata
+             FROM blobs AS keys
+             JOIN unit_cpp_template_metadata AS facts ON facts.blob_id = keys.id
+             WHERE keys.lang = ? AND keys.blob_oid IN ({placeholders})
+             ORDER BY keys.blob_oid, facts.unit_key"
         );
         let params = chunk_params(lang, chunk);
         let mut stmt = conn.prepare_cached(&sql)?;
@@ -9972,6 +10374,24 @@ fn read_cpp_template_metadata_bulk(
     Ok(out)
 }
 
+/// The bulk range read, as one builder so the EXPLAIN QUERY PLAN pin cannot
+/// drift from the statement the hydration path runs.
+///
+/// This is the shape every bulk fact reader uses: seek `blobs` once per
+/// requested OID on `UNIQUE(blob_oid, lang)`, then range-scan the fact table on
+/// the interned id. The unique index carries the rowid, and the rowid IS the
+/// id, so the seek is covering and never reads the `blobs` table itself.
+fn ranges_bulk_sql(placeholders: &str) -> String {
+    format!(
+        "SELECT keys.blob_oid, facts.unit_key, facts.start_byte, facts.end_byte,
+                facts.start_line, facts.end_line
+         FROM blobs AS keys
+         JOIN unit_ranges AS facts ON facts.blob_id = keys.id
+         WHERE keys.lang = ? AND keys.blob_oid IN ({placeholders})
+         ORDER BY keys.blob_oid, facts.unit_key, facts.ordinal"
+    )
+}
+
 fn read_ranges_bulk(conn: &Connection, lang: &str, oids: &[String]) -> Result<RangeRows> {
     let mut out: RangeRows = HashMap::default();
     for chunk in oids.chunks(900) {
@@ -9979,12 +10399,7 @@ fn read_ranges_bulk(conn: &Connection, lang: &str, oids: &[String]) -> Result<Ra
             continue;
         }
         let placeholders = chunk_placeholders(chunk);
-        let sql = format!(
-            "SELECT blob_oid, unit_key, start_byte, end_byte, start_line, end_line
-             FROM unit_ranges
-             WHERE lang = ? AND blob_oid IN ({placeholders})
-             ORDER BY blob_oid, unit_key, ordinal"
-        );
+        let sql = ranges_bulk_sql(&placeholders);
         let params = chunk_params(lang, chunk);
         let mut stmt = conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
@@ -10019,9 +10434,11 @@ fn read_children_bulk(
         }
         let placeholders = chunk_placeholders(chunk);
         let sql = format!(
-            "SELECT blob_oid, parent_key, child_key FROM unit_children
-             WHERE lang = ? AND blob_oid IN ({placeholders})
-             ORDER BY blob_oid, parent_key, ordinal"
+            "SELECT keys.blob_oid, facts.parent_key, facts.child_key
+             FROM blobs AS keys
+             JOIN unit_children AS facts ON facts.blob_id = keys.id
+             WHERE keys.lang = ? AND keys.blob_oid IN ({placeholders})
+             ORDER BY keys.blob_oid, facts.parent_key, facts.ordinal"
         );
         let params = chunk_params(lang, chunk);
         let mut stmt = conn.prepare_cached(&sql)?;
@@ -10052,9 +10469,11 @@ fn read_ruby_method_dispatch_modes_bulk(
         }
         let placeholders = chunk_placeholders(chunk);
         let sql = format!(
-            "SELECT blob_oid, unit_key, mode FROM ruby_method_dispatch_modes
-             WHERE lang = ? AND blob_oid IN ({placeholders})
-             ORDER BY blob_oid, unit_key"
+            "SELECT keys.blob_oid, facts.unit_key, facts.mode
+             FROM blobs AS keys
+             JOIN ruby_method_dispatch_modes AS facts ON facts.blob_id = keys.id
+             WHERE keys.lang = ? AND keys.blob_oid IN ({placeholders})
+             ORDER BY keys.blob_oid, facts.unit_key"
         );
         let params = chunk_params(lang, chunk);
         let mut stmt = conn.prepare_cached(&sql)?;
@@ -10085,9 +10504,11 @@ fn read_scala_traits_bulk(
         }
         let placeholders = chunk_placeholders(chunk);
         let sql = format!(
-            "SELECT blob_oid, unit_key FROM scala_traits
-             WHERE lang = ? AND blob_oid IN ({placeholders})
-             ORDER BY blob_oid, unit_key"
+            "SELECT keys.blob_oid, facts.unit_key
+             FROM blobs AS keys
+             JOIN scala_traits AS facts ON facts.blob_id = keys.id
+             WHERE keys.lang = ? AND keys.blob_oid IN ({placeholders})
+             ORDER BY keys.blob_oid, facts.unit_key"
         );
         let params = chunk_params(lang, chunk);
         let mut stmt = conn.prepare_cached(&sql)?;
@@ -10445,6 +10866,7 @@ impl CandidateRowContainer for CandidatePrimaryRangeRow {
     fn with_hydrated_fq(self, fq: Option<RelationalUnitFq>) -> Self::Hydrated {
         CandidatePrimaryRangeRow {
             candidate: candidate_with_hydrated_fq(self.candidate, fq),
+            in_test_region: self.in_test_region,
             primary_range: self.primary_range,
         }
     }
@@ -10503,6 +10925,29 @@ fn padded_candidate_key_arity(len: usize) -> usize {
         .unwrap_or(LADDER[LADDER.len() - 1])
 }
 
+/// `NOT INDEXED` is the whole point of this function's shape, and removing it
+/// costs hours (issue #2794).
+///
+/// `code_unit_fq_segments` is `WITHOUT ROWID` on `(blob_id, unit_key,
+/// seg_ordinal)` and carries no secondary index, so the join above is a
+/// primary-key prefix seek and there is nothing else here for the planner to
+/// choose. It chose something else anyway. From the 256-key rung of
+/// [`padded_candidate_key_arity`] upward -- that is, on every full chunk --
+/// SQLite 3.53 stops seeking the primary key and instead builds an AUTOMATIC
+/// COVERING INDEX on `segments(unit_key)`, over the whole table, *per
+/// execution*. On dotnet/runtime that is a transient index over 3,842,193 rows
+/// rebuilt 2,007 times inside one `all_declarations` call, which is where
+/// `file_usage_graph.prefetch_targets` spent most of its time even after the
+/// wide exact-names view stopped scanning `code_units`: a `balance_nonroot` and
+/// `defragmentPage` storm at 100% of one core, with flat RSS because each index
+/// is built and dropped again.
+///
+/// `NOT INDEXED` forbids exactly that, and nothing else: the table has no index
+/// to lose, and its `WITHOUT ROWID` primary key is the table itself, so the
+/// seek survives. `hydration_chunks_seek_the_segment_primary_key` pins every
+/// rung of the ladder. Note that older SQLite builds plan this correctly, so a
+/// check against the system `sqlite3` will not reproduce the defect; the pin
+/// runs through the bundled engine the product ships.
 fn candidate_fq_segments_sql(padded_arity: usize) -> String {
     let values = std::iter::repeat_n("(?, ?, ?, ?)", padded_arity)
         .collect::<Vec<_>>()
@@ -10512,9 +10957,10 @@ fn candidate_fq_segments_sql(padded_arity: usize) -> String {
          SELECT requested.request_ordinal, segments.seg_ordinal,
                 segments.seg_kind, segments.segment
          FROM requested
-         JOIN code_unit_fq_segments AS segments
-           ON segments.blob_oid = requested.blob_oid
-          AND segments.lang = requested.lang
+         JOIN blobs AS keys
+           ON keys.blob_oid = requested.blob_oid AND keys.lang = requested.lang
+         JOIN code_unit_fq_segments AS segments NOT INDEXED
+           ON segments.blob_id = keys.id
           AND segments.unit_key = requested.unit_key"
     )
 }
@@ -10694,12 +11140,13 @@ fn definition_order_candidate_row_from_row(
 fn candidate_primary_range_row_from_row(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<CandidatePrimaryRangeRow> {
-    // The relational FQ header occupies 12..=18; the range follows at 19..=22.
+    // The relational FQ header occupies 12..=18; test-region evidence is 19
+    // and the range follows at 20..=23.
     let primary_range = match (
-        row.get::<_, Option<i64>>(19)?,
         row.get::<_, Option<i64>>(20)?,
         row.get::<_, Option<i64>>(21)?,
         row.get::<_, Option<i64>>(22)?,
+        row.get::<_, Option<i64>>(23)?,
     ) {
         (Some(start_byte), Some(end_byte), Some(start_line), Some(end_line)) => Some(Range {
             start_byte: i64_to_usize(start_byte).map_err(rusqlite_error_from_store)?,
@@ -10711,6 +11158,7 @@ fn candidate_primary_range_row_from_row(
     };
     Ok(CandidatePrimaryRangeRow {
         candidate: candidate_row_from_row(row)?,
+        in_test_region: row.get::<_, i64>(19)? != 0,
         primary_range,
     })
 }
@@ -10792,11 +11240,12 @@ where
     Ok(out)
 }
 
-/// The full search-candidate projection, parameterized by its row predicate so
-/// the by-key hydration and the whole-language enumeration cannot drift apart.
-fn search_candidate_sql(predicate: &str) -> String {
+/// The full search-candidate projection, parameterized by its source and row
+/// predicate so the by-key hydration and the whole-language enumeration share
+/// their columns and completion predicate without sharing a join order.
+fn search_candidate_projection_sql(prefix: &str, from: &str, predicate: &str) -> String {
     format!(
-        "SELECT units.blob_oid, units.lang, units.unit_key, units.kind, units.short_name,
+        "{prefix}SELECT keys.blob_oid, units.lang, units.unit_key, units.kind, units.short_name,
                 units.content_qualifier, units.signature, units.synthetic,
                 units.is_type_alias, units.top_level_ordinal, units.in_declarations,
                 units.in_definition_lookup, units.fq_anchor_kind, units.fq_anchor_pop,
@@ -10805,16 +11254,67 @@ fn search_candidate_sql(predicate: &str) -> String {
                 units.normalized_fqn_tail, units.in_test_region,
                 primary_range.start_byte, primary_range.end_byte,
                 primary_range.start_line, primary_range.end_line
-         FROM code_units AS units
-         JOIN blob_meta AS meta
-           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
-         LEFT JOIN unit_ranges AS primary_range
-           ON primary_range.blob_oid = units.blob_oid
-          AND primary_range.lang = units.lang
-          AND primary_range.unit_key = units.unit_key
-          AND primary_range.ordinal = 0
+         {from}
          WHERE {predicate} AND units.in_declarations = 1
            AND {PARSED_BLOB_COMPLETE_CONDITION}"
+    )
+}
+
+fn search_candidate_sql(predicate: &str) -> String {
+    search_candidate_projection_sql(
+        "",
+        "FROM code_units AS units
+         JOIN blobs AS keys
+           ON keys.id = units.blob_id
+         JOIN blob_meta AS meta
+           ON meta.blob_id = units.blob_id
+         LEFT JOIN unit_ranges AS primary_range
+           ON primary_range.blob_id = units.blob_id
+          AND primary_range.unit_key = units.unit_key
+          AND primary_range.ordinal = 0",
+        predicate,
+    )
+}
+
+/// Fixed arities for the tuple list used by key hydration. Padding with NULLs
+/// keeps a small set of prepared SQL shapes; the inner joins discard padding.
+const SEARCH_CANDIDATE_KEY_BATCH_SIZE: usize = 400;
+
+fn padded_search_candidate_key_arity(len: usize) -> usize {
+    const LADDER: [usize; 4] = [16, 64, 256, SEARCH_CANDIDATE_KEY_BATCH_SIZE];
+    LADDER
+        .iter()
+        .copied()
+        .find(|&arity| arity >= len)
+        .unwrap_or(SEARCH_CANDIDATE_KEY_BATCH_SIZE)
+}
+
+/// The by-key path is driven by an exact `(lang, blob_oid, unit_key)` tuple
+/// set. The requested CTE is the outer relation, so SQLite seeks each blob
+/// through its unique OID/language index and each declaration through the
+/// `(blob_id, unit_key)` primary key. This avoids both the language-wide index
+/// scan and reading every declaration in a matched blob before filtering.
+fn search_candidate_key_set_sql(padded_arity: usize) -> String {
+    let values = std::iter::repeat_n("(?, ?, ?)", padded_arity)
+        .collect::<Vec<_>>()
+        .join(", ");
+    search_candidate_projection_sql(
+        &format!("WITH requested(lang, blob_oid, unit_key) AS (VALUES {values})\n"),
+        "FROM requested
+         JOIN blobs AS keys
+           ON keys.blob_oid = requested.blob_oid
+          AND keys.lang = requested.lang
+         JOIN code_units AS units
+           ON units.blob_id = keys.id
+          AND units.lang = requested.lang
+          AND units.unit_key = requested.unit_key
+         JOIN blob_meta AS meta
+           ON meta.blob_id = units.blob_id
+         LEFT JOIN unit_ranges AS primary_range
+           ON primary_range.blob_id = units.blob_id
+          AND primary_range.unit_key = units.unit_key
+          AND primary_range.ordinal = 0",
+        "1 = 1",
     )
 }
 
@@ -10823,7 +11323,7 @@ fn search_candidate_rows_by_lang_conn(
     lang: &str,
 ) -> Result<Vec<HydratedSearchCandidateRow>> {
     let sql = format!(
-        "{} ORDER BY units.blob_oid, units.unit_key",
+        "{} ORDER BY keys.blob_oid, units.unit_key",
         search_candidate_sql("units.lang = ?1")
     );
     let mut stmt = conn.prepare_cached(&sql)?;
@@ -10926,12 +11426,14 @@ fn search_candidate_name_rows_sql(
         .join(" ");
     let sql = format!(
         "SELECT CASE units.lang {language_cases} END,
-                units.blob_oid, units.unit_key, units.short_name, units.content_qualifier
+                keys.blob_oid, units.unit_key, units.short_name, units.content_qualifier
          FROM temp.active_blob_oids AS active
+         CROSS JOIN blobs AS keys
+           ON keys.blob_oid = active.blob_oid
          CROSS JOIN code_units AS units
-           ON units.blob_oid = active.blob_oid
+           ON units.blob_id = keys.id
          JOIN blob_meta AS meta
-           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
+           ON meta.blob_id = units.blob_id
          WHERE units.lang IN ({}) AND units.in_declarations = 1
            AND {PARSED_BLOB_COMPLETE_CONDITION}{literal_predicate}",
         language_parameters.join(", ")
@@ -11021,9 +11523,10 @@ const REVERSE_IMPORT_CANDIDATE_BLOBS_SQL: &str = "SELECT DISTINCT files.rel_path
        INDEXED BY idx_import_path_segments_by_segment
        ON segments.lang = ?1 AND segments.segment = requested.value
      JOIN import_statements AS imports
-       ON imports.blob_oid = segments.blob_oid
-      AND imports.lang = segments.lang
+       ON imports.blob_id = segments.blob_id
       AND imports.ordinal = segments.ordinal
+     JOIN blobs AS keys
+       ON keys.id = segments.blob_id
      CROSS JOIN selected_workspace_revisions AS selected
        ON selected.lang = segments.lang
      CROSS JOIN main.workspace_file_versions AS files
@@ -11031,7 +11534,7 @@ const REVERSE_IMPORT_CANDIDATE_BLOBS_SQL: &str = "SELECT DISTINCT files.rel_path
        ON files.workspace_id = selected.workspace_id
       AND files.lang = selected.lang
       AND files.generation = selected.generation
-      AND files.blob_oid = segments.blob_oid
+      AND files.blob_oid = keys.blob_oid
       AND files.valid_from <= selected.revision
       AND (files.valid_until IS NULL OR selected.revision < files.valid_until)
      WHERE requested.kind IN (0, 1)
@@ -11044,11 +11547,12 @@ const REVERSE_TYPE_CANDIDATE_BLOBS_SQL: &str = "SELECT DISTINCT files.rel_path
        INDEXED BY idx_reference_identifiers_by_identifier
        ON identifiers.lang = ?1 AND identifiers.identifier = requested.value
      JOIN blob_reference_fact_manifests AS reference_manifest
-       ON reference_manifest.blob_oid = identifiers.blob_oid
-      AND reference_manifest.lang = identifiers.lang
+       ON reference_manifest.blob_id = identifiers.blob_id
      JOIN reference_fact_epochs AS reference_epoch
        ON reference_epoch.lang = reference_manifest.lang
       AND reference_epoch.epoch = reference_manifest.epoch
+     JOIN blobs AS keys
+       ON keys.id = identifiers.blob_id
      CROSS JOIN selected_workspace_revisions AS selected
        ON selected.lang = identifiers.lang
      CROSS JOIN main.workspace_file_versions AS files
@@ -11056,7 +11560,7 @@ const REVERSE_TYPE_CANDIDATE_BLOBS_SQL: &str = "SELECT DISTINCT files.rel_path
        ON files.workspace_id = selected.workspace_id
       AND files.lang = selected.lang
       AND files.generation = selected.generation
-      AND files.blob_oid = identifiers.blob_oid
+      AND files.blob_oid = keys.blob_oid
       AND files.valid_from <= selected.revision
       AND (files.valid_until IS NULL OR selected.revision < files.valid_until)
      WHERE requested.kind = 2";
@@ -11067,11 +11571,12 @@ const REVERSE_IDENTIFIER_CANDIDATE_PATHS_SQL: &str = "SELECT DISTINCT files.rel_
        INDEXED BY idx_reference_identifiers_by_identifier
        ON identifiers.lang = ?1 AND identifiers.identifier = requested.value
      JOIN blob_reference_fact_manifests AS reference_manifest
-       ON reference_manifest.blob_oid = identifiers.blob_oid
-      AND reference_manifest.lang = identifiers.lang
+       ON reference_manifest.blob_id = identifiers.blob_id
      JOIN reference_fact_epochs AS reference_epoch
        ON reference_epoch.lang = reference_manifest.lang
       AND reference_epoch.epoch = reference_manifest.epoch
+     JOIN blobs AS keys
+       ON keys.id = identifiers.blob_id
      CROSS JOIN selected_workspace_revisions AS selected
        ON selected.lang = identifiers.lang
      CROSS JOIN main.workspace_file_versions AS files
@@ -11079,7 +11584,7 @@ const REVERSE_IDENTIFIER_CANDIDATE_PATHS_SQL: &str = "SELECT DISTINCT files.rel_
        ON files.workspace_id = selected.workspace_id
       AND files.lang = selected.lang
       AND files.generation = selected.generation
-      AND files.blob_oid = identifiers.blob_oid
+      AND files.blob_oid = keys.blob_oid
       AND files.valid_from <= selected.revision
       AND (files.valid_until IS NULL OR selected.revision < files.valid_until)
      WHERE requested.kind = 2";
@@ -11119,7 +11624,7 @@ fn usage_fact_rows_by_lang_conn(
 ) -> Result<Vec<HydratedUsageFactRow>> {
     let metadata_columns = signature_metadata_value_columns_sql("metadata");
     let sql = format!(
-        "SELECT units.blob_oid, units.lang, units.unit_key, units.kind, units.short_name,
+        "SELECT keys.blob_oid, units.lang, units.unit_key, units.kind, units.short_name,
                 units.content_qualifier, units.signature, units.synthetic,
                 units.is_type_alias, units.top_level_ordinal, units.in_declarations,
                 units.in_definition_lookup, units.fq_anchor_kind, units.fq_anchor_pop,
@@ -11128,21 +11633,21 @@ fn usage_fact_rows_by_lang_conn(
                 units.normalized_fqn_tail, signature.text,
                 {metadata_columns}
          FROM code_units AS units
+         JOIN blobs AS keys
+           ON keys.id = units.blob_id
          JOIN blob_meta AS meta
-           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
+           ON meta.blob_id = units.blob_id
          LEFT JOIN unit_signatures AS signature
-           ON signature.blob_oid = units.blob_oid
-          AND signature.lang = units.lang
+           ON signature.blob_id = units.blob_id
           AND signature.unit_key = units.unit_key
           AND signature.ordinal = 0
          LEFT JOIN unit_signature_metadata AS metadata
-           ON metadata.blob_oid = units.blob_oid
-          AND metadata.lang = units.lang
+           ON metadata.blob_id = units.blob_id
           AND metadata.unit_key = units.unit_key
           AND metadata.ordinal = 0
          WHERE units.lang = ?1 AND units.in_declarations = 1
            AND {PARSED_BLOB_COMPLETE_CONDITION}
-         ORDER BY units.blob_oid, units.unit_key"
+         ORDER BY keys.blob_oid, units.unit_key"
     );
     let mut stmt = conn.prepare_cached(&sql)?;
     let rows = collect_usage_fact_rows(stmt.query_map([lang], usage_fact_row_from_row)?)?;
@@ -11165,15 +11670,15 @@ fn primary_ranges_by_unit_for_lang_conn(
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            "SELECT ranges.blob_oid, ranges.unit_key, ranges.start_byte, ranges.end_byte,
-                    ranges.start_line, ranges.end_line
-             FROM unit_ranges AS ranges
-             JOIN blobs AS active_blob
-               ON active_blob.blob_oid = ranges.blob_oid AND active_blob.lang = ranges.lang
-             LEFT JOIN analysis_epochs AS active_epoch ON active_epoch.lang = active_blob.lang
-             WHERE ranges.lang = ? AND ranges.ordinal = 0
-               AND ranges.blob_oid IN ({placeholders})
-               AND active_blob.generation = COALESCE(active_epoch.generation, 0)"
+            "SELECT keys.blob_oid, ranges.unit_key, ranges.start_byte,
+                    ranges.end_byte, ranges.start_line, ranges.end_line
+             FROM blobs AS keys
+             JOIN unit_ranges AS ranges
+               ON ranges.blob_id = keys.id AND ranges.ordinal = 0
+             LEFT JOIN analysis_epochs AS active_epoch ON active_epoch.lang = keys.lang
+             WHERE keys.lang = ?
+               AND keys.blob_oid IN ({placeholders})
+               AND keys.generation = COALESCE(active_epoch.generation, 0)"
         );
         let mut parameters = Vec::with_capacity(chunk.len() + 1);
         parameters.push(lang.to_string());
@@ -11220,21 +11725,22 @@ fn definition_lookup_candidate_rows_by_oids_conn(
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            "SELECT units.blob_oid, units.lang, units.unit_key, units.kind, units.short_name,
+            "SELECT keys.blob_oid, units.lang, units.unit_key, units.kind, units.short_name,
                     units.content_qualifier, units.signature, units.synthetic,
                     units.is_type_alias, units.top_level_ordinal, units.in_declarations,
                     units.in_definition_lookup, units.fq_anchor_kind, units.fq_anchor_pop,
                     units.fq_package_tail_segments, units.fq_segment_count,
                     units.exact_fqn_tail, units.fq_segment_bytes,
                     units.normalized_fqn_tail
-             FROM code_units AS units
+             FROM blobs AS keys
+             JOIN code_units AS units ON units.blob_id = keys.id
              JOIN blob_meta AS meta
-               ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
-             WHERE units.lang = ?
+               ON meta.blob_id = units.blob_id
+             WHERE keys.lang = ?
                AND (units.in_declarations = 1 OR units.in_definition_lookup = 1)
-               AND units.blob_oid IN ({placeholders})
+               AND keys.blob_oid IN ({placeholders})
                AND {PARSED_BLOB_COMPLETE_CONDITION}
-             ORDER BY units.blob_oid, units.unit_key"
+             ORDER BY keys.blob_oid, units.unit_key"
         );
         let mut parameters = Vec::with_capacity(chunk.len() + 1);
         parameters.push(lang.to_string());
@@ -11263,11 +11769,12 @@ fn blobs_with_structured_imports_conn(
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            "SELECT DISTINCT imports.blob_oid
-             FROM import_statements AS imports
+            "SELECT DISTINCT keys.blob_oid
+             FROM blobs AS keys
+             JOIN import_statements AS imports ON imports.blob_id = keys.id
              JOIN blob_meta AS meta
-               ON meta.blob_oid = imports.blob_oid AND meta.lang = imports.lang
-             WHERE imports.lang = ? AND imports.blob_oid IN ({placeholders})
+               ON meta.blob_id = imports.blob_id
+             WHERE keys.lang = ? AND keys.blob_oid IN ({placeholders})
                AND {PARSED_BLOB_COMPLETE_CONDITION}"
         );
         let mut parameters = Vec::with_capacity(chunk.len() + 1);
@@ -11299,10 +11806,11 @@ fn read_unit_rows<A: LanguageAdapter>(
     file: &ProjectFile,
 ) -> Result<Vec<UnitRow>> {
     let sql = format!(
-        "SELECT {RAW_UNIT_COLUMNS}
-         FROM code_units
-         WHERE blob_oid = ?1 AND lang = ?2
-         ORDER BY unit_key"
+        "SELECT keys.blob_oid, {RAW_UNIT_COLUMNS}
+         FROM blobs AS keys
+         JOIN code_units AS units ON units.blob_id = keys.id
+         WHERE keys.blob_oid = ?1 AND keys.lang = ?2
+         ORDER BY units.unit_key"
     );
     let mut stmt = conn.prepare_cached(&sql)?;
     let mapped = stmt.query_map(params![oid, lang], |row| raw_unit_row_from_row(row, 0))?;
@@ -11338,7 +11846,7 @@ fn read_unit_rows<A: LanguageAdapter>(
 fn read_import_infos(conn: &Connection, oid: &str, lang: &str) -> Result<Vec<ImportInfo>> {
     let sql = format!(
         "SELECT {IMPORT_STATEMENT_COLUMNS} FROM import_statements
-         WHERE blob_oid = ?1 AND lang = ?2
+         WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
          ORDER BY ordinal"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -11363,7 +11871,7 @@ fn read_materialization_records(
 ) -> Result<Vec<MaterializationRecord>> {
     let mut stmt = conn.prepare(
         "SELECT unit_key, payload FROM materialization_records
-         WHERE blob_oid = ?1 AND lang = ?2
+         WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
          ORDER BY ordinal",
     )?;
     let rows = stmt.query_map(params![oid, lang], |row| {
@@ -11391,7 +11899,7 @@ fn read_scala_exports(
 ) -> Result<HashMap<CodeUnit, Vec<crate::analyzer::ScalaExportInfo>>> {
     let mut stmt = conn.prepare(
         "SELECT owner_key, info FROM scala_exports
-         WHERE blob_oid = ?1 AND lang = ?2
+         WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
          ORDER BY owner_key, ordinal",
     )?;
     let rows = stmt.query_map(params![oid, lang], |row| {
@@ -11419,7 +11927,7 @@ fn read_unit_string_vec(
 ) -> Result<HashMap<CodeUnit, Vec<String>>> {
     let sql = format!(
         "SELECT unit_key, {value_column} FROM {table}
-         WHERE blob_oid = ?1 AND lang = ?2
+         WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
          ORDER BY unit_key, ordinal"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -11446,7 +11954,7 @@ fn read_signature_metadata(
     let mut stmt = conn.prepare(&format!(
         "SELECT metadata.unit_key, {columns}
          FROM unit_signature_metadata AS metadata
-         WHERE metadata.blob_oid = ?1 AND metadata.lang = ?2
+         WHERE metadata.blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
          ORDER BY metadata.unit_key, metadata.ordinal"
     ))?;
     let rows = stmt.query_map(params![oid, lang], |row| {
@@ -11516,18 +12024,16 @@ fn direct_children_limited_candidate_sql() -> String {
         "child",
         "FROM code_units AS owner
          JOIN unit_children AS edge
-           ON edge.blob_oid = owner.blob_oid
-          AND edge.lang = owner.lang
+           ON edge.blob_id = owner.blob_id
           AND edge.parent_key = owner.unit_key
          JOIN code_units AS child
-           ON child.blob_oid = edge.blob_oid
-          AND child.lang = edge.lang
+           ON child.blob_id = edge.blob_id
           AND child.unit_key = edge.child_key
+         JOIN blobs AS keys
+           ON keys.id = child.blob_id
          JOIN blob_meta AS meta
-           ON meta.blob_oid = child.blob_oid
-          AND meta.lang = child.lang",
-        "owner.blob_oid = ?1
-         AND owner.lang = ?2
+           ON meta.blob_id = child.blob_id",
+        "owner.blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
          AND (owner.exact_fqn = ?3 OR owner.exact_fqn IS NULL)
          AND owner.kind = ?4
          AND owner.short_name = ?5
@@ -11549,13 +12055,11 @@ fn signature_metadata_for_unit_limited_sql() -> &'static str {
             "SELECT {row_bytes}, {columns}
          FROM code_units AS units
          JOIN blob_meta AS meta
-           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
+           ON meta.blob_id = units.blob_id
          JOIN unit_signature_metadata AS metadata
-           ON metadata.blob_oid = units.blob_oid
-          AND metadata.lang = units.lang
+           ON metadata.blob_id = units.blob_id
           AND metadata.unit_key = units.unit_key
-         WHERE units.blob_oid = ?1
-           AND units.lang = ?2
+         WHERE units.blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
            AND (units.exact_fqn = ?3 OR units.exact_fqn IS NULL)
            AND units.kind = ?4
            AND units.short_name = ?5
@@ -11632,13 +12136,11 @@ fn signatures_for_unit_limited_conn(
                 END
          FROM code_units AS units
          JOIN blob_meta AS meta
-           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
+           ON meta.blob_id = units.blob_id
          JOIN unit_signatures AS signatures
-           ON signatures.blob_oid = units.blob_oid
-          AND signatures.lang = units.lang
+           ON signatures.blob_id = units.blob_id
           AND signatures.unit_key = units.unit_key
-         WHERE units.blob_oid = ?1
-           AND units.lang = ?2
+         WHERE units.blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
            AND (units.exact_fqn = ?3 OR units.exact_fqn IS NULL)
            AND units.kind = ?4
            AND units.short_name = ?5
@@ -11681,13 +12183,11 @@ fn ruby_method_dispatch_modes_for_unit_limited_conn(
         "SELECT modes.mode
          FROM code_units AS units
          JOIN blob_meta AS meta
-           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
+           ON meta.blob_id = units.blob_id
          JOIN ruby_method_dispatch_modes AS modes
-           ON modes.blob_oid = units.blob_oid
-          AND modes.lang = units.lang
+           ON modes.blob_id = units.blob_id
           AND modes.unit_key = units.unit_key
-         WHERE units.blob_oid = ?1
-           AND units.lang = ?2
+         WHERE units.blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
            AND (units.exact_fqn = ?3 OR units.exact_fqn IS NULL)
            AND units.kind = ?4
            AND units.short_name = ?5
@@ -11773,13 +12273,11 @@ fn raw_supertypes_for_unit_limited_conn(
                 END
          FROM code_units AS units
          JOIN blob_meta AS meta
-           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
+           ON meta.blob_id = units.blob_id
          JOIN unit_supertypes AS supertypes
-           ON supertypes.blob_oid = units.blob_oid
-          AND supertypes.lang = units.lang
+           ON supertypes.blob_id = units.blob_id
           AND supertypes.unit_key = units.unit_key
-         WHERE units.blob_oid = ?1
-           AND units.lang = ?2
+         WHERE units.blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
            AND (units.exact_fqn = ?3 OR units.exact_fqn IS NULL)
            AND units.kind = ?4
            AND units.short_name = ?5
@@ -11827,13 +12325,11 @@ fn supertype_lookup_paths_for_unit_limited_conn(
                 END
          FROM code_units AS units
          JOIN blob_meta AS meta
-           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
+           ON meta.blob_id = units.blob_id
          JOIN unit_supertypes AS supertypes
-           ON supertypes.blob_oid = units.blob_oid
-          AND supertypes.lang = units.lang
+           ON supertypes.blob_id = units.blob_id
           AND supertypes.unit_key = units.unit_key
-         WHERE units.blob_oid = ?1
-           AND units.lang = ?2
+         WHERE units.blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
            AND (units.exact_fqn = ?3 OR units.exact_fqn IS NULL)
            AND units.kind = ?4
            AND units.short_name = ?5
@@ -11869,7 +12365,7 @@ fn read_cpp_template_metadata(
 ) -> Result<HashMap<CodeUnit, CppTemplateMetadata>> {
     let mut stmt = conn.prepare(
         "SELECT unit_key, metadata FROM unit_cpp_template_metadata
-         WHERE blob_oid = ?1 AND lang = ?2
+         WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
          ORDER BY unit_key",
     )?;
     let rows = stmt.query_map(params![oid, lang], |row| {
@@ -11899,13 +12395,11 @@ fn ranges_for_unit_limited_conn(
         "SELECT ranges.start_byte, ranges.end_byte, ranges.start_line, ranges.end_line
          FROM code_units AS units
          JOIN blob_meta AS meta
-           ON meta.blob_oid = units.blob_oid AND meta.lang = units.lang
+           ON meta.blob_id = units.blob_id
          JOIN unit_ranges AS ranges
-           ON ranges.blob_oid = units.blob_oid
-          AND ranges.lang = units.lang
+           ON ranges.blob_id = units.blob_id
           AND ranges.unit_key = units.unit_key
-         WHERE units.blob_oid = ?1
-           AND units.lang = ?2
+         WHERE units.blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
            AND (units.exact_fqn = ?3 OR units.exact_fqn IS NULL)
            AND units.kind = ?4
            AND units.short_name = ?5
@@ -11967,7 +12461,7 @@ fn read_ranges(
     let mut stmt = conn.prepare(
         "SELECT unit_key, start_byte, end_byte, start_line, end_line
          FROM unit_ranges
-         WHERE blob_oid = ?1 AND lang = ?2
+         WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
          ORDER BY unit_key, ordinal",
     )?;
     let rows = stmt.query_map(params![oid, lang], |row| {
@@ -12002,7 +12496,7 @@ fn read_children(
 ) -> Result<HashMap<CodeUnit, Vec<CodeUnit>>> {
     let mut stmt = conn.prepare(
         "SELECT parent_key, child_key FROM unit_children
-         WHERE blob_oid = ?1 AND lang = ?2
+         WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
          ORDER BY parent_key, ordinal",
     )?;
     let rows = stmt.query_map(params![oid, lang], |row| {
@@ -12029,7 +12523,7 @@ fn read_ruby_method_dispatch_modes(
 ) -> Result<HashMap<CodeUnit, RubyMethodDispatchMode>> {
     let mut stmt = conn.prepare(
         "SELECT unit_key, mode FROM ruby_method_dispatch_modes
-         WHERE blob_oid = ?1 AND lang = ?2
+         WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
          ORDER BY unit_key",
     )?;
     let rows = stmt.query_map(params![oid, lang], |row| {
@@ -12053,7 +12547,7 @@ fn read_scala_traits(
 ) -> Result<HashSet<CodeUnit>> {
     let mut stmt = conn.prepare(
         "SELECT unit_key FROM scala_traits
-         WHERE blob_oid = ?1 AND lang = ?2
+         WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
          ORDER BY unit_key",
     )?;
     let rows = stmt.query_map(params![oid, lang], |row| row.get::<_, i64>(0))?;
@@ -12205,7 +12699,7 @@ fn contains_parsed_blob_conn(
 ) -> Result<bool> {
     let sql = format!(
         "SELECT 1 FROM blob_meta AS meta
-         WHERE meta.blob_oid = ?1 AND meta.lang = ?2
+         WHERE meta.blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
            AND {condition}
          LIMIT 1"
     );
@@ -12300,40 +12794,44 @@ fn stored_blob_cascade_costs_sql(key_count: usize) -> String {
     format!(
         "WITH requested(ordinal, blob_oid, lang) AS (VALUES {requested})
          SELECT requested.ordinal,
-           blob.blob_oid IS NOT NULL,
-           meta.blob_oid IS NOT NULL,
-           CASE WHEN blob.blob_oid IS NULL THEN 0
-             WHEN meta.blob_oid IS NULL THEN 1
+           blob.id IS NOT NULL,
+           meta.blob_id IS NOT NULL,
+           CASE WHEN blob.id IS NULL THEN 0
+             WHEN meta.blob_id IS NULL THEN 1
              ELSE 2 + meta.stored_unit_count + meta.range_count + meta.signature_count
                + meta.signature_metadata_count
                + meta.supertype_count + meta.child_count
                + meta.import_statement_count + meta.type_identifier_count
                + (SELECT COUNT(*) FROM code_unit_fq_segments AS fq_segments
-                  WHERE fq_segments.blob_oid = meta.blob_oid
-                    AND fq_segments.lang = meta.lang)
+                  WHERE fq_segments.blob_id = meta.blob_id)
                + (SELECT COUNT(*) FROM unit_visibility_containers AS visibility
-                  WHERE visibility.blob_oid = meta.blob_oid
-                    AND visibility.lang = meta.lang)
+                  WHERE visibility.blob_id = meta.blob_id)
                + (SELECT COUNT(*) FROM import_path_segments AS segments
-                  WHERE segments.blob_oid = meta.blob_oid AND segments.lang = meta.lang)
+                  WHERE segments.blob_id = meta.blob_id)
                + (SELECT COUNT(*) FROM import_lexical_scopes AS scopes
-                  WHERE scopes.blob_oid = meta.blob_oid AND scopes.lang = meta.lang)
+                  WHERE scopes.blob_id = meta.blob_id)
                + (SELECT COUNT(*) FROM import_lexical_prefixes AS prefixes
-                  WHERE prefixes.blob_oid = meta.blob_oid AND prefixes.lang = meta.lang)
+                  WHERE prefixes.blob_id = meta.blob_id)
                + (SELECT COALESCE(SUM(row_count), 0) + COUNT(*)
                   FROM blob_optional_fact_manifest AS manifest
-                  WHERE manifest.blob_oid = meta.blob_oid AND manifest.lang = meta.lang)
-               + (SELECT COUNT(*) FROM structural_facts_snapshots AS snapshots
-                  WHERE snapshots.blob_oid = meta.blob_oid AND snapshots.lang = meta.lang)
-               + CASE WHEN costs.blob_oid IS NULL THEN 0 ELSE 1 END END,
+                  WHERE manifest.blob_id = meta.blob_id)
+               + (SELECT COUNT(*) FROM structural_fact_manifests AS facts
+                  WHERE facts.blob_id = meta.blob_id)
+               + (SELECT COUNT(*) FROM structural_fact_nodes AS facts
+                  WHERE facts.blob_id = meta.blob_id)
+               + (SELECT COUNT(*) FROM structural_fact_roles AS facts
+                  WHERE facts.blob_id = meta.blob_id)
+               + (SELECT COUNT(*) FROM structural_fact_occurrence_roles AS facts
+                  WHERE facts.blob_id = meta.blob_id)
+               + CASE WHEN costs.blob_id IS NULL THEN 0 ELSE 1 END END,
            costs.payload_bytes
          FROM requested
          LEFT JOIN blobs AS blob
            ON blob.blob_oid = requested.blob_oid AND blob.lang = requested.lang
          LEFT JOIN blob_meta AS meta
-           ON meta.blob_oid = blob.blob_oid AND meta.lang = blob.lang
+           ON meta.blob_id = blob.id
          LEFT JOIN blob_payload_costs AS costs
-           ON costs.blob_oid = meta.blob_oid AND costs.lang = meta.lang"
+           ON costs.blob_id = meta.blob_id"
     )
 }
 
@@ -12361,29 +12859,33 @@ fn persisted_blob_mutation_cost_fallback_sql() -> &'static str {
         let signature_metadata_bytes = signature_metadata_row_bytes_sql("unit_signature_metadata");
         format!(
             "SELECT
-       1 + CASE WHEN meta.blob_oid IS NULL THEN 0 ELSE
+       1 + CASE WHEN meta.blob_id IS NULL THEN 0 ELSE
          1 + meta.stored_unit_count + meta.range_count + meta.signature_count
            + meta.signature_metadata_count
            + meta.supertype_count + meta.child_count
            + meta.import_statement_count + meta.type_identifier_count
            + (SELECT COUNT(*) FROM code_unit_fq_segments AS fq_segments
-              WHERE fq_segments.blob_oid = meta.blob_oid
-                AND fq_segments.lang = meta.lang)
+              WHERE fq_segments.blob_id = meta.blob_id)
            + (SELECT COUNT(*) FROM unit_visibility_containers AS visibility
-              WHERE visibility.blob_oid = meta.blob_oid
-                AND visibility.lang = meta.lang)
+              WHERE visibility.blob_id = meta.blob_id)
            + (SELECT COUNT(*) FROM import_path_segments AS segments
-              WHERE segments.blob_oid = meta.blob_oid AND segments.lang = meta.lang)
+              WHERE segments.blob_id = meta.blob_id)
            + (SELECT COUNT(*) FROM import_lexical_scopes AS scopes
-              WHERE scopes.blob_oid = meta.blob_oid AND scopes.lang = meta.lang)
+              WHERE scopes.blob_id = meta.blob_id)
            + (SELECT COUNT(*) FROM import_lexical_prefixes AS prefixes
-              WHERE prefixes.blob_oid = meta.blob_oid AND prefixes.lang = meta.lang)
+              WHERE prefixes.blob_id = meta.blob_id)
            + (SELECT COALESCE(SUM(row_count), 0) + COUNT(*)
               FROM blob_optional_fact_manifest AS manifest
-              WHERE manifest.blob_oid = meta.blob_oid AND manifest.lang = meta.lang)
-           + (SELECT COUNT(*) FROM structural_facts_snapshots AS snapshots
-              WHERE snapshots.blob_oid = meta.blob_oid AND snapshots.lang = meta.lang) END,
-       CASE WHEN meta.blob_oid IS NULL THEN 0 ELSE
+              WHERE manifest.blob_id = meta.blob_id)
+           + (SELECT COUNT(*) FROM structural_fact_manifests AS facts
+              WHERE facts.blob_id = meta.blob_id)
+           + (SELECT COUNT(*) FROM structural_fact_nodes AS facts
+              WHERE facts.blob_id = meta.blob_id)
+           + (SELECT COUNT(*) FROM structural_fact_roles AS facts
+              WHERE facts.blob_id = meta.blob_id)
+           + (SELECT COUNT(*) FROM structural_fact_occurrence_roles AS facts
+              WHERE facts.blob_id = meta.blob_id) END,
+       CASE WHEN meta.blob_id IS NULL THEN 0 ELSE
          length(CAST(meta.content_package AS BLOB))
            + COALESCE((SELECT SUM(
                length(CAST(short_name AS BLOB)) + length(CAST(identifier AS BLOB))
@@ -12398,42 +12900,53 @@ fn persisted_blob_mutation_cost_fallback_sql() -> &'static str {
                + COALESCE(length(CAST(exact_parent_fqn_tail AS BLOB)), 0)
                + COALESCE(length(CAST(normalized_parent_fqn_tail AS BLOB)), 0)
                + COALESCE(length(CAST(package_fqn_tail AS BLOB)), 0)
-             ) FROM code_units WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
+             ) FROM code_units WHERE blob_id = blob.id), 0)
            + COALESCE((SELECT SUM(length(CAST(seg_kind AS BLOB))
                + length(CAST(segment AS BLOB))) FROM code_unit_fq_segments
-               WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
+               WHERE blob_id = blob.id), 0)
            + COALESCE((SELECT SUM(length(CAST(exact_container_tail AS BLOB))
                + COALESCE(length(CAST(normalized_container_tail AS BLOB)), 0))
                FROM unit_visibility_containers
-               WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
+               WHERE blob_id = blob.id), 0)
            + COALESCE((SELECT SUM(length(CAST(text AS BLOB))) FROM unit_signatures
-               WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
+               WHERE blob_id = blob.id), 0)
            + COALESCE((SELECT SUM({signature_metadata_bytes}) FROM unit_signature_metadata
-               WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
+               WHERE blob_id = blob.id), 0)
            + COALESCE((SELECT SUM(length(metadata)) FROM unit_cpp_template_metadata
-               WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
+               WHERE blob_id = blob.id), 0)
            + COALESCE((SELECT SUM(length(CAST(raw AS BLOB))
                + length(CAST(lookup_path AS BLOB))) FROM unit_supertypes
-               WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
+               WHERE blob_id = blob.id), 0)
            + COALESCE((SELECT SUM(length(CAST(statement AS BLOB))
                + COALESCE(length(CAST(identifier AS BLOB)), 0)
                + COALESCE(length(CAST(alias AS BLOB)), 0)) FROM import_statements
-               WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
+               WHERE blob_id = blob.id), 0)
            + COALESCE((SELECT SUM(length(CAST(segment AS BLOB))) FROM import_path_segments
-               WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
+               WHERE blob_id = blob.id), 0)
            + COALESCE((SELECT SUM(length(CAST(prefix AS BLOB))) FROM import_lexical_prefixes
-               WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
+               WHERE blob_id = blob.id), 0)
            + COALESCE((SELECT SUM(length(info)) FROM scala_exports
-               WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
+               WHERE blob_id = blob.id), 0)
            + COALESCE((SELECT SUM(length(payload)) FROM materialization_records
-               WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
+               WHERE blob_id = blob.id), 0)
            + COALESCE((SELECT SUM(length(CAST(identifier AS BLOB))) FROM reference_identifiers
-               WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0)
-           + COALESCE((SELECT SUM(length(payload)) FROM structural_facts_snapshots
-               WHERE blob_oid = blob.blob_oid AND lang = blob.lang), 0) END
+               WHERE blob_id = blob.id), 0)
+           + COALESCE((SELECT SUM(
+               length(CAST(kind AS BLOB))
+                 + COALESCE(length(CAST(construct AS BLOB)), 0)
+                 + COALESCE(length(CAST(call_kind AS BLOB)), 0)
+               + COALESCE(length(CAST(call_coverage AS BLOB)), 0))
+               FROM structural_fact_nodes
+               WHERE blob_id = blob.id), 0)
+           + COALESCE((SELECT SUM(length(CAST(role AS BLOB)))
+               FROM structural_fact_roles
+               WHERE blob_id = blob.id), 0)
+           + COALESCE((SELECT SUM(length(CAST(role AS BLOB)))
+               FROM structural_fact_occurrence_roles
+               WHERE blob_id = blob.id), 0) END
      FROM blobs AS blob
      LEFT JOIN blob_meta AS meta
-       ON meta.blob_oid = blob.blob_oid AND meta.lang = blob.lang
+       ON meta.blob_id = blob.id
      WHERE blob.blob_oid = ?1 AND blob.lang = ?2"
         )
     });
@@ -12442,15 +12955,11 @@ fn persisted_blob_mutation_cost_fallback_sql() -> &'static str {
 
 fn insert_blob_payload_cost_tx(
     tx: &Transaction<'_>,
-    oid: &str,
-    lang: &str,
+    blob_id: i64,
     payload_bytes: usize,
 ) -> Result<()> {
-    tx.prepare_cached(
-        "INSERT INTO blob_payload_costs(blob_oid, lang, payload_bytes)
-         VALUES(?1, ?2, ?3)",
-    )?
-    .execute(params![oid, lang, usize_to_i64(payload_bytes)?])?;
+    tx.prepare_cached("INSERT INTO blob_payload_costs(blob_id, payload_bytes) VALUES(?1, ?2)")?
+        .execute(params![blob_id, usize_to_i64(payload_bytes)?])?;
     Ok(())
 }
 
@@ -12459,7 +12968,12 @@ fn update_blob_payload_cost_tx(tx: &Transaction<'_>, oid: &str, lang: &str) -> R
         let mut statement = tx.prepare_cached(persisted_blob_mutation_cost_fallback_sql())?;
         persisted_blob_mutation_cost_fallback_statement(&mut statement, oid, lang)?
     };
-    insert_blob_payload_cost_tx(tx, oid, lang, cost.payload_bytes)
+    let blob_id = tx.query_row(
+        "SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2",
+        params![oid, lang],
+        |row| row.get::<_, i64>(0),
+    )?;
+    insert_blob_payload_cost_tx(tx, blob_id, cost.payload_bytes)
 }
 
 /// Fixed arities for the `VALUES (?, ?)` pair lists, capped at the caller's
@@ -12510,15 +13024,14 @@ fn missing_published_parsed_blob_keys_conn(
         "SELECT requested.blob_oid, requested.lang
          FROM temp.requested_parsed_blobs AS requested
          LEFT JOIN analysis_epochs AS active_epoch ON active_epoch.lang = requested.lang
+         LEFT JOIN blobs AS keys
+           ON keys.blob_oid = requested.blob_oid
+          AND keys.lang = requested.lang
+          AND keys.generation = COALESCE(active_epoch.generation, 0)
          LEFT JOIN blob_meta AS meta
-           ON meta.blob_oid = requested.blob_oid
-          AND meta.lang = requested.lang
+           ON meta.blob_id = keys.id
           AND meta.is_complete = 1
-         LEFT JOIN blobs AS active_blob
-           ON active_blob.blob_oid = requested.blob_oid
-          AND active_blob.lang = requested.lang
-          AND active_blob.generation = COALESCE(active_epoch.generation, 0)
-         WHERE meta.blob_oid IS NULL OR active_blob.blob_oid IS NULL
+         WHERE keys.id IS NULL OR meta.blob_id IS NULL
          ORDER BY requested.ordinal",
     )?;
     let rows = statement.query_map([], |row| {
@@ -12576,8 +13089,10 @@ fn parsed_blob_keys_sql(padded_arity: usize, joins: &str, condition: &str) -> St
         "WITH requested(blob_oid, lang) AS (VALUES {values})
              SELECT requested.blob_oid, requested.lang
              FROM requested
+             JOIN blobs AS keys
+               ON keys.blob_oid = requested.blob_oid AND keys.lang = requested.lang
              JOIN blob_meta AS meta
-               ON meta.blob_oid = requested.blob_oid AND meta.lang = requested.lang
+               ON meta.blob_id = keys.id
              {joins}
              WHERE {condition}"
     )
@@ -12633,7 +13148,7 @@ fn reclaim_stale_generations_conn(conn: &mut Connection, max_logical_rows: usize
     let stale_blobs = {
         let mut stmt = tx.prepare(
             "SELECT blobs.blob_oid, blobs.lang,
-                    1 + CASE WHEN meta.blob_oid IS NULL THEN 0 ELSE
+                    1 + CASE WHEN meta.blob_id IS NULL THEN 0 ELSE
                       1 + meta.stored_unit_count + meta.range_count + meta.signature_count
                         + meta.signature_metadata_count
                         + meta.supertype_count + meta.child_count
@@ -12641,18 +13156,22 @@ fn reclaim_stale_generations_conn(conn: &mut Connection, max_logical_rows: usize
                         + meta.type_identifier_count
                         + (SELECT COALESCE(SUM(row_count), 0) + COUNT(*)
                            FROM blob_optional_fact_manifest AS manifest
-                           WHERE manifest.blob_oid = meta.blob_oid
-                             AND manifest.lang = meta.lang)
-                        + (SELECT COUNT(*) FROM structural_facts_snapshots AS snapshots
-                           WHERE snapshots.blob_oid = meta.blob_oid
-                             AND snapshots.lang = meta.lang)
-                        + CASE WHEN costs.blob_oid IS NULL THEN 0 ELSE 1 END END AS logical_rows
+                           WHERE manifest.blob_id = meta.blob_id)
+                        + (SELECT COUNT(*) FROM structural_fact_manifests AS facts
+                           WHERE facts.blob_id = meta.blob_id)
+                        + (SELECT COUNT(*) FROM structural_fact_nodes AS facts
+                           WHERE facts.blob_id = meta.blob_id)
+                        + (SELECT COUNT(*) FROM structural_fact_roles AS facts
+                           WHERE facts.blob_id = meta.blob_id)
+                        + (SELECT COUNT(*) FROM structural_fact_occurrence_roles AS facts
+                           WHERE facts.blob_id = meta.blob_id)
+                        + CASE WHEN costs.blob_id IS NULL THEN 0 ELSE 1 END END AS logical_rows
              FROM blobs
              LEFT JOIN analysis_epochs AS epochs ON epochs.lang = blobs.lang
              LEFT JOIN blob_meta AS meta
-               ON meta.blob_oid = blobs.blob_oid AND meta.lang = blobs.lang
+               ON meta.blob_id = blobs.id
              LEFT JOIN blob_payload_costs AS costs
-               ON costs.blob_oid = meta.blob_oid AND costs.lang = meta.lang
+               ON costs.blob_id = meta.blob_id
              WHERE blobs.generation <> COALESCE(epochs.generation, 0)
              ORDER BY blobs.lang, blobs.generation, blobs.blob_oid",
         )?;
@@ -13098,7 +13617,7 @@ fn signature_metadata_insert_sql() -> &'static str {
             .join(", ");
         format!(
             "INSERT INTO unit_signature_metadata(
-           blob_oid, lang, unit_key, ordinal, {columns}
+           blob_id, lang, unit_key, ordinal, {columns}
          ) VALUES(?1, ?2, ?3, ?4, {placeholders})"
         )
     });
@@ -13237,13 +13756,13 @@ impl SignatureMetadataColumns {
     fn insert(
         &self,
         stmt: &mut rusqlite::Statement<'_>,
-        oid: &str,
+        blob_id: i64,
         lang: &str,
         unit_key: i64,
         ordinal: i64,
     ) -> Result<()> {
         stmt.execute(params![
-            oid,
+            blob_id,
             lang,
             unit_key,
             ordinal,
@@ -13491,6 +14010,73 @@ fn deserialize_blob<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
 
 fn bool_to_i64(value: bool) -> i64 {
     i64::from(value)
+}
+
+fn persisted_optional_span(
+    row: &rusqlite::Row<'_>,
+    start_index: usize,
+    end_index: usize,
+) -> rusqlite::Result<Option<PersistedSpan>> {
+    match (
+        row.get::<_, Option<u32>>(start_index)?,
+        row.get::<_, Option<u32>>(end_index)?,
+    ) {
+        (None, None) => Ok(None),
+        (Some(start), Some(end)) => Ok(Some(PersistedSpan { start, end })),
+        _ => Err(rusqlite::Error::FromSqlConversionFailure(
+            start_index,
+            rusqlite::types::Type::Integer,
+            Box::new(StoreError::new(
+                "incomplete persisted structural span fields",
+            )),
+        )),
+    }
+}
+
+fn persisted_structural_fact_payload_bytes(facts: &PersistedStructuralFacts) -> usize {
+    let node_bytes = facts.nodes.iter().fold(0usize, |bytes, node| {
+        bytes
+            .saturating_add(node.kind.len())
+            .saturating_add(node.construct.as_ref().map_or(0, String::len))
+            .saturating_add(
+                node.call_site
+                    .as_ref()
+                    .and_then(|site| site.call_kind.as_ref())
+                    .map_or(0, String::len),
+            )
+            .saturating_add(
+                node.call_site
+                    .as_ref()
+                    .map_or(0, |site| site.coverage.len()),
+            )
+    });
+    let role_bytes = facts
+        .roles
+        .iter()
+        .fold(0usize, |bytes, role| bytes.saturating_add(role.role.len()));
+    facts
+        .occurrence_roles
+        .iter()
+        .fold(node_bytes.saturating_add(role_bytes), |bytes, role| {
+            bytes.saturating_add(role.role.len())
+        })
+}
+
+fn structural_fact_payload_bytes_sql() -> &'static str {
+    "SELECT
+       COALESCE((SELECT SUM(
+         length(CAST(kind AS BLOB))
+           + COALESCE(length(CAST(construct AS BLOB)), 0)
+           + COALESCE(length(CAST(call_kind AS BLOB)), 0)
+           + COALESCE(length(CAST(call_coverage AS BLOB)), 0)
+       ) FROM structural_fact_nodes
+         WHERE blob_id = ?1), 0)
+       + COALESCE((SELECT SUM(length(CAST(role AS BLOB)))
+           FROM structural_fact_roles
+           WHERE blob_id = ?1), 0)
+       + COALESCE((SELECT SUM(length(CAST(role AS BLOB)))
+           FROM structural_fact_occurrence_roles
+           WHERE blob_id = ?1), 0)"
 }
 
 fn usize_to_i64(value: usize) -> Result<i64> {
@@ -14026,10 +14612,11 @@ mod tests {
         let columns = signature_metadata_value_columns_sql("metadata");
         let batch_plan = explain(
             &format!(
-                "SELECT metadata.blob_oid, metadata.unit_key, {columns}
-                 FROM unit_signature_metadata AS metadata
-                 WHERE metadata.lang = ? AND metadata.blob_oid IN (?, ?)
-                 ORDER BY metadata.blob_oid, metadata.unit_key, metadata.ordinal"
+                "SELECT keys.blob_oid, metadata.unit_key, {columns}
+                 FROM blobs AS keys
+                 JOIN unit_signature_metadata AS metadata ON metadata.blob_id = keys.id
+                 WHERE keys.lang = ? AND keys.blob_oid IN (?, ?)
+                 ORDER BY keys.blob_oid, metadata.unit_key, metadata.ordinal"
             ),
             &["java", "oid-a", "oid-b"],
         );
@@ -14150,7 +14737,7 @@ mod tests {
                 conn.execute(
                     "UPDATE blob_meta
                      SET content_package = CAST(zeroblob(?3) AS TEXT)
-                     WHERE blob_oid = ?1 AND lang = ?2",
+                     WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)",
                     params![
                         oid.to_string(),
                         "java",
@@ -14207,7 +14794,7 @@ mod tests {
                 conn.execute(
                     "UPDATE blob_meta
                      SET content_package = ''
-                     WHERE blob_oid = ?1 AND lang = ?2",
+                     WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)",
                     params![oid.to_string(), "java"],
                 )
                 .unwrap(),
@@ -14217,12 +14804,11 @@ mod tests {
                 conn.execute(
                     "UPDATE code_units
                      SET content_qualifier = CAST(zeroblob(?3) AS TEXT)
-                     WHERE blob_oid = ?1 AND lang = ?2
+                     WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
                        AND unit_key = (
                          SELECT MIN(candidate.unit_key)
                          FROM code_units AS candidate
-                         WHERE candidate.blob_oid = ?1
-                           AND candidate.lang = ?2
+                         WHERE candidate.blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
                            AND candidate.content_qualifier <> ''
                        )",
                     params![
@@ -14283,7 +14869,7 @@ mod tests {
             let top_level_count: usize = conn
                 .query_row(
                     "SELECT COUNT(*) FROM code_units
-                     WHERE blob_oid = ?1 AND lang = ?2 AND top_level_ordinal IS NOT NULL",
+                     WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2) AND top_level_ordinal IS NOT NULL",
                     params![oid.to_string(), "java"],
                     |row| row.get(0),
                 )
@@ -14299,7 +14885,7 @@ mod tests {
                          WHEN top_level_ordinal = 0 THEN ''
                          ELSE 'late.namespace'
                      END
-                     WHERE blob_oid = ?1 AND lang = ?2
+                     WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
                        AND top_level_ordinal IS NOT NULL",
                     params![oid.to_string(), "java"],
                 )
@@ -14355,7 +14941,7 @@ mod tests {
                     // statement two bytes past the per-row cap.
                     "UPDATE import_statements
                      SET statement = hex(zeroblob(?3))
-                     WHERE blob_oid = ?1 AND lang = ?2",
+                     WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)",
                     params![
                         oid.to_string(),
                         "go",
@@ -14400,7 +14986,7 @@ mod tests {
                 conn.execute(
                     "UPDATE blob_meta
                      SET import_statement_count = 1
-                     WHERE blob_oid = ?1 AND lang = ?2",
+                     WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)",
                     params![oid.to_string(), "go"],
                 )
                 .unwrap(),
@@ -14461,7 +15047,7 @@ mod tests {
                 conn.execute(
                     "UPDATE unit_supertypes
                      SET raw = CAST(zeroblob(?3) AS TEXT)
-                     WHERE blob_oid = ?1 AND lang = ?2",
+                     WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)",
                     params![oid.to_string(), "scala", oversized],
                 )
                 .unwrap(),
@@ -14481,7 +15067,7 @@ mod tests {
                 conn.execute(
                     "UPDATE unit_supertypes
                      SET lookup_path = CAST(zeroblob(?3) AS TEXT)
-                     WHERE blob_oid = ?1 AND lang = ?2",
+                     WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)",
                     params![oid.to_string(), "scala", oversized],
                 )
                 .unwrap(),
@@ -14520,7 +15106,7 @@ mod tests {
                 conn.execute(
                     "UPDATE code_units
                      SET signature = CAST(zeroblob(?3) AS TEXT)
-                     WHERE blob_oid = ?1 AND lang = ?2 AND identifier = 'Target'",
+                     WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2) AND identifier = 'Target'",
                     params![
                         oid.to_string(),
                         "java",
@@ -14604,7 +15190,10 @@ mod tests {
 
     #[test]
     fn concurrent_mixed_reads_against_one_warm_persistent_store() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Barrier;
+
+        const EXTRA_BLOBS: u32 = 64;
+        const READER_THREADS: usize = 8;
 
         // A persistent store exercises the reader pool (`source = Some`): pure
         // reads run on checked-out read-only connections, not the writer mutex.
@@ -14637,17 +15226,20 @@ mod tests {
             .unwrap();
         assert!(baseline.iter().any(|row| row.short_name == "Widget"));
 
-        let stop = Arc::new(AtomicBool::new(false));
+        let start = Arc::new(Barrier::new(READER_THREADS + 1));
 
-        // Writer thread: persist additional distinct blobs through the single
-        // writer connection while the readers hammer their pooled readers.
+        // Writer thread: persist a bounded set of distinct blobs through the
+        // single writer connection while the readers hammer their pooled
+        // readers. Keeping the corpus fixed prevents the whole-language search
+        // workload from growing according to thread scheduling and SQLite
+        // throughput.
         let writer = {
             let store = Arc::clone(&store);
-            let stop = Arc::clone(&stop);
+            let start = Arc::clone(&start);
             let root = temp.path().to_path_buf();
             std::thread::spawn(move || {
-                let mut index = 0u32;
-                while !stop.load(Ordering::Relaxed) {
+                start.wait();
+                for index in 0..EXTRA_BLOBS {
                     let src = format!("class Extra{index} {{ int f{index}; }}\n");
                     let extra = write_file(&root, &format!("Extra{index}.java"), &src);
                     let extra_state = parse_state(&JavaAdapter, &extra);
@@ -14661,7 +15253,6 @@ mod tests {
                             &extra_state,
                         )
                         .unwrap();
-                    index += 1;
                 }
             })
         };
@@ -14669,12 +15260,14 @@ mod tests {
         // Reader threads: mixed definitions lookup + hydration + search, each
         // asserting the warm Widget rows are always visible.
         let mut readers = Vec::new();
-        for _ in 0..8 {
+        for _ in 0..READER_THREADS {
             let store = Arc::clone(&store);
+            let start = Arc::clone(&start);
             let langs = langs.clone();
             let generations = generations.clone();
             let file = file.clone();
             readers.push(std::thread::spawn(move || {
+                start.wait();
                 for _ in 0..200 {
                     let rows = store
                         .declaration_candidate_rows_by_short_name_for_langs(
@@ -14708,14 +15301,18 @@ mod tests {
         for reader in readers {
             reader.join().expect("reader thread panicked");
         }
-        stop.store(true, Ordering::Relaxed);
         writer.join().expect("writer thread panicked");
 
         // The concurrently persisted blobs are all visible after the fact.
-        let widgets = store
-            .declaration_candidate_rows_by_short_name_for_langs(&langs, &generations, "Widget")
-            .unwrap();
-        assert!(widgets.iter().any(|row| row.short_name == "Widget"));
+        let candidates = store.search_candidate_rows_by_lang("java").unwrap();
+        let names = candidates
+            .iter()
+            .map(|row| row.candidate.short_name.as_str())
+            .collect::<HashSet<_>>();
+        assert!(names.contains("Widget"));
+        for index in 0..EXTRA_BLOBS {
+            assert!(names.contains(format!("Extra{index}").as_str()));
+        }
     }
 
     #[test]
@@ -14828,15 +15425,76 @@ mod tests {
         );
     }
 
+    fn persisted_structural_facts(construct: &str) -> PersistedStructuralFacts {
+        PersistedStructuralFacts {
+            source_bytes: 20,
+            nodes: vec![
+                PersistedStructuralNode {
+                    node_id: 0,
+                    kind: "call".to_owned(),
+                    boolean_value: None,
+                    construct: Some(construct.to_owned()),
+                    span: PersistedSpan { start: 0, end: 10 },
+                    parent: None,
+                    name: Some(PersistedSpan { start: 0, end: 4 }),
+                    subtree_end: 2,
+                    call_site: Some(PersistedCallSite {
+                        call_kind: Some("method".to_owned()),
+                        coverage: "partial".to_owned(),
+                        continues_callee_groups: true,
+                    }),
+                },
+                PersistedStructuralNode {
+                    node_id: 1,
+                    kind: "boolean_literal".to_owned(),
+                    boolean_value: Some(true),
+                    construct: None,
+                    span: PersistedSpan { start: 5, end: 9 },
+                    parent: Some(0),
+                    name: None,
+                    subtree_end: 2,
+                    call_site: None,
+                },
+            ],
+            roles: vec![
+                PersistedStructuralRole {
+                    source_node_id: 0,
+                    ordinal: 0,
+                    role: "callee".to_owned(),
+                    spread: false,
+                    keyword: None,
+                    node: None,
+                    span: PersistedSpan { start: 0, end: 4 },
+                    name: Some(PersistedSpan { start: 0, end: 4 }),
+                },
+                PersistedStructuralRole {
+                    source_node_id: 0,
+                    ordinal: 1,
+                    role: "kwargs".to_owned(),
+                    spread: true,
+                    keyword: Some(PersistedSpan { start: 5, end: 6 }),
+                    node: Some(1),
+                    span: PersistedSpan { start: 5, end: 9 },
+                    name: None,
+                },
+            ],
+            occurrence_roles: vec![PersistedOccurrenceRole {
+                node_id: 1,
+                ordinal: 0,
+                role: "value_reference".to_owned(),
+            }],
+        }
+    }
+
     #[test]
-    fn structural_snapshot_roundtrips_replaces_and_updates_cascade_costs() {
+    fn relational_structural_facts_roundtrip_replace_and_update_cascade_costs() {
         let temp = tempfile::TempDir::new().unwrap();
         let file = write_file(temp.path(), "Model.java", "class Model { int value; }\n");
         let state = Arc::new(parse_state(&JavaAdapter, &file));
         let oid = oid_for(state.source.as_bytes());
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let generation = store
-            .ensure_language_epoch_value("java", "structural-snapshot-v1")
+            .ensure_language_epoch_value("java", "relational-structural-facts-v1")
             .unwrap();
         store
             .write_parsed_blob_at_generation(oid, "java", generation, &JavaAdapter, state.as_ref())
@@ -14852,29 +15510,30 @@ mod tests {
 
         assert_eq!(
             store
-                .load_structural_facts_snapshot(oid, "java", generation, 1)
+                .load_structural_facts_rows(oid, "java", generation, 1)
                 .unwrap(),
             None
         );
-        let first = b"first structural snapshot";
+        let first = persisted_structural_facts("first_construct");
         assert!(
             store
-                .upsert_structural_facts_snapshot(oid, "java", generation, 1, first)
+                .upsert_structural_facts_rows(oid, "java", generation, 1, first.clone())
                 .unwrap()
         );
         assert_eq!(
             store
-                .load_structural_facts_snapshot(oid, "java", generation, 1)
-                .unwrap()
-                .as_deref(),
-            Some(first.as_slice())
+                .load_structural_facts_rows(oid, "java", generation, 1)
+                .unwrap(),
+            Some(first.clone())
         );
 
         let expected_first = PersistedMutationCost {
-            logical_rows: prepared.logical_rows().saturating_add(1),
+            logical_rows: prepared.logical_rows().saturating_add(
+                1 + first.nodes.len() + first.roles.len() + first.occurrence_roles.len(),
+            ),
             payload_bytes: prepared
                 .persisted_payload_bytes()
-                .saturating_add(first.len()),
+                .saturating_add(persisted_structural_fact_payload_bytes(&first)),
         };
         {
             let conn = store.conn.lock().expect("store mutex");
@@ -14886,30 +15545,29 @@ mod tests {
             );
         }
 
-        let second = b"second";
+        let second = persisted_structural_facts("second");
         assert!(
             store
-                .upsert_structural_facts_snapshot(oid, "java", generation, 2, second)
+                .upsert_structural_facts_rows(oid, "java", generation, 2, second.clone())
                 .unwrap()
         );
         assert_eq!(
             store
-                .load_structural_facts_snapshot(oid, "java", generation, 1)
+                .load_structural_facts_rows(oid, "java", generation, 1)
                 .unwrap(),
             None
         );
         assert_eq!(
             store
-                .load_structural_facts_snapshot(oid, "java", generation, 2)
-                .unwrap()
-                .as_deref(),
-            Some(second.as_slice())
+                .load_structural_facts_rows(oid, "java", generation, 2)
+                .unwrap(),
+            Some(second.clone())
         );
         let conn = store.conn.lock().expect("store mutex");
         assert_eq!(
             conn.query_row(
-                "SELECT COUNT(*) FROM structural_facts_snapshots
-                 WHERE blob_oid = ?1 AND lang = 'java'",
+                "SELECT COUNT(*) FROM structural_fact_manifests
+                 WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'java')",
                 [oid.to_string()],
                 |row| row.get::<_, usize>(0),
             )
@@ -14920,26 +15578,39 @@ mod tests {
         assert_eq!(
             conn.query_row(
                 "SELECT payload_bytes FROM blob_payload_costs
-                 WHERE blob_oid = ?1 AND lang = 'java'",
+                 WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'java')",
                 [oid.to_string()],
                 |row| row.get::<_, usize>(0),
             )
             .unwrap(),
             prepared
                 .persisted_payload_bytes()
-                .saturating_add(second.len())
+                .saturating_add(persisted_structural_fact_payload_bytes(&second))
         );
         conn.execute(
-            "DELETE FROM blob_payload_costs WHERE blob_oid = ?1 AND lang = 'java'",
+            "DELETE FROM blob_payload_costs WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'java')",
+            [oid.to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM structural_fact_occurrence_roles
+             WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'java')",
             [oid.to_string()],
         )
         .unwrap();
         drop(conn);
 
-        let repaired = b"repaired legacy payload cost";
+        assert_eq!(
+            store
+                .load_structural_facts_rows(oid, "java", generation, 2)
+                .unwrap(),
+            None,
+            "manifest row counts must reject partial child rows"
+        );
+        let repaired = persisted_structural_facts("repaired");
         assert!(
             store
-                .upsert_structural_facts_snapshot(oid, "java", generation, 3, repaired)
+                .upsert_structural_facts_rows(oid, "java", generation, 3, repaired.clone())
                 .unwrap()
         );
         assert_eq!(
@@ -14949,15 +15620,15 @@ mod tests {
                 .expect("store mutex")
                 .query_row(
                     "SELECT payload_bytes FROM blob_payload_costs
-                     WHERE blob_oid = ?1 AND lang = 'java'",
+                     WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'java')",
                     [oid.to_string()],
                     |row| row.get::<_, usize>(0),
                 )
                 .unwrap(),
             prepared
                 .persisted_payload_bytes()
-                .saturating_add(repaired.len()),
-            "a missing legacy cost row must be recomputed with snapshot bytes"
+                .saturating_add(persisted_structural_fact_payload_bytes(&repaired)),
+            "a missing legacy cost row must be recomputed with relational fact text"
         );
 
         store
@@ -14965,22 +15636,81 @@ mod tests {
             .unwrap();
         assert_eq!(
             store
-                .load_structural_facts_snapshot(oid, "java", generation, 3)
+                .load_structural_facts_rows(oid, "java", generation, 3)
                 .unwrap(),
             None,
-            "replacing the parsed blob must cascade-delete its snapshot"
+            "replacing the parsed blob must cascade-delete its structural facts"
         );
     }
 
     #[test]
-    fn structural_snapshot_requires_current_complete_parent_generation() {
+    fn relational_structural_fact_replacement_is_atomic_for_concurrent_readers() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(temp.path(), "Model.java", "class Model { int value; }\n");
+        let state = parse_state(&JavaAdapter, &file);
+        let oid = oid_for(state.source.as_bytes());
+        let store = Arc::new(
+            AnalyzerStore::open_persistent(&temp.path().join("relational-facts.db")).unwrap(),
+        );
+        let generation = store
+            .ensure_language_epoch_value("java", "atomic-relational-structural-facts-v1")
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(oid, "java", generation, &JavaAdapter, &state)
+            .unwrap();
+        let first = persisted_structural_facts("first");
+        let second = persisted_structural_facts("second");
+        assert!(
+            store
+                .upsert_structural_facts_rows(oid, "java", generation, 1, first.clone())
+                .unwrap()
+        );
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        std::thread::scope(|scope| {
+            let reader_store = Arc::clone(&store);
+            let reader_barrier = Arc::clone(&barrier);
+            let reader_first = first.clone();
+            let reader_second = second.clone();
+            scope.spawn(move || {
+                reader_barrier.wait();
+                for _ in 0..100 {
+                    let observed = reader_store
+                        .load_structural_facts_rows(oid, "java", generation, 1)
+                        .unwrap()
+                        .expect("a committed facts set must remain visible");
+                    assert!(
+                        observed == reader_first || observed == reader_second,
+                        "a reader must see one complete committed facts set: {observed:?}"
+                    );
+                }
+            });
+
+            barrier.wait();
+            for index in 0..20 {
+                let replacement = if index % 2 == 0 {
+                    second.clone()
+                } else {
+                    first.clone()
+                };
+                assert!(
+                    store
+                        .upsert_structural_facts_rows(oid, "java", generation, 1, replacement)
+                        .unwrap()
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn relational_structural_facts_require_current_complete_parent_generation() {
         let temp = tempfile::TempDir::new().unwrap();
         let file = write_file(temp.path(), "Model.java", "class Model {}\n");
         let state = parse_state(&JavaAdapter, &file);
         let oid = oid_for(state.source.as_bytes());
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let old_generation = store
-            .ensure_language_epoch_value("java", "snapshot-old-generation")
+            .ensure_language_epoch_value("java", "structural-facts-old-generation")
             .unwrap();
         store
             .write_parsed_blob_at_generation(oid, "java", old_generation, &JavaAdapter, &state)
@@ -14988,42 +15718,85 @@ mod tests {
         store.mark_parsed_blob_incomplete_for_test(oid, "java");
         assert!(
             !store
-                .upsert_structural_facts_snapshot(oid, "java", old_generation, 1, b"ignored",)
+                .upsert_structural_facts_rows(
+                    oid,
+                    "java",
+                    old_generation,
+                    1,
+                    persisted_structural_facts("ignored"),
+                )
                 .unwrap()
         );
         assert_eq!(
             store
-                .load_structural_facts_snapshot(oid, "java", old_generation, 1)
+                .load_structural_facts_rows(oid, "java", old_generation, 1)
                 .unwrap(),
             None
         );
 
         let current_generation = store
-            .ensure_language_epoch_value("java", "snapshot-current-generation")
+            .ensure_language_epoch_value("java", "structural-facts-current-generation")
             .unwrap();
         assert!(
             store
-                .load_structural_facts_snapshot(oid, "java", old_generation, 1)
+                .load_structural_facts_rows(oid, "java", old_generation, 1)
                 .unwrap_err()
                 .is_stale_generation()
         );
         assert!(
             store
-                .upsert_structural_facts_snapshot(oid, "java", old_generation, 1, b"stale",)
+                .upsert_structural_facts_rows(
+                    oid,
+                    "java",
+                    old_generation,
+                    1,
+                    persisted_structural_facts("stale"),
+                )
                 .unwrap_err()
                 .is_stale_generation()
         );
         assert!(
             !store
-                .upsert_structural_facts_snapshot(
+                .upsert_structural_facts_rows(
                     oid,
                     "java",
                     current_generation,
                     1,
-                    b"no current parent",
+                    persisted_structural_facts("no current parent"),
                 )
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn relational_structural_fact_hydration_seeks_primary_keys() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let conn = store.conn.lock().expect("store mutex");
+        for (table, order_by) in [
+            ("structural_fact_nodes", "node_id"),
+            ("structural_fact_roles", "source_node_id, ordinal"),
+            ("structural_fact_occurrence_roles", "node_id, ordinal"),
+        ] {
+            let plan = conn
+                .prepare(&format!(
+                    "EXPLAIN QUERY PLAN SELECT * FROM {table}
+                     WHERE blob_id = ?1 ORDER BY {order_by}"
+                ))
+                .unwrap()
+                .query_map([0_i64], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(
+                plan.iter()
+                    .any(|step| step.contains(&format!("SEARCH {table} USING PRIMARY KEY"))),
+                "structural fact hydration must seek {table}: {plan:?}"
+            );
+            assert!(
+                plan.iter().all(|step| !step.contains("SCAN")),
+                "structural fact hydration must not scan tables: {plan:?}"
+            );
+        }
     }
 
     #[test]
@@ -15283,10 +16056,9 @@ mod tests {
             "the prefilter must not change the plan"
         );
         assert!(
-            prefiltered
-                .iter()
-                .any(|detail| detail.contains("SEARCH active USING PRIMARY KEY")),
-            "the live blob set must be sought, not scanned: {prefiltered:#?}"
+            prefiltered.iter().any(|detail| detail
+                .contains("SEARCH keys USING COVERING INDEX sqlite_autoindex_blobs_1")),
+            "each live blob OID must intern through the unique index: {prefiltered:#?}"
         );
         assert!(
             prefiltered
@@ -15300,6 +16072,247 @@ mod tests {
                 .any(|detail| detail.contains("SCAN units")),
             "the declaration table must never be scanned: {prefiltered:#?}"
         );
+    }
+
+    #[test]
+    fn search_candidate_key_plan_is_driven_by_the_requested_blob() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let conn = store.conn.lock().expect("store mutex");
+        let sql = search_candidate_key_set_sql(1);
+        let plan = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .expect("prepare plan")
+            .query_map(params!["java", TEST_OID, 0_i64], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+
+        let blob_seek = plan
+            .iter()
+            .position(|detail| {
+                detail.contains(
+                    "SEARCH keys USING COVERING INDEX sqlite_autoindex_blobs_1 (blob_oid=? AND lang=?)",
+                )
+            })
+            .unwrap_or_else(|| panic!("the by-key query must seek the blob OID: {plan:#?}"));
+        let unit_seek = plan
+            .iter()
+            .position(|detail| {
+                detail.contains("SEARCH units USING PRIMARY KEY (blob_id=? AND unit_key=?)")
+            })
+            .unwrap_or_else(|| panic!("the by-key query must seek code_units by blob: {plan:#?}"));
+        assert!(
+            blob_seek < unit_seek,
+            "the requested blob must drive its code_units probe: {plan:#?}"
+        );
+        assert!(
+            plan.iter().all(|detail| !detail.contains("SCAN units")),
+            "the by-key query must not scan code_units: {plan:#?}"
+        );
+        assert!(
+            plan.iter()
+                .all(|detail| !detail.contains("idx_code_units_lang_identifier_lookup")),
+            "the by-key query must not fall back to the language-wide index: {plan:#?}"
+        );
+        assert!(
+            sql.contains("requested.blob_oid")
+                && sql.contains("requested.lang")
+                && sql.contains("requested.unit_key")
+                && sql.contains("active_blob.generation"),
+            "the by-key query must retain blob, language, and live-generation predicates: {sql}"
+        );
+    }
+
+    #[test]
+    fn search_candidate_key_hydration_preserves_multi_blob_language_parity() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        let java_alpha = write_file(
+            root,
+            "java/Alpha.java",
+            "package demo; class Alpha { int value; }\n",
+        );
+        let java_beta = write_file(
+            root,
+            "java/Beta.java",
+            "package demo; class Beta { void run() {} int other; }\n",
+        );
+        let rust_gamma = write_file(root, "rust/gamma.rs", "pub struct Gamma;\n");
+        let java_alpha_oid = oid_for(java_alpha.read_to_string().unwrap().as_bytes());
+        let java_beta_oid = oid_for(java_beta.read_to_string().unwrap().as_bytes());
+        let rust_gamma_oid = oid_for(rust_gamma.read_to_string().unwrap().as_bytes());
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        store
+            .write_parsed_blob(
+                java_alpha_oid,
+                "java",
+                &JavaAdapter,
+                &parse_state(&JavaAdapter, &java_alpha),
+            )
+            .unwrap();
+        store
+            .write_parsed_blob(
+                java_beta_oid,
+                "java",
+                &JavaAdapter,
+                &parse_state(&JavaAdapter, &java_beta),
+            )
+            .unwrap();
+        store
+            .write_parsed_blob(
+                rust_gamma_oid,
+                "rust",
+                &RustAdapter,
+                &parse_state(&RustAdapter, &rust_gamma),
+            )
+            .unwrap();
+
+        let languages = vec!["java".to_string(), "rust".to_string()];
+        let generations = HashMap::from_iter([
+            ("java".to_string(), GenerationId::BOOTSTRAP),
+            ("rust".to_string(), GenerationId::BOOTSTRAP),
+        ]);
+        let java_baseline = store.search_candidate_rows_by_lang("java").unwrap();
+        let rust_baseline = store.search_candidate_rows_by_lang("rust").unwrap();
+        let alpha = java_baseline
+            .iter()
+            .find(|row| row.candidate.short_name == "Alpha")
+            .expect("Alpha declaration");
+        let beta = java_baseline
+            .iter()
+            .find(|row| row.candidate.short_name == "Beta")
+            .expect("Beta declaration");
+        let alpha_keys = java_baseline
+            .iter()
+            .filter(|row| row.candidate.blob_oid == java_alpha_oid)
+            .map(|row| row.candidate.unit_key)
+            .collect::<HashSet<_>>();
+        let beta_only_unit_key = java_baseline
+            .iter()
+            .filter(|row| row.candidate.blob_oid == java_beta_oid)
+            .map(|row| row.candidate.unit_key)
+            .find(|unit_key| !alpha_keys.contains(unit_key))
+            .expect("Beta fixture must have a unit key absent from Alpha");
+        let gamma = rust_baseline
+            .iter()
+            .find(|row| row.candidate.short_name == "Gamma")
+            .expect("Gamma declaration");
+
+        let requested = vec![
+            SearchCandidateKey {
+                lang_index: 0,
+                blob_oid: java_alpha_oid,
+                unit_key: alpha.candidate.unit_key,
+            },
+            SearchCandidateKey {
+                lang_index: 0,
+                blob_oid: java_beta_oid,
+                unit_key: beta.candidate.unit_key,
+            },
+            SearchCandidateKey {
+                lang_index: 1,
+                blob_oid: rust_gamma_oid,
+                unit_key: gamma.candidate.unit_key,
+            },
+            // A valid unit key from another blob must not cross the blob
+            // boundary, and a nonexistent key must remain a near miss.
+            SearchCandidateKey {
+                lang_index: 0,
+                blob_oid: java_alpha_oid,
+                unit_key: beta_only_unit_key,
+            },
+            SearchCandidateKey {
+                lang_index: 0,
+                blob_oid: java_alpha_oid,
+                unit_key: i64::MAX,
+            },
+            // The OID exists, but only for Rust; the language scope must
+            // prevent this request from reaching the Rust declaration.
+            SearchCandidateKey {
+                lang_index: 0,
+                blob_oid: rust_gamma_oid,
+                unit_key: gamma.candidate.unit_key,
+            },
+        ];
+        // More than one fixed-arity batch must remain equivalent to one
+        // request. These missing keys exercise the padded 400-tuple query and
+        // ensure near misses do not cause declaration-range over-reading.
+        let mut requested = requested;
+        requested.extend((0..401).map(|index| SearchCandidateKey {
+            lang_index: 0,
+            blob_oid: java_alpha_oid,
+            unit_key: i64::MIN + i64::from(index),
+        }));
+        assert!(requested.len() > SEARCH_CANDIDATE_KEY_BATCH_SIZE);
+        let hydrated = store
+            .search_candidate_rows_for_keys(&languages, &generations, &requested, None)
+            .unwrap();
+        assert!(hydrated.complete);
+
+        let expected = [alpha, beta, gamma]
+            .into_iter()
+            .map(|row| {
+                (
+                    row.candidate.blob_oid,
+                    row.candidate.lang.clone(),
+                    row.candidate.unit_key,
+                )
+            })
+            .collect::<HashSet<_>>();
+        let actual = hydrated
+            .rows
+            .iter()
+            .map(|row| {
+                (
+                    row.candidate.blob_oid,
+                    row.candidate.lang.clone(),
+                    row.candidate.unit_key,
+                )
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(actual, expected);
+        assert_eq!(hydrated.rows.len(), expected.len());
+        for row in &hydrated.rows {
+            let baseline = java_baseline
+                .iter()
+                .chain(rust_baseline.iter())
+                .find(|candidate| {
+                    candidate.candidate.blob_oid == row.candidate.blob_oid
+                        && candidate.candidate.lang == row.candidate.lang
+                        && candidate.candidate.unit_key == row.candidate.unit_key
+                })
+                .expect("hydrated row must have a baseline projection");
+            assert_eq!(row, baseline, "by-key hydration changed projection fields");
+            assert!(
+                row.primary_range.is_some(),
+                "fixture should retain declaration range"
+            );
+        }
+    }
+
+    #[test]
+    fn search_candidate_key_hydration_honors_cancellation_before_batch() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        let result = store
+            .search_candidate_rows_for_keys(
+                &["java".to_string()],
+                &HashMap::from_iter([("java".to_string(), GenerationId::BOOTSTRAP)]),
+                &[SearchCandidateKey {
+                    lang_index: 0,
+                    blob_oid: oid_for(b"missing candidate blob"),
+                    unit_key: 0,
+                }],
+                Some(&cancellation),
+            )
+            .unwrap();
+
+        assert!(!result.complete);
+        assert!(result.rows.is_empty());
+        assert_eq!(result.inspected, 0);
     }
 
     /// A literal is matched as text, so the two characters `LIKE` would read as
@@ -15956,14 +16969,21 @@ mod tests {
             .unwrap();
 
         assert!(
-            plan.iter()
-                .any(|detail| detail.contains("SEARCH meta USING PRIMARY KEY")),
-            "the requested key must seek blob_meta: {plan:#?}"
+            plan.iter().any(|detail| detail
+                .contains("SEARCH keys USING COVERING INDEX sqlite_autoindex_blobs_1")),
+            "the (blob_oid, lang) pair must intern through the unique index, and \
+             that index covers the id it returns, so this seek never reads the \
+             blobs table itself: {plan:#?}"
         );
         assert!(
             plan.iter()
-                .any(|detail| detail.contains("SEARCH active_blob USING PRIMARY KEY")),
-            "the active-generation check must seek blobs: {plan:#?}"
+                .any(|detail| detail.contains("SEARCH meta USING PRIMARY KEY")),
+            "the interned key must seek blob_meta: {plan:#?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("SEARCH active_blob USING INTEGER PRIMARY KEY")),
+            "the active-generation check must seek blobs by its rowid id: {plan:#?}"
         );
         for table in verified_fact_tables() {
             assert!(
@@ -15971,6 +16991,44 @@ mod tests {
                 "the read-path plan must not touch {table}: {plan:#?}"
             );
         }
+    }
+
+    /// The bulk fact readers must intern once per requested OID and then walk
+    /// the fact table's own primary key. Two ways to get this wrong would not
+    /// show up as a failure anywhere else: scanning `blobs` instead of seeking
+    /// it, and scanning the fact table because the join lost its key.
+    #[test]
+    fn bulk_fact_reads_seek_the_intern_index_and_then_the_fact_primary_key() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let conn = store.conn.lock().expect("store mutex");
+        let chunk = ["a".to_string(), "b".to_string()];
+        let sql = ranges_bulk_sql(&chunk_placeholders(&chunk));
+        let parameters = chunk_params("rust", &chunk);
+        let plan = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .expect("prepare plan")
+            .query_map(params_from_iter(parameters.iter()), |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(
+            plan.iter().any(|detail| detail
+                .contains("SEARCH keys USING COVERING INDEX sqlite_autoindex_blobs_1")),
+            "the requested OIDs must seek the intern index, which covers the id \
+             it returns: {plan:#?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("SEARCH facts USING PRIMARY KEY")),
+            "each interned id must range-scan unit_ranges by its own key: {plan:#?}"
+        );
+        assert!(
+            plan.iter().all(|detail| !detail.contains("SCAN")),
+            "no relation in a bulk fact read may be scanned: {plan:#?}"
+        );
     }
 
     /// The read path takes membership by default and the full condition only
@@ -16117,7 +17175,7 @@ mod tests {
         {
             let conn = store.conn.lock().unwrap();
             conn.execute(
-                "DELETE FROM unit_ranges WHERE blob_oid = ?1 AND lang = 'java'",
+                "DELETE FROM unit_ranges WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'java')",
                 [oid.to_string()],
             )
             .unwrap();
@@ -16251,7 +17309,7 @@ mod tests {
             let unit_key = conn
                 .query_row(
                     "SELECT unit_key FROM code_units
-                     WHERE blob_oid = ?1 AND lang = 'java'
+                     WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'java')
                        AND short_name = 'Sample' AND in_declarations = 1",
                     [oid.to_string()],
                     |row| row.get::<_, i64>(0),
@@ -16259,16 +17317,16 @@ mod tests {
                 .unwrap();
             conn.execute(
                 "DELETE FROM unit_ranges
-                 WHERE blob_oid = ?1 AND lang = 'java' AND unit_key = ?2",
+                 WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'java') AND unit_key = ?2",
                 params![oid.to_string(), unit_key],
             )
             .unwrap();
             for (ordinal, start_byte) in [(0_i64, 20_i64), (1, 5)] {
                 conn.execute(
                     "INSERT INTO unit_ranges(
-                       blob_oid, lang, unit_key, ordinal,
+                       blob_id, lang, unit_key, ordinal,
                        start_byte, end_byte, start_line, end_line
-                     ) VALUES(?1, 'java', ?2, ?3, ?4, ?5, 0, 0)",
+                     ) VALUES((SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'java'), 'java', ?2, ?3, ?4, ?5, 0, 0)",
                     params![
                         oid.to_string(),
                         unit_key,
@@ -16283,9 +17341,9 @@ mod tests {
                 "UPDATE blob_meta
                  SET range_count = (
                    SELECT COUNT(*) FROM unit_ranges
-                   WHERE blob_oid = ?1 AND lang = 'java'
+                   WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'java')
                  )
-                 WHERE blob_oid = ?1 AND lang = 'java'",
+                 WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'java')",
                 [oid.to_string()],
             )
             .unwrap();
@@ -16309,7 +17367,7 @@ mod tests {
             let conn = store.conn.lock().unwrap();
             conn.execute(
                 "DELETE FROM unit_ranges
-                 WHERE blob_oid = ?1 AND lang = 'java' AND unit_key = ?2",
+                 WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'java') AND unit_key = ?2",
                 params![oid.to_string(), unit_key],
             )
             .unwrap();
@@ -16317,9 +17375,9 @@ mod tests {
                 "UPDATE blob_meta
                  SET range_count = (
                    SELECT COUNT(*) FROM unit_ranges
-                   WHERE blob_oid = ?1 AND lang = 'java'
+                   WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'java')
                  )
-                 WHERE blob_oid = ?1 AND lang = 'java'",
+                 WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'java')",
                 [oid.to_string()],
             )
             .unwrap();
@@ -16589,8 +17647,8 @@ mod tests {
         assert!(
             conn.execute_batch(
                 "INSERT INTO code_unit_fq_segments(
-                     blob_oid, lang, unit_key, seg_ordinal, seg_kind, segment)
-                 SELECT blob_oid, lang, unit_key, seg_ordinal, seg_kind, segment
+                     blob_id, lang, unit_key, seg_ordinal, seg_kind, segment)
+                 SELECT blob_id, lang, unit_key, seg_ordinal, seg_kind, segment
                  FROM code_unit_fq_segments WHERE seg_ordinal = 0"
             )
             .is_err(),
@@ -16668,7 +17726,7 @@ mod tests {
             .unwrap()
             .execute(
                 "DELETE FROM code_unit_fq_segments
-                 WHERE blob_oid = ?1 AND lang = 'java'",
+                 WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'java')",
                 [loser_oid.to_string()],
             )
             .unwrap();
@@ -16707,7 +17765,7 @@ mod tests {
         {
             let conn = store.conn.lock().unwrap();
             conn.execute(
-                "DELETE FROM code_units WHERE blob_oid = ?1 AND lang = 'python'",
+                "DELETE FROM code_units WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'python')",
                 [oid.to_string()],
             )
             .unwrap();
@@ -16741,9 +17799,11 @@ mod tests {
         {
             let conn = store.conn.lock().unwrap();
             conn.execute(
-                "INSERT INTO blob_optional_fact_manifest(
-                   blob_oid, lang, fact_kind, row_count
-                 ) VALUES(?1, 'python', 99, 1)",
+                "INSERT INTO blob_optional_fact_manifest(blob_id, fact_kind, row_count)
+                 VALUES(
+                   (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'python'),
+                   99, 1
+                 )",
                 [oid.to_string()],
             )
             .unwrap();
@@ -16776,7 +17836,7 @@ mod tests {
             let deleted = conn
                 .execute(
                     "DELETE FROM blob_optional_fact_manifest
-                     WHERE blob_oid = ?1 AND lang = 'cpp' AND fact_kind = 1",
+                     WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'cpp') AND fact_kind = 1",
                     [oid.to_string()],
                 )
                 .unwrap();
@@ -17784,6 +18844,323 @@ mod tests {
         );
     }
 
+    #[test]
+    fn csharp_structured_test_classification_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "Http3RequestTests.cs",
+            "public class Http3RequestTests {\n\
+             [ConditionalTheory]\n\
+             public void RequestAbortRaised() { }\n\
+             }\n",
+        );
+        let mut state = parse_state(&CSharpAdapter, &file);
+        assert!(state.contains_tests);
+        // The direct-name classifier used before this epoch did not recognize
+        // custom xUnit attributes and persisted this runnable test as false.
+        state.contains_tests = false;
+        let state = Arc::new(state);
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let prior_epoch = epoch::csharp_epoch_before_structured_runnable_test_classification();
+        let prior_generation = store
+            .ensure_language_epoch_value("csharp", &prior_epoch)
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "csharp",
+                prior_generation,
+                &CSharpAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "csharp").unwrap());
+
+        let current_generation = store
+            .ensure_language_epoch(Language::CSharp, &tree_sitter_c_sharp::LANGUAGE.into())
+            .unwrap();
+
+        assert_ne!(current_generation, prior_generation);
+        assert!(!store.contains_parsed_blob(oid, "csharp").unwrap());
+        assert_eq!(
+            store
+                .missing_parsed_blob_keys(&[(oid, "csharp".to_string())])
+                .unwrap(),
+            vec![(oid, "csharp".to_string())]
+        );
+    }
+
+    #[test]
+    fn csharp_inherited_test_classification_epoch_invalidates_prior_owner_facts() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "BaseSpec.cs",
+            "public abstract class BaseSpec {\n\
+             [Fact]\n\
+             public virtual void Inherited() { }\n\
+             }\n",
+        );
+        let mut state = parse_state(&CSharpAdapter, &file);
+        assert!(state.contains_tests);
+        assert_eq!(1, state.test_region_units.len());
+        // The immediately preceding C# epoch retained only the file-level
+        // boolean. It did not identify which declaring type owns the runner
+        // method, so a hierarchy walk could not classify derived files.
+        state.test_region_units.clear();
+        let state = Arc::new(state);
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let prior_epoch = epoch::csharp_epoch_before_inherited_test_classification();
+        let prior_generation = store
+            .ensure_language_epoch_value("csharp", &prior_epoch)
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "csharp",
+                prior_generation,
+                &CSharpAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "csharp").unwrap());
+
+        let current_generation = store
+            .ensure_language_epoch(Language::CSharp, &tree_sitter_c_sharp::LANGUAGE.into())
+            .unwrap();
+
+        assert_ne!(current_generation, prior_generation);
+        assert!(!store.contains_parsed_blob(oid, "csharp").unwrap());
+        assert_eq!(
+            store
+                .missing_parsed_blob_keys(&[(oid, "csharp".to_string())])
+                .unwrap(),
+            vec![(oid, "csharp".to_string())]
+        );
+    }
+
+    #[test]
+    fn scala_top_level_extension_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "Ext.scala",
+            "package example\n\nextension (s: String)\n  def asInt: Int = s.toInt\n",
+        );
+        let mut state = parse_state(&ScalaAdapter, &file);
+        assert!(
+            state
+                .declarations
+                .iter()
+                .any(|unit| unit.fq_name() == "example.asInt"),
+            "the current walk records the top-level extension method: {:?}",
+            state.declarations
+        );
+        // The walk used before this epoch handled `extension` only inside a
+        // template body, so a file whose members are all top-level extension
+        // methods persisted no declaration but its file scope.
+        state
+            .declarations
+            .retain(|unit| unit.fq_name() != "example.asInt");
+        state
+            .top_level_declarations
+            .retain(|unit| unit.fq_name() != "example.asInt");
+        let state = Arc::new(state);
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let prior_epoch = epoch::scala_epoch_before_top_level_extension_declarations();
+        let prior_generation = store
+            .ensure_language_epoch_value("scala", &prior_epoch)
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "scala",
+                prior_generation,
+                &ScalaAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "scala").unwrap());
+
+        let current_generation = store
+            .ensure_language_epoch(
+                Language::Scala,
+                &crate::analyzer::scala::language::LANGUAGE.into(),
+            )
+            .unwrap();
+
+        assert_ne!(current_generation, prior_generation);
+        assert!(!store.contains_parsed_blob(oid, "scala").unwrap());
+        assert_eq!(
+            store
+                .missing_parsed_blob_keys(&[(oid, "scala".to_string())])
+                .unwrap(),
+            vec![(oid, "scala".to_string())]
+        );
+    }
+
+    #[test]
+    fn rust_nested_import_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "lib.rs",
+            "pub fn run() {}\n\n#[cfg(test)]\nmod tests {\n    use crate::run;\n}\n",
+        );
+        let mut state = parse_state(&RustAdapter, &file);
+        assert!(
+            state
+                .imports
+                .iter()
+                .any(|import| import.raw_snippet.contains("use crate::run")),
+            "the current walk records the import written inside `mod tests`: {:?}",
+            state.imports
+        );
+        // Before this epoch the walk collected only the file's top-level `use`
+        // declarations, so an import written inside an inline module was absent
+        // from the persisted family the coarse file graph reads.
+        state
+            .imports
+            .retain(|import| !import.raw_snippet.contains("use crate::run"));
+        let state = Arc::new(state);
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let prior_epoch = epoch::rust_epoch_before_nested_and_extern_crate_import_facts();
+        let prior_generation = store
+            .ensure_language_epoch_value("rust", &prior_epoch)
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "rust",
+                prior_generation,
+                &RustAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "rust").unwrap());
+
+        let current_generation = store
+            .ensure_language_epoch(Language::Rust, &tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+
+        assert_ne!(current_generation, prior_generation);
+        assert!(!store.contains_parsed_blob(oid, "rust").unwrap());
+        assert_eq!(
+            store
+                .missing_parsed_blob_keys(&[(oid, "rust".to_string())])
+                .unwrap(),
+            vec![(oid, "rust".to_string())]
+        );
+    }
+
+    #[test]
+    fn cpp_nested_include_claim_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "dense.h",
+            "class Dense {\npublic:\n#include \"dense_plugin.h\"\n};\n",
+        );
+        let mut state = parse_state(&CppAdapter, &file);
+        assert!(
+            state
+                .imports
+                .iter()
+                .any(|import| import.raw_snippet.contains("dense_plugin.h")),
+            "the current walk records the include written inside the class body: {:?}",
+            state.imports
+        );
+        // Before this epoch includes were collected by the declaration walk,
+        // which descends only through declaration scopes, so a directive inside
+        // a class body was never recorded as an include claim.
+        state
+            .imports
+            .retain(|import| !import.raw_snippet.contains("dense_plugin.h"));
+        let state = Arc::new(state);
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let prior_epoch = epoch::cpp_epoch_before_nested_include_claims();
+        let prior_generation = store
+            .ensure_language_epoch_value("cpp", &prior_epoch)
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "cpp",
+                prior_generation,
+                &CppAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "cpp").unwrap());
+
+        let current_generation = store
+            .ensure_language_epoch(Language::Cpp, &tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+
+        assert_ne!(current_generation, prior_generation);
+        assert!(!store.contains_parsed_blob(oid, "cpp").unwrap());
+        assert_eq!(
+            store
+                .missing_parsed_blob_keys(&[(oid, "cpp".to_string())])
+                .unwrap(),
+            vec![(oid, "cpp".to_string())]
+        );
+    }
+
+    #[test]
+    fn js_structured_test_classification_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "runtime.js",
+            "export function emit(value, callback) { callback(value); }\nemit(1, () => {});\n",
+        );
+        let mut state = parse_state(&crate::analyzer::javascript::JavascriptAdapter, &file);
+        assert!(!state.contains_tests);
+        // This is the stale value produced by the former `it(` substring
+        // matcher for the `emit(...)` production call above.
+        state.contains_tests = true;
+        let state = Arc::new(state);
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let prior_epoch = epoch::javascript_epoch_before_structured_test_classification();
+        let prior_generation = store
+            .ensure_language_epoch_value("javascript", &prior_epoch)
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "javascript",
+                prior_generation,
+                &crate::analyzer::javascript::JavascriptAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "javascript").unwrap());
+
+        let current_generation = store
+            .ensure_language_epoch(
+                Language::JavaScript,
+                &tree_sitter_javascript::LANGUAGE.into(),
+            )
+            .unwrap();
+
+        assert_ne!(current_generation, prior_generation);
+        assert!(!store.contains_parsed_blob(oid, "javascript").unwrap());
+        assert_eq!(
+            store
+                .missing_parsed_blob_keys(&[(oid, "javascript".to_string())])
+                .unwrap(),
+            vec![(oid, "javascript".to_string())]
+        );
+    }
+
     /// The TypeScript half of the same #2597 bump.
     #[test]
     fn ts_callable_modifier_metadata_epoch_invalidates_prior_parsed_blobs() {
@@ -17797,6 +19174,54 @@ mod tests {
         let oid = oid_for(state.source.as_bytes());
         let store = AnalyzerStore::open_ephemeral().unwrap();
         let prior_epoch = epoch::typescript_epoch_before_callable_modifier_metadata();
+        let prior_generation = store
+            .ensure_language_epoch_value("typescript", &prior_epoch)
+            .unwrap();
+        store
+            .write_parsed_blob_at_generation(
+                oid,
+                "typescript",
+                prior_generation,
+                &TypescriptAdapter,
+                state.as_ref(),
+            )
+            .unwrap();
+        assert!(store.contains_parsed_blob(oid, "typescript").unwrap());
+
+        let current_generation = store
+            .ensure_language_epoch(
+                Language::TypeScript,
+                &tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            )
+            .unwrap();
+
+        assert_ne!(current_generation, prior_generation);
+        assert!(!store.contains_parsed_blob(oid, "typescript").unwrap());
+        assert_eq!(
+            store
+                .missing_parsed_blob_keys(&[(oid, "typescript".to_string())])
+                .unwrap(),
+            vec![(oid, "typescript".to_string())]
+        );
+    }
+
+    #[test]
+    fn ts_structured_test_classification_epoch_invalidates_prior_parsed_blobs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = write_file(
+            temp.path(),
+            "runtime.ts",
+            "export function init(value: number, callback: (value: number) => void): void { callback(value); }\ninit(1, () => {});\n",
+        );
+        let mut state = parse_state(&TypescriptAdapter, &file);
+        assert!(!state.contains_tests);
+        // This is the stale value produced by the former `it(` substring
+        // matcher for the `init(...)` production call above.
+        state.contains_tests = true;
+        let state = Arc::new(state);
+        let oid = oid_for(state.source.as_bytes());
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let prior_epoch = epoch::typescript_epoch_before_structured_test_classification();
         let prior_generation = store
             .ensure_language_epoch_value("typescript", &prior_epoch)
             .unwrap();
@@ -18111,13 +19536,21 @@ mod tests {
 
         let physical_counts = || {
             let conn = store.conn.lock().expect("analyzer store mutex poisoned");
+            // `blobs` is the intern point and keeps the hex; its children are
+            // reached through the id it mints.
             ["blobs", "blob_meta", "code_units"].map(|table| {
-                conn.query_row(
-                    &format!("SELECT COUNT(*) FROM {table} WHERE blob_oid = ?1 AND lang = 'cpp'"),
-                    [oid.to_string()],
-                    |row| row.get::<_, usize>(0),
-                )
-                .unwrap()
+                let sql = if table == "blobs" {
+                    "SELECT COUNT(*) FROM blobs WHERE blob_oid = ?1 AND lang = 'cpp'".to_string()
+                } else {
+                    format!(
+                        "SELECT COUNT(*) FROM {table}
+                         WHERE blob_id = (
+                           SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'cpp'
+                         )"
+                    )
+                };
+                conn.query_row(&sql, [oid.to_string()], |row| row.get::<_, usize>(0))
+                    .unwrap()
             })
         };
         let before = physical_counts();
@@ -18501,7 +19934,7 @@ mod tests {
             .lock()
             .expect("store mutex")
             .execute(
-                "DELETE FROM blob_payload_costs WHERE blob_oid = ?1 AND lang = 'java'",
+                "DELETE FROM blob_payload_costs WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'java')",
                 [oid.to_string()],
             )
             .unwrap();
@@ -18640,7 +20073,7 @@ mod tests {
                 .expect("store mutex")
                 .query_row(
                     "SELECT payload_bytes FROM blob_payload_costs
-                     WHERE blob_oid = ?1 AND lang = 'java'",
+                     WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'java')",
                     [oids[0].to_string()],
                     |row| row.get::<_, usize>(0),
                 )
@@ -18691,8 +20124,12 @@ mod tests {
         )
         .unwrap();
         let conn = store.conn.lock().expect("store mutex");
-        conn.execute("DELETE FROM blob_payload_costs WHERE lang = 'java'", [])
-            .unwrap();
+        conn.execute(
+            "DELETE FROM blob_payload_costs
+             WHERE blob_id IN (SELECT id FROM blobs WHERE lang = 'java')",
+            [],
+        )
+        .unwrap();
         let mut fallback_statement = conn
             .prepare_cached(persisted_blob_mutation_cost_fallback_sql())
             .unwrap();
@@ -18875,7 +20312,7 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "DELETE FROM blob_payload_costs WHERE blob_oid = ?1 AND lang = 'java'",
+            "DELETE FROM blob_payload_costs WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'java')",
             [complete_oid.to_string()],
         )
         .unwrap();
@@ -18928,11 +20365,14 @@ mod tests {
             &["oid-a", "java", "oid-b", "java", "oid-a", "java"],
         );
         for table in ["blob", "meta", "costs"] {
+            let keyed = if table == "blob" {
+                format!("SEARCH {table} USING COVERING INDEX sqlite_autoindex_blobs_1")
+            } else {
+                format!("SEARCH {table} USING PRIMARY KEY")
+            };
             assert!(
-                fast_plan
-                    .iter()
-                    .any(|detail| detail.contains(&format!("SEARCH {table} USING PRIMARY KEY"))),
-                "set lookup for {table} must use its composite primary key: {fast_plan:#?}"
+                fast_plan.iter().any(|detail| detail.contains(&keyed)),
+                "set lookup for {table} must seek its own key: {fast_plan:#?}"
             );
             assert!(
                 fast_plan
@@ -18964,11 +20404,14 @@ mod tests {
             "import_lexical_prefixes",
             "reference_identifiers",
         ] {
+            let keyed = if table == "blob" {
+                format!("SEARCH {table} USING COVERING INDEX sqlite_autoindex_blobs_1")
+            } else {
+                format!("SEARCH {table} USING PRIMARY KEY")
+            };
             assert!(
-                fallback_plan
-                    .iter()
-                    .any(|detail| detail.contains(&format!("SEARCH {table} USING PRIMARY KEY"))),
-                "legacy replacement-cost branch for {table} must use its composite primary key: {fallback_plan:#?}"
+                fallback_plan.iter().any(|detail| detail.contains(&keyed)),
+                "legacy replacement-cost branch for {table} must seek its own key: {fallback_plan:#?}"
             );
             assert!(
                 fallback_plan
@@ -19028,7 +20471,7 @@ mod tests {
         assert!(
             range_plan
                 .iter()
-                .any(|detail| detail.contains("SEARCH code_unit_fq_segments USING PRIMARY KEY")),
+                .any(|detail| detail.contains("SEARCH facts USING PRIMARY KEY")),
             "file batches must seek the segment primary key: {range_plan:#?}"
         );
         assert!(
@@ -19110,6 +20553,11 @@ mod tests {
                 .iter()
                 .any(|detail| detail.contains("idx_code_units_anchored_blob_exact_tail")),
             "mounted lookup must seek the request tail inside the selected blob: {header_plan:#?}"
+        );
+        assert_anchor_package_seek_is_outermost(
+            &header_plan,
+            "idx_code_units_anchored_blob_exact_tail",
+            "the anchored component point lookup",
         );
         assert!(
             header_plan.iter().all(|detail| {
@@ -19273,6 +20721,93 @@ mod tests {
         }));
     }
 
+    // EXPLAIN QUERY PLAN lists one row per loop in nesting order, so the position
+    // of a row is the depth at which the relation is driven.
+    fn first_plan_row(plan: &[String], needles: &[&str]) -> Option<usize> {
+        plan.iter()
+            .position(|detail| needles.iter().all(|needle| detail.contains(needle)))
+    }
+
+    // The anchor package seek is the only selective entry point of an anchored
+    // definition lookup. When the planner drives from the workspace file relation
+    // instead, each probe walks every per-language workspace file version: on a
+    // 1,447-file Ruby workspace that cost 2.510 ms per probe against 0.011 ms with
+    // the seek outermost, and one bare-name definitions request runs thousands of
+    // them (#2742).
+    fn assert_anchor_package_seek_is_outermost(plan: &[String], unit_relation: &str, label: &str) {
+        let package_seek = first_plan_row(
+            plan,
+            &["idx_workspace_file_anchor_rows_package", "package_name=?"],
+        )
+        .unwrap_or_else(|| panic!("{label} must seek the anchor package index: {plan:#?}"));
+        let unit_probe = first_plan_row(plan, &[unit_relation]).unwrap_or_else(|| {
+            panic!("{label} must probe units through {unit_relation}: {plan:#?}")
+        });
+        assert!(
+            package_seek < unit_probe,
+            "{label} must seek the anchor package before it probes units: {plan:#?}"
+        );
+        assert!(
+            first_plan_row(plan, &["versions"]).is_none_or(|index| package_seek < index),
+            "{label} must seek the anchor package before it reads workspace file versions: {plan:#?}"
+        );
+    }
+
+    #[test]
+    fn anchored_definition_lookups_seek_the_anchor_package_outermost() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let conn = store.conn.lock().expect("store mutex");
+        let membership = "units.in_declarations = 1";
+        let explain = |sql: &str, parameters: &[rusqlite::types::Value]| {
+            conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map(params_from_iter(parameters.iter()), |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let text = |value: &str| rusqlite::types::Value::Text(value.to_string());
+        let generation = rusqlite::types::Value::Integer(0);
+
+        assert_anchor_package_seek_is_outermost(
+            &explain(
+                point_anchor_only_definition_candidate_sql(membership),
+                &[text("java"), generation.clone(), text("pkg")],
+            ),
+            "SEARCH units USING PRIMARY KEY",
+            "the anchor-only point lookup",
+        );
+
+        let request_json = text("[[0,\"pkg\",\"Widget\",0,1]]");
+        assert_anchor_package_seek_is_outermost(
+            &explain(
+                &batch_component_definition_candidate_sql(
+                    true,
+                    RenderedTailMatch::Exact,
+                    membership,
+                ),
+                &[request_json, text("java"), generation.clone()],
+            ),
+            "idx_code_units_anchored_blob_exact_tail",
+            "the anchored batch component lookup",
+        );
+
+        assert_anchor_package_seek_is_outermost(
+            &explain(
+                &batch_anchor_only_definition_candidate_sql(membership),
+                &[
+                    text("[[0,\"pkg\",\"\",0,1]]"),
+                    text("java"),
+                    generation.clone(),
+                ],
+            ),
+            "SEARCH units USING PRIMARY KEY",
+            "the anchor-only batch lookup",
+        );
+    }
+
     #[test]
     fn anchor_only_lookup_uses_the_null_tail_relation() {
         let sql = point_anchor_only_definition_candidate_sql("units.in_declarations = 1");
@@ -19288,6 +20823,91 @@ mod tests {
     // planner ever reads `code_units` end to end for it, symbol lookup is back
     // to the per-language table walk #1688 and #1758 removed (194.3 s and
     // 443.1 s on the measured workspaces).
+    // Issue #2794. `file_usage_graph.prefetch_targets` hydrates every mounted
+    // declaration in the workspace through this one statement. Read through the
+    // wide three-arm `live_definition_exact_names` view it cost 89.4 minutes on
+    // dotnet/runtime against 4.2 s in the graph-only record: SQLite materialized
+    // the compound view as a co-routine (including the path arm the caller's
+    // `source_kind <> 'path'` discarded in full), built an AUTOMATIC PARTIAL
+    // COVERING INDEX over the result, scanned all 802,432 `code_units` rows, and
+    // sorted the join through a TEMP B-TREE. The lean view must instead walk the
+    // workspace's own files and seek each blob's units by primary key.
+    #[test]
+    fn mounted_declaration_scan_seeks_live_workspace_files() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let conn = store.conn.lock().expect("store mutex");
+        let sql = format!("EXPLAIN QUERY PLAN {}", mounted_declaration_sql());
+        let mut statement = conn.prepare(&sql).unwrap();
+        let plan = statement
+            .query_map(params_from_iter(["csharp"]), |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("SEARCH units USING PRIMARY KEY")),
+            "each mounted file's declarations must be a primary-key range: {plan:#?}"
+        );
+        assert!(
+            plan.iter().all(|detail| !detail.contains("SCAN units")),
+            "the mounted-declaration scan must never read code_units end to end: {plan:#?}"
+        );
+        assert!(
+            plan.iter().all(|detail| !detail.contains("AUTOMATIC")),
+            "the mounted-declaration scan must not build a transient index: {plan:#?}"
+        );
+        assert!(
+            plan.iter().all(|detail| !detail.contains("CO-ROUTINE")),
+            "the mounted-declaration scan must not materialize a compound view: {plan:#?}"
+        );
+        assert!(
+            plan.iter().all(|detail| !detail.contains("TEMP B-TREE")),
+            "the caller sorts in Rust, so the query must not sort: {plan:#?}"
+        );
+        assert!(
+            plan.iter()
+                .all(|detail| !detail.contains("workspace_file_path_symbol_rows")),
+            "the path-symbol arm is discarded by the caller and must not be read: {plan:#?}"
+        );
+    }
+
+    // Issue #2794. Every candidate query in the store hydrates its relational
+    // identities through `candidate_fq_segments_sql`, one padded chunk of keys
+    // at a time, so a bad plan here is a bad plan everywhere -- and the plan
+    // only goes bad on the wide rungs, which is exactly what a large answer
+    // uses. See that function's comment for what SQLite does without the hint.
+    #[test]
+    fn hydration_chunks_seek_the_segment_primary_key() {
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        let conn = store.conn.lock().expect("store mutex");
+        for arity in [1usize, 16, 64, 256, 400] {
+            let sql = format!("EXPLAIN QUERY PLAN {}", candidate_fq_segments_sql(arity));
+            let bindings = (0..arity * 4)
+                .map(|_| rusqlite::types::Value::Null)
+                .collect::<Vec<_>>();
+            let plan = conn
+                .prepare(&sql)
+                .unwrap()
+                .query_map(params_from_iter(bindings.iter()), |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+
+            assert!(
+                plan.iter().any(|detail| detail
+                    .contains("SEARCH segments USING PRIMARY KEY (blob_id=? AND unit_key=?)")),
+                "a {arity}-key chunk must seek the segment primary key: {plan:#?}"
+            );
+            assert!(
+                plan.iter().all(|detail| !detail.contains("AUTOMATIC")),
+                "a {arity}-key chunk must not build a transient index over the segment table: {plan:#?}"
+            );
+        }
+    }
+
     #[test]
     fn identifier_prefix_lookup_seeks_the_identifier_index() {
         let store = AnalyzerStore::open_ephemeral().unwrap();
@@ -19783,7 +21403,7 @@ mod tests {
         let manifest_rows: usize = conn
             .query_row(
                 "SELECT COUNT(*) FROM blob_optional_fact_manifest
-                 WHERE blob_oid = ?1 AND lang = 'python'",
+                 WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'python')",
                 [oid.to_string()],
                 |row| row.get(0),
             )
@@ -20077,12 +21697,13 @@ mod tests {
                         COUNT(segments.seg_ordinal)
                  FROM code_units AS units
                  JOIN code_unit_fq_segments AS segments
-                   ON segments.blob_oid = units.blob_oid
-                  AND segments.lang = units.lang
+                   ON segments.blob_id = units.blob_id
                   AND segments.unit_key = units.unit_key
-                 WHERE units.blob_oid = ?1 AND units.lang = 'csharp'
+                 WHERE units.blob_id = (
+                         SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'csharp'
+                       )
                    AND units.identifier LIKE 'Nested%'
-                 GROUP BY units.blob_oid, units.lang, units.unit_key",
+                 GROUP BY units.blob_id, units.unit_key",
                 [oid.to_string()],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
@@ -20474,8 +22095,8 @@ mod tests {
         let err = conn
             .execute(
                 "INSERT INTO unit_ranges(
-                   blob_oid, lang, unit_key, ordinal, start_byte, end_byte, start_line, end_line
-                 ) VALUES(?1, 'rust', 1, 0, 10, 2, 4, 3)",
+                   blob_id, lang, unit_key, ordinal, start_byte, end_byte, start_line, end_line
+                 ) VALUES((SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'rust'), 'rust', 1, 0, 10, 2, 4, 3)",
                 [TEST_OID],
             )
             .unwrap_err();
@@ -20489,8 +22110,8 @@ mod tests {
         insert_test_blob_and_unit(&conn);
         let err = conn
             .execute(
-                "INSERT INTO unit_children(blob_oid, lang, parent_key, child_key, ordinal)
-                 VALUES(?1, 'rust', 1, 1, 0)",
+                "INSERT INTO unit_children(blob_id, lang, parent_key, child_key, ordinal)
+                 VALUES((SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'rust'), 'rust', 1, 1, 0)",
                 [TEST_OID],
             )
             .unwrap_err();
@@ -20508,8 +22129,8 @@ mod tests {
         .unwrap();
         let err = conn
             .execute(
-                "INSERT INTO unit_signatures(blob_oid, lang, unit_key, ordinal, text)
-                 VALUES(?1, 'rust', 99, 0, 'fn orphan()')",
+                "INSERT INTO unit_signatures(blob_id, lang, unit_key, ordinal, text)
+                 VALUES((SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'rust'), 'rust', 99, 0, 'fn orphan()')",
                 [TEST_OID],
             )
             .unwrap_err();
@@ -20528,10 +22149,10 @@ mod tests {
         let file_scope_err = conn
             .execute(
                 "INSERT INTO code_units(
-                   blob_oid, lang, unit_key, kind, short_name, identifier, content_qualifier,
+                   blob_id, lang, unit_key, kind, short_name, identifier, content_qualifier,
                    signature, synthetic, is_type_alias, top_level_ordinal,
                    in_declarations, in_definition_lookup
-                 ) VALUES(?1, 'rust', 1, 5, 'file', 'file', '', NULL, 0, 0, 0, 1, 0)",
+                 ) VALUES((SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'rust'), 'rust', 1, 5, 'file', 'file', '', NULL, 0, 0, 0, 1, 0)",
                 [TEST_OID],
             )
             .unwrap_err();
@@ -20545,10 +22166,10 @@ mod tests {
             .and_then(|_| {
                 conn.execute(
                     "INSERT INTO code_units(
-                       blob_oid, lang, unit_key, kind, short_name, identifier, content_qualifier,
+                       blob_id, lang, unit_key, kind, short_name, identifier, content_qualifier,
                        signature, synthetic, is_type_alias, top_level_ordinal,
                        in_declarations, in_definition_lookup
-                     ) VALUES(?1, 'python', 1, 3, 'mod', 'mod', '', NULL, 0, 0, 0, 1, 0)",
+                     ) VALUES((SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'python'), 'python', 1, 3, 'mod', 'mod', '', NULL, 0, 0, 0, 1, 0)",
                     [TEST_OID],
                 )
             })
@@ -20648,8 +22269,9 @@ mod tests {
 
         {
             let conn = store.conn.lock().unwrap();
-            let count_sql =
-                format!("SELECT COUNT(*) FROM {table} WHERE blob_oid = ?1 AND lang = ?2");
+            let count_sql = format!(
+                "SELECT COUNT(*) FROM {table} WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)"
+            );
             let count: usize = conn
                 .query_row(&count_sql, params![oid.to_string(), lang], |row| row.get(0))
                 .unwrap();
@@ -20657,7 +22279,9 @@ mod tests {
                 count > 0,
                 "fixture should persist at least one {table} row for {lang}"
             );
-            let delete_sql = format!("DELETE FROM {table} WHERE blob_oid = ?1 AND lang = ?2");
+            let delete_sql = format!(
+                "DELETE FROM {table} WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)"
+            );
             conn.execute(&delete_sql, params![oid.to_string(), lang])
                 .unwrap();
         }
@@ -21026,9 +22650,10 @@ mod tests {
             params![TEST_OID, lang],
         )
         .unwrap();
+        let blob_id = tx.last_insert_rowid();
         insert_import_rows(
             &tx,
-            TEST_OID,
+            blob_id,
             lang,
             &ImportRows::from_imports(imports).unwrap(),
         )
@@ -21071,7 +22696,7 @@ mod tests {
 
         let count = |table: &str| -> i64 {
             conn.query_row(
-                &format!("SELECT COUNT(*) FROM {table} WHERE blob_oid = ?1 AND lang = 'rust'"),
+                &format!("SELECT COUNT(*) FROM {table} WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'rust')"),
                 [TEST_OID],
                 |row| row.get(0),
             )
@@ -21090,7 +22715,7 @@ mod tests {
         let pathless: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM import_statements
-                 WHERE blob_oid = ?1 AND lang = 'rust' AND declaration_start_byte IS NULL",
+                 WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'rust') AND declaration_start_byte IS NULL",
                 [TEST_OID],
                 |row| row.get(0),
             )
@@ -21120,7 +22745,7 @@ mod tests {
         ] {
             let remaining: i64 = conn
                 .query_row(
-                    &format!("SELECT COUNT(*) FROM {table} WHERE blob_oid = ?1"),
+                    &format!("SELECT COUNT(*) FROM {table} WHERE blob_id IN (SELECT id FROM blobs WHERE blob_oid = ?1)"),
                     [TEST_OID],
                     |row| row.get(0),
                 )
@@ -21142,8 +22767,8 @@ mod tests {
         let insert = |columns: &str, values: &str| -> rusqlite::Error {
             conn.execute(
                 &format!(
-                    "INSERT INTO import_statements(blob_oid, lang, ordinal, statement, {columns})
-                     VALUES(?1, 'rust', 0, 'use x;', {values})"
+                    "INSERT INTO import_statements(blob_id, lang, ordinal, statement, {columns})
+                     VALUES((SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'rust'), 'rust', 0, 'use x;', {values})"
                 ),
                 [TEST_OID],
             )
@@ -21176,8 +22801,8 @@ mod tests {
         let negative_ordinal = conn
             .execute(
                 "INSERT INTO import_statements(
-                   blob_oid, lang, ordinal, statement, is_wildcard, is_global
-                 ) VALUES(?1, 'rust', -1, 'use x;', 0, 0)",
+                   blob_id, lang, ordinal, statement, is_wildcard, is_global
+                 ) VALUES((SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'rust'), 'rust', -1, 'use x;', 0, 0)",
                 [TEST_OID],
             )
             .unwrap_err();
@@ -21185,16 +22810,16 @@ mod tests {
 
         conn.execute(
             "INSERT INTO import_statements(
-               blob_oid, lang, ordinal, statement, is_wildcard, is_global
-             ) VALUES(?1, 'rust', 0, 'use x;', 0, 0)",
+               blob_id, lang, ordinal, statement, is_wildcard, is_global
+             ) VALUES((SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'rust'), 'rust', 0, 'use x;', 0, 0)",
             [TEST_OID],
         )
         .unwrap();
         let inverted_scope = conn
             .execute(
                 "INSERT INTO import_lexical_scopes(
-                   blob_oid, lang, ordinal, scope_ordinal, start_byte, end_byte
-                 ) VALUES(?1, 'rust', 0, 0, 20, 10)",
+                   blob_id, lang, ordinal, scope_ordinal, start_byte, end_byte
+                 ) VALUES((SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'rust'), 'rust', 0, 0, 20, 10)",
                 [TEST_OID],
             )
             .unwrap_err();
@@ -21202,8 +22827,8 @@ mod tests {
         let orphan_segment = conn
             .execute(
                 "INSERT INTO import_path_segments(
-                   blob_oid, lang, ordinal, seg_ordinal, segment
-                 ) VALUES(?1, 'rust', 41, 0, 'nobody')",
+                   blob_id, lang, ordinal, seg_ordinal, segment
+                 ) VALUES((SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'rust'), 'rust', 41, 0, 'nobody')",
                 [TEST_OID],
             )
             .unwrap_err();
@@ -21232,7 +22857,7 @@ mod tests {
                 .prepare(
                     "SELECT ordinal, statement, is_wildcard, is_global, identifier, alias,
                             path_kind, declaration_start_byte, binder_start, binder_end
-                     FROM import_statements WHERE blob_oid = ?1 AND lang = 'scala'
+                     FROM import_statements WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'scala')
                      ORDER BY ordinal",
                 )
                 .unwrap();
@@ -21260,10 +22885,10 @@ mod tests {
             let mut children = conn
                 .prepare(
                     "SELECT 'seg', ordinal, seg_ordinal, segment
-                     FROM import_path_segments WHERE blob_oid = ?1 AND lang = 'scala'
+                     FROM import_path_segments WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'scala')
                      UNION ALL
                      SELECT 'prefix', ordinal, prefix_ordinal, prefix
-                     FROM import_lexical_prefixes WHERE blob_oid = ?1 AND lang = 'scala'
+                     FROM import_lexical_prefixes WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'scala')
                      ORDER BY 1, 2, 3",
                 )
                 .unwrap()
@@ -21372,7 +22997,7 @@ mod tests {
         let per_blob = explain(
             &format!(
                 "SELECT {IMPORT_STATEMENT_COLUMNS} FROM import_statements
-                 WHERE blob_oid = ?1 AND lang = ?2
+                 WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
                  ORDER BY ordinal"
             ),
             &[TEST_OID, "rust"],
@@ -21398,22 +23023,27 @@ mod tests {
         ] {
             let plan = explain(
                 &format!(
-                    "SELECT blob_oid, ordinal, {value_columns}
-                     FROM {table}
-                     WHERE lang = ? AND blob_oid IN (?, ?)
-                     ORDER BY blob_oid, ordinal"
+                    "SELECT keys.blob_oid, facts.ordinal, {value_columns}
+                     FROM blobs AS keys
+                     JOIN {table} AS facts ON facts.blob_id = keys.id
+                     WHERE keys.lang = ? AND keys.blob_oid IN (?, ?)
+                     ORDER BY keys.blob_oid, facts.ordinal"
                 ),
                 &["rust", TEST_OID, TEST_OID],
             );
             assert!(
                 plan.iter()
-                    .any(|detail| detail.contains(&format!("SEARCH {table} USING PRIMARY KEY"))),
+                    .any(|detail| detail.contains("SEARCH facts USING PRIMARY KEY")),
+                "{table}: {plan:#?}"
+            );
+            assert!(
+                plan.iter().any(|detail| detail
+                    .contains("SEARCH keys USING COVERING INDEX sqlite_autoindex_blobs_1")),
                 "{table}: {plan:#?}"
             );
             assert!(
                 plan.iter()
-                    .all(|detail| !detail.contains(&format!("SCAN {table}"))
-                        && !detail.contains("USE TEMP B-TREE")),
+                    .all(|detail| !detail.contains("SCAN") && !detail.contains("USE TEMP B-TREE")),
                 "{table}: {plan:#?}"
             );
         }
@@ -21477,20 +23107,85 @@ mod tests {
         }
         let generation = store.current_generation("java").unwrap();
         let batched = store
-            .workspace_content_package_facts("java", generation, &oids)
+            .workspace_content_package_facts("java", generation, &oids, None)
             .unwrap()
+            .facts
             .into_iter()
             .collect::<HashSet<_>>();
         let singles = oids
             .iter()
             .flat_map(|oid| {
                 store
-                    .workspace_content_package_facts("java", generation, &[*oid])
+                    .workspace_content_package_facts("java", generation, &[*oid], None)
                     .unwrap()
+                    .facts
             })
             .collect::<HashSet<_>>();
         assert!(!batched.is_empty(), "fixture must publish package facts");
         assert_eq!(batched, singles);
+    }
+
+    #[test]
+    fn workspace_package_facts_include_declaration_free_go_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let _ = write_file(temp.path(), "go.mod", "module example.com/demo\n");
+        let source = "package service\n";
+        let file = write_file(temp.path(), "service/service.go", source);
+        let oid = oid_for(source.as_bytes());
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        store
+            .write_parsed_blob(oid, "go", &GoAdapter, &parse_state(&GoAdapter, &file))
+            .unwrap();
+
+        let generation = store.current_generation("go").unwrap();
+        let outcome = store
+            .workspace_content_package_facts(
+                "go",
+                generation,
+                &[oid],
+                Some(PackageAnchor::OwnModule { pop: 0 }),
+            )
+            .unwrap();
+
+        assert!(outcome.complete);
+        let facts = outcome.facts;
+        assert_eq!(facts.len(), 1, "one file must publish one package fact");
+        assert_eq!(facts[0].blob_oid, oid);
+        assert_eq!(facts[0].anchor, Some(PackageAnchor::OwnModule { pop: 0 }));
+        assert_eq!(facts[0].content_qualifier, "service");
+        assert!(facts[0].package_tail.is_empty());
+    }
+
+    #[test]
+    fn anchored_workspace_package_facts_report_an_unindexed_blob_incomplete() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = "package service\n";
+        let file = write_file(temp.path(), "service/service.go", source);
+        let persisted_oid = oid_for(source.as_bytes());
+        let missing_oid = oid_for(b"package missing\n");
+        let store = AnalyzerStore::open_ephemeral().unwrap();
+        store
+            .write_parsed_blob(
+                persisted_oid,
+                "go",
+                &GoAdapter,
+                &parse_state(&GoAdapter, &file),
+            )
+            .unwrap();
+
+        let generation = store.current_generation("go").unwrap();
+        let outcome = store
+            .workspace_content_package_facts(
+                "go",
+                generation,
+                &[persisted_oid, missing_oid],
+                Some(PackageAnchor::OwnModule { pop: 0 }),
+            )
+            .unwrap();
+
+        assert!(!outcome.complete);
+        assert_eq!(outcome.facts.len(), 1);
+        assert_eq!(outcome.facts[0].blob_oid, persisted_oid);
     }
 
     #[test]
@@ -21596,10 +23291,10 @@ mod tests {
         .unwrap();
         conn.execute(
             "INSERT INTO code_units(
-               blob_oid, lang, unit_key, kind, short_name, identifier, content_qualifier,
+               blob_id, lang, unit_key, kind, short_name, identifier, content_qualifier,
                signature, synthetic, is_type_alias, top_level_ordinal,
                in_declarations, in_definition_lookup
-             ) VALUES(?1, 'rust', 1, 0, 'Thing', 'Thing', '', NULL, 0, 0, 0, 1, 0)",
+             ) VALUES((SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'rust'), 'rust', 1, 0, 'Thing', 'Thing', '', NULL, 0, 0, 0, 1, 0)",
             [TEST_OID],
         )
         .unwrap();
@@ -22396,7 +24091,7 @@ mod tests {
             .into_iter()
             .map(|table| {
                 conn.query_row(
-                    &format!("SELECT COUNT(*) FROM {table} WHERE blob_oid = ?1 AND lang = ?2"),
+                    &format!("SELECT COUNT(*) FROM {table} WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)"),
                     params![oid.to_string(), "rust"],
                     |row| row.get::<_, usize>(0),
                 )
@@ -22555,7 +24250,7 @@ mod tests {
             ]
             .map(|table| {
                 conn.query_row(
-                    &format!("SELECT COUNT(*) FROM {table} WHERE blob_oid = ?1 AND lang = ?2"),
+                    &format!("SELECT COUNT(*) FROM {table} WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)"),
                     params![oid.to_string(), "rust"],
                     |row| row.get::<_, usize>(0),
                 )
@@ -22734,7 +24429,7 @@ replay! { mod replayed; }
             .unwrap();
         let conn = store.conn.lock().unwrap();
         let mut statement = conn
-            .prepare("SELECT short_name FROM code_units WHERE blob_oid = ?1 AND lang = ?2")
+            .prepare("SELECT short_name FROM code_units WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)")
             .unwrap();
         let names: Vec<String> = statement
             .query_map(params![oid.to_string(), lang], |row| row.get(0))

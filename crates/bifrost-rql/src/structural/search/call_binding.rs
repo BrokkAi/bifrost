@@ -32,8 +32,10 @@ use crate::analyzer::lexical_definitions::{
 };
 use crate::analyzer::semantic::LengthDelimitedDigest;
 use crate::analyzer::semantic_model::{
-    SemanticModelCallableDisposition, SemanticModelCallableIncompleteReason,
-    SemanticModelCallableKey, SemanticModelCompleteness,
+    Completeness, ProcedureSummaryMemberKey, SemanticModelCallableDisposition,
+    SemanticModelCallableIncompleteReason, SemanticModelCallableKey, SemanticModelCompleteness,
+    SemanticModelMatchDisposition, SemanticModelOriginKind, SemanticModelProof,
+    SemanticModelProvenance,
 };
 use crate::analyzer::usages::call_binding::{
     CallBindingCoverage, CallBindingMapping, CallBindingReport, CallBindingRow, CallBindingTarget,
@@ -45,9 +47,8 @@ use crate::analyzer::usages::call_relations::{
 use crate::analyzer::usages::callable_signature::{
     CallableSignatureReport, callable_signature_reports,
 };
-use crate::analyzer::usages::get_definition::{
-    DefinitionLookupRequest, DefinitionLookupStatus, resolve_call_target_batch_with_source,
-};
+use crate::analyzer::usages::effects::ModeledProcedureKey;
+use crate::analyzer::usages::get_definition::DefinitionLookupStatus;
 use brokk_bifrost_core::analyzer::structural::callable::ReceiverContract;
 
 use super::dispatch::DispatchSiteAnswer;
@@ -69,8 +70,70 @@ pub(super) struct CallBindingSiteValue {
     /// identity is the #2438 dispatch identity; source declarations remain a
     /// presentation-only materialized view.
     pub(super) dispatch: CallBindingDispatch,
+    /// Exactness of the endpoint selector, kept separate from runtime dispatch.
+    /// `authored_summary` means the declaration identity is exact and the one
+    /// residual override boundary is covered by an explicit reviewed contract.
+    pub(super) selector: CallBindingSelectorProof,
+    /// The declared semantic target identity. This is separate from the
+    /// dispatch identity because a model can identify one external declaration
+    /// while runtime dispatch remains open or partial.
+    pub(super) semantic_target_id: Option<String>,
+    /// Whether the declared target came from an indexed source declaration or
+    /// the activated semantic-model overlay.
+    pub(super) target_origin: Option<&'static str>,
     pub(super) model_id: Option<String>,
     pub(super) pack_id: Option<String>,
+    pub(super) semantic_model_provenance: Option<Arc<SemanticModelProvenance>>,
+    /// Stable identity of the type that owns this callable's receiver, when
+    /// the shared binder establishes one. An exact model owner takes
+    /// precedence; otherwise this is the source declaration identity. It is
+    /// never a qualified/display name.
+    pub(super) receiver_type_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct CallBindingSelectorProof {
+    pub(super) exact: bool,
+    pub(super) tier: Option<&'static str>,
+    pub(super) summary_id: Option<String>,
+    pub(super) summary_model_id: Option<String>,
+    pub(super) summary_provenance: Option<Arc<SemanticModelProvenance>>,
+}
+
+impl CallBindingSelectorProof {
+    fn unavailable() -> Self {
+        Self {
+            exact: false,
+            tier: None,
+            summary_id: None,
+            summary_model_id: None,
+            summary_provenance: None,
+        }
+    }
+
+    fn derived() -> Self {
+        Self {
+            exact: true,
+            tier: Some("derived"),
+            summary_id: None,
+            summary_model_id: None,
+            summary_provenance: None,
+        }
+    }
+
+    fn authored_summary(
+        summary_id: String,
+        summary_model_id: String,
+        provenance: SemanticModelProvenance,
+    ) -> Self {
+        Self {
+            exact: true,
+            tier: Some("authored_summary"),
+            summary_id: Some(summary_id),
+            summary_model_id: Some(summary_model_id),
+            summary_provenance: Some(Arc::new(provenance)),
+        }
+    }
 }
 
 /// The dispatch quality carried alongside every binding row of one call.
@@ -156,15 +219,19 @@ enum ModelCallBinding {
     Unique {
         layout: FormalParameterLayout,
         receiver: CallReceiverBinding,
+        key: ModeledProcedureKey,
         model_id: String,
         pack_id: String,
+        receiver_type_id: Option<String>,
         signature_id: String,
+        semantic_model_provenance: Arc<SemanticModelProvenance>,
     },
     Conflict,
     Incomplete {
         model_id: Option<String>,
         pack_id: Option<String>,
         reason: SemanticModelCallableIncompleteReason,
+        semantic_model_provenance: Option<Arc<SemanticModelProvenance>>,
     },
     Empty,
     Unavailable,
@@ -181,19 +248,26 @@ fn model_call_binding(
     let Some(overlay) = analyzer.semantic_model_overlay() else {
         return ModelCallBinding::Unavailable;
     };
-    let language = target.language().stable_label();
+    let modeled_key = ModeledProcedureKey {
+        language: target.language().semantic_pack_label().to_owned(),
+        owner: target.owner_fqn().to_owned(),
+        member: target.member().to_owned(),
+        has_receiver: target.has_receiver(),
+        parameter_count: target.arity(),
+    };
     let key = SemanticModelCallableKey::new(
-        language,
-        target.owner_fqn(),
-        target.member(),
-        target.has_receiver(),
-        target.arity(),
+        &modeled_key.language,
+        &modeled_key.owner,
+        &modeled_key.member,
+        modeled_key.has_receiver,
+        modeled_key.parameter_count,
     );
     let matched = overlay.callable_for_target(key);
     let provenance = matched
         .records
         .first()
-        .map(|symbol| (symbol.id.clone(), symbol.provenance.pack_id.clone()));
+        .map(|symbol| Arc::new(symbol.provenance.clone()));
+    let model_id = matched.records.first().map(|symbol| symbol.id.clone());
     match matched.disposition {
         SemanticModelCallableDisposition::Unique => {
             let Some(symbol) = matched.unique() else {
@@ -201,20 +275,22 @@ fn model_call_binding(
             };
             let Some(signature) = symbol.structured_signature() else {
                 return ModelCallBinding::Incomplete {
-                    model_id: provenance.as_ref().map(|(id, _)| id.clone()),
-                    pack_id: provenance.as_ref().map(|(_, pack)| pack.clone()),
+                    model_id: model_id.clone(),
+                    pack_id: provenance.as_ref().map(|value| value.pack_id.clone()),
                     reason: SemanticModelCallableIncompleteReason::MissingSignature,
+                    semantic_model_provenance: provenance,
                 };
             };
             let mut slots = Vec::with_capacity(signature.parameters.len());
             for (ordinal, parameter) in signature.parameters.iter().enumerate() {
                 let Some(name) = parameter.name.clone() else {
                     return ModelCallBinding::Incomplete {
-                        model_id: provenance.as_ref().map(|(id, _)| id.clone()),
-                        pack_id: provenance.as_ref().map(|(_, pack)| pack.clone()),
+                        model_id: model_id.clone(),
+                        pack_id: provenance.as_ref().map(|value| value.pack_id.clone()),
                         reason: SemanticModelCallableIncompleteReason::MissingFormalName {
                             ordinal,
                         },
+                        semantic_model_provenance: provenance,
                     };
                 };
                 slots.push(FormalParameterSlot {
@@ -243,26 +319,36 @@ fn model_call_binding(
             } else {
                 CallReceiverBinding::Absent
             };
-            let Some((model_id, pack_id)) = provenance else {
+            let Some(model_provenance) = provenance else {
                 return ModelCallBinding::Unavailable;
             };
+            let model_id = symbol.id.clone();
+            let pack_id = model_provenance.pack_id.clone();
             let signature_id = model_signature_id(&model_id, signature);
+            let receiver_type_id = target
+                .has_receiver()
+                .then(|| symbol.owner_id.clone())
+                .flatten();
             ModelCallBinding::Unique {
                 layout: FormalParameterLayout {
                     slots,
                     python_binding: None,
                 },
                 receiver,
+                key: modeled_key,
                 model_id,
                 pack_id,
+                receiver_type_id,
                 signature_id,
+                semantic_model_provenance: model_provenance,
             }
         }
         SemanticModelCallableDisposition::Conflict => ModelCallBinding::Conflict,
         SemanticModelCallableDisposition::Incomplete(reason) => ModelCallBinding::Incomplete {
-            model_id: provenance.as_ref().map(|(id, _)| id.clone()),
-            pack_id: provenance.map(|(_, pack)| pack),
+            model_id,
+            pack_id: provenance.as_ref().map(|value| value.pack_id.clone()),
             reason,
+            semantic_model_provenance: provenance,
         },
         SemanticModelCallableDisposition::Empty => ModelCallBinding::Empty,
     }
@@ -270,8 +356,16 @@ fn model_call_binding(
 
 enum SourceTargetModelProvenance {
     Absent,
-    Exact { model_id: String, pack_id: String },
-    Incomplete,
+    Exact {
+        model_id: String,
+        receiver_type_id: Option<String>,
+        provenance: Arc<SemanticModelProvenance>,
+        key: ModeledProcedureKey,
+    },
+    Incomplete {
+        model_id: Option<String>,
+        provenance: Option<Arc<SemanticModelProvenance>>,
+    },
 }
 
 fn model_provenance_for_source_target(
@@ -293,24 +387,174 @@ fn model_provenance_for_source_target(
         key.has_receiver,
         key.parameter_count,
     ));
+    let incomplete_provenance = matched
+        .records
+        .first()
+        .map(|symbol| Arc::new(symbol.provenance.clone()));
     let Some(symbol) = matched.unique() else {
         return match matched.disposition {
             SemanticModelCallableDisposition::Empty => SourceTargetModelProvenance::Absent,
             SemanticModelCallableDisposition::Unique => unreachable!("unique match has a record"),
-            SemanticModelCallableDisposition::Conflict
-            | SemanticModelCallableDisposition::Incomplete(_) => {
-                SourceTargetModelProvenance::Incomplete
+            SemanticModelCallableDisposition::Conflict => SourceTargetModelProvenance::Incomplete {
+                model_id: None,
+                provenance: None,
+            },
+            SemanticModelCallableDisposition::Incomplete(_) => {
+                SourceTargetModelProvenance::Incomplete {
+                    model_id: matched.records.first().map(|symbol| symbol.id.clone()),
+                    provenance: incomplete_provenance,
+                }
             }
         };
     };
-    if symbol.provenance.ambiguous
-        || symbol.provenance.completeness != SemanticModelCompleteness::Complete
-    {
-        return SourceTargetModelProvenance::Incomplete;
-    }
+    debug_assert!(!symbol.provenance.ambiguous);
     SourceTargetModelProvenance::Exact {
         model_id: symbol.id.clone(),
-        pack_id: symbol.provenance.pack_id.clone(),
+        receiver_type_id: key.has_receiver.then(|| symbol.owner_id.clone()).flatten(),
+        provenance: Arc::new(symbol.provenance.clone()),
+        key,
+    }
+}
+
+/// Select an authored override contract only for the one residual shape #2371
+/// can discharge. The named `unresolved` boundary distinguishes that contract
+/// residual from real target-limit or workspace-hierarchy truncation.
+fn authored_residual_arm(answer: &DispatchSiteAnswer) -> Option<&super::dispatch::DispatchArm> {
+    (matches!(answer.outcome, "unknown" | "unproven")
+        && answer.call_site_count == 1
+        && answer.arms.len() == 1
+        && is_authored_override_residual(&answer.unnamed_boundaries))
+    .then(|| &answer.arms[0])
+}
+
+fn authored_selector_proof_for_source_target(
+    analyzer: &dyn IAnalyzer,
+    answer: &DispatchSiteAnswer,
+    source_target: &CodeUnit,
+    key: &ModeledProcedureKey,
+) -> Option<CallBindingSelectorProof> {
+    let arm = authored_residual_arm(answer)?;
+    if arm.target_unit.as_ref() != Some(source_target) {
+        return None;
+    }
+    authored_summary_selector_proof(analyzer, key)
+}
+
+fn authored_selector_proof_for_external_target(
+    analyzer: &dyn IAnalyzer,
+    answer: &DispatchSiteAnswer,
+    key: &ModeledProcedureKey,
+) -> Option<CallBindingSelectorProof> {
+    let target = authored_residual_arm(answer)?
+        .unmaterialized_target
+        .as_ref()?;
+    if target.language().semantic_pack_label() != key.language
+        || target.owner_fqn() != key.owner
+        || target.member() != key.member
+        || target.has_receiver() != key.has_receiver
+        || target.arity() != key.parameter_count
+    {
+        return None;
+    }
+    authored_summary_selector_proof(analyzer, key)
+}
+
+fn authored_summary_selector_proof(
+    analyzer: &dyn IAnalyzer,
+    key: &ModeledProcedureKey,
+) -> Option<CallBindingSelectorProof> {
+    let active = analyzer.active_semantic_models()?;
+    let matched = active.procedure_summaries_for_member(ProcedureSummaryMemberKey::new(
+        &key.language,
+        &key.owner,
+        &key.member,
+        key.has_receiver,
+        key.parameter_count,
+    ));
+    if matched.disposition != SemanticModelMatchDisposition::Unique {
+        return None;
+    }
+    let selected = matched.records.first()?;
+    if selected.record.completeness != Completeness::Complete || !selected.record.covers_overrides {
+        return None;
+    }
+    Some(CallBindingSelectorProof::authored_summary(
+        selected.record.id.clone(),
+        selected.record.model_id.clone(),
+        selected.provenance(&active),
+    ))
+}
+
+fn is_authored_override_residual(boundaries: &[&str]) -> bool {
+    boundaries == ["unresolved"]
+}
+
+fn resolver_proven_static_model_selector(answer: &DispatchSiteAnswer) -> bool {
+    answer.outcome == "resolved"
+        && answer.coverage.is_exhaustive()
+        && answer.unnamed_boundaries.is_empty()
+        && matches!(
+            answer.arms.as_slice(),
+            [arm]
+                if arm.proof == "proven"
+                    && arm
+                        .unmaterialized_target
+                        .as_ref()
+                        .is_some_and(|target| target.resolver_proves_static_call())
+        )
+}
+
+#[cfg(test)]
+mod authored_override_residual_tests {
+    use super::{DispatchSiteAnswer, authored_residual_arm, is_authored_override_residual};
+
+    #[test]
+    fn only_one_unresolved_boundary_is_the_contract_residual() {
+        assert!(is_authored_override_residual(&["unresolved"]));
+        assert!(!is_authored_override_residual(&[]));
+        assert!(!is_authored_override_residual(&["truncated"]));
+        assert!(!is_authored_override_residual(&["external"]));
+        assert!(!is_authored_override_residual(&[
+            "unresolved",
+            "unresolved"
+        ]));
+        assert!(!is_authored_override_residual(&["unresolved", "truncated"]));
+    }
+
+    #[test]
+    fn only_unknown_or_unproven_answers_can_carry_the_contract_residual() {
+        let answer = |outcome| DispatchSiteAnswer {
+            outcome,
+            coverage: crate::analyzer::semantic::CandidateCoverage::Open,
+            call_site_count: 1,
+            semantic_unsupported: None,
+            exceeded_limit: None,
+            arms: Vec::new(),
+            unnamed_boundaries: vec!["unresolved"],
+        };
+        for outcome in ["unknown", "unproven"] {
+            let mut answer = answer(outcome);
+            answer.arms.push(super::super::dispatch::DispatchArm {
+                target_id: "target".to_owned(),
+                target_path: "target".to_owned(),
+                target_unit: None,
+                exact_external_target: None,
+                unmaterialized_target: None,
+                proof: "proven",
+                completeness: "partial",
+                boundary_kind: Some("external"),
+            });
+            assert!(authored_residual_arm(&answer).is_some());
+        }
+        for outcome in [
+            "resolved",
+            "ambiguous",
+            "unsupported",
+            "exceeded_budget",
+            "cancelled",
+        ] {
+            assert!(authored_residual_arm(&answer(outcome)).is_none());
+        }
     }
 }
 
@@ -326,6 +570,34 @@ fn model_signature_id(
     digest.push(model_id.as_bytes());
     digest.push(&encoded);
     digest.finish().to_string()
+}
+
+pub(super) const fn semantic_model_origin_label(origin: SemanticModelOriginKind) -> &'static str {
+    match origin {
+        SemanticModelOriginKind::WorkspaceSource => "workspace_source",
+        SemanticModelOriginKind::ExactGeneratedOutput => "exact_generated_output",
+        SemanticModelOriginKind::DependencySource => "dependency_source",
+        SemanticModelOriginKind::DependencyBinary => "dependency_binary",
+        SemanticModelOriginKind::PrebuiltApiIndex => "prebuilt_api_index",
+        SemanticModelOriginKind::DeclarativeModel => "declarative_model",
+    }
+}
+
+pub(super) const fn semantic_model_proof_label(proof: SemanticModelProof) -> &'static str {
+    match proof {
+        SemanticModelProof::AuthoredAnchor => "authored_anchor",
+        SemanticModelProof::ExactArtifact => "exact_artifact",
+        SemanticModelProof::PackFact => "pack_fact",
+    }
+}
+
+pub(super) const fn semantic_model_completeness_label(
+    completeness: SemanticModelCompleteness,
+) -> &'static str {
+    match completeness {
+        SemanticModelCompleteness::Partial => "partial",
+        SemanticModelCompleteness::Complete => "complete",
+    }
 }
 
 /// One row of one call site's binding report.
@@ -356,7 +628,7 @@ pub(super) fn call_binding_expansions(
     diagnostics: &mut Vec<CodeQueryDiagnostic>,
 ) -> Vec<PipelineExpansion> {
     let file = shape.report.outcome.file.clone();
-    let resolved = resolve_call_target(analyzer, shape, cancellation);
+    let resolved = resolve_call_target(analyzer, shape, bindings, cancellation);
     let (mut target, declaration, mut signature_id, source_target) = match resolved {
         ResolvedCallTarget::Unit(unit) => {
             let source_target = unit.clone();
@@ -412,26 +684,46 @@ pub(super) fn call_binding_expansions(
     let dispatch_answer =
         semantic.map(|semantic| semantic.dispatch_at_source(&file, shape.report.outcome.range));
     let has_semantic = dispatch_answer.is_some();
-    let mut dispatch = dispatch_answer
+    let dispatch = dispatch_answer
         .as_ref()
         .map_or_else(CallBindingDispatch::unavailable, |answer| {
             CallBindingDispatch::from_answer(answer, source_target.as_ref(), None)
         });
     let mut model_id = None;
     let mut pack_id = None;
-    if dispatch.is_exact()
-        && let Some(source_target) = source_target.as_ref()
-    {
+    let mut receiver_type_id = None;
+    let mut semantic_target_id = source_target
+        .as_ref()
+        .and_then(|_| dispatch.target_id.clone());
+    let mut target_origin = source_target.as_ref().map(|_| "source");
+    let mut semantic_model_provenance = None;
+    let mut modeled_key = None;
+    let mut model_static_selector_proven = false;
+    // A unique model record can describe the source resolver's declaration
+    // even when runtime dispatch remains open. Keep those two facts separate:
+    // model provenance never upgrades the dispatch proof below.
+    if let Some(source_target) = source_target.as_ref() {
         match model_provenance_for_source_target(analyzer, source_target) {
             SourceTargetModelProvenance::Absent => {}
             SourceTargetModelProvenance::Exact {
                 model_id: resolved_model_id,
-                pack_id: resolved_pack_id,
+                receiver_type_id: resolved_receiver_type_id,
+                provenance,
+                key,
             } => {
                 model_id = Some(resolved_model_id);
-                pack_id = Some(resolved_pack_id);
+                pack_id = Some(provenance.pack_id.clone());
+                receiver_type_id = resolved_receiver_type_id;
+                semantic_model_provenance = Some(provenance);
+                modeled_key = Some(key);
             }
-            SourceTargetModelProvenance::Incomplete => {
+            SourceTargetModelProvenance::Incomplete {
+                model_id: incomplete_model_id,
+                provenance,
+            } => {
+                model_id = incomplete_model_id;
+                pack_id = provenance.as_ref().map(|value| value.pack_id.clone());
+                semantic_model_provenance = provenance;
                 diagnostics.push(CodeQueryDiagnostic {
                     code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
                     impact: CodeQueryDiagnosticImpact::Incomplete,
@@ -443,80 +735,135 @@ pub(super) fn call_binding_expansions(
         }
     }
     if source_target.is_none()
-        && let Some((answer, arm)) = dispatch_answer.as_ref().and_then(|answer| {
-            (answer.outcome == "resolved"
-                && answer.coverage.label() == "exhaustive"
-                && answer.arms.len() == 1
-                && answer.unnamed_boundaries.is_empty())
-            .then(|| (answer, &answer.arms[0]))
+        && let Some(arm) = dispatch_answer.as_ref().and_then(|answer| {
+            (answer.arms.len() == 1
+                && answer.arms[0].target_unit.is_none()
+                && answer.arms[0].unmaterialized_target.is_some())
+            .then(|| &answer.arms[0])
         })
     {
-        let proven_complete = arm.target_unit.is_none()
-            && arm.unmaterialized_target.is_some()
-            && arm.proof == "proven"
-            && arm.completeness == "complete";
-        if proven_complete {
-            match model_call_binding(analyzer, arm, shape) {
-                ModelCallBinding::Unique {
-                    layout,
-                    receiver,
-                    model_id: resolved_model_id,
-                    pack_id: resolved_pack_id,
-                    signature_id: resolved_signature_id,
-                } => {
-                    target = CallBindingTarget::ResolvedExternal { layout, receiver };
-                    signature_id = Some(resolved_signature_id);
-                    model_id = Some(resolved_model_id);
-                    pack_id = Some(resolved_pack_id);
-                    dispatch = CallBindingDispatch::from_answer(answer, None, Some(&arm.target_id));
-                }
-                ModelCallBinding::Conflict => {
-                    target = CallBindingTarget::Ambiguous;
-                }
-                ModelCallBinding::Incomplete {
-                    model_id: incomplete_model_id,
-                    pack_id: incomplete_pack_id,
-                    reason,
-                } => {
-                    target = CallBindingTarget::Unresolved;
-                    model_id = incomplete_model_id;
-                    pack_id = incomplete_pack_id;
-                    diagnostics.push(CodeQueryDiagnostic {
-                        code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
-                        impact: CodeQueryDiagnosticImpact::Incomplete,
-                        branch: Vec::new(),
-                        language: crate::analyzer::common::language_for_file(&file).config_label(),
-                        message: format!(
-                            "call_bindings semantic model callable is incomplete: {reason:?}"
-                        ),
-                    });
-                }
-                ModelCallBinding::Empty | ModelCallBinding::Unavailable => {
-                    target = CallBindingTarget::Unresolved;
-                }
+        match model_call_binding(analyzer, arm, shape) {
+            ModelCallBinding::Unique {
+                layout,
+                receiver,
+                key,
+                model_id: resolved_model_id,
+                pack_id: resolved_pack_id,
+                receiver_type_id: resolved_receiver_type_id,
+                signature_id: resolved_signature_id,
+                semantic_model_provenance: resolved_provenance,
+            } => {
+                model_static_selector_proven = dispatch_answer
+                    .as_ref()
+                    .is_some_and(resolver_proven_static_model_selector);
+                target = CallBindingTarget::ResolvedExternal { layout, receiver };
+                signature_id = Some(resolved_signature_id);
+                model_id = Some(resolved_model_id);
+                pack_id = Some(resolved_pack_id);
+                receiver_type_id = resolved_receiver_type_id;
+                semantic_target_id = Some(arm.target_id.clone());
+                target_origin = Some("semantic_model");
+                semantic_model_provenance = Some(resolved_provenance);
+                modeled_key = Some(key);
+            }
+            ModelCallBinding::Conflict => {
+                target = CallBindingTarget::Ambiguous;
+            }
+            ModelCallBinding::Incomplete {
+                model_id: incomplete_model_id,
+                pack_id: incomplete_pack_id,
+                reason,
+                semantic_model_provenance: incomplete_provenance,
+            } => {
+                target = CallBindingTarget::Unresolved;
+                model_id = incomplete_model_id;
+                pack_id = incomplete_pack_id;
+                target_origin = incomplete_provenance.as_ref().map(|_| "semantic_model");
+                semantic_model_provenance = incomplete_provenance;
+                diagnostics.push(CodeQueryDiagnostic {
+                    code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
+                    impact: CodeQueryDiagnosticImpact::Incomplete,
+                    branch: Vec::new(),
+                    language: crate::analyzer::common::language_for_file(&file).config_label(),
+                    message: format!(
+                        "call_bindings semantic model callable is incomplete: {reason:?}"
+                    ),
+                });
+            }
+            ModelCallBinding::Empty | ModelCallBinding::Unavailable => {
+                target = CallBindingTarget::Unresolved;
             }
         }
     }
 
     let report = Arc::new(call_binding_report(&file, &shape.report, target));
+    // The owner identity is meaningful only when this call's shared binder
+    // emitted an exact receiver/implicit row. In particular, do not attach a
+    // model member's owner to static, unestablished, or terminal rows.
+    if report.rows.iter().any(|row| {
+        matches!(
+            row.binding_kind,
+            Some(crate::analyzer::usages::call_binding::CallBindingKind::Receiver)
+                | Some(crate::analyzer::usages::call_binding::CallBindingKind::Implicit)
+        ) && matches!(row.mapping, CallBindingMapping::Exact)
+    }) {
+        if receiver_type_id.is_none()
+            && let Some(source_target) = source_target.as_ref()
+        {
+            receiver_type_id = analyzer
+                .parent_of(source_target)
+                .map(|parent| parent.declaration_id().to_string());
+        }
+    } else {
+        receiver_type_id = None;
+    }
     let binding_is_exact = matches!(report.coverage, CallBindingCoverage::Exhaustive)
         && signature_id.is_some()
         && report
             .rows
             .iter()
             .all(|row| matches!(row.mapping, CallBindingMapping::Exact));
-    if has_semantic && (!dispatch.is_exact() || !binding_is_exact) {
+    let selector = if binding_is_exact && (dispatch.is_exact() || model_static_selector_proven) {
+        CallBindingSelectorProof::derived()
+    } else if binding_is_exact {
+        dispatch_answer
+            .as_ref()
+            .and_then(|answer| {
+                let key = modeled_key.as_ref()?;
+                match source_target.as_ref() {
+                    Some(target) => {
+                        authored_selector_proof_for_source_target(analyzer, answer, target, key)
+                    }
+                    None => authored_selector_proof_for_external_target(analyzer, answer, key),
+                }
+            })
+            .unwrap_or_else(CallBindingSelectorProof::unavailable)
+    } else {
+        CallBindingSelectorProof::unavailable()
+    };
+    if has_semantic && !binding_is_exact {
         diagnostics.push(CodeQueryDiagnostic {
             code: CodeQueryDiagnosticCode::SemanticAnalysisPartial,
             impact: CodeQueryDiagnosticImpact::Incomplete,
             branch: Vec::new(),
             language: crate::analyzer::common::language_for_file(&file).config_label(),
             message: format!(
-                "call_bindings did not establish one exact dispatch target and complete actual-to-formal coverage (dispatch outcome={}, coverage={}, target_count={}, binding coverage={})",
+                "call_bindings did not establish complete actual-to-formal coverage (dispatch outcome={}, coverage={}, target_count={}, binding coverage={})",
                 dispatch.outcome,
                 dispatch.coverage,
                 dispatch.target_count,
                 report.coverage.label(),
+            ),
+        });
+    } else if has_semantic && !selector.exact {
+        diagnostics.push(CodeQueryDiagnostic {
+            code: CodeQueryDiagnosticCode::CallBindingDispatchPartial,
+            impact: CodeQueryDiagnosticImpact::Incomplete,
+            branch: Vec::new(),
+            language: crate::analyzer::common::language_for_file(&file).config_label(),
+            message: format!(
+                "call_bindings established an exact declared target and actual-to-formal mapping, but exact selector proof remains unavailable (dispatch outcome={}, coverage={}, target_count={})",
+                dispatch.outcome, dispatch.coverage, dispatch.target_count,
             ),
         });
     }
@@ -525,8 +872,13 @@ pub(super) fn call_binding_expansions(
         target: declaration,
         signature_id,
         dispatch,
+        selector,
+        semantic_target_id,
+        target_origin,
         model_id,
         pack_id,
+        semantic_model_provenance,
+        receiver_type_id,
     };
     (0..site.report.rows.len())
         .map(|index| {
@@ -553,35 +905,27 @@ enum ResolvedCallTarget {
 /// the token that names the callee -- so no text is matched and no name is
 /// compared here. A callable-object call (`proc.(x)`) records no callee token
 /// and is therefore unresolved rather than guessed at.
+///
+/// The resolution itself runs through `bindings`' per-file prefetch (issue
+/// #2765): the first call site of a file resolves every call site's callee
+/// range in one batch, and every other call site of that file is served from
+/// the cached outcome instead of re-deriving a fresh per-file resolution
+/// context. This changes nothing about which resolver runs or what it
+/// answers -- same resolver, same per-request outcome -- only how many times
+/// its shared per-file setup work is paid.
 fn resolve_call_target(
     analyzer: &dyn IAnalyzer,
     shape: &CallShapeValue,
+    bindings: &mut CallBindingCache,
     cancellation: Option<&CancellationToken>,
 ) -> ResolvedCallTarget {
     let outcome = &shape.report.outcome;
     let Some(callee_range) = outcome.callee_range else {
         return ResolvedCallTarget::Unresolved;
     };
-    let Some(source) = analyzer.indexed_source(&outcome.file).map(Arc::<str>::from) else {
-        return ResolvedCallTarget::Unresolved;
-    };
-    let scope = AnalyzerQueryScope::new(analyzer);
-    let Some(lookup) = resolve_call_target_batch_with_source(
-        analyzer,
-        scope.token(),
-        vec![DefinitionLookupRequest {
-            file: outcome.file.clone(),
-            line: None,
-            column: None,
-            start_byte: Some(callee_range.start_byte),
-            end_byte: Some(callee_range.end_byte),
-        }],
-        outcome.file.clone(),
-        source,
-        cancellation,
-    )
-    .into_iter()
-    .next() else {
+    let Some(lookup) =
+        bindings.resolved_call_target(analyzer, &outcome.file, callee_range, cancellation)
+    else {
         return ResolvedCallTarget::Unresolved;
     };
     if lookup.outcome.status != DefinitionLookupStatus::Resolved {

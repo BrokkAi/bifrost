@@ -24,7 +24,7 @@ use super::{
     SemanticGapId, SemanticGapImpacts, SemanticGapKind, SemanticGapSubject, SemanticLocator,
     SemanticOutcome, SemanticProviderError, SemanticRole, SemanticValue, SemanticValueKind,
     SemanticWork, SourceAnchor, SourceMapping, SourceMappingId, SourceMappingKind, SourcePosition,
-    SourceSpan, ValueFlowKind, ValueId,
+    SourceSpan, StructuralNodeIdentity, ValueFlowKind, ValueId,
 };
 
 /// Common operational failures produced while lowering one procedure.
@@ -402,14 +402,38 @@ impl<'route> CleanupRoutePlanner<'route> {
     where
         R: Copy,
     {
+        self.next_with_lookup(
+            builder,
+            session,
+            |expected| {
+                regions
+                    .iter()
+                    .copied()
+                    .find(|region| region_id(*region) == expected)
+            },
+            source_node,
+        )
+    }
+
+    /// Advance using an adapter-owned cleanup lookup.
+    ///
+    /// Adapters whose cleanup IDs index dense storage can avoid repeatedly
+    /// scanning all registered regions as continuation histories specialize.
+    pub(crate) fn next_with_lookup<'tree, R>(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        session: &mut ProcedureLoweringSession<'_>,
+        mut lookup_region: impl FnMut(CleanupRegionId) -> Option<R>,
+        source_node: impl Fn(R) -> Node<'tree>,
+    ) -> Result<Option<CleanupSpecialization<R>>, ProcedureLoweringError>
+    where
+        R: Copy,
+    {
         while self.next_index > 0 {
             self.next_index -= 1;
             let index = self.next_index;
             let expected = self.route.cleanups()[index];
-            let region = regions
-                .iter()
-                .copied()
-                .find(|region| region_id(*region) == expected)
+            let region = lookup_region(expected)
                 .ok_or_else(|| ProcedureLoweringError::Invalid("missing cleanup region".into()))?;
             let (entry, step) =
                 if let Some(entry) = builder.cleanup_specialization_entry(self.route, index) {
@@ -627,6 +651,7 @@ pub(crate) struct CallSiteScaffold {
     pub(crate) callee: ValueId,
     pub(crate) receiver: Option<ValueId>,
     pub(crate) arguments: Box<[SemanticCallArgument]>,
+    pub(crate) normal_results: Box<[ValueId]>,
     pub(crate) result: Option<ValueId>,
     pub(crate) thrown: Option<ValueId>,
     pub(crate) declared_targets: CallableTargetResolution,
@@ -696,6 +721,7 @@ impl<'a> ProcedureLoweringSession<'a> {
             id: base_source,
             locator: locator.clone(),
             kind: SourceMappingKind::Exact,
+            ast_identity: None,
         });
         parts.evidence_rows.push(Evidence {
             id: base_evidence,
@@ -799,6 +825,18 @@ impl<'a> ProcedureLoweringSession<'a> {
         anchor: SourceAnchor,
         kind: SourceMappingKind,
     ) -> Result<PointMetadata, ProcedureLoweringError> {
+        self.add_mapping_with_ast_identity(builder, anchor, kind, None)
+    }
+
+    /// Add a source mapping with an exact producer-authored structural fact
+    /// identity when the adapter has one for the same source snapshot.
+    pub(crate) fn add_mapping_with_ast_identity(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        anchor: SourceAnchor,
+        kind: SourceMappingKind,
+        ast_identity: Option<StructuralNodeIdentity>,
+    ) -> Result<PointMetadata, ProcedureLoweringError> {
         let source = SourceMappingId::try_from_index(self.next_source)
             .map_err(|_| ProcedureLoweringError::Invalid("too many source mappings".into()))?;
         let evidence = EvidenceId::try_from_index(self.next_evidence)
@@ -815,6 +853,7 @@ impl<'a> ProcedureLoweringSession<'a> {
             id: source,
             locator,
             kind,
+            ast_identity,
         })?;
         builder.add_evidence(Evidence {
             id: evidence,
@@ -1341,6 +1380,7 @@ impl<'a> ProcedureLoweringSession<'a> {
             callee: call.callee,
             receiver: call.receiver,
             arguments: call.arguments,
+            normal_results: call.normal_results,
             result: call.result,
             thrown: call.thrown,
             declared_targets: call.declared_targets,
@@ -2044,6 +2084,7 @@ mod tests {
                     callee,
                     receiver: None,
                     arguments: Box::new([]),
+                    normal_results: Box::new([]),
                     result: None,
                     thrown: None,
                     declared_targets: CallableTargetResolution::Unknown,

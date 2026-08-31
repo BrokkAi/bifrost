@@ -218,15 +218,23 @@ pub(super) fn prepare_seed_access(
             build: StructuralIndexBuildMetrics::default(),
         },
     );
+    let wait = match &acquisition {
+        StructuralIndexAcquisition::Ready { wait, .. }
+        | StructuralIndexAcquisition::Unavailable { wait, .. }
+        | StructuralIndexAcquisition::Cancelled { wait, .. } => *wait,
+    };
+    if wait.wait_ns > 0 {
+        crate::profiling::note_with(|| {
+            format!(
+                "structural.complete_cache_wait waits={} wait_ns={}",
+                wait.waits, wait.wait_ns
+            )
+        });
+    }
     if let Some(profile) = &mut state.profile {
         let access = &mut profile.access_path;
         access.representation_version = STRUCTURAL_INDEX_REPRESENTATION_VERSION;
         access.index_lookups = access.index_lookups.saturating_add(1);
-        let wait = match &acquisition {
-            StructuralIndexAcquisition::Ready { wait, .. }
-            | StructuralIndexAcquisition::Unavailable { wait, .. }
-            | StructuralIndexAcquisition::Cancelled { wait, .. } => *wait,
-        };
         access.index_waits = access.index_waits.saturating_add(wait.waits);
         access.index_wait_ns = access.index_wait_ns.saturating_add(wait.wait_ns);
     }

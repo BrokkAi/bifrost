@@ -292,6 +292,20 @@ pub trait BackwardDistributiveDataflowProblem {
     /// preserved by the kernel across every predecessor edge.
     fn zero_fact(&self) -> Self::Fact;
 
+    /// Whether resolved calls also project their caller-side control
+    /// continuations as call-to-return edges (#1952, #2782).
+    ///
+    /// This is the backward half of
+    /// [`DistributiveDataflowProblem::resolved_call_to_return`] and it means
+    /// the same thing. The bounded snapshot carries those rows for every
+    /// resolved call; the kernel delivers them only to a problem that declares
+    /// it can take the preimage of a call the demanded value flowed past
+    /// rather than through. A problem that keeps the default sees a resolved
+    /// call exactly as it did before: call and matched-return edges only.
+    fn resolved_call_to_return(&self) -> bool {
+        false
+    }
+
     /// Compute predecessor facts for an ordinary edge. `edge.source()` is the
     /// predecessor and `edge.target()` is the demanded successor; the edge
     /// descriptor itself retains that original orientation.

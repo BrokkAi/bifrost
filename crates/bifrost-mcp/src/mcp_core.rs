@@ -227,23 +227,6 @@ fn location_references_schema(path_description: &str, max_items: Option<usize>) 
     })
 }
 
-/// The `max_duration_secs` property both scan tools publish.
-///
-/// The ceiling is read from the analyzer constant so the advertised number cannot drift from the
-/// one the scan applies, and it is stated here so a caller knows the maximum before it calls
-/// rather than after a clamped run (#1886). The schema deliberately carries no `maximum`: a larger
-/// value is accepted and reported back in `scope.max_duration_clamped`, not refused.
-fn scan_usages_max_duration_property() -> Value {
-    let ceiling_secs = crate::searchtools::SCAN_USAGES_MAX_DURATION_CEILING.as_secs();
-    json!({
-        "type": "integer",
-        "minimum": 0,
-        "description": format!(
-            "Override the default wall-clock budget for this call. Leave unset for interactive use; a batch/background caller scanning a large workspace can request more time. Values above the server ceiling of {ceiling_secs} seconds run at that ceiling instead, and the response reports the requested and applied budgets in `scope.max_duration_clamped`."
-        )
-    })
-}
-
 fn scan_usages_by_reference_descriptor() -> Value {
     tool_descriptor(
         "scan_usages_by_reference",
@@ -271,8 +254,7 @@ fn scan_usages_by_reference_descriptor() -> Value {
                     "type": "array",
                     "items": { "type": "string" },
                     "description": "Optional project-relative paths or globs used to narrow where usages are searched."
-                },
-                "max_duration_secs": scan_usages_max_duration_property()
+                }
             },
             "required": ["symbols"]
         }),
@@ -330,8 +312,7 @@ fn scan_usages_by_location_descriptor() -> Value {
                     "type": "array",
                     "items": { "type": "string" },
                     "description": "Optional project-relative paths or globs used to narrow where usages are searched."
-                },
-                "max_duration_secs": scan_usages_max_duration_property()
+                }
             },
             "required": ["targets"]
         }),
@@ -399,4 +380,31 @@ pub(crate) fn workspace_tool_descriptors() -> Vec<Value> {
             json_schema_object(&[]),
         ),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_usage_schemas_leave_deadline_policy_to_the_frontend() {
+        for render_line_numbers in [true, false] {
+            let descriptors = symbol_tool_descriptors(render_line_numbers);
+            let tool_name = if render_line_numbers {
+                "scan_usages_by_location"
+            } else {
+                "scan_usages_by_reference"
+            };
+            let descriptor = descriptors
+                .iter()
+                .find(|descriptor| descriptor["name"] == tool_name)
+                .unwrap_or_else(|| panic!("missing descriptor for {tool_name}"));
+            assert!(
+                descriptor["inputSchema"]["properties"]
+                    .get("max_duration_secs")
+                    .is_none(),
+                "{descriptor}"
+            );
+        }
+    }
 }

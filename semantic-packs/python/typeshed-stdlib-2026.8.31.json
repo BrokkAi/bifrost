@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "pack_id": "bifrost.python-stdlib",
-  "pack_version": "2026.8.8",
+  "pack_version": "2026.8.31",
   "ecosystem": "python",
   "kind": {
     "artifact_kind": "python_stub",
@@ -20,12 +20,13 @@
       "os/path.pyi",
       "posixpath.pyi",
       "re.pyi",
+      "subprocess.pyi",
       "typing.pyi"
     ]
   },
   "artifact": {
     "file_name": "typeshed-stdlib-1620e2254765",
-    "sha256": "b0bdd0b288feb36c0b501f07a5d45450c13478e1aef26e0ff58abdef1d5a0036",
+    "sha256": "93304b488dc873715670296aa9c0b7b91db049db8e342287bcb859a58b79e87d",
     "url": "https://github.com/python/typeshed/archive/1620e225476597f34177351ef913dc8390dade30.tar.gz",
     "container": null
   },
@@ -58,7 +59,7 @@
     "review_required": false
   },
   "notices": [
-    "notices/typeshed-stdlib-2026.8.8.txt"
+    "notices/typeshed-stdlib-2026.8.31.txt"
   ],
   "measurement_activation": {
     "toolchain": {
@@ -77,6 +78,11 @@
       "kind": "member",
       "owner": "os",
       "name": "getcwd"
+    },
+    {
+      "kind": "member",
+      "owner": "subprocess",
+      "name": "run"
     }
   ]
 }

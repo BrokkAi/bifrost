@@ -31,8 +31,9 @@ impl AnalyzerFixture {
         }
         let project: Arc<dyn Project> =
             Arc::new(FilesystemProject::new(temp.path().to_path_buf()).expect("project"));
-        let analyzer = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
-            .expect("ephemeral workspace should build");
+        let analyzer =
+            WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
+                .expect("ephemeral workspace should build");
         Self {
             _temp: temp,
             analyzer,
@@ -49,7 +50,7 @@ impl AnalyzerFixture {
                 .unwrap_or_else(|err| panic!("failed to write {rel}: {err}"));
         }
         let project = TestProject::new(root, language);
-        let analyzer = WorkspaceAnalyzer::build_ephemeral(
+        let analyzer = WorkspaceAnalyzer::build_ephemeral_footgun(
             Arc::new(project.clone()),
             AnalyzerConfig::default(),
         )

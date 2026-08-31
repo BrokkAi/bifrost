@@ -1,6 +1,8 @@
 use super::{build_csharp_edges, csharp_graph_source};
 use crate::analyzer::usages::common::{analyzed_files_for_language, language_for_file};
-use crate::analyzer::usages::inverted_edges::{EdgeNodeDomain, UsageEdgeWeights, UsageEdges};
+use crate::analyzer::usages::inverted_edges::{
+    EdgeNodeDomain, UsageEdgeBuildResult, UsageEdgeWeights, UsageEdges,
+};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
 use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
@@ -388,17 +390,17 @@ impl<'a> CSharpEdgeResolver<'a> {
         )
     }
 
-    pub(crate) fn build_inbound_edges<F>(
+    pub(crate) fn build_inbound_edges_with_completeness<F>(
         &self,
         analyzer: &dyn IAnalyzer,
         token: QueryToken<'_>,
         callees: &HashSet<String>,
         keep_file: F,
-    ) -> UsageEdges
+    ) -> UsageEdgeBuildResult<UsageEdges>
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        build_csharp_edges(
+        super::build_csharp_edges_with_completeness(
             analyzer,
             token,
             self.csharp,

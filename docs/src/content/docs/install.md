@@ -52,9 +52,10 @@ npx -y @brokkai/bifrost --version
 ```
 
 The root package installs one checksum-verified native package for the current
-operating system, CPU, and Linux C library. It does not download or build
-Bifrost during installation. Upgrade it with `npm update -g
-@brokkai/bifrost`. Remove it with `npm uninstall -g @brokkai/bifrost`.
+supported operating system and CPU. On Linux it requires glibc; musl platforms
+are rejected. It does not download or build Bifrost during installation.
+Upgrade it with `npm update -g @brokkai/bifrost`. Remove it with
+`npm uninstall -g @brokkai/bifrost`.
 
 The CLI package is `@brokkai/bifrost`. The separate
 `@brokk/bifrost-agent` package contains the Pi extension and host MCP integration.
@@ -97,8 +98,8 @@ The formula installs the `bifrost` CLI from the release archive for your
 platform and verifies its published SHA-256 checksum. Upgrade with `brew
 upgrade bifrost` and uninstall with `brew uninstall bifrost`. The tap
 regenerates its formulae from tagged releases on a schedule, so upgrades
-follow new Bifrost releases automatically. For Windows, ARM64 musl Linux, or
-Android, use the methods below.
+follow new Bifrost releases automatically. For Windows, musl Linux, or Android,
+use the methods below.
 
 ## Install Script
 
@@ -118,18 +119,18 @@ missing and the terminal is interactive.
 | Platform | Architecture | Install script | Release target |
 | --- | --- | --- | --- |
 | macOS | Apple Silicon and Intel | Yes | `universal-apple-darwin` |
-| Linux (glibc) | x86-64 | Yes | `x86_64-unknown-linux-gnu` |
-| Linux (musl, such as Alpine) | x86-64 | Yes | `x86_64-unknown-linux-musl` |
-| Linux (glibc) | ARM64 | Yes | `aarch64-unknown-linux-gnu` |
-| Linux (musl, such as Alpine) | ARM64 | No, use Cargo | none published |
+| Linux (glibc 2.28+) | x86-64 | Yes | `x86_64-unknown-linux-gnu` |
+| Linux (musl, such as Alpine) | x86-64 | No, unsupported | none published |
+| Linux (glibc 2.28+) | ARM64 | Yes | `aarch64-unknown-linux-gnu` |
+| Linux (musl, such as Alpine) | ARM64 | No, unsupported | none published |
 | WSL 1 and WSL 2 | x86-64 and ARM64 | Yes, as Linux | Linux targets above |
 | Android (Termux) | ARM64 | Yes | `aarch64-linux-android` |
 | Windows | x64 and ARM64 | No, use Cargo | `.zip` on the release page |
 
-On x86-64 Linux the script picks the archive matching your C library and falls
-back to the statically linked musl build, which runs on any x86-64 Linux. On
-ARM64 there is no musl archive, so the script stops with an explanation rather
-than installing a glibc binary that cannot run.
+On Linux the script installs the GNU archive for your architecture. Both GNU
+archives require glibc 2.28 or newer. On a musl system the script stops before
+downloading and explains that no supported prebuilt release is available,
+rather than installing a glibc binary that cannot run.
 
 ### WSL
 
@@ -181,8 +182,9 @@ the upgrade path.
 
 ## Cargo
 
-Cargo builds the CLI from source and works on any platform with a Rust
-toolchain, including Windows:
+Cargo builds the CLI from source and works on supported platforms with a Rust
+toolchain, including Windows. Musl builds are not tested or supported, but
+users may attempt the same source installation command:
 
 ```bash
 cargo install brokk-bifrost --locked --force

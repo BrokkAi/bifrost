@@ -134,6 +134,21 @@ impl SummaryReachedFact {
         self.path_qualities
     }
 
+    /// How many distinct derivations of this reached fact the solve retained
+    /// for `quality`.
+    ///
+    /// One reached fact is routinely produced along several paths, and two
+    /// paths can generate it from different sources, so a client that must name
+    /// every contributing source reconstructs all of them. A client that only
+    /// needs one concrete example path takes derivation zero. Zero means
+    /// nothing was retained for the quality: reconstructing derivation zero
+    /// then reports whether retention was disabled or the quality was dropped.
+    pub fn retained_derivations(&self, quality: PathQuality) -> usize {
+        self.path_qualities
+            .dominating_quality(quality)
+            .map_or(0, |quality| self.witnesses.ids(quality).len())
+    }
+
     fn retained_bytes(&self) -> usize {
         self.witnesses.retained_bytes()
     }
@@ -225,6 +240,14 @@ impl SummaryIncomingCall {
 
     pub const fn path_qualities(&self) -> PathQualityFrontier {
         self.path_qualities
+    }
+
+    /// How many distinct caller-relative derivations of this call the solve
+    /// retained for `quality`. See [`SummaryReachedFact::retained_derivations`].
+    pub fn retained_derivations(&self, quality: PathQuality) -> usize {
+        self.path_qualities
+            .dominating_quality(quality)
+            .map_or(0, |quality| self.witnesses.ids(quality).len())
     }
 
     fn retained_bytes(&self) -> usize {
@@ -328,6 +351,7 @@ pub struct SummaryEdge {
     target: ProgramPointHandle,
     proof: ProofStatus,
     completeness: EvidenceCompleteness,
+    implicit_abort_only: bool,
 }
 
 impl SummaryEdge {
@@ -339,6 +363,7 @@ impl SummaryEdge {
             target: edge.target.clone(),
             proof: edge.proof.clone(),
             completeness: edge.completeness.clone(),
+            implicit_abort_only: false,
         }
     }
 
@@ -350,7 +375,18 @@ impl SummaryEdge {
             target: edge.target,
             proof: edge.proof,
             completeness: edge.completeness,
+            implicit_abort_only: false,
         }
+    }
+
+    pub(crate) fn from_matched_return(edge: ProcedureIcfgEdge, implicit_abort_only: bool) -> Self {
+        debug_assert!(
+            !implicit_abort_only || edge.kind == IcfgEdgeKind::ExceptionalReturn,
+            "only an exceptional return can carry an implicit-abort-only weakening"
+        );
+        let mut result = Self::from_owned_procedure_edge(edge);
+        result.implicit_abort_only = implicit_abort_only;
+        result
     }
 
     pub const fn kind(&self) -> IcfgEdgeKind {
@@ -375,6 +411,10 @@ impl SummaryEdge {
 
     pub const fn completeness(&self) -> &EvidenceCompleteness {
         &self.completeness
+    }
+
+    pub(crate) const fn implicit_abort_only(&self) -> bool {
+        self.implicit_abort_only
     }
 
     fn retained_heap_bytes(&self) -> usize {
@@ -820,10 +860,27 @@ impl<Fact> SummaryDataflowResult<Fact> {
             .filter(move |summary| summary.entry() == entry)
     }
 
+    /// One concrete path that reached `reached` at `quality`.
+    ///
+    /// This is derivation zero of possibly several. Use
+    /// [`SummaryReachedFact::retained_derivations`] with
+    /// [`Self::witness_for_reached_derivation`] when the answer is a union over
+    /// paths rather than one example of them.
     pub fn witness_for_reached(
         &self,
         reached: &SummaryReachedFact,
         quality: PathQuality,
+        limits: WitnessReconstructionLimits,
+    ) -> Result<SummaryWitness, SummaryWitnessError> {
+        self.witness_for_reached_derivation(reached, quality, 0, limits)
+    }
+
+    /// The `derivation`-th retained path that reached `reached` at `quality`.
+    pub fn witness_for_reached_derivation(
+        &self,
+        reached: &SummaryReachedFact,
+        quality: PathQuality,
+        derivation: usize,
         limits: WitnessReconstructionLimits,
     ) -> Result<SummaryWitness, SummaryWitnessError> {
         let reached_index = self
@@ -837,13 +894,14 @@ impl<Fact> SummaryDataflowResult<Fact> {
                     )
             })
             .ok_or(SummaryWitnessError::TargetNotInResult)?;
-        self.witness_for_reached_index(reached_index, quality, limits)
+        self.witness_for_reached_index(reached_index, quality, derivation, limits)
     }
 
     pub(crate) fn witness_for_reached_index(
         &self,
         reached_index: usize,
         quality: PathQuality,
+        derivation: usize,
         limits: WitnessReconstructionLimits,
     ) -> Result<SummaryWitness, SummaryWitnessError> {
         let reached = self
@@ -858,7 +916,12 @@ impl<Fact> SummaryDataflowResult<Fact> {
         let Some(quality) = reached.path_qualities.dominating_quality(quality) else {
             return Err(SummaryWitnessError::QualityNotRetained(quality));
         };
-        let Some(evidence) = reached.witnesses.first(quality) else {
+        let derivations = reached.witnesses.ids(quality);
+        debug_assert!(
+            derivation == 0 || derivation < derivations.len(),
+            "a derivation index past the retained alternatives is a caller error"
+        );
+        let Some(evidence) = derivations.get(derivation).copied() else {
             return if self.witness_retention_truncated {
                 Ok(SummaryWitness::retention_truncated_marker(quality))
             } else {
@@ -891,6 +954,17 @@ impl<Fact> SummaryDataflowResult<Fact> {
         quality: PathQuality,
         limits: WitnessReconstructionLimits,
     ) -> Result<SummaryWitness, SummaryWitnessError> {
+        self.witness_for_incoming_call_derivation(incoming, quality, 0, limits)
+    }
+
+    /// The `derivation`-th retained caller-relative path for `incoming`.
+    pub fn witness_for_incoming_call_derivation(
+        &self,
+        incoming: &SummaryIncomingCall,
+        quality: PathQuality,
+        derivation: usize,
+        limits: WitnessReconstructionLimits,
+    ) -> Result<SummaryWitness, SummaryWitnessError> {
         let incoming = self
             .incoming_calls
             .iter()
@@ -906,7 +980,12 @@ impl<Fact> SummaryDataflowResult<Fact> {
         let Some(quality) = incoming.path_qualities.dominating_quality(quality) else {
             return Err(SummaryWitnessError::QualityNotRetained(quality));
         };
-        let Some(evidence) = incoming.witnesses.first(quality) else {
+        let derivations = incoming.witnesses.ids(quality);
+        debug_assert!(
+            derivation == 0 || derivation < derivations.len(),
+            "a derivation index past the retained alternatives is a caller error"
+        );
+        let Some(evidence) = derivations.get(derivation).copied() else {
             return if self.witness_retention_truncated {
                 Ok(SummaryWitness::retention_truncated_marker(quality))
             } else {
@@ -1097,6 +1176,7 @@ fn compare_summary_edges(left: &SummaryEdge, right: &SummaryEdge) -> Ordering {
         .then_with(|| compare_optional_call_sites(left.origin(), right.origin()))
         .then_with(|| compare_proof(left.proof(), right.proof()))
         .then_with(|| compare_completeness(left.completeness(), right.completeness()))
+        .then_with(|| left.implicit_abort_only().cmp(&right.implicit_abort_only()))
 }
 
 fn compare_proof(left: &ProofStatus, right: &ProofStatus) -> Ordering {

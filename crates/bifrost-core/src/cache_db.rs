@@ -31,7 +31,7 @@ const BASELINE_MIGRATION_VERSION: i64 = 18;
 // Version 25 belonged to a rejected local relational-key experiment. Skipping
 // it prevents an old experimental v25 store from being mistaken for this
 // schema; the version sequence is intentionally monotonic, not contiguous.
-const CURRENT_MIGRATION_VERSION: i64 = 32;
+const CURRENT_MIGRATION_VERSION: i64 = 34;
 pub const OPTIONAL_FACT_KIND_CPP_TEMPLATE_METADATA: i64 = 1;
 pub const OPTIONAL_FACT_KIND_RUBY_METHOD_DISPATCH_MODE: i64 = 2;
 pub const OPTIONAL_FACT_KIND_SCALA_TRAIT: i64 = 3;
@@ -63,6 +63,9 @@ const RELATIONAL_DEFINITION_IDENTIFIER_VIEWS_SQL: &str =
     include_str!("../migrations/cache/0031-relational-definition-identifier-views.sql");
 const REVISIONED_WORKSPACE_PROJECTIONS_SQL: &str =
     include_str!("../migrations/cache/0032-revisioned-workspace-projections.sql");
+const INTERN_BLOB_IDS_SQL: &str = include_str!("../migrations/cache/0033-intern-blob-ids.sql");
+const RELATIONAL_STRUCTURAL_FACTS_SQL: &str =
+    include_str!("../migrations/cache/0034-relational-structural-facts.sql");
 
 // Migration 0023 spells the signature-metadata byte cap as the literal 8388608,
 // because a checked-in SQL file cannot interpolate a Rust constant. The two must
@@ -83,7 +86,7 @@ struct CacheMigration {
     sql: &'static str,
 }
 
-const CACHE_MIGRATIONS: [CacheMigration; 14] = [
+const CACHE_MIGRATIONS: [CacheMigration; 16] = [
     CacheMigration {
         version: 18,
         sql: CURRENT_BASELINE_SQL,
@@ -139,6 +142,14 @@ const CACHE_MIGRATIONS: [CacheMigration; 14] = [
     CacheMigration {
         version: 32,
         sql: REVISIONED_WORKSPACE_PROJECTIONS_SQL,
+    },
+    CacheMigration {
+        version: 33,
+        sql: INTERN_BLOB_IDS_SQL,
+    },
+    CacheMigration {
+        version: 34,
+        sql: RELATIONAL_STRUCTURAL_FACTS_SQL,
     },
 ];
 
@@ -843,7 +854,7 @@ fn stage_upgraded_store(cache_dir: &Path, source: &Path) -> Result<tempfile::Tem
             )
         })?;
         source_conn
-            .backup(rusqlite::DatabaseName::Main, &staged, None)
+            .backup(rusqlite::MAIN_DB, &staged, None)
             .map_err(|err| {
                 format!(
                     "cache DB upgrade SQLite error copying {}: {err}",
@@ -1629,13 +1640,13 @@ fn migrate_with_sql(conn: &mut Connection, migrations: &[CacheMigration]) -> Res
         migrate_with_sql_locked(conn, migrations, false)?,
         LockedMigrationOutcome::Complete
     ) {
-        return Ok(());
+        return drain_free_pages(conn);
     }
 
     conn.pragma_update(None, "foreign_keys", "OFF")
         .map_err(|err| format!("cache DB SQLite error: {err}"))?;
     let result = match migrate_with_sql_locked(conn, migrations, true) {
-        Ok(LockedMigrationOutcome::Complete) => Ok(()),
+        Ok(LockedMigrationOutcome::Complete) => drain_free_pages(conn),
         Ok(LockedMigrationOutcome::RebuildRequired) => {
             Err("cache DB schema rebuild was not applied".to_string())
         }
@@ -1645,6 +1656,81 @@ fn migrate_with_sql(conn: &mut Connection, migrations: &[CacheMigration]) -> Res
         .pragma_update(None, "foreign_keys", "ON")
         .map_err(|err| format!("cache DB SQLite error: {err}"));
     result.and(restore)
+}
+
+/// Return the pages a migration freed to the filesystem, one incremental-vacuum
+/// step at a time, before anything else touches the store.
+///
+/// This is a workaround for an upstream SQLite defect, and it is written down
+/// here because the symptom is alarming and the cause is not in this
+/// repository.
+///
+/// After a WAL transaction that leaves a NON-EMPTY freelist in an
+/// `auto_vacuum=INCREMENTAL` database, SQLite fails every subsequent
+/// `PRAGMA wal_checkpoint` on that database with SQLITE_CORRUPT, "database disk
+/// image is malformed", for the life of the process -- while `integrity_check`
+/// reports `ok` and every read and write succeeds. A checkpoint that can never
+/// run means a WAL that grows without bound, so this is not cosmetic.
+///
+/// The trigger is neither this schema nor one SQLite release. A synthetic
+/// database -- create forty tables, insert a row in each, drop them all in one
+/// transaction -- reproduces it on 3.45.0, 3.46.0, 3.50.2, 3.53.2, 3.53.3, and
+/// 3.53.4 alike, at both 4 KiB and 32 KiB pages. It needs all four of
+/// `auto_vacuum=INCREMENTAL`, WAL, a non-empty freelist, and a SQLite built
+/// without `SQLITE_SECURE_DELETE` -- `auto_vacuum=NONE`, `auto_vacuum=FULL`,
+/// and rollback-journal mode all checkpoint that same workload cleanly, and so
+/// does the identical amalgamation compiled with `SQLITE_SECURE_DELETE` or a
+/// connection that turns `PRAGMA secure_delete` on before the transaction.
+///
+/// The mechanism is the database-size sanity check in `walCheckpoint`, not a
+/// real corrupt page. Under incremental auto-vacuum, `DROP TABLE` relocates the
+/// highest root page down into the slot it is vacating and then frees the
+/// vacated page. That page is clean when `freePage2` reaches it, so it is not
+/// on the dirty list and gets no WAL frame -- which is correct, because it is a
+/// freelist leaf whose content is meaningless. But the checkpointer then finds
+/// `nSize + 65536 + mxFrame*szPage < mxPage*szPage`, decides the WAL cannot
+/// account for the database's committed page count, and returns
+/// `SQLITE_CORRUPT`. `secure_delete` masks it because `freePage2`'s
+/// secure-delete branch calls `sqlite3PagerWrite` on every freed page, which
+/// dirties it and puts it back in the WAL. A distribution `sqlite3` binary
+/// checkpoints the same workload without complaint for that reason;
+/// `libsqlite3-sys` does not define `SQLITE_SECURE_DELETE`.
+///
+/// `.agents/docs/sqlite-wal-incremental-vacuum-checkpoint-report.md` holds the
+/// standalone C reproduction, the measured page and frame counts behind that
+/// arithmetic, and the version matrix. Issue #2789 tracks whether to close the
+/// class structurally with `secure_delete` instead.
+///
+/// What changed on our side is that migration 0033 rewrites every fact table,
+/// so it is the first migration in this chain to leave a freelist behind at
+/// all; every schema before it committed with `freelist_count = 0`.
+///
+/// One incremental-vacuum step is enough to clear the state, and draining the
+/// list is what a rewrite migration should do anyway: it hands the old schema's
+/// pages back to the filesystem instead of leaving the store permanently larger
+/// than its contents. The loop is needed because the same defect makes
+/// `incremental_vacuum(0)` free one page per call instead of all of them.
+///
+/// `free_pages_under_incremental_auto_vacuum_still_break_wal_checkpoints` is
+/// the tripwire: it pins the upstream condition, so it starts failing when a
+/// bundled-SQLite upgrade or a `secure_delete` policy makes this function
+/// unnecessary. Until then, do not "simplify" it into a single
+/// `incremental_vacuum(0)`.
+fn drain_free_pages(conn: &Connection) -> Result<()> {
+    let mut previous = i64::MAX;
+    loop {
+        let free: i64 = conn
+            .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+            .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+        // Stop on an empty list, and stop if a step made no progress, so a
+        // database whose free pages cannot be relocated cannot spin here.
+        if free == 0 || free >= previous {
+            return Ok(());
+        }
+        previous = free;
+        conn.execute_batch("PRAGMA incremental_vacuum(0);")
+            .map_err(|err| format!("cache DB SQLite error: {err}"))?;
+    }
 }
 
 enum LockedMigrationOutcome {
@@ -2035,6 +2121,82 @@ mod tests {
 
     use super::*;
 
+    /// A database with no Bifrost schema in it, in the store's own shape:
+    /// incremental auto-vacuum, WAL, and one transaction that frees pages.
+    fn synthetic_store_with_free_pages(path: &Path, page_size: u32) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        conn.pragma_update(None, "page_size", page_size).unwrap();
+        conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")
+            .unwrap();
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode, "wal");
+        // The page size and auto-vacuum mode only take effect once the file has
+        // a header to hold them.
+        conn.execute_batch("VACUUM;").unwrap();
+        let filler = "x".repeat(2000);
+        let mut sql = String::from("BEGIN;");
+        for table in 0..40 {
+            sql.push_str(&format!(
+                "CREATE TABLE t{table}(a TEXT); INSERT INTO t{table}(a) VALUES('{filler}');"
+            ));
+        }
+        for table in 0..40 {
+            sql.push_str(&format!("DROP TABLE t{table};"));
+        }
+        sql.push_str("COMMIT;");
+        conn.execute_batch(&sql).unwrap();
+        let free: i64 = conn
+            .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+            .unwrap();
+        assert!(free > 0, "the workload must leave pages on the freelist");
+        conn
+    }
+
+    /// The tripwire for `drain_free_pages`. See that function for the full
+    /// account: a bundled SQLite built without `SQLITE_SECURE_DELETE` cannot
+    /// checkpoint a WAL database that has a non-empty freelist under
+    /// incremental auto-vacuum, on every release from 3.45.0 through 3.53.4.
+    ///
+    /// If the first half of this test fails, the upstream condition is gone --
+    /// delete `drain_free_pages`, its call sites, and this test. If the second
+    /// half fails, the drain no longer clears the state and the store is one
+    /// migration away from a WAL that grows without bound.
+    #[test]
+    fn free_pages_under_incremental_auto_vacuum_still_break_wal_checkpoints() {
+        let temp = tempfile::tempdir().unwrap();
+        for (index, page_size) in [4096u32, 32768].into_iter().enumerate() {
+            let undrained = temp.path().join(format!("undrained{index}.db"));
+            let conn = synthetic_store_with_free_pages(&undrained, page_size);
+            let blocked = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                row.get::<_, i64>(0)
+            });
+            let error = blocked.expect_err(&format!(
+                "SQLite {} checkpointed a {page_size}-byte-page store with free pages: \
+                 the defect drain_free_pages works around is fixed, so delete it",
+                rusqlite::version()
+            ));
+            assert!(
+                matches!(
+                    error.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::DatabaseCorrupt)
+                ),
+                "unexpected checkpoint failure: {error:?}"
+            );
+
+            let drained = temp.path().join(format!("drained{index}.db"));
+            let conn = synthetic_store_with_free_pages(&drained, page_size);
+            drain_free_pages(&conn).unwrap();
+            let busy = conn
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap();
+            assert_eq!(busy, 0, "the drained store must checkpoint");
+        }
+    }
+
     fn open_in_memory_cache() -> Connection {
         let mut conn = Connection::open_in_memory().unwrap();
         configure_connection(&mut conn).unwrap();
@@ -2167,6 +2329,113 @@ mod tests {
     }
 
     #[test]
+    fn relational_structural_facts_replace_the_blob_and_enforce_row_shape() {
+        let conn = open_in_memory_cache();
+        let old_table_exists = conn
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM sqlite_master
+                   WHERE type = 'table' AND name = 'structural_facts_snapshots'
+                 )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap();
+        assert!(!old_table_exists);
+
+        conn.execute_batch(
+            "INSERT INTO analysis_epochs(lang, epoch, generation)
+               VALUES('java', 'test', 7);
+             INSERT INTO blobs(blob_oid, lang, generation)
+               VALUES('1111111111111111111111111111111111111111', 'java', 7);
+             INSERT INTO blob_meta(
+               blob_id, lang, contains_tests, content_package,
+               stored_unit_count, range_count, signature_count,
+               signature_metadata_count, supertype_count, child_count,
+               import_statement_count, type_identifier_count, is_complete
+             ) VALUES(
+               (SELECT id FROM blobs WHERE blob_oid = '1111111111111111111111111111111111111111' AND lang = 'java'),
+               'java', 0, 'pkg',
+               0, 0, 0, 0, 0, 0, 0, 0, 1
+             );
+             INSERT INTO structural_fact_manifests(
+               blob_id, facts_version, source_bytes, node_count,
+               role_count, occurrence_role_count
+             ) VALUES(
+               (SELECT id FROM blobs WHERE blob_oid = '1111111111111111111111111111111111111111' AND lang = 'java'),
+               12, 10, 1, 1, 1
+             );
+             INSERT INTO structural_fact_nodes(
+               blob_id, node_id, kind, start_byte, end_byte, subtree_end
+             ) VALUES(
+               (SELECT id FROM blobs WHERE blob_oid = '1111111111111111111111111111111111111111' AND lang = 'java'), 0,
+               'identifier', 0, 4, 1
+             );
+             INSERT INTO structural_fact_roles(
+               blob_id, source_node_id, ordinal, role, spread,
+               target_start_byte, target_end_byte
+             ) VALUES(
+               (SELECT id FROM blobs WHERE blob_oid = '1111111111111111111111111111111111111111' AND lang = 'java'), 0, 0,
+               'callee', 0, 0, 4
+             );
+             INSERT INTO structural_fact_occurrence_roles(
+               blob_id, node_id, ordinal, role
+             ) VALUES(
+               (SELECT id FROM blobs WHERE blob_oid = '1111111111111111111111111111111111111111' AND lang = 'java'), 0, 0,
+               'value_reference'
+             );",
+        )
+        .unwrap();
+
+        let invalid_kind = conn
+            .execute(
+                "INSERT INTO structural_fact_nodes(
+                   blob_id, node_id, kind, start_byte, end_byte, subtree_end
+                 ) VALUES(
+                   (SELECT id FROM blobs WHERE blob_oid = '1111111111111111111111111111111111111111' AND lang = 'java'), 1,
+                   'not_a_kind', 4, 5, 2
+                 )",
+                [],
+            )
+            .unwrap_err();
+        assert!(invalid_kind.to_string().contains("CHECK constraint failed"));
+
+        let partial_call_site = conn
+            .execute(
+                "UPDATE structural_fact_nodes SET call_coverage = 'exact'
+                 WHERE blob_id = (SELECT id FROM blobs
+                   WHERE blob_oid = '1111111111111111111111111111111111111111'
+                     AND lang = 'java')
+                   AND node_id = 0",
+                [],
+            )
+            .unwrap_err();
+        assert!(
+            partial_call_site
+                .to_string()
+                .contains("CHECK constraint failed")
+        );
+
+        conn.execute(
+            "DELETE FROM blobs
+             WHERE blob_oid = '1111111111111111111111111111111111111111'
+               AND lang = 'java'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM structural_fact_manifests",
+                [],
+                |row| { row.get::<_, usize>(0) }
+            )
+            .unwrap(),
+            0,
+            "deleting the parsed blob must cascade through all structural rows"
+        );
+    }
+
+    #[test]
     fn live_definition_views_enforce_publication_and_keep_indexed_lookups() {
         let conn = open_in_memory_cache();
         let live_oid = "1111111111111111111111111111111111111111";
@@ -2178,30 +2447,31 @@ mod tests {
                ('2222222222222222222222222222222222222222', 'java', 6),
                ('3333333333333333333333333333333333333333', 'java', 7);
              INSERT INTO blob_meta(
-               blob_oid, lang, contains_tests, content_package,
+               blob_id, lang, contains_tests, content_package,
                stored_unit_count, range_count, signature_count,
                signature_metadata_count, supertype_count, child_count,
                import_statement_count, type_identifier_count, is_complete
-             ) VALUES
-               ('1111111111111111111111111111111111111111', 'java', 0, 'pkg',
-                1, 0, 0, 0, 0, 0, 0, 0, 1),
-               ('2222222222222222222222222222222222222222', 'java', 0, 'pkg',
-                1, 0, 0, 0, 0, 0, 0, 0, 1),
-               ('3333333333333333333333333333333333333333', 'java', 0, 'pkg',
-                1, 0, 0, 0, 0, 0, 0, 0, 0);
+             )
+             SELECT id, lang, 0, 'pkg', 1, 0, 0, 0, 0, 0, 0, 0,
+                    CASE WHEN blob_oid LIKE '3%' THEN 0 ELSE 1 END
+             FROM blobs;
              INSERT INTO code_units(
-               blob_oid, lang, unit_key, kind, short_name, identifier,
+               blob_id, lang, unit_key, kind, short_name, identifier,
                content_qualifier, exact_fqn, normalized_fqn,
                simple_type_name, synthetic, is_type_alias,
                in_declarations, in_definition_lookup
-             ) VALUES
-               ('1111111111111111111111111111111111111111', 'java', 1, 0,
-                'Live', 'Live', 'pkg', 'pkg.Live', 'pkg.Live', 'Live', 0, 0, 1, 1),
-               ('2222222222222222222222222222222222222222', 'java', 1, 0,
-                'Stale', 'Stale', 'pkg', 'pkg.Stale', 'pkg.Stale', 'Stale', 0, 0, 1, 1),
-               ('3333333333333333333333333333333333333333', 'java', 1, 0,
-                'Incomplete', 'Incomplete', 'pkg', 'pkg.Incomplete',
-                'pkg.Incomplete', 'Incomplete', 0, 0, 1, 1);",
+             )
+             SELECT id, lang, 1, 0, name, name, 'pkg', 'pkg.' || name,
+                    'pkg.' || name, name, 0, 0, 1, 1
+             FROM (
+               SELECT id, lang, blob_oid,
+                      CASE substr(blob_oid, 1, 1)
+                        WHEN '1' THEN 'Live'
+                        WHEN '2' THEN 'Stale'
+                        ELSE 'Incomplete'
+                      END AS name
+               FROM blobs
+             );",
         )
         .unwrap();
 
@@ -2257,28 +2527,24 @@ mod tests {
              INSERT INTO blobs(blob_oid, lang, generation)
                VALUES('1111111111111111111111111111111111111111', 'java', 7);
              INSERT INTO blob_meta(
-               blob_oid, lang, contains_tests, content_package,
+               blob_id, lang, contains_tests, content_package,
                stored_unit_count, range_count, signature_count,
                signature_metadata_count, supertype_count, child_count,
                import_statement_count, type_identifier_count, is_complete
-             ) VALUES(
-               '1111111111111111111111111111111111111111', 'java', 0, 'pkg',
-               1, 0, 0, 0, 0, 0, 0, 0, 1
-             );
+             )
+             SELECT id, lang, 0, 'pkg', 1, 0, 0, 0, 0, 0, 0, 0, 1 FROM blobs;
              INSERT INTO code_units(
-               blob_oid, lang, unit_key, kind, short_name, identifier,
+               blob_id, lang, unit_key, kind, short_name, identifier,
                content_qualifier, simple_type_name, synthetic, is_type_alias,
                in_declarations, in_definition_lookup, fq_anchor_kind, fq_anchor_pop,
                fq_package_tail_segments, exact_fqn_tail, normalized_fqn_tail,
                exact_parent_fqn_tail, package_fqn_tail
-             ) VALUES(
-               '1111111111111111111111111111111111111111', 'java', 1, 0,
-               'Live$1', 'Live$1', 'pkg', 'Live', 0, 0, 1, 1, NULL, NULL,
-               1, 'pkg.Live$1', 'pkg.Live', 'pkg', 'pkg'
-             );
-             INSERT INTO unit_signatures(blob_oid, lang, unit_key, ordinal, text)
-               VALUES('1111111111111111111111111111111111111111', 'java', 1, 0,
-                      'class Live$1');
+             )
+             SELECT id, lang, 1, 0, 'Live$1', 'Live$1', 'pkg', 'Live', 0, 0, 1, 1,
+                    NULL, NULL, 1, 'pkg.Live$1', 'pkg.Live', 'pkg', 'pkg'
+             FROM blobs;
+             INSERT INTO unit_signatures(blob_id, lang, unit_key, ordinal, text)
+               SELECT id, lang, 1, 0, 'class Live$1' FROM blobs;
              INSERT INTO workspace_revisions(workspace_id, lang, generation, revision)
                VALUES(
                  'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
@@ -3032,8 +3298,7 @@ mod tests {
         conn.execute_batch("CREATE TABLE legacy_cache(value TEXT) STRICT;")
             .unwrap();
         let migrations = future_migration_sql(
-            "INSERT INTO blob_payload_costs(blob_oid, lang, payload_bytes)
-             VALUES('0000000000000000000000000000000000000000', 'rust', 0);",
+            "INSERT INTO blob_payload_costs(blob_id, payload_bytes) VALUES(424242, 0);",
         );
 
         let err = migrate_with_sql(&mut conn, &migrations).unwrap_err();
@@ -3958,7 +4223,8 @@ mod tests {
         assert_eq!(
             conn.query_row(
                 "SELECT fq_segment_count FROM code_units
-                 WHERE blob_oid = ?1 AND lang = 'java' AND unit_key = 7",
+                 WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'java')
+                   AND unit_key = 7",
                 [&oid],
                 |row| row.get::<_, i64>(0),
             )
@@ -3968,7 +4234,8 @@ mod tests {
         assert_eq!(
             conn.query_row(
                 "SELECT fq_segment_bytes FROM code_units
-                 WHERE blob_oid = ?1 AND lang = 'java' AND unit_key = 7",
+                 WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'java')
+                   AND unit_key = 7",
                 [&oid],
                 |row| row.get::<_, i64>(0),
             )
@@ -3979,7 +4246,8 @@ mod tests {
             .prepare(
                 "SELECT seg_ordinal, seg_kind, segment
                  FROM code_unit_fq_segments
-                 WHERE blob_oid = ?1 AND lang = 'java' AND unit_key = 7
+                 WHERE blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = 'java')
+                   AND unit_key = 7
                  ORDER BY seg_ordinal",
             )
             .unwrap()
@@ -4311,5 +4579,388 @@ mod tests {
         );
         assert_eq!(std::fs::read(&older).unwrap(), older_before);
         assert!(staged_leftovers(&cache_dir).is_empty());
+    }
+
+    /// Every content-addressed fact family that remains after migrations 33
+    /// and 34, in the order a snapshot reads them.
+    ///
+    /// `blobs` is not here: it is the intern point rather than a fact table,
+    /// and the test asserts its contents separately. The opaque
+    /// `structural_facts_snapshots` family is intentionally absent because
+    /// migration 34 replaces it with relational facts that are rebuilt on
+    /// demand rather than carrying its bincode payload forward.
+    const CARRIED_ANALYZER_FACT_TABLES: [&str; 32] = [
+        "code_units",
+        "code_unit_fq_segments",
+        "unit_visibility_containers",
+        "unit_ranges",
+        "unit_signatures",
+        "unit_signature_metadata",
+        "unit_supertypes",
+        "unit_children",
+        "unit_cpp_template_metadata",
+        "ruby_method_dispatch_modes",
+        "scala_traits",
+        "scala_exports",
+        "import_statements",
+        "import_path_segments",
+        "import_lexical_scopes",
+        "import_lexical_prefixes",
+        "reference_identifiers",
+        "materialization_records",
+        "blob_meta",
+        "blob_optional_fact_manifest",
+        "blob_payload_costs",
+        "blob_reference_fact_manifests",
+        "rust_exports",
+        "rust_import_targets",
+        "rust_modules",
+        "rust_identifier_occurrences",
+        "rust_module_scopes",
+        "rust_module_routes",
+        "rust_module_route_gates",
+        "rust_item_macros",
+        "rust_include_edges",
+        "rust_include_host_bindings",
+    ];
+
+    /// A table's columns other than the blob key, which is the only thing
+    /// migration 33 changes. Reading them from the live schema rather than
+    /// listing them keeps the snapshot complete as columns are added.
+    fn non_key_columns(conn: &Connection, table: &str) -> Vec<String> {
+        conn.prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+            .into_iter()
+            .filter(|column| column != "blob_oid" && column != "blob_id" && column != "lang")
+            .collect()
+    }
+
+    /// Every fact row of every family, projected as
+    /// `(blob_oid, lang, <the table's other columns>)`.
+    ///
+    /// The projection is deliberately shape-independent: before migration 33 a
+    /// row carries its own `blob_oid` and `lang`; after it, both come from the
+    /// `blobs` row its `blob_id` names. Equality of two snapshots is therefore
+    /// the claim that the migration moved the key and nothing else.
+    fn analyzer_fact_snapshot(
+        conn: &Connection,
+    ) -> Vec<(String, Vec<String>, Vec<Vec<rusqlite::types::Value>>)> {
+        CARRIED_ANALYZER_FACT_TABLES
+            .into_iter()
+            .map(|table| {
+                let columns = non_key_columns(conn, table);
+                let projected = columns
+                    .iter()
+                    .map(|column| format!("t.{column}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let order = (1..=columns.len() + 2)
+                    .map(|ordinal| ordinal.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = if column_exists(conn, table, "blob_id").unwrap() {
+                    format!(
+                        "SELECT keys.blob_oid, keys.lang, {projected}
+                         FROM {table} AS t
+                         JOIN blobs AS keys ON keys.id = t.blob_id
+                         ORDER BY {order}"
+                    )
+                } else {
+                    format!(
+                        "SELECT t.blob_oid, t.lang, {projected}
+                         FROM {table} AS t
+                         ORDER BY {order}"
+                    )
+                };
+                let mut statement = conn.prepare(&sql).unwrap();
+                let width = columns.len() + 2;
+                let rows = statement
+                    .query_map([], |row| {
+                        (0..width)
+                            .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                    })
+                    .unwrap()
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .unwrap();
+                (table.to_string(), columns, rows)
+            })
+            .collect()
+    }
+
+    fn blob_registry_rows(conn: &Connection) -> Vec<(String, String, i64)> {
+        conn.prepare("SELECT blob_oid, lang, generation FROM blobs ORDER BY blob_oid, lang")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    /// One published blob with a row in every fact family, written in the
+    /// version-32 shape.
+    ///
+    /// Two languages, because `lang` is part of the identity a fact row carries
+    /// and interning must not merge two readings of the same bytes.
+    fn seed_v32_analyzer_facts(conn: &Connection) {
+        let oid = seeded_oid("analyzer-facts");
+        let other = seeded_oid("second-blob");
+        for (blob, lang) in [(&oid, "rust"), (&oid, "cpp:c"), (&other, "rust")] {
+            conn.execute(
+                "INSERT INTO blobs(blob_oid, lang, generation) VALUES(?1, ?2, 0)",
+                rusqlite::params![blob, lang],
+            )
+            .unwrap();
+            for statement in [
+                "INSERT INTO code_units(
+                   blob_oid, lang, unit_key, kind, short_name, identifier,
+                   content_qualifier, exact_fqn, normalized_fqn, simple_type_name,
+                   signature, synthetic, is_type_alias, top_level_ordinal,
+                   in_declarations, in_definition_lookup, in_test_region,
+                   fq_anchor_kind, fq_anchor_pop, fq_package_tail_segments,
+                   exact_fqn_tail, normalized_fqn_tail, exact_parent_fqn_tail,
+                   normalized_parent_fqn_tail, package_fqn_tail,
+                   fq_segment_count, fq_segment_bytes
+                 ) VALUES(?1, ?2, 1, 0, 'Widget', 'Widget', 'pkg', 'pkg.Widget',
+                          'pkg.widget', 'Widget', NULL, 0, 0, 0, 1, 1, 0,
+                          'own_module', 1, 1, 'Widget', NULL, NULL, NULL, 'pkg', 2, 17)",
+                "INSERT INTO code_units(
+                   blob_oid, lang, unit_key, kind, short_name, identifier,
+                   content_qualifier, synthetic, is_type_alias, in_declarations,
+                   in_definition_lookup
+                 ) VALUES(?1, ?2, 2, 1, 'run', 'run', 'pkg', 0, 0, 1, 0)",
+                "INSERT INTO code_unit_fq_segments(blob_oid, lang, unit_key, seg_ordinal, seg_kind, segment)
+                 VALUES(?1, ?2, 1, 0, 'package', 'pkg')",
+                "INSERT INTO code_unit_fq_segments(blob_oid, lang, unit_key, seg_ordinal, seg_kind, segment)
+                 VALUES(?1, ?2, 1, 1, 'type', 'Widget')",
+                "INSERT INTO unit_visibility_containers(
+                   blob_oid, lang, unit_key, container_ordinal, exact_container_tail,
+                   normalized_container_tail
+                 ) VALUES(?1, ?2, 2, 0, 'Widget', NULL)",
+                "INSERT INTO unit_ranges(blob_oid, lang, unit_key, ordinal, start_byte, end_byte, start_line, end_line)
+                 VALUES(?1, ?2, 1, 0, 0, 120, 0, 6)",
+                "INSERT INTO unit_ranges(blob_oid, lang, unit_key, ordinal, start_byte, end_byte, start_line, end_line)
+                 VALUES(?1, ?2, 2, 0, 30, 90, 2, 4)",
+                "INSERT INTO unit_signatures(blob_oid, lang, unit_key, ordinal, text)
+                 VALUES(?1, ?2, 2, 0, 'fn run(&self) -> u32')",
+                "INSERT INTO unit_signature_metadata(
+                   blob_oid, lang, unit_key, ordinal, label, parameters,
+                   return_type_text, declaration_only, callable_arity_required,
+                   callable_arity_total, callable_arity_repeated, callable_is_static
+                 ) VALUES(?1, ?2, 2, 0, 'run', '[\"self\"]', 'u32', 0, 0, 0, 0, 0)",
+                "INSERT INTO unit_supertypes(blob_oid, lang, unit_key, ordinal, raw, lookup_path)
+                 VALUES(?1, ?2, 1, 0, 'Base', 'pkg.Base')",
+                "INSERT INTO unit_children(blob_oid, lang, parent_key, child_key, ordinal)
+                 VALUES(?1, ?2, 1, 2, 0)",
+                "INSERT INTO unit_cpp_template_metadata(blob_oid, lang, unit_key, metadata)
+                 VALUES(?1, ?2, 1, x'0102')",
+                "INSERT INTO ruby_method_dispatch_modes(blob_oid, lang, unit_key, mode)
+                 VALUES(?1, ?2, 2, 1)",
+                "INSERT INTO scala_traits(blob_oid, lang, unit_key) VALUES(?1, ?2, 1)",
+                "INSERT INTO scala_exports(blob_oid, lang, owner_key, ordinal, info)
+                 VALUES(?1, ?2, 1, 0, x'0304')",
+                "INSERT INTO import_statements(
+                   blob_oid, lang, ordinal, statement, is_wildcard, is_global,
+                   identifier, alias, path_kind, declaration_start_byte,
+                   binder_start, binder_end
+                 ) VALUES(?1, ?2, 0, 'use pkg::Base;', 0, 0, 'Base', NULL,
+                          'namespace', 0, 9, 13)",
+                "INSERT INTO import_path_segments(blob_oid, lang, ordinal, seg_ordinal, segment)
+                 VALUES(?1, ?2, 0, 0, 'pkg')",
+                "INSERT INTO import_lexical_scopes(blob_oid, lang, ordinal, scope_ordinal, start_byte, end_byte)
+                 VALUES(?1, ?2, 0, 0, 0, 120)",
+                "INSERT INTO import_lexical_prefixes(blob_oid, lang, ordinal, prefix_ordinal, prefix)
+                 VALUES(?1, ?2, 0, 0, 'pkg')",
+                "INSERT INTO reference_identifiers(blob_oid, lang, identifier) VALUES(?1, ?2, 'Base')",
+                "INSERT INTO materialization_records(blob_oid, lang, ordinal, unit_key, payload)
+                 VALUES(?1, ?2, 0, 1, x'0506')",
+                "INSERT INTO blob_meta(
+                   blob_oid, lang, contains_tests, content_package, stored_unit_count,
+                   range_count, signature_count, signature_metadata_count,
+                   supertype_count, child_count, import_statement_count,
+                   type_identifier_count, is_complete
+                 ) VALUES(?1, ?2, 0, 'pkg', 2, 2, 1, 1, 1, 1, 1, 1, 1)",
+                "INSERT INTO blob_optional_fact_manifest(blob_oid, lang, fact_kind, row_count)
+                 VALUES(?1, ?2, 1, 1)",
+                "INSERT INTO blob_optional_fact_manifest(blob_oid, lang, fact_kind, row_count)
+                 VALUES(?1, ?2, 5, 1)",
+                "INSERT INTO blob_payload_costs(blob_oid, lang, payload_bytes) VALUES(?1, ?2, 512)",
+                "INSERT INTO structural_facts_snapshots(blob_oid, lang, snapshot_version, payload)
+                 VALUES(?1, ?2, 3, x'0708')",
+                "INSERT INTO blob_reference_fact_manifests(blob_oid, lang, epoch, identifier_count)
+                 VALUES(?1, ?2, 1, 1)",
+                "INSERT INTO rust_exports(blob_oid, lang, ordinal, exported_name, source_path, imported_name, is_glob)
+                 VALUES(?1, ?2, 0, 'Base', 'pkg/base.rs', NULL, 0)",
+                "INSERT INTO rust_import_targets(
+                   blob_oid, lang, ordinal, module_path, bound_name, imported_name,
+                   is_glob, visibility, owner_module, owner_start, owner_end,
+                   local_start, local_end, cfg_condition, is_extern_crate
+                 ) VALUES(?1, ?2, 0, 'pkg', 'Base', 'Base', 0, 'pub', 'crate', 0, 120, 9, 13, 'always', 0)",
+                "INSERT INTO rust_modules(blob_oid, lang, ordinal, module_name, is_inline, start_byte, end_byte)
+                 VALUES(?1, ?2, 0, 'inner', 1, 20, 100)",
+                "INSERT INTO rust_identifier_occurrences(blob_oid, lang, identifier, context_mask)
+                 VALUES(?1, ?2, 'Base', 3)",
+                "INSERT INTO rust_module_scopes(
+                   blob_oid, lang, ordinal, parent_ordinal, module_name, path_attribute,
+                   imports_macros, body_start, body_end
+                 ) VALUES(?1, ?2, 0, NULL, 'crate', NULL, 0, 0, 120)",
+                "INSERT INTO rust_module_routes(
+                   blob_oid, lang, ordinal, scope_ordinal, module_name, path_attribute,
+                   visibility, imports_macros, test_gated, declaration_start, declaration_end
+                 ) VALUES(?1, ?2, 0, 0, 'inner', NULL, 'pub', 0, 0, 20, 26)",
+                "INSERT INTO rust_module_route_gates(
+                   blob_oid, lang, route_ordinal, gate_ordinal, macro_name, invocation_start
+                 ) VALUES(?1, ?2, 0, 0, 'cfg_if', 18)",
+                "INSERT INTO rust_item_macros(
+                   blob_oid, lang, ordinal, macro_name, visible_after, scope_start,
+                   scope_end, passthrough
+                 ) VALUES(?1, ?2, 0, 'declare', 10, 0, 120, 0)",
+                "INSERT INTO rust_include_edges(blob_oid, lang, ordinal, relative_path, file_name, include_start)
+                 VALUES(?1, ?2, 0, 'gen/table.rs', 'table.rs', 40)",
+                "INSERT INTO rust_include_host_bindings(
+                   blob_oid, lang, edge_ordinal, ordinal, local_name, module_specifier,
+                   imported_name, scope_start, kind
+                 ) VALUES(?1, ?2, 0, 0, 'Base', 'pkg', 'Base', 0, 'named')",
+            ] {
+                conn.execute(statement, rusqlite::params![blob, lang])
+                    .unwrap_or_else(|err| panic!("seed {statement}: {err}"));
+            }
+        }
+    }
+
+    /// A warm version-32 store carries every retained analyzer fact family
+    /// forward through blob-id interning unchanged.
+    ///
+    /// Fail-before: without migration 33 there is nothing to carry forward to,
+    /// and the upgraded store still keys its facts by the forty-character hex,
+    /// so the `blob_id` assertions below fail.
+    #[test]
+    fn warm_v32_analyzer_facts_survive_blob_id_interning() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path();
+        let older = store_path(cache_dir, 32);
+        create_store_at(&older, &migrations_through(32), 32);
+        let (expected_facts, expected_blobs, expected_semantic) = {
+            let older_conn = Connection::open(&older).unwrap();
+            older_conn
+                .pragma_update(None, "foreign_keys", "ON")
+                .unwrap();
+            seed_v32_analyzer_facts(&older_conn);
+            (
+                analyzer_fact_snapshot(&older_conn),
+                blob_registry_rows(&older_conn),
+                semantic_rows(&older_conn),
+            )
+        };
+        assert!(
+            expected_facts
+                .iter()
+                .all(|(table, _, rows)| !rows.is_empty() || panic!("{table} seeded no rows")),
+        );
+        let older_before = std::fs::read(&older).unwrap();
+
+        let conn = open_unified_connection(&current_store_path(cache_dir)).unwrap();
+
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        assert_eq!(
+            analyzer_fact_snapshot(&conn),
+            expected_facts,
+            "every retained fact family must read back identically after interning"
+        );
+        assert_eq!(blob_registry_rows(&conn), expected_blobs);
+        assert_eq!(semantic_rows(&conn), expected_semantic);
+        assert_eq!(
+            schema_object_definitions(&conn).unwrap(),
+            *CURRENT_SCHEMA_OBJECTS,
+            "an upgraded store must be indistinguishable from one this build wrote"
+        );
+        assert!(quick_check_is_ok(&conn).unwrap());
+        assert!(!column_exists(&conn, "code_units", "blob_oid").unwrap());
+        assert!(column_exists(&conn, "code_units", "blob_id").unwrap());
+        // Interning is not deduplication: two readings of the same bytes under
+        // different storage languages stay distinct rows with distinct ids.
+        let ids: Vec<i64> = conn
+            .prepare("SELECT DISTINCT blob_id FROM code_units ORDER BY blob_id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(ids.len(), 3, "one id per (blob_oid, lang) pair: {ids:?}");
+        assert_eq!(std::fs::read(&older).unwrap(), older_before);
+        assert!(staged_leftovers(cache_dir).is_empty());
+    }
+
+    /// Deleting a blob's registry row still empties every fact family, now
+    /// through the integer key.
+    ///
+    /// This is the property the writer's publish path depends on: it clears a
+    /// previous publication with one `DELETE FROM blobs`. The pragma assertion
+    /// is part of the test because a cascade that is declared but not enforced
+    /// looks exactly like one that works until something reads the orphans.
+    #[test]
+    fn deleting_a_blob_cascades_every_interned_fact_family() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cascade.db");
+        create_store_at(&path, &migrations_through(32), 32);
+        {
+            let seed = Connection::open(&path).unwrap();
+            seed.pragma_update(None, "foreign_keys", "ON").unwrap();
+            seed_v32_analyzer_facts(&seed);
+        }
+        let conn = open_unified_connection(&path).unwrap();
+        assert_eq!(
+            cache_migration_version(&conn).unwrap(),
+            CURRENT_MIGRATION_VERSION
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "the cascade only fires with foreign keys enforced"
+        );
+        assert!(
+            column_exists(&conn, "code_units", "blob_id").unwrap(),
+            "this test is about the interned shape"
+        );
+        let populated = analyzer_fact_snapshot(&conn);
+        assert!(populated.iter().all(|(_, _, rows)| !rows.is_empty()));
+
+        let removed = conn
+            .execute(
+                "DELETE FROM blobs WHERE blob_oid = ?1 AND lang = 'rust'",
+                [seeded_oid("analyzer-facts")],
+            )
+            .unwrap();
+        assert_eq!(removed, 1);
+
+        for (table, _, rows) in analyzer_fact_snapshot(&conn) {
+            assert!(
+                rows.iter()
+                    .all(|row| row[1] != rusqlite::types::Value::Text("rust".into())
+                        || row[0] != rusqlite::types::Value::Text(seeded_oid("analyzer-facts"))),
+                "{table} kept rows for a deleted blob: {rows:#?}"
+            );
+            assert!(
+                !rows.is_empty(),
+                "{table} lost the rows of blobs that were not deleted"
+            );
+        }
+        assert!(
+            conn.prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .next()
+                .is_none(),
+            "the cascade must leave no orphan"
+        );
     }
 }

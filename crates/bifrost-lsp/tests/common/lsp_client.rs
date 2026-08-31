@@ -47,7 +47,10 @@ pub struct LspServer {
     reader: Option<BufReader<ChildStdout>>,
     stderr: Option<ChildStderr>,
     next_id: u64,
-    _cache_dir: TempDir,
+    /// Owned by the server object for the default spawn, which creates the
+    /// isolated cache directory itself. The machine-cache-root variant lets the
+    /// test own the directory so it can inspect what the server wrote there.
+    _cache_dir: Option<TempDir>,
 }
 
 impl LspServer {
@@ -71,7 +74,40 @@ impl LspServer {
             reader: Some(BufReader::new(stdout)),
             stderr: Some(stderr),
             next_id: 1,
-            _cache_dir: cache_dir,
+            _cache_dir: Some(cache_dir),
+        }
+    }
+
+    /// Spawn the server rooted at `root` with `machine_cache_root` as its
+    /// machine-local cache root, and no exact-directory override at all.
+    ///
+    /// [`lsp_command`] pins `BIFROST_CACHE_DIR`, which wins over every other
+    /// rule in the cache-location funnel and so collapses each session's
+    /// database into one known directory. That is what almost every test wants,
+    /// but it also means no test can observe where the server *would* have put
+    /// its database. This variant removes that override so the funnel runs for
+    /// real, and points `BIFROST_CACHE_ROOT` at a directory the test owns, so
+    /// the test can assert the resulting layout without writing to the
+    /// developer's own cache.
+    pub fn spawn_with_machine_cache_root(root: &Path, machine_cache_root: &Path) -> Self {
+        let mut command = lsp_command_with_machine_cache_root(root, machine_cache_root);
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn bifrost");
+        let stdin = child.stdin.take().expect("stdin");
+        let stdout = child.stdout.take().expect("stdout");
+        let stderr = child.stderr.take().expect("stderr");
+
+        Self {
+            child: Some(child),
+            stdin: Some(stdin),
+            reader: Some(BufReader::new(stdout)),
+            stderr: Some(stderr),
+            next_id: 1,
+            _cache_dir: None,
         }
     }
 
@@ -120,7 +156,7 @@ impl LspServer {
             reader: Some(reader),
             stderr: Some(stderr),
             next_id: 2,
-            _cache_dir: cache_dir,
+            _cache_dir: Some(cache_dir),
         }
     }
 
@@ -552,6 +588,26 @@ fn lsp_command(root: &Path) -> (Command, TempDir) {
         // wants stdlib proof must configure explicit `jdk_homes` instead.
         .env_remove("JAVA_HOME");
     (command, cache_dir)
+}
+
+fn lsp_command_with_machine_cache_root(root: &Path, machine_cache_root: &Path) -> Command {
+    let binary = option_env!("CARGO_BIN_EXE_bifrost-lsp-test-server")
+        .or(option_env!("CARGO_BIN_EXE_bifrost"))
+        .expect("Cargo did not provide an LSP server binary");
+    let mut command = Command::new(binary);
+    command
+        .arg("--root")
+        .arg(root)
+        .arg("--server")
+        .arg("lsp")
+        .env("BIFROST_CACHE_GC", "off")
+        .env(
+            brokk_bifrost_analysis::gitblob::CACHE_ROOT_ENV,
+            machine_cache_root,
+        )
+        .env_remove(brokk_bifrost_analysis::gitblob::CACHE_DIR_ENV)
+        .env_remove("JAVA_HOME");
+    command
 }
 
 impl Drop for LspServer {

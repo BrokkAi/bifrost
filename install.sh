@@ -35,7 +35,7 @@ Usage:
 
 Platforms:
   macOS            Apple Silicon and Intel, via the universal binary.
-  Linux            x86-64 with glibc or musl, and ARM64 with glibc.
+  Linux            x86-64 and ARM64 with glibc 2.28 or newer.
   WSL              Supported as Linux. Installs the Linux binary, which runs
                    inside WSL and is not callable from Windows-native tools.
   Android          ARM64 under Termux.
@@ -82,8 +82,8 @@ download_file() {
   curl "${args[@]}" -o "$dest" "$url"
 }
 
-# Static musl builds run anywhere on x86_64, so the detected libc only decides
-# which asset is preferred, not which ones are acceptable.
+# GNU/Linux release binaries require glibc. Detect musl before consulting the
+# release so the error cannot be mistaken for a missing asset.
 detect_linux_libc() {
   if ldd --version 2>&1 | grep -qi musl; then
     printf 'musl\n'
@@ -132,8 +132,8 @@ detect_platform() {
       else
         OS_FAMILY="linux"
         LIBC="$(detect_linux_libc)"
-        if [[ "$ARCH" == "aarch64" && "$LIBC" == "musl" ]]; then
-          die "no aarch64 musl build is published, and the glibc build would not run here (this looks like Alpine or another musl distro on ARM64). Build from source instead: cargo install brokk-bifrost --locked"
+        if [[ "$LIBC" == "musl" ]]; then
+          die "no prebuilt musl release is published (this looks like Alpine or another musl distribution). Musl is unsupported; you can attempt a source build with: cargo install brokk-bifrost --locked"
         fi
       fi
       ;;
@@ -156,10 +156,8 @@ asset_patterns() {
       printf '%s\n' "aarch64-linux-android"
       ;;
     linux)
-      if [[ "$ARCH" == "x86_64" && "$LIBC" == "musl" ]]; then
-        printf '%s\n' "x86_64-unknown-linux-musl" "x86_64-unknown-linux-gnu"
-      elif [[ "$ARCH" == "x86_64" ]]; then
-        printf '%s\n' "x86_64-unknown-linux-gnu" "x86_64-unknown-linux-musl"
+      if [[ "$ARCH" == "x86_64" ]]; then
+        printf '%s\n' "x86_64-unknown-linux-gnu"
       else
         printf '%s\n' "aarch64-unknown-linux-gnu"
       fi

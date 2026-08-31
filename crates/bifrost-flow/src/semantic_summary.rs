@@ -674,13 +674,19 @@ fn build_summary_set(
     }
 
     ExternalSemanticSummarySet::try_new(summaries, compatibility).map_err(|error| match error {
-        ExternalSummarySetError::AmbiguousTarget => ProcedureSummaryBindingError::AmbiguousTarget {
-            summary_id: "<structured target>".to_owned(),
-        },
+        ExternalSummarySetError::AmbiguousTarget
+        | ExternalSummarySetError::InconsistentSummaryKey => {
+            ProcedureSummaryBindingError::AmbiguousTarget {
+                summary_id: "<structured target>".to_owned(),
+            }
+        }
         ExternalSummarySetError::IncompatibleSummary | ExternalSummarySetError::InferredSummary => {
             ProcedureSummaryBindingError::IncompatibleCompatibilityKey {
                 summary_id: "<summary family>".to_owned(),
             }
+        }
+        ExternalSummarySetError::InvalidTargetAlias => {
+            unreachable!("ordinary bound summary construction does not accept target aliases")
         }
     })
 }
@@ -916,6 +922,9 @@ fn lower_output(
 ) -> Result<SummaryPort, ProcedureSummaryBindingError> {
     match output {
         CompiledSummaryOutput::NormalReturn {} => Ok(SummaryPort::NormalReturn),
+        CompiledSummaryOutput::IndexedNormalReturn { ordinal } => {
+            Ok(SummaryPort::IndexedNormalReturn(*ordinal))
+        }
         CompiledSummaryOutput::ExceptionalReturn {} => Ok(SummaryPort::ExceptionalReturn),
         CompiledSummaryOutput::Receiver {} if binding.boundary.receiver().is_some() => {
             Ok(SummaryPort::Receiver)

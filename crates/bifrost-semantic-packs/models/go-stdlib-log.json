@@ -1,0 +1,192 @@
+{
+  "schema_version": 1,
+  "pack_id": "bifrost.go.stdlib.log",
+  "version": "1.0.0",
+  "producer": {
+    "name": "bifrost",
+    "version": "0.10.6"
+  },
+  "language": "go",
+  "ecosystem": "go",
+  "compatibility": {
+    "bifrost": ">=0.10.6, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "https://pkg.go.dev/log",
+    "revision": "go1.27.0"
+  },
+  "license": "BSD-3-Clause",
+  "completeness": "partial",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "go.stdlib.log.normal-continuation",
+      "activation": [{}],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "log.fatal",
+            "target": {
+              "path": "src/log/log.go",
+              "symbol": "log.Fatal(v ...any)",
+              "has_receiver": false,
+              "variadic": true,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "normal_continuation_absent": true,
+            "transfers": []
+          },
+          {
+            "id": "log.fatalf",
+            "target": {
+              "path": "src/log/log.go",
+              "symbol": "log.Fatalf(format string, v ...any)",
+              "has_receiver": false,
+              "variadic": true,
+              "parameter_count": 2
+            },
+            "completeness": "partial",
+            "normal_continuation_absent": true,
+            "transfers": []
+          },
+          {
+            "id": "log.fatalln",
+            "target": {
+              "path": "src/log/log.go",
+              "symbol": "log.Fatalln(v ...any)",
+              "has_receiver": false,
+              "variadic": true,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "normal_continuation_absent": true,
+            "transfers": []
+          },
+          {
+            "id": "log.panic",
+            "target": {
+              "path": "src/log/log.go",
+              "symbol": "log.Panic(v ...any)",
+              "has_receiver": false,
+              "variadic": true,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "normal_continuation_absent": true,
+            "transfers": []
+          },
+          {
+            "id": "log.panicf",
+            "target": {
+              "path": "src/log/log.go",
+              "symbol": "log.Panicf(format string, v ...any)",
+              "has_receiver": false,
+              "variadic": true,
+              "parameter_count": 2
+            },
+            "completeness": "partial",
+            "normal_continuation_absent": true,
+            "transfers": []
+          },
+          {
+            "id": "log.panicln",
+            "target": {
+              "path": "src/log/log.go",
+              "symbol": "log.Panicln(v ...any)",
+              "has_receiver": false,
+              "variadic": true,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "normal_continuation_absent": true,
+            "transfers": []
+          },
+          {
+            "id": "log.logger.fatal",
+            "target": {
+              "path": "src/log/log.go",
+              "symbol": "log.Logger.Fatal(v ...any)",
+              "has_receiver": true,
+              "variadic": true,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "normal_continuation_absent": true,
+            "transfers": []
+          },
+          {
+            "id": "log.logger.fatalf",
+            "target": {
+              "path": "src/log/log.go",
+              "symbol": "log.Logger.Fatalf(format string, v ...any)",
+              "has_receiver": true,
+              "variadic": true,
+              "parameter_count": 2
+            },
+            "completeness": "partial",
+            "normal_continuation_absent": true,
+            "transfers": []
+          },
+          {
+            "id": "log.logger.fatalln",
+            "target": {
+              "path": "src/log/log.go",
+              "symbol": "log.Logger.Fatalln(v ...any)",
+              "has_receiver": true,
+              "variadic": true,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "normal_continuation_absent": true,
+            "transfers": []
+          },
+          {
+            "id": "log.logger.panic",
+            "target": {
+              "path": "src/log/log.go",
+              "symbol": "log.Logger.Panic(v ...any)",
+              "has_receiver": true,
+              "variadic": true,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "normal_continuation_absent": true,
+            "transfers": []
+          },
+          {
+            "id": "log.logger.panicf",
+            "target": {
+              "path": "src/log/log.go",
+              "symbol": "log.Logger.Panicf(format string, v ...any)",
+              "has_receiver": true,
+              "variadic": true,
+              "parameter_count": 2
+            },
+            "completeness": "partial",
+            "normal_continuation_absent": true,
+            "transfers": []
+          },
+          {
+            "id": "log.logger.panicln",
+            "target": {
+              "path": "src/log/log.go",
+              "symbol": "log.Logger.Panicln(v ...any)",
+              "has_receiver": true,
+              "variadic": true,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "normal_continuation_absent": true,
+            "transfers": []
+          }
+        ]
+      }
+    }
+  ]
+}

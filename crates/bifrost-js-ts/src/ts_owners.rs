@@ -152,10 +152,17 @@ pub fn ts_receiver_owner_candidates_at_byte(
         aliases,
         receiver,
         byte,
+        0,
         &TsReceiverResolution::default(),
     )
 }
 
+/// `depth` is the caller's accumulated budget in the mutually recursive owner
+/// cluster, not a fresh count. Restarting it here would let a cycle that passes
+/// through this hop run forever: the cluster's only per-turn progress is the
+/// depth increment, and the `TsReceiverResolution` visited set cannot stand in
+/// for it because a self-recursive function called from distinct byte offsets
+/// produces a distinct key every turn (#2744).
 #[allow(clippy::too_many_arguments)]
 fn ts_receiver_owner_candidates_at_byte_with_resolution(
     host: &dyn JsTsSource,
@@ -167,6 +174,7 @@ fn ts_receiver_owner_candidates_at_byte_with_resolution(
     aliases: &AliasResolver,
     receiver: &str,
     byte: usize,
+    depth: usize,
     resolution: &TsReceiverResolution,
 ) -> Vec<CodeUnit> {
     if receiver == "this"
@@ -186,6 +194,10 @@ fn ts_receiver_owner_candidates_at_byte_with_resolution(
         return Vec::new();
     };
 
+    // Keep an annotated parameter's owner in the same candidate set as every
+    // visible write. If a write names a different owner, the combined set is
+    // ambiguous rather than silently replacing the declared evidence with a
+    // latest-write answer (#2495).
     let mut candidates = ts_receiver_owners_from_parameters(
         host, support, file, source, imports, aliases, scope, receiver,
     );
@@ -195,7 +207,8 @@ fn ts_receiver_owner_candidates_at_byte_with_resolution(
         ));
     }
     candidates.extend(ts_receiver_owners_from_local_bindings(
-        host, support, file, source, root, imports, aliases, scope, receiver, byte, 0, resolution,
+        host, support, file, source, root, imports, aliases, scope, receiver, byte, depth,
+        resolution,
     ));
     sort_units(&mut candidates);
     candidates.dedup();
@@ -223,6 +236,49 @@ pub fn jsts_enclosing_function_scope(root: Node<'_>, byte: usize) -> Option<Node
         }
         current = current.parent()?;
     }
+}
+
+/// Whether a simple receiver binding has a visible assignment before one use.
+///
+/// TypeScript annotations are structural, so an assignment can preserve the
+/// declared type while changing the nominal owner. Annotation-only owner
+/// recovery must yield to the structured write fold whenever such a write is
+/// present (#2495).
+pub fn ts_binding_is_assigned_before(
+    scope: Node<'_>,
+    source: &str,
+    receiver: &str,
+    before_byte: usize,
+) -> bool {
+    let mut stack = vec![scope];
+    while let Some(node) = stack.pop() {
+        if node.start_byte() >= before_byte {
+            continue;
+        }
+        if node.id() != scope.id()
+            && matches!(
+                node.kind(),
+                "function_declaration"
+                    | "function_expression"
+                    | "arrow_function"
+                    | "method_definition"
+                    | "class_declaration"
+                    | "abstract_class_declaration"
+                    | "interface_declaration"
+            )
+        {
+            continue;
+        }
+        if node.kind() == "assignment_expression"
+            && let Some(left) = node.child_by_field_name("left")
+            && node_text_matches(left, source, receiver)
+        {
+            return true;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    false
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -529,7 +585,7 @@ fn ts_receiver_owners_from_local_bindings(
     if depth > 8 {
         return Vec::new();
     }
-    let mut owners = Vec::new();
+    let mut owners = ReceiverOwnerWrites::Unseen;
     ts_collect_receiver_owners_from_bindings(
         host,
         support,
@@ -546,7 +602,38 @@ fn ts_receiver_owners_from_local_bindings(
         &mut owners,
         resolution,
     );
-    owners
+    match owners {
+        ReceiverOwnerWrites::Owners(owners) => owners,
+        ReceiverOwnerWrites::Unseen
+        | ReceiverOwnerWrites::Unknown
+        | ReceiverOwnerWrites::Conflicted => Vec::new(),
+    }
+}
+
+enum ReceiverOwnerWrites {
+    Unseen,
+    Owners(Vec<CodeUnit>),
+    Unknown,
+    Conflicted,
+}
+
+impl ReceiverOwnerWrites {
+    fn record(&mut self, mut owners: Vec<CodeUnit>) {
+        sort_units(&mut owners);
+        owners.dedup();
+        if owners.is_empty() {
+            if !matches!(self, ReceiverOwnerWrites::Conflicted) {
+                *self = ReceiverOwnerWrites::Unknown;
+            }
+            return;
+        }
+        match self {
+            ReceiverOwnerWrites::Unseen => *self = ReceiverOwnerWrites::Owners(owners),
+            ReceiverOwnerWrites::Owners(previous) if *previous == owners => {}
+            ReceiverOwnerWrites::Owners(_) => *self = ReceiverOwnerWrites::Conflicted,
+            ReceiverOwnerWrites::Unknown | ReceiverOwnerWrites::Conflicted => {}
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -563,7 +650,7 @@ fn ts_collect_receiver_owners_from_bindings(
     receiver: &str,
     before_byte: usize,
     depth: usize,
-    out: &mut Vec<CodeUnit>,
+    out: &mut ReceiverOwnerWrites,
     resolution: &TsReceiverResolution,
 ) {
     let mut stack = vec![node];
@@ -591,7 +678,7 @@ fn ts_collect_receiver_owners_from_bindings(
             && node_text_matches(name, source, receiver)
         {
             if let Some(type_node) = node.child_by_field_name("type") {
-                let latest = match ts_resolve_type_node_to_property_owner_outcome(
+                let annotated = match ts_resolve_type_node_to_property_owner_outcome(
                     host,
                     support,
                     file,
@@ -608,10 +695,10 @@ fn ts_collect_receiver_owners_from_bindings(
                     | ReceiverAnalysisOutcome::Unsupported { .. }
                     | ReceiverAnalysisOutcome::ExceededBudget { .. } => Vec::new(),
                 };
-                out.clear();
-                out.extend(latest);
-            } else if let Some(value) = node.child_by_field_name("value") {
-                let latest = ts_expression_property_owners(
+                out.record(annotated);
+            }
+            if let Some(value) = node.child_by_field_name("value") {
+                let initialized = ts_expression_property_owners(
                     host,
                     support,
                     file,
@@ -623,8 +710,7 @@ fn ts_collect_receiver_owners_from_bindings(
                     depth + 1,
                     resolution,
                 );
-                out.clear();
-                out.extend(latest);
+                out.record(initialized);
             }
         }
 
@@ -650,8 +736,7 @@ fn ts_collect_receiver_owners_from_bindings(
                     )
                 })
                 .unwrap_or_default();
-            out.clear();
-            out.extend(latest);
+            out.record(latest);
         }
 
         let mut cursor = node.walk();
@@ -692,7 +777,13 @@ fn ts_expression_property_owners(
                     depth + 1,
                     resolution,
                 );
-                ts_expand_call_return_property_owners(host, support, callees, depth + 1)
+                ts_expand_call_return_property_owners_with_resolution(
+                    host,
+                    support,
+                    callees,
+                    depth + 1,
+                    resolution,
+                )
             })
             .unwrap_or_default(),
         "await_expression" => {
@@ -927,6 +1018,7 @@ fn ts_expression_receiver_owners(
                 aliases,
                 receiver,
                 expression.start_byte(),
+                depth,
                 resolution,
             )
         }
@@ -1306,11 +1398,31 @@ fn ts_expand_property_owners(
     owners
 }
 
+/// Entry point for a caller outside the recursive cluster, which starts a fresh
+/// receiver resolution. A caller already inside the cluster must use
+/// [`ts_expand_call_return_property_owners_with_resolution`] and pass its live
+/// resolution instead (#2744).
 pub fn ts_expand_call_return_property_owners(
     host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     callees: Vec<CodeUnit>,
     depth: usize,
+) -> Vec<CodeUnit> {
+    ts_expand_call_return_property_owners_with_resolution(
+        host,
+        support,
+        callees,
+        depth,
+        &TsReceiverResolution::default(),
+    )
+}
+
+fn ts_expand_call_return_property_owners_with_resolution(
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    callees: Vec<CodeUnit>,
+    depth: usize,
+    resolution: &TsReceiverResolution,
 ) -> Vec<CodeUnit> {
     if depth > 8 {
         return Vec::new();
@@ -1320,11 +1432,12 @@ pub fn ts_expand_call_return_property_owners(
         if jsts_function_returns_direct_object_literal(host, &callee) {
             owners.push(callee.clone());
         }
-        owners.extend(ts_function_return_property_owners(
+        owners.extend(ts_function_return_property_owners_with_resolution(
             host,
             support,
             &callee,
             depth + 1,
+            resolution,
         ));
     }
     sort_units(&mut owners);
@@ -1446,11 +1559,31 @@ fn ts_resolve_type_from_unit_context(
     )
 }
 
+/// Entry point for a caller outside the recursive cluster, which starts a fresh
+/// receiver resolution. A caller already inside the cluster must use
+/// [`ts_function_return_property_owners_with_resolution`] and pass its live
+/// resolution instead (#2744).
 pub fn ts_function_return_property_owners(
     host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     function: &CodeUnit,
     depth: usize,
+) -> Vec<CodeUnit> {
+    ts_function_return_property_owners_with_resolution(
+        host,
+        support,
+        function,
+        depth,
+        &TsReceiverResolution::default(),
+    )
+}
+
+fn ts_function_return_property_owners_with_resolution(
+    host: &dyn JsTsSource,
+    support: &dyn BoundedDefinitionLookup,
+    function: &CodeUnit,
+    depth: usize,
+    resolution: &TsReceiverResolution,
 ) -> Vec<CodeUnit> {
     if depth > 8 {
         return Vec::new();
@@ -1490,6 +1623,7 @@ pub fn ts_function_return_property_owners(
             node,
             node.id(),
             depth + 1,
+            resolution,
             &mut owners,
         );
     }
@@ -1536,12 +1670,16 @@ fn ts_collect_return_property_owners(
     node: Node<'_>,
     root_id: usize,
     depth: usize,
+    // The caller's live resolution. Constructing a fresh one here would clear
+    // both the visited-key set and the `MAX_TS_RECEIVER_RESOLUTION_DEPTH`
+    // counter once per cycle turn, so neither guard could ever accumulate
+    // (#2744).
+    resolution: &TsReceiverResolution,
     out: &mut Vec<CodeUnit>,
 ) {
     if depth > 8 {
         return;
     }
-    let resolution = TsReceiverResolution::default();
     let mut stack = vec![node];
     while let Some(node) = stack.pop() {
         if node.id() != root_id
@@ -1571,7 +1709,7 @@ fn ts_collect_return_property_owners(
                     aliases,
                     expression,
                     depth + 1,
-                    &resolution,
+                    resolution,
                 ));
             }
             continue;
@@ -1675,4 +1813,332 @@ fn ts_assertion_type_child(node: Node<'_>) -> Option<Node<'_>> {
                 | "intersection_type"
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brokk_bifrost_core::analyzer::capabilities::{
+        ImportAnalysisProvider, TypeHierarchyProvider,
+    };
+    use brokk_bifrost_core::analyzer::model::{CodeUnitType, ImportInfo, Range};
+    use brokk_bifrost_core::analyzer::project::{Project, TestProject};
+    use brokk_bifrost_core::analyzer::query_token::QueryToken;
+    use brokk_bifrost_core::hash::HashMap;
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    /// A self-recursive function whose declared return type is a union of a
+    /// generic-wrapped type and a plain one, and which calls itself from four
+    /// distinct byte offsets. Two of those calls initialize a local binding
+    /// whose member call (`.then`) sends the resolver back through
+    /// `ts_receiver_owner_candidates_at_byte_with_resolution` for the same
+    /// receiver, closing the owner cluster's mutual-recursion cycle (#2744).
+    const RECURSIVE_UNION_SOURCE: &str = r#"
+interface Wrapped<T> {
+  then(handler: (value: T) => T): Wrapped<T>
+}
+
+function unroll(items: string[], acc: string, start: number): Wrapped<string> | string {
+  if (start < 0) {
+    return acc
+  }
+
+  const first = unroll(items, acc, 0)
+  if (start === 0) {
+    return first.then(next => unroll(items, next, 1))
+  }
+
+  const second = unroll(items, acc, start)
+  return second.then(next => unroll(items, '', start))
+}
+
+export function caller(items: string[]): Wrapped<string> | string {
+  const rolled = unroll(items, '', 0)
+  return rolled.then(next => next)
+}
+"#;
+
+    struct FakeJsTsSource {
+        project: Arc<TestProject>,
+        aliases: Arc<AliasResolver>,
+        file: ProjectFile,
+        source: String,
+        declarations: Vec<(CodeUnit, Range)>,
+    }
+
+    impl FakeJsTsSource {
+        fn new(root: &std::path::Path, source: &str) -> Self {
+            let file = ProjectFile::new(root, "unroll.ts");
+            std::fs::write(file.abs_path(), source).expect("write fixture");
+            let project = Arc::new(TestProject::new(root, Language::TypeScript));
+            let aliases = Arc::new(AliasResolver::new(project.clone() as Arc<dyn Project>));
+
+            // Index the two top-level functions by their declaration ranges,
+            // exactly what `ts_nodes_for_code_unit` reads back.
+            let tree = parse_js_ts_tree(&file, source, Language::TypeScript).expect("parse");
+            let mut declarations = Vec::new();
+            let root_node = tree.root_node();
+            let mut stack = vec![root_node];
+            while let Some(node) = stack.pop() {
+                if node.kind() == "function_declaration"
+                    && let Some(name) = node.child_by_field_name("name")
+                {
+                    let identifier = &source[name.start_byte()..name.end_byte()];
+                    declarations.push((
+                        CodeUnit::new(
+                            file.clone(),
+                            CodeUnitType::Function,
+                            "",
+                            identifier.to_string(),
+                        ),
+                        Range {
+                            start_byte: node.start_byte(),
+                            end_byte: node.end_byte(),
+                            start_line: node.start_position().row,
+                            end_line: node.end_position().row,
+                        },
+                    ));
+                }
+                let mut cursor = node.walk();
+                let children: Vec<_> = node.named_children(&mut cursor).collect();
+                stack.extend(children);
+            }
+
+            Self {
+                project,
+                aliases,
+                file,
+                source: source.to_string(),
+                declarations,
+            }
+        }
+    }
+
+    impl CodeUnitIndex for FakeJsTsSource {
+        fn project(&self) -> &dyn Project {
+            self.project.as_ref()
+        }
+
+        fn languages(&self) -> BTreeSet<Language> {
+            BTreeSet::from([Language::TypeScript])
+        }
+
+        fn analyzed_files(&self) -> Vec<ProjectFile> {
+            vec![self.file.clone()]
+        }
+
+        fn all_declarations(&self) -> Box<dyn Iterator<Item = CodeUnit> + '_> {
+            Box::new(self.declarations.iter().map(|(unit, _)| unit.clone()))
+        }
+
+        fn ranges(&self, code_unit: &CodeUnit) -> Vec<Range> {
+            self.declarations
+                .iter()
+                .filter(|(unit, _)| unit == code_unit)
+                .map(|(_, range)| *range)
+                .collect()
+        }
+
+        // The cycle under test never reaches these; a fake that answered them
+        // would only add setup the regression does not exercise.
+        fn search_definitions(&self, _pattern: &str, _case_sensitive: bool) -> BTreeSet<CodeUnit> {
+            unimplemented!()
+        }
+
+        fn enclosing_code_unit(&self, _file: &ProjectFile, _range: &Range) -> Option<CodeUnit> {
+            unimplemented!()
+        }
+
+        fn enclosing_code_unit_for_lines(
+            &self,
+            _file: &ProjectFile,
+            _start_line: usize,
+            _end_line: usize,
+        ) -> Option<CodeUnit> {
+            unimplemented!()
+        }
+
+        fn get_skeleton(&self, _code_unit: &CodeUnit) -> Option<String> {
+            unimplemented!()
+        }
+
+        fn get_skeleton_header(&self, _code_unit: &CodeUnit) -> Option<String> {
+            unimplemented!()
+        }
+
+        fn get_source(&self, _code_unit: &CodeUnit, _include_comments: bool) -> Option<String> {
+            unimplemented!()
+        }
+
+        fn get_sources(&self, _code_unit: &CodeUnit, _include_comments: bool) -> BTreeSet<String> {
+            unimplemented!()
+        }
+    }
+
+    impl ImportAnalysisProvider for FakeJsTsSource {
+        fn imported_code_units_of(
+            &self,
+            _file: &ProjectFile,
+        ) -> Arc<brokk_bifrost_core::hash::HashSet<CodeUnit>> {
+            Arc::new(brokk_bifrost_core::hash::HashSet::default())
+        }
+
+        fn referencing_files_of(
+            &self,
+            _file: &ProjectFile,
+        ) -> brokk_bifrost_core::hash::HashSet<ProjectFile> {
+            brokk_bifrost_core::hash::HashSet::default()
+        }
+    }
+
+    impl TypeHierarchyProvider for FakeJsTsSource {
+        fn get_direct_ancestors(&self, _code_unit: &CodeUnit) -> Vec<CodeUnit> {
+            Vec::new()
+        }
+
+        fn get_direct_descendants(
+            &self,
+            _code_unit: &CodeUnit,
+        ) -> brokk_bifrost_core::hash::HashSet<CodeUnit> {
+            brokk_bifrost_core::hash::HashSet::default()
+        }
+    }
+
+    impl JsTsSource for FakeJsTsSource {
+        fn alias_resolver(&self) -> &Arc<AliasResolver> {
+            &self.aliases
+        }
+
+        fn language(&self) -> Language {
+            Language::TypeScript
+        }
+
+        fn all_files(&self) -> Vec<ProjectFile> {
+            vec![self.file.clone()]
+        }
+
+        fn bulk_import_infos(
+            &self,
+            _files: &[ProjectFile],
+        ) -> HashMap<ProjectFile, Vec<ImportInfo>> {
+            HashMap::default()
+        }
+
+        fn raw_supertypes_of(&self, _code_unit: &CodeUnit) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn import_statements(&self, _file: &ProjectFile) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn is_type_alias(&self, _code_unit: &CodeUnit) -> bool {
+            false
+        }
+
+        fn raw_signatures(&self, _code_unit: &CodeUnit) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn with_usage_definitions(
+            &self,
+            _token: QueryToken<'_>,
+            read: &mut dyn FnMut(&dyn BoundedDefinitionLookup),
+        ) {
+            read(self);
+        }
+
+        fn usage_index(
+            &self,
+            _cancellation: Option<&brokk_bifrost_core::cancellation::CancellationToken>,
+        ) -> Option<Arc<crate::graph::resolver::JsTsUsageIndex>> {
+            None
+        }
+    }
+
+    impl BoundedDefinitionLookup for FakeJsTsSource {
+        fn fqn(&self, fqn: &str) -> Vec<CodeUnit> {
+            self.declarations
+                .iter()
+                .filter(|(unit, _)| unit.fq_name() == fqn)
+                .map(|(unit, _)| unit.clone())
+                .collect()
+        }
+
+        fn fqn_in_language(&self, fqn: &str, _language: Language) -> Vec<CodeUnit> {
+            self.fqn(fqn)
+        }
+
+        fn file_identifier(&self, file: &ProjectFile, ident: &str) -> Vec<CodeUnit> {
+            if file != &self.file {
+                return Vec::new();
+            }
+            self.declarations
+                .iter()
+                .filter(|(unit, _)| unit.short_name() == ident)
+                .map(|(unit, _)| unit.clone())
+                .collect()
+        }
+
+        fn package_exists(&self, _package: &str) -> bool {
+            false
+        }
+
+        fn package_exists_in_language(&self, _package: &str, _language: Language) -> bool {
+            false
+        }
+
+        fn fqn_exists(&self, fqn: &str) -> bool {
+            !self.fqn(fqn).is_empty()
+        }
+
+        fn fqn_prefix_exists(&self, _prefix: &str) -> bool {
+            false
+        }
+
+        fn fqn_direct_children(&self, _fqn: &str) -> Vec<CodeUnit> {
+            Vec::new()
+        }
+    }
+
+    /// Before #2744, the receiver-owner cluster reset both of its bounded
+    /// recursion guards once per cycle turn: the accumulated `depth` budget was
+    /// replaced with a literal `0` on the local-bindings hop, and
+    /// `ts_collect_return_property_owners` built a fresh `TsReceiverResolution`,
+    /// clearing both the visited-key set and the
+    /// `MAX_TS_RECEIVER_RESOLUTION_DEPTH` counter. This fixture drove that cycle
+    /// until the process aborted on a stack overflow, which no in-process
+    /// harness could contain. Completing at all is the assertion.
+    #[test]
+    fn self_recursive_union_return_terminates() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let host = FakeJsTsSource::new(root.path(), RECURSIVE_UNION_SOURCE);
+        let tree = parse_js_ts_tree(&host.file, &host.source, Language::TypeScript).expect("parse");
+        let imports = compute_jsts_import_binder(&host.source, &tree);
+
+        // `rolled` is bound to the self-recursive call, so resolving its owner
+        // enters the cluster the same way `resolve_one` does.
+        let byte = host
+            .source
+            .find("return rolled.then")
+            .expect("caller return site")
+            + "return ".len();
+
+        let owners = ts_receiver_owner_candidates_at_byte(
+            &host,
+            &host,
+            &host.file,
+            &host.source,
+            tree.root_node(),
+            &imports,
+            host.aliases.as_ref(),
+            "rolled",
+            byte,
+        );
+
+        // The budgets bound the walk; the answer itself is whatever the bounded
+        // walk reaches, so only termination is pinned here.
+        assert!(owners.len() < 64, "unexpected owner explosion: {owners:?}");
+    }
 }

@@ -5,10 +5,12 @@
 //! dependency, evaluator, finding, or renderer state.
 
 use std::fmt;
+use std::ops::Range;
 use std::str::FromStr;
 
 use brokk_bifrost_analysis::analyzer::identifier::define_identifier;
 use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
+use brokk_bifrost_analysis::analyzer::semantic_model::SemanticModelProvenance;
 use brokk_bifrost_analysis::analyzer::usages::{ReferenceKind, UsageHitKind, UsageHitSurface};
 use brokk_bifrost_analysis::schema_version::SchemaVersionResolution;
 use brokk_bifrost_flow::dataflow::UnmodeledCallBehavior;
@@ -314,6 +316,58 @@ impl RowDerivation {
 pub struct RowFilter {
     pub over: RowBindingName,
     pub predicates: Vec<RowPredicate>,
+    /// Policy-specific evidence interpretation attached by a typed shorthand.
+    /// Generic `(filter ...)` records never set this marker.
+    pub evidence: Option<RowFilterEvidence>,
+    /// A qualified `(call ...)` locator retained until a loaded policy has an
+    /// analyzer and active semantic-model context. Symbol-shaped stable IDs
+    /// do not use this field and remain ordinary relational literals.
+    pub call_locator: Option<CallLocator>,
+    /// Typed identity/provenance produced when `call_locator` is resolved.
+    /// Source ranges and authored spellings are deliberately not retained.
+    pub resolved_locators: Vec<ResolvedPolicyLocator>,
+}
+
+/// One qualified callable/type spelling and its authored source range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyLocator {
+    pub value: String,
+    pub range: Range<usize>,
+}
+
+/// Pending values from a qualified `(call ...)` record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallLocator {
+    pub target: Option<PolicyLocator>,
+    pub receiver_type: Option<PolicyLocator>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedPolicyLocatorRole {
+    Callable,
+    ReceiverType,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedPolicyLocatorKind {
+    WorkspaceDeclaration,
+    ActiveSemanticModel,
+}
+
+/// The typed identity selected for one authored locator. Model provenance is
+/// retained because the active model set is part of a model locator's meaning;
+/// workspace source identities need no activation payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedPolicyLocator {
+    pub role: ResolvedPolicyLocatorRole,
+    pub kind: ResolvedPolicyLocatorKind,
+    pub identity: String,
+    pub provenance: Option<SemanticModelProvenance>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowFilterEvidence {
+    DeclaredCall,
 }
 
 /// Publish a new named relation holding chosen, optionally renamed, columns of
@@ -1559,6 +1613,7 @@ pub enum PolicyEndpointBinding {
     MatchedValue,
     Receiver,
     ReturnValue,
+    ResultIndex { index: u32 },
     ArgumentIndex { index: u32 },
     ArgumentName { name: String },
 }
@@ -1705,6 +1760,7 @@ pub enum PolicyPort {
     MatchedValue,
     Receiver,
     ReturnValue,
+    ResultIndex { index: u32 },
     ArgumentIndex { index: u32 },
     ArgumentName { name: String },
 }
@@ -1827,6 +1883,7 @@ pub enum TypestateSeedBinding {
     MatchedValue,
     Receiver,
     ReturnValue,
+    ResultIndex { index: u32 },
     ArgumentIndex { index: u32 },
     ArgumentName { name: String },
 }
@@ -1887,6 +1944,7 @@ pub enum TypestateEventTrigger {
 pub enum TypestateCallBinding {
     Receiver,
     ReturnValue,
+    ResultIndex { index: u32 },
     ArgumentIndex { index: u32 },
     ArgumentName { name: String },
 }

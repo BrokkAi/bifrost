@@ -254,6 +254,11 @@ where
     }
 
     #[cfg(any(test, feature = "test-support"))]
+    pub fn reset_revivals_for_test(&self) {
+        self.revivals.store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
     pub fn insert_complete_for_test(&self, key: K, value: Arc<V>) {
         self.entries.insert(key, value);
     }
@@ -265,6 +270,14 @@ where
     pub fn evict_for_test(&self, key: &K) {
         self.entries.invalidate(key);
         self.entries.run_pending_tasks();
+    }
+
+    /// Logically evict every ready value without disturbing live weak
+    /// identities. The next lookup for a still-held value must therefore pass
+    /// through `revive`, just as it does after capacity eviction.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn invalidate_all_for_test(&self) {
+        self.entries.invalidate_all();
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -710,6 +723,37 @@ mod tests {
             Arc::ptr_eq(&held, &value),
             "one validity key must denote one live instance"
         );
+        assert_eq!(cache.revivals_for_test(), 1);
+    }
+
+    #[test]
+    fn invalidate_all_forces_a_ready_miss_and_reset_counts_the_next_revival() {
+        let cache = cache(1, 1);
+        let cancellation = CancellationToken::default();
+        let key = "held".to_string();
+
+        let (CompleteValueAcquisition::Leader { permit }, _) = cache.acquire(&key, &cancellation)
+        else {
+            panic!("a new key must lead")
+        };
+        let held = Arc::new(19);
+        permit.publish_complete(Arc::clone(&held));
+
+        cache.evict_for_test(&key);
+        let (CompleteValueAcquisition::Cached { value }, _) = cache.acquire(&key, &cancellation)
+        else {
+            panic!("the first logical eviction must revive the held value")
+        };
+        assert!(Arc::ptr_eq(&held, &value));
+        assert_eq!(cache.revivals_for_test(), 1);
+
+        cache.reset_revivals_for_test();
+        cache.invalidate_all_for_test();
+        let (CompleteValueAcquisition::Cached { value }, _) = cache.acquire(&key, &cancellation)
+        else {
+            panic!("bulk invalidation must force a miss that revives the held value")
+        };
+        assert!(Arc::ptr_eq(&held, &value));
         assert_eq!(cache.revivals_for_test(), 1);
     }
 

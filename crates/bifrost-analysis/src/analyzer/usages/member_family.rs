@@ -119,12 +119,12 @@ impl MemberFamilyAnswer {
     }
 
     /// The complete answer for a member the language excludes from families.
-    fn no_family(capability: MemberFamilyCapability, reason: MemberFamilyReason) -> Self {
+    pub fn no_family(capability: MemberFamilyCapability, reason: MemberFamilyReason) -> Self {
         debug_assert!(reason.is_proven_exclusion());
         Self::not_proven(capability, MemberFamilyOutcome::NoFamily, reason)
     }
 
-    fn incomplete(capability: MemberFamilyCapability, reason: MemberFamilyReason) -> Self {
+    pub fn incomplete(capability: MemberFamilyCapability, reason: MemberFamilyReason) -> Self {
         Self::not_proven(capability, MemberFamilyOutcome::Incomplete, reason)
     }
 

@@ -387,6 +387,7 @@ pub enum PolicyIncompleteReason {
     PipelineRowBudget,
     ImportGraphBudget,
     ReferenceCandidateBudget,
+    NoAnalyzableFiles,
     PartialDiscovery,
     CapabilityIncomplete,
     EndpointDominanceUndecidable,
@@ -411,6 +412,7 @@ impl PolicyIncompleteReason {
             Self::PipelineRowBudget => "pipeline_row_budget",
             Self::ImportGraphBudget => "import_graph_budget",
             Self::ReferenceCandidateBudget => "reference_candidate_budget",
+            Self::NoAnalyzableFiles => "no_analyzable_files",
             Self::PartialDiscovery => "partial_discovery",
             Self::CapabilityIncomplete => "capability_incomplete",
             Self::EndpointDominanceUndecidable => "endpoint_dominance_undecidable",
@@ -1987,6 +1989,33 @@ impl PolicyDiagnostic {
             primary,
             related,
         })
+    }
+
+    /// One location-free diagnostic whose message is bounded, never rejected.
+    ///
+    /// A run-level failure explanation must not be dropped for being too
+    /// long: the refusal it explains is often the only account of a whole
+    /// run's outcome (#2779 shipped a 455-case category refusal with an
+    /// empty diagnostics list exactly this way). Oversized prose is cut at a
+    /// char boundary and marked, and construction cannot fail.
+    pub fn new_bounded(
+        code: PolicyDiagnosticCode,
+        severity: PolicyDiagnosticSeverity,
+        impact: PolicyDiagnosticImpact,
+        message: impl Into<String>,
+    ) -> Self {
+        const TRUNCATION_MARKER: &str = " [truncated]";
+        let mut message = message.into();
+        if message.len() > MAX_REPORT_PROSE_BYTES {
+            let mut boundary = MAX_REPORT_PROSE_BYTES - TRUNCATION_MARKER.len();
+            while boundary > 0 && !message.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            message.truncate(boundary);
+            message.push_str(TRUNCATION_MARKER);
+        }
+        Self::try_new(code, severity, impact, message, None, Vec::new())
+            .expect("a bounded location-free diagnostic must construct")
     }
 
     pub const fn code(&self) -> &PolicyDiagnosticCode {
@@ -4198,6 +4227,27 @@ mod tests {
     use crate::source::{PolicySourceIdentity, parse_rqlp_source};
     use serde_json::json;
 
+    /// #2779: an oversized message must be truncated, never rejected, so a
+    /// run-level failure explanation cannot vanish for being too complete.
+    #[test]
+    fn a_bounded_diagnostic_truncates_oversized_prose_instead_of_failing() {
+        let oversized = PolicyDiagnostic::new_bounded(
+            PolicyDiagnosticCode::EvaluationFailure,
+            PolicyDiagnosticSeverity::Warning,
+            PolicyDiagnosticImpact::RunIncomplete,
+            "m".repeat(MAX_REPORT_PROSE_BYTES * 4),
+        );
+        assert!(oversized.message().len() <= MAX_REPORT_PROSE_BYTES);
+        assert!(oversized.message().ends_with(" [truncated]"));
+        let short = PolicyDiagnostic::new_bounded(
+            PolicyDiagnosticCode::EvaluationFailure,
+            PolicyDiagnosticSeverity::Warning,
+            PolicyDiagnosticImpact::RunIncomplete,
+            "short",
+        );
+        assert_eq!(short.message(), "short");
+    }
+
     /// #2356: the per-policy diagnostic cap must not hide a reason family.
     ///
     /// A corpus-scale run emits one diagnostic per site, so the three abstention
@@ -5379,6 +5429,7 @@ mod tests {
             R::PipelineRowBudget,
             R::ImportGraphBudget,
             R::ReferenceCandidateBudget,
+            R::NoAnalyzableFiles,
             R::PartialDiscovery,
             R::CapabilityIncomplete,
             R::EndpointDominanceUndecidable,

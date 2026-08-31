@@ -75,6 +75,16 @@ fn expression_name_node<'tree>(expression: Node<'tree>) -> Option<Node<'tree>> {
     }
 }
 
+fn transparent_parenthesized_expression<'tree>(mut expression: Node<'tree>) -> Node<'tree> {
+    while expression.kind() == "parenthesized_expression" {
+        let Some(inner) = first_named_child(expression) else {
+            break;
+        };
+        expression = inner;
+    }
+    expression
+}
+
 fn unquoted_go_string_span(node: Node<'_>) -> Option<Span> {
     if !matches!(
         node.kind(),
@@ -264,6 +274,7 @@ impl StructuralSpec for GoStructuralSpec {
                     if function.kind() == "selector_expression"
                         && let Some(operand) = function.child_by_field_name("operand")
                     {
+                        let operand = transparent_parenthesized_expression(operand);
                         attach_role_with_derived_name(
                             sink,
                             Role::Receiver,
@@ -282,6 +293,7 @@ impl StructuralSpec for GoStructuralSpec {
                     sink.role_named(Role::Field, field, field);
                 }
                 if let Some(operand) = node.child_by_field_name("operand") {
+                    let operand = transparent_parenthesized_expression(operand);
                     attach_role_with_derived_name(
                         sink,
                         Role::Object,

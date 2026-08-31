@@ -598,6 +598,20 @@ pub(super) fn record_named_boundary(name: String) {
     }
 }
 
+/// Record a boundary whose structured resolver already identified the exact
+/// external declaration-model target. The target is carried by the trace row
+/// instead of being reconstructed from the written reference later.
+pub(super) fn record_named_boundary_with_target(name: String, target: String) {
+    if !recording() {
+        return;
+    }
+    let mut row = external_route_row(name);
+    row.boundary = BoundaryStatus::ExternalIndexed;
+    row.external_target = Some(target);
+    row.outcome = CandidateOutcome::Selected;
+    record(row);
+}
+
 fn external_route_row(name: String) -> TraceCandidate {
     TraceCandidate::rejected(
         TraceCandidateRef::ExternalRoute { name },
@@ -1364,9 +1378,11 @@ mod boundary_evidence_tests {
             file.write(source).expect("write fixture source");
             let config = config(&root);
             let project = TestProject::new(root, language);
-            let workspace =
-                WorkspaceAnalyzer::build_ephemeral(Arc::new(project) as Arc<dyn Project>, config)
-                    .expect("ephemeral workspace should build");
+            let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
+                Arc::new(project) as Arc<dyn Project>,
+                config,
+            )
+            .expect("ephemeral workspace should build");
             Self {
                 _temp: temp,
                 workspace,

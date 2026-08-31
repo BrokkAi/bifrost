@@ -2749,7 +2749,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ) -> Result<(), PhpLoweringError> {
         let subject = required_field(node, "condition")?;
         let body = required_field(node, "body")?;
-        let arms = named_children(body);
+        let arms = named_children_without_comments(body);
         let merge = self.point(builder, node, Vec::new())?;
         self.edge(builder, merge, next)?;
 
@@ -2768,7 +2768,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             match arm.kind() {
                 "match_conditional_expression" => {
                     let conditions = required_field(arm, "conditional_expressions")?;
-                    for predicate in named_children(conditions) {
+                    for predicate in named_children_without_comments(conditions) {
                         conditional_candidates.push((predicate, result_entry));
                     }
                 }
@@ -3081,6 +3081,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 callee,
                 receiver,
                 arguments: arguments.into_boxed_slice(),
+                normal_results: Box::new([]),
                 result: Some(result),
                 thrown: Some(thrown),
                 declared_targets: resolution.clone(),
@@ -4608,6 +4609,24 @@ fn named_children(node: Node<'_>) -> Vec<Node<'_>> {
     node.named_children(&mut cursor).collect()
 }
 
+/// The named children that are program text rather than commentary.
+///
+/// A `comment` is a tree-sitter extra, so the grammar admits one between any
+/// two children of any node and makes it a *named* child there. Every other
+/// child walk in this file already screens its children by kind -- statements
+/// through [`is_statement_kind`], switch bodies through their two case kinds,
+/// expression operands through [`child_is_runtime`] -- so only a walk over a
+/// list the grammar states exhaustively needs this. A match body is such a
+/// list: reading a comment in one as an arm asked it for a `return_expression`
+/// it cannot have, and the resulting lowering failure cost the whole file its
+/// semantics.
+fn named_children_without_comments(node: Node<'_>) -> Vec<Node<'_>> {
+    named_children(node)
+        .into_iter()
+        .filter(|child| !is_comment_kind(child.kind()))
+        .collect()
+}
+
 fn first_named_child(node: Node<'_>) -> Option<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor).next()
@@ -5495,7 +5514,113 @@ fn is_runtime_leaf(kind: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::analyzer::LanguageDialect;
+    use crate::analyzer::tree_sitter_analyzer::{PreparedSourceOrigin, PreparedSyntaxSource};
+    use crate::text_utils::compute_line_starts;
+
+    /// Lower one inline PHP file and return the procedures the adapter built.
+    ///
+    /// A lowering failure is not a partial result: the provider drops the whole
+    /// file's semantics, so every query over any procedure in it disappears.
+    /// That is what makes the shape of this harness the point -- an `expect`
+    /// here stands for a file that a campaign would find silently unqueryable.
+    fn lower_php(source: &str) -> Vec<ProcedureSemanticsParts> {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
+            .expect("PHP grammar must load");
+        let tree = parser.parse(source, None).expect("PHP source must parse");
+        let prepared = PreparedSyntaxTree::new(
+            PreparedSyntaxSource::Exact(Arc::<str>::from(source)),
+            tree,
+            compute_line_starts(source),
+            LanguageDialect::Standard(Language::Php),
+            PreparedSourceOrigin::Disk,
+            None,
+        );
+        let file = ProjectFile::new(std::env::temp_dir(), "fixture.php");
+        let outcome = PhpSemanticLowerer
+            .lower(
+                &file,
+                &prepared,
+                &SemanticBudget::default(),
+                &CancellationToken::default(),
+            )
+            .expect("PHP lowering must not fail");
+        let SemanticOutcome::Complete { value, .. } = outcome else {
+            panic!("the fixture is small enough to lower completely");
+        };
+        value
+    }
+
+    /// The one procedure's program point and control edge counts, which say
+    /// that the arms were lowered and how many decisions the body kept.
+    fn lowered_shape(source: &str) -> (usize, usize) {
+        let mut procedures = lower_php(source);
+        assert_eq!(
+            procedures.len(),
+            1,
+            "the fixture declares exactly one procedure"
+        );
+        let parts = procedures.remove(0);
+        (parts.points.len(), parts.control_edges.len())
+    }
+
+    /// `comment` is a tree-sitter extra, so the grammar admits one anywhere in
+    /// a `match_block` and makes it a named child there. Asking a comment for
+    /// the `return_expression` every arm has failed the lowering, and because a
+    /// provider failure is per file rather than per procedure, one `//` in one
+    /// match body cost that whole file its semantics. Every position the
+    /// grammar allows a comment in must lower to the same procedure as the
+    /// comment-free spelling.
+    #[test]
+    fn commented_match_bodies_lower_like_their_comment_free_spelling() {
+        let baseline = lowered_shape(
+            "<?php\nfunction pick(string $t): int {\n    return match ($t) {\n        'a', 'b' => 1,\n        default => 0,\n    };\n}\n",
+        );
+
+        for (position, source) in [
+            (
+                "leading line comment",
+                "<?php\nfunction pick(string $t): int {\n    return match ($t) {\n        // leading\n        'a', 'b' => 1,\n        default => 0,\n    };\n}\n",
+            ),
+            (
+                "between-arm block comment",
+                "<?php\nfunction pick(string $t): int {\n    return match ($t) {\n        'a', 'b' => 1,\n        /* between */\n        default => 0,\n    };\n}\n",
+            ),
+            (
+                "trailing line comment",
+                "<?php\nfunction pick(string $t): int {\n    return match ($t) {\n        'a', 'b' => 1,\n        default => 0, // trailing\n    };\n}\n",
+            ),
+            (
+                "comment inside the condition list",
+                "<?php\nfunction pick(string $t): int {\n    return match ($t) {\n        'a', /* mid */ 'b' => 1,\n        default => 0,\n    };\n}\n",
+            ),
+        ] {
+            assert_eq!(
+                lowered_shape(source),
+                baseline,
+                "a {position} must not change what the match body lowers to"
+            );
+        }
+    }
+
+    /// The near miss the defect report contrasted against: a `switch` body
+    /// screens its children by case kind, so a comment there was always
+    /// harmless. It must stay harmless.
+    #[test]
+    fn commented_switch_bodies_lower_like_their_comment_free_spelling() {
+        let baseline = lowered_shape(
+            "<?php\nfunction pick(string $t): int {\n    switch ($t) {\n        case 'a':\n            return 1;\n    }\n    return 0;\n}\n",
+        );
+        let commented = lowered_shape(
+            "<?php\nfunction pick(string $t): int {\n    switch ($t) {\n        // leading\n        case 'a':\n            return 1; // trailing\n    }\n    return 0;\n}\n",
+        );
+        assert_eq!(commented, baseline);
+    }
 
     /// The constant the condition lowering folds `if (<condition>)` to, or
     /// `None` when it keeps the decision and lowers the condition instead.

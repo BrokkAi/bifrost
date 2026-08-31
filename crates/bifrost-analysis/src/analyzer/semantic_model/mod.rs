@@ -17,13 +17,15 @@ mod source;
 mod validate;
 
 pub use artifact::{
-    ArtifactEncoding, ArtifactError, CompiledDeclaredEffect, CompiledDeclaredEffectCertainty,
-    CompiledDeclaredEffectTiming, CompiledPackManifest, CompiledPayload, CompiledProcedureSummary,
-    CompiledProcedureTarget, CompiledSemanticModelPack, CompiledShard, CompiledShardArtifact,
-    CompiledShardDescriptor, CompiledSummaryEffect, CompiledSummaryExitKind, CompiledSummaryInput,
-    CompiledSummaryLocation, CompiledSummaryLocationKind, CompiledSummaryOutput,
-    CompiledSummaryTransfer, DecodeLimits, PayloadKind, decode_manifest, decode_shard,
-    decode_shard_for_manifest,
+    ArtifactEncoding, ArtifactError, CompiledConditionalResultRefinement, CompiledDeclaredEffect,
+    CompiledDeclaredEffectCertainty, CompiledDeclaredEffectTiming, CompiledNormalReturnRefinement,
+    CompiledOperationPrecondition, CompiledPackManifest, CompiledPayload,
+    CompiledPredicateProofEffect, CompiledProcedureSummary, CompiledProcedureTarget,
+    CompiledResultContract, CompiledResultMemberContract, CompiledResultPredicate,
+    CompiledSemanticModelPack, CompiledShard, CompiledShardArtifact, CompiledShardDescriptor,
+    CompiledSummaryEffect, CompiledSummaryExitKind, CompiledSummaryInput, CompiledSummaryLocation,
+    CompiledSummaryLocationKind, CompiledSummaryOutput, CompiledSummaryTransfer, DecodeLimits,
+    PayloadKind, decode_manifest, decode_shard, decode_shard_for_manifest,
 };
 pub use authoring::*;
 pub use catalog::*;

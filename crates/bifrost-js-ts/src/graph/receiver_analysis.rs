@@ -5,7 +5,7 @@
 //! factory calls that return constructed values, and class factory methods whose body
 //! returns a constructed value.
 
-use crate::imports::require_call_module_specifier;
+use crate::imports::{npm_package_of_module_specifier, require_call_module_specifier};
 use crate::imports::{
     resolve_js_ts_direct_import_candidates, resolve_js_ts_module_binding_candidates,
     resolve_js_ts_module_specifier,
@@ -20,6 +20,7 @@ use crate::ts_owners::{
 };
 use crate::tsconfig::AliasResolver;
 use crate::type_text::ts_type_annotation_text;
+use brokk_bifrost_core::analyzer::model::CodeUnitType;
 use brokk_bifrost_core::analyzer::tree_walk::subtree_contains;
 use brokk_bifrost_core::analyzer::tree_walk::{
     BoundedNamedTreeWalk, walk_named_tree_preorder_bounded,
@@ -886,7 +887,45 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
             };
             current = parent;
         }
-        ReceiverAnalysisOutcome::Unknown
+        self.imported_module_receiver_outcome(receiver, budget)
+            .unwrap_or(ReceiverAnalysisOutcome::Unknown)
+    }
+
+    /// A uniquely bound package import is already a complete receiver identity;
+    /// it does not need value-flow summary expansion to prove what module object
+    /// the identifier denotes. Local bindings and assignments are handled by
+    /// the lexical walk above and therefore take precedence over this fallback.
+    fn imported_module_receiver_outcome(
+        &self,
+        receiver: &str,
+        budget: ReceiverAnalysisBudget,
+    ) -> Option<ReceiverAnalysisOutcome<ReceiverValue>> {
+        if self.imports.has_competing_static_imports(receiver)
+            || self.imports.was_truncated(receiver)
+        {
+            return Some(ReceiverAnalysisOutcome::Ambiguous(Vec::new()));
+        }
+        let binding = self.imports.binding(receiver)?;
+        npm_package_of_module_specifier(&binding.module_specifier)?;
+        let identity = match binding.kind {
+            ImportKind::Default | ImportKind::Namespace | ImportKind::CommonJsRequire => {
+                binding.module_specifier.clone()
+            }
+            ImportKind::Named => receiver.to_owned(),
+            ImportKind::Glob => return None,
+        };
+        let module = CodeUnit::with_signature(
+            self.file.clone(),
+            CodeUnitType::Module,
+            "",
+            identity,
+            None,
+            true,
+        );
+        Some(ReceiverAnalysisOutcome::single_precise_or_ambiguous(
+            vec![ReceiverValue::ModuleOrExportObject(module)],
+            budget,
+        ))
     }
 
     fn latest_iterable_element_binding_in_scope(
@@ -949,6 +988,24 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         tracker: &mut ReceiverAnalysisBudgetTracker,
     ) -> Option<ReceiverAnalysisOutcome<ReceiverValue>> {
         let mut latest = None;
+        let record = |latest: &mut Option<ReceiverAnalysisOutcome<ReceiverValue>>,
+                      outcome: ReceiverAnalysisOutcome<ReceiverValue>| {
+            // This source-order fold is not a CFG reachability proof. Once a
+            // visible binding or write has unknown, ambiguous, unsupported, or
+            // over-budget value evidence, a later precise write cannot erase
+            // that uncertainty and manufacture an exact receiver (#2495).
+            if !matches!(
+                latest.as_ref(),
+                Some(
+                    ReceiverAnalysisOutcome::Unknown
+                        | ReceiverAnalysisOutcome::Ambiguous(_)
+                        | ReceiverAnalysisOutcome::Unsupported { .. }
+                        | ReceiverAnalysisOutcome::ExceededBudget { .. }
+                )
+            ) {
+                *latest = Some(outcome);
+            }
+        };
         let mut stack = vec![scope];
         while let Some(node) = stack.pop() {
             if let Err(limit) = tracker.record_scope_node() {
@@ -968,24 +1025,30 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
                     .is_some_and(|name| node_text_matches(name, self.source, receiver))
                 && let Some(type_node) = node.child_by_field_name("type")
             {
-                latest = Some(self.type_annotation_receiver_outcome(type_node, budget));
+                record(
+                    &mut latest,
+                    self.type_annotation_receiver_outcome(type_node, budget),
+                );
             } else if binding_node_shadows_receiver(node, self.source, receiver) {
-                latest = Some(ReceiverAnalysisOutcome::Unknown);
+                record(&mut latest, ReceiverAnalysisOutcome::Unknown);
             } else if node.kind() == "variable_declarator"
                 && let Some(name) = node.child_by_field_name("name")
                 && node_text_matches(name, self.source, receiver)
             {
-                latest =
-                    Some(self.resolve_variable_declarator_binding(node, depth, budget, tracker));
+                record(
+                    &mut latest,
+                    self.resolve_variable_declarator_binding(node, depth, budget, tracker),
+                );
             } else if node.kind() == "assignment_expression"
                 && let Some(left) = node.child_by_field_name("left")
                 && matches!(left.kind(), "identifier" | "type_identifier")
                 && node_text_matches(left, self.source, receiver)
             {
                 if assignment_has_nonlinear_control_ancestor(node, scope) {
-                    latest = Some(ReceiverAnalysisOutcome::Ambiguous(Vec::new()));
+                    record(&mut latest, ReceiverAnalysisOutcome::Ambiguous(Vec::new()));
                 } else {
-                    latest = Some(
+                    record(
+                        &mut latest,
                         node.child_by_field_name("right")
                             .map(|right| self.resolve_expression(right, depth + 1, budget, tracker))
                             .unwrap_or(ReceiverAnalysisOutcome::Unknown),
@@ -1009,6 +1072,16 @@ impl<'tree, 'a> JsTsReceiverFactProvider<'tree, 'a> {
         budget: ReceiverAnalysisBudget,
         tracker: &mut ReceiverAnalysisBudgetTracker,
     ) -> ReceiverAnalysisOutcome<ReceiverValue> {
+        if let (Some(name), Some(value)) = (
+            declarator
+                .child_by_field_name("name")
+                .and_then(|name| simple_identifier_text(name, self.source)),
+            declarator.child_by_field_name("value"),
+        ) && require_call_module_specifier(value, self.source).is_some()
+            && let Some(outcome) = self.imported_module_receiver_outcome(name, budget)
+        {
+            return outcome;
+        }
         if self.language == Language::TypeScript
             && let Some(type_node) = declarator.child_by_field_name("type")
         {

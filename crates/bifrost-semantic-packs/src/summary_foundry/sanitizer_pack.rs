@@ -591,6 +591,7 @@ fn build_summary(
             path: entry.target.path.clone(),
             symbol: entry.target.symbol.clone(),
             has_receiver: entry.target.has_receiver,
+            variadic: false,
             parameter_count,
         },
         completeness: match entry.completeness {
@@ -598,10 +599,16 @@ fn build_summary(
             SanitizerCompleteness::Complete => Completeness::Complete,
         },
         covers_overrides: false,
+        normal_continuation_absent: false,
+        normal_result_count: None,
         locations: Vec::new(),
         transfers: vec![transfer],
         effects: vec![effect],
         declared_effects: Vec::new(),
+        preconditions: None,
+        result_contracts: Vec::new(),
+        conditional_result_refinements: Vec::new(),
+        normal_return_refinements: Vec::new(),
     })
 }
 

@@ -241,7 +241,7 @@ fn compact_csharp_excerpt(text: &str) -> String {
 pub fn csharp_contains_tests(root: Node<'_>, source: &str) -> bool {
     let mut found = false;
     walk_named_tree_preorder(root, true, |node| {
-        found |= node.kind() == "attribute" && csharp_test_attribute(node, source);
+        found |= csharp_method_has_runnable_test_attribute(node, source);
         if found {
             WalkControl::SkipChildren
         } else {
@@ -251,7 +251,38 @@ pub fn csharp_contains_tests(root: Node<'_>, source: &str) -> bool {
     found
 }
 
-fn csharp_test_attribute(node: Node<'_>, source: &str) -> bool {
+/// Whether this method declaration carries a runner-recognized test attribute.
+///
+/// The owner check stays structural: attributes on a class, parameter,
+/// property, or nested local declaration do not make this method runnable.
+pub fn csharp_method_has_runnable_test_attribute(node: Node<'_>, source: &str) -> bool {
+    if node.kind() != "method_declaration" {
+        return false;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter(|child| child.kind() == "attribute_list")
+        .any(|attribute_list| {
+            let mut cursor = attribute_list.walk();
+            attribute_list
+                .named_children(&mut cursor)
+                .any(|attribute| csharp_runnable_test_attribute(attribute, source))
+        })
+}
+
+fn csharp_runnable_test_attribute(node: Node<'_>, source: &str) -> bool {
+    let Some(attribute_list) = node
+        .parent()
+        .filter(|parent| parent.kind() == "attribute_list")
+    else {
+        return false;
+    };
+    if !attribute_list
+        .parent()
+        .is_some_and(|owner| owner.kind() == "method_declaration")
+    {
+        return false;
+    }
     let Some(name) = node
         .child_by_field_name("name")
         .or_else(|| node.named_child(0))
@@ -268,8 +299,18 @@ fn csharp_test_attribute_name(name: &str) -> bool {
     let final_name = name.strip_suffix("Attribute").unwrap_or(name);
     matches!(
         final_name,
-        "Test" | "Fact" | "Theory" | "TestMethod" | "TestCase"
-    )
+        "Fact"
+            | "Theory"
+            | "Test"
+            | "TestCase"
+            | "TestCaseSource"
+            | "TestMethod"
+            | "DataTestMethod"
+    ) || ["Fact", "Theory"].iter().any(|suffix| {
+        final_name
+            .strip_suffix(suffix)
+            .is_some_and(|prefix| !prefix.is_empty())
+    })
 }
 
 fn final_identifier_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
@@ -295,6 +336,67 @@ fn node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     source
         .get(node.start_byte()..node.end_byte())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod test_classification_tests {
+    use super::csharp_contains_tests;
+    use tree_sitter::Parser;
+
+    fn contains_tests(source: &str) -> bool {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
+            .expect("C# grammar");
+        let tree = parser.parse(source, None).expect("C# tree");
+        csharp_contains_tests(tree.root_node(), source)
+    }
+
+    #[test]
+    fn recognizes_standard_runner_method_attributes() {
+        for attribute in [
+            "Fact",
+            "Xunit.TheoryAttribute",
+            "Test",
+            "NUnit.Framework.TestCase",
+            "TestCaseSource",
+            "TestMethod",
+            "Microsoft.VisualStudio.TestTools.UnitTesting.DataTestMethodAttribute",
+        ] {
+            let source = format!("public class Suite {{ [{attribute}] public void Runs() {{ }} }}");
+            assert!(contains_tests(&source), "{attribute}");
+        }
+    }
+
+    #[test]
+    fn recognizes_custom_xunit_fact_and_theory_names() {
+        for attribute in [
+            "ConditionalTheory",
+            "ConditionalTheoryAttribute",
+            "Microsoft.AspNetCore.InternalTesting.ConditionalTheoryAttribute",
+            "RetryFact",
+            "SkippableFactAttribute",
+        ] {
+            let source = format!("public class Suite {{ [{attribute}] public void Runs() {{ }} }}");
+            assert!(contains_tests(&source), "{attribute}");
+        }
+    }
+
+    #[test]
+    fn rejects_non_runnable_attributes_and_non_method_placements() {
+        for source in [
+            "[TestFixture] public class Suite { public void Helper() { } }",
+            "[Fact] public class Suite { public void Helper() { } }",
+            "public class Suite { [TestCategory(\"slow\")] public void Helper() { } }",
+            "public class Suite { [TestInitialize] public void Setup() { } }",
+            "public class Suite { [TheoryData] public void Helper() { } }",
+            "public class Suite { [FactData] public void Helper() { } }",
+            "public class Suite { public void Helper([Fact] int value) { } }",
+            "public class Suite { [Fact] public int Value { get; set; } }",
+        ] {
+            assert!(!contains_tests(source), "{source}");
+        }
+    }
 }
 
 #[test]

@@ -1214,6 +1214,176 @@ fn occurrence_filter_help_and_value_diagnostics_are_range_precise() {
     }
 }
 
+/// Result-contract projection, aggregate validation, and typed operation uses
+/// hover from the same registry that parses and validates both RQL spellings
+/// and JSON operations.
+#[test]
+fn result_contract_use_form_help_and_diagnostics_are_range_precise() {
+    for rql in [
+        "(result-contract-uses (call-result-contracts (call-shape (call :callee \"Open\"))))",
+        "(result-contract-operation-uses (call-result-contracts (call-shape (call :callee \"Open\"))))",
+    ] {
+        for token in [
+            if rql.starts_with("(result-contract-operation-uses") {
+                "result-contract-operation-uses"
+            } else {
+                "result-contract-uses"
+            },
+            "call-result-contracts",
+        ] {
+            let offset = rql.find(token).unwrap();
+            let help = query_source_help_at(rql, offset)
+                .unwrap_or_else(|| panic!("no result-contract help for {token}"));
+            assert_eq!(&rql[help.range], token);
+            assert!(!help.description.is_empty());
+            if token == "result-contract-operation-uses" {
+                assert!(help.description.contains("positional call arguments"));
+                assert!(help.description.contains("parameter_ordinal"));
+            }
+        }
+        assert!(
+            validate_query_source(rql).is_empty(),
+            "{rql}: {:#?}",
+            validate_query_source(rql)
+        );
+    }
+
+    let underscored = "(result_contract_operation_uses (call_result_contracts (call_shape (call :callee \"Open\"))))";
+    assert!(
+        validate_query_source(underscored).is_empty(),
+        "{underscored}: {:#?}",
+        validate_query_source(underscored)
+    );
+
+    for operation in ["result_contract_uses", "result_contract_operation_uses"] {
+        let json = format!(
+            r#"{{"match":{{"kind":"call"}},"steps":[{{"op":"call_shape"}},{{"op":"call_result_contracts"}},{{"op":"{operation}"}}]}}"#
+        );
+        let offset = json.find(operation).unwrap();
+        let help = query_source_help_at(&json, offset).expect("no JSON result-contract-use help");
+        let expected = format!("\"{operation}\"");
+        assert_eq!(&json[help.range], expected.as_str());
+        assert!(
+            validate_query_source(&json).is_empty(),
+            "{json}: {:#?}",
+            validate_query_source(&json)
+        );
+    }
+
+    let wrong_upstream = "(result-contract-operation-uses (call-shape (call)))";
+    let diagnostic = validate_query_source(wrong_upstream)
+        .into_iter()
+        .find(|diagnostic| {
+            diagnostic.code == "invalid-query"
+                && diagnostic.message.contains("requires call_result_contract")
+        })
+        .expect("typed upstream diagnostic");
+    assert_eq!(
+        &wrong_upstream[diagnostic.range.clone()],
+        "result-contract-operation-uses",
+        "{diagnostic:?}"
+    );
+
+    let removed_summary =
+        "(result-contract-use-summary (call-result-contracts (call-shape (call))))";
+    let diagnostic = validate_query_source(removed_summary)
+        .into_iter()
+        .find(|diagnostic| diagnostic.code == "unknown-form")
+        .expect("unknown-form diagnostic");
+    assert_eq!(
+        &removed_summary[diagnostic.range.clone()],
+        "result-contract-use-summary",
+        "{diagnostic:?}"
+    );
+}
+
+#[test]
+fn result_contract_failure_use_help_and_diagnostics_are_range_precise() {
+    let rql = "(result-contract-failure-uses :provenance [distinct-zero-binding unknown] :consumer [returned-call-argument] (call-result-contracts (call-shape (call :callee \"Open\"))))";
+    for token in ["result-contract-failure-uses", ":provenance", ":consumer"] {
+        let offset = rql.find(token).unwrap();
+        let help = query_source_help_at(rql, offset)
+            .unwrap_or_else(|| panic!("no failure-use help for {token}"));
+        assert_eq!(&rql[help.range], token);
+        assert!(!help.description.is_empty());
+    }
+    assert!(
+        validate_query_source(rql).is_empty(),
+        "{rql}: {:#?}",
+        validate_query_source(rql)
+    );
+
+    let json = r#"{"match":{"kind":"call"},"steps":[{"op":"call_shape"},{"op":"call_result_contracts"},{"op":"result_contract_failure_uses","provenance":["distinct_zero_binding"],"consumer":["returned_call_argument"]}]}"#;
+    for token in ["result_contract_failure_uses", "provenance", "consumer"] {
+        let offset = json.find(token).unwrap();
+        let help = query_source_help_at(json, offset)
+            .unwrap_or_else(|| panic!("no JSON failure-use help for {token}"));
+        assert!(!help.description.is_empty());
+    }
+    assert!(
+        validate_query_source(json).is_empty(),
+        "{json}: {:#?}",
+        validate_query_source(json)
+    );
+
+    for (source, token, allowed) in [
+        (
+            "(result-contract-failure-uses :provenance [same-name] (call-result-contracts (call-shape (call))))",
+            "same-name",
+            &["condition_result", "distinct_zero_binding", "unknown"][..],
+        ),
+        (
+            "(result-contract-failure-uses :consumer [log] (call-result-contracts (call-shape (call))))",
+            "log",
+            &["return", "returned_call_argument", "call_argument"][..],
+        ),
+    ] {
+        let diagnostic = validate_query_source(source)
+            .into_iter()
+            .find(|diagnostic| diagnostic.code == "invalid-query-step-option")
+            .unwrap_or_else(|| panic!("no constrained-value diagnostic for {source}"));
+        assert_eq!(&source[diagnostic.range.clone()], token);
+        for label in allowed {
+            assert!(diagnostic.message.contains(label), "{diagnostic:?}");
+        }
+    }
+
+    for (source, token, allowed) in [
+        (
+            r#"{"match":{"kind":"call"},"steps":[{"op":"call_shape"},{"op":"call_result_contracts"},{"op":"result_contract_failure_uses","provenance":["same_name"]}]}"#,
+            r#""same_name""#,
+            &["condition_result", "distinct_zero_binding", "unknown"][..],
+        ),
+        (
+            r#"{"match":{"kind":"call"},"steps":[{"op":"call_shape"},{"op":"call_result_contracts"},{"op":"result_contract_failure_uses","consumer":["log"]}]}"#,
+            r#""log""#,
+            &["return", "returned_call_argument", "call_argument"][..],
+        ),
+    ] {
+        let diagnostic = validate_query_source(source)
+            .into_iter()
+            .find(|diagnostic| diagnostic.code == "unknown-value")
+            .unwrap_or_else(|| panic!("no JSON constrained-value diagnostic for {source}"));
+        assert_eq!(&source[diagnostic.range.clone()], token, "{diagnostic:?}");
+        for label in allowed {
+            assert!(diagnostic.message.contains(label), "{diagnostic:?}");
+        }
+    }
+
+    let wrong_upstream = "(result-contract-failure-uses (call-shape (call)))";
+    let diagnostic = validate_query_source(wrong_upstream)
+        .into_iter()
+        .find(|diagnostic| {
+            diagnostic.code == "invalid-query"
+                && diagnostic.message.contains("requires call_result_contract")
+        })
+        .expect("typed failure-use upstream diagnostic");
+    assert_eq!(
+        &wrong_upstream[diagnostic.range.clone()],
+        "result-contract-failure-uses"
+    );
+}
+
 /// The callable-signature row wrappers hover from the same registry that
 /// parses them, and live validation accepts the wrapper chain and rejects a
 /// misspelling with a range-precise diagnostic (#1478 M2).

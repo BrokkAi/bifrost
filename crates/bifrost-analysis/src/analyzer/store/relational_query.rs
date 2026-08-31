@@ -19,7 +19,7 @@ use crate::analyzer::{CodeUnit, ProjectFile, sort_units};
 use crate::hash::HashMap;
 
 const CANDIDATE_COLUMNS: &str =
-    "units.blob_oid, units.lang, units.unit_key, units.kind, units.short_name,
+    "names.blob_oid, units.lang, units.unit_key, units.kind, units.short_name,
      units.content_qualifier, units.signature, units.synthetic, units.is_type_alias,
      units.top_level_ordinal, units.in_declarations, units.in_definition_lookup,
      units.fq_anchor_kind, units.fq_anchor_pop, units.fq_package_tail_segments,
@@ -33,11 +33,10 @@ fn content_sql(view: &str, predicate: &str) -> String {
         "SELECT {CANDIDATE_COLUMNS}, names.rel_path
          FROM {view} AS names
          JOIN code_units AS units
-           ON units.blob_oid = names.blob_oid
-          AND units.lang = names.lang
+           ON units.blob_id = names.blob_id
           AND units.unit_key = names.unit_key
          WHERE names.lang = ?1 AND names.source_kind <> 'path' AND {predicate}
-         ORDER BY names.rel_path, units.blob_oid, units.unit_key"
+         ORDER BY names.rel_path, names.blob_oid, units.unit_key"
     )
 }
 
@@ -174,8 +173,7 @@ fn batched_content_sql(
           AND names.source_kind <> 'path'
           AND {join_predicate}
          JOIN code_units AS units
-           ON units.blob_oid = names.blob_oid
-          AND units.lang = names.lang
+           ON units.blob_id = names.blob_id
           AND units.unit_key = names.unit_key"
     )
 }
@@ -190,8 +188,7 @@ fn scanned_content_sql(view: &str, request_values: &str, name_values: &str) -> S
          FROM {view} AS names
          CROSS JOIN requests ON requests.lookup_key = json_array({name_values})
          JOIN code_units AS units
-           ON units.blob_oid = names.blob_oid
-          AND units.lang = names.lang
+           ON units.blob_id = names.blob_id
           AND units.unit_key = names.unit_key
          WHERE names.lang = ?2 AND names.source_kind <> 'path'"
     )
@@ -208,8 +205,7 @@ fn batched_definition_order_sql(view: &str) -> String {
          SELECT requests.request_index, {CANDIDATE_COLUMNS}, names.rel_path,
                 (SELECT MIN(ranges.start_byte)
                  FROM unit_ranges AS ranges
-                 WHERE ranges.blob_oid = units.blob_oid
-                   AND ranges.lang = units.lang
+                 WHERE ranges.blob_id = units.blob_id
                    AND ranges.unit_key = units.unit_key) AS first_start_byte
          FROM requests
          CROSS JOIN {view} AS names ON names.lang = ?2
@@ -218,8 +214,7 @@ fn batched_definition_order_sql(view: &str) -> String {
           AND names.exact_parent_tail = requests.parent_tail
           AND names.identifier = requests.identifier
          JOIN code_units AS units
-           ON units.blob_oid = names.blob_oid
-          AND units.lang = names.lang
+           ON units.blob_id = names.blob_id
           AND units.unit_key = names.unit_key"
     )
 }
@@ -358,7 +353,7 @@ fn live_unit_counts(
         "SELECT COALESCE(SUM(meta.stored_unit_count), 0)
          FROM live_workspace_files AS files
          JOIN blob_meta AS meta
-           ON meta.blob_oid = files.blob_oid AND meta.lang = files.lang
+           ON meta.blob_id = files.blob_id
          WHERE files.lang = ?1",
     )?;
     storage_languages
@@ -1082,17 +1077,11 @@ fn package_relation_value<A: LanguageAdapter>(
         crate::analyzer::fq_name::segment_interner(),
     );
     match relation {
-        PackageRelationKind::Exists => {
-            let mut exists = false;
-            let mut statement = tx.prepare_cached(PACKAGE_EXISTS_SQL)?;
-            for lang in storage_languages {
-                exists |= statement
-                    .query_row(params![lang, package], |_| Ok(()))
-                    .optional()?
-                    .is_some();
-            }
-            Ok(PackageRelationValue::Exists(exists))
-        }
+        PackageRelationKind::Exists => Ok(PackageRelationValue::Exists(package_exists(
+            tx,
+            storage_languages,
+            &package,
+        )?)),
         PackageRelationKind::Files => {
             let mut files = Vec::new();
             let mut statement = tx.prepare_cached(
@@ -1142,6 +1131,24 @@ fn package_relation_value<A: LanguageAdapter>(
             Ok(PackageRelationValue::Packages(packages))
         }
     }
+}
+
+fn package_exists(
+    tx: &Transaction<'_>,
+    storage_languages: &[String],
+    package: &str,
+) -> Result<bool> {
+    let mut statement = tx.prepare_cached(PACKAGE_EXISTS_SQL)?;
+    for lang in storage_languages {
+        if statement
+            .query_row(params![lang, package], |_| Ok(()))
+            .optional()?
+            .is_some()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 // `live_workspace_package_files` remains authoritative for liveness. Repeating
@@ -1196,7 +1203,8 @@ fn callable_values<A: LanguageAdapter>(
                 facts.callable_parameter_types, facts.callable_is_native,
                 facts.class_like_is_interface, facts.class_like_is_static
          FROM live_callable_facts AS facts
-         WHERE facts.blob_oid = ?1 AND facts.lang = ?2 AND facts.unit_key = ?3
+         WHERE facts.blob_id = (SELECT id FROM blobs WHERE blob_oid = ?1 AND lang = ?2)
+           AND facts.unit_key = ?3
          ORDER BY facts.ordinal";
     let mut facts = Vec::new();
     for lang in storage_languages {
@@ -1385,6 +1393,28 @@ impl AnalyzerStore {
         }
         tx.commit()?;
         Ok(RelationalStoreOutcome::Complete(values))
+    }
+
+    /// Whether one exact package has a live workspace member in any selected
+    /// storage language. This is the direct, allocation-free package relation
+    /// used by analyzer hot paths that need only the Boolean answer (#2795).
+    pub(crate) fn workspace_package_exists_for_langs(
+        &self,
+        storage_languages: &[String],
+        generations: &HashMap<String, GenerationId>,
+        workspace_snapshots: &WorkspaceSnapshots,
+        package: &str,
+    ) -> Result<bool> {
+        let mut connection = self.read_conn_for_workspace(workspace_snapshots)?;
+        let tx = connection.transaction()?;
+        require_generation_map(
+            &tx,
+            generations,
+            storage_languages.iter().map(String::as_str),
+        )?;
+        let exists = package_exists(&tx, storage_languages, package)?;
+        tx.commit()?;
+        Ok(exists)
     }
 
     /// Primary declaration positions for an exact-name batch.
@@ -2090,8 +2120,7 @@ mod tests {
         assert!(
             order_plan.iter().any(|detail| {
                 detail.contains("SEARCH ranges USING PRIMARY KEY")
-                    && detail.contains("blob_oid=?")
-                    && detail.contains("lang=?")
+                    && detail.contains("blob_id=?")
                     && detail.contains("unit_key=?")
             }),
             "definition ordering must seek ranges by their unit key: {order_plan:#?}"

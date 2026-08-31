@@ -439,10 +439,13 @@ impl PythonArtifactPackProducer {
         } else {
             Completeness::Partial
         };
-        let mut activation = request.activation.clone();
-        for selector in &mut activation {
-            selector.artifact_sha256 = Some(artifact.sha256().to_owned());
-        }
+        // A source-set digest proves the exact model input, not an installed
+        // Python dependency. Keep the caller's activation selector so a
+        // typeshed-derived stdlib pack can activate from CPython toolchain
+        // evidence without pretending the typeshed archive is present in the
+        // analyzed workspace. Single-artifact dependency production retains
+        // its exact artifact selector in `produce_loaded_artifact`.
+        let activation = request.activation.clone();
         ArtifactProduction {
             artifact_sha256: Some(artifact.sha256().to_owned()),
             pack: Some(AuthoredSemanticModelPack {
@@ -1303,6 +1306,7 @@ impl<'a, 'd> PythonApiCollector<'a, 'd> {
             is_static,
             is_abstract: false,
             is_virtual: false,
+            callable_family_complete: false,
             signature,
             receiver: None,
             extension_receiver: None,
@@ -3075,6 +3079,19 @@ mod tests {
             "{:#?}",
             production.diagnostics
         );
+        assert_eq!(
+            production
+                .pack
+                .as_ref()
+                .unwrap()
+                .shards
+                .first()
+                .unwrap()
+                .activation[0]
+                .artifact_sha256,
+            None,
+            "a source-set digest is provenance, not workspace activation evidence"
+        );
         let pack = production.pack.unwrap();
         let derived = pack
             .shards
@@ -3103,5 +3120,104 @@ mod tests {
             TypeRef::Named { ref name, .. } if name == "absent.Missing"
         ));
         compile_pack(&pack, &CompilerOptions::default()).unwrap();
+    }
+
+    #[test]
+    fn stub_overloads_preserve_subprocess_run_formal_names_and_defaults() {
+        let source = r#"from typing import Literal, overload
+
+@overload
+def run(
+    args: object,
+    bufsize: int = -1,
+    executable: object = None,
+    stdin: object = None,
+    stdout: object = None,
+    stderr: object = None,
+    preexec_fn: object = None,
+    close_fds: bool = True,
+    shell: bool = False,
+    cwd: object = None,
+    *,
+    capture_output: bool = False,
+    check: bool = False,
+    text: Literal[False] | None = None,
+) -> bytes: ...
+
+@overload
+def run(
+    args: object,
+    bufsize: int = -1,
+    executable: object = None,
+    stdin: object = None,
+    stdout: object = None,
+    stderr: object = None,
+    preexec_fn: object = None,
+    close_fds: bool = True,
+    shell: bool = False,
+    cwd: object = None,
+    *,
+    capture_output: bool = False,
+    check: bool = False,
+    text: Literal[True],
+) -> str: ...
+"#;
+        let tree = brokk_bifrost_python::declarations::parse_python_tree(source).unwrap();
+        let limits = ArtifactProducerLimits::default();
+        let mut diagnostics = BoundedProducerDiagnostics::new(&limits);
+        let mut collector = PythonApiCollector::new(
+            "subprocess",
+            Path::new("subprocess.pyi"),
+            "subprocess.pyi".to_owned(),
+            source,
+            &limits,
+            &mut diagnostics,
+        );
+        collector.collect(tree.root_node(), None);
+        let runs = collector
+            .members
+            .iter()
+            .filter(|member| {
+                member.owner
+                    == type_declaration_id(TypeIdentity {
+                        ecosystem: "python",
+                        name: "subprocess",
+                    })
+                    && member.name == "run"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(runs.len(), 2, "both overload declarations must survive");
+        for run in runs {
+            let parameters = &run.signature.as_ref().unwrap().parameters;
+            assert_eq!(
+                parameters
+                    .iter()
+                    .map(|parameter| parameter.name.as_deref().unwrap())
+                    .collect::<Vec<_>>(),
+                [
+                    "args",
+                    "bufsize",
+                    "executable",
+                    "stdin",
+                    "stdout",
+                    "stderr",
+                    "preexec_fn",
+                    "close_fds",
+                    "shell",
+                    "cwd",
+                    "capture_output",
+                    "check",
+                    "text",
+                ]
+            );
+            assert!(!parameters[0].optional);
+            assert!(parameters[8].optional, "shell has an exact default");
+            assert!(parameters[10].optional, "capture_output is keyword-only");
+            assert!(!parameters.iter().any(|parameter| parameter.variadic));
+        }
+        drop(collector);
+        let (diagnostics, suppressed) = diagnostics.finish();
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        assert_eq!(suppressed, 0);
     }
 }

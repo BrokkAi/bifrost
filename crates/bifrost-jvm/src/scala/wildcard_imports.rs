@@ -383,6 +383,40 @@ fn owners_for_candidate(
     owners
 }
 
+/// Definition FQNs consulted while resolving one structured Scala import.
+///
+/// File-graph construction knows every import before it resolves any of them,
+/// so the analyzer can prefetch these exact keys in one store read. Package
+/// existence remains an in-memory namespace lookup and is intentionally not
+/// represented here.
+pub fn scala_import_definition_candidates(
+    import: &ImportInfo,
+    fallback_package_prefixes: &[String],
+) -> Vec<String> {
+    let Some(path) = scala_import_path(import) else {
+        return Vec::new();
+    };
+    let package_prefixes = import
+        .path
+        .as_ref()
+        .map(|path| path.lexical_prefixes.as_slice())
+        .filter(|prefixes| !prefixes.is_empty())
+        .unwrap_or(fallback_package_prefixes);
+    let candidates = scala_import_path_candidates(&path, package_prefixes);
+    let mut definitions = if import.is_wildcard {
+        candidates
+            .iter()
+            .flat_map(|candidate| scala_owner_split_spellings(candidate))
+            .map(|candidate| format!("{}$", candidate.trim_end_matches('$')))
+            .collect::<Vec<_>>()
+    } else {
+        candidates
+    };
+    definitions.sort_unstable();
+    definitions.dedup();
+    definitions
+}
+
 /// The fully qualified paths an import path may denote from an active Scala
 /// package context.
 ///

@@ -513,11 +513,27 @@ fn case_name_from_path(path: &str) -> Option<String> {
 // Per-category require-model policies
 // ===========================================================================
 
-/// One sink endpoint: the callee name to match and which argument carries the
-/// dangerous operand.
+/// One sink endpoint: the callee name to match and how to select its operand.
 struct Sink {
     callee: &'static str,
-    argument: u32,
+    selector: SinkSelector,
+}
+
+/// How a sink identifies the call whose operand it observes.
+///
+/// Most Benchmark endpoints are intentionally broad name selectors. The
+/// PrintWriter formatting overloads are different: their payload formals move
+/// when Locale is present, so those endpoints use the exact call-binding
+/// relation and let the compiler map the selected formal back to each written
+/// caller-side actual.
+enum SinkSelector {
+    Name {
+        argument: u32,
+    },
+    ExactCallBinding {
+        model_id: &'static str,
+        formal_name: &'static str,
+    },
 }
 
 /// The attacker-controlled sources, shared by every category. These are the
@@ -543,7 +559,17 @@ const SOURCE_CALLEES: &[&str] = &[
 ];
 
 fn category_sinks(category: InjectionCategory) -> Vec<Sink> {
-    let s = |callee, argument| Sink { callee, argument };
+    let s = |callee, argument| Sink {
+        callee,
+        selector: SinkSelector::Name { argument },
+    };
+    let exact = |callee, model_id, formal_name| Sink {
+        callee,
+        selector: SinkSelector::ExactCallBinding {
+            model_id,
+            formal_name,
+        },
+    };
     match category {
         // The JDBC lane (`prepareStatement` .. `addBatch`) plus the Spring
         // `JdbcTemplate` lane. The Benchmark routes 156 of its `sqli` cases
@@ -588,8 +614,22 @@ fn category_sinks(category: InjectionCategory) -> Vec<Sink> {
             s("println", 0),
             s("print", 0),
             s("write", 0),
-            s("format", 0),
-            s("printf", 0),
+            exact("format", "member.printwriter.format-format", "format"),
+            exact("format", "member.printwriter.format-format", "args"),
+            exact(
+                "format",
+                "member.printwriter.format-locale-format",
+                "format",
+            ),
+            exact("format", "member.printwriter.format-locale-format", "args"),
+            exact("printf", "member.printwriter.printf-format", "format"),
+            exact("printf", "member.printwriter.printf-format", "args"),
+            exact(
+                "printf",
+                "member.printwriter.printf-locale-format",
+                "format",
+            ),
+            exact("printf", "member.printwriter.printf-locale-format", "args"),
             s("append", 0),
         ],
     }
@@ -617,24 +657,53 @@ pub fn build_policy(category: InjectionCategory) -> String {
     let mut sinks = String::new();
     for (index, sink) in category_sinks(category).into_iter().enumerate() {
         let callee = sink.callee;
-        let argument = sink.argument;
-        // The dangerous operand is positional argument `argument`, so the call
-        // must carry at least `argument + 1` positional arguments to be this
-        // sink at all. Constraining the selector by minimum arity is a
-        // structural correctness bound, not TPR tuning: it excludes the
-        // arity-overloaded no-operand calls (a no-argument
-        // `PreparedStatement.execute()` collides with `Statement.execute(String)`
-        // by name) that otherwise abort endpoint binding for the whole compile
-        // (#1935 cause 1). A real sink call always has the operand, so the bound
-        // never drops a true positive.
-        let min_arity = argument + 1;
-        sinks.push_str(&format!(
-            "          (sink :id snk-{index} :display-name {callee:?}\n\
-             \x20           :categories [data.sensitive]\n\
-             \x20           :selector (rql :schema-version 1\n\
-             \x20             (language java (call :callee (name {callee:?}) (arity :min {min_arity}))))\n\
-             \x20           :dangerous-operand (argument :index {argument}) :accepts [attacker-controlled])\n"
-        ));
+        match sink.selector {
+            SinkSelector::Name { argument } => {
+                // The dangerous operand is positional argument `argument`, so
+                // the call must carry at least `argument + 1` positional
+                // arguments to be this sink at all. Constraining the selector
+                // by minimum arity is a structural correctness bound, not TPR
+                // tuning: it excludes arity-overloaded no-operand calls (a
+                // no-argument `PreparedStatement.execute()` collides with
+                // `Statement.execute(String)` by name) that otherwise abort
+                // endpoint binding for the whole compile (#1935 cause 1).
+                // A real sink call always has the operand, so the bound never
+                // drops a true positive.
+                let min_arity = argument + 1;
+                sinks.push_str(&format!(
+                    "          (sink :id snk-{index} :display-name {callee:?}\n\
+                     \x20           :categories [data.sensitive]\n\
+                     \x20           :selector (rql :schema-version 1\n\
+                     \x20             (language java (call :callee (name {callee:?}) (arity :min {min_arity}))))\n\
+                     \x20           :dangerous-operand (argument :index {argument}) :accepts [attacker-controlled])\n"
+                ));
+            }
+            SinkSelector::ExactCallBinding {
+                model_id,
+                formal_name,
+            } => {
+                // Keep the call-binding row as the endpoint's output. The
+                // `call-argument` derivation filters by the exact declared
+                // formal, while taint endpoint lowering remaps that formal to
+                // the caller-side actual index recorded in the row. This is
+                // essential for Locale-first and variadic overloads: Locale is
+                // formal 0, format is formal 1, and every written vararg maps
+                // to formal 2.
+                let display_name = format!("{callee} {formal_name}");
+                sinks.push_str(&format!(
+                    "          (sink :id snk-{index} :display-name {display_name:?}\n\
+                     \x20           :categories [data.sensitive]\n\
+                     \x20           :selector (row-selector :output calls\n\
+                     \x20             (bind :name calls :query\n\
+                     \x20               (rql :schema-version 1\n\
+                     \x20                 (language java\n\
+                     \x20                   (call-bindings (call-shape (call :callee (name {callee:?})))))))\n\
+                     \x20             (call :over calls :resolves-to {model_id} :proof declared)\n\
+                     \x20             (call-argument :over calls :formal-name {formal_name:?}))\n\
+                     \x20           :dangerous-operand (argument :name {formal_name:?}) :accepts [attacker-controlled])\n",
+                ));
+            }
+        }
     }
     let id = policy_id(category);
     let taxonomy_id = format!("BENCHMARK-{}", category.label().to_uppercase());
@@ -1043,7 +1112,7 @@ pub fn run(config: &RunConfig) -> Result<RunResult, String> {
         .map_err(|error| format!("open benchmark project: {error}"))?;
     let project: Arc<dyn Project> = Arc::new(project);
     let analyzer_config = run_analyzer_config(&config.dependency_jars);
-    let workspace = WorkspaceAnalyzer::build_ephemeral(project, analyzer_config)
+    let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(project, analyzer_config)
         .map_err(|error| format!("build benchmark workspace: {error}"))?;
 
     // The same measurement `PolicyCoordinator` takes to scale its budget lanes:
@@ -1813,8 +1882,9 @@ mod tests {
             .expect("write fixture source");
         let project: Arc<dyn Project> =
             Arc::new(FilesystemProject::new(scratch.path()).expect("open fixture project"));
-        let workspace = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
-            .expect("build ephemeral workspace");
+        let workspace =
+            WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
+                .expect("build ephemeral workspace");
         let cancellation = CancellationToken::new();
         let request = SemanticModelActivationRequest {
             bifrost_version: Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),

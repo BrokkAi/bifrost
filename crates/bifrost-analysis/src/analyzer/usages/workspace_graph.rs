@@ -404,6 +404,10 @@ pub(crate) struct WorkspaceUsageRankingNode {
     pub(crate) primary_file: ProjectFile,
     pub(crate) seed_files: Vec<ProjectFile>,
     pub(crate) incomplete: bool,
+    /// Present on the coarse file-dependency graph, whose bulk file-fact read
+    /// already knows whether each file contains tests. Exact symbol graphs do
+    /// not currently consume this classification.
+    pub(crate) contains_tests: Option<bool>,
 }
 
 pub(crate) struct WorkspaceUsageRankingGraph {
@@ -432,6 +436,7 @@ impl WorkspaceUsageRankingGraph {
                     primary_file: node.primary.source().clone(),
                     seed_files: node.declaration_files,
                     incomplete: node.truncated_inbound.is_some() || node.unproven_inbound > 0,
+                    contains_tests: None,
                 }
             })
             .collect();

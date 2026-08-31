@@ -502,6 +502,62 @@ impl<'plan> TaintFlowProblem<'plan> {
         base.compose(&TaintEdgeFunction::kill(&removed))
     }
 
+    /// Apply policy-local sanitizer effects while an input carrier crosses a
+    /// call boundary. Keeping this out of the point transfer is important:
+    /// the call-to-return edge still carries the caller's original value when
+    /// the sanitizer result is unused. Unresolved bindings are deliberately
+    /// retained as incomplete instead of removing any labels.
+    fn sanitizer_input_transfer(
+        &self,
+        point: &crate::analyzer::semantic::ProgramPointHandle,
+        carrier: ValueFlowCarrierId,
+        base: &TaintEdgeFunction,
+    ) -> (TaintEdgeFunction, bool) {
+        let mut function = base.clone();
+        let mut complete = true;
+        for sanitizer in self
+            .plan
+            .sanitizers()
+            .iter()
+            .filter(|sanitizer| sanitizer.point() == point && sanitizer.carrier() == carrier)
+        {
+            if sanitizer.is_proven() {
+                function = function.compose(&TaintEdgeFunction::kill(sanitizer.removed()));
+            }
+            if !sanitizer.is_resolved() {
+                complete = false;
+            }
+        }
+        (function, complete)
+    }
+
+    /// Apply a policy-local sanitizer only to its declared output transfer at
+    /// an unmodeled call boundary. The preserved caller-side flow is emitted
+    /// separately and remains untouched.
+    fn sanitizer_boundary_transfer(
+        &self,
+        point: &crate::analyzer::semantic::ProgramPointHandle,
+        input: ValueFlowCarrierId,
+        output: ValueFlowCarrierId,
+        base: &TaintEdgeFunction,
+    ) -> (TaintEdgeFunction, bool) {
+        let mut function = base.clone();
+        let mut complete = true;
+        for sanitizer in self.plan.sanitizers().iter().filter(|sanitizer| {
+            sanitizer.point() == point
+                && sanitizer.carrier() == input
+                && sanitizer.output() == output
+        }) {
+            if sanitizer.is_proven() {
+                function = function.compose(&TaintEdgeFunction::kill(sanitizer.removed()));
+            }
+            if !sanitizer.is_resolved() {
+                complete = false;
+            }
+        }
+        (function, complete)
+    }
+
     fn initial_active(
         &self,
         point: &crate::analyzer::semantic::ProgramPointHandle,
@@ -875,6 +931,15 @@ impl<'plan> TaintFlowProblem<'plan> {
                 active
                     .into_iter()
                     .flat_map(|flow| {
+                        let (mapped_function, mapped_complete) = self.sanitizer_input_transfer(
+                            step.source(),
+                            flow.carrier,
+                            &flow.function,
+                        );
+                        let mapped_flow = ActiveTaint {
+                            function: mapped_function,
+                            ..flow.clone().through_semantics(mapped_complete)
+                        };
                         let preserved = self
                             .plan
                             .value_flow()
@@ -886,7 +951,7 @@ impl<'plan> TaintFlowProblem<'plan> {
                                 .call_targets(call, callee, flow.carrier)
                                 .map(move |(target, complete)| ActiveTaint {
                                     carrier: target,
-                                    ..flow.clone().through_semantics(complete)
+                                    ..mapped_flow.clone().through_semantics(complete)
                                 }),
                         )
                     })
@@ -946,11 +1011,19 @@ impl<'plan> TaintFlowProblem<'plan> {
                         kind,
                         flow.carrier,
                         |transfer| {
+                            let (function, sanitizer_complete) = self.sanitizer_boundary_transfer(
+                                step.source(),
+                                flow.carrier,
+                                transfer.target,
+                                &flow.function,
+                            );
                             propagated.push(ActiveTaint {
                                 carrier: transfer.target,
-                                uncertain: flow.uncertain || !transfer.proven_complete,
+                                uncertain: flow.uncertain
+                                    || !transfer.proven_complete
+                                    || !sanitizer_complete,
                                 function: self.sanitized_transfer_function(
-                                    &flow.function,
+                                    &function,
                                     &transfer.removed_labels,
                                 ),
                             });
@@ -1014,6 +1087,12 @@ impl<'plan> TaintFlowProblem<'plan> {
         let mapped = active
             .into_iter()
             .flat_map(|flow| {
+                let (mapped_function, mapped_complete) =
+                    self.sanitizer_input_transfer(edge.source(), flow.carrier, &flow.function);
+                let mapped_flow = ActiveTaint {
+                    function: mapped_function,
+                    ..flow.clone().through_semantics(mapped_complete)
+                };
                 let preserved = self
                     .plan
                     .value_flow()
@@ -1025,7 +1104,7 @@ impl<'plan> TaintFlowProblem<'plan> {
                         .call_targets(&transfer.origin, &transfer.callee, flow.carrier)
                         .map(move |(target, complete)| ActiveTaint {
                             carrier: target,
-                            ..flow.clone().through_semantics(complete)
+                            ..mapped_flow.clone().through_semantics(complete)
                         }),
                 )
             })
@@ -1110,11 +1189,19 @@ impl<'plan> TaintFlowProblem<'plan> {
                 edge.kind(),
                 flow.carrier,
                 |transfer| {
+                    let (function, sanitizer_complete) = self.sanitizer_boundary_transfer(
+                        edge.source(),
+                        flow.carrier,
+                        transfer.target,
+                        &flow.function,
+                    );
                     let transferred = ActiveTaint {
                         carrier: transfer.target,
-                        uncertain: flow.uncertain || !transfer.proven_complete,
+                        uncertain: flow.uncertain
+                            || !transfer.proven_complete
+                            || !sanitizer_complete,
                         function: self
-                            .sanitized_transfer_function(&flow.function, &transfer.removed_labels),
+                            .sanitized_transfer_function(&function, &transfer.removed_labels),
                     };
                     emitting =
                         out.emit(IdeTransition::new(transferred.fact(), transferred.function));
@@ -1679,6 +1766,58 @@ impl<'plan> TaintBackwardFlowProblem<'plan> {
             .collect()
     }
 
+    /// Compute the backward preimage of a class after a policy-local
+    /// input-to-output sanitizer transfer. The policy transfer is kept
+    /// separate from the semantic boundary labels so unresolved policy
+    /// bindings can conservatively preserve the demand while marking it
+    /// uncertain.
+    fn inverse_policy_sanitizer_classes(
+        &self,
+        point: &crate::analyzer::semantic::ProgramPointHandle,
+        input: ValueFlowCarrierId,
+        output: ValueFlowCarrierId,
+        class_index: u16,
+    ) -> Vec<(u16, bool)> {
+        let Some(class) = self.class_id(class_index) else {
+            return Vec::new();
+        };
+        let mut classes = vec![(class, false)];
+        for sanitizer in self.plan.sanitizers().iter().filter(|sanitizer| {
+            sanitizer.point() == point
+                && sanitizer.carrier() == input
+                && sanitizer.output() == output
+                && sanitizer.carrier() != sanitizer.output()
+        }) {
+            if sanitizer.is_proven() {
+                let mut predecessors = Vec::new();
+                let function = TaintEdgeFunction::kill(sanitizer.removed());
+                for (class, uncertain) in classes {
+                    predecessors.extend(
+                        function
+                            .preimage_class(class)
+                            .iter_dense()
+                            .map(|predecessor| (predecessor, uncertain)),
+                    );
+                }
+                classes = predecessors;
+            }
+            if !sanitizer.is_resolved() {
+                for (_, uncertain) in &mut classes {
+                    *uncertain = true;
+                }
+            }
+        }
+        classes
+            .into_iter()
+            .map(|(class, uncertain)| {
+                (
+                    u16::try_from(class.index()).expect("taint universe fits in u16"),
+                    uncertain,
+                )
+            })
+            .collect()
+    }
+
     fn inverse_edge_carriers(
         &self,
         edge: DataflowEdge<'_, TaintBackwardFact>,
@@ -1712,11 +1851,20 @@ impl<'plan> TaintBackwardFlowProblem<'plan> {
                         self.plan.value_flow().call_targets(call, callee, source)
                     {
                         if target == output_carrier {
-                            output.push((
-                                source,
-                                class_index,
-                                uncertain || edge_uncertain || !complete,
-                            ));
+                            for (predecessor_class, sanitizer_uncertain) in self
+                                .inverse_policy_sanitizer_classes(
+                                    edge.source(),
+                                    source,
+                                    target,
+                                    class_index,
+                                )
+                            {
+                                output.push((
+                                    source,
+                                    predecessor_class,
+                                    uncertain || edge_uncertain || !complete || sanitizer_uncertain,
+                                ));
+                            }
                         }
                     }
                 }
@@ -1785,14 +1933,26 @@ impl<'plan> TaintBackwardFlowProblem<'plan> {
                         if transfer.target != output_carrier {
                             continue;
                         }
-                        for predecessor_class in
-                            self.inverse_boundary_classes(&transfer.removed_labels, class_index)
-                        {
-                            output.push((
+                        for (policy_class, sanitizer_uncertain) in self
+                            .inverse_policy_sanitizer_classes(
+                                edge.source(),
                                 source,
-                                predecessor_class,
-                                uncertain || edge_uncertain || !transfer.proven_complete,
-                            ));
+                                transfer.target,
+                                class_index,
+                            )
+                        {
+                            for predecessor_class in self
+                                .inverse_boundary_classes(&transfer.removed_labels, policy_class)
+                            {
+                                output.push((
+                                    source,
+                                    predecessor_class,
+                                    uncertain
+                                        || edge_uncertain
+                                        || !transfer.proven_complete
+                                        || sanitizer_uncertain,
+                                ));
+                            }
                         }
                     }
                     if source == output_carrier && application.abstained {
@@ -1861,6 +2021,14 @@ impl BackwardDistributiveDataflowProblem for TaintBackwardFlowProblem<'_> {
 
     fn zero_fact(&self) -> Self::Fact {
         TaintBackwardFact::zero()
+    }
+
+    /// The forward taint client takes the caller-side continuation of a
+    /// resolved call, so the preimage relation must take it too, or a class
+    /// the callee neither receives nor returns has no backward path past the
+    /// call (#2782).
+    fn resolved_call_to_return(&self) -> bool {
+        true
     }
 
     fn normal_predecessor_flow(

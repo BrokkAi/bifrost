@@ -13,6 +13,8 @@ from types import ModuleType
 from typing import Any, get_args, overload
 
 from .models import (
+    BlastRadiusResult,
+    CyclomaticComplexityDiffResult,
     DiffAnalysisResult,
     CodeQualityReport,
     CodeQueryExecutionMode,
@@ -23,6 +25,7 @@ from .models import (
     FindFilesContainingResult,
     GetFileContentsResult,
     MostRelevantFilesResult,
+    MissingTestsResult,
     RefreshResult,
     RenameSymbolResult,
     CodeQueryResponse,
@@ -507,7 +510,6 @@ class SearchToolsClient:
         *,
         include_tests: bool = False,
         paths: list[str] | None = None,
-        max_duration_secs: int | None = None,
     ) -> ScanUsagesResult:
         arguments: dict[str, Any] = {
             "include_tests": include_tests,
@@ -515,8 +517,6 @@ class SearchToolsClient:
         arguments["symbols"] = symbols
         if paths is not None:
             arguments["paths"] = paths
-        if max_duration_secs is not None:
-            arguments["max_duration_secs"] = max_duration_secs
         payload = self._call_tool_payload("scan_usages_by_reference", arguments)
         return ScanUsagesResult.from_dict(
             payload.structured,
@@ -529,7 +529,6 @@ class SearchToolsClient:
         *,
         include_tests: bool = False,
         paths: list[str] | None = None,
-        max_duration_secs: int | None = None,
     ) -> ScanUsagesResult:
         arguments: dict[str, Any] = {
             "targets": targets,
@@ -537,8 +536,6 @@ class SearchToolsClient:
         }
         if paths is not None:
             arguments["paths"] = paths
-        if max_duration_secs is not None:
-            arguments["max_duration_secs"] = max_duration_secs
         payload = self._call_tool_payload("scan_usages_by_location", arguments)
         return ScanUsagesResult.from_dict(
             payload.structured,
@@ -690,9 +687,11 @@ class SearchToolsClient:
     ) -> DiffAnalysisResult:
         """Diff two endpoints and return semantic effects.
 
-        ``target`` omitted means the uncommitted working tree; ``base`` defaults
-        to the first parent of ``target`` (or ``HEAD`` when ``target`` is the
-        working tree). Merge and root commits require an explicit ``base``.
+        With both endpoints omitted, the target is the live working tree and
+        the base is the merge base of ``HEAD`` and the default branch advertised
+        by ``origin/HEAD`` (falling back to ``HEAD`` when unavailable). An
+        explicit commit ``target`` still defaults to its first parent. Merge and
+        root commits require an explicit ``base``.
         """
         arguments: dict[str, Any] = {"include_tests": include_tests}
         if target is not None:
@@ -700,6 +699,71 @@ class SearchToolsClient:
         if base is not None:
             arguments["base"] = base
         return DiffAnalysisResult.from_dict(self._call_tool("analyze_diff", arguments))
+
+    def blast_radius(
+        self,
+        target: str | None = None,
+        *,
+        base: str | None = None,
+        max_scopes: int | None = None,
+    ) -> BlastRadiusResult:
+        """Suggest test scopes from structured file-import dependencies.
+
+        The endpoint defaults match :meth:`analyze_diff`. The result is not a
+        method-call graph or runtime coverage report.
+        """
+        arguments: dict[str, Any] = {}
+        if target is not None:
+            arguments["target"] = target
+        if base is not None:
+            arguments["base"] = base
+        if max_scopes is not None:
+            arguments["max_scopes"] = max_scopes
+        payload = self._call_tool_payload("blast_radius", arguments)
+        return BlastRadiusResult.from_dict(payload.structured, payload.rendered_text)
+
+    def cyclomatic_complexity(
+        self,
+        target: str | None = None,
+        *,
+        base: str | None = None,
+        include_tests: bool = False,
+    ) -> CyclomaticComplexityDiffResult:
+        """Compare complexity for functions introduced or edited by a diff.
+
+        Endpoint defaults match :meth:`analyze_diff`. Deleted functions and
+        pure moves are omitted; edited functions remain present when their
+        complexity delta is zero.
+        """
+        arguments: dict[str, Any] = {"include_tests": include_tests}
+        if target is not None:
+            arguments["target"] = target
+        if base is not None:
+            arguments["base"] = base
+        payload = self._call_tool_payload("cyclomatic_complexity", arguments)
+        return CyclomaticComplexityDiffResult.from_dict(
+            payload.structured, payload.rendered_text
+        )
+
+    def missing_tests(
+        self,
+        target: str | None = None,
+        *,
+        base: str | None = None,
+    ) -> MissingTestsResult:
+        """Find changed functions with no structured call path from tests.
+
+        The file dependency graph bounds exact usage analysis. Incomplete
+        negative evidence is returned separately as indeterminate functions;
+        this is static reachability rather than runtime coverage.
+        """
+        arguments: dict[str, Any] = {}
+        if target is not None:
+            arguments["target"] = target
+        if base is not None:
+            arguments["base"] = base
+        payload = self._call_tool_payload("missing_tests", arguments)
+        return MissingTestsResult.from_dict(payload.structured, payload.rendered_text)
 
     # ------------------------------------------------------------------
     # Structured data tools

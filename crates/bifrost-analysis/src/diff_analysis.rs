@@ -1,7 +1,13 @@
 use crate::analyzer::test_paths;
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
-use crate::analyzer::{AnalyzerConfig, CodeUnit, CodeUnitType, IAnalyzer, Language, ProjectFile};
+use crate::analyzer::{
+    AnalyzerConfig, CodeUnit, CodeUnitType, DependencyPackEcosystem, IAnalyzer, Language,
+    ProjectFile,
+};
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
+use crate::analyzer::{RevisionBlobIdentities, RevisionWorkspaceProjection, SharedAnalyzerCache};
+use crate::gitblob::resolve_default_branch_ref;
+use crate::profiling;
 use crate::searchtools::{
     UsageGraphCallSite, UsageGraphEdge, UsageGraphParams, UsageGraphTruncatedSymbol, usage_graph,
 };
@@ -14,8 +20,10 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Endpoint label reported for the uncommitted working tree.
@@ -24,12 +32,14 @@ pub const WORKTREE_ENDPOINT: &str = "worktree";
 /// Parameters for `analyze_diff`.
 ///
 /// Both endpoints are optional; see [`resolve_endpoints`] for the resolution
-/// table. `{}` means "HEAD vs the working tree".
+/// table. `{}` means "merge base of HEAD and the default branch vs the working
+/// tree".
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct AnalyzeDiffParams {
     /// Revspec of the "before" endpoint. Defaults to the first parent of
-    /// `target` when `target` is a commit, and to `HEAD` when `target` is the
-    /// working tree.
+    /// `target` when `target` is a commit. For the implicit working-tree target,
+    /// it defaults to the merge base of `HEAD` and the default branch advertised
+    /// by `refs/remotes/origin/HEAD`, falling back to `HEAD` when unavailable.
     #[serde(default)]
     pub base: Option<String>,
     /// Revspec of the "after" endpoint. Omitted means the working tree.
@@ -37,6 +47,22 @@ pub struct AnalyzeDiffParams {
     pub target: Option<String>,
     #[serde(default = "default_include_tests")]
     pub include_tests: bool,
+}
+
+/// Endpoint selectors shared by diff-derived tools.
+#[derive(Debug, Clone, Default)]
+pub struct DiffEndpointParams {
+    pub base: Option<String>,
+    pub target: Option<String>,
+}
+
+impl From<&AnalyzeDiffParams> for DiffEndpointParams {
+    fn from(params: &AnalyzeDiffParams) -> Self {
+        Self {
+            base: params.base.clone(),
+            target: params.target.clone(),
+        }
+    }
 }
 
 /// Trusted host configuration for immutable `analyze_diff` endpoints.
@@ -123,6 +149,92 @@ pub struct PatchSymbols {
     pub deleted: Vec<DeletedSymbol>,
     pub moved: Vec<MovedSymbol>,
     pub signature_changes: Vec<SignatureChange>,
+}
+
+/// Symbol endpoint pairing and patch tags before exact call-edge analysis.
+///
+/// This crate-private shape deliberately has no call collections. It is the
+/// shared boundary consumed directly by `blast_radius`; only `analyze_diff`
+/// converts it into [`PatchSymbols`] and enriches the records with exact call
+/// deltas.
+pub(crate) struct PairedSymbolChanges {
+    pub(crate) edited: Vec<PairedEditedSymbol>,
+    pub(crate) introduced: Vec<PairedIntroducedSymbol>,
+    pub(crate) deleted: Vec<PairedDeletedSymbol>,
+    pub(crate) moved: Vec<PairedMovedSymbol>,
+    pub(crate) signature_changes: Vec<SignatureChange>,
+}
+
+pub(crate) struct PairedEditedSymbol {
+    pub(crate) before: CommitSymbol,
+    pub(crate) after: CommitSymbol,
+    touched_old_lines: Vec<usize>,
+    touched_new_lines: Vec<usize>,
+}
+
+pub(crate) struct PairedIntroducedSymbol {
+    pub(crate) after: CommitSymbol,
+    touched_new_lines: Vec<usize>,
+}
+
+pub(crate) struct PairedDeletedSymbol {
+    pub(crate) before: CommitSymbol,
+    touched_old_lines: Vec<usize>,
+}
+
+pub(crate) struct PairedMovedSymbol {
+    pub(crate) before: CommitSymbol,
+    pub(crate) after: CommitSymbol,
+    similarity: Option<f64>,
+}
+
+impl PairedSymbolChanges {
+    fn into_patch_symbols(self) -> PatchSymbols {
+        PatchSymbols {
+            edited: self
+                .edited
+                .into_iter()
+                .map(|pair| EditedSymbolPair {
+                    before: pair.before,
+                    after: pair.after,
+                    touched_old_lines: pair.touched_old_lines,
+                    touched_new_lines: pair.touched_new_lines,
+                    added_calls: Vec::new(),
+                    removed_calls: Vec::new(),
+                })
+                .collect(),
+            introduced: self
+                .introduced
+                .into_iter()
+                .map(|record| IntroducedSymbol {
+                    after: record.after,
+                    touched_new_lines: record.touched_new_lines,
+                    calls: Vec::new(),
+                })
+                .collect(),
+            deleted: self
+                .deleted
+                .into_iter()
+                .map(|record| DeletedSymbol {
+                    before: record.before,
+                    touched_old_lines: record.touched_old_lines,
+                    called: Vec::new(),
+                })
+                .collect(),
+            moved: self
+                .moved
+                .into_iter()
+                .map(|record| MovedSymbol {
+                    before: record.before,
+                    after: record.after,
+                    added_calls: Vec::new(),
+                    removed_calls: Vec::new(),
+                    similarity: record.similarity,
+                })
+                .collect(),
+            signature_changes: self.signature_changes,
+        }
+    }
 }
 
 /// One outgoing call edge a patch symbol gained or lost.
@@ -279,14 +391,14 @@ struct EdgeKey {
 
 /// One end of a diff: a commit, a bare tree, or the live working tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Snapshot {
+pub(crate) enum Snapshot {
     Commit(Oid),
     Tree(Oid),
     Worktree,
 }
 
 impl Snapshot {
-    fn label(&self) -> String {
+    pub(crate) fn label(&self) -> String {
         match self {
             Self::Commit(oid) => oid.to_string(),
             Self::Tree(oid) => format!("tree:{oid}"),
@@ -294,7 +406,7 @@ impl Snapshot {
         }
     }
 
-    fn is_immutable(self) -> bool {
+    pub(crate) fn is_immutable(self) -> bool {
         !matches!(self, Self::Worktree)
     }
 }
@@ -303,14 +415,14 @@ impl Snapshot {
 ///
 /// | params                     | base                | target      |
 /// |----------------------------|---------------------|-------------|
-/// | `{}`                       | `HEAD`              | working tree|
+/// | `{}`                       | merge base of `HEAD` and default branch | working tree|
 /// | `{target: X}`              | first parent of `X` | `X`         |
 /// | `{base: A, target: B}`     | `A`                 | `B`         |
 /// | `{base: A}`                | `A`                 | working tree|
 ///
 fn resolve_endpoints(
     repo: &Repository,
-    params: &AnalyzeDiffParams,
+    params: &DiffEndpointParams,
 ) -> Result<(Snapshot, Snapshot), String> {
     let target = match params.target.as_deref().map(str::trim) {
         Some(revision) if !revision.is_empty() => resolve_snapshot(repo, revision)?,
@@ -364,11 +476,7 @@ fn default_base(
     target_revision: Option<&str>,
 ) -> Result<Snapshot, String> {
     match target {
-        Snapshot::Worktree => resolve_commit(repo, "HEAD")
-            .map(Snapshot::Commit)
-            .map_err(|err| {
-                format!("unable to default `base` to HEAD for a working-tree diff: {err}")
-            }),
+        Snapshot::Worktree => default_worktree_base(repo).map(Snapshot::Commit),
         Snapshot::Commit(oid) => {
             let commit = repo
                 .find_commit(oid)
@@ -403,6 +511,25 @@ fn default_base(
     }
 }
 
+fn default_worktree_base(repo: &Repository) -> Result<Oid, String> {
+    let head = resolve_commit(repo, "HEAD").map_err(|err| {
+        format!("unable to resolve HEAD while defaulting `base` for a working-tree diff: {err}")
+    })?;
+    let default_branch = resolve_default_branch_ref(repo);
+    let default_head = resolve_commit(repo, &default_branch.ref_name).map_err(|err| {
+        format!(
+            "unable to resolve default branch `{}` while defaulting `base` for a working-tree diff: {err}",
+            default_branch.display_name
+        )
+    })?;
+    repo.merge_base(head, default_head).map_err(|err| {
+        format!(
+            "unable to find a merge base between HEAD and default branch `{}`: {err}",
+            default_branch.display_name
+        )
+    })
+}
+
 pub fn analyze_diff(
     analyzer: &dyn IAnalyzer,
     params: AnalyzeDiffParams,
@@ -416,16 +543,180 @@ pub fn analyze_diff_at_root(
     params: AnalyzeDiffParams,
     options: &DiffAnalysisOptions,
 ) -> Result<DiffAnalysisResult, String> {
-    let resolution_repo = open_repository(root, options, false)?;
-    let (base, target) = resolve_endpoints(&resolution_repo.repo, &params)?;
-    let repository = if base.is_immutable() && target.is_immutable() {
-        open_repository(root, options, true)?
-    } else {
-        resolution_repo
-    };
-    let repo = &repository.repo;
+    let prepared = PreparedDiff::at_root(root, DiffEndpointParams::from(&params), options)?;
+    analyze_prepared_diff(&prepared, params.include_tests)
+}
 
-    let (file_changes, changed_lines) = diff_metadata(repo, base, target)?;
+/// A resolved diff and its Git metadata, shared by tools derived from a diff.
+///
+/// The repository owner remains attached because immutable comparisons may use
+/// a private bare repository whose lifetime must cover subsequent exports.
+pub(crate) struct PreparedDiff {
+    repository: DiffRepository,
+    /// The repository's persisted analyzer cache, opened once for this request
+    /// when either endpoint is immutable. `None` means only that both endpoints
+    /// are mutable, so this request builds no revision image and needs no
+    /// shared cache; a cache that exists but cannot be opened fails the request
+    /// instead of downgrading it.
+    shared_cache: Option<SharedAnalyzerCache>,
+    pub(crate) base: Snapshot,
+    pub(crate) target: Snapshot,
+    pub(crate) file_changes: Vec<FileChange>,
+    changed_lines: BTreeMap<String, ChangedLines>,
+}
+
+impl PreparedDiff {
+    pub(crate) fn at_root(
+        root: &Path,
+        params: DiffEndpointParams,
+        options: &DiffAnalysisOptions,
+    ) -> Result<Self, String> {
+        let resolution_repo = open_repository(root, options, false)?;
+        let (base, target) = resolve_endpoints(&resolution_repo.repo, &params)?;
+        let repository = if base.is_immutable() && target.is_immutable() {
+            open_repository(root, options, true)?
+        } else {
+            resolution_repo
+        };
+        let (file_changes, changed_lines) = diff_metadata(&repository.repo, base, target)?;
+        // Resolve the cache from the caller's root, never from an export
+        // directory: `cache_dir_path` walks up to the primary repository, and a
+        // temp export has no repository to walk up to.
+        let shared_cache = if base.is_immutable() || target.is_immutable() {
+            Some(SharedAnalyzerCache::open(root).map_err(|error| error.to_string())?)
+        } else {
+            None
+        };
+        Ok(Self {
+            repository,
+            shared_cache,
+            base,
+            target,
+            file_changes,
+            changed_lines,
+        })
+    }
+
+    /// The persisted cache immutable images of this diff publish into.
+    pub(crate) fn shared_cache(&self) -> Option<&SharedAnalyzerCache> {
+        self.shared_cache.as_ref()
+    }
+
+    /// Build an analyzer over the *whole* target revision.
+    ///
+    /// An analyzed diff's own target endpoint carries only the diff's files
+    /// plus what name resolution needs, which is everything the patch-symbol
+    /// model reads. A question about the rest of the revision -- who calls a
+    /// changed symbol, whether any test references it -- has no answer in that
+    /// image, because the files that would hold the answer were never
+    /// exported. This pays the whole-revision export and parse to get one. An
+    /// immutable target reads the request's shared content-addressed cache, so
+    /// it parses only the blobs no earlier request already published.
+    pub(crate) fn whole_target_analysis(&self) -> Result<EndpointAnalysis, String> {
+        let image = RevisionImage::materialize(
+            &self.repository.repo,
+            self.target,
+            None,
+            &self.repository.alternate_object_dirs,
+            self.shared_cache(),
+        )?;
+        let analyzer = build_revision_analyzer(&image, self.shared_cache())?;
+        Ok(EndpointAnalysis { analyzer, image })
+    }
+
+    /// Materialize the source and dependency-input files that can contribute
+    /// to a file-dependency graph in `languages`.
+    ///
+    /// This is deliberately a separate seam from [`Self::materialize`]. The
+    /// latter's `None` form means a complete immutable revision and is used by
+    /// callers whose answer depends on every file. Blast-radius only needs the
+    /// selected usage ecosystems, so exporting their source files avoids
+    /// inflating unrelated language trees while retaining the manifests and
+    /// build inputs that give those sources their identity.
+    pub(crate) fn materialize_file_dependencies(
+        &self,
+        snapshot: Snapshot,
+        languages: &BTreeSet<Language>,
+    ) -> Result<RevisionImage, String> {
+        RevisionImage::materialize_file_dependencies(
+            &self.repository.repo,
+            snapshot,
+            languages,
+            &self.repository.alternate_object_dirs,
+        )
+    }
+}
+
+pub(crate) struct PreparedSymbolChanges {
+    symbol_changes: PairedSymbolChanges,
+    context: SymbolChangesContext,
+}
+
+impl PreparedSymbolChanges {
+    pub(crate) fn symbol_changes(&self) -> &PairedSymbolChanges {
+        &self.symbol_changes
+    }
+
+    pub(crate) fn endpoint_analyzers(&self) -> (&dyn IAnalyzer, &dyn IAnalyzer) {
+        (
+            self.context.base_analyzer.analyzer(),
+            self.context.target_analyzer.analyzer(),
+        )
+    }
+
+    /// Consume the lightweight result without retaining endpoint analyzers that
+    /// exist only so full diff analysis can continue into exact call edges.
+    pub(crate) fn into_symbol_changes(self) -> PairedSymbolChanges {
+        self.symbol_changes
+    }
+}
+
+struct SymbolChangesContext {
+    base_analyzer: RevisionAnalyzer,
+    target_analyzer: RevisionAnalyzer,
+    // Declared after the analyzers so the export directories outlive every
+    // query that reads their files.
+    _base_image: RevisionImage,
+    _target_image: RevisionImage,
+    after: BTreeMap<SymbolKey, SymbolSnapshot>,
+    changed_paths: Vec<String>,
+}
+
+pub(crate) fn analyze_prepared_symbol_changes(
+    prepared: &PreparedDiff,
+    include_tests: bool,
+) -> Result<PreparedSymbolChanges, String> {
+    let (changed_paths, base_paths, target_paths) = symbol_change_paths(prepared);
+    let repo = &prepared.repository.repo;
+    let base_image = {
+        let _scope = profiling::scope("diff_symbols.materialize_base");
+        RevisionImage::materialize_symbols(
+            repo,
+            prepared.base,
+            &base_paths,
+            &prepared.repository.alternate_object_dirs,
+        )?
+    };
+    let target_image = {
+        let _scope = profiling::scope("diff_symbols.materialize_target");
+        RevisionImage::materialize_symbols(
+            repo,
+            prepared.target,
+            &target_paths,
+            &prepared.repository.alternate_object_dirs,
+        )?
+    };
+    analyze_prepared_symbol_changes_from_images(
+        prepared,
+        include_tests,
+        base_image,
+        target_image,
+        changed_paths,
+    )
+}
+
+fn symbol_change_paths(prepared: &PreparedDiff) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let file_changes = &prepared.file_changes;
     let changed_paths: Vec<String> = file_changes
         .iter()
         .flat_map(|change| [change.old_path.clone(), change.path.clone()])
@@ -447,14 +738,35 @@ pub fn analyze_diff_at_root(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
+    (changed_paths, base_paths, target_paths)
+}
 
-    let base_image = RevisionImage::materialize(repo, base, Some(&base_paths))?;
-    let target_image = RevisionImage::materialize(repo, target, Some(&target_paths))?;
-    let base_analyzer = build_analyzer(base_image.root(), base_image.files())?;
-    let target_analyzer = build_analyzer(target_image.root(), target_image.files())?;
+fn analyze_prepared_symbol_changes_from_images(
+    prepared: &PreparedDiff,
+    include_tests: bool,
+    base_image: RevisionImage,
+    target_image: RevisionImage,
+    changed_paths: Vec<String>,
+) -> Result<PreparedSymbolChanges, String> {
+    let file_changes = &prepared.file_changes;
+    let changed_lines = &prepared.changed_lines;
+    let base_analyzer = {
+        let _scope = profiling::scope("diff_symbols.build_base_analyzer");
+        build_revision_analyzer(&base_image, prepared.shared_cache())?
+    };
+    let target_analyzer = {
+        let _scope = profiling::scope("diff_symbols.build_target_analyzer");
+        build_revision_analyzer(&target_image, prepared.shared_cache())?
+    };
 
-    let before = symbol_snapshot_map(base_analyzer.analyzer(), params.include_tests);
-    let after = symbol_snapshot_map(target_analyzer.analyzer(), params.include_tests);
+    let before = {
+        let _scope = profiling::scope("diff_symbols.snapshot_base");
+        symbol_snapshot_map(base_analyzer.analyzer(), include_tests)
+    };
+    let after = {
+        let _scope = profiling::scope("diff_symbols.snapshot_target");
+        symbol_snapshot_map(target_analyzer.analyzer(), include_tests)
+    };
 
     let mut introduced = Vec::new();
     let mut edited = Vec::new();
@@ -472,7 +784,10 @@ pub fn analyze_diff_at_root(
     // hunk is not reported edited even when the patch changed its meaning from
     // above (an enclosing scope or an import shifting parse context), and an
     // unpaired symbol with no overlap is likewise dropped rather than reported.
-    let endpoint_pairing = pair_endpoints(&before, &after, &file_changes);
+    let endpoint_pairing = {
+        let _scope = profiling::scope("diff_symbols.pair_endpoints");
+        pair_endpoints(&before, &after, file_changes)
+    };
     for (pre, post) in &endpoint_pairing.pairs {
         // A paired symbol is only *moved* when it genuinely relocated -- its
         // name changed (body-identity pairing matched it under a new fqn), its
@@ -485,14 +800,12 @@ pub fn analyze_diff_at_root(
         let relocated = pre.symbol.fqn != post.symbol.fqn
             || pre.symbol.path != post.symbol.path
             || (pre.symbol.start_line != post.symbol.start_line
-                && !is_pure_line_shift(&pre.symbol, &post.symbol, &changed_lines));
+                && !is_pure_line_shift(&pre.symbol, &post.symbol, changed_lines));
         let fallback_score = endpoint_pairing.fallback_paired.get(&pre.key).copied();
         if relocated {
-            moved.push(MovedSymbol {
+            moved.push(PairedMovedSymbol {
                 before: pre.symbol.clone(),
                 after: post.symbol.clone(),
-                added_calls: Vec::new(),
-                removed_calls: Vec::new(),
                 similarity: fallback_score.map(|score| (score * 100.0).round() / 100.0),
             });
         }
@@ -510,37 +823,33 @@ pub fn analyze_diff_at_root(
                 after: post.symbol.clone(),
             });
         }
-        let touched_old_lines = old_overlap(&pre.symbol, &changed_lines);
-        let touched_new_lines = new_overlap(&post.symbol, &changed_lines);
+        let touched_old_lines = old_overlap(&pre.symbol, changed_lines);
+        let touched_new_lines = new_overlap(&post.symbol, changed_lines);
         if relocated_by_body || (touched_old_lines.is_empty() && touched_new_lines.is_empty()) {
             continue;
         }
-        edited.push(EditedSymbolPair {
+        edited.push(PairedEditedSymbol {
             before: pre.symbol.clone(),
             after: post.symbol.clone(),
             touched_old_lines,
             touched_new_lines,
-            added_calls: Vec::new(),
-            removed_calls: Vec::new(),
         });
     }
     for post in &endpoint_pairing.postimage_only {
-        let touched_new_lines = new_overlap(&post.symbol, &changed_lines);
+        let touched_new_lines = new_overlap(&post.symbol, changed_lines);
         if !touched_new_lines.is_empty() {
-            introduced.push(IntroducedSymbol {
+            introduced.push(PairedIntroducedSymbol {
                 after: post.symbol.clone(),
                 touched_new_lines,
-                calls: Vec::new(),
             });
         }
     }
     for pre in &endpoint_pairing.preimage_only {
-        let touched_old_lines = old_overlap(&pre.symbol, &changed_lines);
+        let touched_old_lines = old_overlap(&pre.symbol, changed_lines);
         if !touched_old_lines.is_empty() {
-            deleted.push(DeletedSymbol {
+            deleted.push(PairedDeletedSymbol {
                 before: pre.symbol.clone(),
                 touched_old_lines,
-                called: Vec::new(),
             });
         }
     }
@@ -551,6 +860,120 @@ pub fn analyze_diff_at_root(
     moved.sort_by(|a, b| a.after.cmp(&b.after));
     signature_changes.sort_by(|a, b| a.after.cmp(&b.after));
 
+    Ok(PreparedSymbolChanges {
+        symbol_changes: PairedSymbolChanges {
+            edited,
+            introduced,
+            deleted,
+            moved,
+            signature_changes,
+        },
+        context: SymbolChangesContext {
+            base_analyzer,
+            target_analyzer,
+            _base_image: base_image,
+            _target_image: target_image,
+            after,
+            changed_paths,
+        },
+    })
+}
+
+/// One diff endpoint's on-disk image and the analyzer built over it.
+///
+/// Declaration order is drop order: the analyzer releases the export before the
+/// temporary directory holding it is removed.
+pub(crate) struct EndpointAnalysis {
+    analyzer: RevisionAnalyzer,
+    image: RevisionImage,
+}
+
+impl EndpointAnalysis {
+    pub(crate) fn analyzer(&self) -> &dyn IAnalyzer {
+        self.analyzer.analyzer()
+    }
+
+    /// Directory the endpoint's files live in: a private export for a committed
+    /// endpoint, the project root itself for the working tree.
+    pub(crate) fn root(&self) -> &Path {
+        self.image.root()
+    }
+}
+
+/// [`analyze_prepared_diff`]'s result together with the endpoint analyses that
+/// produced it, so a derived analysis can ask further questions of the very
+/// same two revision images instead of exporting and re-parsing them.
+pub(crate) struct AnalyzedDiff {
+    pub(crate) result: DiffAnalysisResult,
+    pub(crate) base: EndpointAnalysis,
+    pub(crate) target: EndpointAnalysis,
+}
+
+pub(crate) fn analyze_prepared_diff(
+    prepared: &PreparedDiff,
+    include_tests: bool,
+) -> Result<DiffAnalysisResult, String> {
+    analyze_prepared_diff_with_endpoints(prepared, include_tests).map(|analyzed| analyzed.result)
+}
+
+pub(crate) fn analyze_prepared_diff_with_endpoints(
+    prepared: &PreparedDiff,
+    include_tests: bool,
+) -> Result<AnalyzedDiff, String> {
+    let (changed_paths, base_paths, target_paths) = symbol_change_paths(prepared);
+    let repo = &prepared.repository.repo;
+    let base_image = {
+        let _scope = profiling::scope("diff_exact.materialize_base");
+        RevisionImage::materialize(
+            repo,
+            prepared.base,
+            Some(&base_paths),
+            &prepared.repository.alternate_object_dirs,
+            prepared.shared_cache(),
+        )?
+    };
+    let target_image = {
+        let _scope = profiling::scope("diff_exact.materialize_target");
+        RevisionImage::materialize(
+            repo,
+            prepared.target,
+            Some(&target_paths),
+            &prepared.repository.alternate_object_dirs,
+            prepared.shared_cache(),
+        )?
+    };
+    let PreparedSymbolChanges {
+        symbol_changes,
+        context,
+    } = analyze_prepared_symbol_changes_from_images(
+        prepared,
+        include_tests,
+        base_image,
+        target_image,
+        changed_paths,
+    )?;
+    let PatchSymbols {
+        mut edited,
+        mut introduced,
+        mut deleted,
+        mut moved,
+        signature_changes,
+    } = symbol_changes.into_patch_symbols();
+    // Each image is rejoined to the analyzer built over it, and
+    // `EndpointAnalysis` declares the analyzer first so the analyzer drops
+    // before the export directory it reads files out of.
+    let SymbolChangesContext {
+        _base_image: base_image,
+        _target_image: target_image,
+        base_analyzer,
+        target_analyzer,
+        after,
+        changed_paths,
+    } = context;
+    let base = prepared.base;
+    let target = prepared.target;
+    let file_changes = &prepared.file_changes;
+
     let import_changes = import_changes(
         base_analyzer.analyzer(),
         target_analyzer.analyzer(),
@@ -559,7 +982,7 @@ pub fn analyze_diff_at_root(
     let graph_before = usage_graph(
         base_analyzer.analyzer(),
         UsageGraphParams {
-            include_tests: params.include_tests,
+            include_tests,
             paths: Some(changed_paths.clone()),
             depth: 1,
         },
@@ -567,7 +990,7 @@ pub fn analyze_diff_at_root(
     let graph_after = usage_graph(
         target_analyzer.analyzer(),
         UsageGraphParams {
-            include_tests: params.include_tests,
+            include_tests,
             paths: Some(changed_paths),
             depth: 1,
         },
@@ -640,22 +1063,36 @@ pub fn analyze_diff_at_root(
         graph_after.truncated_symbols,
     );
 
-    Ok(DiffAnalysisResult {
-        endpoints: DiffEndpoints {
-            base: base.label(),
-            target: target.label(),
+    Ok(AnalyzedDiff {
+        result: DiffAnalysisResult {
+            endpoints: DiffEndpoints {
+                base: base.label(),
+                target: target.label(),
+            },
+            file_changes: file_changes.clone(),
+            patch_symbols,
+            dependency_symbols,
+            import_changes,
+            unattributed_call_edge_changes,
+            large_callsite_symbols,
         },
-        file_changes,
-        patch_symbols,
-        dependency_symbols,
-        import_changes,
-        unattributed_call_edge_changes,
-        large_callsite_symbols,
+        base: EndpointAnalysis {
+            analyzer: base_analyzer,
+            image: base_image,
+        },
+        target: EndpointAnalysis {
+            analyzer: target_analyzer,
+            image: target_image,
+        },
     })
 }
 
 struct DiffRepository {
     repo: Repository,
+    /// Object directories explicitly trusted by the host for this request.
+    /// libgit2 attaches them in memory; Git subprocesses receive the identical
+    /// closed set through `GIT_ALTERNATE_OBJECT_DIRECTORIES`.
+    alternate_object_dirs: Vec<PathBuf>,
     // Must outlive `repo`: it owns the private bare repository backing an
     // immutable comparison.
     _temp: Option<RevisionTempDir>,
@@ -678,23 +1115,35 @@ fn open_repository(
             )
         })?;
         add_odb_alternate(&repo, &source_objects, "repository object directory")?;
-        return attach_snapshot_alternate(repo, options).map(|repo| DiffRepository {
+        let mut alternate_object_dirs = vec![source_objects];
+        let repo = attach_snapshot_alternate(repo, options, &mut alternate_object_dirs)?;
+        return Ok(DiffRepository {
             repo,
+            alternate_object_dirs,
             _temp: Some(temp),
         });
     } else {
         Repository::open(root)
     }
     .map_err(|err| format!("not a git repository at project root: {err}"))?;
-    attach_snapshot_alternate(repo, options).map(|repo| DiffRepository { repo, _temp: None })
+    let mut alternate_object_dirs = Vec::new();
+    attach_snapshot_alternate(repo, options, &mut alternate_object_dirs).map(|repo| {
+        DiffRepository {
+            repo,
+            alternate_object_dirs,
+            _temp: None,
+        }
+    })
 }
 
 fn attach_snapshot_alternate(
     repo: Repository,
     options: &DiffAnalysisOptions,
+    alternate_object_dirs: &mut Vec<PathBuf>,
 ) -> Result<Repository, String> {
     if let Some(path) = options.snapshot_object_dir.as_deref() {
         add_odb_alternate(&repo, path, "configured diff snapshot object directory")?;
+        alternate_object_dirs.push(path.to_path_buf());
     }
     Ok(repo)
 }
@@ -858,17 +1307,32 @@ fn snapshot_tree(repo: &Repository, snapshot: Snapshot) -> Result<git2::Tree<'_>
 
 /// An analyzable image of one diff endpoint.
 ///
-/// Immutable endpoints — a commit or a bare tree — are exported into a private
-/// temp directory from their resolved tree; the working-tree endpoint is
-/// analyzed in place from the real project root. Both sides carry the diff's
-/// own changed paths plus what `export_snapshot_files`/`worktree_files` add
-/// for name resolution and newly-referenced packages -- not the revision's
-/// entire file set, which stays correct only at whole-tree scale (see
-/// `export_revision`'s much larger cost budget).
-enum RevisionImage {
+/// An immutable endpoint -- a commit or a bare tree -- is materialized under a
+/// private temp directory from its resolved tree; the working-tree endpoint is
+/// analyzed in place from the real project root.
+///
+/// What a snapshot names depends on which materializer built it. The two
+/// path-restricted ones (`materialize`, `materialize_symbols`) name the diff's
+/// own changed paths plus what `export_snapshot_files` adds for name resolution
+/// and newly-referenced packages, and write every byte of them.
+/// `materialize_file_dependencies` names the whole selected ecosystem, because
+/// a file graph that omits a file reads its absence as absence, but writes only
+/// the analyzers' configuration inputs: every other named path is created empty
+/// so module resolution's filesystem probes still find it, and its bytes are
+/// served on demand from `objects`. Either way the image names every file it
+/// claims to analyze, with the blob id that identifies it.
+pub(crate) enum RevisionImage {
     Snapshot {
         temp: RevisionTempDir,
         files: Vec<PathBuf>,
+        /// The blob ids the image's tree walk already resolved for `files`.
+        /// A tree entry carries its blob id, so this inventory costs nothing to
+        /// collect and saves the analyzer a read-and-hash of every exported
+        /// byte: the export directory holds no Git repository, so nothing there
+        /// can tell the analyzer what these files are.
+        blobs: Arc<RevisionBlobIdentities>,
+        /// Serves the bytes of any named file the export did not write.
+        objects: Arc<RevisionObjectDatabase>,
     },
     Worktree {
         root: PathBuf,
@@ -877,25 +1341,63 @@ enum RevisionImage {
 }
 
 impl RevisionImage {
+    /// Assemble a snapshot image from one materialization's `(path, blob id)`
+    /// inventory.
+    ///
+    /// The inventory names every analyzer-visible file of the revision whether
+    /// or not its bytes were written to `temp`; the object database serves the
+    /// rest.
+    fn snapshot(
+        temp: RevisionTempDir,
+        written: Vec<(PathBuf, Oid)>,
+        named_only: Vec<(PathBuf, Oid)>,
+        repo: &Repository,
+        alternate_object_dirs: &[PathBuf],
+    ) -> Result<Self, String> {
+        let files = written
+            .iter()
+            .chain(named_only.iter())
+            .map(|(path, _)| path.clone())
+            .collect();
+        let objects = RevisionObjectDatabase::new(repo, alternate_object_dirs);
+        if let Some((_, oid)) = named_only.first().or_else(|| written.first()) {
+            objects.probe(*oid)?;
+        }
+        Ok(Self::Snapshot {
+            temp,
+            files,
+            blobs: Arc::new(RevisionBlobIdentities::new(written, named_only)),
+            objects: Arc::new(objects),
+        })
+    }
+
     /// `paths: None` exports every file in the snapshot, for `export_revision`'s
     /// whole-tree policy gating. `paths: Some(_)` restricts the export to
     /// those paths plus what's described above.
+    ///
+    /// `cache` reaches only the path-restricted branch, whose import expansion
+    /// analyzes the changed files to find the packages they now reference. The
+    /// complete-tree branch has no expansion step to route: it already holds
+    /// every file of the revision.
     fn materialize(
         repo: &Repository,
         snapshot: Snapshot,
         paths: Option<&[String]>,
+        alternate_object_dirs: &[PathBuf],
+        cache: Option<&SharedAnalyzerCache>,
     ) -> Result<Self, String> {
         match snapshot {
             Snapshot::Commit(oid) | Snapshot::Tree(oid) => {
                 let temp = RevisionTempDir::new(&oid.to_string())?;
-                let files = match paths {
-                    Some(paths) => export_snapshot_files(repo, snapshot, temp.path(), paths)?,
+                let exported = match paths {
+                    Some(paths) => {
+                        export_snapshot_files(repo, snapshot, temp.path(), paths, cache)?
+                    }
                     None => {
-                        let all = all_tree_paths(repo, snapshot)?;
-                        export_tree_paths(repo, &snapshot_tree(repo, snapshot)?, temp.path(), &all)?
+                        export_complete_tree(repo, &snapshot_tree(repo, snapshot)?, temp.path())?
                     }
                 };
-                Ok(Self::Snapshot { temp, files })
+                Self::snapshot(temp, exported, Vec::new(), repo, alternate_object_dirs)
             }
             Snapshot::Worktree => {
                 let root = repo
@@ -926,16 +1428,129 @@ impl RevisionImage {
         }
     }
 
-    fn root(&self) -> &Path {
+    /// Materialize only what callable discovery needs: the changed files plus
+    /// ambient ancestor manifests that establish package/crate identity.
+    ///
+    /// Exact diff analysis uses [`Self::materialize`] because call resolution
+    /// also needs imported target packages. Callable pairing never resolves
+    /// calls, so recursively exporting those packages is wasted work and can
+    /// be slower than exporting a complete large revision.
+    fn materialize_symbols(
+        repo: &Repository,
+        snapshot: Snapshot,
+        paths: &[String],
+        alternate_object_dirs: &[PathBuf],
+    ) -> Result<Self, String> {
+        match snapshot {
+            Snapshot::Commit(oid) | Snapshot::Tree(oid) => {
+                let temp = RevisionTempDir::new(&oid.to_string())?;
+                let exported = export_snapshot_symbol_files(repo, snapshot, temp.path(), paths)?;
+                Self::snapshot(temp, exported, Vec::new(), repo, alternate_object_dirs)
+            }
+            Snapshot::Worktree => {
+                let root = repo
+                    .workdir()
+                    .ok_or_else(|| {
+                        "repository has no working tree; pass an explicit `target` commit"
+                            .to_string()
+                    })?
+                    .to_path_buf();
+                let files = worktree_symbol_files(&root, paths)?;
+                Ok(Self::Worktree { root, files })
+            }
+        }
+    }
+
+    /// Materialize the bounded immutable image consumed by blast-radius's
+    /// coarse file-dependency graph. Every analyzer-visible source file in a
+    /// selected usage ecosystem is retained, along with the package/build
+    /// inputs that existing workspace analyzers read for that ecosystem.
+    ///
+    /// `materialize` remains the complete-tree operation for `paths: None`;
+    /// keeping this operation separate prevents a caller from accidentally
+    /// changing that long-standing whole-revision contract.
+    fn materialize_file_dependencies(
+        repo: &Repository,
+        snapshot: Snapshot,
+        languages: &BTreeSet<Language>,
+        alternate_object_dirs: &[PathBuf],
+    ) -> Result<Self, String> {
+        match snapshot {
+            Snapshot::Commit(oid) | Snapshot::Tree(oid) => {
+                let temp = RevisionTempDir::new(&oid.to_string())?;
+                let tree = snapshot_tree(repo, snapshot)?;
+                let exported = export_file_dependency_tree(
+                    repo,
+                    &tree,
+                    temp.path(),
+                    languages,
+                    alternate_object_dirs,
+                )?;
+                Self::snapshot(
+                    temp,
+                    exported.configuration_inputs,
+                    exported.sources,
+                    repo,
+                    alternate_object_dirs,
+                )
+            }
+            Snapshot::Worktree => {
+                let root = repo
+                    .workdir()
+                    .ok_or_else(|| {
+                        "repository has no working tree; pass an explicit `target` commit"
+                            .to_string()
+                    })?
+                    .to_path_buf();
+                let project = FilesystemProject::new(&root).map_err(|err| {
+                    format!("unable to list working tree {}: {err}", root.display())
+                })?;
+                let files = project
+                    .all_files()
+                    .map_err(|err| {
+                        format!("unable to list working tree {}: {err}", root.display())
+                    })?
+                    .into_iter()
+                    .map(|file| file.rel_path().to_path_buf())
+                    .filter(|path| file_dependency_tree_path(path, languages))
+                    .collect();
+                Ok(Self::Worktree { root, files })
+            }
+        }
+    }
+
+    pub(crate) fn root(&self) -> &Path {
         match self {
             Self::Snapshot { temp, .. } => temp.path(),
             Self::Worktree { root, .. } => root,
         }
     }
 
-    fn files(&self) -> &[PathBuf] {
+    pub(crate) fn files(&self) -> &[PathBuf] {
         match self {
             Self::Snapshot { files, .. } | Self::Worktree { files, .. } => files,
+        }
+    }
+
+    /// The project an analyzer of this image reads through, paired with the
+    /// revision's own blob ids when it has them.
+    ///
+    /// A worktree image has neither: its root is the live project root, which
+    /// is a real Git repository, so the analyzer's ordinary identity source
+    /// both answers for it and sees the uncommitted edits this image must
+    /// respect, and its bytes are the files on disk.
+    fn project(&self) -> (Arc<dyn Project>, Option<Arc<RevisionBlobIdentities>>) {
+        let files = FileSetProject::new(self.root().to_path_buf(), self.files().iter().cloned());
+        match self {
+            Self::Snapshot { blobs, objects, .. } => (
+                Arc::new(RevisionImageProject {
+                    files,
+                    objects: Arc::clone(objects),
+                    blobs: Arc::clone(blobs),
+                }),
+                Some(Arc::clone(blobs)),
+            ),
+            Self::Worktree { .. } => (Arc::new(files), None),
         }
     }
 }
@@ -965,6 +1580,71 @@ impl RevisionExport {
     /// Full hex id of the commit the requested revision resolved to.
     pub fn commit_id(&self) -> &str {
         &self.commit_id
+    }
+
+    /// The exported image, for a caller that analyzes it through
+    /// [`build_revision_analyzer`] rather than reading its files directly.
+    pub(crate) fn image(&self) -> &RevisionImage {
+        &self.image
+    }
+
+    /// Build an analyzer over this whole exported revision, reading and writing
+    /// the primary repository's shared content-addressed cache.
+    ///
+    /// `repository_root` is the *live* workspace root this export came from,
+    /// never [`Self::root`]. The cache location resolves through the standard
+    /// funnel, which walks up to the primary repository, and a temp export
+    /// directory has no repository to walk up to. Because the revision's
+    /// content is immutable, every fact this build publishes is keyed by blob
+    /// id and is reusable by the worktree build, by a linked worktree, and by
+    /// every later revision request -- and this build in turn parses only the
+    /// blobs no earlier request already published.
+    ///
+    /// The returned value borrows nothing, but the files it analyzes live under
+    /// this export, so the caller must keep the export alive for the whole
+    /// lifetime of the returned workspace: dropping the export deletes the tree
+    /// out from under it.
+    pub fn build_workspace(&self, repository_root: &Path) -> Result<RevisionWorkspace, String> {
+        let cache =
+            SharedAnalyzerCache::open(repository_root).map_err(|error| error.to_string())?;
+        // Claimed before the build, so a build that fails partway still leaves
+        // no rows naming this export's directory behind.
+        let projection = cache.claim_revision_workspace(self.image.root());
+        let (project, blobs) = self.image.project();
+        let blobs = blobs.expect(
+            "an export always materializes a snapshot image, which carries the revision's blob ids",
+        );
+        let workspace = WorkspaceAnalyzer::build_revision_image(
+            project,
+            AnalyzerConfig::default(),
+            None,
+            Some(&cache),
+            blobs,
+        )
+        .map_err(|error| format!("Failed to build the revision export analyzer: {error}"))?;
+        Ok(RevisionWorkspace {
+            workspace,
+            _projection: projection,
+        })
+    }
+}
+
+/// An analyzer over one whole exported revision, together with the workspace
+/// projection rows that export published into the shared analyzer cache.
+///
+/// The projection is declared after the analyzer so it drops after it: every
+/// query the request makes still sees the export's files mounted, and the rows
+/// naming a temp-directory root are gone before the request returns.
+pub struct RevisionWorkspace {
+    workspace: WorkspaceAnalyzer,
+    _projection: RevisionWorkspaceProjection,
+}
+
+impl RevisionWorkspace {
+    /// The built analyzer. Concrete rather than `&dyn IAnalyzer` because pack
+    /// activation and policy evaluation both read the workspace itself.
+    pub fn workspace(&self) -> &WorkspaceAnalyzer {
+        &self.workspace
     }
 }
 
@@ -1040,7 +1720,10 @@ pub fn export_revision(workspace_root: &Path, revision: &str) -> Result<Revision
             })?
     };
     let subtree = Snapshot::Tree(tree.id());
-    let image = RevisionImage::materialize(&repo, subtree, None)?;
+    // The complete-tree branch runs no import expansion, so there is nothing
+    // here for a shared cache to serve. `correspond_revisions` opens the cache
+    // itself and hands it to the analyzer it builds over this image.
+    let image = RevisionImage::materialize(&repo, subtree, None, &[], None)?;
     Ok(RevisionExport {
         image,
         commit_id: commit_id.to_string(),
@@ -1068,14 +1751,16 @@ fn fs_dir_file_paths(root: &Path, dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Collect the changed paths that actually exist as regular files on disk,
-/// plus everything [`ambient_ancestor_paths_fs`] and
-/// [`import_expansion_targets`] add for the same reasons `export_snapshot_files`
-/// does for a committed endpoint.
+/// plus everything [`symbol_identity_ancestor_paths_fs`] and
+/// [`worktree_import_expansion_targets`] add for the same reasons
+/// `export_snapshot_files` does for a committed endpoint.
 ///
 /// A path deleted in the working tree still appears in the diff but has no
 /// file to analyze, so it is skipped the same way a missing tree entry is.
 fn worktree_files(root: &Path, paths: &[String]) -> Result<Vec<PathBuf>, String> {
-    let mut present = BTreeSet::new();
+    let mut present = worktree_symbol_files(root, paths)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
     let mut changed = Vec::with_capacity(paths.len());
     for raw_path in paths {
         let rel = safe_tree_entry_path(raw_path)?;
@@ -1084,12 +1769,10 @@ fn worktree_files(root: &Path, paths: &[String]) -> Result<Vec<PathBuf>, String>
             .map(|metadata| metadata.is_file())
             .unwrap_or(false);
         if is_regular_file {
-            present.insert(rel.clone());
             changed.push(rel);
         }
     }
-    present.extend(ambient_ancestor_paths_fs(root, paths));
-    for target in import_expansion_targets(root, None, &changed)? {
+    for target in worktree_import_expansion_targets(root, &changed)? {
         match target {
             ImportExpansionTarget::Directory(dir) => {
                 present.extend(fs_dir_file_paths(root, &root.join(&dir)));
@@ -1107,10 +1790,25 @@ fn worktree_files(root: &Path, paths: &[String]) -> Result<Vec<PathBuf>, String>
     Ok(present.into_iter().collect())
 }
 
-/// Every regular file sitting directly inside an ancestor directory of a
-/// changed path, up to `root`, deduplicated across `paths`. Filesystem analog
-/// of [`ambient_ancestor_paths`], for the working-tree endpoint.
-fn ambient_ancestor_paths_fs(root: &Path, paths: &[String]) -> Vec<PathBuf> {
+fn worktree_symbol_files(root: &Path, paths: &[String]) -> Result<Vec<PathBuf>, String> {
+    let mut present = BTreeSet::new();
+    for raw_path in paths {
+        let rel = safe_tree_entry_path(raw_path)?;
+        let is_regular_file = fs::symlink_metadata(root.join(&rel))
+            .map(|metadata| metadata.is_file())
+            .unwrap_or(false);
+        if is_regular_file {
+            present.insert(rel);
+        }
+    }
+    present.extend(symbol_identity_ancestor_paths_fs(root, paths));
+    Ok(present.into_iter().collect())
+}
+
+/// Analyzer configuration and package-identity files sitting directly inside
+/// an ancestor directory of a changed path, up to `root`, deduplicated across
+/// `paths`. Filesystem analog of [`symbol_identity_ancestor_paths`].
+fn symbol_identity_ancestor_paths_fs(root: &Path, paths: &[String]) -> Vec<PathBuf> {
     let mut visited_dirs = BTreeSet::new();
     let mut ambient = Vec::new();
     for raw_path in paths {
@@ -1119,8 +1817,8 @@ fn ambient_ancestor_paths_fs(root: &Path, paths: &[String]) -> Vec<PathBuf> {
         };
         let mut dir = rel.parent();
         while let Some(current) = dir {
-            // See `ambient_ancestor_paths`: once a directory is revisited,
-            // the rest of this path's ancestors were already swept too.
+            // See `symbol_identity_ancestor_paths`: once a directory is
+            // revisited, the rest of this path's ancestors were already swept.
             if !visited_dirs.insert(current.to_path_buf()) {
                 break;
             }
@@ -1130,9 +1828,10 @@ fn ambient_ancestor_paths_fs(root: &Path, paths: &[String]) -> Vec<PathBuf> {
                 .flatten()
             {
                 let path = entry.path();
-                if fs::symlink_metadata(&path)
-                    .map(|metadata| metadata.file_type().is_file())
-                    .unwrap_or(false)
+                if symbol_identity_file(&path)
+                    && fs::symlink_metadata(&path)
+                        .map(|metadata| metadata.file_type().is_file())
+                        .unwrap_or(false)
                     && let Ok(rel_file) = path.strip_prefix(root)
                 {
                     ambient.push(rel_file.to_path_buf());
@@ -1154,23 +1853,139 @@ fn ambient_ancestor_paths_fs(root: &Path, paths: &[String]) -> Vec<PathBuf> {
 /// repository to answer cheaply, a different and harder problem than this
 /// one.
 ///
-/// `tree` distinguishes how a candidate's existence gets checked: against a
-/// snapshot's git tree for a committed endpoint (`Some`), or directly on disk
-/// for the working tree (`None`, where `root` already IS the project root).
-enum ImportExpansionTarget {
+/// The two endpoint kinds ask the question differently, and each has its own
+/// entry point: [`snapshot_import_expansion_targets`] checks a candidate's
+/// existence against the revision's Git tree and reads the shared cache, while
+/// [`worktree_import_expansion_targets`] checks it on disk under the live
+/// project root and cannot.
+pub(crate) enum ImportExpansionTarget {
     Directory(PathBuf),
     File(PathBuf),
 }
 
-fn import_expansion_targets(
+/// What `rel` imports, resolved to workspace-relative paths against the image
+/// on disk at `root`.
+///
+/// The two `*_import_expansion_targets` entry points answer the same question
+/// for a whole path set at once and throw away which file asked, because their
+/// consumer only needs the union to export. A caller building adjacency between
+/// two files needs the attribution, so it asks per file here instead of
+/// re-deriving import syntax.
+pub(crate) fn resolved_imports_of(
+    analyzer: &dyn IAnalyzer,
     root: &Path,
-    tree: Option<&git2::Tree>,
+    rel: &Path,
+) -> Vec<ImportExpansionTarget> {
+    let Some(provider) = analyzer.import_analysis_provider() else {
+        return Vec::new();
+    };
+    let Some(file) = analyzer.project().file_by_rel_path(rel) else {
+        return Vec::new();
+    };
+    let scope = AnalyzerQueryScope::new(analyzer);
+    let token = scope.token();
+    let importing_dir = rel.parent().unwrap_or_else(|| Path::new(""));
+    let mut targets = Vec::new();
+    for info in provider.import_info_of(token, &file) {
+        for import_target in import_targets(&info) {
+            if let Some((path, is_directory)) =
+                resolve_import_target(importing_dir, &import_target, |candidate| {
+                    worktree_entry_kind(root, candidate)
+                })
+            {
+                targets.push(if is_directory {
+                    ImportExpansionTarget::Directory(path)
+                } else {
+                    ImportExpansionTarget::File(path)
+                });
+            }
+        }
+    }
+    targets
+}
+
+/// Import expansion for a committed endpoint, whose `root` is the private
+/// export directory the surrounding materialization is filling in and whose
+/// `changed_paths` are genuine blobs of `tree`.
+///
+/// This build shares the repository's content-addressed cache. The blobs it
+/// parses are the diff's own changed files, which the endpoint analyzer of the
+/// same request parses again moments later and every later request against this
+/// revision reads instead of parsing. `cache` of `None` means the host has no
+/// usable persisted cache; the same build then runs against an ephemeral store
+/// and returns the same targets.
+///
+/// A candidate's existence is checked against `tree` rather than the export
+/// directory, because the export holds only the files selected so far -- the
+/// whole point of the expansion is to name the ones it does not yet hold.
+fn snapshot_import_expansion_targets(
+    root: &Path,
+    tree: &git2::Tree,
+    changed_paths: &[PathBuf],
+    cache: Option<&SharedAnalyzerCache>,
+) -> Result<Vec<ImportExpansionTarget>, String> {
+    // The tree entry that put each changed path on disk carries its blob id, so
+    // the facts this build publishes are keyed by the revision's own content
+    // identity without re-hashing a byte. A changed path with no tree entry was
+    // added on the other endpoint and has nothing on disk here either; both the
+    // inventory and the project listing simply pass over it.
+    let blobs = changed_paths
+        .iter()
+        .filter_map(|rel| {
+            let entry = tree.get_path(rel).ok()?;
+            (entry.kind() == Some(ObjectType::Blob) && is_regular_file_mode(entry.filemode()))
+                .then(|| (rel.clone(), entry.id()))
+        })
+        .collect::<Vec<_>>();
+    let analyzer = RevisionAnalyzer::over_partial_export(
+        root,
+        changed_paths,
+        Arc::new(RevisionBlobIdentities::new(blobs, Vec::new())),
+        cache,
+    )
+    .map_err(|error| format!("Failed to build import-expansion analyzer: {error}"))?;
+    Ok(collect_import_expansion_targets(
+        analyzer.analyzer(),
+        changed_paths,
+        |candidate| {
+            tree.get_path(candidate)
+                .ok()
+                .map(|entry| entry.kind() == Some(ObjectType::Tree))
+        },
+    ))
+}
+
+/// Import expansion for the working-tree endpoint, where `root` already IS the
+/// live project root and a candidate's existence is checked on disk.
+///
+/// This build stays ephemeral, for the reason [`build_analyzer`] states: a
+/// partial view of a live root must not become that workspace's cached picture
+/// of itself. It is the same discrimination [`RevisionAnalyzer::build`] makes
+/// when it withholds the shared cache from a worktree image.
+fn worktree_import_expansion_targets(
+    root: &Path,
     changed_paths: &[PathBuf],
 ) -> Result<Vec<ImportExpansionTarget>, String> {
     let analyzer = build_analyzer(root, changed_paths)?;
-    let analyzer = analyzer.analyzer();
+    Ok(collect_import_expansion_targets(
+        analyzer.analyzer(),
+        changed_paths,
+        |candidate| worktree_entry_kind(root, candidate),
+    ))
+}
+
+/// Resolve every import of `changed_paths` through `analyzer`, keeping the
+/// candidates `entry_kind` says the endpoint actually holds.
+///
+/// `entry_kind` reports `Some(true)` for a directory, `Some(false)` for a file,
+/// and `None` for a path the endpoint does not hold.
+fn collect_import_expansion_targets(
+    analyzer: &dyn IAnalyzer,
+    changed_paths: &[PathBuf],
+    entry_kind: impl Fn(&Path) -> Option<bool>,
+) -> Vec<ImportExpansionTarget> {
     let Some(provider) = analyzer.import_analysis_provider() else {
-        return Ok(Vec::new());
+        return Vec::new();
     };
     let scope = AnalyzerQueryScope::new(analyzer);
     let token = scope.token();
@@ -1183,15 +1998,9 @@ fn import_expansion_targets(
         let importing_dir = rel.parent().unwrap_or_else(|| Path::new(""));
         for info in provider.import_info_of(token, &file) {
             for import_target in import_targets(&info) {
-                let resolved =
-                    resolve_import_target(importing_dir, &import_target, |candidate| match tree {
-                        Some(tree) => tree
-                            .get_path(candidate)
-                            .ok()
-                            .map(|entry| entry.kind() == Some(ObjectType::Tree)),
-                        None => worktree_entry_kind(root, candidate),
-                    });
-                if let Some((path, is_directory)) = resolved {
+                if let Some((path, is_directory)) =
+                    resolve_import_target(importing_dir, &import_target, &entry_kind)
+                {
                     targets.push(if is_directory {
                         ImportExpansionTarget::Directory(path)
                     } else {
@@ -1201,7 +2010,7 @@ fn import_expansion_targets(
             }
         }
     }
-    Ok(targets)
+    targets
 }
 
 /// Return the kind of a worktree entry only when every path component below
@@ -1396,7 +2205,198 @@ fn resolve_candidate(
     })
 }
 
-struct RevisionTempDir {
+/// Reads an immutable revision image's file bytes out of the repository's Git
+/// object database.
+///
+/// The ecosystem-scoped export writes only the analyzers' configuration inputs
+/// to disk (see `export_file_dependency_tree`), because a revision's source
+/// blobs are already stored, deduplicated, in the repository the request names.
+/// Inflating all of them per request is the cost this exists to remove: on a
+/// warm shared cache almost none of them is ever read, since the parsed facts
+/// they would produce are already published.
+///
+/// `git2::Repository` is `Send` but not `Sync`, so handles are pooled rather
+/// than shared behind one lock: a reader borrows a handle, reads, and returns
+/// it. The pool grows to the number of concurrent readers -- one per parse
+/// worker at the peak -- and the lock is held only for the borrow and the
+/// return, never for the object read.
+pub(crate) struct RevisionObjectDatabase {
+    git_dir: PathBuf,
+    alternate_object_dirs: Vec<PathBuf>,
+    idle: Mutex<Vec<Repository>>,
+}
+
+impl RevisionObjectDatabase {
+    /// `alternate_object_dirs` must be the same trusted set the request's own
+    /// repository handle carries (`DiffRepository::alternate_object_dirs`).
+    ///
+    /// An immutable comparison runs against a private bare repository whose
+    /// only objects are the real repository's, attached as an in-memory
+    /// alternate (`open_repository`). Reopening that bare repository without
+    /// the alternate produces a handle that finds no object at all, and the
+    /// symptom is not an error but silence: every read fails, every file goes
+    /// unparsed, and the answer is simply smaller. `probe` turns that into a
+    /// failure at construction.
+    fn new(repo: &Repository, alternate_object_dirs: &[PathBuf]) -> Self {
+        Self {
+            git_dir: repo.path().to_path_buf(),
+            alternate_object_dirs: alternate_object_dirs.to_vec(),
+            idle: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Read one of the image's own blobs, so a handle that cannot see the
+    /// revision's objects is reported here rather than as missing analysis.
+    fn probe(&self, oid: Oid) -> Result<(), String> {
+        self.read_blob(oid).map(|_| ())
+    }
+
+    fn read_blob(&self, oid: Oid) -> Result<Vec<u8>, String> {
+        let repo = match self
+            .idle
+            .lock()
+            .expect("revision object database mutex poisoned")
+            .pop()
+        {
+            Some(repo) => repo,
+            None => self.open()?,
+        };
+        let read = (|| {
+            let odb = repo
+                .odb()
+                .map_err(|error| format!("unable to open revision object database: {error}"))?;
+            odb.read(oid)
+                .map(|object| object.data().to_vec())
+                .map_err(|error| format!("unable to read revision blob {oid}: {error}"))
+        })();
+        self.idle
+            .lock()
+            .expect("revision object database mutex poisoned")
+            .push(repo);
+        read
+    }
+
+    fn open(&self) -> Result<Repository, String> {
+        let repo = Repository::open(&self.git_dir).map_err(|error| {
+            format!(
+                "unable to reopen repository {}: {error}",
+                self.git_dir.display()
+            )
+        })?;
+        if !self.alternate_object_dirs.is_empty() {
+            let odb = repo
+                .odb()
+                .map_err(|error| format!("unable to open revision object database: {error}"))?;
+            for directory in &self.alternate_object_dirs {
+                let path = directory.to_str().ok_or_else(|| {
+                    format!(
+                        "trusted Git object directory {} is not valid UTF-8",
+                        directory.display()
+                    )
+                })?;
+                odb.add_disk_alternate(path).map_err(|error| {
+                    format!("unable to trust Git object directory {path}: {error}")
+                })?;
+            }
+        }
+        Ok(repo)
+    }
+}
+
+/// The [`Project`] an immutable revision image is analyzed through.
+///
+/// It names every analyzer-visible file of the revision, exactly as the plain
+/// file set does, so absence still means absence and `analyzed_files` is
+/// complete. It differs in where the bytes come from: every file the image's
+/// inventory names is read from the repository's object database by the blob id
+/// the revision's tree walk recorded, and only a file the inventory does not
+/// name falls through to the filesystem, where the read fails as it should.
+struct RevisionImageProject {
+    files: FileSetProject,
+    objects: Arc<RevisionObjectDatabase>,
+    blobs: Arc<RevisionBlobIdentities>,
+}
+
+impl Project for RevisionImageProject {
+    fn root(&self) -> &Path {
+        self.files.root()
+    }
+
+    fn analyzer_languages(&self) -> BTreeSet<Language> {
+        self.files.analyzer_languages()
+    }
+
+    fn all_files(&self) -> std::io::Result<BTreeSet<ProjectFile>> {
+        self.files.all_files()
+    }
+
+    fn analyzable_files(&self, language: Language) -> std::io::Result<BTreeSet<ProjectFile>> {
+        self.files.analyzable_files(language)
+    }
+
+    fn analyzable_files_from(
+        &self,
+        files: &BTreeSet<ProjectFile>,
+        language: Language,
+    ) -> std::io::Result<BTreeSet<ProjectFile>> {
+        self.files.analyzable_files_from(files, language)
+    }
+
+    fn file_by_rel_path(&self, rel_path: &Path) -> Option<ProjectFile> {
+        self.files.file_by_rel_path(rel_path)
+    }
+
+    fn persistence_root(&self) -> Option<&Path> {
+        self.files.persistence_root()
+    }
+
+    fn read_source(&self, file: &ProjectFile) -> std::io::Result<String> {
+        match self.revision_bytes(file) {
+            Some(bytes) => {
+                bytes.and_then(brokk_bifrost_core::analyzer::project::decode_source_bytes)
+            }
+            None => self.files.read_source(file),
+        }
+    }
+
+    fn read_source_limited(
+        &self,
+        file: &ProjectFile,
+        max_bytes: usize,
+    ) -> std::io::Result<Option<String>> {
+        match self.revision_bytes(file) {
+            Some(bytes) => {
+                let bytes = bytes?;
+                if bytes.len() > max_bytes {
+                    return Ok(None);
+                }
+                brokk_bifrost_core::analyzer::project::decode_source_bytes(bytes).map(Some)
+            }
+            None => self.files.read_source_limited(file, max_bytes),
+        }
+    }
+}
+
+impl RevisionImageProject {
+    /// `file`'s bytes as the revision holds them, or `None` for a file this
+    /// image does not name -- whose disk read then fails, as it should.
+    ///
+    /// The inventory is consulted before the filesystem, never after. A source
+    /// file's on-disk copy is an empty placeholder that exists only so module
+    /// resolution can see the path (see `create_empty_source_files`), so
+    /// reading disk first would hand every caller an empty file.
+    fn revision_bytes(&self, file: &ProjectFile) -> Option<std::io::Result<Vec<u8>>> {
+        let oid = self.blobs.oid_for(file)?;
+        Some(self.objects.read_blob(oid).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("{}: {error}", file.rel_path().display()),
+            )
+        }))
+    }
+}
+
+pub(crate) struct RevisionTempDir {
     path: PathBuf,
 }
 
@@ -1440,44 +2440,55 @@ impl Drop for RevisionTempDir {
     }
 }
 
-/// Every regular file path in `snapshot`'s tree, workspace-relative.
-fn all_tree_paths(repo: &Repository, snapshot: Snapshot) -> Result<Vec<String>, String> {
+/// Export the changed files plus ambient ancestor manifests used to establish
+/// their package/crate identity. Callable discovery needs this bounded image,
+/// but does not resolve imported callees.
+fn export_snapshot_symbol_files(
+    repo: &Repository,
+    snapshot: Snapshot,
+    root: &Path,
+    paths: &[String],
+) -> Result<Vec<(PathBuf, Oid)>, String> {
     let tree = snapshot_tree(repo, snapshot)?;
-    Ok(tree_dir_file_paths(repo, &tree, Path::new("")))
+    export_snapshot_symbol_files_from_tree(repo, &tree, root, paths)
 }
 
-/// Export `paths` from `snapshot`'s tree into `root`, plus every ambient
-/// manifest an ancestor directory up (see [`ambient_ancestor_paths`]) and
-/// every package `paths`' own imports concretely reference (see
-/// [`import_expansion_targets`]), which -- unlike the ambient export -- must
-/// join the returned list: an import's target needs to be a real, analyzed
-/// declaration for its callee to resolve, not just a file sitting on disk for
-/// a manifest reader to open.
+fn export_snapshot_symbol_files_from_tree(
+    repo: &Repository,
+    tree: &git2::Tree,
+    root: &Path,
+    paths: &[String],
+) -> Result<Vec<(PathBuf, Oid)>, String> {
+    let mut exported = export_tree_paths(repo, tree, root, paths)?;
+    let already_exported = paths.iter().cloned().collect::<BTreeSet<_>>();
+    let ambient = symbol_identity_ancestor_paths(repo, tree, paths)
+        .into_iter()
+        .filter(|path| !already_exported.contains(path))
+        .collect::<Vec<_>>();
+    exported.extend(export_tree_paths(repo, tree, root, &ambient)?);
+    Ok(exported)
+}
+
+/// Extend the symbol image with every package the changed files' imports
+/// concretely reference. Exact call analysis needs those files to be real
+/// analyzer inputs; callable discovery deliberately stops before this step.
 ///
-/// A restricted export (just the diff's own changed paths) cannot resolve a
-/// symbol whose name or call graph depends on a file the diff never touches:
-/// a module/package manifest an ancestor directory up, or a callee that
-/// lives in some other, untouched file entirely.
+/// `cache` is the repository's shared analyzer cache, which the import-expansion
+/// analyzer built below reads and writes; see
+/// [`snapshot_import_expansion_targets`].
 fn export_snapshot_files(
     repo: &Repository,
     snapshot: Snapshot,
     root: &Path,
     paths: &[String],
-) -> Result<Vec<PathBuf>, String> {
+    cache: Option<&SharedAnalyzerCache>,
+) -> Result<Vec<(PathBuf, Oid)>, String> {
     let tree = snapshot_tree(repo, snapshot)?;
-    let mut exported = export_tree_paths(repo, &tree, root, paths)?;
-
-    // Ambient files join `exported` too: Go's own module-root discovery
-    // (`go_module_roots`) finds `go.mod` by filtering the project's file
-    // list, not by reading the filesystem directly, so a `go.mod` written to
-    // disk but left out of this list is invisible to it.
-    let mut already_exported: BTreeSet<String> = paths.iter().cloned().collect();
-    let ambient: Vec<String> = ambient_ancestor_paths(repo, &tree, paths)
-        .into_iter()
-        .filter(|path| !already_exported.contains(path))
-        .collect();
-    exported.extend(export_tree_paths(repo, &tree, root, &ambient)?);
-    already_exported.extend(ambient);
+    let mut exported = export_snapshot_symbol_files_from_tree(repo, &tree, root, paths)?;
+    let already_exported = exported
+        .iter()
+        .map(|(path, _)| path.to_string_lossy().into_owned())
+        .collect::<BTreeSet<_>>();
 
     // Import expansion resolves against a manifest that just landed on disk
     // above (a `go.mod`, a `Cargo.toml`, ...), so it only runs now.
@@ -1486,7 +2497,7 @@ fn export_snapshot_files(
         .filter_map(|path| safe_tree_entry_path(path).ok())
         .collect();
     let mut expansion = BTreeSet::new();
-    for target in import_expansion_targets(root, Some(&tree), &changed)? {
+    for target in snapshot_import_expansion_targets(root, &tree, &changed, cache)? {
         match target {
             ImportExpansionTarget::Directory(dir) => {
                 expansion.extend(tree_dir_file_paths(repo, &tree, &dir));
@@ -1510,8 +2521,9 @@ fn export_tree_paths(
     tree: &git2::Tree,
     root: &Path,
     paths: &[String],
-) -> Result<Vec<PathBuf>, String> {
+) -> Result<Vec<(PathBuf, Oid)>, String> {
     let mut written = Vec::with_capacity(paths.len());
+    let mut created_dirs = HashSet::new();
     for raw_path in paths {
         let rel = safe_tree_entry_path(raw_path)?;
         let Ok(entry) = tree.get_path(&rel) else {
@@ -1525,31 +2537,487 @@ fn export_tree_paths(
             .map_err(|err| format!("unable to read blob `{}`: {err}", rel.display()))?;
         let path = root.join(&rel);
         if let Some(parent) = path.parent() {
-            create_private_dirs(root, parent)?;
+            create_private_dirs_cached(root, parent, &mut created_dirs)?;
         }
         write_private_file(&path, blob.content())?;
         set_private_file_permissions(&path)?;
-        written.push(rel);
+        written.push((rel, entry.id()));
     }
     Ok(written)
 }
 
-/// Every regular file sitting directly inside an ancestor directory of a
-/// changed path, up to the snapshot root, deduplicated across `paths`.
+/// Export a complete immutable tree in one traversal.
 ///
-/// This has no notion of what a "manifest" is named. A per-language file
-/// list would have to track every module/package/build file each analyzer
-/// might walk up to find (and every path-based variant, like a JVM Gradle
-/// lockfile under `gradle/dependency-locks/`) and would silently miss
-/// whichever one it forgot. Copying whatever an ancestor directory actually
-/// contains cannot miss a name it wasn't told about, and stays cheap because
-/// it is bounded by each changed path's own depth, not the size of the tree.
-fn ambient_ancestor_paths(repo: &Repository, tree: &git2::Tree, paths: &[String]) -> Vec<String> {
+/// The restricted exporter above starts from a small path set, where a
+/// `tree.get_path` per file is appropriate. A complete revision already has
+/// the tree walk in hand. Turning every walked path back into a fresh tree
+/// lookup, and re-running `mkdir` plus permission changes for each ancestor of
+/// every file, made deep 10k-file repositories spend minutes before analysis
+/// began. This walk reads each tree entry once and creates each directory once.
+fn export_complete_tree(
+    repo: &Repository,
+    tree: &git2::Tree,
+    root: &Path,
+) -> Result<Vec<(PathBuf, Oid)>, String> {
+    let _scope = crate::profiling::scope("RevisionImage::export_complete_tree");
+    let mut entries = Vec::new();
+    let mut failure = None;
+    let walk = tree.walk(TreeWalkMode::PreOrder, |parent, entry| {
+        let Some(name) = entry.name() else {
+            return TreeWalkResult::Ok;
+        };
+        let raw_path = format!("{parent}{name}");
+        let rel = match safe_tree_entry_path(&raw_path) {
+            Ok(rel) => rel,
+            Err(error) => {
+                failure = Some(error);
+                return TreeWalkResult::Abort;
+            }
+        };
+        if entry.kind() != Some(ObjectType::Blob) || !is_regular_file_mode(entry.filemode()) {
+            return TreeWalkResult::Ok;
+        }
+        entries.push((rel, entry.id()));
+        TreeWalkResult::Ok
+    });
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    walk.map_err(|error| format!("unable to walk immutable revision tree: {error}"))?;
+
+    export_tree_entries(repo, root, entries, &[])
+}
+
+/// Export a tree-walk result while preserving lexical error reporting.
+///
+/// Keeping the one-pass walk separate from the selection predicate lets the
+/// complete exporter and the ecosystem-scoped exporter share the same safe
+/// path, directory, and blob handling without making the complete exporter
+/// depend on a filter.
+///
+/// The entries are returned with their blob ids: the caller hands them to the
+/// analyzer as the image's content identities, which is what keeps the
+/// analyzer from re-hashing bytes this function just wrote.
+fn export_tree_entries(
+    repo: &Repository,
+    root: &Path,
+    entries: Vec<(PathBuf, Oid)>,
+    alternate_object_dirs: &[PathBuf],
+) -> Result<Vec<(PathBuf, Oid)>, String> {
+    let mut created_dirs = HashSet::new();
+    for (rel, _) in &entries {
+        if let Some(parent) = root.join(rel).parent() {
+            create_private_dirs_cached(root, parent, &mut created_dirs)?;
+        }
+    }
+
+    // Git's batch protocol performs one pack traversal for the complete
+    // object stream. Calling libgit2's `Odb::read` independently for tens of
+    // thousands of blobs repeatedly re-enters pack lookup and delta setup;
+    // on dotnet/runtime that object-read shape alone took about 71 seconds.
+    // Keep the existing libgit2 implementation as a portable fallback. The
+    // destination is a new private temp image, so removing a partial batch
+    // before retrying cannot affect caller-owned files.
+    if let Err(error) = export_tree_entries_with_git(repo, root, &entries, alternate_object_dirs) {
+        profiling::note(format!(
+            "bulk Git revision export unavailable; falling back to libgit2: {error}"
+        ));
+        for (rel, _) in &entries {
+            let _ = fs::remove_file(root.join(rel));
+        }
+        export_tree_entries_with_libgit2(repo, root, &entries)?;
+    }
+
+    Ok(entries)
+}
+
+fn export_tree_entries_with_git(
+    repo: &Repository,
+    root: &Path,
+    entries: &[(PathBuf, Oid)],
+    alternate_object_dirs: &[PathBuf],
+) -> Result<(), String> {
+    let mut command = Command::new("git");
+    command
+        .arg("--git-dir")
+        .arg(repo.path())
+        .arg("cat-file")
+        .arg("--batch")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if !alternate_object_dirs.is_empty() {
+        let joined = std::env::join_paths(alternate_object_dirs)
+            .map_err(|error| format!("unable to encode trusted Git object directories: {error}"))?;
+        command.env("GIT_ALTERNATE_OBJECT_DIRECTORIES", joined);
+    }
+
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("unable to start `git cat-file --batch`: {error}"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "bulk Git exporter has no stdin".to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "bulk Git exporter has no stdout".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "bulk Git exporter has no stderr".to_string())?;
+
+    let mut requests = Vec::with_capacity(entries.len().saturating_mul(41));
+    for (_, oid) in entries {
+        writeln!(&mut requests, "{oid}")
+            .map_err(|error| format!("unable to prepare bulk Git request: {error}"))?;
+    }
+    let request_writer = std::thread::spawn(move || {
+        stdin
+            .write_all(&requests)
+            .map_err(|error| format!("unable to send bulk Git request: {error}"))
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut reader = stderr;
+        reader
+            .read_to_end(&mut bytes)
+            .map(|_| String::from_utf8_lossy(&bytes).trim().to_string())
+            .map_err(|error| format!("unable to read bulk Git diagnostics: {error}"))
+    });
+
+    let writer_threads = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(16);
+    let mut writers = Vec::with_capacity(writer_threads);
+    for _ in 0..writer_threads {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<(PathBuf, Vec<u8>)>(2);
+        let writer_root = root.to_path_buf();
+        let handle = std::thread::spawn(move || -> Result<(), String> {
+            while let Ok((rel, contents)) = receiver.recv() {
+                write_private_file(&writer_root.join(rel), &contents)?;
+            }
+            Ok(())
+        });
+        writers.push((sender, handle));
+    }
+
+    let mut reader = BufReader::new(stdout);
+    let export_result = (|| {
+        for (index, (rel, expected_oid)) in entries.iter().enumerate() {
+            let mut header = String::new();
+            let bytes = reader.read_line(&mut header).map_err(|error| {
+                format!(
+                    "unable to read bulk Git header for `{}`: {error}",
+                    rel.display()
+                )
+            })?;
+            if bytes == 0 {
+                return Err(format!(
+                    "bulk Git output ended before blob `{}`",
+                    rel.display()
+                ));
+            }
+            let mut fields = header.split_ascii_whitespace();
+            let actual_oid = fields.next().ok_or_else(|| {
+                format!("bulk Git returned an empty header for `{}`", rel.display())
+            })?;
+            let kind = fields.next().ok_or_else(|| {
+                format!("bulk Git omitted the object kind for `{}`", rel.display())
+            })?;
+            let size = fields
+                .next()
+                .ok_or_else(|| format!("bulk Git omitted the object size for `{}`", rel.display()))?
+                .parse::<usize>()
+                .map_err(|error| {
+                    format!(
+                        "bulk Git returned an invalid size for `{}`: {error}",
+                        rel.display()
+                    )
+                })?;
+            if fields.next().is_some() || actual_oid != expected_oid.to_string() || kind != "blob" {
+                return Err(format!(
+                    "bulk Git returned unexpected header {:?} for blob `{}` ({expected_oid})",
+                    header.trim_end(),
+                    rel.display()
+                ));
+            }
+
+            let mut contents = vec![0; size];
+            reader.read_exact(&mut contents).map_err(|error| {
+                format!("unable to read bulk Git blob `{}`: {error}", rel.display())
+            })?;
+            let mut separator = [0_u8; 1];
+            reader.read_exact(&mut separator).map_err(|error| {
+                format!(
+                    "unable to read bulk Git separator for `{}`: {error}",
+                    rel.display()
+                )
+            })?;
+            if separator != *b"\n" {
+                return Err(format!(
+                    "bulk Git returned an invalid blob separator for `{}`",
+                    rel.display()
+                ));
+            }
+            writers[index % writers.len()]
+                .0
+                .send((rel.clone(), contents))
+                .map_err(|_| format!("bulk Git file writer stopped before `{}`", rel.display()))?;
+        }
+        Ok(())
+    })();
+
+    if export_result.is_err() {
+        let _ = child.kill();
+    }
+    let status = child
+        .wait()
+        .map_err(|error| format!("unable to wait for bulk Git exporter: {error}"))?;
+    request_writer
+        .join()
+        .map_err(|_| "bulk Git request writer panicked".to_string())??;
+    let diagnostics = stderr_reader
+        .join()
+        .map_err(|_| "bulk Git diagnostics reader panicked".to_string())??;
+    let writer_handles = writers
+        .into_iter()
+        .map(|(sender, handle)| {
+            drop(sender);
+            handle
+        })
+        .collect::<Vec<_>>();
+    let mut writer_result = Ok(());
+    for handle in writer_handles {
+        let result = handle
+            .join()
+            .map_err(|_| "bulk Git file writer panicked".to_string())?;
+        if writer_result.is_ok() {
+            writer_result = result;
+        }
+    }
+    export_result?;
+    writer_result?;
+    if !status.success() {
+        return Err(format!(
+            "bulk Git exporter exited with {status}: {diagnostics}"
+        ));
+    }
+    Ok(())
+}
+
+fn export_tree_entries_with_libgit2(
+    repo: &Repository,
+    root: &Path,
+    entries: &[(PathBuf, Oid)],
+) -> Result<(), String> {
+    let odb = repo
+        .odb()
+        .map_err(|error| format!("unable to open repository object database: {error}"))?;
+    for (rel, oid) in entries {
+        let object = odb
+            .read(*oid)
+            .map_err(|error| format!("unable to read blob `{}`: {error}", rel.display()))?;
+        write_private_file(&root.join(rel), object.data())?;
+    }
+    Ok(())
+}
+
+/// Inventory every regular file that can participate in the selected usage
+/// ecosystems, and write to disk only the ones that must be real files.
+///
+/// The dependency graph only creates nodes for analyzer source extensions, but
+/// its analyzers also read package/build inputs to establish module, package,
+/// and project identity, and several of those readers open the manifest by path
+/// rather than through the project -- `read_manifest` in
+/// `brokk_bifrost_rust::cargo_routes` opens `Cargo.toml` with `std::fs`, and
+/// `brokk_bifrost_go::packages` opens `go.mod` the same way. Those inputs are
+/// therefore written.
+///
+/// Source files are not. Their bytes already exist, deduplicated, in the
+/// repository's object database, and `RevisionImageProject` reads them from
+/// there for whatever actually needs them. On a warm shared cache that is
+/// almost nothing: the parsed facts for a blob the cache has already seen are
+/// read out of the store, and the blob itself is never touched. The returned
+/// inventory names every file either way, so the analyzer's file listing, its
+/// graph nodes and its blob identities describe the whole revision.
+struct ExportedFileDependencyTree {
+    /// Written to disk with their real content.
+    configuration_inputs: Vec<(PathBuf, Oid)>,
+    /// Named, and created as empty paths, but served from the object database.
+    sources: Vec<(PathBuf, Oid)>,
+}
+
+fn export_file_dependency_tree(
+    repo: &Repository,
+    tree: &git2::Tree,
+    root: &Path,
+    languages: &BTreeSet<Language>,
+    alternate_object_dirs: &[PathBuf],
+) -> Result<ExportedFileDependencyTree, String> {
+    let _scope = crate::profiling::scope("RevisionImage::export_file_dependency_tree");
+    let mut entries = Vec::new();
+    let mut failure = None;
+    let walk = tree.walk(TreeWalkMode::PreOrder, |parent, entry| {
+        let Some(name) = entry.name() else {
+            return TreeWalkResult::Ok;
+        };
+        let raw_path = format!("{parent}{name}");
+        let rel = match safe_tree_entry_path(&raw_path) {
+            Ok(rel) => rel,
+            Err(error) => {
+                failure = Some(error);
+                return TreeWalkResult::Abort;
+            }
+        };
+        if entry.kind() == Some(ObjectType::Blob)
+            && is_regular_file_mode(entry.filemode())
+            && file_dependency_tree_path(&rel, languages)
+        {
+            entries.push((rel, entry.id()));
+        }
+        TreeWalkResult::Ok
+    });
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    walk.map_err(|error| format!("unable to walk immutable revision tree: {error}"))?;
+
+    let (configuration_inputs, sources): (Vec<_>, Vec<_>) = entries
+        .into_iter()
+        .partition(|(rel, _)| ecosystem_identity_file(rel, languages));
+    let configuration_inputs =
+        export_tree_entries(repo, root, configuration_inputs, alternate_object_dirs)?;
+    create_empty_source_files(root, &sources)?;
+    Ok(ExportedFileDependencyTree {
+        configuration_inputs,
+        sources,
+    })
+}
+
+/// Create every source file the image names, with no content.
+///
+/// The bytes come from the object database on demand, but the PATH has to be
+/// on disk: module resolution in several languages answers "does this module
+/// exist" by probing the filesystem for candidate files -- Rust's `mod foo;`
+/// tries `foo.rs` and `foo/mod.rs` (`rust_external_module_children` in
+/// `brokk_bifrost_rust::cargo_routes`), and a JavaScript or TypeScript
+/// specifier tries each extension and `index.<ext>`
+/// (`brokk_bifrost_js_ts::imports`). Both take absence as proof that the module
+/// is not there, so an unwritten path silently deletes real graph edges.
+///
+/// This is much cheaper than the export it replaces: no blob is inflated and no
+/// content is written, only an empty inode per file. `RevisionImageProject`
+/// reads through the inventory rather than the filesystem, so nothing ever sees
+/// the empty content.
+fn create_empty_source_files(root: &Path, sources: &[(PathBuf, Oid)]) -> Result<(), String> {
+    let mut created_dirs = HashSet::new();
+    for (rel, _) in sources {
+        let path = root.join(rel);
+        if let Some(parent) = path.parent() {
+            create_private_dirs_cached(root, parent, &mut created_dirs)?;
+        }
+        write_private_file(&path, &[])?;
+    }
+    Ok(())
+}
+
+fn file_dependency_tree_path(path: &Path, languages: &BTreeSet<Language>) -> bool {
+    let source_language = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(Language::from_extension)
+        .unwrap_or(Language::None);
+    if languages.contains(&source_language) {
+        return true;
+    }
+
+    ecosystem_identity_file(path, languages)
+}
+
+/// Return whether `path` is a package/build identity input for one selected
+/// usage ecosystem. The dependency-input registry is the source of truth for
+/// resolver-owned inputs; the small additions cover analyzer identity facts
+/// that are not dependency-pack inputs (Python package markers and compiler
+/// configuration files).
+fn ecosystem_identity_file(path: &Path, languages: &BTreeSet<Language>) -> bool {
+    DependencyPackEcosystem::ALL
+        .into_iter()
+        .filter(|ecosystem| {
+            ecosystem
+                .languages()
+                .iter()
+                .any(|language| languages.contains(language))
+        })
+        .any(|ecosystem| ecosystem.is_file_dependency_input(path))
+}
+
+/// Whether a file is structured package/workspace identity used while naming
+/// declarations in a bounded callable-discovery image.
+///
+/// Exact call analysis deliberately uses the broader materialization path.
+/// Callable discovery does not need neighboring source or fixture files, and
+/// sweeping every direct child of an ancestor directory is not bounded in
+/// practice: TypeScript's compiler baseline directory has more than 20,000
+/// siblings. Keep only the checked-in configuration facts the analyzers
+/// already consume, plus Python package markers.
+fn symbol_identity_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    matches!(
+        name,
+        "__init__.py"
+            | "Cargo.toml"
+            | "go.mod"
+            | "go.work"
+            | "package.json"
+            | "tsconfig.json"
+            | "jsconfig.json"
+            | "pom.xml"
+            | "settings.xml"
+            | "build.gradle"
+            | "build.gradle.kts"
+            | "settings.gradle"
+            | "settings.gradle.kts"
+            | "gradle.properties"
+            | "gradle.lockfile"
+            | "libs.versions.toml"
+            | "compile_commands.json"
+            | "compile_flags.txt"
+            | "CMakeLists.txt"
+            | "Gemfile"
+            | "composer.json"
+            | "Directory.Build.props"
+            | "Directory.Build.targets"
+            | "Directory.Packages.props"
+            | "NuGet.config"
+    ) || matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some("csproj" | "fsproj" | "vbproj")
+    )
+}
+
+/// Structured identity inputs sitting directly inside ancestor directories of
+/// changed paths, up to the snapshot root, deduplicated across `paths`.
+fn symbol_identity_ancestor_paths(
+    repo: &Repository,
+    tree: &git2::Tree,
+    paths: &[String],
+) -> Vec<String> {
     fn push_blobs(dir: &git2::Tree, prefix: &str, out: &mut Vec<String>) {
         for entry in dir.iter() {
             if entry.kind() == Some(ObjectType::Blob)
                 && is_regular_file_mode(entry.filemode())
                 && let Some(name) = entry.name()
+                && symbol_identity_file(Path::new(name))
             {
                 out.push(format!("{prefix}{name}"));
             }
@@ -1623,7 +3091,16 @@ fn tree_dir_file_paths(repo: &Repository, tree: &git2::Tree, dir: &Path) -> Vec<
     paths
 }
 
+#[cfg(test)]
 fn create_private_dirs(root: &Path, parent: &Path) -> Result<(), String> {
+    create_private_dirs_cached(root, parent, &mut HashSet::new())
+}
+
+fn create_private_dirs_cached(
+    root: &Path,
+    parent: &Path,
+    created_dirs: &mut HashSet<PathBuf>,
+) -> Result<(), String> {
     let rel = parent.strip_prefix(root).map_err(|err| {
         format!(
             "unable to create directory outside revision root {}: {err}",
@@ -1633,6 +3110,9 @@ fn create_private_dirs(root: &Path, parent: &Path) -> Result<(), String> {
     let mut current = root.to_path_buf();
     for component in rel.components() {
         current.push(component.as_os_str());
+        if !created_dirs.insert(current.clone()) {
+            continue;
+        }
         match create_private_dir(&current) {
             Ok(()) => set_private_dir_permissions(&current)?,
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -1729,27 +3209,159 @@ fn is_regular_file_mode(mode: i32) -> bool {
         || mode == i32::from(FileMode::BlobExecutable)
 }
 
-/// Build a throwaway analyzer over exactly `files`.
+/// Build a throwaway analyzer over exactly `files` under a live project root.
 ///
-/// This must never touch an on-disk analyzer cache: for commit endpoints the
-/// root is a temp directory that is deleted immediately afterwards, and for the
-/// working-tree endpoint the root is the *live* project root, whose real cache
-/// must not be replaced by one that only ever saw a handful of changed files.
-/// `build_ephemeral` states that requirement at the call site instead of
+/// One production caller remains: [`worktree_import_expansion_targets`], whose
+/// root is the *live* project root for a working-tree endpoint. It may not
+/// write an on-disk cache under that root's workspace identity, because a
+/// partial file set must not become the workspace's cached picture of itself.
+/// `build_ephemeral_footgun` states that requirement at the call site instead of
 /// relying on `FileSetProject::persistence_root()` happening to be `None`.
+///
+/// The rule is about the *live root*, not about partiality or about immutable
+/// revisions. Every immutable path shares the repository's content-addressed
+/// cache: a `blast_radius` or `analyze_diff` endpoint image through
+/// [`build_revision_analyzer`] or [`build_file_dependency_analyzer`], a
+/// committed endpoint's import expansion through
+/// [`RevisionAnalyzer::over_partial_export`], and `correspond_revisions`
+/// through the first of those. A revision's facts are keyed by blob content and
+/// are reusable however few of its files one request happened to select; a
+/// live root's workspace projection is not.
 pub(crate) fn build_analyzer(root: &Path, files: &[PathBuf]) -> Result<WorkspaceAnalyzer, String> {
     let project = Arc::new(FileSetProject::new(
         root.to_path_buf(),
         files.iter().cloned(),
     ));
-    WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
+    WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
         .map_err(|error| format!("Failed to build diff endpoint analyzer: {error}"))
+}
+
+/// An analyzer over one diff-endpoint image, together with the workspace
+/// projection rows the image published into a shared analyzer cache.
+///
+/// The projection is declared after the analyzer so it drops after it: every
+/// query the request makes still sees the image's files mounted, and the rows
+/// naming a temp-directory root are gone before the request returns.
+pub(crate) struct RevisionAnalyzer {
+    workspace: WorkspaceAnalyzer,
+    _projection: Option<RevisionWorkspaceProjection>,
+}
+
+impl RevisionAnalyzer {
+    fn build(
+        image: &RevisionImage,
+        cache: Option<&SharedAnalyzerCache>,
+        languages: Option<&BTreeSet<Language>>,
+    ) -> Result<Self, crate::analyzer::store::StoreError> {
+        let (project, blobs) = image.project();
+        // Only a temp-directory export may share the repository's cache. A
+        // worktree image's root is the *live* project root, and publishing a
+        // partial file listing under that workspace identity would replace the
+        // workspace's own picture of itself.
+        let cache = match image {
+            RevisionImage::Snapshot { .. } => cache,
+            RevisionImage::Worktree { .. } => None,
+        };
+        // Claimed before the build, so a build that fails partway still leaves
+        // no workspace rows behind.
+        let projection = cache.map(|cache| cache.claim_revision_workspace(image.root()));
+        let workspace = match blobs {
+            Some(blobs) => WorkspaceAnalyzer::build_revision_image(
+                project,
+                AnalyzerConfig::default(),
+                languages,
+                cache,
+                blobs,
+            ),
+            None => match languages {
+                Some(languages) => WorkspaceAnalyzer::build_ephemeral_for_languages_footgun(
+                    project,
+                    AnalyzerConfig::default(),
+                    languages,
+                ),
+                None => {
+                    WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
+                }
+            },
+        }?;
+        Ok(Self {
+            workspace,
+            _projection: projection,
+        })
+    }
+
+    /// Build over part of a revision export: `root` is the private export
+    /// directory a materialization is still filling in, `files` the subset
+    /// already written there, and `blobs` their ids from the same tree walk.
+    ///
+    /// A partial listing is safe to publish here for the reason a complete one
+    /// is: the root is a self-deleting temp directory whose workspace rows the
+    /// returned lease removes, and the parsed facts that stay behind are keyed
+    /// by blob content, which a partial selection cannot make partial.
+    fn over_partial_export(
+        root: &Path,
+        files: &[PathBuf],
+        blobs: Arc<RevisionBlobIdentities>,
+        cache: Option<&SharedAnalyzerCache>,
+    ) -> Result<Self, crate::analyzer::store::StoreError> {
+        let project = Arc::new(FileSetProject::new(
+            root.to_path_buf(),
+            files.iter().cloned(),
+        ));
+        // Claimed before the build, as in `build` above.
+        let projection = cache.map(|cache| cache.claim_revision_workspace(root));
+        let workspace = WorkspaceAnalyzer::build_revision_image(
+            project,
+            AnalyzerConfig::default(),
+            None,
+            cache,
+            blobs,
+        )?;
+        Ok(Self {
+            workspace,
+            _projection: projection,
+        })
+    }
+
+    pub(crate) fn analyzer(&self) -> &dyn IAnalyzer {
+        self.workspace.analyzer()
+    }
+}
+
+/// Build the complete analyzer of one diff-endpoint image.
+///
+/// An immutable image reads and writes the repository's shared
+/// content-addressed cache, so a blob it shares with the worktree, a linked
+/// worktree, or an earlier revision request is read instead of re-parsed.
+/// Without a usable cache the same build runs against an ephemeral store: the
+/// answers are identical, only the parse bill differs.
+pub(crate) fn build_revision_analyzer(
+    image: &RevisionImage,
+    cache: Option<&SharedAnalyzerCache>,
+) -> Result<RevisionAnalyzer, String> {
+    RevisionAnalyzer::build(image, cache, None)
+        .map_err(|error| format!("Failed to build diff endpoint analyzer: {error}"))
+}
+
+/// Build the file-dependency view of one revision image, restricted to the
+/// usage ecosystems the coarse graph will walk.
+///
+/// The project still names every analyzer-visible file, so an omitted graph
+/// node is never mistaken for negative dependency evidence.
+pub(crate) fn build_file_dependency_analyzer(
+    image: &RevisionImage,
+    cache: Option<&SharedAnalyzerCache>,
+    languages: &BTreeSet<Language>,
+) -> Result<RevisionAnalyzer, String> {
+    RevisionAnalyzer::build(image, cache, Some(languages))
+        .map_err(|error| format!("Failed to build file-dependency analyzer: {error}"))
 }
 
 fn symbol_snapshot_map(
     analyzer: &dyn IAnalyzer,
     include_tests: bool,
 ) -> BTreeMap<SymbolKey, SymbolSnapshot> {
+    let _query_scope = AnalyzerQueryScope::new(analyzer);
     let mut out = BTreeMap::new();
     // Read each file at most once: many declarations share a source, and the
     // body hash only needs the file's text sliced by line range.
@@ -1788,7 +3400,9 @@ fn symbol_snapshot_map(
             .entry(unit.source().abs_path())
             .or_insert_with(|| unit.source().read_to_string().ok())
             .as_deref()
-            .and_then(|text| body_token_signature(text, &name, range.start_line, range.end_line));
+            .and_then(|text| {
+                body_token_signature_for_bytes(text, &name, range.start_byte, range.end_byte)
+            });
         out.insert(
             key.clone(),
             SymbolSnapshot {
@@ -2112,40 +3726,45 @@ fn within_fuzzy_weight_ratio(weight_a: f64, weight_b: f64) -> bool {
     weight_a.max(weight_b) <= FUZZY_WEIGHT_RATIO_LIMIT * weight_a.min(weight_b)
 }
 
-/// A normalized token sequence for a symbol's body, or `None` when the body is
-/// too trivial to identify a move by content alone.
+/// Tokenize a declaration directly from its analyzer byte range.
 ///
-/// The symbol's own `name` is blanked (see [`blank_identifier`]) so a rename
-/// does not change the signature, then the `[start_line, end_line]` span
-/// (1-based, inclusive) is tokenized into identifier/number runs and individual
-/// punctuation characters. Internal identifiers are deliberately KEPT: they let
-/// [`body_similarity`] tell genuinely different logic apart, and the threshold
-/// absorbs the few that a rename touches. A body of fewer than two non-blank
-/// lines is rejected (`None`): too weak a fingerprint to pair on without
-/// inventing moves.
-fn body_token_signature(
+/// `symbol_snapshot_map` may visit hundreds of declarations in one generated
+/// or compiler source file. Restarting `source.lines()` at byte zero for every
+/// declaration makes that pass quadratic in file length. Analyzer ranges
+/// already carry exact UTF-8 byte offsets, so this slices once. The symbol's
+/// own name is blanked and the slice is tokenized into word/number runs and
+/// punctuation; bodies with fewer than two non-blank lines are too weak to
+/// identify a move and return `None`.
+fn body_token_signature_for_bytes(
     source: &str,
     name: &str,
-    start_line: usize,
-    end_line: usize,
+    start_byte: usize,
+    end_byte: usize,
 ) -> Option<Vec<String>> {
-    if start_line == 0 || end_line < start_line {
-        return None;
-    }
+    let body = source.get(start_byte..end_byte)?;
     let mut tokens = Vec::new();
     let mut non_blank_lines = 0;
-    for line in source
-        .lines()
-        .skip(start_line - 1)
-        .take(end_line - start_line + 1)
-    {
-        let blanked = blank_identifier(line, name);
-        let before = tokens.len();
-        tokenize_into(&blanked, &mut tokens);
-        if tokens.len() > before {
-            non_blank_lines += 1;
-        }
+    for line in body.lines() {
+        tokenize_body_line(line, name, &mut tokens, &mut non_blank_lines);
     }
+    finish_body_token_signature(tokens, non_blank_lines)
+}
+
+fn tokenize_body_line(
+    line: &str,
+    name: &str,
+    tokens: &mut Vec<String>,
+    non_blank_lines: &mut usize,
+) {
+    let blanked = blank_identifier(line, name);
+    let before = tokens.len();
+    tokenize_into(&blanked, tokens);
+    if tokens.len() > before {
+        *non_blank_lines += 1;
+    }
+}
+
+fn finish_body_token_signature(tokens: Vec<String>, non_blank_lines: usize) -> Option<Vec<String>> {
     if non_blank_lines < 2 || tokens.is_empty() {
         return None;
     }
@@ -2613,7 +4232,10 @@ fn large_callsite_symbols(
     out.into_values().collect()
 }
 
-fn primary_range(analyzer: &dyn IAnalyzer, unit: &CodeUnit) -> Option<crate::analyzer::Range> {
+pub(crate) fn primary_range(
+    analyzer: &dyn IAnalyzer,
+    unit: &CodeUnit,
+) -> Option<crate::analyzer::Range> {
     analyzer
         .ranges(unit)
         .iter()
@@ -2625,7 +4247,7 @@ fn sort_symbols(symbols: &mut [CommitSymbol]) {
     symbols.sort();
 }
 
-fn path_string(path: &Path) -> String {
+pub(crate) fn path_string(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
@@ -2665,7 +4287,7 @@ fn language_for_path(path: &Path) -> String {
     }
 }
 
-fn path_language(path: &Path) -> Language {
+pub(crate) fn path_language(path: &Path) -> Language {
     path.extension()
         .and_then(|ext| ext.to_str())
         .map(Language::from_extension)
@@ -2680,16 +4302,367 @@ fn kind_name(kind: CodeUnitType) -> &'static str {
 mod tests {
     use super::{
         AnalyzeDiffParams, BODY_MOVE_SIMILARITY_THRESHOLD, ChangedLines, CommitSymbol,
-        DiffAnalysisOptions, FileChange, ImportTarget, RevisionTempDir, SymbolKey, SymbolSnapshot,
-        analyze_diff_at_root, body_similarity, body_token_signature, create_private_dirs,
-        diff_local_idf, is_pure_line_shift, pair_endpoints, resolve_import_target,
-        within_fuzzy_weight_ratio, worktree_files, write_private_file,
+        DiffAnalysisOptions, DiffEndpointParams, FileChange, ImportTarget, Language, PreparedDiff,
+        RevisionImage, RevisionTempDir, SharedAnalyzerCache, Snapshot, SymbolKey, SymbolSnapshot,
+        WORKTREE_ENDPOINT, analyze_diff_at_root, analyze_prepared_diff,
+        analyze_prepared_symbol_changes, body_similarity, body_token_signature_for_bytes,
+        create_private_dirs, diff_local_idf, is_pure_line_shift, pair_endpoints,
+        resolve_import_target, within_fuzzy_weight_ratio, worktree_files, write_private_file,
     };
     use crate::gitblob::test_repo;
-    use std::collections::BTreeMap;
+    use git2::{Oid, Repository};
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn complete_revision_export_preserves_every_regular_tree_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo::init_repo(dir.path());
+        fs::create_dir_all(dir.path().join("deep/one/two")).unwrap();
+        fs::write(dir.path().join("root.ts"), "export const root = 1;\n").unwrap();
+        fs::write(
+            dir.path().join("deep/one/first.ts"),
+            "export const first = 1;\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("deep/one/two/second.ts"),
+            "export const second = 2;\n",
+        )
+        .unwrap();
+        let commit = test_repo::commit_all(&repo, "complete tree");
+
+        let image =
+            RevisionImage::materialize(&repo, Snapshot::Commit(commit), None, &[], None).unwrap();
+        let files = image.files().iter().cloned().collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            BTreeSet::from([
+                PathBuf::from("deep/one/first.ts"),
+                PathBuf::from("deep/one/two/second.ts"),
+                PathBuf::from("root.ts"),
+            ]),
+            files
+        );
+        assert_eq!(
+            "export const second = 2;\n",
+            fs::read_to_string(image.root().join("deep/one/two/second.ts")).unwrap()
+        );
+    }
+
+    #[test]
+    fn file_dependency_export_keeps_selected_sources_and_identity_inputs_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo::init_repo(dir.path());
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/main.ts"), "export const main = 1;\n").unwrap();
+        fs::write(
+            dir.path().join("src/shared.js"),
+            "export const shared = 1;\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("src/unrelated.java"),
+            "class Unrelated {}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("src/app.cs"),
+            "namespace Fixture; class App {}\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("package.json"), "{\"name\":\"fixture\"}\n").unwrap();
+        fs::write(dir.path().join("package-lock.json"), "{}\n").unwrap();
+        fs::write(dir.path().join("tsconfig.json"), "{}\n").unwrap();
+        fs::write(dir.path().join("pom.xml"), "<project/>\n").unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("Directory.Build.props"), "<Project/>\n").unwrap();
+        fs::write(dir.path().join("generated.targets"), "<Project/>\n").unwrap();
+        fs::write(dir.path().join("fixture.dll"), b"managed fixture").unwrap();
+        let commit = test_repo::commit_all(&repo, "scoped graph image");
+
+        let selected = BTreeSet::from([Language::JavaScript, Language::TypeScript]);
+        let image = RevisionImage::materialize_file_dependencies(
+            &repo,
+            Snapshot::Commit(commit),
+            &selected,
+            &[],
+        )
+        .unwrap();
+        let files = image.files().iter().cloned().collect::<BTreeSet<_>>();
+
+        assert!(files.contains(Path::new("src/main.ts")));
+        assert!(files.contains(Path::new("src/shared.js")));
+        assert!(files.contains(Path::new("package.json")));
+        assert!(files.contains(Path::new("package-lock.json")));
+        assert!(files.contains(Path::new("tsconfig.json")));
+        assert!(!files.contains(Path::new("src/unrelated.java")));
+        assert!(!files.contains(Path::new("pom.xml")));
+        assert!(!files.contains(Path::new("Cargo.toml")));
+        assert!(!files.contains(Path::new("Directory.Build.props")));
+        assert!(!files.contains(Path::new("generated.targets")));
+        assert!(!files.contains(Path::new("fixture.dll")));
+
+        let csharp_image = RevisionImage::materialize_file_dependencies(
+            &repo,
+            Snapshot::Commit(commit),
+            &BTreeSet::from([Language::CSharp]),
+            &[],
+        )
+        .unwrap();
+        let csharp_files = csharp_image
+            .files()
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert!(csharp_files.contains(Path::new("src/app.cs")));
+        assert!(csharp_files.contains(Path::new("Directory.Build.props")));
+        assert!(csharp_files.contains(Path::new("generated.targets")));
+        assert!(csharp_files.contains(Path::new("fixture.dll")));
+        assert!(!csharp_files.contains(Path::new("src/main.ts")));
+
+        // The complete exporter remains an independent contract for callers
+        // that need every regular tree file.
+        let complete =
+            RevisionImage::materialize(&repo, Snapshot::Commit(commit), None, &[], None).unwrap();
+        let complete_files = complete.files().iter().cloned().collect::<BTreeSet<_>>();
+        assert!(complete_files.contains(Path::new("src/unrelated.java")));
+        assert!(complete_files.contains(Path::new("pom.xml")));
+        assert!(complete_files.contains(Path::new("Cargo.toml")));
+    }
+
+    #[test]
+    fn file_dependency_export_writes_only_configuration_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo::init_repo(dir.path());
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/main.ts"), "export const main = 1;\n").unwrap();
+        fs::write(
+            dir.path().join("src/shared.js"),
+            "export const shared = 1;\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("package.json"), "{\"name\":\"fixture\"}\n").unwrap();
+        let commit = test_repo::commit_all(&repo, "scoped graph image");
+
+        let image = RevisionImage::materialize_file_dependencies(
+            &repo,
+            Snapshot::Commit(commit),
+            &BTreeSet::from([Language::JavaScript, Language::TypeScript]),
+            &[],
+        )
+        .unwrap();
+
+        // The manifest is a real file: several dependency resolvers open it
+        // with `std::fs` rather than through the project.
+        assert_eq!(
+            fs::read_to_string(image.root().join("package.json")).unwrap(),
+            "{\"name\":\"fixture\"}\n"
+        );
+        // Source blobs are not inflated. The paths exist so module resolution
+        // can find them; the bytes stay in the repository.
+        for source in ["src/main.ts", "src/shared.js"] {
+            let path = image.root().join(source);
+            assert!(path.is_file(), "{source} must exist for module resolution");
+            assert_eq!(
+                fs::metadata(&path).unwrap().len(),
+                0,
+                "{source} must not be inflated into the export"
+            );
+        }
+
+        // The project still serves the revision's real source for every named
+        // file, so nothing downstream sees the empty placeholder.
+        let (project, _) = image.project();
+        let main = project.file_by_rel_path(Path::new("src/main.ts")).unwrap();
+        assert_eq!(
+            project.read_source(&main).unwrap(),
+            "export const main = 1;\n"
+        );
+        let manifest = project.file_by_rel_path(Path::new("package.json")).unwrap();
+        assert_eq!(
+            project.read_source(&manifest).unwrap(),
+            "{\"name\":\"fixture\"}\n"
+        );
+    }
+
+    #[test]
+    fn symbol_materialization_keeps_ambient_identity_without_import_expansion() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo::init_repo(dir.path());
+        fs::write(dir.path().join("go.mod"), "module repro\n\ngo 1.21\n").unwrap();
+        fs::create_dir_all(dir.path().join("pkga")).unwrap();
+        fs::create_dir_all(dir.path().join("pkgb")).unwrap();
+        fs::write(
+            dir.path().join("pkga/a.go"),
+            "package pkga\n\nimport \"repro/pkgb\"\n\nfunc Caller() int { return pkgb.Value() }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("pkga/unrelated.go"),
+            "package pkga\n\nfunc Unrelated() int { return 2 }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("pkgb/b.go"),
+            "package pkgb\n\nfunc Value() int { return 1 }\n",
+        )
+        .unwrap();
+        let commit = test_repo::commit_all(&repo, "base");
+        let paths = vec!["pkga/a.go".to_string()];
+
+        let symbols =
+            RevisionImage::materialize_symbols(&repo, Snapshot::Commit(commit), &paths, &[])
+                .unwrap();
+        let symbol_files = symbols.files().iter().cloned().collect::<BTreeSet<_>>();
+        assert!(symbol_files.contains(Path::new("go.mod")));
+        assert!(symbol_files.contains(Path::new("pkga/a.go")));
+        assert!(!symbol_files.contains(Path::new("pkga/unrelated.go")));
+        assert!(!symbol_files.contains(Path::new("pkgb/b.go")));
+
+        let exact =
+            RevisionImage::materialize(&repo, Snapshot::Commit(commit), Some(&paths), &[], None)
+                .unwrap();
+        assert!(exact.files().contains(&PathBuf::from("pkgb/b.go")));
+    }
+
+    #[test]
+    fn full_diff_composes_exact_calls_after_standalone_symbol_pairing() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo::init_repo(dir.path());
+        fs::write(dir.path().join("go.mod"), "module repro\n\ngo 1.21\n").unwrap();
+        fs::create_dir_all(dir.path().join("sample")).unwrap();
+        fs::write(
+            dir.path().join("sample/calls.go"),
+            "package sample\n\nfunc Left() int { return 1 }\nfunc Right() int { return 2 }\nfunc Caller() int { return Left() }\n",
+        )
+        .unwrap();
+        test_repo::commit_all(&repo, "base");
+        fs::write(
+            dir.path().join("sample/calls.go"),
+            "package sample\n\nfunc Left() int { return 1 }\nfunc Right() int { return 2 }\nfunc Caller() int { return Right() }\n",
+        )
+        .unwrap();
+
+        let prepared = PreparedDiff::at_root(
+            dir.path(),
+            DiffEndpointParams {
+                base: Some("HEAD".to_string()),
+                target: None,
+            },
+            &DiffAnalysisOptions::default(),
+        )
+        .unwrap();
+        let paired_only = analyze_prepared_symbol_changes(&prepared, true).unwrap();
+        let full = analyze_prepared_diff(&prepared, true).unwrap();
+
+        assert_eq!(1, paired_only.symbol_changes.edited.len());
+        assert_eq!("Caller", paired_only.symbol_changes.edited[0].after.name);
+        let caller = full
+            .patch_symbols
+            .edited
+            .iter()
+            .find(|pair| pair.after.name == "Caller")
+            .expect("full diff must retain the paired callable");
+        assert_eq!(
+            vec!["repro/sample.Right"],
+            caller
+                .added_calls
+                .iter()
+                .map(|call| call.to.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            vec!["repro/sample.Left"],
+            caller
+                .removed_calls
+                .iter()
+                .map(|call| call.to.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn zero_argument_worktree_diff_starts_at_the_default_branch_merge_base() {
+        let temp = RevisionTempDir::new("default-branch-merge-base").unwrap();
+        let root = temp.path();
+        let repo = Repository::init(root).unwrap();
+        let signature = git2::Signature::now("Tester", "tester@example.com").unwrap();
+        let commit = |update_ref: &str, parent: Option<Oid>, body: &str, message: &str| {
+            fs::write(
+                root.join("lib.go"),
+                format!("package sample\n\nfunc Existing() int {{\n\treturn {body}\n}}\n"),
+            )
+            .unwrap();
+            let mut index = repo.index().unwrap();
+            index.clear().unwrap();
+            index.add_path(Path::new("lib.go")).unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let parents = parent
+                .into_iter()
+                .map(|oid| repo.find_commit(oid).unwrap())
+                .collect::<Vec<_>>();
+            repo.commit(
+                Some(update_ref),
+                &signature,
+                &signature,
+                message,
+                &tree,
+                &parents.iter().collect::<Vec<_>>(),
+            )
+            .unwrap()
+        };
+
+        let common = commit("HEAD", None, "1", "common");
+        let default_head = commit("refs/heads/master", Some(common), "10", "default");
+        let feature_head = commit("refs/heads/feature", Some(common), "2", "feature");
+        repo.set_head("refs/heads/feature").unwrap();
+        repo.reference(
+            "refs/remotes/origin/master",
+            default_head,
+            true,
+            "test default branch",
+        )
+        .unwrap();
+        repo.reference_symbolic(
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/master",
+            true,
+            "test remote HEAD",
+        )
+        .unwrap();
+        fs::write(
+            root.join("lib.go"),
+            "package sample\n\nfunc Existing() int {\n\treturn 3\n}\n",
+        )
+        .unwrap();
+
+        let result = analyze_diff_at_root(
+            root,
+            AnalyzeDiffParams::default(),
+            &DiffAnalysisOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(common.to_string(), result.endpoints.base);
+        assert_eq!(WORKTREE_ENDPOINT, result.endpoints.target);
+        assert_eq!(feature_head, repo.head().unwrap().target().unwrap());
+        assert!(
+            result
+                .patch_symbols
+                .edited
+                .iter()
+                .any(|pair| pair.after.name == "Existing"),
+            "the implicit diff must include committed feature-branch changes"
+        );
+    }
 
     /// The working-tree sentinel (`target: None`) must report the same
     /// `patch_symbols`/`dependency_symbols` as an equivalent explicit target,
@@ -2832,11 +4805,121 @@ mod tests {
         );
     }
 
+    /// A two-commit Go module whose second commit makes `pkga` start importing
+    /// `pkgb`, so a committed endpoint's import expansion must follow the new
+    /// `import "repro/pkgb"`. Returns the second commit.
+    fn go_import_expansion_repo(root: &Path) -> Oid {
+        let repo = test_repo::init_repo(root);
+        fs::write(root.join("go.mod"), "module repro\n\ngo 1.21\n").unwrap();
+        fs::create_dir_all(root.join("pkga")).unwrap();
+        fs::create_dir_all(root.join("pkgb")).unwrap();
+        fs::write(
+            root.join("pkga/a.go"),
+            "package pkga\n\nfunc helper() int { return 1 }\nfunc Caller() int { return helper() }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("pkgb/b.go"),
+            "package pkgb\n\nfunc MakeThing(x int) int { return x }\n",
+        )
+        .unwrap();
+        test_repo::commit_all(&repo, "commit 1");
+        fs::write(
+            root.join("pkga/a.go"),
+            "package pkga\n\nimport \"repro/pkgb\"\n\nfunc helper() int { return 1 }\nfunc Caller() int { return helper() + pkgb.MakeThing(2) }\n",
+        )
+        .unwrap();
+        test_repo::commit_all(&repo, "commit 2")
+    }
+
+    /// Materialize the changed-file-scoped image of `commit`, whose export runs
+    /// the import expansion, and report the files the expansion settled on.
+    fn expanded_image_files(
+        repo: &Repository,
+        commit: Oid,
+        cache: Option<&SharedAnalyzerCache>,
+    ) -> BTreeSet<PathBuf> {
+        let paths = ["pkga/a.go".to_string()];
+        let image =
+            RevisionImage::materialize(repo, Snapshot::Commit(commit), Some(&paths), &[], cache)
+                .unwrap();
+        image.files().iter().cloned().collect()
+    }
+
+    fn cache_row_count(root: &Path, table: &str) -> i64 {
+        rusqlite::Connection::open(crate::analyzer::store::analyzer_db_path(root))
+            .expect("open the shared analyzer cache")
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .expect("count cache rows")
+    }
+
+    /// A committed endpoint's import expansion parses the diff's own changed
+    /// files, and those parses describe blobs of the revision, so they belong in
+    /// the repository's shared cache: a second identical materialization must
+    /// publish nothing.
+    #[test]
+    fn snapshot_import_expansion_reuses_the_shared_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let head = go_import_expansion_repo(root);
+        let repo = Repository::open(root).unwrap();
+        let cache = SharedAnalyzerCache::open(root).expect("the fixture is a git repository");
+
+        let cold = expanded_image_files(&repo, head, Some(&cache));
+        let after_cold = cache_row_count(root, "blobs");
+        let warm = expanded_image_files(&repo, head, Some(&cache));
+        let after_warm = cache_row_count(root, "blobs");
+        drop(cache);
+
+        assert!(
+            cold.contains(Path::new("pkgb/b.go")),
+            "the expansion must follow the new import into pkgb: {cold:?}"
+        );
+        assert_eq!(cold, warm, "warm and cold must select the same image");
+        assert!(
+            after_cold > 0,
+            "a cold expansion publishes the changed file's parsed blob"
+        );
+        assert_eq!(
+            after_cold, after_warm,
+            "a warm expansion must publish no new blobs"
+        );
+        // Both export directories are gone, so any surviving workspace row
+        // names a path that no longer exists.
+        assert_eq!(0, cache_row_count(root, "workspace_heads"));
+        assert_eq!(0, cache_row_count(root, "workspace_revisions"));
+        assert_eq!(0, cache_row_count(root, "workspace_file_versions"));
+    }
+
+    /// The fallback a host without a usable persisted cache takes: the same
+    /// expansion runs against an ephemeral store and must select the same image.
+    #[test]
+    fn snapshot_import_expansion_without_a_cache_selects_the_same_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let head = go_import_expansion_repo(root);
+        let repo = Repository::open(root).unwrap();
+
+        let fallback = expanded_image_files(&repo, head, None);
+        let cache = SharedAnalyzerCache::open(root).expect("the fixture is a git repository");
+        let shared = expanded_image_files(&repo, head, Some(&cache));
+        drop(cache);
+
+        assert_eq!(fallback, shared);
+        assert!(
+            cache_row_count(root, "blobs") > 0,
+            "the shared run must have used the cache"
+        );
+    }
+
     /// A changed file that starts calling a function in an untouched sibling
     /// package: `MakeThing`'s own file was never part of the diff, so
     /// resolving the call and attaching its full definition both depend on
-    /// `import_expansion_targets` following the new `import "repro/pkgb"` to
-    /// `pkgb`'s directory and exporting it alongside the diff's own files.
+    /// `snapshot_import_expansion_targets` following the new `import
+    /// "repro/pkgb"` to `pkgb`'s directory and exporting it alongside the
+    /// diff's own files.
     #[test]
     fn dependency_symbols_includes_a_newly_called_function_in_an_untouched_package() {
         let dir = tempfile::tempdir().unwrap();
@@ -3235,10 +5318,8 @@ mod tests {
     /// symbol body takes. The df pool is just the two bodies, the smallest
     /// diff-local pool a scored pair can occur in.
     fn similarity(a_name: &str, a_src: &str, b_name: &str, b_src: &str) -> f64 {
-        let lines_a = a_src.lines().count();
-        let lines_b = b_src.lines().count();
-        let a = body_token_signature(a_src, a_name, 1, lines_a).unwrap();
-        let b = body_token_signature(b_src, b_name, 1, lines_b).unwrap();
+        let a = body_token_signature_for_bytes(a_src, a_name, 0, a_src.len()).unwrap();
+        let b = body_token_signature_for_bytes(b_src, b_name, 0, b_src.len()).unwrap();
         let idf = diff_local_idf([a.as_slice(), b.as_slice()].into_iter());
         body_similarity(&a, &b, &idf)
     }
@@ -3404,23 +5485,34 @@ mod tests {
     }
 
     #[test]
-    fn body_token_signature_rejects_trivial_and_degenerate_ranges() {
+    fn body_token_signature_rejects_trivial_and_degenerate_byte_ranges() {
         let src = accumulate_body("f", "sum");
-        let n = src.lines().count();
-        assert!(body_token_signature(&src, "f", 1, n).is_some());
+        assert!(body_token_signature_for_bytes(&src, "f", 0, src.len()).is_some());
         // One non-blank line is too weak a fingerprint.
         assert_eq!(
-            body_token_signature("pub fn f() { done() }\n", "f", 1, 1),
+            body_token_signature_for_bytes(
+                "pub fn f() { done() }\n",
+                "f",
+                0,
+                "pub fn f() { done() }\n".len(),
+            ),
             None
         );
         // Degenerate ranges are rejected, not panicked on.
-        assert_eq!(body_token_signature(&src, "f", 0, n), None);
-        assert_eq!(body_token_signature(&src, "f", 5, 1), None);
+        assert_eq!(body_token_signature_for_bytes(&src, "f", 5, 1), None);
+        assert_eq!(
+            body_token_signature_for_bytes(&src, "f", src.len(), src.len() + 1),
+            None
+        );
     }
 
     fn snap_src(fqn: &str, name: &str, path: &str, src: &str) -> SymbolSnapshot {
-        let n = src.lines().count();
-        snapshot(fqn, name, path, body_token_signature(src, name, 1, n))
+        snapshot(
+            fqn,
+            name,
+            path,
+            body_token_signature_for_bytes(src, name, 0, src.len()),
+        )
     }
 
     /// The third pairing rule (RM-style move detection): a symbol relocated to a
@@ -3940,5 +6032,62 @@ mod entry_point_tests {
                 "`{name}` must be rejected"
             );
         }
+    }
+
+    /// A whole-revision export analyzes through the primary repository's shared
+    /// content-addressed cache, and the rows naming its self-deleting export
+    /// directory are gone once the workspace drops. The parsed blob facts the
+    /// same build published are keyed by content and stay: those are the asset
+    /// the next request reuses.
+    #[test]
+    fn a_revision_export_workspace_answers_and_then_drops_its_projection() {
+        let temp = tempfile::tempdir().expect("temporary repository");
+        let root = temp.path();
+        two_commit_repo(root);
+
+        let export = export_revision(root, "HEAD").expect("export HEAD");
+        // Resolved while the export directory still exists: the identity
+        // canonicalizes its root, exactly as the claim did.
+        let export_identity = brokk_bifrost_core::gitblob::workspace_cache_identity(export.root());
+        let workspace = export.build_workspace(root).expect("revision workspace");
+
+        let names = {
+            let analyzer = workspace.workspace().analyzer();
+            let _scope = AnalyzerQueryScope::new(analyzer);
+            analyzer
+                .all_declarations()
+                .map(|unit| unit.fq_name())
+                .collect::<BTreeSet<_>>()
+        };
+        assert!(
+            names.iter().any(|name| name.ends_with("Existing")),
+            "the export's analyzer must answer over the exported files: {names:?}"
+        );
+
+        drop(workspace);
+        drop(export);
+
+        let connection = rusqlite::Connection::open(crate::analyzer::store::analyzer_db_path(root))
+            .expect("open the shared analyzer cache");
+        let workspaces: BTreeSet<String> = {
+            let mut statement = connection
+                .prepare("SELECT DISTINCT workspace_id FROM workspace_heads")
+                .expect("prepare workspace listing");
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .expect("query workspace listing");
+            rows.map(|row| row.expect("read workspace id")).collect()
+        };
+        assert!(
+            !workspaces.contains(&export_identity),
+            "the export's workspace rows must not outlive it: {workspaces:?}"
+        );
+        let blobs: i64 = connection
+            .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
+            .expect("count cached blobs");
+        assert!(
+            blobs > 0,
+            "the export must have published its parsed blob facts to the shared cache"
+        );
     }
 }

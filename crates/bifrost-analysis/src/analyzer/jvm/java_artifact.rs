@@ -630,6 +630,7 @@ pub(super) fn java_api_facts(
                 is_static: member.is_static,
                 is_abstract: member.is_abstract,
                 is_virtual: member.is_virtual,
+                callable_family_complete: false,
                 signature: member.signature,
                 receiver: None,
                 extension_receiver: None,

@@ -85,8 +85,12 @@ use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_kotlin_bounded,
 };
 use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_kotlin_type_bounded};
+use crate::analyzer::usages::inverted_edges::{
+    UsageEdgesCache, cached_dead_code_usage_edges, weight_usage_edges,
+};
 use crate::analyzer::usages::kotlin_graph::{
-    KotlinUsageGraphStrategy, build_inbound_kotlin_usage_edges, build_kotlin_usage_edge_weights,
+    KotlinUsageGraphStrategy, build_inbound_kotlin_usage_edges_with_completeness,
+    build_kotlin_usage_edge_weights,
 };
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::weighted_cache::{
@@ -130,6 +134,10 @@ pub struct KotlinAnalyzer {
     realm_imported_code_units: Cache<ProjectFile, Arc<HashSet<CodeUnit>>>,
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
+    /// Coarse import targets projected directly to files. Built before the
+    /// parallel file-graph walk so that a large Kotlin workspace does not run
+    /// one bounded definition query per import.
+    file_dependency_index: Arc<OnceLock<imports::KotlinFileDependencyIndex>>,
     same_package_reference_index:
         Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
     top_level_declarations_by_package: Arc<OnceLock<HashMap<String, Arc<Vec<CodeUnit>>>>>,
@@ -155,11 +163,20 @@ pub struct KotlinAnalyzer {
             crate::analyzer::DirectDescendantIndex,
         >,
     >,
+    dead_code_usage_edges: UsageEdgesCache,
 }
 
 crate::analyzer::impl_forward_query_provider!(KotlinAnalyzer);
 
 impl KotlinAnalyzer {
+    #[cfg(test)]
+    pub(crate) fn relational_batch_reader_checkouts_for_test(&self) -> usize {
+        self.inner
+            .analyzer_store()
+            .relational_batch_counts_for_test()
+            .0
+    }
+
     pub fn new(project: Arc<dyn Project>) -> Self {
         Self::new_with_config(project, AnalyzerConfig::default())
     }
@@ -223,6 +240,7 @@ impl KotlinAnalyzer {
             realm_imported_code_units: build_weighted_cache(memo_budget / 8, weight_code_unit_set),
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
+            file_dependency_index: Arc::new(OnceLock::new()),
             same_package_reference_index: Arc::new(PoolSafeMemo::new()),
             top_level_declarations_by_package: Arc::new(OnceLock::new()),
             direct_ancestors: build_weighted_cache(memo_budget / 16, weight_code_unit_vec_by_unit),
@@ -232,6 +250,7 @@ impl KotlinAnalyzer {
             ),
             direct_descendant_index: Arc::new(KeyedPoolSafeMemo::new()),
             realm_direct_descendant_index: Arc::new(KeyedPoolSafeMemo::new()),
+            dead_code_usage_edges: build_weighted_cache(memo_budget / 8, weight_usage_edges),
         }
     }
 
@@ -773,6 +792,15 @@ impl IAnalyzer for KotlinAnalyzer {
         self.external_index.get().is_some()
     }
 
+    fn external_dispatch_behavior_identity(
+        &self,
+    ) -> Option<crate::analyzer::semantic::StableDigest> {
+        Some(
+            self.external_declaration_index()
+                .dispatch_behavior_identity(),
+        )
+    }
+
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
         // Every import- and package-derived index is rebuilt from the new
         // generation: an edit anywhere can add, remove, or rename a
@@ -844,6 +872,17 @@ impl IAnalyzer for KotlinAnalyzer {
 
     fn contains_tests(&self, file: &ProjectFile) -> bool {
         self.inner.contains_tests(file)
+    }
+
+    fn contains_tests_for_changed_file(&self, file: &ProjectFile) -> bool {
+        let contains_tests = self.contains_tests(file);
+        if contains_tests || file_language(file) != Language::Kotlin {
+            return contains_tests;
+        }
+        let Ok(source) = self.inner.project().read_source(file) else {
+            return false;
+        };
+        brokk_bifrost_jvm::kotlin::test_detection::kotlin_changed_file_contains_tests(file, &source)
     }
 
     fn in_test_region(&self, code_unit: &CodeUnit) -> bool {
@@ -979,10 +1018,17 @@ impl DeadCodeBulkProof for KotlinDeadCodeBulk {
         analyzer: &dyn IAnalyzer,
         candidates: &[CodeUnit],
     ) -> Option<DeadCodeBulkEdges> {
-        let scope = AnalyzerQueryScope::new(analyzer);
+        let cancellation = analyzer.active_query_cancellation().unwrap_or_default();
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        let _scope = AnalyzerQueryScope::with_cancellation(analyzer, &cancellation);
+        let kotlin = resolve_analyzer::<KotlinAnalyzer>(analyzer)?;
         let callees = candidate_fqns(candidates);
-        build_inbound_kotlin_usage_edges(analyzer, scope.token(), &callees)
-            .map(|edges| DeadCodeBulkEdges::Fqn(Arc::new(edges)))
+        cached_dead_code_usage_edges(analyzer, &kotlin.dead_code_usage_edges, &callees, |token| {
+            build_inbound_kotlin_usage_edges_with_completeness(analyzer, token, &callees)
+        })
+        .map(DeadCodeBulkEdges::Fqn)
     }
 }
 
@@ -996,6 +1042,14 @@ impl LanguageSupport for KotlinSupport {
     /// already use.
     fn call_callee_node<'t>(&self, call: Node<'t>) -> Option<Node<'t>> {
         syntax::kotlin_callee(call)
+    }
+
+    /// No Kotlin declaration names its identifier with a field either, so the header
+    /// token is read positionally. Without this, name selection falls through to a text
+    /// search over the whole declaration and can answer with a same-named occurrence in
+    /// the body, such as `this.offset` inside `fun offset` (#2712).
+    fn declaration_name_node<'t>(&self, declaration: Node<'t>) -> Option<Node<'t>> {
+        syntax::kotlin_declaration_name(declaration)
     }
 
     /// The argument list is `value_arguments`, which an ordinary call nests one level
@@ -1149,5 +1203,31 @@ impl StructuralReceiverResolver for KotlinSupport {
             query.budget,
             query.cancellation,
         )
+    }
+}
+
+#[cfg(test)]
+mod dead_code_cache_tests {
+    use super::*;
+    use crate::analyzer::usages::inverted_edges::UsageEdges;
+    use crate::inline_project::InlineTestProject;
+
+    #[test]
+    fn update_all_update_and_overlay_clone_start_with_empty_dead_code_caches() {
+        let fixture = InlineTestProject::with_language(Language::Kotlin)
+            .file("A.kt", "class A")
+            .build();
+        let analyzer = KotlinAnalyzer::from_project(fixture.project().clone());
+        let key: Arc<[String]> = vec!["A".to_string()].into();
+        analyzer
+            .dead_code_usage_edges
+            .insert(key.clone(), Arc::new(UsageEdges::default()));
+
+        let updated = analyzer.update(&std::collections::BTreeSet::new());
+        assert!(updated.dead_code_usage_edges.get(&key).is_none());
+        let rebuilt = analyzer.update_all();
+        assert!(rebuilt.dead_code_usage_edges.get(&key).is_none());
+        let overlay = analyzer.clone_with_project(fixture.project_dyn());
+        assert!(overlay.dead_code_usage_edges.get(&key).is_none());
     }
 }

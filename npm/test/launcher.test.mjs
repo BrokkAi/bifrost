@@ -32,14 +32,14 @@ test("selects each published native package", () => {
   assert.equal(platformPackageName("darwin", "arm64"), "@brokkai/bifrost-darwin-universal");
   assert.equal(platformPackageName("darwin", "x64"), "@brokkai/bifrost-darwin-universal");
   assert.equal(platformPackageName("linux", "x64", "gnu"), "@brokkai/bifrost-linux-x64-gnu");
-  assert.equal(platformPackageName("linux", "x64", "musl"), "@brokkai/bifrost-linux-x64-musl");
   assert.equal(platformPackageName("linux", "arm64", "gnu"), "@brokkai/bifrost-linux-arm64-gnu");
   assert.equal(platformPackageName("android", "arm64"), "@brokkai/bifrost-android-arm64");
   assert.equal(platformPackageName("win32", "x64"), "@brokkai/bifrost-win32-x64");
   assert.equal(platformPackageName("win32", "arm64"), "@brokkai/bifrost-win32-arm64");
 });
 
-test("rejects an unsupported platform", () => {
+test("rejects unsupported musl platforms", () => {
+  assert.throws(() => platformPackageName("linux", "x64", "musl"), /does not publish/);
   assert.throws(() => platformPackageName("linux", "arm64", "musl"), /does not publish/);
 });
 

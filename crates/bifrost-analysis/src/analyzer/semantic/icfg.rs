@@ -8,7 +8,8 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::sync::Arc;
 
-use crate::analyzer::WorkspaceAnalyzer;
+use crate::analyzer::semantic_model::{ActiveSemanticModelSnapshot, ProcedureSummaryMemberKey};
+use crate::analyzer::{DispatchHierarchyExpansion, Language, WorkspaceAnalyzer};
 use crate::hash::{HashMap, HashSet};
 
 use super::cfg_algorithms::{
@@ -19,16 +20,113 @@ use super::workspace_oracle::{
     WorkspaceSemanticOracle, exact_source_for_procedure, semantic_locator_work,
 };
 use super::{
-    CallContinuationKind, CallSiteHandle, CallSiteId, ControlContinuation, ControlEdgeKind,
-    DeferredInvocationKind, DispatchBoundary, DispatchBoundaryKind, DispatchOracle, DispatchResult,
-    EvidenceCompleteness, EvidenceHandle, FormalMultiplicity, OracleLimits, OracleRelationArena,
-    OracleRelationHandle, OracleRelationId, OracleRelationKind, OracleRelationOwner,
-    OracleRelationRecord, OracleRelationSubject, ProcedureHandle, ProcedureInvocationKind,
-    ProgramPointHandle, ProgramPointId, ProofStatus, SemanticBudgetExceeded, SemanticCallSite,
-    SemanticCapability, SemanticGap, SemanticGapDischarge, SemanticGapImpact, SemanticGapKind,
-    SemanticGapSubject, SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticValue,
-    SemanticValueKind, SemanticWork,
+    CallContinuationKind, CallSiteHandle, CallSiteId, CandidateCoverage, ControlContinuation,
+    ControlEdgeKind, DeferredInvocationKind, DispatchBoundary, DispatchBoundaryKind,
+    DispatchOracle, DispatchResult, EvidenceCompleteness, EvidenceHandle, FormalMultiplicity,
+    LengthDelimitedDigest, OracleLimits, OracleRelationArena, OracleRelationHandle,
+    OracleRelationId, OracleRelationKind, OracleRelationOwner, OracleRelationRecord,
+    OracleRelationSubject, ProcedureHandle, ProcedureInvocationKind, ProgramPointHandle,
+    ProgramPointId, ProofStatus, SemanticBudgetExceeded, SemanticCallSite, SemanticCapability,
+    SemanticGap, SemanticGapDischarge, SemanticGapImpact, SemanticGapKind, SemanticGapSubject,
+    SemanticLanguage, SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticValue,
+    SemanticValueKind, SemanticWork, StableDigest,
 };
+
+const DEFAULT_ICFG_PROVIDER_BEHAVIOR_DOMAIN: &[u8] = b"bifrost-icfg-provider/default-behavior/v1";
+const WORKSPACE_ICFG_PROVIDER_BEHAVIOR_DOMAIN: &[u8] =
+    b"bifrost-icfg-provider/workspace-behavior/v3";
+
+/// Whether this first authored non-return consumer has an unambiguous call
+/// identity and immediate-invocation contract for `language`.
+///
+/// The external member key intentionally collapses same-arity overloads, and
+/// an unmaterialized boundary does not carry async/generator invocation
+/// semantics. Go has neither overloads nor deferred callable invocation at an
+/// emitted outer call site: spawned calls are withheld by lowering, while a
+/// supported `defer` emits its call only on the cleanup route where it really
+/// executes. Broaden this predicate only with an equally structured proof.
+const fn supports_authored_normal_continuation_absence(language: SemanticLanguage) -> bool {
+    matches!(language, SemanticLanguage::Standard(Language::Go))
+}
+
+/// Stable identity of every input that can change one provider's ICFG topology.
+///
+/// Providers whose behavior varies independently of their semantic artifacts
+/// must override [`IcfgProvider::behavior_identity`]. The default preserves one
+/// conservative identity for stateless providers and existing test fakes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct IcfgProviderBehaviorIdentity(StableDigest);
+
+impl IcfgProviderBehaviorIdentity {
+    pub fn hash_bytes(bytes: impl AsRef<[u8]>) -> Self {
+        Self(StableDigest::sha256(bytes))
+    }
+
+    pub const fn digest(self) -> StableDigest {
+        self.0
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        self.0.as_bytes()
+    }
+
+    fn workspace(
+        workspace: &WorkspaceAnalyzer,
+        hierarchy_expansion: DispatchHierarchyExpansion,
+        snapshot: Option<&ActiveSemanticModelSnapshot>,
+    ) -> Self {
+        let mut digest = LengthDelimitedDigest::new(WORKSPACE_ICFG_PROVIDER_BEHAVIOR_DOMAIN);
+        match snapshot {
+            Some(snapshot) => {
+                digest.push(b"active-semantic-model-set");
+                digest.push(snapshot.active_models().active_model_set_hash().as_bytes());
+                if snapshot.semantic_model_overlay().is_some() {
+                    digest.push(b"semantic-model-overlay-present");
+                } else {
+                    digest.push(b"semantic-model-overlay-absent");
+                }
+            }
+            None => digest.push(b"no-active-semantic-model-set"),
+        }
+        digest.push(b"dispatch-hierarchy-expansion");
+        digest.push(if hierarchy_expansion.concrete_overrides {
+            b"concrete-overrides"
+        } else {
+            b"off"
+        });
+        // Dispatch can materialize any compatible declaration in the analyzer,
+        // not only procedures from the root artifact. Bind the exact analyzed
+        // file-set, language composition, epochs, and configuration through
+        // their stable content identity. A pointer or generation would prevent
+        // valid reuse across equivalent analyzer snapshots without proving the
+        // target universes equal.
+        match workspace.analyzer().workspace_content_identity() {
+            Some(identity) => {
+                digest.push(b"workspace-dispatch-universe");
+                digest.push(identity.digest().as_bytes());
+            }
+            None => {
+                // Every production language analyzer publishes a content
+                // identity. Only a workspace with no language delegates has a
+                // genuinely empty dispatch universe that is safe to name with
+                // one shared marker.
+                assert!(
+                    workspace.analyzer().languages().is_empty(),
+                    "a nonempty workspace analyzer must state a content identity for ICFG caching"
+                );
+                digest.push(b"empty-workspace-dispatch-universe");
+            }
+        }
+        match workspace.analyzer().external_dispatch_behavior_identity() {
+            Some(identity) => {
+                digest.push(b"external-dispatch-surface");
+                digest.push(identity.as_bytes());
+            }
+            None => digest.push(b"no-external-dispatch-surface"),
+        }
+        Self(digest.finish())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CallTransfer {
@@ -59,6 +157,7 @@ pub struct CallBoundary {
 pub struct CallTransferSet {
     pub transfers: Box<[CallTransfer]>,
     pub boundaries: Box<[CallBoundary]>,
+    pub coverage: CandidateCoverage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -115,6 +214,7 @@ pub struct IcfgExitProfile {
     gap_reason: Option<Box<str>>,
     matched_return_has_gaps: bool,
     matched_return_gap_reason: Option<Box<str>>,
+    matched_return_gaps_are_implicit_abort_only: bool,
     // `SemanticOutcome` has no representation for a retained payload whose
     // quality is specifically truncated without attributing that truncation
     // to the current request budget. Keep the exact local quality so the
@@ -162,6 +262,18 @@ impl IcfgExitProfile {
         }
     }
 
+    /// Whether every gap weakening this matched return is an unlowered
+    /// implicit-abort edge that its producer marked non-rejoining, with at
+    /// least one such gap.
+    ///
+    /// The profile retains this structured classification because its rendered
+    /// reason is diagnostic text, not an analysis interface. A caller may
+    /// discharge these gaps only after proving that no abort route in its
+    /// analyzed region runs user code.
+    pub const fn matched_return_gaps_are_implicit_abort_only(&self) -> bool {
+        self.matched_return_gaps_are_implicit_abort_only
+    }
+
     /// Project this callee-local exit through one exact incoming call.
     pub fn project_matched_return(
         &self,
@@ -174,7 +286,13 @@ impl IcfgExitProfile {
 /// Exact result of matching one profiled callee exit to one incoming call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MatchedReturnProjection {
-    Edge(ProcedureIcfgEdge),
+    Edge {
+        /// Exact return edge projected into the caller.
+        edge: ProcedureIcfgEdge,
+        /// Whether the exit profile is the only source weakening this edge,
+        /// and all of its matched-return gaps are implicit aborts.
+        implicit_abort_only: bool,
+    },
     Absent,
     Boundary(ProcedureIcfgBoundary),
 }
@@ -188,6 +306,11 @@ pub struct CallToReturnProjection {
 }
 
 pub trait IcfgProvider: DispatchOracle {
+    /// Stable identity of provider state that can change emitted topology.
+    fn behavior_identity(&self) -> IcfgProviderBehaviorIdentity {
+        IcfgProviderBehaviorIdentity::hash_bytes(DEFAULT_ICFG_PROVIDER_BEHAVIOR_DOMAIN)
+    }
+
     fn call_transfers(
         &self,
         caller: &ProcedureHandle,
@@ -219,15 +342,44 @@ pub trait IcfgProvider: DispatchOracle {
 }
 
 /// One provider is tied to one [`WorkspaceAnalyzer`] generation.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct WorkspaceIcfgProvider<'a> {
     oracle: WorkspaceSemanticOracle<'a>,
+    active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
+    behavior_identity: IcfgProviderBehaviorIdentity,
 }
 
 impl<'a> WorkspaceIcfgProvider<'a> {
     pub fn new(workspace: &'a WorkspaceAnalyzer) -> Self {
+        Self::with_active_semantic_model_snapshot(
+            workspace,
+            workspace.analyzer().active_semantic_model_snapshot(),
+        )
+    }
+
+    /// Bind this provider to an active-model snapshot already captured by its
+    /// request owner.
+    ///
+    /// This keeps several semantic consumers in one request on one model
+    /// identity even if a later activation publishes a new analyzer overlay.
+    pub fn with_active_semantic_model_snapshot(
+        workspace: &'a WorkspaceAnalyzer,
+        snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
+    ) -> Self {
+        let semantic_model_overlay = snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.semantic_model_overlay().map(Arc::clone));
+        let oracle =
+            WorkspaceSemanticOracle::with_semantic_model_overlay(workspace, semantic_model_overlay);
+        let behavior_identity = IcfgProviderBehaviorIdentity::workspace(
+            workspace,
+            oracle.hierarchy_expansion(),
+            snapshot.as_deref(),
+        );
         Self {
-            oracle: WorkspaceSemanticOracle::new(workspace),
+            oracle,
+            active_semantic_model_snapshot: snapshot,
+            behavior_identity,
         }
     }
 
@@ -615,6 +767,11 @@ struct SnapshotBuilder {
     nodes: Vec<IcfgNodeKey>,
     edges: Vec<IcfgEdge>,
     edge_set: HashSet<IcfgEdge>,
+    /// Every caller-side continuation already published, whichever projection
+    /// published it. A dispatch boundary and a matched return can name the
+    /// same continuation of the same call, and the two rows differ only in the
+    /// boundary they carry, so plain edge deduplication would keep both.
+    call_to_return_edges: HashSet<(IcfgNodeId, IcfgNodeId, IcfgEdgeKind)>,
     boundaries: Vec<IcfgBoundary>,
     queue: VecDeque<IcfgNodeId>,
     exit_profiles: HashMap<
@@ -635,6 +792,7 @@ impl SnapshotBuilder {
             nodes: Vec::new(),
             edges: Vec::new(),
             edge_set: HashSet::default(),
+            call_to_return_edges: HashSet::default(),
             boundaries: Vec::new(),
             queue: VecDeque::new(),
             exit_profiles: HashMap::default(),
@@ -922,6 +1080,10 @@ impl DispatchOracle for WorkspaceIcfgProvider<'_> {
     }
 }
 impl IcfgProvider for WorkspaceIcfgProvider<'_> {
+    fn behavior_identity(&self) -> IcfgProviderBehaviorIdentity {
+        self.behavior_identity
+    }
+
     fn call_transfers(
         &self,
         caller: &ProcedureHandle,
@@ -943,14 +1105,38 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
         let mapped = try_map_semantic_outcome(dispatch_outcome, |dispatch| {
             let mut transfers = Vec::new();
             let mut additional_work = SemanticWork::default();
-            let (candidates, dispatch_boundaries, _) = dispatch.into_parts();
+            let (candidates, dispatch_boundaries, coverage) = dispatch.into_parts();
             let mut boundaries = dispatch_boundaries
                 .into_vec()
                 .into_iter()
-                .map(|dispatch| CallBoundary {
-                    origin: origin.clone(),
-                    dispatch,
-                    model: CallToReturnModel::NormalAndExceptional,
+                .map(|dispatch| {
+                    let normal_continuation_absent = dispatch
+                        .unmaterialized_external_target()
+                        .is_some_and(|target| {
+                            supports_authored_normal_continuation_absence(target.language())
+                                && self.active_semantic_model_snapshot.as_deref().is_some_and(
+                                    |snapshot| {
+                                        snapshot.active_models().proves_normal_continuation_absent(
+                                            ProcedureSummaryMemberKey::new(
+                                                target.language().semantic_pack_label(),
+                                                target.owner_fqn(),
+                                                target.member(),
+                                                target.has_receiver(),
+                                                target.arity(),
+                                            ),
+                                        )
+                                    },
+                                )
+                        });
+                    CallBoundary {
+                        origin: origin.clone(),
+                        dispatch,
+                        model: if normal_continuation_absent {
+                            CallToReturnModel::Exceptional
+                        } else {
+                            CallToReturnModel::NormalAndExceptional
+                        },
+                    }
                 })
                 .collect::<Vec<_>>();
             for candidate in candidates.into_vec() {
@@ -1037,6 +1223,7 @@ impl IcfgProvider for WorkspaceIcfgProvider<'_> {
             let mut transfer_set = CallTransferSet {
                 transfers: transfers.into_boxed_slice(),
                 boundaries: boundaries.into_boxed_slice(),
+                coverage,
             };
             additional_work = sum_semantic_work(
                 additional_work,
@@ -1882,6 +2069,7 @@ fn materialize_exit_profile(
     let mut quality = SnapshotQuality::Complete;
     let mut gap_reason_bytes = 0usize;
     let mut matched_return_gap_reason_bytes = 0usize;
+    let mut matched_return_gaps_are_implicit_abort_only = true;
     for gap in semantics.gaps() {
         if request.cancellation.is_cancelled() {
             return Ok(SemanticOutcome::Cancelled {
@@ -1897,6 +2085,11 @@ fn materialize_exit_profile(
             .saturating_add(semantic_gap_reason_entry_bytes(gap, return_gap_count > 0));
         return_gap_count = return_gap_count.saturating_add(1);
         if is_matched_return_gap(gap) {
+            matched_return_gaps_are_implicit_abort_only &= gap.discharge
+                == SemanticGapDischarge::NonRejoiningExceptionalExit
+                && crate::analyzer::semantic::workspace_oracle::implicit_abort_gap_is_discharged(
+                    gap, false,
+                );
             matched_return_gap_reason_bytes = matched_return_gap_reason_bytes.saturating_add(
                 semantic_gap_reason_entry_bytes(gap, matched_return_gap_count > 0),
             );
@@ -1985,6 +2178,8 @@ fn materialize_exit_profile(
         gap_reason,
         matched_return_has_gaps: matched_return_gap_count > 0,
         matched_return_gap_reason,
+        matched_return_gaps_are_implicit_abort_only: matched_return_gap_count > 0
+            && matched_return_gaps_are_implicit_abort_only,
         quality,
     };
     Ok(exit_profile_outcome(profile, quality, total_work))
@@ -2161,19 +2356,31 @@ fn link_boundary_continuations(
     let projection = project_call_boundary(key.point.procedure(), semantic_call, boundary)?;
     for edge in projection.edges {
         debug_assert_eq!(edge.source, key.point);
-        builder.link(
+        let kind = edge.kind;
+        let linked = builder.link(
             source,
             TraversalKey {
                 point: edge.target,
                 frames: key.frames.clone(),
             },
-            edge.kind,
+            kind,
             edge.origin,
             edge.proof,
             edge.completeness,
             edge.boundary,
             request,
         )?;
+        // A matched return through a resolved target of the same call must not
+        // publish a second row for a continuation this boundary already owns.
+        if let Some(target) = linked
+            && matches!(
+                kind,
+                IcfgEdgeKind::CallToNormalContinuation
+                    | IcfgEdgeKind::CallToExceptionalContinuation
+            )
+        {
+            builder.call_to_return_edges.insert((source, target, kind));
+        }
     }
     for boundary in projection.boundaries {
         debug_assert_eq!(boundary.at, key.point);
@@ -2209,23 +2416,29 @@ pub(crate) fn project_matched_return(
     match destination {
         ControlContinuation::Target(point) => {
             let (proof, completeness) = return_evidence(exit, incoming);
+            let implicit_abort_only = exit.matched_return_gaps_are_implicit_abort_only
+                && matches!(&incoming.proof, ProofStatus::Proven)
+                && matches!(&incoming.completeness, EvidenceCompleteness::Complete);
             let continuation = incoming
                 .origin
                 .procedure()
                 .point_handle(point)
                 .ok_or_else(|| SemanticProviderError::internal("return continuation is stale"))?;
-            Ok(MatchedReturnProjection::Edge(ProcedureIcfgEdge {
-                source: exit.callee_exit.clone(),
-                target: continuation,
-                kind: match exit.kind {
-                    ReturnTransferKind::Normal => IcfgEdgeKind::NormalReturn,
-                    ReturnTransferKind::Exceptional => IcfgEdgeKind::ExceptionalReturn,
+            Ok(MatchedReturnProjection::Edge {
+                edge: ProcedureIcfgEdge {
+                    source: exit.callee_exit.clone(),
+                    target: continuation,
+                    kind: match exit.kind {
+                        ReturnTransferKind::Normal => IcfgEdgeKind::NormalReturn,
+                        ReturnTransferKind::Exceptional => IcfgEdgeKind::ExceptionalReturn,
+                    },
+                    origin: Some(incoming.origin.clone()),
+                    proof,
+                    completeness,
+                    boundary: None,
                 },
-                origin: Some(incoming.origin.clone()),
-                proof,
-                completeness,
-                boundary: None,
-            }))
+                implicit_abort_only,
+            })
         }
         ControlContinuation::Absent => Ok(MatchedReturnProjection::Absent),
         state => Ok(MatchedReturnProjection::Boundary(ProcedureIcfgBoundary {
@@ -2322,17 +2535,19 @@ where
     builder.quality = merge_quality(builder.quality, profile.quality);
 
     match profile.project_matched_return(&frame.transfer)? {
-        MatchedReturnProjection::Edge(edge) => {
+        MatchedReturnProjection::Edge { edge, .. } => {
             debug_assert_eq!(edge.source, key.point);
-            let target_key = TraversalKey {
+            let caller_frames: Box<[CallFrame]> = key.frames[..key.frames.len() - 1]
+                .to_vec()
+                .into_boxed_slice();
+            let return_kind = edge.kind;
+            let continuation_key = TraversalKey {
                 point: edge.target,
-                frames: key.frames[..key.frames.len() - 1]
-                    .to_vec()
-                    .into_boxed_slice(),
+                frames: caller_frames,
             };
-            builder.link(
+            let continuation = builder.link(
                 node,
-                target_key,
+                continuation_key.clone(),
                 edge.kind,
                 edge.origin,
                 edge.proof,
@@ -2340,6 +2555,16 @@ where
                 edge.boundary,
                 request,
             )?;
+            if let Some(continuation) = continuation {
+                link_caller_side_continuation(
+                    builder,
+                    &frame.transfer,
+                    continuation_key,
+                    continuation,
+                    return_kind,
+                    request,
+                )?;
+            }
         }
         MatchedReturnProjection::Absent => {}
         MatchedReturnProjection::Boundary(boundary) => {
@@ -2353,6 +2578,77 @@ where
         }
     }
     Ok(true)
+}
+
+/// Link the caller's own control continuation across a resolved call whose
+/// matched return has just been projected (#1952, #2782).
+///
+/// A resolved call replaces the caller's scaffolding edge with call and
+/// matched-return transfers, so nothing in the bounded graph otherwise lets a
+/// caller-side value the callee neither receives nor returns survive the call.
+/// Summary tabulation projects this row for itself; a solver reading this
+/// snapshot had no way to, and its backward direction therefore lost every
+/// value-flow pair that spans a call.
+///
+/// The row is projected here, beside the matched return, rather than at the
+/// call, because the two must agree on when control resumes: a callee that
+/// never returns normally reaches no normal exit, so it yields neither a
+/// normal return nor a normal continuation.
+///
+/// The edge is the caller's own scaffolding, so its evidence is proven and
+/// complete, and it carries no dispatch boundary. `resolved_call_to_return` is
+/// what tells a solver whether to traverse it.
+fn link_caller_side_continuation(
+    builder: &mut SnapshotBuilder,
+    transfer: &CallTransfer,
+    continuation_key: TraversalKey,
+    continuation: IcfgNodeId,
+    return_kind: IcfgEdgeKind,
+    request: &mut SemanticRequest<'_>,
+) -> Result<(), SemanticProviderError> {
+    let kind = match return_kind {
+        IcfgEdgeKind::NormalReturn => IcfgEdgeKind::CallToNormalContinuation,
+        IcfgEdgeKind::ExceptionalReturn => IcfgEdgeKind::CallToExceptionalContinuation,
+        _ => return Ok(()),
+    };
+    let caller = transfer.origin.procedure();
+    let call_site = caller
+        .semantics()
+        .call_site(transfer.origin.id())
+        .ok_or_else(|| SemanticProviderError::internal("ICFG return origin call site is stale"))?;
+    let call_point = caller
+        .point_handle(call_site.point)
+        .ok_or_else(|| SemanticProviderError::internal("ICFG return origin point is stale"))?;
+    let call_key = TraversalKey {
+        point: call_point,
+        frames: continuation_key.frames.clone(),
+    };
+    // The callee was entered from this node, so it is already interned. An
+    // absent caller would mean the return context does not match the call the
+    // traversal came through, which `expand_return` has already rejected.
+    let source = builder.interner.get(&call_key).copied().ok_or_else(|| {
+        SemanticProviderError::internal("ICFG matched return has no calling node")
+    })?;
+    // A dispatch boundary at the same call already published this
+    // continuation, and that row reaches every problem. A second,
+    // boundary-free row for it would only duplicate the edge.
+    if !builder
+        .call_to_return_edges
+        .insert((source, continuation, kind))
+    {
+        return Ok(());
+    }
+    builder.link(
+        source,
+        continuation_key,
+        kind,
+        Some(transfer.origin.clone()),
+        ProofStatus::Proven,
+        EvidenceCompleteness::Complete,
+        None,
+        request,
+    )?;
+    Ok(())
 }
 
 fn add_local_edge(
@@ -2497,8 +2793,8 @@ mod tests {
         CallableDefinitionIdentity, retain_dispatch_candidate,
     };
     use crate::analyzer::semantic::{
-        CandidateCoverage, DeclarationSegment, DispatchCandidate, ProcedureKind, SemanticBudget,
-        SemanticGapId, SemanticGapImpacts,
+        DeclarationSegment, DispatchCandidate, ProcedureKind, SemanticBudget, SemanticGapId,
+        SemanticGapImpacts,
     };
     use crate::analyzer::{CodeUnit, CodeUnitType, ProjectFile};
     use crate::cancellation::CancellationToken;
@@ -3979,9 +4275,22 @@ void raii_caller() {
     }
 
     #[test]
-    fn workspace_icfg_provider_remains_copy() {
-        fn assert_copy<T: Copy>() {}
-        assert_copy::<WorkspaceIcfgProvider<'static>>();
+    fn workspace_icfg_provider_remains_clone() {
+        fn assert_clone<T: Clone>() {}
+        assert_clone::<WorkspaceIcfgProvider<'static>>();
+    }
+
+    #[test]
+    fn authored_normal_continuation_absence_starts_with_unambiguous_go_calls() {
+        assert!(supports_authored_normal_continuation_absence(
+            SemanticLanguage::Standard(Language::Go)
+        ));
+        assert!(
+            !supports_authored_normal_continuation_absence(SemanticLanguage::Standard(
+                Language::Java
+            )),
+            "same-arity overloads need an exact signature and immediate-invocation proof first"
+        );
     }
 
     #[test]
@@ -4185,7 +4494,9 @@ void raii_caller() {
             "invalid profile topology must not own semantic work"
         );
 
-        let MatchedReturnProjection::Edge(return_edge) = profile
+        let MatchedReturnProjection::Edge {
+            edge: return_edge, ..
+        } = profile
             .project_matched_return(&incoming)
             .expect("matched target return")
         else {
@@ -4197,6 +4508,51 @@ void raii_caller() {
         assert_eq!(return_edge.origin.as_ref(), Some(&incoming.origin));
         assert_eq!(return_edge.proof, incoming.proof);
         assert_eq!(return_edge.completeness, incoming.completeness);
+
+        let exceptional_exit = target
+            .point_handle(target.semantics().exceptional_exit_point())
+            .expect("target exceptional exit");
+        let abort_profile = IcfgExitProfile {
+            callee_entry: incoming.callee_entry.clone(),
+            callee_exit: exceptional_exit,
+            kind: ReturnTransferKind::Exceptional,
+            gap_reason: Some("unsupported exceptional_control_flow: implicit abort".into()),
+            matched_return_has_gaps: true,
+            matched_return_gap_reason: Some(
+                "unsupported exceptional_control_flow: implicit abort".into(),
+            ),
+            matched_return_gaps_are_implicit_abort_only: true,
+            quality: SnapshotQuality::Unsupported(SemanticCapability::ExceptionalControlFlow),
+        };
+        let projection_is_abort_only = |incoming: &CallTransfer| {
+            let MatchedReturnProjection::Edge {
+                implicit_abort_only,
+                ..
+            } = abort_profile
+                .project_matched_return(incoming)
+                .expect("implicit-abort exceptional return")
+            else {
+                panic!("target exceptional exit must project a return edge");
+            };
+            implicit_abort_only
+        };
+        assert!(
+            projection_is_abort_only(&incoming),
+            "a proven complete incoming transfer leaves only the implicit-abort weakening"
+        );
+        let mut unproven_incoming = incoming.clone();
+        unproven_incoming.proof = ProofStatus::Unproven("independent dispatch uncertainty".into());
+        assert!(
+            !projection_is_abort_only(&unproven_incoming),
+            "independently unproven incoming evidence must remain distinct"
+        );
+        let mut partial_incoming = incoming.clone();
+        partial_incoming.completeness =
+            EvidenceCompleteness::Partial("independent call-transfer gap".into());
+        assert!(
+            !projection_is_abort_only(&partial_incoming),
+            "independently partial incoming evidence must remain distinct"
+        );
 
         let mut mismatched_entry = incoming.clone();
         mismatched_entry.callee_entry = exit.clone();
@@ -4221,6 +4577,134 @@ void raii_caller() {
                 kind: CallContinuationKind::Normal,
                 state: ControlContinuation::Unknown,
             }
+        );
+    }
+
+    #[test]
+    fn go_implicit_abort_discharge_uses_the_gap_point_cleanup_scope() {
+        let fixture = AnalyzerFixture::new_for_language(
+            crate::analyzer::Language::Go,
+            &[(
+                "defer_abort_scope.go",
+                concat!(
+                    "package sample\n",
+                    "type resource struct{ value int }\n",
+                    "func cleanup(int) {}\n",
+                    "func first(resource *resource) { defer cleanup(resource.value) }\n",
+                    "func later(resource *resource) {\n",
+                    "    defer cleanup(0)\n",
+                    "    defer cleanup(resource.value)\n",
+                    "}\n",
+                ),
+            )],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "defer_abort_scope.go");
+        let cancellation = CancellationToken::default();
+        let mut materialization_budget = SemanticBudget::default();
+        let artifact = fixture
+            .analyzer
+            .materialize_program_semantics(
+                &file,
+                &mut SemanticRequest::new(&mut materialization_budget, &cancellation),
+            )
+            .expect("Go materialization")
+            .available_value()
+            .cloned()
+            .expect("Go artifact");
+        let find_procedure = |name| {
+            artifact
+                .procedures()
+                .iter()
+                .find(|procedure| {
+                    procedure
+                        .locator()
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(DeclarationSegment::name)
+                        == Some(name)
+                })
+                .and_then(|procedure| artifact.procedure_handle(procedure.id()))
+                .unwrap_or_else(|| panic!("missing {name} procedure"))
+        };
+        let selection_gap = |procedure: &ProcedureHandle| {
+            procedure
+                .semantics()
+                .gaps()
+                .iter()
+                .find(|gap| gap.detail.as_ref() == "selection may panic on a nil operand")
+                .cloned()
+                .unwrap_or_else(|| panic!("missing selector abort gap in {procedure:#?}"))
+        };
+        let first = find_procedure("first");
+        let later = find_procedure("later");
+        let first_gap = selection_gap(&first);
+        let later_gap = selection_gap(&later);
+        assert_eq!(
+            first_gap.discharge,
+            SemanticGapDischarge::NonRejoiningExceptionalExit,
+            "the first defer is not registered until after its field selection"
+        );
+        assert_eq!(
+            later_gap.discharge,
+            SemanticGapDischarge::ExitOnlyProcedureCompletion,
+            "the earlier defer can run on panic, but cannot resume this procedure's normal body"
+        );
+
+        for procedure in [&first, &later] {
+            assert!(
+                crate::analyzer::semantic::workspace_oracle::abort_paths_run_user_code(
+                    procedure.semantics()
+                ),
+                "the procedure-wide fallback sees deferred user code"
+            );
+        }
+        assert!(
+            crate::analyzer::semantic::workspace_oracle::implicit_abort_gap_is_discharged(
+                &first_gap, true,
+            ),
+            "a later cleanup elsewhere in the procedure must not open the first selection"
+        );
+        assert!(
+            !crate::analyzer::semantic::workspace_oracle::implicit_abort_gap_is_discharged(
+                &later_gap, true,
+            ),
+            "an already-active cleanup must keep the later selection open"
+        );
+
+        let provider = fixture.analyzer.icfg_provider();
+        let exit_profile = |procedure: &ProcedureHandle| {
+            let entry = procedure
+                .point_handle(procedure.semantics().entry_point())
+                .expect("procedure entry");
+            let exit = procedure
+                .point_handle(procedure.semantics().normal_exit_point())
+                .expect("procedure normal exit");
+            let mut budget = SemanticBudget::default();
+            provider
+                .exit_profile(
+                    &entry,
+                    &exit,
+                    &mut SemanticRequest::new(&mut budget, &cancellation),
+                )
+                .expect("normal exit profile")
+        };
+        let first_outcome = exit_profile(&first);
+        assert!(
+            matches!(&first_outcome, SemanticOutcome::Complete { .. }),
+            "the first deferred argument's pre-registration abort must discharge: {first_outcome:#?}"
+        );
+        let later_outcome = exit_profile(&later);
+        assert!(
+            matches!(&later_outcome, SemanticOutcome::Unsupported { .. }),
+            "the later field selection can abort through the earlier cleanup: {later_outcome:#?}"
+        );
+        assert!(
+            later_outcome
+                .available_value()
+                .and_then(IcfgExitProfile::aggregate_return_affecting_gap_reason)
+                .is_some_and(|reason| reason.contains("selection may panic on a nil operand")),
+            "the retained boundary must name the point-local selector gap: {later_outcome:#?}"
         );
     }
 
@@ -4386,7 +4870,7 @@ void raii_caller() {
             crate::analyzer::Language::Go,
             &[(
                 "entry_scope.go",
-                "package sample\nfunc mayPanic() {}\nfunc target() { defer mayPanic() }\n",
+                "package sample\nfunc target(callback func()) { defer callback() }\n",
             )],
         );
         let file = ProjectFile::new(fixture.project_root(), "entry_scope.go");

@@ -693,6 +693,7 @@ fn entry_facts(
                 is_static,
                 is_abstract,
                 is_virtual: kind == MemberKind::Method && !is_static && explicitly_virtual,
+                callable_family_complete: false,
                 signature,
                 receiver: None,
                 extension_receiver,

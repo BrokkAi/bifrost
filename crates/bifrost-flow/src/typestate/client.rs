@@ -1,9 +1,9 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 
 use crate::analyzer::semantic::{
-    EvidenceCompleteness, IcfgEdgeKind, IcfgProvider, IcfgSnapshot, IcfgSnapshotLimits,
-    ProcedureHandle, ProofStatus, SemanticBudget, SemanticWork,
+    EvidenceCompleteness, IcfgBoundaryKind, IcfgEdgeKind, IcfgProvider, IcfgSnapshot,
+    IcfgSnapshotLimits, ProcedureHandle, ProofStatus, SemanticBudget, SemanticWork,
 };
 use crate::dataflow::{
     BackwardDistributiveDataflowProblem, BackwardSnapshotDataflowError,
@@ -11,16 +11,16 @@ use crate::dataflow::{
     DataflowDirectionCapabilities, DataflowDirectionPlan, DataflowDirectionPlanningError,
     DataflowDirectionRequirements, DataflowEdge, DataflowOutput, DataflowRequest,
     DistributiveDataflowProblem, IcfgInputStatus, IcfgSolveInput, ReusableProcedureSummary,
-    ReusableSummaryProvider, SolverTermination, SummaryDataflowError, SummaryDataflowResult,
-    SummaryPointSeed, SummarySolveInput, SummaryWitnessError, WitnessRetentionLimits,
-    plan_snapshot_dataflow_direction, snapshot_node_ids_for_points,
+    ReusableSummaryProvider, SolverTermination, SummaryBoundaryKind, SummaryDataflowError,
+    SummaryDataflowResult, SummaryPointSeed, SummarySolveInput, SummaryWitnessError,
+    WitnessRetentionLimits, plan_snapshot_dataflow_direction, snapshot_node_ids_for_points,
     solve_backward_demands_on_snapshot, solve_with_reusable_end_summaries,
 };
 
 use super::{
-    BoundTypestateEvent, BoundTypestateTerminal, CompiledProtocol, ProtocolEventId,
-    ProtocolEventOccurrence, ProtocolExpectationKey, ProtocolObservationPhase, ProtocolStateId,
-    ProtocolStateKey, ProtocolTerminalObservationSpec, ProtocolUncertaintyCause,
+    BoundTypestateEvent, BoundTypestateInitialSeed, BoundTypestateTerminal, CompiledProtocol,
+    ProtocolEventId, ProtocolEventOccurrence, ProtocolExpectationKey, ProtocolObservationPhase,
+    ProtocolStateId, ProtocolStateKey, ProtocolTerminalObservationSpec, ProtocolUncertaintyCause,
     ProtocolUncertaintyResolution, ProtocolUnmatchedEventBehavior, TypestateBindingPlan,
     TypestateBindingPlanHash, TypestateBindingQuality, TypestateEventBindingId,
     TypestateProtocolHash, TypestateSubjectId, TypestateSubjectKey, TypestateTerminalBindingId,
@@ -298,7 +298,14 @@ impl TypestateFact {
         }
     }
 
-    pub(super) const fn non_violation_binding(self) -> Option<TypestateEventBindingId> {
+    /// The event binding a non-violating observation fired on.
+    ///
+    /// Public for the same reason [`Self::terminal_observation`] is: it is the
+    /// only field that separates one `NonViolation` fact from another, and the
+    /// only one that separates a `NonViolation` fact from the zero fact, so a
+    /// caller canonicalizing observations cannot render a faithful projection
+    /// without it.
+    pub const fn non_violation_binding(self) -> Option<TypestateEventBindingId> {
         match self.0 {
             TypestateFactKind::NonViolation { event_binding, .. } => Some(event_binding),
             TypestateFactKind::Zero
@@ -571,6 +578,7 @@ pub struct TypestateBackwardResult {
     binding_plan_hash: TypestateBindingPlanHash,
     bindings_complete: bool,
     execution_complete: bool,
+    result_complete: bool,
     result: BackwardSnapshotDataflowResult<TypestateFact>,
 }
 
@@ -596,7 +604,7 @@ impl TypestateBackwardResult {
     }
 
     pub fn is_complete(&self) -> bool {
-        self.bindings_complete && self.execution_complete && self.result.is_complete()
+        self.bindings_complete && self.execution_complete && self.result_complete
     }
 }
 
@@ -609,6 +617,7 @@ pub struct TypestateSummaryResult {
     bindings_complete: bool,
     bindings_summary_complete: bool,
     execution_complete: bool,
+    result_complete: bool,
     result: SummaryDataflowResult<TypestateFact>,
 }
 
@@ -642,7 +651,7 @@ impl TypestateSummaryResult {
     }
 
     pub fn is_complete(&self) -> bool {
-        self.bindings_complete && self.execution_complete && self.result.is_complete()
+        self.bindings_complete && self.execution_complete && self.result_complete
     }
 
     /// Whether this solve is safe to project into a reusable protocol artifact.
@@ -653,7 +662,7 @@ impl TypestateSummaryResult {
     /// do not.
     pub fn is_summary_publication_complete(&self) -> bool {
         self.bindings_summary_complete
-            && self.result.is_complete()
+            && self.result_complete
             && self.result.facts().iter().all(|fact| {
                 !fact.abstained()
                     && !fact
@@ -672,6 +681,7 @@ impl TypestateSummaryResult {
 pub struct TypestateFlowProblem<'plan> {
     protocol: &'plan CompiledProtocol,
     bindings: &'plan TypestateBindingPlan,
+    conditional_seed_root: Option<ProcedureHandle>,
 }
 
 impl<'plan> TypestateFlowProblem<'plan> {
@@ -697,7 +707,21 @@ impl<'plan> TypestateFlowProblem<'plan> {
         {
             return Err(TypestateFlowProblemError::ContextSensitiveBindingsUnsupported);
         }
-        Ok(Self { protocol, bindings })
+        Ok(Self {
+            protocol,
+            bindings,
+            conditional_seed_root: None,
+        })
+    }
+
+    fn try_new_for_analysis_root(
+        protocol: &'plan CompiledProtocol,
+        bindings: &'plan TypestateBindingPlan,
+        root: &ProcedureHandle,
+    ) -> Result<Self, TypestateFlowProblemError> {
+        let mut problem = Self::try_new(protocol, bindings)?;
+        problem.conditional_seed_root = Some(root.clone());
+        Ok(problem)
     }
 
     pub const fn protocol(&self) -> &CompiledProtocol {
@@ -880,53 +904,81 @@ impl<'plan> TypestateFlowProblem<'plan> {
         Ok(())
     }
 
-    fn bindings_complete(&self) -> bool {
+    fn analysis_subjects(
+        &self,
+        root: &ProcedureHandle,
+        entry_facts: &[TypestateFact],
+    ) -> BTreeSet<TypestateSubjectId> {
+        self.bindings
+            .initial_seeds()
+            .iter()
+            .filter(|binding| {
+                observation_site_procedure(binding.site())
+                    .is_some_and(|procedure| procedure == root)
+            })
+            .map(BoundTypestateInitialSeed::subject)
+            .chain(entry_facts.iter().filter_map(|fact| fact.subject()))
+            .collect()
+    }
+
+    fn bindings_complete(&self, subjects: &BTreeSet<TypestateSubjectId>) -> bool {
         self.bindings
             .subjects()
             .iter()
+            .filter(|binding| subjects.contains(&binding.id()))
             .all(|binding| binding.quality().is_definitive())
             && self
                 .bindings
                 .initial_seeds()
                 .iter()
+                .filter(|binding| subjects.contains(&binding.subject()))
                 .all(|binding| binding.quality().is_definitive())
             && self
                 .bindings
                 .event_bindings()
                 .iter()
+                .filter(|binding| subjects.contains(&binding.subject()))
                 .all(|binding| binding.quality().is_definitive())
             && self
                 .bindings
                 .terminal_bindings()
                 .iter()
+                .filter(|binding| subjects.contains(&binding.subject()))
                 .all(|binding| binding.quality().is_definitive())
     }
 
-    fn bindings_summary_complete(&self) -> bool {
+    fn bindings_summary_complete(&self, subjects: &BTreeSet<TypestateSubjectId>) -> bool {
         self.bindings
             .subjects()
             .iter()
+            .filter(|binding| subjects.contains(&binding.id()))
             .all(|binding| binding.quality().is_complete())
             && self
                 .bindings
                 .initial_seeds()
                 .iter()
+                .filter(|binding| subjects.contains(&binding.subject()))
                 .all(|binding| binding.quality().is_complete())
             && self
                 .bindings
                 .event_bindings()
                 .iter()
+                .filter(|binding| subjects.contains(&binding.subject()))
                 .all(|binding| binding.quality().is_complete())
             && self
                 .bindings
                 .terminal_bindings()
                 .iter()
+                .filter(|binding| subjects.contains(&binding.subject()))
                 .all(|binding| binding.quality().is_complete())
     }
 
     fn summary_point_seeds(&self, root: &ProcedureHandle) -> Vec<SummaryPointSeed<TypestateFact>> {
         let mut seeds = Vec::new();
         for seed in self.bindings.initial_seeds() {
+            if seed.activation_edge().is_some() {
+                continue;
+            }
             let Some(point) = seed.site().program_point_handle() else {
                 continue;
             };
@@ -987,6 +1039,31 @@ impl<'plan> TypestateFlowProblem<'plan> {
                     if !out.should_continue() {
                         return;
                     }
+                    if seed.activation_edge().is_some()
+                        && let Some(root) = &self.conditional_seed_root
+                    {
+                        let procedure = observation_site_procedure(seed.site())
+                            .expect("validated initial seeds retain a procedure");
+                        if procedure != root {
+                            continue;
+                        }
+                    }
+                    if let Some(activation) = seed.activation_edge() {
+                        let row = activation
+                            .procedure()
+                            .semantics()
+                            .control_edge(activation.id())
+                            .expect("validated control-edge activation resolves");
+                        let target = activation
+                            .procedure()
+                            .point_handle(row.target_point)
+                            .expect("validated control-edge activation retains its target");
+                        if edge.target() != &target
+                            || edge.kind() != IcfgEdgeKind::Intraprocedural(row.kind)
+                        {
+                            continue;
+                        }
+                    }
                     let fact =
                         TypestateFact::state(self.bindings.hash(), seed.subject(), seed.state());
                     let facts = self.apply_seed_quality(fact, seed.subject(), seed.quality());
@@ -1017,6 +1094,7 @@ impl<'plan> TypestateFlowProblem<'plan> {
         let mut facts = TransferFactSet::new(facts);
         let subject = facts.subject();
         let mut eligible_events = Vec::new();
+        let mut modeled_external_effect_applied = false;
         for binding in self
             .bindings
             .event_bindings_at_program_point_all_contexts(edge.source())
@@ -1048,16 +1126,36 @@ impl<'plan> TypestateFlowProblem<'plan> {
         }
 
         if let Some(call) = edge.origin() {
-            for stage in family.stages(edge.kind()) {
+            let stages = family.stages(edge.kind());
+            if edge.boundary().is_some_and(modeled_external_boundary) {
+                for binding in self.bindings.event_bindings_at_call_site_all_contexts(call) {
+                    if subject == Some(binding.subject())
+                        && binding.modeled_external_effect().is_some()
+                    {
+                        modeled_external_effect_applied = true;
+                        if stages.is_empty() && edge.boundary().is_some_and(deferred_boundary) {
+                            eligible_events.push(EligibleEvent::from_binding(binding));
+                            if !self.apply_binding(&mut facts, binding, out) {
+                                return facts.emit(out);
+                            }
+                        }
+                    }
+                }
+            }
+            for stage in stages {
                 for binding in self.bindings.event_bindings_at_call_site_all_contexts(call) {
                     if !out.should_continue() {
                         return false;
                     }
+                    let modeled_boundary = subject == Some(binding.subject())
+                        && binding.modeled_external_effect().is_some()
+                        && edge.boundary().is_some_and(modeled_external_boundary);
+                    modeled_external_effect_applied |= modeled_boundary;
                     if call_occurrence(self.protocol, binding.event(), *stage) {
                         if subject == Some(binding.subject()) {
                             eligible_events.push(EligibleEvent::from_binding(binding));
                         }
-                        if edge.boundary().is_none()
+                        if (edge.boundary().is_none() || modeled_boundary)
                             && !self.apply_binding(&mut facts, binding, out)
                         {
                             return facts.emit(out);
@@ -1079,7 +1177,26 @@ impl<'plan> TypestateFlowProblem<'plan> {
                 }
             }
         } else {
-            for stage in family.originless_call_stages() {
+            let stages = family.originless_call_stages();
+            if edge.boundary().is_some_and(modeled_external_boundary) {
+                for binding in self
+                    .bindings
+                    .event_bindings_at_call_program_point_all_contexts(edge.source())
+                {
+                    if subject == Some(binding.subject())
+                        && binding.modeled_external_effect().is_some()
+                    {
+                        modeled_external_effect_applied = true;
+                        if stages.is_empty() && edge.boundary().is_some_and(deferred_boundary) {
+                            eligible_events.push(EligibleEvent::from_binding(binding));
+                            if !self.apply_binding(&mut facts, binding, out) {
+                                return facts.emit(out);
+                            }
+                        }
+                    }
+                }
+            }
+            for stage in stages {
                 for binding in self
                     .bindings
                     .event_bindings_at_call_program_point_all_contexts(edge.source())
@@ -1087,11 +1204,15 @@ impl<'plan> TypestateFlowProblem<'plan> {
                     if !out.should_continue() {
                         return false;
                     }
+                    let modeled_boundary = subject == Some(binding.subject())
+                        && binding.modeled_external_effect().is_some()
+                        && edge.boundary().is_some_and(modeled_external_boundary);
+                    modeled_external_effect_applied |= modeled_boundary;
                     if call_occurrence(self.protocol, binding.event(), *stage) {
                         if subject == Some(binding.subject()) {
                             eligible_events.push(EligibleEvent::from_binding(binding));
                         }
-                        if edge.boundary().is_none()
+                        if (edge.boundary().is_none() || modeled_boundary)
                             && !self.apply_binding(&mut facts, binding, out)
                         {
                             return facts.emit(out);
@@ -1116,25 +1237,33 @@ impl<'plan> TypestateFlowProblem<'plan> {
         eligible_events.sort_unstable();
         eligible_events.dedup();
 
+        let call_noninterference = subject.is_some_and(|subject| {
+            self.bindings
+                .call_is_proven_noninterfering(subject, edge.origin(), edge.source())
+        });
+
         if let Some(boundary) = edge.boundary() {
-            let cause = match boundary {
-                crate::analyzer::semantic::DispatchBoundaryKind::External(_)
-                | crate::analyzer::semantic::DispatchBoundaryKind::Unmaterialized(_)
-                | crate::analyzer::semantic::DispatchBoundaryKind::Deferred { .. } => {
-                    ProtocolUncertaintyCause::ExternalCall
+            if !modeled_external_effect_applied && !call_noninterference {
+                let cause = match boundary {
+                    crate::analyzer::semantic::DispatchBoundaryKind::External(_)
+                    | crate::analyzer::semantic::DispatchBoundaryKind::Unmaterialized(_)
+                    | crate::analyzer::semantic::DispatchBoundaryKind::Deferred { .. } => {
+                        ProtocolUncertaintyCause::ExternalCall
+                    }
+                    crate::analyzer::semantic::DispatchBoundaryKind::Unresolved
+                    | crate::analyzer::semantic::DispatchBoundaryKind::Truncated => {
+                        ProtocolUncertaintyCause::UnknownCall
+                    }
+                };
+                if !facts.map_stream(out, |fact, emit| {
+                    self.emit_uncertainty(fact, cause, &eligible_events, emit)
+                }) {
+                    return facts.emit(out);
                 }
-                crate::analyzer::semantic::DispatchBoundaryKind::Unresolved
-                | crate::analyzer::semantic::DispatchBoundaryKind::Truncated => {
-                    ProtocolUncertaintyCause::UnknownCall
-                }
-            };
-            if !facts.map_stream(out, |fact, emit| {
-                self.emit_uncertainty(fact, cause, &eligible_events, emit)
-            }) {
-                return facts.emit(out);
             }
         } else if (!matches!(edge.proof(), ProofStatus::Proven)
             || !matches!(edge.completeness(), EvidenceCompleteness::Complete))
+            && !call_noninterference
             && !facts.map_stream(out, |fact, emit| {
                 self.emit_uncertainty(
                     fact,
@@ -1759,7 +1888,7 @@ where
     Provider: IcfgProvider + ?Sized,
     Reusable: ReusableSummaryProvider<TypestateFact> + ?Sized,
 {
-    let problem = TypestateFlowProblem::try_new(protocol, bindings)?;
+    let problem = TypestateFlowProblem::try_new_for_analysis_root(protocol, bindings, root)?;
     problem.validate_analysis_root(root)?;
     problem.validate_entry_facts(entry_facts)?;
     let witness_retention = WitnessRetentionLimits::best_effort(
@@ -1769,6 +1898,7 @@ where
     )
     .expect("typestate best-effort witness limits are valid");
     let point_seeds = problem.summary_point_seeds(root);
+    let analysis_subjects = problem.analysis_subjects(root, entry_facts);
     let result = solve_with_reusable_end_summaries(
         SummarySolveInput::new(root, entry_facts)
             .with_point_seeds(&point_seeds)
@@ -1783,14 +1913,203 @@ where
         .facts()
         .iter()
         .all(|fact| fact.uncertainty().is_empty() && !fact.abstained());
+    let result_complete =
+        result.is_complete() || reviewed_bindings_close_result_coverage(&result, bindings);
     Ok(TypestateSummaryResult {
         protocol_hash: protocol.hash(),
         binding_plan_hash: bindings.hash(),
-        bindings_complete: problem.bindings_complete(),
-        bindings_summary_complete: problem.bindings_summary_complete(),
+        bindings_complete: problem.bindings_complete(&analysis_subjects),
+        bindings_summary_complete: problem.bindings_summary_complete(&analysis_subjects),
         execution_complete,
+        result_complete,
         result,
     })
+}
+
+fn reviewed_bindings_close_result_coverage(
+    result: &SummaryDataflowResult<TypestateFact>,
+    bindings: &TypestateBindingPlan,
+) -> bool {
+    if !has_reviewed_coverage_binding(bindings) {
+        return false;
+    }
+    let coverage = result.coverage();
+    let mut subjects_by_point = HashMap::<_, HashSet<_>>::new();
+    for reached in result.reached() {
+        if let Some(subject) = result.fact(reached.fact()).and_then(|fact| fact.subject()) {
+            subjects_by_point
+                .entry(reached.point().clone())
+                .or_default()
+                .insert(subject);
+        }
+    }
+    result.termination().is_fixed_point()
+        && coverage
+            .unproven_edges()
+            .iter()
+            .chain(coverage.partial_edges())
+            .all(|edge| {
+                subjects_by_point.get(edge.source()).is_none_or(|subjects| {
+                    call_boundary_closed_for_subjects(
+                        bindings,
+                        subjects,
+                        edge.origin(),
+                        edge.source(),
+                    )
+                })
+            })
+        && coverage.boundaries().iter().all(|boundary| {
+            let Some(subjects) = subjects_by_point.get(boundary.at()) else {
+                return true;
+            };
+            match boundary.kind() {
+                // A provider envelope without a call origin is procedure-wide
+                // metadata, not evidence that this subject crossed an
+                // unmodeled operation. Concrete incomplete edges and call
+                // boundaries below retain that obligation.
+                SummaryBoundaryKind::Semantic(_) if boundary.origin().is_none() => true,
+                SummaryBoundaryKind::Semantic(_) | SummaryBoundaryKind::Dispatch(_) => {
+                    call_boundary_closed_for_subjects(
+                        bindings,
+                        subjects,
+                        boundary.origin(),
+                        boundary.at(),
+                    )
+                }
+                SummaryBoundaryKind::Limit(_) | SummaryBoundaryKind::Continuation { .. } => false,
+            }
+        })
+}
+
+fn reviewed_bindings_close_backward_result_coverage(
+    result: &BackwardSnapshotDataflowResult<TypestateFact>,
+    bindings: &TypestateBindingPlan,
+) -> bool {
+    if !result.coverage().input_status().is_complete() || !has_reviewed_coverage_binding(bindings) {
+        return false;
+    }
+
+    // Backward snapshot nodes include their exact call context. Keep relevance
+    // at that granularity: aggregating by program point could let a reviewed
+    // binding reached in one context close an unrelated gap in another.
+    let snapshot = result.snapshot();
+    let mut subjects_by_node = HashMap::<_, HashSet<_>>::new();
+    for reached in result.reached() {
+        if let Some(subject) = result.fact(reached.fact()).and_then(|fact| fact.subject()) {
+            subjects_by_node
+                .entry(reached.node())
+                .or_default()
+                .insert(subject);
+        }
+    }
+
+    let mut closed_relevant_gap = false;
+    for edge_id in result
+        .coverage()
+        .unproven_edges()
+        .iter()
+        .chain(result.coverage().partial_edges())
+    {
+        let Some(edge) = snapshot.edge(*edge_id) else {
+            return false;
+        };
+        // A backward transfer consumes the fact at the original edge target.
+        // If an unmodeled boundary has no exact preimage, no fact reaches the
+        // source node, but the gap is still relevant to that demanded target.
+        let Some(subjects) = subjects_by_node.get(&edge.target) else {
+            continue;
+        };
+        let Some(point) = snapshot.node(edge.source).map(|node| node.point()) else {
+            return false;
+        };
+        closed_relevant_gap = true;
+        if !call_boundary_closed_for_subjects(bindings, subjects, edge.origin.as_ref(), point) {
+            return false;
+        }
+    }
+    for boundary in result.coverage().boundaries() {
+        let mut subjects = subjects_by_node
+            .get(&boundary.at)
+            .cloned()
+            .unwrap_or_default();
+        for (_, edge) in snapshot.successor_edges(boundary.at) {
+            if edge.origin.as_ref() != boundary.origin.as_ref() {
+                continue;
+            }
+            if let Some(target_subjects) = subjects_by_node.get(&edge.target) {
+                subjects.extend(target_subjects);
+            }
+        }
+        if subjects.is_empty() {
+            continue;
+        }
+        let Some(point) = snapshot.node(boundary.at).map(|node| node.point()) else {
+            return false;
+        };
+        match &boundary.kind {
+            IcfgBoundaryKind::Dispatch(_) => {
+                closed_relevant_gap = true;
+                if !call_boundary_closed_for_subjects(
+                    bindings,
+                    &subjects,
+                    boundary.origin.as_ref(),
+                    point,
+                ) {
+                    return false;
+                }
+            }
+            IcfgBoundaryKind::Limit(_) | IcfgBoundaryKind::Continuation { .. } => return false,
+        }
+    }
+
+    // An incomplete provider envelope alone is not enough evidence to erase a
+    // gap. At least one concrete edge or dispatch boundary relevant to this
+    // demand must have been discharged by reviewed, subject-specific coverage.
+    result.termination().is_fixed_point() && closed_relevant_gap
+}
+
+fn has_reviewed_coverage_binding(bindings: &TypestateBindingPlan) -> bool {
+    bindings
+        .initial_seeds()
+        .iter()
+        .any(BoundTypestateInitialSeed::reviewed_fresh_result)
+        || bindings
+            .event_bindings()
+            .iter()
+            .any(|binding| binding.modeled_external_effect().is_some())
+        || !bindings.call_noninterference_bindings().is_empty()
+}
+
+fn call_boundary_closed_for_subjects(
+    bindings: &TypestateBindingPlan,
+    subjects: &HashSet<TypestateSubjectId>,
+    origin: Option<&crate::analyzer::semantic::CallSiteHandle>,
+    point: &crate::analyzer::semantic::ProgramPointHandle,
+) -> bool {
+    subjects.iter().copied().all(|subject| {
+        modeled_effect_binding_at(bindings, subject, origin, point)
+            || bindings.call_is_proven_noninterfering(subject, origin, point)
+    })
+}
+
+fn modeled_effect_binding_at(
+    bindings: &TypestateBindingPlan,
+    subject: TypestateSubjectId,
+    origin: Option<&crate::analyzer::semantic::CallSiteHandle>,
+    point: &crate::analyzer::semantic::ProgramPointHandle,
+) -> bool {
+    match origin {
+        Some(call) => bindings
+            .event_bindings_at_call_site_all_contexts(call)
+            .any(|binding| {
+                binding.subject() == subject && binding.modeled_external_effect().is_some()
+            }),
+        None => bindings
+            .event_bindings_at_call_program_point_all_contexts(point)
+            .any(|binding| {
+                binding.subject() == subject && binding.modeled_external_effect().is_some()
+            }),
+    }
 }
 
 struct TypestateBackwardSnapshotProblem<'problem, 'demands> {
@@ -1882,9 +2201,24 @@ pub fn solve_typestate_backward_on_snapshot(
     bindings: &TypestateBindingPlan,
     request: &mut DataflowRequest<'_>,
 ) -> Result<TypestateBackwardResult, TypestateBackwardSolveError> {
-    let problem = TypestateFlowProblem::try_new(protocol, bindings)?;
+    let problem = TypestateFlowProblem::try_new_for_analysis_root(protocol, bindings, root)?;
     problem.validate_analysis_root(root)?;
     problem.validate_backward_demands(demands)?;
+    let analysis_subjects = if demands
+        .iter()
+        .any(|demand| demand.fact().subject().is_none())
+    {
+        bindings
+            .subjects()
+            .iter()
+            .map(|subject| subject.id())
+            .collect()
+    } else {
+        demands
+            .iter()
+            .filter_map(|demand| demand.fact().subject())
+            .collect()
+    };
     let backward_problem = TypestateBackwardSnapshotProblem {
         problem: &problem,
         demands,
@@ -1895,11 +2229,14 @@ pub fn solve_typestate_backward_on_snapshot(
         .facts()
         .iter()
         .all(|fact| fact.uncertainty().is_empty() && !fact.abstained());
+    let result_complete =
+        result.is_complete() || reviewed_bindings_close_backward_result_coverage(&result, bindings);
     Ok(TypestateBackwardResult {
         protocol_hash: protocol.hash(),
         binding_plan_hash: bindings.hash(),
-        bindings_complete: problem.bindings_complete(),
+        bindings_complete: problem.bindings_complete(&analysis_subjects),
         execution_complete,
+        result_complete,
         result,
     })
 }
@@ -2309,6 +2646,23 @@ enum CallStage {
     AfterExceptionalReturn,
     ActualToFormal,
     ReturnFlow,
+}
+
+fn modeled_external_boundary(boundary: &crate::analyzer::semantic::DispatchBoundaryKind) -> bool {
+    matches!(
+        boundary,
+        crate::analyzer::semantic::DispatchBoundaryKind::External(_)
+            | crate::analyzer::semantic::DispatchBoundaryKind::Unmaterialized(_)
+            | crate::analyzer::semantic::DispatchBoundaryKind::Deferred { .. }
+            | crate::analyzer::semantic::DispatchBoundaryKind::Unresolved
+    )
+}
+
+fn deferred_boundary(boundary: &crate::analyzer::semantic::DispatchBoundaryKind) -> bool {
+    matches!(
+        boundary,
+        crate::analyzer::semantic::DispatchBoundaryKind::Deferred { .. }
+    )
 }
 
 fn point_occurrence(protocol: &CompiledProtocol, event: ProtocolEventId) -> bool {

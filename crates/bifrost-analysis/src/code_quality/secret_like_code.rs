@@ -4,6 +4,7 @@
 use super::{ReportLines, sanitize_table_cell};
 use crate::analyzer::test_paths;
 use crate::analyzer::{IAnalyzer, Language};
+use crate::gitblob::resolve_default_branch_ref;
 use crate::path_utils::normalize_pattern;
 use git2::{FileMode, ObjectType, Oid, Repository, Sort, TreeWalkMode, TreeWalkResult};
 use regex::Regex;
@@ -106,13 +107,6 @@ struct GitContext {
     repo: Repository,
     repo_root: PathBuf,
     project_root: PathBuf,
-}
-
-#[derive(Debug, Clone)]
-struct DefaultRefInfo {
-    ref_name: String,
-    display_name: String,
-    fallback: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -384,24 +378,6 @@ impl GitContext {
             repo_root,
             project_root: canonical,
         })
-    }
-}
-
-fn resolve_default_branch_ref(repo: &Repository) -> DefaultRefInfo {
-    if let Ok(head_ref) = repo.find_reference("refs/remotes/origin/HEAD")
-        && let Some(target) = head_ref.symbolic_target()
-    {
-        let display = target.rsplit('/').next().unwrap_or(target).to_string();
-        return DefaultRefInfo {
-            ref_name: target.to_string(),
-            display_name: display,
-            fallback: false,
-        };
-    }
-    DefaultRefInfo {
-        ref_name: "HEAD".to_string(),
-        display_name: "HEAD (default branch unavailable)".to_string(),
-        fallback: true,
     }
 }
 
@@ -1020,8 +996,11 @@ mod tests {
     fn build_analyzer(root: &Path) -> WorkspaceAnalyzer {
         let project = crate::TestProject::from_root_with_inferred_languages(root.to_path_buf())
             .unwrap_or_else(|_| crate::TestProject::new(root.to_path_buf(), crate::Language::Java));
-        WorkspaceAnalyzer::build_ephemeral(std::sync::Arc::new(project), AnalyzerConfig::default())
-            .expect("ephemeral workspace should build")
+        WorkspaceAnalyzer::build_ephemeral_footgun(
+            std::sync::Arc::new(project),
+            AnalyzerConfig::default(),
+        )
+        .expect("ephemeral workspace should build")
     }
 
     fn write_file(root: &Path, rel: &str, contents: &str) {

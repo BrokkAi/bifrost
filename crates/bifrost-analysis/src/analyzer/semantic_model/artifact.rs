@@ -6,6 +6,7 @@ use crate::analyzer::canonical_hash::{
     hash_domain_bytes, is_lower_sha256, lower_hex_string, sha256_bytes,
 };
 use crate::analyzer::identifier::validate_identifier;
+use brokk_bifrost_core::analyzer::model::CallableArity;
 use flate2::bufread::DeflateDecoder;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -165,6 +166,12 @@ pub struct CompiledProcedureSummary {
     /// claimed, so a summary that does not claim it keeps its content digest.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub covers_overrides: bool,
+    /// The reviewed claim that this procedure has no normal continuation.
+    /// Serialized only when true so old compiled bytes and digests stay stable.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub normal_continuation_absent: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normal_result_count: Option<u32>,
     pub locations: Vec<CompiledSummaryLocation>,
     pub transfers: Vec<CompiledSummaryTransfer>,
     pub effects: Vec<CompiledSummaryEffect>,
@@ -174,6 +181,85 @@ pub struct CompiledProcedureSummary {
     /// field existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub declared_effects: Vec<CompiledDeclaredEffect>,
+    /// Compiled mirror of the procedure-level operation-precondition review
+    /// state. `None` and `Some([])` are intentionally distinct claims.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preconditions: Option<Vec<CompiledOperationPrecondition>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub result_contracts: Vec<CompiledResultContract>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditional_result_refinements: Vec<CompiledConditionalResultRefinement>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub normal_return_refinements: Vec<CompiledNormalReturnRefinement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompiledConditionalResultRefinement {
+    pub result_ordinal: u32,
+    pub outcome: bool,
+    pub parameter_ordinal: u32,
+    pub predicate: CompiledResultPredicate,
+    pub proof_effect: CompiledPredicateProofEffect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompiledPredicateProofEffect {
+    Establishes,
+    DoesNotEstablish,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompiledNormalReturnRefinement {
+    pub parameter_ordinal: u32,
+    pub predicate: CompiledResultPredicate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompiledResultContract {
+    pub result_ordinal: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition_result_ordinal: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predicate: Option<CompiledResultPredicate>,
+    /// Reviewed predicate over the protected result. It is an independent
+    /// correlation for a paired contract and the validity predicate itself
+    /// for a direct contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_success_predicate: Option<CompiledResultPredicate>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub member_contracts: Vec<CompiledResultMemberContract>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompiledResultMemberContract {
+    pub member: String,
+    pub parameter_count: u32,
+    pub completeness: Completeness,
+    /// Compiled mirror of the operation-precondition review state. `None` and
+    /// `Some([])` are intentionally distinct semantic claims.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preconditions: Option<Vec<CompiledOperationPrecondition>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declared_effects: Vec<CompiledDeclaredEffect>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompiledOperationPrecondition {
+    pub input: CompiledSummaryInput,
+    pub predicate: CompiledResultPredicate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompiledResultPredicate {
+    Null,
+    NonNull,
 }
 
 /// Compiled mirror of `AuthoredDeclaredEffect` (#2437).
@@ -206,7 +292,41 @@ pub struct CompiledProcedureTarget {
     pub path: String,
     pub symbol: String,
     pub has_receiver: bool,
+    /// Compiled mirror of the authored target's variadic-tail declaration.
+    /// Serialized only when true so existing fixed-arity artifacts keep their
+    /// canonical bytes and semantic digests.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub variadic: bool,
     pub parameter_count: u32,
+}
+
+impl CompiledProcedureTarget {
+    /// Smallest actual argument count accepted by this declaration shape.
+    pub const fn minimum_parameter_count(&self) -> u32 {
+        if self.variadic {
+            assert!(
+                self.parameter_count > 0,
+                "validated variadic targets declare their final formal"
+            );
+            self.parameter_count - 1
+        } else {
+            self.parameter_count
+        }
+    }
+
+    /// Compact declaration shape used for applicability checks and indexes.
+    pub const fn callable_arity(&self) -> CallableArity {
+        CallableArity::new(
+            self.minimum_parameter_count() as usize,
+            self.parameter_count as usize,
+            self.variadic,
+        )
+    }
+
+    /// Whether an actual call arity is applicable to this declaration shape.
+    pub const fn accepts_parameter_count(&self, actual: u32) -> bool {
+        self.callable_arity().accepts(actual as usize)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -223,7 +343,7 @@ pub enum CompiledSummaryLocationKind {
     Heap,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CompiledSummaryInput {
     Receiver {},
@@ -234,6 +354,7 @@ pub enum CompiledSummaryInput {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CompiledSummaryOutput {
     NormalReturn {},
+    IndexedNormalReturn { ordinal: u32 },
     Receiver {},
     Capture { location: String },
     Heap { location: String },
@@ -1205,10 +1326,13 @@ fn authored_procedure_summary_from_compiled(
             path: summary.target.path.clone(),
             symbol: summary.target.symbol.clone(),
             has_receiver: summary.target.has_receiver,
+            variadic: summary.target.variadic,
             parameter_count: summary.target.parameter_count,
         },
         completeness: summary.completeness,
         covers_overrides: summary.covers_overrides,
+        normal_continuation_absent: summary.normal_continuation_absent,
+        normal_result_count: summary.normal_result_count,
         locations: summary
             .locations
             .iter()
@@ -1242,6 +1366,91 @@ fn authored_procedure_summary_from_compiled(
             .iter()
             .map(authored_declared_effect_from_compiled)
             .collect(),
+        preconditions: summary.preconditions.as_ref().map(|preconditions| {
+            preconditions
+                .iter()
+                .map(|precondition| AuthoredOperationPrecondition {
+                    input: authored_summary_input_from_compiled(&precondition.input),
+                    predicate: authored_result_predicate_from_compiled(precondition.predicate),
+                })
+                .collect()
+        }),
+        result_contracts: summary
+            .result_contracts
+            .iter()
+            .map(|contract| AuthoredResultContract {
+                result_ordinal: contract.result_ordinal,
+                condition_result_ordinal: contract.condition_result_ordinal,
+                predicate: contract
+                    .predicate
+                    .map(authored_result_predicate_from_compiled),
+                result_success_predicate: contract
+                    .result_success_predicate
+                    .map(authored_result_predicate_from_compiled),
+                member_contracts: contract
+                    .member_contracts
+                    .iter()
+                    .map(|member| AuthoredResultMemberContract {
+                        member: member.member.clone(),
+                        parameter_count: member.parameter_count,
+                        completeness: member.completeness,
+                        preconditions: member.preconditions.as_ref().map(|preconditions| {
+                            preconditions
+                                .iter()
+                                .map(|precondition| AuthoredOperationPrecondition {
+                                    input: authored_summary_input_from_compiled(
+                                        &precondition.input,
+                                    ),
+                                    predicate: authored_result_predicate_from_compiled(
+                                        precondition.predicate,
+                                    ),
+                                })
+                                .collect()
+                        }),
+                        declared_effects: member
+                            .declared_effects
+                            .iter()
+                            .map(authored_declared_effect_from_compiled)
+                            .collect(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+        conditional_result_refinements: summary
+            .conditional_result_refinements
+            .iter()
+            .map(|refinement| AuthoredConditionalResultRefinement {
+                result_ordinal: refinement.result_ordinal,
+                outcome: refinement.outcome,
+                parameter_ordinal: refinement.parameter_ordinal,
+                predicate: authored_result_predicate_from_compiled(refinement.predicate),
+                proof_effect: match refinement.proof_effect {
+                    CompiledPredicateProofEffect::Establishes => {
+                        AuthoredPredicateProofEffect::Establishes
+                    }
+                    CompiledPredicateProofEffect::DoesNotEstablish => {
+                        AuthoredPredicateProofEffect::DoesNotEstablish
+                    }
+                },
+            })
+            .collect(),
+        normal_return_refinements: summary
+            .normal_return_refinements
+            .iter()
+            .map(|refinement| AuthoredNormalReturnRefinement {
+                parameter_ordinal: refinement.parameter_ordinal,
+                predicate: authored_result_predicate_from_compiled(refinement.predicate),
+            })
+            .collect(),
+    }
+}
+
+fn authored_result_predicate_from_compiled(
+    predicate: CompiledResultPredicate,
+) -> AuthoredResultPredicate {
+    match predicate {
+        CompiledResultPredicate::Null => AuthoredResultPredicate::Null,
+        CompiledResultPredicate::NonNull => AuthoredResultPredicate::NonNull,
     }
 }
 
@@ -1274,6 +1483,9 @@ fn authored_summary_input_from_compiled(input: &CompiledSummaryInput) -> Authore
 fn authored_summary_output_from_compiled(output: &CompiledSummaryOutput) -> AuthoredSummaryOutput {
     match output {
         CompiledSummaryOutput::NormalReturn {} => AuthoredSummaryOutput::NormalReturn {},
+        CompiledSummaryOutput::IndexedNormalReturn { ordinal } => {
+            AuthoredSummaryOutput::IndexedNormalReturn { ordinal: *ordinal }
+        }
         CompiledSummaryOutput::Receiver {} => AuthoredSummaryOutput::Receiver {},
         CompiledSummaryOutput::Capture { location } => AuthoredSummaryOutput::Capture {
             location: location.clone(),
@@ -1407,6 +1619,303 @@ mod tests {
         include_bytes!("../../../testdata/semantic-model-packs/declarations-v1.json");
     const PROCEDURE_SUMMARIES: &[u8] =
         include_bytes!("../../../testdata/semantic-model-packs/procedure-summaries-v1.json");
+
+    #[test]
+    fn control_only_normal_continuation_absence_round_trips() {
+        let mut authored: AuthoredSemanticModelPack =
+            serde_json::from_slice(PROCEDURE_SUMMARIES).unwrap();
+        let AuthoredPayload::ProcedureSummaries { summaries } = &mut authored.shards[0].payload
+        else {
+            unreachable!()
+        };
+        let authored_summary = &mut summaries[1];
+        authored_summary.completeness = Completeness::Partial;
+        authored_summary.normal_continuation_absent = true;
+        authored_summary.transfers.clear();
+        authored_summary.effects.clear();
+        let expected = authored_summary.clone();
+
+        let compiled = compile_pack(&authored, &CompilerOptions::default()).unwrap();
+        let decoded = decode_shard_for_manifest(
+            &compiled.manifest,
+            &compiled.shards[0].descriptor,
+            &compiled.shards[0].bytes,
+            &DecodeLimits::default(),
+        )
+        .unwrap();
+        let summary = &decoded.payload().procedure_summaries().unwrap()[1];
+        assert!(summary.normal_continuation_absent);
+        assert_eq!(
+            authored_procedure_summary_from_compiled(summary),
+            expected,
+            "compiled-to-authored defensive reconstruction preserves the claim"
+        );
+        assert!(
+            String::from_utf8(canonical_json(summary).unwrap())
+                .unwrap()
+                .contains("\"normal_continuation_absent\":true")
+        );
+    }
+
+    #[test]
+    fn absent_procedure_preconditions_preserve_existing_bytes_and_digests() {
+        let authored: AuthoredSemanticModelPack =
+            serde_json::from_slice(PROCEDURE_SUMMARIES).unwrap();
+        let AuthoredPayload::ProcedureSummaries { summaries } = &authored.shards[0].payload else {
+            unreachable!()
+        };
+        assert!(
+            summaries
+                .iter()
+                .all(|summary| summary.preconditions.is_none())
+        );
+        assert!(summaries.iter().all(|summary| {
+            !String::from_utf8(canonical_json(summary).unwrap())
+                .unwrap()
+                .contains("\"preconditions\"")
+        }));
+
+        // Captured before procedure-level preconditions existed. An omitted
+        // optional claim must leave the authored content, compiled shard, and
+        // manifest identities byte-for-byte compatible.
+        let compiled = compile_pack(&authored, &CompilerOptions::default()).unwrap();
+        assert_eq!(
+            compiled.manifest.semantic_sha256,
+            "287323ecf762582b6398ad06e893d1465921b3e8789877f2f72fc7be45b0fad2"
+        );
+        assert_eq!(
+            compiled.manifest.content_sha256,
+            "aa7cc37d6c45ed038dfe0c92a0c9f604f52bf7bcdc027225c5b37b9eb62020bd"
+        );
+        assert_eq!(
+            compiled.shards[0].descriptor.semantic_sha256,
+            "0fa2cafdde42718988144143a86dd526337acab6c1e767e158d0df51f4abae30"
+        );
+        assert_eq!(
+            compiled.shards[0].descriptor.content_sha256,
+            "c412472b25e4d097dd56d5e0538b29855fb79377ec9bcadf6f896808bf302f06"
+        );
+
+        let decoded = decode_shard_for_manifest(
+            &compiled.manifest,
+            &compiled.shards[0].descriptor,
+            &compiled.shards[0].bytes,
+            &DecodeLimits::default(),
+        )
+        .unwrap();
+        assert!(
+            decoded
+                .payload()
+                .procedure_summaries()
+                .unwrap()
+                .iter()
+                .all(|summary| summary.preconditions.is_none())
+        );
+        assert!(
+            !String::from_utf8(canonical_json(&decoded).unwrap())
+                .unwrap()
+                .contains("\"preconditions\"")
+        );
+    }
+
+    #[test]
+    fn procedure_precondition_review_states_compile_canonically_and_round_trip() {
+        let mut reviewed_empty: AuthoredSemanticModelPack =
+            serde_json::from_slice(PROCEDURE_SUMMARIES).unwrap();
+        let unreviewed = reviewed_empty.clone();
+        let AuthoredPayload::ProcedureSummaries { summaries } =
+            &mut reviewed_empty.shards[0].payload
+        else {
+            unreachable!()
+        };
+        summaries[0].preconditions = Some(Vec::new());
+
+        let options = CompilerOptions {
+            compression: CompressionPolicy::AlwaysRaw,
+            ..CompilerOptions::default()
+        };
+        let baseline = compile_pack(&unreviewed, &options).unwrap();
+        let reviewed_empty_compiled = compile_pack(&reviewed_empty, &options)
+            .expect("a reviewed-empty precondition set is a substantive summary claim");
+        assert_ne!(
+            reviewed_empty_compiled.manifest.semantic_sha256,
+            baseline.manifest.semantic_sha256
+        );
+        assert!(
+            String::from_utf8(reviewed_empty_compiled.shards[0].bytes.clone())
+                .unwrap()
+                .contains("\"preconditions\":[]")
+        );
+
+        let mut precondition_only = reviewed_empty.clone();
+        let AuthoredPayload::ProcedureSummaries { summaries } =
+            &mut precondition_only.shards[0].payload
+        else {
+            unreachable!()
+        };
+        summaries[0].transfers.clear();
+        summaries[0].effects.clear();
+        compile_pack(&precondition_only, &options)
+            .expect("a reviewed-empty precondition set is a substantive summary claim");
+
+        let decoded = decode_shard_for_manifest(
+            &reviewed_empty_compiled.manifest,
+            &reviewed_empty_compiled.shards[0].descriptor,
+            &reviewed_empty_compiled.shards[0].bytes,
+            &DecodeLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            decoded.payload().procedure_summaries().unwrap()[0].preconditions,
+            Some(Vec::new())
+        );
+
+        let mut populated = reviewed_empty;
+        let AuthoredPayload::ProcedureSummaries { summaries } = &mut populated.shards[0].payload
+        else {
+            unreachable!()
+        };
+        summaries[0].preconditions = Some(vec![
+            AuthoredOperationPrecondition {
+                input: AuthoredSummaryInput::Parameter { ordinal: 0 },
+                predicate: AuthoredResultPredicate::Null,
+            },
+            AuthoredOperationPrecondition {
+                input: AuthoredSummaryInput::Receiver {},
+                predicate: AuthoredResultPredicate::NonNull,
+            },
+        ]);
+        let populated_compiled = compile_pack(&populated, &options).unwrap();
+        let mut reordered = populated.clone();
+        let AuthoredPayload::ProcedureSummaries { summaries } = &mut reordered.shards[0].payload
+        else {
+            unreachable!()
+        };
+        summaries[0].preconditions.as_mut().unwrap().reverse();
+        assert_eq!(
+            compile_pack(&reordered, &options).unwrap(),
+            populated_compiled,
+            "operation preconditions compile as a deterministic set keyed by input"
+        );
+        assert_ne!(
+            populated_compiled.manifest.semantic_sha256,
+            reviewed_empty_compiled.manifest.semantic_sha256
+        );
+
+        let decoded = decode_shard_for_manifest(
+            &populated_compiled.manifest,
+            &populated_compiled.shards[0].descriptor,
+            &populated_compiled.shards[0].bytes,
+            &DecodeLimits::default(),
+        )
+        .unwrap();
+        let summary = &decoded.payload().procedure_summaries().unwrap()[0];
+        assert_eq!(
+            summary.preconditions,
+            Some(vec![
+                CompiledOperationPrecondition {
+                    input: CompiledSummaryInput::Receiver {},
+                    predicate: CompiledResultPredicate::NonNull,
+                },
+                CompiledOperationPrecondition {
+                    input: CompiledSummaryInput::Parameter { ordinal: 0 },
+                    predicate: CompiledResultPredicate::Null,
+                },
+            ])
+        );
+        assert_eq!(
+            authored_procedure_summary_from_compiled(summary).preconditions,
+            Some(vec![
+                AuthoredOperationPrecondition {
+                    input: AuthoredSummaryInput::Receiver {},
+                    predicate: AuthoredResultPredicate::NonNull,
+                },
+                AuthoredOperationPrecondition {
+                    input: AuthoredSummaryInput::Parameter { ordinal: 0 },
+                    predicate: AuthoredResultPredicate::Null,
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn procedure_preconditions_validate_inputs_duplicates_and_conflicts() {
+        fn with_preconditions(
+            preconditions: Vec<AuthoredOperationPrecondition>,
+        ) -> AuthoredSemanticModelPack {
+            let mut authored: AuthoredSemanticModelPack =
+                serde_json::from_slice(PROCEDURE_SUMMARIES).unwrap();
+            let AuthoredPayload::ProcedureSummaries { summaries } = &mut authored.shards[0].payload
+            else {
+                unreachable!()
+            };
+            summaries[1].preconditions = Some(preconditions);
+            authored
+        }
+
+        let receiver = AuthoredOperationPrecondition {
+            input: AuthoredSummaryInput::Receiver {},
+            predicate: AuthoredResultPredicate::NonNull,
+        };
+        let out_of_range = AuthoredOperationPrecondition {
+            input: AuthoredSummaryInput::Parameter { ordinal: u32::MAX },
+            predicate: AuthoredResultPredicate::NonNull,
+        };
+        let parameter_null = AuthoredOperationPrecondition {
+            input: AuthoredSummaryInput::Parameter { ordinal: 0 },
+            predicate: AuthoredResultPredicate::Null,
+        };
+        let parameter_non_null = AuthoredOperationPrecondition {
+            input: AuthoredSummaryInput::Parameter { ordinal: 0 },
+            predicate: AuthoredResultPredicate::NonNull,
+        };
+        for (pack, expected_code, expected_path_suffix) in [
+            (
+                with_preconditions(vec![receiver]),
+                "summary.receiver_unavailable",
+                ".preconditions[0].input",
+            ),
+            (
+                with_preconditions(vec![out_of_range]),
+                "summary.invalid_ordinal",
+                ".preconditions[0].input.ordinal",
+            ),
+            (
+                with_preconditions(vec![parameter_null.clone(), parameter_null.clone()]),
+                "summary.duplicate_operation_precondition",
+                ".preconditions[1].input",
+            ),
+            (
+                with_preconditions(vec![parameter_null, parameter_non_null]),
+                "summary.conflicting_operation_precondition",
+                ".preconditions[1].predicate",
+            ),
+        ] {
+            let diagnostics = compile_pack(&pack, &CompilerOptions::default()).unwrap_err();
+            assert!(
+                diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == expected_code
+                        && diagnostic.path.ends_with(expected_path_suffix)
+                }),
+                "missing `{expected_code}` at `*{expected_path_suffix}` in {diagnostics:#?}"
+            );
+        }
+
+        let mut variadic = with_preconditions(vec![AuthoredOperationPrecondition {
+            input: AuthoredSummaryInput::Parameter { ordinal: 0 },
+            predicate: AuthoredResultPredicate::NonNull,
+        }]);
+        let AuthoredPayload::ProcedureSummaries { summaries } = &mut variadic.shards[0].payload
+        else {
+            unreachable!()
+        };
+        summaries[1].target.variadic = true;
+        let diagnostics = compile_pack(&variadic, &CompilerOptions::default()).unwrap_err();
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "summary.unsupported_variadic_tail_reference"
+                && diagnostic.path.ends_with(".preconditions[0].input.ordinal")
+        }));
+    }
 
     #[test]
     fn shard_decoder_rejects_noncanonical_json_with_valid_digests() {

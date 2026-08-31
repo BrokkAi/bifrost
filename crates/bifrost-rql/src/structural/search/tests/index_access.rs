@@ -34,7 +34,7 @@ fn semantic_projection_rejects_a_newer_source_than_the_retained_scan_seed() {
         root,
         Language::TypeScript,
     ))));
-    let workspace = WorkspaceAnalyzer::build_ephemeral(
+    let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
         Arc::clone(&overlay) as Arc<dyn crate::analyzer::Project>,
         AnalyzerConfig::default(),
     )
@@ -798,7 +798,7 @@ fn multi_analyzer_owns_and_shares_one_workspace_import_topology() {
         root,
         BTreeSet::from([Language::Java, Language::TypeScript]),
     ));
-    let workspace = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
+    let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
         .expect("ephemeral workspace should build");
     let limits = CodeQueryExecutionLimits::default();
 
@@ -1153,7 +1153,7 @@ fn update_all_rebuilds_postings_for_added_and_deleted_files() {
         .expect("write original source");
     let project: Arc<dyn crate::analyzer::Project> =
         Arc::new(TestProject::new(root.clone(), Language::TypeScript));
-    let workspace = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
+    let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
         .expect("ephemeral workspace should build");
     assert_eq!(
         run_required_index(workspace.analyzer(), "Before")

@@ -11,8 +11,8 @@ typeshed revision.
 
 ## The pinned slice
 
-`typeshed-stdlib-2026.8.8.json` pins typeshed revision
-`1620e225476597f34177351ef913dc8390dade30` and lists 15 stub files. The
+`typeshed-stdlib-2026.8.31.json` pins typeshed revision
+`1620e225476597f34177351ef913dc8390dade30` and lists 16 stub files. The
 slice is deliberately bounded to the modules an ordinary Python program
 touches first:
 
@@ -21,6 +21,7 @@ touches first:
 | `builtins` | `builtins.pyi` |
 | `typing` | `typing.pyi` |
 | `re` | `re.pyi` |
+| `subprocess` | `subprocess.pyi` |
 | `os` | `os/__init__.pyi` |
 | `os.path` | `os/path.pyi`, `posixpath.pyi`, `ntpath.pyi` |
 | `json` | `json/__init__.pyi`, `json/decoder.pyi`, `json/encoder.pyi`, `json/scanner.pyi`, `json/tool.pyi` |
@@ -28,7 +29,7 @@ touches first:
 | `collections.abc` | `collections/abc.pyi`, `_collections_abc.pyi` |
 
 The pack is one slice of the standard library, not the standard library. It
-publishes nothing about `sys`, `pathlib`, `subprocess`, or the other ~270
+publishes nothing about `sys`, `pathlib`, or the other ~270
 stdlib modules typeshed carries. A consumer must not read a name's absence
 from this pack as a statement about the standard library. The manifest
 records `completeness: complete` because that field states extraction
@@ -82,7 +83,7 @@ declaration the interpreter has.
 
 Typeshed is licensed under the Apache License, Version 2.0. The pinned
 revision and the license are recorded in the specification's provenance and
-in `notices/typeshed-stdlib-2026.8.8.txt`, which ships with the pack.
+in `notices/typeshed-stdlib-2026.8.31.txt`, which ships with the pack.
 
 ## Regeneration
 
@@ -105,7 +106,7 @@ To run the same steps by hand:
 ```console
 cargo run --locked --release --features release-tooling -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- generate \
   /path/to/output \
-  semantic-packs/python/typeshed-stdlib-2026.8.8.json /path/to/typeshed-stdlib-1620e2254765
+  semantic-packs/python/typeshed-stdlib-2026.8.31.json /path/to/typeshed-stdlib-1620e2254765
 
 cargo run --locked --release --features release-tooling -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- verify \
   /path/to/output

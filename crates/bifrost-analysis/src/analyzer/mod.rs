@@ -12,6 +12,13 @@ mod csharp;
 pub mod declaration_range;
 pub(crate) mod exception_handling;
 mod go;
+pub use go::package_identity::modeled_go_callable_result_pointer_field;
+pub use go::{
+    GO_MODELED_RESULT_BINDING_TYPE_PROOF_MAX_SOURCE_BYTES,
+    GO_MODELED_RESULT_BINDING_TYPE_PROOF_MAX_STEPS,
+    go_modeled_result_binding_type_identity_is_exact,
+    go_modeled_result_binding_type_identity_proof_work,
+};
 mod i_analyzer;
 mod index_warmer;
 pub mod invalidation;
@@ -75,8 +82,9 @@ pub(crate) use brokk_bifrost_cpp::imports::{
     include_paths as cpp_include_paths, resolve_include_targets, resolve_include_targets_with_index,
 };
 pub use capabilities::{
-    CapabilityProvider, DescendantIndexScope, DescendantIndexVariant, ImportAnalysisProvider,
-    ImportReachability, TestDetectionProvider, TypeAliasProvider, TypeHierarchyProvider,
+    AdditionalFileDependencies, CapabilityProvider, DescendantIndexScope, DescendantIndexVariant,
+    FileDependencyFacts, ImportAnalysisProvider, ImportReachability, TestDetectionProvider,
+    TypeAliasProvider, TypeHierarchyProvider,
 };
 pub(crate) use capabilities::{
     DirectDescendantIndex, build_direct_descendant_index, build_reverse_file_index,
@@ -85,13 +93,13 @@ pub(crate) use capabilities::{
 };
 pub use config::{
     AnalyzerConfig, CSharpAnalyzerConfig, DispatchHierarchyExpansion, GoAnalyzerConfig,
-    GoDependencyDiscoveryConfig, JsTsAnalyzerConfig, JsTsDependencyDiscoveryConfig,
-    JvmAnalyzerConfig, JvmDependencyDiscoveryConfig, JvmDependencyDiscoveryMode,
-    JvmExternalArtifact, JvmExternalArtifactOrigin, JvmExternalDependencies, JvmMavenCoordinate,
-    JvmStandardLibraryDiscoveryConfig, PhpAnalyzerConfig, PhpDependencyApiEvidence,
-    PythonAnalyzerConfig, PythonEnvironmentConfig, PythonEnvironmentLimits, RubyAnalyzerConfig,
-    RubyDependencyApiEvidence, RubyGemApiArtifact, RustAnalyzerConfig, RustDependencyApiEvidence,
-    RustPackageApiArtifact, RustSelectedTarget,
+    GoDependencyDiscoveryConfig, GoDependencyDiscoveryMode, JsTsAnalyzerConfig,
+    JsTsDependencyDiscoveryConfig, JvmAnalyzerConfig, JvmDependencyDiscoveryConfig,
+    JvmDependencyDiscoveryMode, JvmExternalArtifact, JvmExternalArtifactOrigin,
+    JvmExternalDependencies, JvmMavenCoordinate, JvmStandardLibraryDiscoveryConfig,
+    PhpAnalyzerConfig, PhpDependencyApiEvidence, PythonAnalyzerConfig, PythonEnvironmentConfig,
+    PythonEnvironmentLimits, RubyAnalyzerConfig, RubyDependencyApiEvidence, RubyGemApiArtifact,
+    RustAnalyzerConfig, RustDependencyApiEvidence, RustPackageApiArtifact, RustSelectedTarget,
 };
 pub use cpp::CppAnalyzer;
 pub(crate) use cpp::{
@@ -223,18 +231,23 @@ pub use source_ingestion::{
     IngestedSource, SourceIngestionError, SourceIngestionKind, ingest_source_bytes,
 };
 pub(crate) use tree_sitter_analyzer::{
-    AnalyzerStoreContext, BuildAbort, BulkFileStateSource, ephemeral_store_context,
-    persistent_store_context, persistent_store_context_without_automatic_gc,
+    AnalyzerStoreContext, BuildAbort, BulkFileStateSource, RevisionBlobIdentities,
+    ephemeral_store_context, persistent_store_context,
+    persistent_store_context_without_automatic_gc, revision_image_store_context,
 };
 pub use tree_sitter_analyzer::{
     BuildProgress, BuildProgressEvent, BuildProgressPhase, LanguageAdapter, TreeSitterAnalyzer,
 };
 pub use typescript::TypescriptAnalyzer;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use usages::java_usage_evidence_cache::JavaUsageEvidenceCacheStats;
 pub use workspace::{
     DependencyPackActivationOutcome, DependencyPackEcosystem, DependencyPackEcosystemOutcome,
     DependencyPackWorkspaceContext, EmptyAnalyzer, PythonSemanticModelActivationOutcome,
     PythonSemanticModelWorkspaceContext, WorkspaceAnalyzer,
 };
+pub(crate) use workspace::{RevisionWorkspaceProjection, SharedAnalyzerCache};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ParserFlavor {

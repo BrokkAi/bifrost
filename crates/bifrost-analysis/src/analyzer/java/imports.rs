@@ -21,7 +21,7 @@ use brokk_bifrost_jvm::java::graph_support::{
     java_could_import_file, java_could_import_file_without_source, java_same_package_fqn,
     resolve_java_import_infos, resolve_java_type_name,
 };
-use brokk_bifrost_jvm::java::imports::non_static_import_path;
+use brokk_bifrost_jvm::java::imports::{non_static_import_path, static_import_path};
 use rayon::prelude::*;
 use std::sync::Arc;
 
@@ -32,6 +32,13 @@ pub(crate) enum JavaTypeResolution {
 }
 
 impl ImportAnalysisProvider for JavaAnalyzer {
+    fn file_dependency_facts_for_files(
+        &self,
+        files: &[ProjectFile],
+    ) -> Option<crate::hash::HashMap<ProjectFile, crate::analyzer::FileDependencyFacts>> {
+        Some(self.inner.bulk_file_dependency_facts(files.iter().cloned()))
+    }
+
     fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();
@@ -305,6 +312,136 @@ impl ImportAnalysisProvider for JavaAnalyzer {
         ))
     }
 
+    fn imported_files_from_infos(
+        &self,
+        _file: &ProjectFile,
+        imports: &[ImportInfo],
+    ) -> Option<HashSet<ProjectFile>> {
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        let wildcard_packages = imports
+            .iter()
+            .filter_map(|import| {
+                import
+                    .is_wildcard
+                    .then(|| non_static_import_path(import))
+                    .flatten()
+                    .map(|path| path.render_segments("."))
+            })
+            .collect::<Vec<_>>();
+        let types_by_package =
+            <Self as JavaSource>::source_types_in_packages(self, token, &wildcard_packages);
+        let mut files = HashSet::default();
+        for import in imports {
+            if let Some(package) = import
+                .is_wildcard
+                .then(|| non_static_import_path(import))
+                .flatten()
+                .map(|path| path.render_segments("."))
+            {
+                files.extend(
+                    types_by_package
+                        .get(&package)
+                        .into_iter()
+                        .flatten()
+                        .map(|unit| unit.source().clone()),
+                );
+                continue;
+            }
+            let Some(fqn) = java_import_dependency_fqn(import) else {
+                continue;
+            };
+            files.extend(
+                self.inner
+                    .definitions(&fqn)
+                    .map(|unit| unit.source().clone()),
+            );
+        }
+        Some(files)
+    }
+
+    fn prefetch_file_dependency_targets(
+        &self,
+        files: &[ProjectFile],
+        import_infos: Option<&HashMap<ProjectFile, Vec<ImportInfo>>>,
+        cancellation: &crate::cancellation::CancellationToken,
+    ) {
+        let scope = AnalyzerQueryScope::new(self);
+        let token = scope.token();
+        let mut definitions = Vec::new();
+        for file in files {
+            if cancellation.is_cancelled() {
+                return;
+            }
+            let owned_imports;
+            let imports = if let Some(imports) = import_infos.and_then(|all| all.get(file)) {
+                imports.as_slice()
+            } else {
+                owned_imports = self.inner.import_info_of(token, file);
+                &owned_imports
+            };
+            definitions.extend(imports.iter().filter_map(java_import_dependency_fqn));
+        }
+        definitions.sort_unstable();
+        definitions.dedup();
+        self.inner.prefetch_definitions(&definitions);
+    }
+
+    fn additional_direct_file_dependencies(
+        &self,
+        files: &[ProjectFile],
+        cancellation: &crate::cancellation::CancellationToken,
+    ) -> Option<crate::analyzer::AdditionalFileDependencies> {
+        let selected = files.iter().cloned().collect::<HashSet<_>>();
+        let packages = self.inner.bulk_import_facts(files.iter().cloned());
+        let identifiers = self.inner.bulk_type_identifiers(files.iter().cloned());
+        let mut targets_by_package_and_name: HashMap<String, HashMap<String, Vec<ProjectFile>>> =
+            HashMap::default();
+        for declaration in self.inner.all_declarations() {
+            if cancellation.is_cancelled() {
+                return None;
+            }
+            if declaration.is_class()
+                && declaration.short_name() == declaration.identifier()
+                && selected.contains(declaration.source())
+            {
+                targets_by_package_and_name
+                    .entry(declaration.package_name().to_string())
+                    .or_default()
+                    .entry(declaration.identifier().to_string())
+                    .or_default()
+                    .push(declaration.source().clone());
+            }
+        }
+        let mut dependencies: HashMap<ProjectFile, HashSet<ProjectFile>> = HashMap::default();
+        for source in files {
+            if cancellation.is_cancelled() {
+                return None;
+            }
+            let Some(package) = packages
+                .get(source)
+                .map(|facts| facts.package_name.as_str())
+            else {
+                continue;
+            };
+            for identifier in identifiers.get(source).into_iter().flatten() {
+                let Some(targets) = targets_by_package_and_name
+                    .get(package)
+                    .and_then(|by_name| by_name.get(identifier))
+                else {
+                    continue;
+                };
+                dependencies
+                    .entry(source.clone())
+                    .or_default()
+                    .extend(targets.iter().filter(|target| *target != source).cloned());
+            }
+        }
+        Some(crate::analyzer::AdditionalFileDependencies::complete(
+            dependencies,
+        ))
+    }
+
     fn relevant_imports_for(&self, code_unit: &CodeUnit) -> HashSet<String> {
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();
@@ -330,6 +467,19 @@ impl ImportAnalysisProvider for JavaAnalyzer {
 }
 
 impl TestDetectionProvider for JavaAnalyzer {}
+
+fn java_import_dependency_fqn(import: &ImportInfo) -> Option<String> {
+    if let Some(path) = non_static_import_path(import) {
+        return (!import.is_wildcard).then(|| path.render_segments("."));
+    }
+    let path = static_import_path(import)?;
+    let owner_segments = if import.is_wildcard {
+        path.segments.as_slice()
+    } else {
+        path.segments.split_last()?.1
+    };
+    (!owner_segments.is_empty()).then(|| owner_segments.join("."))
+}
 
 impl JavaAnalyzer {
     pub(super) fn same_package_reference_index(

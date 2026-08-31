@@ -330,6 +330,10 @@ where
         self.problem.zero_fact()
     }
 
+    fn resolved_call_to_return(&self) -> bool {
+        self.problem.resolved_call_to_return()
+    }
+
     fn normal_predecessor_flow(
         &self,
         edge: super::DataflowEdge<'_, Self::Fact>,

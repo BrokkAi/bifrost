@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "pack_id": "bifrost.go.testify.require",
+  "version": "1.0.0",
+  "producer": {
+    "name": "bifrost",
+    "version": "0.10.5"
+  },
+  "language": "go",
+  "ecosystem": "go-module",
+  "compatibility": {
+    "bifrost": ">=0.10.5, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "https://pkg.go.dev/github.com/stretchr/testify/require",
+    "revision": "v1.11.1"
+  },
+  "license": "MIT",
+  "completeness": "complete",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "go.testify.require.normal-return-refinements",
+      "activation": [
+        {
+          "module": {
+            "name": "github.com/stretchr/testify",
+            "version": "=1.11.1"
+          }
+        }
+      ],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "require.no-error",
+            "target": {
+              "path": "require/require.go",
+              "symbol": "github.com/stretchr/testify/require.NoError(t TestingT, err error, msgAndArgs ...interface{})",
+              "has_receiver": false,
+              "variadic": true,
+              "parameter_count": 3
+            },
+            "completeness": "complete",
+            "transfers": [],
+            "normal_return_refinements": [
+              {
+                "parameter_ordinal": 1,
+                "predicate": "null"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

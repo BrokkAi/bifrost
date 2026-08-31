@@ -8,15 +8,17 @@ use crate::analyzer::semantic_model::{
     DependencyPackLimits, DependencyPackPreparationOutcome, DependencyResolver,
     DependencyResolverBounds, SemanticModelActivationPersistence, SemanticModelActivationRequest,
     SemanticModelRuntimeOutcome, SemanticPackCatalog, SubprocessPolicy,
-    acquire_active_semantic_models_with_evidence, prepare_dependency_semantic_packs,
+    acquire_active_semantic_models_with_evidence, prepare_compatible_installed_semantic_packs,
+    prepare_dependency_semantic_packs,
 };
 use crate::analyzer::store::StoreError;
 use crate::analyzer::tree_sitter_analyzer::WorkspaceBuildSnapshot;
 use crate::analyzer::{
     AnalyzerBuildTierAccess, AnalyzerConfig, AnalyzerDelegate, BuildProgress,
-    CSharpDependencyPackAdapter, GoDependencyPackAdapter, IAnalyzer, JsTsDependencyPackAdapter,
-    JvmDependencyDiscoveryMode, JvmDependencyPackAdapter, Language, MultiAnalyzer, Project,
-    PythonDependencyPackAdapter, RubyDependencyPackAdapter, RustDependencyPackAdapter,
+    CSharpDependencyPackAdapter, GoDependencyDiscoveryMode, GoDependencyPackAdapter, IAnalyzer,
+    JsTsDependencyPackAdapter, JvmDependencyDiscoveryMode, JvmDependencyPackAdapter, Language,
+    MultiAnalyzer, Project, PythonDependencyPackAdapter, RevisionBlobIdentities,
+    RubyDependencyPackAdapter, RustDependencyPackAdapter,
     resolve_csharp_semantic_pack_dependencies, resolve_go_semantic_pack_dependencies,
     resolve_js_ts_semantic_pack_dependencies, resolve_jvm_semantic_pack_dependencies,
     resolve_python_semantic_pack_dependencies, resolve_ruby_semantic_pack_dependencies,
@@ -51,6 +53,7 @@ impl WorkspaceBuildLock {
                     lock_path.display()
                 ))
             })?;
+        let _scope = profiling::scope("WorkspaceAnalyzer::build_lock_wait");
         file.lock().map_err(|error| {
             StoreError::new(format!(
                 "failed to acquire workspace analyzer build lock {}: {error}",
@@ -65,6 +68,107 @@ fn analyzer_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
     let mut path = OsString::from(db_path.as_os_str());
     path.push(suffix);
     PathBuf::from(path)
+}
+
+/// The repository's shared content-addressed analyzer cache, opened once for a
+/// request that analyzes immutable revisions of that repository.
+///
+/// Parsed facts are keyed by Git blob id and language storage key, not by
+/// workspace, so a revision image can read every blob the cache already holds
+/// -- from the live worktree, a linked worktree, or an earlier revision
+/// request -- and contributes the ones it had to parse back to all of them.
+/// The cache location resolves from the *original* repository root through the
+/// standard funnel; a revision image's own root is a self-deleting export
+/// directory and must never be used to derive it.
+pub(crate) struct SharedAnalyzerCache {
+    store: Arc<crate::analyzer::store::AnalyzerStore>,
+}
+
+impl SharedAnalyzerCache {
+    /// Open the persisted cache serving `repository_root`.
+    ///
+    /// Opening is strict. A request that analyzes an immutable revision reads
+    /// and writes this cache, and a host that cannot open it has no silently
+    /// equivalent slower path: an ephemeral rebuild re-parses every blob of
+    /// every revision on every request, so it is a performance failure worth
+    /// reporting rather than absorbing. Two things fail here. `repository_root`
+    /// may not be in a Git repository, which no immutable request reaches in
+    /// practice because resolving the revision already needed one -- a bare
+    /// repository passes, because reading a revision needs the object database
+    /// and not a checkout; or the store
+    /// may refuse the cache -- an unwritable or read-only checkout, or a
+    /// filesystem SQLite rejects. The escape for a checkout that must stay
+    /// read-only is `BIFROST_CACHE_ROOT`, which relocates the cache off the
+    /// repository.
+    pub(crate) fn open(repository_root: &Path) -> Result<Self, StoreError> {
+        if !brokk_bifrost_core::gitblob::has_object_database(repository_root) {
+            return Err(StoreError::new(format!(
+                "{} is not inside a git repository, so it has no shared analyzer cache to serve immutable revision analysis",
+                repository_root.display()
+            )));
+        }
+        let db_path = crate::analyzer::store::analyzer_db_path(repository_root);
+        let store = crate::analyzer::store::AnalyzerStore::open_persistent(&db_path).map_err(
+            |error| {
+                error.context(format!(
+                    "opening the shared analyzer cache at {} for immutable revision analysis; this cache is derived state, so remove {} and retry to rebuild it, or set BIFROST_CACHE_ROOT to relocate it off a read-only checkout",
+                    db_path.display(),
+                    db_path.display(),
+                ))
+            },
+        )?;
+        Ok(Self {
+            store: Arc::new(store),
+        })
+    }
+
+    fn store(&self) -> Arc<crate::analyzer::store::AnalyzerStore> {
+        Arc::clone(&self.store)
+    }
+
+    /// Claim the workspace projection rows an immutable image at `image_root`
+    /// is about to publish, so they are removed when the request ends.
+    pub(crate) fn claim_revision_workspace(
+        &self,
+        image_root: &Path,
+    ) -> RevisionWorkspaceProjection {
+        RevisionWorkspaceProjection {
+            store: self.store(),
+            // Resolved now, while the export directory still exists:
+            // `WorkspaceId::for_root` canonicalizes, and a canonicalization
+            // that fails after the directory is unlinked would produce a
+            // different identity than the build published under.
+            workspace_id: crate::analyzer::store::WorkspaceId::for_root(image_root),
+        }
+    }
+}
+
+/// The workspace projection rows one immutable revision image publishes into a
+/// shared cache, removed when this value drops.
+///
+/// Query paths mount a workspace's files through `workspace_heads` and
+/// `workspace_file_versions`, so a revision image must publish them to be
+/// queryable at all -- declaration lookup, package resolution and path-symbol
+/// resolution all read those rows. They describe a temp-directory root that
+/// stops existing when the request ends, though, so leaving them behind would
+/// grow the shared cache by one whole file listing per request forever. The
+/// parsed blob facts the same build published are keyed by content and stay:
+/// those are the reusable asset.
+pub(crate) struct RevisionWorkspaceProjection {
+    store: Arc<crate::analyzer::store::AnalyzerStore>,
+    workspace_id: crate::analyzer::store::WorkspaceId,
+}
+
+impl Drop for RevisionWorkspaceProjection {
+    fn drop(&mut self) {
+        if let Err(error) = self.store.delete_workspace_projection(&self.workspace_id) {
+            eprintln!(
+                "bifrost: could not drop the revision image's workspace projection rows from the \
+                 shared analyzer cache; they will be reclaimed when this language's analysis \
+                 generation next changes: {error}"
+            );
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -353,6 +457,35 @@ impl DependencyPackEcosystem {
         self.resolver().dependency_inputs()
     }
 
+    /// Whether a revision path must accompany this ecosystem's source files
+    /// in an immutable file-dependency image.
+    ///
+    /// This is the reader-side predicate, not merely the manifest basename
+    /// list used for dependency-pack invalidation. JVM and .NET analyzers also
+    /// consume patterned build inputs such as arbitrary `*.gradle`, `*.props`,
+    /// and `*.targets` files. Keeping the predicate here gives workspace
+    /// construction and revision export one source of truth.
+    pub(crate) fn is_file_dependency_input(self, path: &Path) -> bool {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        match self {
+            Self::Jvm => {
+                crate::analyzer::jvm::dependency_discovery::is_jvm_dependency_input_path(path)
+            }
+            Self::DotNet => crate::analyzer::csharp::is_csharp_dependency_input_path(path),
+            Self::Npm => {
+                self.dependency_inputs().contains(&name)
+                    || matches!(name, "tsconfig.json" | "jsconfig.json")
+            }
+            Self::Cpp => path == Path::new("compile_commands.json"),
+            Self::Python | Self::Go | Self::Cargo | Self::Ruby | Self::Composer => {
+                self.dependency_inputs().contains(&name)
+            }
+        }
+    }
+
     /// The resolver that discovers this ecosystem's dependencies, paired with
     /// the adapter that turns them into packs.
     ///
@@ -555,16 +688,38 @@ impl DependencyResolver for GoDependencyResolver {
 
     fn bounds(&self, config: &AnalyzerConfig) -> DependencyResolverBounds {
         let discovery = &config.go.dependency_discovery;
+        let runs_tools = discovery.mode != GoDependencyDiscoveryMode::Disabled;
         DependencyResolverBounds {
-            subprocess: if discovery.enabled {
+            subprocess: if runs_tools {
                 // `go list` under the bounded-process runner, with a cleared
                 // environment and the module cache the configuration names.
                 SubprocessPolicy::OfflineBuildTools
             } else {
                 SubprocessPolicy::Forbidden
             },
-            wall_clock: discovery.enabled.then_some(discovery.timeout),
+            wall_clock: runs_tools.then_some(discovery.timeout),
             ..READS_FILES_ONLY
+        }
+    }
+
+    fn prepare(
+        &self,
+        config: &AnalyzerConfig,
+        catalog: &SemanticPackCatalog,
+        dependencies: &[crate::analyzer::semantic_model::ResolvedDependency],
+        limits: &DependencyPackLimits,
+        cancellation: Option<&crate::CancellationToken>,
+    ) -> DependencyPackPreparationOutcome {
+        if config.go.dependency_discovery.mode == GoDependencyDiscoveryMode::CuratedPackEvidence {
+            prepare_compatible_installed_semantic_packs(catalog, dependencies, limits, cancellation)
+        } else {
+            prepare_dependency_semantic_packs(
+                catalog,
+                self.adapter(),
+                dependencies,
+                limits,
+                cancellation,
+            )
         }
     }
 
@@ -775,16 +930,27 @@ impl WorkspaceAnalyzer {
         let mut publication_evidence = Vec::with_capacity(ecosystems.len());
         let mut cancelled = false;
 
+        // Dependency-pack work runs before the parse phase and is attributed to
+        // the workspace as a whole, so a slow ecosystem looks like slow startup
+        // with no further detail. The discover/prepare span pair is per
+        // ecosystem on purpose: it names which resolver is spending the time and
+        // separates discovery, which walks the workspace, from preparation,
+        // which reads and generates packs.
         for ecosystem in ecosystems.iter().copied() {
             let resolver = ecosystem.resolver();
             let mut limits = context.limits;
             resolver.adjust_limits(config, &mut limits);
-            let discovery = resolver.resolve(
-                config,
-                self.analyzer().project(),
-                &limits,
-                Some(context.cancellation),
-            );
+            let discovery = {
+                let _scope = crate::profiling::scope_with(|| {
+                    format!("semantic_pack.discover[{}]", ecosystem.label())
+                });
+                resolver.resolve(
+                    config,
+                    self.analyzer().project(),
+                    &limits,
+                    Some(context.cancellation),
+                )
+            };
             if discovery.cancelled {
                 cancelled = true;
                 outcomes.push(DependencyPackEcosystemOutcome {
@@ -802,13 +968,22 @@ impl WorkspaceAnalyzer {
                 });
                 continue;
             }
-            let preparation = prepare_dependency_semantic_packs(
-                context.catalog,
-                resolver.adapter(),
-                &discovery.dependencies,
-                &limits,
-                Some(context.cancellation),
-            );
+            let preparation = {
+                let _scope = crate::profiling::scope_with(|| {
+                    format!(
+                        "semantic_pack.prepare[{},{} deps]",
+                        ecosystem.label(),
+                        discovery.dependencies.len()
+                    )
+                });
+                resolver.prepare(
+                    config,
+                    context.catalog,
+                    &discovery.dependencies,
+                    &limits,
+                    Some(context.cancellation),
+                )
+            };
             if preparation.cancelled {
                 cancelled = true;
                 outcomes.push(DependencyPackEcosystemOutcome {
@@ -840,7 +1015,11 @@ impl WorkspaceAnalyzer {
             });
         }
 
-        if cancelled || (!ecosystems.is_empty() && publication_evidence.is_empty()) {
+        if cancelled
+            || (!ecosystems.is_empty()
+                && publication_evidence.is_empty()
+                && activation.evidence.is_empty())
+        {
             return DependencyPackActivationOutcome {
                 ecosystems: outcomes,
                 runtime: None,
@@ -941,7 +1120,10 @@ impl WorkspaceAnalyzer {
         }
     }
 
-    pub fn build_ephemeral_for_languages(
+    /// Language-restricted [`Self::build_ephemeral_footgun`], and a footgun for
+    /// the same reason: read that function's doc before calling this one. The
+    /// persisted equivalent is [`Self::build_persisted_for_languages`].
+    pub fn build_ephemeral_for_languages_footgun(
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
         languages: &BTreeSet<Language>,
@@ -950,14 +1132,49 @@ impl WorkspaceAnalyzer {
         Self::build_filtered(project, config, Some(languages), store_context, None)
     }
 
-    /// Build an analyzer whose store lives only in memory, no matter what the
-    /// project's [`Project::persistence_root`] says.
+    /// Build an analyzer over a delete-on-drop temporary store, no matter what
+    /// the project's [`Project::persistence_root`] says.
     ///
-    /// Use this for throwaway file sets — temp-directory revision exports, or a
-    /// changed-file-scoped view of a live workspace — where writing an on-disk
-    /// cache would be either pure waste or actively wrong (a partial file set
-    /// must not become the workspace's cached picture of itself).
-    pub fn build_ephemeral(
+    /// Named a footgun because it usually is one. An ephemeral store forfeits
+    /// all reuse: every run re-parses and re-persists the whole world into a
+    /// database that is deleted when the analyzer drops, so the next run starts
+    /// from nothing. [`Self::build_persisted`] and its siblings instead reuse
+    /// content-addressed blobs across runs, and take the per-cache build lock
+    /// across the whole reconciliation so concurrent builders on one database
+    /// do not each parse the same missing set. A persisted request over a
+    /// project with no [`Project::persistence_root`] is a hard error rather
+    /// than a quiet downgrade, so this family of functions is the only door to
+    /// a throwaway store and taking it is always a stated choice. Prefer
+    /// persisted unless one of the following is your actual reason:
+    ///
+    /// - Session-only parse-error evidence. Tree-sitter ERROR nodes exist only
+    ///   on a cold parse, so `IAnalyzer::parse_errors` is complete for the whole
+    ///   workspace only when nothing was served from a warm cache.
+    /// - An explicit do-not-write-here operator opt-out, for a checkout you do
+    ///   not own and must leave byte-identical.
+    /// - Deliberate cold-build measurement.
+    /// - A partial file set over a *live* workspace root, such as a
+    ///   changed-file-scoped view of it. Writing an on-disk cache under that
+    ///   root's workspace identity would be actively wrong: a build publishes
+    ///   workspace projection rows, and a partial file set must not become the
+    ///   workspace's cached picture of itself.
+    ///
+    /// Tests are fine: a hermetic small fixture wants no cache to survive it.
+    ///
+    /// An immutable revision image is no longer such a case, however few of the
+    /// revision's files one request selected. It goes through
+    /// [`Self::build_revision_image`] and shares the repository's
+    /// content-addressed cache, because a fact keyed by blob id, language
+    /// storage key and generation describes those bytes for every consumer, not
+    /// just the request that parsed them, and a selection of files cannot make
+    /// a blob's facts partial. The workspace rows such a build publishes name a
+    /// self-deleting export directory and are removed by the caller's
+    /// [`SharedAnalyzerCache::claim_revision_workspace`] lease, which is the
+    /// part a live root cannot have. That path no longer falls back here when a
+    /// host's cache will not open either; it reports the failure. What still
+    /// arrives here is the partial case above: a worktree image, whose file set
+    /// is a slice of a live workspace.
+    pub fn build_ephemeral_footgun(
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
     ) -> Result<Self, StoreError> {
@@ -965,11 +1182,66 @@ impl WorkspaceAnalyzer {
         Self::build_filtered(project, config, None, store_context, None)
     }
 
+    /// Build an analyzer over one immutable revision image, publishing its
+    /// parsed facts into the repository's shared content-addressed cache.
+    ///
+    /// The cache is keyed by Git blob id and language storage key, so the
+    /// blobs of this revision that the cache has already seen are read rather
+    /// than parsed, and the ones parsed here warm the cache for every later
+    /// consumer. [`Self::build_filtered`] holds the per-cache build lock across
+    /// the whole reconciliation, exactly as a worktree build does, so two
+    /// builders never each parse the same missing set.
+    ///
+    /// `cache` of `None` means the caller deliberately wants this image kept
+    /// out of the shared cache, not that the host lacks one: a cache that will
+    /// not open is reported, never worked around. The case that reaches here is
+    /// a worktree image, whose root is a live project root and whose file set
+    /// is partial, so publishing under that workspace identity would replace
+    /// the workspace's own picture of itself. The build then runs against an
+    /// ephemeral store, which returns the same answers and differs only in
+    /// having to parse every blob.
+    ///
+    /// `languages` of `Some` restricts which parsers run. A file graph has no
+    /// edges between distinct usage ecosystems, so a caller that already knows
+    /// the seed ecosystems retains the complete revision's files while skipping
+    /// parsers whose facts cannot enter the requested reverse walk.
+    ///
+    /// `blobs` is the image's own inventory of Git blob ids, so identity
+    /// resolution reads the ids the export's tree walk already produced instead
+    /// of re-hashing the bytes it just wrote.
+    ///
+    /// With a cache, the caller must hold a
+    /// [`SharedAnalyzerCache::claim_revision_workspace`] claim for `project`'s
+    /// root for as long as the analyzer is used, so the workspace projection
+    /// rows this build publishes for a temp-directory root do not outlive the
+    /// request.
+    pub(crate) fn build_revision_image(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        languages: Option<&BTreeSet<Language>>,
+        cache: Option<&SharedAnalyzerCache>,
+        blobs: Arc<RevisionBlobIdentities>,
+    ) -> Result<Self, StoreError> {
+        let mut store_context = match cache {
+            Some(cache) => {
+                crate::analyzer::revision_image_store_context(project.as_ref(), cache.store())
+            }
+            None => crate::analyzer::ephemeral_store_context(project.as_ref())?,
+        };
+        store_context.revision_blobs = Some(blobs);
+        Self::build_filtered(project, config, languages, store_context, None)
+    }
+
     /// Build an analyzer and retain the tier crossings paid while constructing
     /// it. The observer is finished before the result is returned, so later
     /// incremental work cannot contaminate the open report.
+    ///
+    /// A footgun for the reason given on [`Self::build_ephemeral_footgun`], with
+    /// one narrowing: measuring the tier crossings of a cold build is itself a
+    /// legitimate reason to want one. If you are measuring anything else, use
+    /// [`Self::build_persisted_with_tier_access`].
     #[doc(hidden)]
-    pub fn build_ephemeral_with_tier_access(
+    pub fn build_ephemeral_with_tier_access_footgun(
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
     ) -> Result<(Self, Arc<AnalyzerBuildTierAccess>), StoreError> {
@@ -988,6 +1260,23 @@ impl WorkspaceAnalyzer {
         Self::build_persisted_inner(project, config, None, true, None)
     }
 
+    /// Language-restricted [`Self::build_persisted`]: the same shared
+    /// content-addressed cache, with only the requested languages' parsers run.
+    ///
+    /// Restricting languages narrows which per-language delegates are built. It
+    /// does not narrow what stays in the cache: garbage collection reaches from
+    /// git refs and the uncommitted working set, which say nothing about
+    /// language, so an unselected language's facts survive this build and a
+    /// later whole-workspace build reuses them.
+    pub fn build_persisted_for_languages(
+        project: Arc<dyn Project>,
+        config: AnalyzerConfig,
+        languages: &BTreeSet<Language>,
+    ) -> Result<Self, StoreError> {
+        let store_context = crate::analyzer::persistent_store_context(project.as_ref())?;
+        Self::build_filtered(project, config, Some(languages), store_context, None)
+    }
+
     /// Build a persisted analyzer whose cache is collected only when the host
     /// explicitly requests it.
     pub fn build_persisted_without_automatic_gc(
@@ -997,7 +1286,7 @@ impl WorkspaceAnalyzer {
         Self::build_persisted_inner(project, config, None, false, None)
     }
 
-    /// Persisted counterpart of [`Self::build_ephemeral_with_tier_access`].
+    /// Persisted counterpart of [`Self::build_ephemeral_with_tier_access_footgun`].
     #[doc(hidden)]
     pub fn build_persisted_with_tier_access(
         project: Arc<dyn Project>,
@@ -1052,11 +1341,13 @@ impl WorkspaceAnalyzer {
         // reconciliation, not just the first population. Otherwise concurrent
         // worktrees all snapshot the same missing set and each creates a full
         // analyzer pool before any of them can publish reusable results.
-        let build_lock = store_context
-            .store
-            .db_path()
-            .map(WorkspaceBuildLock::acquire)
-            .transpose()?;
+        let build_lock = if let Some(db_path) = store_context.store.db_path() {
+            profiling::note("workspace.store=persistent");
+            Some(WorkspaceBuildLock::acquire(db_path)?)
+        } else {
+            profiling::note("workspace.store=ephemeral");
+            None
+        };
         // A fresh abort per fan-out. The caller's context may outlive this
         // build and go on to serve lazy per-language delegate builds, and those
         // must not inherit a flag this build set.
@@ -1087,6 +1378,7 @@ impl WorkspaceAnalyzer {
             store_context.liveness.as_deref(),
             &selected_languages,
         );
+        store_context.workspace_listing_complete = store_context.workspace_snapshot.is_some();
         // One build thread per language: a single language with one pathological
         // file (a vendored million-line generated parser.c, say) otherwise
         // serializes ahead of every other language's build and dominates cold
@@ -1205,9 +1497,13 @@ impl WorkspaceAnalyzer {
     }
 
     /// The on-disk path of the analyzer store this workspace persists to, or
-    /// `None` when the store lives only in memory — an ephemeral build, or a
-    /// persisted build whose project offers no [`Project::persistence_root`]
-    /// and therefore degraded to the in-memory store.
+    /// `None` when the store has no persistent workspace identity, which now
+    /// means exactly one thing: this was an ephemeral build. A persisted build
+    /// over a project with no [`Project::persistence_root`] fails rather than
+    /// degrading, so a workspace from a persisted build always reports a path.
+    /// `None` does not mean the store has no file. An ephemeral store is a
+    /// delete-on-drop temporary database rather than `:memory:`, so the reader
+    /// pool can share it; what it lacks is an identity that outlives the build.
     ///
     /// This reports what the build actually produced, not what the caller
     /// requested, so hosts that must surface their persistence decision as
@@ -1493,6 +1789,10 @@ impl WorkspaceAnalyzer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::semantic_model::{
+        CompilerOptions, SemanticModelActivationEvidence, SemanticModelRuntimeLimits,
+        SessionPackSource, SessionPackSourceKind, SourceFormat, compile_source,
+    };
     use crate::analyzer::store::liveness::Liveness;
     use crate::analyzer::{
         FilesystemProject, MultiRootProject, OverlayProject, Project, ProjectFile, TestProject,
@@ -1500,6 +1800,110 @@ mod tests {
     use crate::gitblob::test_repo::{commit_all, init_repo};
     use rusqlite::Connection;
     use std::sync::atomic::Ordering;
+
+    use crate::inline_project::InlineTestProject;
+
+    #[test]
+    fn intrinsic_models_activate_when_dependency_discovery_fails() {
+        let project = InlineTestProject::with_language(Language::Go)
+            .file("main.go", "package main\n")
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let catalog = SemanticPackCatalog::open_ephemeral(Default::default()).unwrap();
+        let pack = compile_source(
+            SourceFormat::Json,
+            br#"{
+              "schema_version": 1,
+              "pack_id": "test.go.intrinsic",
+              "version": "1.0.0",
+              "producer": {"name": "test", "version": "1.0.0"},
+              "language": "go",
+              "ecosystem": "go",
+              "compatibility": {"bifrost": ">=0.10.0, <1.0.0"},
+              "provenance": {"source": "test:go-intrinsic"},
+              "license": "Apache-2.0",
+              "completeness": "complete",
+              "safety": {"generated_code_only": false, "review_required": false},
+              "shards": [{
+                "id": "summaries",
+                "activation": [{}],
+                "payload": {
+                  "kind": "procedure_summaries",
+                  "summaries": [{
+                    "id": "test.go.exit",
+                    "target": {
+                      "path": "src/os/proc.go",
+                      "symbol": "os.Exit(code int)",
+                      "has_receiver": false,
+                      "parameter_count": 1
+                    },
+                    "completeness": "complete",
+                    "normal_continuation_absent": true,
+                    "transfers": [],
+                    "effects": [{
+                      "kind": "unknown_call_boundary",
+                      "event": "test.go.exit-boundary"
+                    }]
+                  }]
+                }
+              }]
+            }"#,
+            &CompilerOptions::default(),
+        )
+        .unwrap_or_else(|diagnostics| panic!("intrinsic fixture failed: {diagnostics:#?}"));
+        catalog
+            .register_session_pack(
+                &pack,
+                &SessionPackSource {
+                    kind: SessionPackSourceKind::Embedded,
+                    source_id: "test:go-intrinsic".to_owned(),
+                },
+            )
+            .unwrap();
+
+        let mut config = AnalyzerConfig::default();
+        config.go.dependency_discovery.mode = GoDependencyDiscoveryMode::CuratedPackEvidence;
+        config.go.dependency_discovery.go_executable = Some(project.root().join("missing-go"));
+        let request = SemanticModelActivationRequest {
+            bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+            evidence: vec![SemanticModelActivationEvidence {
+                language: "go".to_owned(),
+                ecosystem: "go".to_owned(),
+                package: None,
+                module: None,
+                toolchain: None,
+                target: None,
+                configuration: None,
+                artifact_sha256: None,
+            }],
+            controls: Vec::new(),
+            limits: SemanticModelRuntimeLimits::default(),
+        };
+        let outcome = workspace.activate_dependency_packs(
+            &config,
+            &[DependencyPackEcosystem::Go],
+            DependencyPackWorkspaceContext {
+                catalog: &catalog,
+                persistence: None,
+                activation: &request,
+                limits: DependencyPackLimits::default(),
+                cancellation: &crate::CancellationToken::default(),
+            },
+        );
+
+        assert!(!outcome.complete());
+        assert!(outcome.diagnostic_refresh_required);
+        assert!(!outcome.ecosystems[0].discovery.complete);
+        assert!(outcome.ecosystems[0].preparation.is_none());
+        let SemanticModelRuntimeOutcome::Ready { active, .. } = outcome
+            .runtime
+            .expect("intrinsic activation must still run")
+        else {
+            panic!("intrinsic activation should be ready")
+        };
+        assert_eq!(active.shards().len(), 1);
+        assert_eq!(active.shards()[0].manifest.pack_id, "test.go.intrinsic");
+    }
 
     #[test]
     fn git_multilanguage_build_reuses_constructor_listing_and_one_oid_batch() {
@@ -1511,7 +1915,7 @@ mod tests {
         commit_all(&repository, "multi-language workspace");
 
         let project = Arc::new(FilesystemProject::new(&root).unwrap());
-        let workspace = WorkspaceAnalyzer::build_ephemeral(
+        let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
             Arc::clone(&project) as Arc<dyn Project>,
             AnalyzerConfig::default(),
         )
@@ -1555,7 +1959,7 @@ mod tests {
         std::fs::write(root.join("Sample.java"), "class Sample {}\n").unwrap();
         std::fs::write(root.join("sample.py"), "class SamplePy:\n    pass\n").unwrap();
         let project = Arc::new(TestProject::from_root_with_inferred_languages(&root).unwrap());
-        let workspace = WorkspaceAnalyzer::build_ephemeral(
+        let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
             Arc::clone(&project) as Arc<dyn Project>,
             AnalyzerConfig::default(),
         )
@@ -1579,7 +1983,7 @@ mod tests {
         std::fs::write(python_root.join("sample.py"), "class SamplePy:\n    pass\n").unwrap();
 
         let project = Arc::new(MultiRootProject::new([java_root, python_root]).unwrap());
-        let workspace = WorkspaceAnalyzer::build_ephemeral(
+        let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
             Arc::clone(&project) as Arc<dyn Project>,
             AnalyzerConfig::default(),
         )
@@ -1640,7 +2044,7 @@ mod tests {
                 .unwrap();
         assert_eq!(refreshed_entry.oid(), refreshed_expected);
 
-        let workspace = WorkspaceAnalyzer::build_ephemeral(
+        let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
             Arc::clone(&overlay) as Arc<dyn Project>,
             AnalyzerConfig::default(),
         )
@@ -1694,8 +2098,9 @@ mod tests {
         let file = ProjectFile::new(root.clone(), "src/generation.ts");
         file.write("export const generation = 1;\n").unwrap();
         let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::TypeScript));
-        let workspace = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
-            .expect("ephemeral workspace should build");
+        let workspace =
+            WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
+                .expect("ephemeral workspace should build");
         let cancellation = crate::analyzer::semantic::CancellationToken::default();
         let mut budget = crate::analyzer::semantic::SemanticBudget::default();
         let artifact = workspace
@@ -1742,7 +2147,7 @@ mod tests {
             .unwrap();
 
         let single: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Rust));
-        let single = WorkspaceAnalyzer::build_ephemeral(single, AnalyzerConfig::default())
+        let single = WorkspaceAnalyzer::build_ephemeral_footgun(single, AnalyzerConfig::default())
             .expect("ephemeral workspace should build");
         assert!(!single.query_indexes_warm());
         single.warm_query_indexes();
@@ -1752,7 +2157,7 @@ mod tests {
             root,
             BTreeSet::from([Language::Rust, Language::Java]),
         ));
-        let multi = WorkspaceAnalyzer::build_ephemeral(multi, AnalyzerConfig::default())
+        let multi = WorkspaceAnalyzer::build_ephemeral_footgun(multi, AnalyzerConfig::default())
             .expect("ephemeral workspace should build");
         assert!(!multi.query_indexes_warm());
         multi.warm_query_indexes();
@@ -1777,7 +2182,7 @@ mod tests {
             .unwrap();
 
         let rust: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Rust));
-        let rust = WorkspaceAnalyzer::build_ephemeral(rust, AnalyzerConfig::default())
+        let rust = WorkspaceAnalyzer::build_ephemeral_footgun(rust, AnalyzerConfig::default())
             .expect("ephemeral workspace should build");
         assert!(rust.rust_usage_facts_ready());
         assert!(!rust.rust_usage_facts_warm());
@@ -1786,7 +2191,7 @@ mod tests {
         assert!(rust.rust_usage_facts_warm());
 
         let java: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Java));
-        let java = WorkspaceAnalyzer::build_ephemeral(java, AnalyzerConfig::default())
+        let java = WorkspaceAnalyzer::build_ephemeral_footgun(java, AnalyzerConfig::default())
             .expect("ephemeral workspace should build");
         assert!(java.rust_usage_facts_ready());
         assert!(java.rust_usage_facts_warm());
@@ -1818,7 +2223,7 @@ mod tests {
             memo_cache_budget_bytes: Some(1024 * 1024),
             ..AnalyzerConfig::default()
         };
-        let workspace = WorkspaceAnalyzer::build_ephemeral(Arc::clone(&project), config)
+        let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(Arc::clone(&project), config)
             .expect("ephemeral workspace should build");
         assert_eq!(
             workspace
@@ -1898,21 +2303,24 @@ mod tests {
 
         let disk_oid = git2::Oid::hash_object(git2::ObjectType::Blob, disk_source.as_bytes())
             .expect("hash committed source");
-        let committed_snapshot_rows = Connection::open(
+        let committed_fact_manifests = Connection::open(
             root.join(".bifrost/cache")
                 .join(crate::cache_db::cache_db_file_name()),
         )
         .unwrap()
         .query_row(
-            "SELECT COUNT(*) FROM structural_facts_snapshots
-                 WHERE blob_oid = ?1 AND lang = 'typescript:ts'",
+            "SELECT COUNT(*) FROM structural_fact_manifests
+                 WHERE blob_id = (
+                   SELECT id FROM blobs
+                   WHERE blob_oid = ?1 AND lang = 'typescript:ts'
+                 )",
             [disk_oid.to_string()],
             |row| row.get::<_, usize>(0),
         )
         .unwrap();
         assert_eq!(
-            committed_snapshot_rows, 1,
-            "overlay analysis must not replace the committed source snapshot"
+            committed_fact_manifests, 1,
+            "overlay analysis must not replace the committed source facts"
         );
     }
 }

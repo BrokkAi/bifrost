@@ -27,6 +27,9 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
 use brokk_bifrost_analysis::Language;
+use brokk_bifrost_mcp::benchmark_api::{
+    BENCHMARK_MCP_REQUEST_BUDGET_SECS, MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV,
+};
 use common::InlineTestProject;
 use serde_json::{Value, json};
 
@@ -51,6 +54,17 @@ fn spawn_server(root: &Path) -> Child {
     Command::new(mcp_server_binary())
         // The workspace-authoring location for semantic models is opt-in.
         .env("BIFROST_WORKSPACE_SEMANTIC_MODELS", "on")
+        // A functional wire test must not incidentally assert the cold-start
+        // budget: left at the production default a first call made during the
+        // workspace build is held to COLD_WORKSPACE_REQUEST_BUDGET (4.5s), and
+        // suite saturation then fails a protocol assertion for box load. Two
+        // tests prove the cold-start claim deliberately instead, on a reserved
+        // machine -- see `apply_test_request_budget` in
+        // `crates/bifrost-mcp/tests/bifrost_mcp_server.rs`.
+        .env(
+            MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV,
+            BENCHMARK_MCP_REQUEST_BUDGET_SECS.to_string(),
+        )
         .arg("--root")
         .arg(root)
         .arg("--mcp")

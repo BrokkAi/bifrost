@@ -19,6 +19,24 @@ fn lower_javascript_procedure(
     source: &str,
     procedure_name: Option<&str>,
 ) -> ProcedureSemanticsParts {
+    lower_javascript_parts(source)
+        .into_iter()
+        .find(|procedure| {
+            procedure.kind == ProcedureKind::Function
+                && procedure_name.is_none_or(|name| {
+                    procedure
+                        .locator
+                        .declaration()
+                        .segments()
+                        .last()
+                        .and_then(|segment| segment.name())
+                        == Some(name)
+                })
+        })
+        .expect("function procedure must be lowered")
+}
+
+fn lower_javascript_parts(source: &str) -> Vec<ProcedureSemanticsParts> {
     let mut parser = tree_sitter::Parser::new();
     parser
         .set_language(&tree_sitter_javascript::LANGUAGE.into())
@@ -47,20 +65,235 @@ fn lower_javascript_procedure(
         panic!("JavaScript semantic lowering must complete");
     };
     value
-        .into_iter()
+}
+
+#[test]
+fn local_const_callback_publishes_target_and_capture_ports() {
+    let source = r#"
+        function capture(source) {
+            const captured = source;
+            const callback = () => sink(captured);
+            callback();
+        }
+    "#;
+    let parts = lower_javascript_parts(source);
+    let callback = parts
+        .iter()
+        .find(|procedure| procedure.kind == ProcedureKind::Lambda)
+        .expect("callback procedure");
+    let parent = parts
+        .iter()
         .find(|procedure| {
-            procedure.kind == ProcedureKind::Function
-                && procedure_name.is_none_or(|name| {
-                    procedure
-                        .locator
-                        .declaration()
-                        .segments()
-                        .last()
-                        .and_then(|segment| segment.name())
-                        == Some(name)
-                })
+            procedure
+                .locator
+                .declaration()
+                .segments()
+                .last()
+                .and_then(|segment| segment.name())
+                == Some("capture")
         })
-        .expect("function procedure must be lowered")
+        .expect("capture procedure");
+
+    assert!(
+        parent.call_sites.iter().any(|call| {
+            call.declared_targets
+                == CallableTargetResolution::Proven(CallableTarget::Local(callback.id))
+        }),
+        "call sites={:#?}",
+        parent.call_sites
+    );
+    assert!(
+        parent
+            .captures
+            .iter()
+            .any(|capture| capture.target == callback.id),
+        "captures={:#?}",
+        parent.captures
+    );
+    assert!(callback.memory_locations.iter().any(|location| {
+        matches!(
+            location.kind,
+            MemoryLocationKind::Capture { lexical_parent } if lexical_parent == parent.id
+        )
+    }));
+    let captured_source = parent
+        .captures
+        .iter()
+        .find_map(|capture| (capture.target == callback.id).then_some(capture.captured))
+        .and_then(|captured| match captured {
+            CaptureSource::Value(value) => Some(value),
+            CaptureSource::Location(_) => None,
+        })
+        .expect("value capture source");
+    let tree = parse_javascript_source(source);
+    let source_call = nodes_of_kind(tree.root_node(), "call_expression")
+        .into_iter()
+        .find(|call| source.get(call.byte_range()) == Some("sink(captured)"))
+        .expect("sink call");
+    let captured_read = source_call
+        .child_by_field_name("arguments")
+        .and_then(|arguments| arguments.named_child(0))
+        .expect("captured sink argument");
+    let captured_input = callback
+        .points
+        .iter()
+        .flat_map(|point| &point.events)
+        .find_map(|event| match event.effect {
+            SemanticEffect::MemoryLoad {
+                kind: MemoryAccessKind::Capture,
+                result,
+                ..
+            } => Some(result),
+            _ => None,
+        })
+        .expect("capture input load");
+    assert!(value_flow_reaches(
+        &all_value_flows(callback),
+        captured_input,
+        value_for_node(callback, captured_read)
+    ));
+    assert!(
+        parent
+            .values
+            .iter()
+            .any(|value| value.id == captured_source)
+    );
+}
+
+#[test]
+fn callback_with_unsupported_parameter_capture_keeps_invocation_unknown() {
+    let source = r#"
+        function capture(input) {
+            const callback = () => sink(input);
+            callback();
+        }
+    "#;
+    let parts = lower_javascript_parts(source);
+    let parent = parts
+        .iter()
+        .find(|procedure| {
+            procedure
+                .locator
+                .declaration()
+                .segments()
+                .last()
+                .and_then(|segment| segment.name())
+                == Some("capture")
+        })
+        .expect("capture procedure");
+    let callback = parts
+        .iter()
+        .find(|procedure| procedure.kind == ProcedureKind::Lambda)
+        .expect("callback procedure");
+
+    assert_eq!(
+        parent.call_sites.len(),
+        1,
+        "call sites={:#?}",
+        parent.call_sites
+    );
+    assert_eq!(
+        parent.call_sites[0].declared_targets,
+        CallableTargetResolution::Unknown
+    );
+    assert!(
+        !parent
+            .gaps
+            .iter()
+            .any(|gap| gap.capability == SemanticCapability::Captures)
+    );
+    assert!(callback.gaps.iter().any(|gap| {
+        gap.capability == SemanticCapability::Captures && gap.kind == SemanticGapKind::Unsupported
+    }));
+}
+
+#[test]
+fn sibling_callback_chain_keeps_each_capture_target_distinct() {
+    let source = r#"
+        function capture(input) {
+            const tainted = input;
+            const inner = () => sink(tainted);
+            const outer = () => inner();
+            outer();
+        }
+    "#;
+    let parts = lower_javascript_parts(source);
+    let named = |name: &str| {
+        parts
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some(name)
+            })
+            .unwrap_or_else(|| panic!("missing {name} procedure"))
+    };
+    let parent = named("capture");
+    let inner = named("inner");
+    let outer = named("outer");
+
+    assert!(
+        parent
+            .captures
+            .iter()
+            .any(|capture| capture.target == inner.id)
+    );
+    assert!(
+        parent
+            .captures
+            .iter()
+            .any(|capture| capture.target == outer.id)
+    );
+    assert!(outer.call_sites.iter().any(|call| {
+        call.declared_targets == CallableTargetResolution::Proven(CallableTarget::Local(inner.id))
+    }));
+    for child in [inner, outer] {
+        let child_slots = child
+            .memory_locations
+            .iter()
+            .filter(|location| matches!(location.kind, MemoryLocationKind::Capture { .. }))
+            .count();
+        assert_eq!(child_slots, 1, "{:?} capture slots", child.locator);
+    }
+}
+
+fn prepare_typescript_source(source: &str) -> PreparedSyntaxTree {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+        .expect("TypeScript grammar must load");
+    let tree = parser
+        .parse(source, None)
+        .expect("TypeScript source must parse");
+    PreparedSyntaxTree::new(
+        PreparedSyntaxSource::Exact(Arc::from(source)),
+        tree,
+        crate::text_utils::compute_line_starts(source),
+        LanguageDialect::Standard(Language::TypeScript),
+        PreparedSourceOrigin::Disk,
+        None,
+    )
+}
+
+fn lower_typescript_source(source: &str) -> Vec<ProcedureSemanticsParts> {
+    let prepared = prepare_typescript_source(source);
+    let file = ProjectFile::new(std::env::temp_dir(), "semantic-parameter-identity.ts");
+    let outcome = JsTsSemanticLowerer::typescript()
+        .lower(
+            &file,
+            &prepared,
+            &SemanticBudget::default(),
+            &CancellationToken::default(),
+        )
+        .expect("TypeScript semantic lowering must succeed");
+    let SemanticOutcome::Complete { value, .. } = outcome else {
+        panic!("TypeScript semantic lowering must complete");
+    };
+    value
 }
 
 fn value_for_node(parts: &ProcedureSemanticsParts, node: tree_sitter::Node<'_>) -> ValueId {
@@ -75,6 +308,94 @@ fn value_for_node(parts: &ProcedureSemanticsParts, node: tree_sitter::Node<'_>) 
                 .then_some(value.id)
         })
         .unwrap_or_else(|| panic!("semantic value must cover `{}`", node.kind()))
+}
+
+#[test]
+fn typescript_parameters_retain_exact_structural_fact_identities() {
+    let source = r#"
+        declare const Query: ParameterDecorator;
+
+        class Controller {
+            constructor(@Query id: string) {}
+
+            method(@Query value: string, page: number) {}
+        }
+    "#;
+    let facts = crate::analyzer::structural::extract::extract_file_facts(
+        &brokk_bifrost_js_ts::structural::TYPESCRIPT_STRUCTURAL_SPEC,
+        &tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        source,
+    )
+    .expect("TypeScript structural facts must extract");
+    let parameter_fact_ids = facts
+        .nodes()
+        .iter()
+        .enumerate()
+        .filter_map(|(id, node)| {
+            (node.kind == crate::analyzer::structural::kinds::NormalizedKind::Parameter)
+                .then_some(id as u32)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(parameter_fact_ids.len(), 3);
+
+    let procedures = lower_typescript_source(source);
+    let parameter_identities = procedures
+        .iter()
+        .flat_map(|procedure| {
+            procedure
+                .values
+                .iter()
+                .filter(|value| matches!(value.kind, SemanticValueKind::Parameter { .. }))
+                .map(|value| {
+                    procedure.source_mappings[value.source.index()]
+                        .ast_identity
+                        .expect("TypeScript parameter mapping must retain structural identity")
+                })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(parameter_identities.len(), 3);
+    assert!(parameter_identities.iter().all(|identity| {
+        identity.content() == facts.source_identity()
+            && parameter_fact_ids.contains(&identity.node_id())
+    }));
+    let mut identity_ids = parameter_identities
+        .iter()
+        .map(|identity| identity.node_id())
+        .collect::<Vec<_>>();
+    identity_ids.sort_unstable();
+    identity_ids.dedup();
+    assert_eq!(identity_ids.len(), parameter_identities.len());
+}
+
+#[test]
+fn typescript_structural_identity_pass_is_charged_to_semantic_budget() {
+    let source = "class Controller { method(value: string) {} }";
+    let prepared = prepare_typescript_source(source);
+    let file = ProjectFile::new(std::env::temp_dir(), "semantic-parameter-budget.ts");
+    let default_budget = SemanticBudget::default();
+    let inventory = enumerate_procedures(
+        &file,
+        &prepared,
+        &default_budget,
+        &CancellationToken::default(),
+    )
+    .expect("TypeScript procedure inventory must succeed");
+    let ProcedureEnumeration::Complete { inventory_work, .. } = inventory else {
+        panic!("default TypeScript procedure inventory must complete");
+    };
+    assert!(inventory_work.nested_entries > 0);
+
+    let mut limits = SemanticWork::default_limits();
+    limits.nested_entries = inventory_work.nested_entries;
+    let budget = SemanticBudget::new(limits).expect("inventory-sized budget is positive");
+    let outcome = JsTsSemanticLowerer::typescript()
+        .lower(&file, &prepared, &budget, &CancellationToken::default())
+        .expect("TypeScript semantic lowering must report its bounded outcome");
+    let SemanticOutcome::ExceededBudget { exceeded, work, .. } = outcome else {
+        panic!("the structural identity pass must not run outside the semantic budget");
+    };
+    assert_eq!(exceeded.dimension(), SemanticBudgetDimension::NestedEntries);
+    assert_eq!(work.nested_entries, inventory_work.nested_entries + 1);
 }
 
 fn parse_javascript_source(source: &str) -> tree_sitter::Tree {
@@ -1145,4 +1466,66 @@ fn array_index_keys_normalize_decimal_integer_tokens_only() {
         stable_member_key(source, indices[1]).as_deref(),
         Some("number:0")
     );
+}
+
+#[test]
+fn array_element_object_fields_reuse_literal_identity() {
+    let source = r#"
+        function flow(source) {
+            const items = [{ value: 0 }, { value: 0 }];
+            items[0].value = source;
+            return items[0].value;
+        }
+    "#;
+    let parts = lower_javascript_source(source);
+    let field_events = field_memory_events(&parts);
+    assert_eq!(field_events.stores.len(), 1);
+    assert_eq!(field_events.loads.len(), 1);
+    let (store_location, _) = field_events.stores[0];
+    let (load_location, _) = field_events.loads[0];
+    let store_member = match &parts.memory_locations[store_location.index()].kind {
+        MemoryLocationKind::Field { member, .. } => member,
+        _ => panic!("field store must use a field location"),
+    };
+    let load_member = match &parts.memory_locations[load_location.index()].kind {
+        MemoryLocationKind::Field { member, .. } => member,
+        _ => panic!("field load must use a field location"),
+    };
+    assert_eq!(store_member, load_member);
+    assert!(!parts.gaps.iter().any(|gap| {
+        matches!(
+            gap.capability,
+            SemanticCapability::FieldMemory | SemanticCapability::ExceptionalControlFlow
+        )
+    }));
+}
+
+#[test]
+fn escaped_array_element_keeps_field_identity_incomplete() {
+    let source = r#"
+        function flow(source) {
+            const items = [{ value: 0 }];
+            const extracted = items[0];
+            extracted.value = source;
+            return items[0].value;
+        }
+    "#;
+    let parts = lower_javascript_source(source);
+    assert!(parts.gaps.iter().any(|gap| {
+        gap.capability == SemanticCapability::FieldMemory && gap.kind == SemanticGapKind::Unknown
+    }));
+}
+
+#[test]
+fn absent_array_element_field_keeps_field_identity_incomplete() {
+    let source = r#"
+        function flow() {
+            const items = [{ other: 0 }];
+            return items[0].value;
+        }
+    "#;
+    let parts = lower_javascript_source(source);
+    assert!(parts.gaps.iter().any(|gap| {
+        gap.capability == SemanticCapability::FieldMemory && gap.kind == SemanticGapKind::Unknown
+    }));
 }

@@ -14,6 +14,7 @@ pub enum CodeQueryDiagnosticCode {
     NoEnclosingProcedure,
     SemanticCapabilityUnsupported,
     SemanticAnalysisPartial,
+    CallBindingDispatchPartial,
     SemanticBudgetExhausted,
     SemanticProviderFailed,
     UnresolvedProtocolReference,
@@ -86,6 +87,7 @@ pub enum CodeQueryDiagnosticCode {
     IdentityAxisUnsupported,
     PathDerivationIncomplete,
     EffectDerivationIncomplete,
+    ResultContractDerivationIncomplete,
     EffectBudgetExhausted,
     JsxProjectionIncomplete,
     ResultLimitReached,
@@ -105,6 +107,7 @@ impl CodeQueryDiagnosticCode {
             Self::NoEnclosingProcedure => "no_enclosing_procedure",
             Self::SemanticCapabilityUnsupported => "semantic_capability_unsupported",
             Self::SemanticAnalysisPartial => "semantic_analysis_partial",
+            Self::CallBindingDispatchPartial => "call_binding_dispatch_partial",
             Self::SemanticBudgetExhausted => "semantic_budget_exhausted",
             Self::SemanticProviderFailed => "semantic_provider_failed",
             Self::UnresolvedProtocolReference => "unresolved_protocol_reference",
@@ -177,6 +180,7 @@ impl CodeQueryDiagnosticCode {
             Self::IdentityAxisUnsupported => "identity_axis_unsupported",
             Self::PathDerivationIncomplete => "path_derivation_incomplete",
             Self::EffectDerivationIncomplete => "effect_derivation_incomplete",
+            Self::ResultContractDerivationIncomplete => "result_contract_derivation_incomplete",
             Self::EffectBudgetExhausted => "effect_budget_exhausted",
             Self::JsxProjectionIncomplete => "jsx_projection_incomplete",
             Self::ResultLimitReached => "result_limit_reached",
@@ -376,9 +380,12 @@ pub struct CodeQuerySemanticLimits {
     ///
     /// `None` is the ordinary case: one uniform `max_rows_per_dimension`
     /// bounds every row lane, and the executor derives a memory-shaped
-    /// estimate for each lane from `max_retained_bytes` on top of it, because
-    /// a caller that supplies one number for fourteen lanes of very different
-    /// density has not priced any of them.
+    /// estimate for each homogeneous retained-row lane from
+    /// `max_retained_bytes` on top of it, because a caller that supplies one
+    /// number for fourteen lanes of very different density has not priced any
+    /// of them. `nested_entries` keeps the uniform bound: that lane mixes small
+    /// nested collection entries with non-retained bounded traversal work, so
+    /// pricing every entry as one retained row would not estimate its memory.
     ///
     /// `Some` says the caller has: it carries its own multi-dimensional
     /// ledger and knows exactly how much of each lane is left. Those
@@ -386,9 +393,9 @@ pub struct CodeQuerySemanticLimits {
     /// that drains `nested_entries` leaves `procedures` almost untouched --
     /// and collapsing them to one scalar caps every dimension at the most
     /// depleted lane (#2523). When the table is present it is authoritative:
-    /// it replaces both the scalar and the byte-shaped estimate. The real
-    /// memory bound is unaffected either way, because it is measured rather
-    /// than estimated: `SemanticQueryState::materialize` charges each
+    /// it replaces the scalar and every applicable byte-shaped estimate. The
+    /// real memory bound is unaffected either way, because it is measured
+    /// rather than estimated: `SemanticQueryState::materialize` charges each
     /// artifact's own retained bytes against `max_retained_bytes`.
     ///
     /// The table's `SourceBytes` and `OwnedTextBytes` entries are never read.

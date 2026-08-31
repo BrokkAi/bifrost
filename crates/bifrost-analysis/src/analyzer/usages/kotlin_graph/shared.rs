@@ -9,13 +9,21 @@
 //! and dead code. Both drive the same receiver typing, member lookup, and name
 //! ladder through `super::resolver::KotlinResolutionCtx`.
 
-use super::{kotlin_target_spec_replayable, scan_kotlin_file_replayable, with_kotlin_graph_source};
+use super::{
+    KotlinGraphSource, kotlin_target_spec_replayable, scan_kotlin_file_replayable,
+    with_kotlin_graph_source,
+};
 use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::common::language_for_file;
-use crate::analyzer::usages::inverted_edges::{EdgeNodeDomain, UsageEdgeWeights, UsageEdges};
+use crate::analyzer::usages::inverted_edges::{
+    ClassRangeIndex, EdgeNodeDomain, FileDeclarations, UsageEdgeBuildResult, UsageEdgeWeights,
+    UsageEdges,
+};
 use crate::analyzer::usages::model::{FuzzyResult, UsageHit};
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
-use crate::analyzer::usages::parsed_tree::ParseSpec;
+use crate::analyzer::usages::parsed_tree::{
+    ParseSpec, ParsedTreeFile, parse_tree_sitter_file, parse_tree_sitter_source,
+};
 use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use crate::analyzer::{
@@ -54,16 +62,39 @@ impl<'a> UsageQueryResolver<'a> for KotlinQueryResolver {
         let Some(target) = overloads.first() else {
             return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
         };
-        let _spec_scope = crate::profiling::scope("kotlin_graph::target_spec");
-        let Some(spec) = kotlin_target_spec_replayable(analyzer, token, overloads) else {
-            return GraphUsageOutcome::fallback_safe(
-                target.fq_name(),
-                GraphFailureReason::UnsupportedTargetShape(
-                    "Kotlin target has no indexed owner to resolve references against",
-                ),
-                "KotlinUsageGraphStrategy",
+        let uncancelled = crate::CancellationToken::new();
+        let cancellation = scan_scope.cancellation().unwrap_or(&uncancelled);
+        let relational_session =
+            crate::analyzer::relational_frontier::RelationalFrontierSession::new(
+                analyzer,
+                cancellation,
             );
-        };
+        let _spec_scope = crate::profiling::scope("kotlin_graph::target_spec");
+        let spec =
+            match kotlin_target_spec_replayable(&relational_session, analyzer, token, overloads) {
+                crate::analyzer::RelationalFrontierOutcome::Complete(Some(spec)) => spec,
+                crate::analyzer::RelationalFrontierOutcome::Complete(None) => {
+                    return GraphUsageOutcome::fallback_safe(
+                        target.fq_name(),
+                        GraphFailureReason::UnsupportedTargetShape(
+                            "Kotlin target has no indexed owner to resolve references against",
+                        ),
+                        "KotlinUsageGraphStrategy",
+                    );
+                }
+                crate::analyzer::RelationalFrontierOutcome::Cancelled => {
+                    return GraphUsageOutcome::Resolved(FuzzyResult::empty_success());
+                }
+                crate::analyzer::RelationalFrontierOutcome::Failed(_) => {
+                    return GraphUsageOutcome::fallback_safe(
+                        target.fq_name(),
+                        GraphFailureReason::UnsupportedTargetShape(
+                            "the Kotlin relational target frontier failed",
+                        ),
+                        "KotlinUsageGraphStrategy",
+                    );
+                }
+            };
         drop(_spec_scope);
 
         let _select_scope = crate::profiling::scope("kotlin_graph::select_files");
@@ -103,7 +134,26 @@ impl<'a> UsageQueryResolver<'a> for KotlinQueryResolver {
                 break;
             }
             let _file_scope = crate::profiling::scope("kotlin_graph::scan_file");
-            scan_kotlin_file_replayable(analyzer, token, &file, &spec, &mut state);
+            match scan_kotlin_file_replayable(
+                &relational_session,
+                analyzer,
+                token,
+                &file,
+                &spec,
+                &mut state,
+            ) {
+                crate::analyzer::RelationalFrontierOutcome::Complete(()) => {}
+                crate::analyzer::RelationalFrontierOutcome::Cancelled => break,
+                crate::analyzer::RelationalFrontierOutcome::Failed(_) => {
+                    return GraphUsageOutcome::fallback_safe(
+                        target.fq_name(),
+                        GraphFailureReason::UnsupportedTargetShape(
+                            "the Kotlin relational file frontier failed",
+                        ),
+                        "KotlinUsageGraphStrategy",
+                    );
+                }
+            }
             if *state.limit_exceeded {
                 break;
             }
@@ -181,7 +231,18 @@ pub(crate) fn scan_kotlin_files_for_jvm_type(
     if resolve_analyzer::<KotlinAnalyzer>(analyzer).is_none() {
         return;
     }
-    let Some(spec) = kotlin_target_spec_replayable(analyzer, token, std::slice::from_ref(target))
+    let cancellation = crate::CancellationToken::new();
+    let relational_session = crate::analyzer::relational_frontier::RelationalFrontierSession::new(
+        analyzer,
+        &cancellation,
+    );
+    let crate::analyzer::RelationalFrontierOutcome::Complete(Some(spec)) =
+        kotlin_target_spec_replayable(
+            &relational_session,
+            analyzer,
+            token,
+            std::slice::from_ref(target),
+        )
     else {
         return;
     };
@@ -199,7 +260,19 @@ pub(crate) fn scan_kotlin_files_for_jvm_type(
         limit_exceeded,
     };
     for file in ordered {
-        scan_kotlin_file_replayable(analyzer, token, &file, &spec, &mut state);
+        if !matches!(
+            scan_kotlin_file_replayable(
+                &relational_session,
+                analyzer,
+                token,
+                &file,
+                &spec,
+                &mut state,
+            ),
+            crate::analyzer::RelationalFrontierOutcome::Complete(())
+        ) {
+            return;
+        }
         if *state.limit_exceeded {
             break;
         }
@@ -216,6 +289,20 @@ pub(crate) fn scan_kotlin_files_for_jvm_type(
 pub(crate) struct KotlinEdgeResolver<'a> {
     files: Vec<ProjectFile>,
     kotlin: &'a KotlinAnalyzer,
+}
+
+struct PreparedKotlinEdgeFile {
+    file: ProjectFile,
+    parsed: ParsedTreeFile,
+    declarations: FileDeclarations,
+    class_ranges: ClassRangeIndex,
+}
+
+fn clone_file_declarations(declarations: &FileDeclarations) -> FileDeclarations {
+    FileDeclarations {
+        enclosers: declarations.enclosers.clone(),
+        definitions: declarations.definitions.clone(),
+    }
 }
 
 /// The whole-workspace `caller -> callee` scan behind this language's
@@ -293,32 +380,32 @@ impl<'a> KotlinEdgeResolver<'a> {
         )
     }
 
-    pub(crate) fn build_inbound_edges<F>(
+    pub(crate) fn build_inbound_edges_with_completeness<F>(
         &self,
         analyzer: &dyn IAnalyzer,
         token: QueryToken<'_>,
         callees: &HashSet<String>,
         keep_file: F,
-    ) -> UsageEdges
+    ) -> Option<UsageEdgeBuildResult<UsageEdges>>
     where
         F: Fn(&ProjectFile) -> bool + Sync,
     {
-        let selected_files: Vec<_> = self
+        let mut selected_files: Vec<_> = self
             .files
             .iter()
             .filter(|file| keep_file(file))
             .cloned()
             .collect();
+        selected_files.sort_unstable();
         let file_states = self
             .kotlin
-            .bulk_file_states(selected_files, BulkFileStateSource::Omit);
-        build_kotlin_edges(
+            .bulk_file_states(selected_files.clone(), BulkFileStateSource::Omit);
+        build_kotlin_inbound_edges_with_completeness(
             analyzer,
             token,
-            &self.files,
+            &selected_files,
             &file_states,
             EdgeNodeDomain::Inbound(callees),
-            keep_file,
         )
     }
 
@@ -349,6 +436,107 @@ impl<'a> KotlinEdgeResolver<'a> {
             EdgeNodeDomain::Closed(nodes),
             keep_file,
         )
+    }
+}
+
+fn build_kotlin_inbound_edges_with_completeness(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    files: &[ProjectFile],
+    file_states: &HashMap<ProjectFile, FileState>,
+    domain: EdgeNodeDomain<'_>,
+) -> Option<UsageEdgeBuildResult<UsageEdges>> {
+    use crate::analyzer::usages::inverted_edges::{
+        build_file_declarations_from_state, class_range_index_from_state,
+        collect_file_edges_with_domain,
+    };
+
+    let cancellation = analyzer.active_query_cancellation()?;
+    if cancellation.is_cancelled() {
+        return None;
+    }
+    let language = brokk_bifrost_jvm::kotlin::language::LANGUAGE.into();
+    let mut omitted_files = Vec::new();
+    let mut prepared_files = Vec::with_capacity(files.len());
+    for file in files {
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        let Some(state) = file_states.get(file) else {
+            omitted_files.push(file.clone());
+            continue;
+        };
+        let parsed = if state.source.is_empty() {
+            parse_tree_sitter_file(file, ParseSpec::whole(&language))
+        } else {
+            parse_tree_sitter_source(state.source.clone(), ParseSpec::whole(&language))
+        };
+        let Some(parsed) = parsed else {
+            omitted_files.push(file.clone());
+            continue;
+        };
+        let declarations = build_file_declarations_from_state(state);
+        let class_ranges = class_range_index_from_state(state);
+        prepared_files.push(PreparedKotlinEdgeFile {
+            file: file.clone(),
+            parsed,
+            declarations,
+            class_ranges,
+        });
+    }
+
+    let session = crate::analyzer::relational_frontier::RelationalFrontierSession::new(
+        analyzer,
+        &cancellation,
+    );
+    let per_file = match session.resolve_owned_items(
+        "kotlin_inbound_edge_scan",
+        &prepared_files,
+        |prepared, frontier| {
+            let graph = KotlinGraphSource {
+                index: analyzer,
+                hierarchy: analyzer.type_hierarchy_provider(),
+                type_alias: analyzer.type_alias_provider(),
+                imports: analyzer.import_analysis_provider(),
+                relational_definitions: frontier.as_ref(),
+            };
+            collect_file_edges_with_domain(
+                &prepared.file,
+                domain,
+                &prepared.parsed,
+                clone_file_declarations(&prepared.declarations),
+                |input| {
+                    brokk_bifrost_jvm::kotlin::graph::inverted::scan_file(
+                        &graph,
+                        token,
+                        &prepared.file,
+                        input,
+                        prepared.class_ranges.clone(),
+                    )
+                },
+            )
+        },
+    ) {
+        crate::analyzer::relational_frontier::RelationalItemFrontierOutcome::Complete(results) => {
+            results
+        }
+        crate::analyzer::relational_frontier::RelationalItemFrontierOutcome::Cancelled(_) => {
+            return None;
+        }
+        crate::analyzer::relational_frontier::RelationalItemFrontierOutcome::Failed(_) => {
+            return None;
+        }
+    };
+    omitted_files.sort_unstable();
+    omitted_files.dedup();
+    let output = crate::analyzer::usages::inverted_edges::merge_and_cap(per_file);
+    if omitted_files.is_empty() {
+        Some(UsageEdgeBuildResult::Complete(output))
+    } else {
+        Some(UsageEdgeBuildResult::Uncacheable {
+            output,
+            omitted_files,
+        })
     }
 }
 

@@ -839,11 +839,25 @@ fn relational_assertion_plan_to_json(plan: &RelationalAssertionPlan) -> Value {
 /// collapse into one projected object if their field sets ever coincide.
 fn row_derivation_to_json(derivation: &RowDerivation) -> Value {
     match derivation {
-        RowDerivation::Filter(filter) => json!({
-            "type": derivation.label(),
-            "over": filter.over.as_str(),
-            "where": filter.predicates.iter().map(row_predicate_to_json).collect::<Vec<_>>(),
-        }),
+        RowDerivation::Filter(filter) => {
+            let mut object = Map::new();
+            object.insert("type".to_owned(), json!(derivation.label()));
+            object.insert("over".to_owned(), json!(filter.over.as_str()));
+            object.insert(
+                "where".to_owned(),
+                json!(
+                    filter
+                        .predicates
+                        .iter()
+                        .map(row_predicate_to_json)
+                        .collect::<Vec<_>>()
+                ),
+            );
+            if matches!(filter.evidence, Some(RowFilterEvidence::DeclaredCall)) {
+                object.insert("evidence".to_owned(), json!("declared_call"));
+            }
+            Value::Object(object)
+        }
         RowDerivation::Project(projection) => json!({
             "type": derivation.label(),
             "name": projection.name.as_str(),
@@ -947,6 +961,23 @@ fn row_literal_to_json(literal: &RowLiteral) -> Value {
         RowLiteral::Integer(value) => json!(value),
         RowLiteral::Boolean(value) => json!(value),
     }
+}
+
+pub(crate) fn resolved_locator_to_json(locator: &ResolvedPolicyLocator) -> Value {
+    let role = match locator.role {
+        ResolvedPolicyLocatorRole::Callable => "callable",
+        ResolvedPolicyLocatorRole::ReceiverType => "receiver_type",
+    };
+    let kind = match locator.kind {
+        ResolvedPolicyLocatorKind::WorkspaceDeclaration => "workspace_declaration",
+        ResolvedPolicyLocatorKind::ActiveSemanticModel => "active_semantic_model",
+    };
+    json!({
+        "role": role,
+        "kind": kind,
+        "identity": locator.identity,
+        "provenance": locator.provenance,
+    })
 }
 
 fn row_assertion_to_json(assertion: &RowAssertion) -> Value {
@@ -1417,6 +1448,9 @@ fn endpoint_binding_to_json(binding: &PolicyEndpointBinding) -> Value {
         PolicyEndpointBinding::MatchedValue => Value::Object(tagged("matched_value")),
         PolicyEndpointBinding::Receiver => Value::Object(tagged("receiver")),
         PolicyEndpointBinding::ReturnValue => Value::Object(tagged("return_value")),
+        PolicyEndpointBinding::ResultIndex { index } => {
+            json!({ "type": "result_index", "index": index })
+        }
         PolicyEndpointBinding::ArgumentIndex { index } => {
             json!({ "type": "argument_index", "index": index })
         }
@@ -1639,6 +1673,9 @@ fn policy_port_to_json(port: &PolicyPort) -> Value {
         PolicyPort::MatchedValue => Value::Object(tagged("matched_value")),
         PolicyPort::Receiver => Value::Object(tagged("receiver")),
         PolicyPort::ReturnValue => Value::Object(tagged("return_value")),
+        PolicyPort::ResultIndex { index } => {
+            json!({ "type": "result_index", "index": index })
+        }
         PolicyPort::ArgumentIndex { index } => {
             json!({ "type": "argument_index", "index": index })
         }
@@ -1812,6 +1849,9 @@ fn typestate_seed_binding_to_json(binding: &TypestateSeedBinding) -> Value {
         TypestateSeedBinding::MatchedValue => Value::Object(tagged("matched_value")),
         TypestateSeedBinding::Receiver => Value::Object(tagged("receiver")),
         TypestateSeedBinding::ReturnValue => Value::Object(tagged("return_value")),
+        TypestateSeedBinding::ResultIndex { index } => {
+            json!({ "type": "result_index", "index": index })
+        }
         TypestateSeedBinding::ArgumentIndex { index } => {
             json!({ "type": "argument_index", "index": index })
         }
@@ -1914,6 +1954,9 @@ fn typestate_call_binding_to_json(binding: &TypestateCallBinding) -> Value {
     match binding {
         TypestateCallBinding::Receiver => Value::Object(tagged("receiver")),
         TypestateCallBinding::ReturnValue => Value::Object(tagged("return_value")),
+        TypestateCallBinding::ResultIndex { index } => {
+            json!({ "type": "result_index", "index": index })
+        }
         TypestateCallBinding::ArgumentIndex { index } => {
             json!({ "type": "argument_index", "index": index })
         }

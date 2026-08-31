@@ -6,13 +6,14 @@ use crate::analyzer::canonical_hash::{lower_hex_string, sha256_bytes};
 use crate::analyzer::cpp::CppAnalyzer;
 use crate::analyzer::semantic_model::{
     ActivationSelector, ArtifactProducerLimits, AuthoredPayload, AuthoredSemanticModelPack,
-    AuthoredShard, BoundedProducerDiagnostics, CatalogCoordinate, Compatibility, Completeness,
-    DependencyArtifactRole, DependencyDiscoveryOutcome, DependencyDiscoveryProfile,
-    DependencyPackAdapter, DependencyPackDiagnostic, DependencyPackDiagnosticSeverity,
-    DependencyPackLimits, DependencyPackProduction, ExactDependencyArtifact, ExternalArtifactKind,
-    HierarchyFact, HierarchyKind, Locator, MemberFact, MemberIdentity, MemberKind, NameSelector,
-    Parameter, Producer, Provenance, ReceiverFact, ResolvedDependency, ResolvedDependencyArtifact,
-    Safety, SemanticModelActivationEvidence, Signature, TypeFact, TypeIdentity, TypeKind, TypeRef,
+    AuthoredShard, BoundedDependencyDiagnostics, BoundedProducerDiagnostics, CatalogCoordinate,
+    Compatibility, Completeness, DependencyArtifactRole, DependencyDiscoveryOutcome,
+    DependencyDiscoveryProfile, DependencyPackAdapter, DependencyPackDiagnostic,
+    DependencyPackDiagnosticSeverity, DependencyPackLimits, DependencyPackProduction,
+    ExactDependencyArtifact, ExternalArtifactKind, HierarchyFact, HierarchyKind, Locator,
+    MemberFact, MemberIdentity, MemberKind, NameSelector, Parameter, Producer, Provenance,
+    ReceiverFact, ResolvedDependency, ResolvedDependencyArtifact, Safety,
+    SemanticModelActivationEvidence, Signature, TypeFact, TypeIdentity, TypeKind, TypeRef,
     Visibility, WildcardVariance, member_declaration_id, type_declaration_id,
 };
 use crate::analyzer::semantic_model::{SemanticModelCompleteness, SemanticModelOverlay};
@@ -24,6 +25,7 @@ use crate::hash::HashMap;
 use brokk_bifrost_core::analyzer::model::{
     StructuredTypeIdentity, StructuredTypeNodeId, StructuredTypeNodeView,
 };
+use brokk_bifrost_core::analyzer::project::decode_source_bytes;
 use brokk_bifrost_cpp::compile_context::CppCompileContexts;
 use brokk_bifrost_cpp::compile_context::CppExternalIncludeResolution;
 use brokk_bifrost_cpp::declarations::CppParameterType;
@@ -198,10 +200,10 @@ fn build_directly_reached_external_headers(
                     dependency_name: root_dependency_name(&root),
                     relative_path: relative_path.to_path_buf(),
                 });
-                let Ok(header_source) = read_external_header(&header) else {
+                let Ok((header_source, raw_bytes)) = read_external_header(&header) else {
                     return Some(ReachedExternalHeaders::Unavailable);
                 };
-                bytes_read = bytes_read.saturating_add(header_source.len());
+                bytes_read = bytes_read.saturating_add(raw_bytes);
                 if bytes_read > MAX_CLOSURE_BYTES {
                     return Some(ReachedExternalHeaders::Unavailable);
                 }
@@ -538,6 +540,7 @@ impl DependencyPackAdapter for CppDependencyPackAdapter {
                 is_static: false,
                 is_abstract: false,
                 is_virtual: false,
+                callable_family_complete: false,
                 signature,
                 receiver: Some(ReceiverFact { pointer: false }),
                 extension_receiver: None,
@@ -623,33 +626,33 @@ pub fn resolve_cpp_semantic_pack_dependencies(
 ) -> DependencyDiscoveryOutcome {
     let contexts = CppCompileContexts::load(project);
     let mut dependencies = Vec::new();
-    let mut diagnostics = Vec::new();
-    let header_sets = match discover_reachable_header_sets(project, &contexts, limits, cancellation)
-    {
+    let mut diagnostics = BoundedDependencyDiagnostics::new(limits);
+    let header_sets = match discover_reachable_header_sets(
+        project,
+        &contexts,
+        limits,
+        cancellation,
+        &mut diagnostics,
+    ) {
         Ok(header_sets) => header_sets,
         Err(HeaderDiscoveryError::Cancelled) => {
+            let (diagnostics, suppressed_diagnostics) = diagnostics.finish();
             return DependencyDiscoveryOutcome {
                 dependencies,
                 diagnostics,
-                suppressed_diagnostics: 0,
+                suppressed_diagnostics,
                 complete: false,
                 cancelled: true,
                 profile: DependencyDiscoveryProfile::default(),
             };
         }
         Err(HeaderDiscoveryError::Failed(message)) => {
-            diagnostics.push(DependencyPackDiagnostic {
-                severity: DependencyPackDiagnosticSeverity::Error,
-                code: "cpp.header_discovery_failed".to_owned(),
-                dependency_id: None,
-                location: None,
-                message,
-            });
+            diagnostics.push(header_discovery_failed(None, message));
             Vec::new()
         }
     };
     let dependency_limit_hit = header_sets.len() > limits.max_dependencies;
-    let suppressed_diagnostics = header_sets.len().saturating_sub(limits.max_dependencies);
+    let undiscovered_dependencies = header_sets.len().saturating_sub(limits.max_dependencies);
     for (root, paths) in header_sets.into_iter().take(limits.max_dependencies) {
         let name = root_dependency_name(&root);
         dependencies.push(ResolvedDependency {
@@ -690,12 +693,15 @@ pub fn resolve_cpp_semantic_pack_dependencies(
             ),
         });
     }
+    let (diagnostics, bounded_diagnostics_suppressed) = diagnostics.finish();
+    let suppressed_diagnostics =
+        undiscovered_dependencies.saturating_add(bounded_diagnostics_suppressed);
     DependencyDiscoveryOutcome {
         profile: DependencyDiscoveryProfile {
             metadata_inputs_considered: 1,
             dependencies_resolved: dependencies.len(),
         },
-        complete: diagnostics.is_empty(),
+        complete: diagnostics.is_empty() && suppressed_diagnostics == 0,
         dependencies,
         diagnostics,
         suppressed_diagnostics,
@@ -713,23 +719,55 @@ fn discover_reachable_header_sets(
     contexts: &CppCompileContexts,
     limits: &DependencyPackLimits,
     cancellation: Option<&CancellationToken>,
+    diagnostics: &mut BoundedDependencyDiagnostics,
 ) -> Result<Vec<(PathBuf, Vec<PathBuf>)>, HeaderDiscoveryError> {
     let files = project.analyzable_files(Language::Cpp).map_err(|error| {
         HeaderDiscoveryError::Failed(format!("cannot list C++ source files: {error}"))
     })?;
+    // An angle include reaches an external root only through the compile
+    // contexts of the file that spells it: with no entry naming that file,
+    // `resolve_external_angle_include` answers `MissingCompileContext` and the
+    // traversal below drops the pair. That is the resolution rule, not a
+    // shortcut around one, and it holds at every depth because a header
+    // reached from a workspace source keeps that source's identity through the
+    // whole closure. So the only sources worth reading are the ones the
+    // database names.
+    //
+    // Reading and parsing all of them instead was serial startup latency
+    // scaling with the workspace rather than with the header sets found: on
+    // Godot, which ships no `compile_commands.json` at all, it read and parsed
+    // 8,233 files in 31.5 seconds to discover nothing. Keep the span: it is
+    // the only place that separates this cost from header-closure traversal.
+    let workspace_file_count = files.len();
+    let compiled_sources = files
+        .into_iter()
+        .filter(|file| !contexts.contexts_for(file).is_empty())
+        .collect::<Vec<_>>();
     let mut pending = Vec::new();
-    for file in files {
-        let source = file.read_to_string().map_err(|error| {
-            HeaderDiscoveryError::Failed(format!(
-                "cannot read C++ source {}: {error}",
-                file.rel_path().display()
-            ))
-        })?;
-        pending.extend(
-            external_angle_include_paths(&source)
-                .into_iter()
-                .map(|include| (file.clone(), include)),
-        );
+    {
+        let _scope = crate::profiling::scope_with(|| {
+            format!(
+                "cpp_headers.scan_workspace_sources[{} of {workspace_file_count} files]",
+                compiled_sources.len()
+            )
+        });
+        for file in compiled_sources {
+            let source = match project.read_source(&file) {
+                Ok(source) => source,
+                Err(error) => {
+                    diagnostics.push(header_discovery_failed(
+                        Some(file.rel_path()),
+                        format!("cannot read C++ source: {error}"),
+                    ));
+                    continue;
+                }
+            };
+            pending.extend(
+                external_angle_include_paths(&source)
+                    .into_iter()
+                    .map(|include| (file.clone(), include)),
+            );
+        }
     }
     let mut paths_by_root: HashMap<PathBuf, crate::hash::HashSet<PathBuf>> = HashMap::default();
     let mut visited = crate::hash::HashSet::default();
@@ -764,13 +802,17 @@ fn discover_reachable_header_sets(
                 limits.max_source_files_per_artifact
             )));
         }
-        let source = read_external_header(&header).map_err(|error| {
-            HeaderDiscoveryError::Failed(format!(
-                "cannot read external C++ header {}: {error}",
-                header.display()
-            ))
-        })?;
-        bytes_read = bytes_read.saturating_add(source.len() as u64);
+        let (source, raw_bytes) = match read_external_header(&header) {
+            Ok(source) => source,
+            Err(error) => {
+                diagnostics.push(header_discovery_failed(
+                    Some(&header),
+                    format!("cannot read external C++ header: {error}"),
+                ));
+                continue;
+            }
+        };
+        bytes_read = bytes_read.saturating_add(raw_bytes as u64);
         if bytes_read > limits.max_total_artifact_bytes {
             return Err(HeaderDiscoveryError::Failed(format!(
                 "C++ header discovery exceeded byte limit {}",
@@ -795,8 +837,23 @@ fn discover_reachable_header_sets(
     Ok(sets)
 }
 
-fn read_external_header(path: &Path) -> std::io::Result<String> {
-    std::fs::read_to_string(path)
+fn read_external_header(path: &Path) -> std::io::Result<(String, usize)> {
+    let bytes = std::fs::read(path)?;
+    let raw_bytes = bytes.len();
+    decode_source_bytes(bytes).map(|source| (source, raw_bytes))
+}
+
+fn header_discovery_failed(
+    location: Option<&Path>,
+    message: impl Into<String>,
+) -> DependencyPackDiagnostic {
+    DependencyPackDiagnostic {
+        severity: DependencyPackDiagnosticSeverity::Error,
+        code: "cpp.header_discovery_failed".to_owned(),
+        dependency_id: None,
+        location: location.map(|path| path.to_string_lossy().into_owned()),
+        message: message.into(),
+    }
 }
 
 enum HeaderDiscoveryError {
@@ -966,7 +1023,7 @@ mod tests {
     };
     use crate::analyzer::{
         AnalyzerConfig, DependencyPackEcosystem, DependencyPackWorkspaceContext, Language,
-        TestProject, WorkspaceAnalyzer,
+        OverlayProject, Project, TestProject, WorkspaceAnalyzer,
     };
     use brokk_bifrost_core::analyzer::ProjectFile;
     use std::sync::Arc;
@@ -1198,6 +1255,264 @@ mod tests {
         );
     }
 
+    /// Every discovered header set, flattened to what a caller can observe:
+    /// the dependency id, the include root relative to the workspace, and the
+    /// header paths under it.
+    fn discovered_header_sets(
+        discovery: &DependencyDiscoveryOutcome,
+        root: &Path,
+    ) -> Vec<(String, String, Vec<String>)> {
+        discovery
+            .dependencies
+            .iter()
+            .map(|dependency| {
+                let ResolvedDependencyArtifactInput::SourceSet {
+                    root: set_root,
+                    relative_paths,
+                } = &dependency.artifacts[0].input
+                else {
+                    panic!("C++ dependency uses a source set");
+                };
+                (
+                    dependency.id.clone(),
+                    set_root
+                        .strip_prefix(root)
+                        .expect("an include root lies under the workspace")
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                    relative_paths
+                        .iter()
+                        .map(|path| path.to_string_lossy().replace('\\', "/"))
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// An angle include resolves to an external root only through the compile
+    /// contexts of the source file that spells it
+    /// (`CppCompileContexts::resolve_external_angle_include` answers
+    /// `MissingCompileContext` when the database names no entry for that file),
+    /// and discovery keeps only `Declared` results. A workspace source the
+    /// database does not name therefore contributes nothing at any depth --
+    /// including through a header that does exist under a root some *other*
+    /// source declares.
+    ///
+    /// This is the property that lets discovery skip reading and parsing those
+    /// sources at all. It is checked here as behavior, on a fixture where the
+    /// unnamed source's include would otherwise resolve.
+    #[test]
+    fn discovery_ignores_sources_the_compile_database_does_not_name() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), "src/main.cpp")
+            .write("#include <widget.h>\nint main() { return 0; }\n")
+            .expect("named source");
+        // Not in the database. `secret.h` exists under the same include root
+        // main.cpp declares, so only the missing compile context keeps it out.
+        ProjectFile::new(root.clone(), "src/unlisted.cpp")
+            .write("#include <secret.h>\nint unlisted() { return 0; }\n")
+            .expect("unnamed source");
+        ProjectFile::new(root.clone(), "fake/include/widget.h")
+            .write("#include <detail/inner.h>\nclass Widget {};\n")
+            .expect("entry header");
+        ProjectFile::new(root.clone(), "fake/include/detail/inner.h")
+            .write("class Inner {};\n")
+            .expect("nested header");
+        ProjectFile::new(root.clone(), "fake/include/secret.h")
+            .write("class Secret {};\n")
+            .expect("unreached header");
+        ProjectFile::new(root.clone(), "compile_commands.json")
+            .write(r#"[{"directory":".","file":"src/main.cpp","arguments":["clang++","-isystem","fake/include","-c","src/main.cpp"]}]"#)
+            .expect("database");
+        let project = TestProject::new(root.clone(), Language::Cpp);
+
+        let discovery = resolve_cpp_semantic_pack_dependencies(
+            &project,
+            &DependencyPackLimits::default(),
+            None,
+        );
+
+        assert!(discovery.complete, "{discovery:#?}");
+        assert!(discovery.diagnostics.is_empty(), "{discovery:#?}");
+        let sets = discovered_header_sets(&discovery, &root);
+        let [(_, set_root, paths)] = sets.as_slice() else {
+            panic!("one C++ include-root dependency: {sets:#?}");
+        };
+        assert_eq!("fake/include", set_root);
+        assert_eq!(
+            &["detail/inner.h".to_string(), "widget.h".to_string()],
+            paths.as_slice(),
+            "only the named source's transitive closure is discovered"
+        );
+    }
+
+    #[test]
+    fn discovery_uses_project_decoding_for_named_sources() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().canonicalize().expect("canonical root");
+        std::fs::create_dir_all(root.join("src")).expect("source directory");
+        let mut source = b"#include <widget.h>\n// legacy byte: ".to_vec();
+        source.push(0xff);
+        source.extend_from_slice(b"\n");
+        std::fs::write(root.join("src/main.cpp"), source).expect("legacy-encoded source");
+        ProjectFile::new(root.clone(), "fake/include/widget.h")
+            .write("class Widget {};\n")
+            .expect("header");
+        ProjectFile::new(root.clone(), "compile_commands.json")
+            .write(r#"[{"directory":".","file":"src/main.cpp","arguments":["clang++","-isystem","fake/include","-c","src/main.cpp"]}]"#)
+            .expect("database");
+        let project = TestProject::new(root.clone(), Language::Cpp);
+
+        let discovery = resolve_cpp_semantic_pack_dependencies(
+            &project,
+            &DependencyPackLimits::default(),
+            None,
+        );
+
+        assert!(discovery.complete, "{discovery:#?}");
+        assert_eq!(
+            vec![(
+                root_dependency_name(&root.join("fake/include")),
+                "fake/include".to_owned(),
+                vec!["widget.h".to_owned()],
+            )],
+            discovered_header_sets(&discovery, &root)
+        );
+    }
+
+    #[test]
+    fn discovery_uses_unsaved_project_source_overlays() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let source = ProjectFile::new(root.clone(), "src/main.cpp");
+        source
+            .write("int main() { return 0; }\n")
+            .expect("disk source");
+        ProjectFile::new(root.clone(), "fake/include/widget.h")
+            .write("class Widget {};\n")
+            .expect("header");
+        ProjectFile::new(root.clone(), "compile_commands.json")
+            .write(r#"[{"directory":".","file":"src/main.cpp","arguments":["clang++","-isystem","fake/include","-c","src/main.cpp"]}]"#)
+            .expect("database");
+        let base: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::Cpp));
+        let project = OverlayProject::new(base);
+        assert!(project.set(
+            source.abs_path(),
+            "#include <widget.h>\nint main() { return 0; }\n".to_owned(),
+        ));
+
+        let discovery = resolve_cpp_semantic_pack_dependencies(
+            &project,
+            &DependencyPackLimits::default(),
+            None,
+        );
+
+        assert!(discovery.complete, "{discovery:#?}");
+        assert_eq!(
+            vec![(
+                root_dependency_name(&root.join("fake/include")),
+                "fake/include".to_owned(),
+                vec!["widget.h".to_owned()],
+            )],
+            discovered_header_sets(&discovery, &root)
+        );
+    }
+
+    #[test]
+    fn discovery_decodes_legacy_external_headers_lossily() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().canonicalize().expect("canonical root");
+        ProjectFile::new(root.clone(), "src/main.cpp")
+            .write("#include <widget.h>\n")
+            .expect("source");
+        std::fs::create_dir_all(root.join("fake/include/detail"))
+            .expect("external include directory");
+        let mut header = b"#include <detail/inner.h>\n// legacy byte: ".to_vec();
+        header.push(0xff);
+        header.extend_from_slice(b"\nclass Widget {};\n");
+        let raw_byte_limit = (header.len() + "class Inner {};\n".len()) as u64;
+        std::fs::write(root.join("fake/include/widget.h"), header).expect("legacy-encoded header");
+        ProjectFile::new(root.clone(), "fake/include/detail/inner.h")
+            .write("class Inner {};\n")
+            .expect("nested header");
+        ProjectFile::new(root.clone(), "compile_commands.json")
+            .write(r#"[{"directory":".","file":"src/main.cpp","arguments":["clang++","-isystem","fake/include","-c","src/main.cpp"]}]"#)
+            .expect("database");
+        let project = TestProject::new(root.clone(), Language::Cpp);
+
+        let limits = DependencyPackLimits {
+            max_total_artifact_bytes: raw_byte_limit,
+            ..DependencyPackLimits::default()
+        };
+        let discovery = resolve_cpp_semantic_pack_dependencies(&project, &limits, None);
+
+        assert!(discovery.complete, "{discovery:#?}");
+        assert_eq!(
+            vec![(
+                root_dependency_name(&root.join("fake/include")),
+                "fake/include".to_owned(),
+                vec!["detail/inner.h".to_owned(), "widget.h".to_owned()],
+            )],
+            discovered_header_sets(&discovery, &root)
+        );
+    }
+
+    /// A source the database names but discovery cannot read is a hole in the
+    /// answer, and it says so. Each read failure is charged to that file and
+    /// bounded without discarding roots contributed by readable siblings.
+    #[test]
+    fn unreadable_named_sources_are_bounded_without_losing_readable_siblings() {
+        let temp = tempfile::tempdir().expect("temp root");
+        let root = temp.path().canonicalize().expect("canonical root");
+        std::fs::create_dir_all(root.join("src")).expect("source directory");
+        std::fs::write(root.join("src/bad_one.cpp"), b"int bad_one() {\0}\n")
+            .expect("first NUL-bearing source");
+        std::fs::write(root.join("src/bad_two.cpp"), b"int bad_two() {\0}\n")
+            .expect("second NUL-bearing source");
+        ProjectFile::new(root.clone(), "src/good.cpp")
+            .write("#include <widget.h>\n")
+            .expect("readable source");
+        ProjectFile::new(root.clone(), "fake/include/widget.h")
+            .write("class Widget {};\n")
+            .expect("header");
+        ProjectFile::new(root.clone(), "compile_commands.json")
+            .write(
+                r#"[
+                    {"directory":".","file":"src/bad_one.cpp","arguments":["clang++","-isystem","fake/include","-c","src/bad_one.cpp"]},
+                    {"directory":".","file":"src/bad_two.cpp","arguments":["clang++","-isystem","fake/include","-c","src/bad_two.cpp"]},
+                    {"directory":".","file":"src/good.cpp","arguments":["clang++","-isystem","fake/include","-c","src/good.cpp"]}
+                ]"#,
+            )
+            .expect("database");
+        let project = TestProject::new(root.clone(), Language::Cpp);
+        let limits = DependencyPackLimits {
+            max_diagnostics: 1,
+            ..DependencyPackLimits::default()
+        };
+
+        let discovery = resolve_cpp_semantic_pack_dependencies(&project, &limits, None);
+
+        assert!(!discovery.complete, "{discovery:#?}");
+        assert_eq!(1, discovery.diagnostics.len(), "{discovery:#?}");
+        assert_eq!(1, discovery.suppressed_diagnostics, "{discovery:#?}");
+        let diagnostic = &discovery.diagnostics[0];
+        assert_eq!("cpp.header_discovery_failed", diagnostic.code);
+        assert_eq!(
+            Some(Path::new("src/bad_one.cpp")),
+            diagnostic.location.as_deref().map(Path::new)
+        );
+        assert_eq!(
+            vec![(
+                root_dependency_name(&root.join("fake/include")),
+                "fake/include".to_owned(),
+                vec!["widget.h".to_owned()],
+            )],
+            discovered_header_sets(&discovery, &root),
+            "the readable source still contributes its include root"
+        );
+    }
+
     #[test]
     fn dependency_limit_makes_discovery_incomplete() {
         let temp = tempfile::tempdir().expect("temp root");
@@ -1252,8 +1567,9 @@ mod tests {
             .write(r#"[{"directory":".","file":"src/main.cpp","arguments":["clang++","-isystem","fake/include","-c","src/main.cpp"]}]"#)
             .expect("database");
         let project: Arc<dyn Project> = Arc::new(TestProject::new(root, Language::Cpp));
-        let workspace = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
-            .expect("ephemeral workspace should build");
+        let workspace =
+            WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
+                .expect("ephemeral workspace should build");
         let cancellation = CancellationToken::new();
         let start = source.find("push_back").expect("member start");
         let request = || DefinitionLookupRequest {

@@ -5,11 +5,13 @@
 //! unmodified by kotlin.test's own `@Test`), Kotest spec base classes named
 //! by a class-like declaration's supertype list, Kotest's
 //! `test("name") { … }` / `"name" should { … }` block forms, and Spek's
-//! `describe`/`it` blocks. Detection is deliberately name-based rather than
-//! import-resolved, matching every other language's `contains_tests`: it
-//! answers "does this file plausibly declare tests", not "which framework,
-//! precisely" (the `java_extends_testcase` analogue is `java/tests.rs:169`;
-//! the Kotest-supertype check here is its Kotlin counterpart).
+//! `describe`/`it` blocks. It also recognizes Kotlin compiler-style `fun box()`
+//! entry points when their files are under an established test-like path.
+//! Detection is deliberately name-based rather than import-resolved, matching
+//! every other language's `contains_tests`: it answers "does this file
+//! plausibly declare tests", not "which framework, precisely" (the
+//! `java_extends_testcase` analogue is `java/tests.rs:169`; the
+//! Kotest-supertype check here is its Kotlin counterpart).
 //!
 //! [`detect_kotlin_test_assertion_smells`] scores the same shapes' bodies for
 //! weak assertions. It mirrors Java's tree-walk shape (`java/tests.rs`)
@@ -31,9 +33,9 @@ use crate::kotlin::syntax::{kotlin_callee, kotlin_named_argument_label};
 use brokk_bifrost_core::analyzer::common::node_source_text as node_text;
 use brokk_bifrost_core::analyzer::model::{TestAssertionSmell, TestAssertionWeights};
 use brokk_bifrost_core::analyzer::tree_walk::{
-    WalkControl, named_children, walk_named_tree_preorder,
+    WalkControl, first_named_child_of_kind, named_children, walk_named_tree_preorder,
 };
-use brokk_bifrost_core::analyzer::{CodeUnitIndex, ProjectFile};
+use brokk_bifrost_core::analyzer::{CodeUnitIndex, Language, ProjectFile, test_paths};
 use brokk_bifrost_core::path_utils::rel_path_string;
 use tree_sitter::{Node, Parser};
 
@@ -128,6 +130,24 @@ pub fn kotlin_contains_tests(root: Node<'_>, source: &str) -> bool {
     found
 }
 
+/// Test evidence used only for a directly changed file. Kotlin compiler box
+/// fixtures are runnable test inputs, but treating every box fixture as a
+/// reverse-walk candidate makes common imports fan out across the whole corpus.
+pub fn kotlin_changed_file_contains_tests(file: &ProjectFile, source: &str) -> bool {
+    let Some(tree) = parse_kotlin_tree_for_tests(source) else {
+        return false;
+    };
+    let root = tree.root_node();
+    if kotlin_contains_tests(root, source) {
+        return true;
+    }
+    test_paths::is_test_like_path(&rel_path_string(file), Language::Kotlin)
+        && named_children(root).into_iter().any(|node| {
+            node.kind() == "function_declaration"
+                && kotlin_function_name(node, source) == Some("box")
+        })
+}
+
 fn kotlin_test_annotation(node: Node<'_>, source: &str) -> bool {
     kotlin_annotation_simple_name(node, source)
         .is_some_and(|name| KOTLIN_TEST_ANNOTATIONS.contains(&name))
@@ -167,6 +187,12 @@ fn kotlin_test_dsl_call(node: Node<'_>, source: &str) -> bool {
         .is_some_and(|callee| {
             KOTLIN_TEST_DSL_CALLS.contains(&kotlin_identifier_text(callee, source))
         })
+        && kotlin_call_trailing_lambda_body(node).is_some()
+}
+
+fn kotlin_function_name<'a>(function: Node<'_>, source: &'a str) -> Option<&'a str> {
+    first_named_child_of_kind(function, "simple_identifier")
+        .map(|name| kotlin_identifier_text(name, source))
 }
 
 /// Kotest's `"name" should { … }` block form: an infix `should` whose right
@@ -282,15 +308,9 @@ fn kotlin_function_body_node(function: Node<'_>) -> Option<Node<'_>> {
 /// (`test("name") { … }`), or `None` for a call with no trailing lambda —
 /// which names no scoreable body.
 fn kotlin_call_trailing_lambda_body(call: Node<'_>) -> Option<Node<'_>> {
-    let call_suffix = named_children(call)
-        .into_iter()
-        .find(|child| child.kind() == "call_suffix")?;
-    let annotated_lambda = named_children(call_suffix)
-        .into_iter()
-        .find(|child| child.kind() == "annotated_lambda")?;
-    named_children(annotated_lambda)
-        .into_iter()
-        .find(|child| child.kind() == "lambda_literal")
+    let call_suffix = first_named_child_of_kind(call, "call_suffix")?;
+    let annotated_lambda = first_named_child_of_kind(call_suffix, "annotated_lambda")?;
+    first_named_child_of_kind(annotated_lambda, "lambda_literal")
 }
 
 fn analyze_kotlin_test_case(

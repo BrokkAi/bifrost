@@ -2,11 +2,14 @@
 name = "brokk-bifrost-semantic-packs"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "Optional prebuilt semantic-pack distribution for brokk-bifrost"
 readme = "README.md"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 publish = true
 autobins = false
 # The JDK source slices under testdata/summary-sources are GPL-2.0 WITH
@@ -26,6 +29,19 @@ release-tooling = [
     "dep:serde-saphyr",
     "dep:sha2",
     "dep:tempfile",
+    "dep:flate2",
+    "dep:tar",
+]
+download = [
+    "dep:semver",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:serde-saphyr",
+    "dep:sha2",
+    "dep:tempfile",
+    "dep:flate2",
+    "dep:tar",
+    "dep:ureq",
 ]
 
 [[bin]]
@@ -34,8 +50,8 @@ path = "src/bin/bifrost-semantic-pack.rs"
 required-features = ["release-tooling"]
 
 [dependencies]
-brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.10.7" }
-brokk-bifrost-flow = { path = "../bifrost-flow", version = "=0.10.7" }
+brokk-bifrost-analysis = { path = "../bifrost-analysis", version = "=0.10.8" }
+brokk-bifrost-flow = { path = "../bifrost-flow", version = "=0.10.8" }
 semver = { version = "1.0.28", optional = true }
 serde = { version = "1.0.228", features = ["derive"], optional = true }
 serde_json = { version = "1.0.145", optional = true }
@@ -44,8 +60,10 @@ serde-saphyr = { version = "0.0.29", default-features = false, features = [
 ], optional = true }
 sha2 = { version = "0.10.8", optional = true }
 tempfile = { version = "3.23.0", optional = true }
+flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"], optional = true }
+tar = { version = "0.4.44", default-features = false, optional = true }
+ureq = { version = "3.4.0", default-features = false, features = ["rustls"], optional = true }
 
 [dev-dependencies]
+tempfile = "3.23.0"
 zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
-flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
-tar = { version = "0.4.44", default-features = false }

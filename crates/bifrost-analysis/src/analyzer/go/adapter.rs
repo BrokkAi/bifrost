@@ -8,7 +8,9 @@ use crate::analyzer::cognitive_complexity;
 use crate::analyzer::{Language, LanguageAdapter, ProjectFile};
 use brokk_bifrost_go::adapter::{GO_COGNITIVE_CONFIG, GO_FILE_EXTENSION, go_extract_call_receiver};
 use brokk_bifrost_go::declarations::{go_package_fq, parse_go_file};
-use brokk_bifrost_go::packages::canonical_go_package_name;
+use brokk_bifrost_go::packages::{
+    canonical_go_package_name, canonical_go_workspace_package_name, go_vendor_package_alias,
+};
 use brokk_bifrost_go::queries::GO_QUERY_DIRECTORY;
 use brokk_bifrost_go::test_detection::go_contains_tests;
 use tree_sitter::Tree;
@@ -65,6 +67,30 @@ impl LanguageAdapter for GoAdapter {
         Some(crate::analyzer::PackageAnchor::OwnModule { pop: 0 })
     }
 
+    fn workspace_file_package_anchor(&self) -> Option<crate::analyzer::PackageAnchor> {
+        Some(crate::analyzer::PackageAnchor::OwnModule { pop: 0 })
+    }
+
+    fn has_workspace_package_identity_inputs(&self) -> bool {
+        true
+    }
+
+    fn workspace_package_identity_input(&self, file: &ProjectFile) -> bool {
+        file.rel_path()
+            .file_name()
+            .is_some_and(|name| name == "go.mod")
+    }
+
+    fn workspace_package_aliases(
+        &self,
+        file: &ProjectFile,
+        canonical: &crate::analyzer::FqName,
+    ) -> Vec<crate::analyzer::FqName> {
+        go_vendor_package_alias(file, canonical)
+            .into_iter()
+            .collect()
+    }
+
     /// A Go declaration always sits in its file's own package, so the file's
     /// own module is the only anchor this adapter can place. The declared
     /// `package` clause travels in the content qualifier because the live
@@ -77,9 +103,10 @@ impl LanguageAdapter for GoAdapter {
         file: &ProjectFile,
     ) -> Option<crate::analyzer::FqName> {
         match anchor {
-            crate::analyzer::PackageAnchor::OwnModule { pop: 0 } => Some(go_package_fq(
-                &canonical_go_package_name(file, content_qualifier),
-            )),
+            crate::analyzer::PackageAnchor::OwnModule { pop: 0 } => {
+                canonical_go_workspace_package_name(file, content_qualifier)
+                    .map(|package| go_package_fq(&package))
+            }
             _ => None,
         }
     }

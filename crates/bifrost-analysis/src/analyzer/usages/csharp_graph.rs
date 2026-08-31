@@ -46,8 +46,8 @@ pub use crate::analyzer::usages::csharp_graph::shared::{
 use crate::analyzer::usages::csharp_graph::shared::{CSharpEdgeResolver, CSharpQueryResolver};
 use crate::analyzer::usages::get_definition::ResolutionSession;
 use crate::analyzer::usages::inverted_edges::{
-    EdgeNodeDomain, UsageEdgeBuildOutput, UsageEdgeWeights, UsageEdges, build_edge_output,
-    parse_and_collect_with_domain,
+    EdgeNodeDomain, UsageEdgeBuildOutput, UsageEdgeBuildResult, UsageEdgeWeights, UsageEdges,
+    build_edge_output, build_edge_output_with_completeness, parse_and_collect_with_domain,
 };
 use crate::analyzer::usages::model::FuzzyResult;
 use crate::analyzer::usages::outcome::{GraphFailureReason, GraphUsageOutcome};
@@ -248,6 +248,33 @@ where
     })
 }
 
+fn build_csharp_edges_with_completeness<Output, F>(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    csharp: &CSharpAnalyzer,
+    files: &[ProjectFile],
+    domain: EdgeNodeDomain<'_>,
+    keep_file: F,
+) -> UsageEdgeBuildResult<Output>
+where
+    Output: UsageEdgeBuildOutput<String>,
+    F: Fn(&ProjectFile) -> bool + Sync,
+{
+    let language = tree_sitter_c_sharp::LANGUAGE.into();
+    let graph = csharp_graph_source(analyzer);
+    build_edge_output_with_completeness(files, keep_file, |file| {
+        parse_and_collect_with_domain(
+            analyzer,
+            file,
+            domain,
+            brokk_bifrost_csharp::preprocessor::csharp_parse_spec(&language),
+            |input| {
+                brokk_bifrost_csharp::graph::inverted::scan_file(&graph, csharp, token, file, input)
+            },
+        )
+    })
+}
+
 pub(crate) fn build_rooted_csharp_usage_edges<F>(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
@@ -261,13 +288,13 @@ where
     Some(resolver.build_rooted_edges(analyzer, token, callers, keep_file))
 }
 
-pub(crate) fn build_inbound_csharp_usage_edges(
+pub(crate) fn build_inbound_csharp_usage_edges_with_completeness(
     analyzer: &dyn IAnalyzer,
     token: QueryToken<'_>,
     callees: &HashSet<String>,
-) -> Option<UsageEdges> {
+) -> Option<UsageEdgeBuildResult<UsageEdges>> {
     let resolver = CSharpEdgeResolver::try_new(analyzer)?;
-    Some(resolver.build_inbound_edges(analyzer, token, callees, |_| true))
+    Some(resolver.build_inbound_edges_with_completeness(analyzer, token, callees, |_| true))
 }
 
 pub(crate) fn build_csharp_usage_edge_weights<F>(

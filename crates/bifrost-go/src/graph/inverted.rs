@@ -24,7 +24,7 @@ use brokk_bifrost_core::hash::{HashMap, HashSet};
 use tree_sitter::Node;
 
 use crate::graph::ast::{
-    SELF_RECEIVER_TOKEN, clause_binding_names, clause_statement_list, for_each_var_spec,
+    SELF_RECEIVER_TOKEN, clause_binding_names, clause_statement_list, for_each_var_spec, is_clause,
     is_definition_identifier, is_identifier_node, is_method_receiver_parameter,
     lhs_identifier_slots, parameter_names, receive_statement_is_short_declaration,
     receiver_symbol_from_qualifier, rhs_expressions, selector_parts, type_ref_from_node,
@@ -191,7 +191,7 @@ fn scan_node(node: Node<'_>, ctx: &mut FileScan<'_>, locals: &mut LocalInference
             scan_type_switch(node, ctx, locals);
             return;
         }
-        "communication_case" | "type_case" | "default_case" => {
+        _ if is_clause(node) => {
             scan_clause(node, ctx, locals);
             return;
         }

@@ -788,6 +788,10 @@ impl CleanupRegionId {
     pub(crate) const fn new(raw: u32) -> Self {
         Self(raw)
     }
+
+    pub(crate) const fn index(self) -> usize {
+        self.0 as usize
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1199,6 +1203,7 @@ mod tests {
                         value: ValueId::new(1),
                         expansion,
                     }]),
+                    normal_results: Box::new([]),
                     result: None,
                     thrown: None,
                     declared_targets: CallableTargetResolution::Unknown,

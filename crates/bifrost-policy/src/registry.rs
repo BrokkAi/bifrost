@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::str;
 use std::sync::Arc;
 
+use brokk_bifrost_analysis::analyzer::IAnalyzer;
 use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
 use brokk_bifrost_analysis::workspace_document::{WorkspaceDocumentError, WorkspaceRoot};
 
@@ -26,6 +27,7 @@ use super::loading::{
     PolicyDocumentLoadError, SelectorLoadError, enumerate_endpoint_directory,
     load_endpoint_closure, read_rqlp_document, resolve_parsed_selector,
 };
+use super::locator::resolve_policy_definition_locators;
 use super::resolved::*;
 use super::source::{
     MAX_RQLP_SOURCE_BYTES, ParsedRqlpDocument, PolicySourceError, PolicySourceIdentity,
@@ -274,7 +276,26 @@ impl PolicyRegistry {
             read_rqlp_document(root, relative_path.as_ref())?
         };
         let (_, document, parsed) = loaded.into_parts();
-        self.finish_policy_registration(parsed, document.source().as_bytes())
+        self.finish_policy_registration(parsed, document.source().as_bytes(), None)
+    }
+
+    /// Load one workspace policy after the host has prepared the analyzer
+    /// snapshot and active semantic-model overlay used to resolve qualified
+    /// locators.
+    pub(crate) fn load_policy_path_with_analyzer(
+        &mut self,
+        relative_path: impl AsRef<Path>,
+        analyzer: &dyn IAnalyzer,
+    ) -> Result<&LoadedPolicy, PolicyRegistryError> {
+        let loaded = {
+            let root = self
+                .workspace_root
+                .as_ref()
+                .ok_or(PolicyRegistryError::WorkspaceAccessUnavailable)?;
+            read_rqlp_document(root, relative_path.as_ref())?
+        };
+        let (_, document, parsed) = loaded.into_parts();
+        self.finish_policy_registration(parsed, document.source().as_bytes(), Some(analyzer))
     }
 
     pub fn register_policy_bytes(
@@ -284,7 +305,20 @@ impl PolicyRegistry {
     ) -> Result<&LoadedPolicy, PolicyRegistryError> {
         validate_policy_source_identity(&identity)?;
         let parsed = parse_policy_bytes(identity, bytes)?;
-        self.finish_policy_registration(parsed, bytes)
+        self.finish_policy_registration(parsed, bytes, None)
+    }
+
+    /// Register one policy after the host has prepared the analyzer snapshot
+    /// and active semantic-model overlay used to resolve qualified locators.
+    pub fn register_policy_bytes_with_analyzer(
+        &mut self,
+        identity: PolicySourceIdentity,
+        bytes: &[u8],
+        analyzer: &dyn IAnalyzer,
+    ) -> Result<&LoadedPolicy, PolicyRegistryError> {
+        validate_policy_source_identity(&identity)?;
+        let parsed = parse_policy_bytes(identity, bytes)?;
+        self.finish_policy_registration(parsed, bytes, Some(analyzer))
     }
 
     pub fn load_endpoint_path(
@@ -299,7 +333,7 @@ impl PolicyRegistry {
             read_rqlp_document(root, relative_path.as_ref())?
         };
         let (_, document, parsed) = loaded.into_parts();
-        self.finish_endpoint_registration(parsed, document.source().as_bytes())
+        self.finish_endpoint_registration(parsed, document.source().as_bytes(), None)
     }
 
     pub fn register_endpoint_bytes(
@@ -309,7 +343,20 @@ impl PolicyRegistry {
     ) -> Result<&LoadedEndpoint, PolicyRegistryError> {
         validate_policy_source_identity(&identity)?;
         let parsed = parse_policy_bytes(identity, bytes)?;
-        self.finish_endpoint_registration(parsed, bytes)
+        self.finish_endpoint_registration(parsed, bytes, None)
+    }
+
+    /// Register one endpoint after the host has prepared the analyzer snapshot
+    /// and active semantic-model overlay used to resolve qualified locators.
+    pub fn register_endpoint_bytes_with_analyzer(
+        &mut self,
+        identity: PolicySourceIdentity,
+        bytes: &[u8],
+        analyzer: &dyn IAnalyzer,
+    ) -> Result<&LoadedEndpoint, PolicyRegistryError> {
+        validate_policy_source_identity(&identity)?;
+        let parsed = parse_policy_bytes(identity, bytes)?;
+        self.finish_endpoint_registration(parsed, bytes, Some(analyzer))
     }
 
     pub fn policies(&self) -> impl ExactSizeIterator<Item = &LoadedPolicy> {
@@ -337,8 +384,10 @@ impl PolicyRegistry {
         &mut self,
         parsed: ParsedRqlpDocument,
         source_bytes: &[u8],
+        analyzer: Option<&dyn IAnalyzer>,
     ) -> Result<&LoadedEndpoint, PolicyRegistryError> {
-        let closure = load_endpoint_closure(self.workspace_root.as_ref(), parsed, source_bytes)?;
+        let closure =
+            load_endpoint_closure(self.workspace_root.as_ref(), parsed, source_bytes, analyzer)?;
         let (loaded, _, retained_bytes) = closure.into_parts();
         let endpoint_id = loaded.definition().id.clone();
         if self.endpoints.contains_key(&endpoint_id) {
@@ -375,6 +424,7 @@ impl PolicyRegistry {
         &mut self,
         parsed: ParsedRqlpDocument,
         source_bytes: &[u8],
+        analyzer: Option<&dyn IAnalyzer>,
     ) -> Result<&LoadedPolicy, PolicyRegistryError> {
         let definition = match parsed.document() {
             RqlpDocument::Policy { definition } => definition.as_ref().clone(),
@@ -400,7 +450,7 @@ impl PolicyRegistry {
             });
         }
 
-        let build = self.build_policy(&parsed, definition, source_bytes)?;
+        let build = self.build_policy(&parsed, definition, source_bytes, analyzer)?;
         let attempted_endpoints = self
             .retained_endpoint_slots
             .checked_add(build.endpoint_slots)
@@ -438,9 +488,11 @@ impl PolicyRegistry {
     fn build_policy(
         &self,
         parsed: &ParsedRqlpDocument,
-        definition: PolicyDefinition,
+        mut definition: PolicyDefinition,
         source_bytes: &[u8],
+        analyzer: Option<&dyn IAnalyzer>,
     ) -> Result<PolicyBuild, PolicyRegistryError> {
+        resolve_policy_definition_locators(&mut definition, analyzer)?;
         let mut retained_bytes = source_bytes.len();
         self.ensure_local_retained_bytes(retained_bytes)?;
         let mut fixed_selectors = BTreeMap::new();
@@ -523,6 +575,7 @@ impl PolicyRegistry {
                         &uses,
                         &mut dependency_selectors,
                         &mut retained_bytes,
+                        analyzer,
                     )?;
                     candidate_dependencies.extend(match_inputs.dependencies);
                     self.validate_candidate_endpoint_count(
@@ -565,6 +618,7 @@ impl PolicyRegistry {
                         &uses,
                         &mut dependency_selectors,
                         &mut retained_bytes,
+                        analyzer,
                     )?;
                     candidate_dependencies.extend(match_inputs.dependencies);
                     self.validate_candidate_endpoint_count(&candidate_dependencies, 0)?;
@@ -998,6 +1052,7 @@ impl PolicyRegistry {
         uses: &[MatchUse],
         dependency_selectors: &mut BTreeMap<PolicySelectorPath, ResolvedPolicySelector>,
         retained_bytes: &mut usize,
+        analyzer: Option<&dyn IAnalyzer>,
     ) -> Result<MatchBuild, PolicyRegistryError> {
         let directory_count = uses
             .iter()
@@ -1026,7 +1081,7 @@ impl PolicyRegistry {
             if directories.contains_key(&key) {
                 continue;
             }
-            let closure = self.load_directory_closure(&key, usage, retained_bytes)?;
+            let closure = self.load_directory_closure(&key, usage, retained_bytes, analyzer)?;
             candidate_count = candidate_count
                 .checked_add(closure.endpoints.len())
                 .ok_or(PolicyRegistryError::EndpointCountOverflow)?;
@@ -1159,6 +1214,7 @@ impl PolicyRegistry {
         key: &DirectoryCacheKey,
         first_usage: &MatchUse,
         retained_bytes: &mut usize,
+        analyzer: Option<&dyn IAnalyzer>,
     ) -> Result<DirectoryClosure, PolicyRegistryError> {
         let root = self
             .workspace_root
@@ -1177,7 +1233,8 @@ impl PolicyRegistry {
         let available = self.available_local_bytes(*retained_bytes)?;
         for source in directory.into_entries() {
             let (_, document, parsed) = source.into_parts();
-            let closure = load_endpoint_closure(Some(root), parsed, document.source().as_bytes())?;
+            let closure =
+                load_endpoint_closure(Some(root), parsed, document.source().as_bytes(), analyzer)?;
             let (endpoint, _, retained) = closure.into_parts();
             transient_bytes = transient_bytes
                 .checked_add(retained)
@@ -1628,6 +1685,7 @@ fn port_to_endpoint_binding(port: &PolicyPort) -> PolicyEndpointBinding {
         PolicyPort::MatchedValue => PolicyEndpointBinding::MatchedValue,
         PolicyPort::Receiver => PolicyEndpointBinding::Receiver,
         PolicyPort::ReturnValue => PolicyEndpointBinding::ReturnValue,
+        PolicyPort::ResultIndex { index } => PolicyEndpointBinding::ResultIndex { index: *index },
         PolicyPort::ArgumentIndex { index } => {
             PolicyEndpointBinding::ArgumentIndex { index: *index }
         }
@@ -1642,6 +1700,9 @@ fn seed_to_endpoint_binding(binding: &TypestateSeedBinding) -> PolicyEndpointBin
         TypestateSeedBinding::MatchedValue => PolicyEndpointBinding::MatchedValue,
         TypestateSeedBinding::Receiver => PolicyEndpointBinding::Receiver,
         TypestateSeedBinding::ReturnValue => PolicyEndpointBinding::ReturnValue,
+        TypestateSeedBinding::ResultIndex { index } => {
+            PolicyEndpointBinding::ResultIndex { index: *index }
+        }
         TypestateSeedBinding::ArgumentIndex { index } => {
             PolicyEndpointBinding::ArgumentIndex { index: *index }
         }
@@ -1936,8 +1997,11 @@ impl From<PolicyDocumentLoadError> for PolicyRegistryError {
 
 impl From<EndpointClosureError> for PolicyRegistryError {
     fn from(error: EndpointClosureError) -> Self {
-        Self::EndpointClosure {
-            message: error.to_string(),
+        match error {
+            EndpointClosureError::Source(error) => Self::Source(Box::new(error)),
+            error => Self::EndpointClosure {
+                message: error.to_string(),
+            },
         }
     }
 }

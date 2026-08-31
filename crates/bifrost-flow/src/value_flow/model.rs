@@ -1,11 +1,11 @@
-use std::{error::Error, fmt, mem::size_of_val};
+use std::{error::Error, fmt, mem::size_of_val, sync::Arc};
 
 use crate::analyzer::semantic::{
     AbstractLocation, AccessPath, AccessPathRoot, AccessPathTail, AccessSelector, CallSiteHandle,
     DurableIdentityError, DurableObjectIdentity, DurablePortIdentity, DurableValueIdentity,
     EvidenceCompleteness, IndexSelector, OracleCallContext, ProcedureHandle, ProcedurePortHandle,
-    ProgramPointHandle, ProofStatus, ScopedSemanticLocator, SemanticLocator, ValueFlowEndpoint,
-    ValueHandle,
+    ProgramPointHandle, ProofStatus, ScopedSemanticLocator, SemanticArtifact, SemanticLocator,
+    ValueFlowEndpoint, ValueHandle,
 };
 use brokk_bifrost_core::analyzer::dense_id::define_dense_id;
 
@@ -55,7 +55,15 @@ impl ValueFlowCarrier {
         match self {
             Self::Value(value) => Some(value.procedure()),
             Self::Port(port) => Some(port.procedure()),
-            Self::Location(location) => carrier_root_procedure(location.path().root()),
+            Self::Location(location) => location.path().root().scoped_procedure(),
+        }
+    }
+
+    pub(crate) fn for_each_retained_artifact(&self, mut visit: impl FnMut(&Arc<SemanticArtifact>)) {
+        match self {
+            Self::Value(value) => visit(value.procedure().artifact()),
+            Self::Port(port) => visit(port.procedure().artifact()),
+            Self::Location(location) => location.for_each_retained_artifact(visit),
         }
     }
 
@@ -304,6 +312,7 @@ pub enum ValueFlowPortKey {
     Receiver,
     Parameter { ordinal: u32 },
     NormalReturn,
+    IndexedNormalReturn { ordinal: u32 },
     ExceptionalReturn,
     Capture { slot: u32 },
 }
@@ -576,6 +585,9 @@ fn carrier_key(identity: &DurableObjectIdentity) -> ValueFlowCarrierKey {
                     ValueFlowPortKey::Parameter { ordinal: *ordinal }
                 }
                 DurablePortIdentity::NormalReturn => ValueFlowPortKey::NormalReturn,
+                DurablePortIdentity::IndexedNormalReturn { ordinal } => {
+                    ValueFlowPortKey::IndexedNormalReturn { ordinal: *ordinal }
+                }
                 DurablePortIdentity::ExceptionalReturn => ValueFlowPortKey::ExceptionalReturn,
                 DurablePortIdentity::Capture { slot, .. } => {
                     ValueFlowPortKey::Capture { slot: *slot }
@@ -638,21 +650,5 @@ fn selector_key(selector: &AccessSelector) -> Result<ValueFlowSelectorKey, Value
             Box::new(value_key(index)?),
         )),
         AccessSelector::Index(IndexSelector::Any) => Ok(ValueFlowSelectorKey::AnyIndex),
-    }
-}
-
-fn carrier_root_procedure(root: &AccessPathRoot) -> Option<&ProcedureHandle> {
-    match root {
-        AccessPathRoot::Value(value) => Some(value.procedure()),
-        AccessPathRoot::CallResult(result) => Some(result.result().procedure()),
-        AccessPathRoot::ProcedurePort(port) | AccessPathRoot::CaptureSlot(port) => {
-            Some(port.procedure())
-        }
-        AccessPathRoot::Allocation(allocation) => Some(allocation.procedure()),
-        AccessPathRoot::LexicalCell(location) => Some(location.procedure()),
-        AccessPathRoot::Static(_)
-        | AccessPathRoot::TypeSummary(_)
-        | AccessPathRoot::ModuleObject(_)
-        | AccessPathRoot::External(_) => None,
     }
 }

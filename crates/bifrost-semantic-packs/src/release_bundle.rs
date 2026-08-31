@@ -40,22 +40,24 @@ use brokk_bifrost_analysis::CancellationToken;
 use brokk_bifrost_analysis::analyzer::semantic_model::{
     ActivationSelector, ArtifactEncoding, ArtifactProducerLimits, ArtifactProduction,
     ArtifactProductionRequest, CatalogCoordinate, CatalogOptions, Compatibility,
-    CompiledSemanticModelPack, CompilerOptions, Completeness, DecodeLimits, DurablePackSource,
-    DurablePackSourceKind, ExactArtifact, ExternalArtifactKind, PackExtractionAccounting,
-    PackExtractionGap, ProducerDiagnostic, ProducerDiagnosticSeverity, Provenance,
-    ResolvedActiveSemanticModels, Safety, SemanticModelActivationControl,
+    CompiledSemanticModelPack, CompilerOptions, Completeness, DecodeLimits, DependencyArtifactRole,
+    DependencyPackLimits, DurablePackSource, DurablePackSourceKind, ExactArtifact,
+    ExactDependencyArtifact, ExternalArtifactKind, GENERATED_PRODUCTION_CACHE_VERSION,
+    GeneratedProductionKey, PackExtractionAccounting, PackExtractionGap, ProducerDiagnostic,
+    ProducerDiagnosticSeverity, Provenance, ResolvedActiveSemanticModels,
+    SEMANTIC_MODEL_SCHEMA_VERSION, Safety, SemanticModelActivationControl,
     SemanticModelActivationEvidence, SemanticModelActivationRequest, SemanticModelControlAction,
     SemanticModelControlScope, SemanticModelPackSelector, SemanticModelResolutionOutcome,
-    SemanticPackCatalog, compile_pack, decode_manifest, decode_shard_for_manifest,
-    pack_rejects_are_warning_only, read_exact_artifact, read_exact_source_set,
-    resolve_active_semantic_models,
+    SemanticPackCatalog, compile_exact_dependency_production, compile_pack, decode_manifest,
+    decode_shard_for_manifest, pack_rejects_are_warning_only, read_exact_artifact,
+    read_exact_source_set, resolve_active_semantic_models,
 };
 use brokk_bifrost_analysis::analyzer::{
     CSharpAssemblyPackProducer, ComposerPackagePackProducer, ComposerPinnedAutoloadRule,
     GoModulePackProducer, GoPinnedPackage as AnalysisGoPinnedPackage, JavaJarPackProducer,
-    JdkSourceArchiveLayout, JdkSourceArchivePackProducer, KotlinSourceJarPackProducer,
-    PythonArtifactPackProducer, RubyGemArchivePackProducer, RustdocJsonPackProducer,
-    ScalaSourceJarPackProducer, TypeScriptDeclarationPackProducer,
+    JdkSourceArchiveLayout, JdkSourceArchivePackProducer, JvmDependencyPackAdapter,
+    KotlinSourceJarPackProducer, PythonArtifactPackProducer, RubyGemArchivePackProducer,
+    RustdocJsonPackProducer, ScalaSourceJarPackProducer, TypeScriptDeclarationPackProducer,
 };
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
@@ -63,7 +65,7 @@ use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
 pub const PACK_SPEC_SCHEMA_VERSION: u32 = 1;
-pub const RELEASE_BUNDLE_SCHEMA_VERSION: u32 = 1;
+pub const RELEASE_BUNDLE_SCHEMA_VERSION: u32 = 2;
 
 fn current_release_generator() -> ReleaseGenerator {
     ReleaseGenerator {
@@ -287,6 +289,11 @@ pub struct ReleaseBundleIndex {
     pub schema_version: u32,
     pub generator: ReleaseGenerator,
     pub packs: Vec<ReleasePack>,
+    /// Exact dependency productions are separate from curated release packs.
+    /// The latter are selected by their reviewed upstream identity; these
+    /// entries are selected by the runtime generated-production key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub generated_productions: Vec<ReleaseGeneratedProduction>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -314,6 +321,36 @@ pub struct ReleasePack {
     pub license: String,
     pub notices: Vec<ReleaseNotice>,
     pub shards: Vec<ReleaseShard>,
+}
+
+/// One exact dependency production emitted by the runtime adapter during
+/// release qualification. This is intentionally separate from [`ReleasePack`]
+/// so a curated pack can retain its upstream producer identity and exhaustive
+/// extraction report without being mistaken for a generated cache entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseGeneratedProduction {
+    /// The curated release recipe that supplied the exact artifact bytes.
+    pub source_pack_id: String,
+    pub source_pack_version: String,
+    pub artifact_sha256: String,
+    pub input_digest: String,
+    pub producer_name: String,
+    pub producer_version: String,
+    pub schema_version: u32,
+    pub cache_version: u32,
+    pub production_digest: String,
+    pub pack_id: String,
+    pub pack_version: String,
+    pub language: String,
+    pub ecosystem: String,
+    pub manifest: ReleaseAsset,
+    pub manifest_semantic_sha256: String,
+    pub manifest_content_sha256: String,
+    pub completeness: Completeness,
+    pub shards: Vec<ReleaseShard>,
+    pub rejects: Vec<ReleaseReject>,
+    pub suppressed_rejects: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -496,12 +533,21 @@ pub fn generate_release_bundle(
     }
     fs::create_dir_all(output_root)
         .map_err(|error| BundleError::new(format!("create {}: {error}", output_root.display())))?;
+    let specs = inputs
+        .iter()
+        .map(|input| read_and_validate_spec(&input.spec_path))
+        .collect::<Result<Vec<_>, BundleError>>()?;
+    assert_eq!(
+        inputs.len(),
+        specs.len(),
+        "each release input must have one parsed spec"
+    );
     let generator = current_release_generator();
     let mut packs = Vec::with_capacity(inputs.len());
     let mut measurements = Vec::with_capacity(inputs.len());
     let mut rejects = Vec::with_capacity(inputs.len());
-    for input in inputs {
-        let (pack, measurement, pack_rejects) = generate_one(output_root, input)?;
+    for (input, spec) in inputs.iter().zip(&specs) {
+        let (pack, measurement, pack_rejects) = generate_one(output_root, input, spec)?;
         packs.push(pack);
         measurements.push(measurement);
         rejects.push(pack_rejects);
@@ -523,10 +569,13 @@ pub fn generate_release_bundle(
             )));
         }
     }
+    let generated_productions =
+        generate_generated_productions(output_root, inputs, &specs, &packs)?;
     let index = ReleaseBundleIndex {
         schema_version: RELEASE_BUNDLE_SCHEMA_VERSION,
         generator: generator.clone(),
         packs,
+        generated_productions,
     };
     write_new_or_identical(output_root, Path::new("index.json"), &json_bytes(&index)?)?;
     let rejects = ReleaseBundleRejects {
@@ -553,17 +602,21 @@ pub fn generate_release_bundle(
     verify_release_bundle(output_root)
 }
 
+fn read_and_validate_spec(spec_path: &Path) -> Result<PinnedPackSpec, BundleError> {
+    let spec_bytes = fs::read(spec_path)
+        .map_err(|error| BundleError::new(format!("read spec {}: {error}", spec_path.display())))?;
+    let spec: PinnedPackSpec = serde_json::from_slice(&spec_bytes).map_err(|error| {
+        BundleError::new(format!("parse spec {}: {error}", spec_path.display()))
+    })?;
+    validate_spec(&spec, spec_path)?;
+    Ok(spec)
+}
+
 fn generate_one(
     output_root: &Path,
     input: &BundleInput,
+    spec: &PinnedPackSpec,
 ) -> Result<(ReleasePack, ReleasePackMeasurement, ReleasePackRejects), BundleError> {
-    let spec_bytes = fs::read(&input.spec_path).map_err(|error| {
-        BundleError::new(format!("read spec {}: {error}", input.spec_path.display()))
-    })?;
-    let spec: PinnedPackSpec = serde_json::from_slice(&spec_bytes).map_err(|error| {
-        BundleError::new(format!("parse spec {}: {error}", input.spec_path.display()))
-    })?;
-    validate_spec(&spec, &input.spec_path)?;
     // A release bundle is the durable extraction-accounting boundary. Retain
     // the interactive safety bound, but size it to the already-bounded source
     // set so every rejected declaration can be named in `rejects.json`.
@@ -571,7 +624,7 @@ fn generate_one(
         max_diagnostics: MAX_SOURCE_SET_FILES,
         ..ArtifactProducerLimits::default()
     };
-    let artifact = read_pinned_artifact(&spec, &input.artifact_path, &producer_limits)?;
+    let artifact = read_pinned_artifact(spec, &input.artifact_path, &producer_limits)?;
     if artifact.sha256() != spec.artifact.sha256 {
         return Err(BundleError::new(format!(
             "artifact {} SHA-256 {} does not match pinned {}",
@@ -628,36 +681,13 @@ fn generate_one(
         BundleError::new(format!("pack compilation failed: {diagnostics:#?}"))
     })?;
     let elapsed = started.elapsed();
-    let runtime_measurement = measure_runtime(&spec, &compiled, &cancellation)?;
+    let runtime_measurement = measure_runtime(spec, &compiled, &cancellation)?;
 
-    let manifest_sha256 = sha256_bytes(&compiled.manifest_bytes);
-    let manifest_path = format!("manifests/{manifest_sha256}.json");
-    write_content_addressed(output_root, &manifest_path, &compiled.manifest_bytes)?;
-    let mut shards = compiled
-        .shards
-        .iter()
-        .map(|shard| {
-            let path = format!("shards/{}.bin", shard.descriptor.stored_sha256);
-            write_content_addressed(output_root, &path, &shard.bytes)?;
-            Ok(ReleaseShard {
-                shard_id: shard.descriptor.shard_id.clone(),
-                asset: ReleaseAsset {
-                    path,
-                    sha256: shard.descriptor.stored_sha256.clone(),
-                    bytes: shard.descriptor.stored_size,
-                },
-                encoding: shard.descriptor.encoding,
-                raw_bytes: shard.descriptor.raw_size,
-                records: shard.descriptor.record_count,
-                semantic_sha256: shard.descriptor.semantic_sha256.clone(),
-                content_sha256: shard.descriptor.content_sha256.clone(),
-            })
-        })
-        .collect::<Result<Vec<_>, BundleError>>()?;
-    shards.sort_unstable_by(|left, right| left.shard_id.cmp(&right.shard_id));
+    let (manifest, manifest_semantic_sha256, manifest_content_sha256, shards) =
+        write_compiled_assets(output_root, &compiled)?;
     let notices = copy_notices(output_root, &input.spec_path, &spec.notices)?;
     let measurement = measurement(
-        &spec,
+        spec,
         artifact.bytes().len() as u64,
         &compiled,
         elapsed.as_millis().try_into().unwrap_or(u64::MAX),
@@ -688,29 +718,232 @@ fn generate_one(
     };
     Ok((
         ReleasePack {
-            pack_id: spec.pack_id,
-            pack_version: spec.pack_version,
+            pack_id: spec.pack_id.clone(),
+            pack_version: spec.pack_version.clone(),
             language: compiled.manifest.language.clone(),
-            ecosystem: spec.ecosystem,
-            artifact: spec.artifact,
+            ecosystem: spec.ecosystem.clone(),
+            artifact: spec.artifact.clone(),
             artifact_bytes: artifact.bytes().len() as u64,
-            manifest: ReleaseAsset {
-                path: manifest_path,
-                sha256: manifest_sha256,
-                bytes: compiled.manifest_bytes.len().try_into().unwrap_or(u64::MAX),
-            },
-            manifest_semantic_sha256: compiled.manifest.semantic_sha256.clone(),
-            manifest_content_sha256: compiled.manifest.content_sha256.clone(),
+            manifest,
+            manifest_semantic_sha256,
+            manifest_content_sha256,
             completeness: compiled.manifest.completeness,
-            compatibility: spec.compatibility,
-            provenance: spec.provenance,
-            license: spec.license,
+            compatibility: spec.compatibility.clone(),
+            provenance: spec.provenance.clone(),
+            license: spec.license.clone(),
             notices,
             shards,
         },
         measurement,
         pack_rejects,
     ))
+}
+
+fn generate_generated_productions(
+    output_root: &Path,
+    inputs: &[BundleInput],
+    specs: &[PinnedPackSpec],
+    curated_packs: &[ReleasePack],
+) -> Result<Vec<ReleaseGeneratedProduction>, BundleError> {
+    assert_eq!(
+        inputs.len(),
+        specs.len(),
+        "each release input must have one parsed spec"
+    );
+    let mut generated = Vec::new();
+    for (input, spec) in inputs.iter().zip(specs) {
+        if !matches!(&spec.kind, PinnedPackKind::JdkSourceZip { .. }) {
+            continue;
+        }
+        let curated = curated_packs
+            .iter()
+            .find(|pack| pack.pack_id == spec.pack_id && pack.pack_version == spec.pack_version)
+            .ok_or_else(|| {
+                BundleError::new(format!(
+                    "generated JDK production has no curated source pack {}@{}",
+                    spec.pack_id, spec.pack_version
+                ))
+            })?;
+        generated.push(generate_jdk_production(output_root, input, spec, curated)?);
+    }
+    generated.sort_unstable_by(|left, right| {
+        left.production_digest
+            .cmp(&right.production_digest)
+            .then_with(|| left.source_pack_id.cmp(&right.source_pack_id))
+            .then_with(|| left.source_pack_version.cmp(&right.source_pack_version))
+    });
+    Ok(generated)
+}
+
+fn generate_jdk_production(
+    output_root: &Path,
+    input: &BundleInput,
+    spec: &PinnedPackSpec,
+    curated: &ReleasePack,
+) -> Result<ReleaseGeneratedProduction, BundleError> {
+    let version = exact_jdk_version(spec)?;
+    // `read_exact_artifact` reports at most one diagnostic (a hard read
+    // failure), so it never feeds the bounded-diagnostics accounting below;
+    // the interactive default is fine here.
+    let artifact_limits = ArtifactProducerLimits::default();
+    let artifact = read_exact_artifact(&input.artifact_path, &artifact_limits)
+        .map_err(|diagnostic| BundleError::new(render_diagnostics(&[diagnostic])))?;
+    if artifact.sha256() != spec.artifact.sha256 || artifact.sha256() != curated.artifact.sha256 {
+        return Err(BundleError::new(format!(
+            "generated JDK artifact {} does not match curated pinned digest",
+            input.artifact_path.display()
+        )));
+    }
+    let dependency =
+        JvmDependencyPackAdapter::jdk_source_dependency(version, input.artifact_path.clone());
+    let exact = ExactDependencyArtifact::from_exact(
+        DependencyArtifactRole::Sources,
+        ExternalArtifactKind::JdkSourceZip,
+        None,
+        artifact,
+    );
+    // Same durable-extraction-accounting boundary as `generate_one`: the
+    // derived production must be able to name every rejected declaration, not
+    // just the interactive-safety-bounded first 256.
+    let limits = DependencyPackLimits {
+        max_diagnostics: MAX_SOURCE_SET_FILES,
+        producer: ArtifactProducerLimits {
+            max_diagnostics: MAX_SOURCE_SET_FILES,
+            ..ArtifactProducerLimits::default()
+        },
+        ..DependencyPackLimits::default()
+    };
+    let cancellation = CancellationToken::default();
+    let production = compile_exact_dependency_production(
+        &JvmDependencyPackAdapter,
+        &dependency,
+        &[exact],
+        &limits,
+        Some(&cancellation),
+    )
+    .map_err(|error| {
+        BundleError::new(format!(
+            "compile generated JDK production for {}@{}: {error:?}",
+            spec.pack_id, spec.pack_version
+        ))
+    })?;
+    let (manifest, manifest_semantic_sha256, manifest_content_sha256, shards) =
+        write_compiled_assets(output_root, &production.compiled)?;
+    let rejects = production
+        .diagnostics
+        .iter()
+        .map(release_reject)
+        .collect::<Vec<_>>();
+    Ok(ReleaseGeneratedProduction {
+        source_pack_id: curated.pack_id.clone(),
+        source_pack_version: curated.pack_version.clone(),
+        artifact_sha256: spec.artifact.sha256.clone(),
+        input_digest: production.key.input_digest().to_owned(),
+        producer_name: production.key.producer_name().to_owned(),
+        producer_version: production.key.producer_version().to_owned(),
+        schema_version: production.key.schema_version(),
+        cache_version: GENERATED_PRODUCTION_CACHE_VERSION,
+        production_digest: production.key.production_digest().to_owned(),
+        pack_id: production.compiled.manifest.pack_id.clone(),
+        pack_version: production.compiled.manifest.version.clone(),
+        language: production.compiled.manifest.language.clone(),
+        ecosystem: production.compiled.manifest.ecosystem.clone(),
+        manifest,
+        manifest_semantic_sha256,
+        manifest_content_sha256,
+        completeness: production.completeness,
+        shards,
+        rejects,
+        suppressed_rejects: production
+            .suppressed_diagnostics
+            .try_into()
+            .unwrap_or(u64::MAX),
+    })
+}
+
+fn exact_jdk_version(spec: &PinnedPackSpec) -> Result<Version, BundleError> {
+    let selector = spec
+        .activation
+        .iter()
+        .find_map(|selector| selector.toolchain.as_ref())
+        .ok_or_else(|| {
+            BundleError::new(format!(
+                "JDK spec {}@{} requires an exact toolchain selector",
+                spec.pack_id, spec.pack_version
+            ))
+        })?;
+    let requirement = selector.version.as_deref().ok_or_else(|| {
+        BundleError::new(format!(
+            "JDK spec {}@{} requires an exact toolchain version",
+            spec.pack_id, spec.pack_version
+        ))
+    })?;
+    let version = requirement.strip_prefix('=').ok_or_else(|| {
+        BundleError::new(format!(
+            "JDK spec {}@{} toolchain selector must be exact",
+            spec.pack_id, spec.pack_version
+        ))
+    })?;
+    Version::parse(version).map_err(|error| {
+        BundleError::new(format!(
+            "JDK spec {}@{} has invalid toolchain version {version:?}: {error}",
+            spec.pack_id, spec.pack_version
+        ))
+    })
+}
+
+fn write_compiled_assets(
+    output_root: &Path,
+    compiled: &CompiledSemanticModelPack,
+) -> Result<(ReleaseAsset, String, String, Vec<ReleaseShard>), BundleError> {
+    let manifest_sha256 = sha256_bytes(&compiled.manifest_bytes);
+    let manifest_path = format!("manifests/{manifest_sha256}.json");
+    write_content_addressed(output_root, &manifest_path, &compiled.manifest_bytes)?;
+    let mut shards = compiled
+        .shards
+        .iter()
+        .map(|shard| {
+            let path = format!("shards/{}.bin", shard.descriptor.stored_sha256);
+            write_content_addressed(output_root, &path, &shard.bytes)?;
+            Ok(ReleaseShard {
+                shard_id: shard.descriptor.shard_id.clone(),
+                asset: ReleaseAsset {
+                    path,
+                    sha256: shard.descriptor.stored_sha256.clone(),
+                    bytes: shard.descriptor.stored_size,
+                },
+                encoding: shard.descriptor.encoding,
+                raw_bytes: shard.descriptor.raw_size,
+                records: shard.descriptor.record_count,
+                semantic_sha256: shard.descriptor.semantic_sha256.clone(),
+                content_sha256: shard.descriptor.content_sha256.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, BundleError>>()?;
+    shards.sort_unstable_by(|left, right| left.shard_id.cmp(&right.shard_id));
+    Ok((
+        ReleaseAsset {
+            path: manifest_path,
+            sha256: manifest_sha256,
+            bytes: compiled.manifest_bytes.len().try_into().unwrap_or(u64::MAX),
+        },
+        compiled.manifest.semantic_sha256.clone(),
+        compiled.manifest.content_sha256.clone(),
+        shards,
+    ))
+}
+
+fn release_reject(diagnostic: &ProducerDiagnostic) -> ReleaseReject {
+    ReleaseReject {
+        severity: match diagnostic.severity {
+            ProducerDiagnosticSeverity::Warning => ReleaseRejectSeverity::Warning,
+            ProducerDiagnosticSeverity::Error => ReleaseRejectSeverity::Error,
+        },
+        code: diagnostic.code.clone(),
+        location: diagnostic.location.clone(),
+        declaration: diagnostic.declaration.clone(),
+        message: diagnostic.message.clone(),
+    }
 }
 
 /// Read the pinned input exactly as the spec kind defines it: a single
@@ -1504,6 +1737,7 @@ pub fn verify_release_bundle(output_root: &Path) -> Result<ReleaseBundle, Bundle
         )));
     }
     ensure_unique_pack_identities(&index.packs)?;
+    ensure_unique_generated_productions(&index.generated_productions)?;
     verify_checksums(output_root, &index)?;
     let rejects = verify_rejects(output_root, &index)?;
     let measurements_path = safe_asset_path(output_root, Path::new("measurements.json"))?;
@@ -1568,6 +1802,9 @@ pub fn verify_release_bundle(output_root: &Path) -> Result<ReleaseBundle, Bundle
             verify_asset(output_root, &notice.asset)?;
         }
     }
+    for generated in &index.generated_productions {
+        verify_generated_production(output_root, &index, generated)?;
+    }
     Ok(ReleaseBundle { index, rejects })
 }
 
@@ -1586,10 +1823,12 @@ pub fn merge_release_bundles(
     }
     let generator = current_release_generator();
     let mut packs = Vec::new();
+    let mut generated_productions = Vec::new();
     let mut rejects = Vec::new();
     let mut measurements = Vec::new();
     let mut assets = BTreeMap::<String, Vec<u8>>::new();
     let mut identities = BTreeSet::new();
+    let mut generated_identities = BTreeSet::new();
 
     // Verify every input and retain all source bytes before touching the
     // output. The output must be a new or empty directory, so a stale or
@@ -1622,13 +1861,32 @@ pub fn merge_release_bundles(
                 collect_asset(input_root, &mut assets, &notice.asset)?;
             }
         }
+        for generated in &bundle.index.generated_productions {
+            if !generated_identities.insert(generated.production_digest.clone()) {
+                return Err(BundleError::new(format!(
+                    "duplicate generated production {} across input bundles",
+                    generated.production_digest
+                )));
+            }
+            collect_asset(input_root, &mut assets, &generated.manifest)?;
+            for shard in &generated.shards {
+                collect_asset(input_root, &mut assets, &shard.asset)?;
+            }
+        }
         packs.extend(bundle.index.packs);
+        generated_productions.extend(bundle.index.generated_productions);
         rejects.extend(bundle.rejects.packs);
         measurements.extend(input_measurements.packs);
     }
 
     packs.sort_unstable_by(|left, right| {
         (&left.pack_id, &left.pack_version).cmp(&(&right.pack_id, &right.pack_version))
+    });
+    generated_productions.sort_unstable_by(|left, right| {
+        left.production_digest
+            .cmp(&right.production_digest)
+            .then_with(|| left.pack_id.cmp(&right.pack_id))
+            .then_with(|| left.pack_version.cmp(&right.pack_version))
     });
     rejects.sort_unstable_by(|left, right| {
         (&left.pack_id, &left.pack_version).cmp(&(&right.pack_id, &right.pack_version))
@@ -1647,6 +1905,7 @@ pub fn merge_release_bundles(
         schema_version: RELEASE_BUNDLE_SCHEMA_VERSION,
         generator: generator.clone(),
         packs,
+        generated_productions,
     };
     let rejects = ReleaseBundleRejects {
         schema_version: RELEASE_BUNDLE_SCHEMA_VERSION,
@@ -1778,6 +2037,144 @@ fn ensure_unique_pack_identities(packs: &[ReleasePack]) -> Result<(), BundleErro
     Ok(())
 }
 
+fn ensure_unique_generated_productions(
+    productions: &[ReleaseGeneratedProduction],
+) -> Result<(), BundleError> {
+    let mut identities = BTreeSet::new();
+    for production in productions {
+        if !identities.insert(&production.production_digest) {
+            return Err(BundleError::new(format!(
+                "duplicate generated production {}",
+                production.production_digest
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn verify_generated_production(
+    output_root: &Path,
+    index: &ReleaseBundleIndex,
+    generated: &ReleaseGeneratedProduction,
+) -> Result<(), BundleError> {
+    validate_sha256("generated artifact", &generated.artifact_sha256)?;
+    validate_sha256("generated input digest", &generated.input_digest)?;
+    validate_sha256("generated production digest", &generated.production_digest)?;
+    if generated.producer_name.is_empty()
+        || generated.producer_version.is_empty()
+        || generated.schema_version == 0
+        || generated.cache_version == 0
+    {
+        return Err(BundleError::new(
+            "generated production identity metadata must be non-empty",
+        ));
+    }
+    if generated.schema_version != SEMANTIC_MODEL_SCHEMA_VERSION {
+        return Err(BundleError::new(format!(
+            "unsupported generated production semantic schema {}",
+            generated.schema_version
+        )));
+    }
+    if generated.cache_version != GENERATED_PRODUCTION_CACHE_VERSION {
+        return Err(BundleError::new(format!(
+            "generated production cache version {} is not current {}",
+            generated.cache_version, GENERATED_PRODUCTION_CACHE_VERSION
+        )));
+    }
+    let key = GeneratedProductionKey::new(
+        generated.input_digest.clone(),
+        generated.producer_name.clone(),
+        generated.producer_version.clone(),
+        generated.schema_version,
+    )
+    .map_err(|error| BundleError::new(format!("invalid generated production key: {error}")))?;
+    if key.production_digest() != generated.production_digest {
+        return Err(BundleError::new(
+            "generated production digest does not match its key fields",
+        ));
+    }
+    let source = index
+        .packs
+        .iter()
+        .find(|pack| {
+            pack.pack_id == generated.source_pack_id
+                && pack.pack_version == generated.source_pack_version
+        })
+        .ok_or_else(|| {
+            BundleError::new(format!(
+                "generated production references missing curated pack {}@{}",
+                generated.source_pack_id, generated.source_pack_version
+            ))
+        })?;
+    if source.language != "java"
+        || source.ecosystem != "jdk"
+        || source.artifact.sha256 != generated.artifact_sha256
+    {
+        return Err(BundleError::new(
+            "generated production does not bind the curated JDK artifact",
+        ));
+    }
+    let compiled = read_compiled_pack(
+        output_root,
+        &generated.pack_id,
+        &generated.manifest,
+        &generated.shards,
+    )?;
+    if compiled.manifest.pack_id != generated.pack_id
+        || compiled.manifest.version != generated.pack_version
+        || compiled.manifest.language != generated.language
+        || compiled.manifest.ecosystem != generated.ecosystem
+        || compiled.manifest.semantic_sha256 != generated.manifest_semantic_sha256
+        || compiled.manifest.content_sha256 != generated.manifest_content_sha256
+        || compiled.manifest.completeness != generated.completeness
+        || compiled.manifest.producer.name != generated.producer_name
+        || compiled.manifest.producer.version != generated.producer_version
+        || compiled.manifest.schema_version != generated.schema_version
+    {
+        return Err(BundleError::new(
+            "generated production index metadata does not match its manifest",
+        ));
+    }
+    let extraction = generated_extraction_accounting(generated);
+    if !pack_rejects_are_warning_only(&extraction) {
+        return Err(BundleError::new(
+            "generated production has error-grade extraction rejects",
+        ));
+    }
+    // A generated production is never curated by hand, so a partial one must
+    // clear the same activation bar `warning_only_and_fully_accounted` gives
+    // installed packs at runtime (catalog/mod.rs `pack_is_activation_ready`):
+    // every reject accounted for by a named gap, nothing suppressed.
+    // Otherwise the bundle ships a production that can never activate,
+    // silently -- the way #2756 shipped 3,535 suppressed JDK rejects behind
+    // an empty diagnostics list. This hard gate applies only to generated
+    // productions; a curated pack can still ship with named-but-unaccounted
+    // rejects (tracked separately) because a human reviewed it.
+    if generated.completeness == Completeness::Partial
+        && !extraction.warning_only_and_fully_accounted()
+    {
+        return Err(BundleError::new(format!(
+            "generated production {}@{} is not activation-ready: partial completeness requires \
+             warning-only fully-accounted extraction (reject_count={}, suppressed_reject_count={}, \
+             named_gaps={})",
+            generated.pack_id,
+            generated.pack_version,
+            extraction.reject_count,
+            extraction.suppressed_reject_count,
+            extraction.gaps.len()
+        )));
+    }
+    if extraction.reject_count != generated.rejects.len().try_into().unwrap_or(u64::MAX)
+        || extraction.suppressed_reject_count != generated.suppressed_rejects
+    {
+        return Err(BundleError::new(
+            "generated production extraction accounting is inconsistent",
+        ));
+    }
+    let _ = key;
+    Ok(())
+}
+
 /// Read and cross-check the structured extraction burn-down report.
 ///
 /// The report is a mandatory release asset: a bundle without it, or with
@@ -1826,18 +2223,29 @@ fn verify_rejects(
 }
 
 fn release_extraction_accounting(rejects: &ReleasePackRejects) -> PackExtractionAccounting {
+    extraction_accounting(&rejects.rejects, rejects.suppressed_rejects)
+}
+
+fn generated_extraction_accounting(
+    generated: &ReleaseGeneratedProduction,
+) -> PackExtractionAccounting {
+    extraction_accounting(&generated.rejects, generated.suppressed_rejects)
+}
+
+fn extraction_accounting(
+    rejects: &[ReleaseReject],
+    suppressed_rejects: u64,
+) -> PackExtractionAccounting {
     PackExtractionAccounting {
-        reject_count: rejects.rejects.len().try_into().unwrap_or(u64::MAX),
-        suppressed_reject_count: rejects.suppressed_rejects,
+        reject_count: rejects.len().try_into().unwrap_or(u64::MAX),
+        suppressed_reject_count: suppressed_rejects,
         error_reject_count: rejects
-            .rejects
             .iter()
             .filter(|reject| reject.severity == ReleaseRejectSeverity::Error)
             .count()
             .try_into()
             .unwrap_or(u64::MAX),
         gaps: rejects
-            .rejects
             .iter()
             .filter_map(|reject| {
                 reject
@@ -1862,39 +2270,14 @@ pub fn install_release_bundle(
     catalog: &SemanticPackCatalog,
 ) -> Result<Vec<ReleasePackInstallation>, BundleError> {
     let bundle = verify_release_bundle(bundle_root)?;
-    let limits = DecodeLimits::default();
-    bundle
+    let mut installed = bundle
         .index
         .packs
         .iter()
         .zip(&bundle.rejects.packs)
         .map(|(pack, rejects)| {
-            let manifest_bytes = verify_asset(bundle_root, &pack.manifest)?;
-            let manifest = decode_manifest(&manifest_bytes, &limits).map_err(|error| {
-                BundleError::new(format!("decode manifest for {}: {error}", pack.pack_id))
-            })?;
-            let shards =
-                manifest
-                    .shards
-                    .iter()
-                    .map(|descriptor| {
-                        let indexed = pack
-                            .shards
-                            .iter()
-                            .find(|shard| shard.shard_id == descriptor.shard_id)
-                            .expect("verified bundle indexes every manifest shard");
-                        let bytes = verify_asset(bundle_root, &indexed.asset)?;
-                        Ok(brokk_bifrost_analysis::analyzer::semantic_model::CompiledShardArtifact {
-                        descriptor: descriptor.clone(),
-                        bytes,
-                    })
-                    })
-                    .collect::<Result<Vec<_>, BundleError>>()?;
-            let compiled = CompiledSemanticModelPack {
-                manifest,
-                manifest_bytes,
-                shards,
-            };
+            let compiled =
+                read_compiled_pack(bundle_root, &pack.pack_id, &pack.manifest, &pack.shards)?;
             let extraction = release_extraction_accounting(rejects);
             let installed = catalog
                 .install_release(
@@ -1920,7 +2303,111 @@ pub fn install_release_bundle(
                 manifest_digest: installed.manifest_digest,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, BundleError>>()?;
+    for generated in &bundle.index.generated_productions {
+        let key = GeneratedProductionKey::new(
+            generated.input_digest.clone(),
+            generated.producer_name.clone(),
+            generated.producer_version.clone(),
+            generated.schema_version,
+        )
+        .map_err(|error| BundleError::new(format!("invalid generated production key: {error}")))?;
+        let compiled = read_compiled_pack(
+            bundle_root,
+            &generated.pack_id,
+            &generated.manifest,
+            &generated.shards,
+        )?;
+        let source = DurablePackSource {
+            kind: DurablePackSourceKind::PreShipped,
+            source_id: format!(
+                "release-generated:{}@{}:{}",
+                generated.source_pack_id,
+                generated.source_pack_version,
+                generated.production_digest
+            ),
+        };
+        let installation = catalog
+            .install_release_generated(
+                &key,
+                &compiled,
+                &source,
+                &generated_extraction_accounting(generated),
+            )
+            .map_err(|error| {
+                BundleError::new(format!(
+                    "install generated {}@{}: {error}",
+                    generated.pack_id, generated.pack_version
+                ))
+            })?;
+        installed.push(ReleasePackInstallation {
+            pack_id: generated.pack_id.clone(),
+            pack_version: generated.pack_version.clone(),
+            manifest_digest: installation.install.manifest_digest,
+        });
+    }
+    Ok(installed)
+}
+
+fn read_compiled_pack(
+    bundle_root: &Path,
+    pack_id: &str,
+    manifest_asset: &ReleaseAsset,
+    indexed_shards: &[ReleaseShard],
+) -> Result<CompiledSemanticModelPack, BundleError> {
+    let manifest_bytes = verify_asset(bundle_root, manifest_asset)?;
+    let limits = DecodeLimits::default();
+    let manifest = decode_manifest(&manifest_bytes, &limits)
+        .map_err(|error| BundleError::new(format!("decode manifest for {pack_id}: {error}")))?;
+    if indexed_shards.len() != manifest.shards.len() {
+        return Err(BundleError::new(format!(
+            "indexed shard count does not match manifest for {pack_id}"
+        )));
+    }
+    let mut indexed_ids = BTreeSet::new();
+    let shards = manifest
+        .shards
+        .iter()
+        .map(|descriptor| {
+            let indexed = indexed_shards
+                .iter()
+                .find(|shard| shard.shard_id == descriptor.shard_id)
+                .ok_or_else(|| {
+                    BundleError::new(format!("missing indexed shard {}", descriptor.shard_id))
+                })?;
+            if !indexed_ids.insert(indexed.shard_id.as_str()) {
+                return Err(BundleError::new(format!(
+                    "duplicate indexed shard {} for {pack_id}",
+                    indexed.shard_id
+                )));
+            }
+            if indexed.encoding != descriptor.encoding
+                || indexed.raw_bytes != descriptor.raw_size
+                || indexed.records != descriptor.record_count
+                || indexed.semantic_sha256 != descriptor.semantic_sha256
+                || indexed.content_sha256 != descriptor.content_sha256
+                || indexed.asset.sha256 != descriptor.stored_sha256
+                || indexed.asset.bytes != descriptor.stored_size
+            {
+                return Err(BundleError::new(format!(
+                    "indexed shard metadata does not match {} for {pack_id}",
+                    descriptor.shard_id
+                )));
+            }
+            let bytes = verify_asset(bundle_root, &indexed.asset)?;
+            Ok(
+                brokk_bifrost_analysis::analyzer::semantic_model::CompiledShardArtifact {
+                    descriptor: descriptor.clone(),
+                    bytes,
+                },
+            )
+        })
+        .collect::<Result<Vec<_>, BundleError>>()?;
+    Ok(CompiledSemanticModelPack {
+        manifest,
+        manifest_bytes,
+        shards,
+    })
 }
 
 fn verify_checksums(output_root: &Path, index: &ReleaseBundleIndex) -> Result<(), BundleError> {
@@ -2184,6 +2671,15 @@ fn release_asset_paths(index: &ReleaseBundleIndex) -> Vec<String> {
         paths.extend(pack.shards.iter().map(|shard| shard.asset.path.clone()));
         paths.extend(pack.notices.iter().map(|notice| notice.asset.path.clone()));
     }
+    for generated in &index.generated_productions {
+        paths.push(generated.manifest.path.clone());
+        paths.extend(
+            generated
+                .shards
+                .iter()
+                .map(|shard| shard.asset.path.clone()),
+        );
+    }
     paths.sort_unstable();
     paths.dedup();
     paths
@@ -2407,7 +2903,286 @@ mod tests {
                 );
             }
         }
+        for generated in &first_bundle.index.generated_productions {
+            assert_eq!(
+                fs::read(first.join(&generated.manifest.path)).unwrap(),
+                fs::read(second.join(&generated.manifest.path)).unwrap()
+            );
+            for shard in &generated.shards {
+                assert_eq!(
+                    fs::read(first.join(&shard.asset.path)).unwrap(),
+                    fs::read(second.join(&shard.asset.path)).unwrap()
+                );
+            }
+        }
         assert_eq!(&verify_release_bundle(first).unwrap(), first_bundle);
+    }
+
+    #[test]
+    fn jdk_generated_production_is_deterministic_verifiable_and_installable() {
+        let fixture = tempdir().unwrap();
+        let artifact = fixture.path().join("src.zip");
+        write_zip(
+            &artifact,
+            &[
+                (
+                    "java.base/module-info.java",
+                    "module java.base { exports java.lang; }",
+                ),
+                (
+                    "java.base/java/lang/Object.java",
+                    "package java.lang; public class Object { public int hashCode() { return 0; } }",
+                ),
+            ],
+        );
+        fs::write(fixture.path().join("NOTICE.txt"), "fixture notice\n").unwrap();
+        let (artifact_sha256, _) = sha256_file(&artifact).unwrap();
+        let artifact_path = artifact.clone();
+        let version = "21.0.8";
+        let activation = ActivationSelector {
+            package: None,
+            module: None,
+            toolchain: Some(NameSelector {
+                name: "jdk".to_owned(),
+                version: Some(format!("={version}")),
+            }),
+            targets: vec!["jvm".to_owned()],
+            configurations: Vec::new(),
+            artifact_sha256: None,
+        };
+        let spec = fixture.path().join("temurin-jdk.json");
+        let pinned = PinnedPackSpec {
+            schema_version: PACK_SPEC_SCHEMA_VERSION,
+            pack_id: "bifrost.jdk".to_owned(),
+            pack_version: version.to_owned(),
+            ecosystem: "jdk".to_owned(),
+            kind: PinnedPackKind::JdkSourceZip {
+                layout: PinnedJdkSourceLayout::ModulePrefixed,
+            },
+            artifact: PinnedArtifact {
+                file_name: "src.zip".to_owned(),
+                sha256: artifact_sha256.clone(),
+                url: Some("https://example.invalid/src.zip".to_owned()),
+                container: None,
+            },
+            compatibility: Compatibility {
+                bifrost: ">=0.8.18, <1.0.0".to_owned(),
+                toolchains: vec![VersionConstraint {
+                    name: "jdk".to_owned(),
+                    requirement: format!("={version}"),
+                }],
+            },
+            activation: vec![activation.clone()],
+            provenance: Provenance {
+                source: "fixture".to_owned(),
+                revision: Some("fixture-v1".to_owned()),
+            },
+            license: "GPL-2.0-only WITH Classpath-exception-2.0".to_owned(),
+            safety: Safety {
+                generated_code_only: false,
+                review_required: false,
+            },
+            notices: vec!["NOTICE.txt".to_owned()],
+            measurement_activation: ActivationSelector {
+                module: Some(NameSelector {
+                    name: "java.base".to_owned(),
+                    version: None,
+                }),
+                ..activation
+            },
+            measurement_queries: vec![PinnedLookupQuery::Type {
+                name: "java.lang.Object".to_owned(),
+            }],
+        };
+        fs::write(&spec, serde_json::to_vec_pretty(&pinned).unwrap()).unwrap();
+        let input = BundleInput {
+            spec_path: spec,
+            artifact_path: artifact,
+        };
+        let first = fixture.path().join("first");
+        let second = fixture.path().join("second");
+        let first_bundle = generate_release_bundle(&first, std::slice::from_ref(&input)).unwrap();
+        let second_bundle = generate_release_bundle(&second, &[input]).unwrap();
+        assert_deterministic_and_installable(&first, &second, &first_bundle, &second_bundle);
+
+        let generated = first_bundle
+            .index
+            .generated_productions
+            .first()
+            .expect("pinned JDK must have one generated production");
+        assert_eq!(generated.source_pack_id, "bifrost.jdk");
+        assert_eq!(generated.source_pack_version, version);
+        // #2756 regression: the derivation's diagnostics caps must be sized
+        // to the durable release boundary (`MAX_SOURCE_SET_FILES`), not the
+        // interactive-safety default of 256, or a JDK source set with more
+        // rejects than that would ship with suppressed rejects and fewer
+        // named gaps than the reject count -- exactly the shape
+        // `warning_only_and_fully_accounted` exists to catch.
+        let generated_accounting = generated_extraction_accounting(generated);
+        assert_eq!(generated_accounting.suppressed_reject_count, 0);
+        assert_eq!(
+            generated_accounting.gaps.len() as u64,
+            generated_accounting.reject_count
+        );
+        let key = GeneratedProductionKey::new(
+            generated.input_digest.clone(),
+            generated.producer_name.clone(),
+            generated.producer_version.clone(),
+            generated.schema_version,
+        )
+        .unwrap();
+        assert_eq!(key.production_digest(), generated.production_digest);
+
+        // The release path and the runtime JDK path must use the same
+        // dependency identity and exact compiler seam, or a release asset
+        // would never satisfy a local generated lookup.
+        let runtime_dependency = JvmDependencyPackAdapter::jdk_source_dependency(
+            Version::parse(version).unwrap(),
+            artifact_path.clone(),
+        );
+        let runtime_artifact =
+            read_exact_artifact(&artifact_path, &ArtifactProducerLimits::default()).unwrap();
+        let runtime_production = compile_exact_dependency_production(
+            &JvmDependencyPackAdapter,
+            &runtime_dependency,
+            &[ExactDependencyArtifact::from_exact(
+                DependencyArtifactRole::Sources,
+                ExternalArtifactKind::JdkSourceZip,
+                None,
+                runtime_artifact,
+            )],
+            &DependencyPackLimits::default(),
+            Some(&CancellationToken::default()),
+        )
+        .unwrap();
+        assert_eq!(
+            runtime_production.key.production_digest(),
+            generated.production_digest
+        );
+
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default()).unwrap();
+        let installed = install_release_bundle(&first, &catalog).unwrap();
+        assert_eq!(
+            installed.len(),
+            2,
+            "curated and generated JDK packs install"
+        );
+        assert!(catalog.generated_production(&key).unwrap().is_some());
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(first.join(&generated.manifest.path))
+            .unwrap()
+            .write_all(b"tampered")
+            .unwrap();
+        assert!(verify_release_bundle(&first).is_err());
+    }
+
+    #[test]
+    fn generated_jdk_production_with_an_unnamed_reject_fails_the_activability_gate() {
+        // A warning that the JDK source producer cannot attach a declaration
+        // to (an archive entry that is skipped for being oversized, not for
+        // naming a specific type) is a real, non-error reject with no gap.
+        // That is exactly the shape #2756 shipped silently: completeness is
+        // Partial, nothing is an error-grade reject, but the accounting is
+        // not fully named. This must fail the bundle build, not just log a
+        // reject count. 8 MiB + 1 matches the JVM producer's fixed
+        // per-source-file bound (`MAX_SOURCE_ENTRY_BYTES` in
+        // crates/bifrost-analysis/src/analyzer/jvm/java_artifact.rs).
+        let fixture = tempdir().unwrap();
+        let artifact = fixture.path().join("src.zip");
+        let oversized_source = " ".repeat(8 * 1024 * 1024 + 1);
+        write_zip(
+            &artifact,
+            &[
+                (
+                    "java.base/module-info.java",
+                    "module java.base { exports java.lang; }",
+                ),
+                (
+                    "java.base/java/lang/Object.java",
+                    "package java.lang; public class Object { public int hashCode() { return 0; } }",
+                ),
+                ("java.base/java/lang/Oversized.java", &oversized_source),
+            ],
+        );
+        fs::write(fixture.path().join("NOTICE.txt"), "fixture notice\n").unwrap();
+        let (artifact_sha256, _) = sha256_file(&artifact).unwrap();
+        let version = "21.0.9";
+        let activation = ActivationSelector {
+            package: None,
+            module: None,
+            toolchain: Some(NameSelector {
+                name: "jdk".to_owned(),
+                version: Some(format!("={version}")),
+            }),
+            targets: vec!["jvm".to_owned()],
+            configurations: Vec::new(),
+            artifact_sha256: None,
+        };
+        let spec = fixture.path().join("temurin-jdk.json");
+        let pinned = PinnedPackSpec {
+            schema_version: PACK_SPEC_SCHEMA_VERSION,
+            pack_id: "bifrost.jdk".to_owned(),
+            pack_version: version.to_owned(),
+            ecosystem: "jdk".to_owned(),
+            kind: PinnedPackKind::JdkSourceZip {
+                layout: PinnedJdkSourceLayout::ModulePrefixed,
+            },
+            artifact: PinnedArtifact {
+                file_name: "src.zip".to_owned(),
+                sha256: artifact_sha256.clone(),
+                url: Some("https://example.invalid/src.zip".to_owned()),
+                container: None,
+            },
+            compatibility: Compatibility {
+                bifrost: ">=0.8.18, <1.0.0".to_owned(),
+                toolchains: vec![VersionConstraint {
+                    name: "jdk".to_owned(),
+                    requirement: format!("={version}"),
+                }],
+            },
+            activation: vec![activation.clone()],
+            provenance: Provenance {
+                source: "fixture".to_owned(),
+                revision: Some("fixture-v1".to_owned()),
+            },
+            license: "GPL-2.0-only WITH Classpath-exception-2.0".to_owned(),
+            safety: Safety {
+                generated_code_only: false,
+                review_required: false,
+            },
+            notices: vec!["NOTICE.txt".to_owned()],
+            measurement_activation: ActivationSelector {
+                module: Some(NameSelector {
+                    name: "java.base".to_owned(),
+                    version: None,
+                }),
+                ..activation
+            },
+            measurement_queries: vec![PinnedLookupQuery::Type {
+                name: "java.lang.Object".to_owned(),
+            }],
+        };
+        fs::write(&spec, serde_json::to_vec_pretty(&pinned).unwrap()).unwrap();
+        let input = BundleInput {
+            spec_path: spec,
+            artifact_path: artifact,
+        };
+        let output = fixture.path().join("bundle");
+        let error = generate_release_bundle(&output, std::slice::from_ref(&input))
+            .expect_err("a generated production with an unnamed reject must fail the bundle gate");
+        let message = error.to_string();
+        assert!(
+            message.contains("not activation-ready") && message.contains("bifrost.external.java"),
+            "{message}"
+        );
+        assert!(
+            message.contains("reject_count=1")
+                && message.contains("suppressed_reject_count=0")
+                && message.contains("named_gaps=0"),
+            "{message}"
+        );
     }
 
     #[test]

@@ -98,6 +98,20 @@ impl JsTsImportBinder {
         self.direct_bindings_for(local_name).nth(1).is_some()
     }
 
+    /// Whether more than one static import claims the same local binding,
+    /// including namespace imports. Consumers deriving one external owner must
+    /// reject this broader ambiguity; direct-definition resolution keeps using
+    /// [`Self::has_competing_direct_imports`] for its narrower candidate set.
+    pub fn has_competing_static_imports(&self, local_name: &str) -> bool {
+        self.bindings
+            .get(local_name)
+            .into_iter()
+            .flat_map(|bindings| bindings.iter())
+            .filter(|binding| binding.is_static)
+            .nth(1)
+            .is_some()
+    }
+
     pub fn was_truncated(&self, local_name: &str) -> bool {
         self.truncated_names.contains(local_name)
     }
@@ -294,6 +308,22 @@ impl JsTsLexicalBindingIndex {
                 assignments
                     .iter()
                     .any(|byte| self.is_program_binding_at(name, *byte, root))
+            })
+    }
+
+    /// Whether an assignment or update rebinds the active lexical binding of
+    /// `name` at `byte`. A same-spelled assignment in a nested shadowing scope
+    /// does not mutate this binding.
+    pub fn is_binding_reassigned_at(&self, name: &str, byte: usize) -> bool {
+        let Some(scope) = self.binding_scope_at(name, byte) else {
+            return false;
+        };
+        self.assignments_by_name
+            .get(name)
+            .is_some_and(|assignments| {
+                assignments
+                    .iter()
+                    .any(|assignment| self.binding_scope_at(name, *assignment) == Some(scope))
             })
     }
 
@@ -993,6 +1023,35 @@ pub fn is_export_alias_identifier(node: Node<'_>) -> bool {
     })
 }
 
+/// The identifier a JS/TS declaration names, for the shape the generic field
+/// and named-children lookups cannot reach: an `export default ...` statement,
+/// whose name is the `default` keyword itself.
+///
+/// Both tree-sitter-javascript and tree-sitter-typescript spell that keyword as
+/// an ANONYMOUS child of the `export_statement`, so a named-children walk never
+/// visits it. Without this reader an anonymous default export (`export default
+/// class extends HTMLElement {}`, `export default function () {}`, `export
+/// default { ... }`) has no reachable name token, and name selection answers
+/// with the first NAMED node spelled `default` in the body -- a destructuring
+/// key (`const { default: Chart } = ...`), an object key (`{ default: true }`),
+/// or a member (`options.default`) -- instead of the declaration keyword
+/// (#2733).
+///
+/// The caller accepts this answer only when the node is spelled like the
+/// identifier it seeks, so a named default export (`export default function
+/// foo()`) falls through to the declaration's own `name` field, and a non-
+/// default export statement (which has no `default` keyword child) falls
+/// through here.
+pub fn js_ts_declaration_name(declaration: Node<'_>) -> Option<Node<'_>> {
+    if declaration.kind() != "export_statement" {
+        return None;
+    }
+    let mut cursor = declaration.walk();
+    declaration
+        .children(&mut cursor)
+        .find(|child| !child.is_named() && child.kind() == "default")
+}
+
 pub fn is_explicit_object_literal_key(node: Node<'_>) -> bool {
     node.parent()
         .is_some_and(|parent| parent.kind() == "pair" && is_object_property_key(node))
@@ -1553,6 +1612,29 @@ function property_write(box) {
         assert!(index.is_program_binding_reassigned("target", tree.root_node()));
         assert!(!index.is_program_binding_reassigned("untouched", tree.root_node()));
         assert!(!index.is_program_binding_reassigned("missing", tree.root_node()));
+    }
+
+    #[test]
+    fn lexical_binding_reassignment_distinguishes_same_spelled_scopes() {
+        let source = r#"
+function outer() {
+  const stable = () => 1;
+  {
+    let stable = () => 2;
+    stable = () => 3;
+    stable();
+  }
+  stable();
+}
+"#;
+        let tree = parse_javascript(source);
+        let index = JsTsLexicalBindingIndex::build(tree.root_node(), source);
+        let inner_use = source.find("stable();").expect("inner stable use");
+        let outer_use = source.rfind("stable();").expect("outer stable use");
+
+        assert!(index.is_binding_reassigned_at("stable", inner_use));
+        assert!(!index.is_binding_reassigned_at("stable", outer_use));
+        assert!(!index.is_binding_reassigned_at("missing", outer_use));
     }
 
     #[test]

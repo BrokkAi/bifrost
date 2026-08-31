@@ -987,6 +987,9 @@ pub(crate) fn endpoint_binding_to_typestate(
         PolicyEndpointBinding::MatchedValue => ResolvedTypestateBinding::MatchedValue,
         PolicyEndpointBinding::Receiver => ResolvedTypestateBinding::Receiver,
         PolicyEndpointBinding::ReturnValue => ResolvedTypestateBinding::ReturnValue,
+        PolicyEndpointBinding::ResultIndex { index } => {
+            ResolvedTypestateBinding::ResultIndex { index: *index }
+        }
         PolicyEndpointBinding::ArgumentIndex { index } => {
             ResolvedTypestateBinding::ArgumentIndex { index: *index }
         }
@@ -1001,6 +1004,7 @@ pub(crate) fn policy_port_to_endpoint_binding(port: &PolicyPort) -> PolicyEndpoi
         PolicyPort::MatchedValue => PolicyEndpointBinding::MatchedValue,
         PolicyPort::Receiver => PolicyEndpointBinding::Receiver,
         PolicyPort::ReturnValue => PolicyEndpointBinding::ReturnValue,
+        PolicyPort::ResultIndex { index } => PolicyEndpointBinding::ResultIndex { index: *index },
         PolicyPort::ArgumentIndex { index } => {
             PolicyEndpointBinding::ArgumentIndex { index: *index }
         }

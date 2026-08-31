@@ -1,0 +1,213 @@
+{
+  "schema_version": 1,
+  "pack_id": "bifrost.go.stdlib.net-url-declarations",
+  "version": "1.0.0",
+  "producer": {
+    "name": "bifrost",
+    "version": "0.10.6"
+  },
+  "language": "go",
+  "ecosystem": "go",
+  "compatibility": {
+    "bifrost": ">=0.10.6, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "https://pkg.go.dev/net/url",
+    "revision": "go1.26.0"
+  },
+  "license": "BSD-3-Clause",
+  "completeness": "partial",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "go.stdlib.net-url.declarations",
+      "activation": [
+        {}
+      ],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "type.fc874add959af775d1acffd769d3d2f5c178871a3b879d242866a93939ccf239",
+            "name": "net/url",
+            "type_kind": "module",
+            "visibility": "package",
+            "is_abstract": false,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [],
+            "aliases": [
+              "url"
+            ],
+            "extension_surfaces": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "net/url/url.go",
+              "symbol": "net/url"
+            }
+          },
+          {
+            "id": "type.31c7d6279e1cefbeca357900ee0a678b96eaf9a31baa5b9b9854484c43afec01",
+            "name": "net/url.URL",
+            "type_kind": "struct",
+            "visibility": "public",
+            "is_abstract": false,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [],
+            "aliases": [],
+            "extension_surfaces": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "net/url/url.go",
+              "symbol": "net/url.URL"
+            }
+          }
+        ],
+        "members": [
+          {
+            "id": "member.b9caddfc676425fb6b5343019b135ab3e75b837e7fdbeaf5b4b160a7bc293503",
+            "owner": "type.31c7d6279e1cefbeca357900ee0a678b96eaf9a31baa5b9b9854484c43afec01",
+            "name": "Scheme",
+            "member_kind": "field",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "string",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "net/url/url.go",
+              "symbol": "net/url.URL.Scheme"
+            }
+          },
+          {
+            "id": "member.738a2ba499048caf49163dd3c5d906451e778ce303090658034f2d2a9f4c220e",
+            "owner": "type.fc874add959af775d1acffd769d3d2f5c178871a3b879d242866a93939ccf239",
+            "name": "Parse",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "rawURL",
+                  "type": {
+                    "kind": "named",
+                    "name": "string",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ],
+              "returns": {
+                "kind": "tuple",
+                "elements": [
+                  {
+                    "kind": "pointer",
+                    "element": {
+                      "kind": "declared",
+                      "id": "type.31c7d6279e1cefbeca357900ee0a678b96eaf9a31baa5b9b9854484c43afec01",
+                      "arguments": [],
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "kind": "named",
+                    "name": "error",
+                    "arguments": [],
+                    "nullable": false
+                  }
+                ]
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "net/url/url.go",
+              "symbol": "net/url.Parse"
+            }
+          },
+          {
+            "id": "member.266c10370b2ea236b0d9bd7f59e1c35eff502f77d9fd9e1cf3c3103f525c6d58",
+            "owner": "type.fc874add959af775d1acffd769d3d2f5c178871a3b879d242866a93939ccf239",
+            "name": "ParseRequestURI",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "rawURL",
+                  "type": {
+                    "kind": "named",
+                    "name": "string",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ],
+              "returns": {
+                "kind": "tuple",
+                "elements": [
+                  {
+                    "kind": "pointer",
+                    "element": {
+                      "kind": "declared",
+                      "id": "type.31c7d6279e1cefbeca357900ee0a678b96eaf9a31baa5b9b9854484c43afec01",
+                      "arguments": [],
+                      "nullable": false
+                    }
+                  },
+                  {
+                    "kind": "named",
+                    "name": "error",
+                    "arguments": [],
+                    "nullable": false
+                  }
+                ]
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "net/url/url.go",
+              "symbol": "net/url.ParseRequestURI"
+            }
+          }
+        ],
+        "relations": []
+      }
+    }
+  ]
+}

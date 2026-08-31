@@ -9,6 +9,7 @@ use crate::analyzer::jvm::jdk_artifact::{
 use crate::analyzer::jvm::jmod_artifact::JdkJmodSetPackProducer;
 use crate::analyzer::jvm::kotlin_artifact::KotlinSourceJarPackProducer;
 use crate::analyzer::jvm::scala_artifact::ScalaSourceJarPackProducer;
+use crate::analyzer::semantic::{LengthDelimitedDigest, StableDigest};
 use crate::analyzer::semantic_model::{
     ActivationSelector, ArtifactProducerLimits, ArtifactProduction, ArtifactProductionRequest,
     AuthoredPayload, AuthoredSemanticModelPack, CatalogCoordinate, Compatibility, Completeness,
@@ -37,7 +38,7 @@ use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tree_sitter::Parser;
 use zip::ZipArchive;
 
@@ -76,6 +77,7 @@ const MAX_ARTIFACT_MEMBERS: usize = 32_768;
 /// and may disagree, so a cycle is possible; the visited set already stops one,
 /// and this bounds the work of a wide but acyclic hierarchy as well.
 const MAX_MEMBER_SURFACE_OWNERS: usize = 64;
+const JVM_EXTERNAL_DISPATCH_BEHAVIOR_DOMAIN: &[u8] = b"bifrost-jvm-external-dispatch-behavior/v1";
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct JvmExternalDeclarationIndex {
@@ -89,6 +91,9 @@ pub(crate) struct JvmExternalDeclarationIndex {
     /// [`JvmIndexedOwnerSurface`].
     members_by_owner: HashMap<String, JvmIndexedOwnerSurface>,
     production_diagnostics: Vec<ProducerDiagnostic>,
+    /// Stable, path-independent identity of the effective declaration surface
+    /// this index exposes to type, member, and hierarchy resolution.
+    dispatch_behavior_identity: OnceLock<StableDigest>,
 }
 
 /// The member surface one indexed artifact type carries (#1900).
@@ -306,6 +311,15 @@ enum JvmDependencyOrigin {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct JvmDependencyPackAdapter;
+
+impl JvmDependencyPackAdapter {
+    /// Build the exact JDK source dependency used by the runtime resolver.
+    /// Release tooling uses this constructor so its production key includes
+    /// the same evidence and provenance as a locally discovered JDK.
+    pub fn jdk_source_dependency(version: Version, source_archive: PathBuf) -> ResolvedDependency {
+        resolved_jdk_dependency(version, Some(source_archive))
+    }
+}
 
 pub fn resolve_jvm_semantic_pack_dependencies(
     config: &JvmAnalyzerConfig,
@@ -1366,6 +1380,97 @@ impl JvmExternalDeclarationIndex {
     /// count is all a boundary classification needs.
     pub(crate) fn production_diagnostic_count(&self) -> usize {
         self.production_diagnostics.len()
+    }
+
+    /// Stable identity of every retained fact that can change external JVM
+    /// dispatch behavior.
+    ///
+    /// Artifact paths and archive entry names are intentionally absent. Once
+    /// an artifact has produced this surface, moving identical bytes does not
+    /// change any resolver answer and should continue to reuse cached flow
+    /// results. A single incomplete marker captures the only diagnostic state
+    /// the resolution boundary observes: whether any producer diagnostic made
+    /// a negative lookup uncertain.
+    pub(crate) fn dispatch_behavior_identity(&self) -> StableDigest {
+        *self.dispatch_behavior_identity.get_or_init(|| {
+            let mut digest = LengthDelimitedDigest::new(JVM_EXTERNAL_DISPATCH_BEHAVIOR_DOMAIN);
+            digest.push(if self.production_diagnostics.is_empty() {
+                b"complete"
+            } else {
+                b"incomplete"
+            });
+
+            let mut types = self.types_by_fqn.iter().collect::<Vec<_>>();
+            types.sort_unstable_by_key(|(fqn, _)| *fqn);
+            digest.push(&(types.len() as u64).to_le_bytes());
+            for (lookup_fqn, external_type) in types {
+                digest.push(b"type");
+                digest.push(lookup_fqn.as_bytes());
+                digest.push(external_type.fqn.as_bytes());
+                digest.push(external_type.package_name.as_bytes());
+                digest.push(external_type.short_name.as_bytes());
+                digest.push(match external_type.kind {
+                    JvmExternalTypeKind::Class => b"class",
+                    JvmExternalTypeKind::Interface => b"interface",
+                    JvmExternalTypeKind::Enum => b"enum",
+                    JvmExternalTypeKind::Annotation => b"annotation",
+                    JvmExternalTypeKind::Record => b"record",
+                });
+                digest.push(match external_type.visibility {
+                    JvmVisibility::Public => b"public",
+                    JvmVisibility::Protected => b"protected",
+                    JvmVisibility::PackagePrivate => b"package-private",
+                    JvmVisibility::Private => b"private",
+                });
+            }
+
+            let mut owners = self.members_by_owner.iter().collect::<Vec<_>>();
+            owners.sort_unstable_by_key(|(owner, _)| *owner);
+            digest.push(&(owners.len() as u64).to_le_bytes());
+            for (owner_fqn, surface) in owners {
+                digest.push(b"owner");
+                digest.push(owner_fqn.as_bytes());
+                digest.push(&(surface.supertypes.len() as u64).to_le_bytes());
+                for supertype in &surface.supertypes {
+                    digest.push(b"supertype");
+                    digest.push(supertype.as_bytes());
+                }
+
+                let mut members = surface.members.iter().collect::<Vec<_>>();
+                members.sort_unstable_by_key(|(name, _)| *name);
+                digest.push(&(members.len() as u64).to_le_bytes());
+                for (lookup_name, member) in members {
+                    digest.push(b"member");
+                    digest.push(lookup_name.as_bytes());
+                    digest.push(member.fqn.as_bytes());
+                    digest.push(member.declaring_package.as_bytes());
+                    digest.push(match member.visibility {
+                        JvmVisibility::Public => b"public",
+                        JvmVisibility::Protected => b"protected",
+                        JvmVisibility::PackagePrivate => b"package-private",
+                        JvmVisibility::Private => b"private",
+                    });
+                    match member.declared_return_type_fqn() {
+                        Some(return_type) => {
+                            digest.push(b"named-return");
+                            digest.push(return_type.as_bytes());
+                        }
+                        None => digest.push(b"no-named-return"),
+                    }
+                    digest.push(if member.is_static {
+                        b"static"
+                    } else {
+                        b"instance"
+                    });
+                    digest.push(if member.is_constant {
+                        b"constant"
+                    } else {
+                        b"not-constant"
+                    });
+                }
+            }
+            digest.finish()
+        })
     }
 
     pub(crate) fn get(&self, fqn: &str) -> Option<&JvmExternalType> {
@@ -4199,8 +4304,22 @@ mod tests {
 
         assert!(!prepared.complete);
         assert_eq!(prepared.profile.artifacts_read, 0);
-        assert_eq!(prepared.diagnostics.len(), 1);
-        assert_eq!(prepared.diagnostics[0].code, "dependency.pack_unavailable");
+        // The dependency is unaccounted (no pack, no installed pack), so
+        // preparation names both the specific reason and the generic
+        // catch-all (#2756).
+        assert_eq!(prepared.diagnostics.len(), 2, "{:#?}", prepared.diagnostics);
+        assert!(
+            prepared
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "dependency.pack_unavailable")
+        );
+        assert!(
+            prepared
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "preparation.unaccounted-dependency")
+        );
     }
 
     #[test]
@@ -4293,8 +4412,22 @@ mod tests {
 
         assert!(!prepared.complete);
         assert_eq!(prepared.profile.artifacts_read, 0);
-        assert_eq!(prepared.diagnostics.len(), 1);
-        assert_eq!(prepared.diagnostics[0].code, "dependency.pack_unavailable");
+        // The dependency is unaccounted (no pack, no installed pack), so
+        // preparation names both the specific reason and the generic
+        // catch-all (#2756).
+        assert_eq!(prepared.diagnostics.len(), 2, "{:#?}", prepared.diagnostics);
+        assert!(
+            prepared
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "dependency.pack_unavailable")
+        );
+        assert!(
+            prepared
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "preparation.unaccounted-dependency")
+        );
     }
 
     #[test]

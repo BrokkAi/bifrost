@@ -40,16 +40,6 @@ export const PLATFORMS = [
     libc: ["glibc"],
   },
   {
-    packageName: "@brokkai/bifrost-linux-x64-musl",
-    target: "x86_64-unknown-linux-musl",
-    extension: ".tar.gz",
-    binary: "bifrost",
-    description: "Native Linux x64 musl bundle for @brokkai/bifrost",
-    os: ["linux"],
-    cpu: ["x64"],
-    libc: ["musl"],
-  },
-  {
     packageName: "@brokkai/bifrost-linux-arm64-gnu",
     target: "aarch64-unknown-linux-gnu",
     extension: ".tar.gz",

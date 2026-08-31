@@ -10,17 +10,22 @@ use crate::analyzer::lexical_definitions::{
 use crate::analyzer::structural::FileFacts;
 use crate::analyzer::structural::resolution::BoundaryStatus;
 use crate::analyzer::usages::call_binding::{OrdinaryFormalSlots, canonical_parameter_name};
+use crate::analyzer::usages::call_shape::call_shapes_in_file;
 use crate::analyzer::usages::get_definition::{
-    CallSiteSyntax, CallSyntaxKind, CallTargetLookupOutcome, DefinitionLookupOutcome,
-    DefinitionLookupRequest, DefinitionLookupStatus, ExactCallReference, ExactCallReferenceGap,
-    IMPORT_BINDINGS_TRUNCATED_DIAGNOSTIC, LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND,
-    PARTIAL_IMPORT_BOUNDARY_DIAGNOSTIC, PARTIAL_IMPORT_UNRESOLVED_DIAGNOSTIC,
-    call_reference_ranges_in_tree, call_reference_requires_point_lookup,
-    call_site_syntax_for_reference, exact_call_reference_for_call, parse_tree_for_language,
+    CallApplicationKind, CallSiteSyntax, CallSyntaxKind, CallTargetLookupOutcome,
+    DefinitionLookupOutcome, DefinitionLookupRequest, DefinitionLookupStatus, ExactCallReference,
+    ExactCallReferenceGap, ExactExternalCallProof, IMPORT_BINDINGS_TRUNCATED_DIAGNOSTIC,
+    LOCAL_VARIABLE_REFERENCE_DIAGNOSTIC_KIND, PARTIAL_IMPORT_BOUNDARY_DIAGNOSTIC,
+    PARTIAL_IMPORT_UNRESOLVED_DIAGNOSTIC, call_reference_ranges_in_tree,
+    call_reference_requires_point_lookup, call_site_syntax_for_reference,
+    exact_call_reference_for_call, is_adjudicated_answer_diagnostic_kind, parse_tree_for_language,
     range_is_call_keyword_label, resolve_call_target_batch_with_source,
     resolve_definition_batch_with_source,
 };
-use crate::analyzer::{CodeUnit, IAnalyzer, Language, ProjectFile, Range};
+use crate::analyzer::{
+    AnalyzerQueryScope, CodeUnit, DispatchExtensibility, IAnalyzer, Language, ProjectFile,
+    QueryScope, Range,
+};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
@@ -55,6 +60,7 @@ pub struct CallSite {
 /// call expression; the dispatch service derives the precise callee reference
 /// through tree-sitter before invoking definition resolution.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[allow(dead_code)] // Retained for the aggregate one-call accounting facade below.
 pub(crate) struct ExactCallLocation {
     pub(crate) file: ProjectFile,
     pub(crate) call_span: Range,
@@ -86,7 +92,13 @@ pub(crate) enum CallDispatchBoundaryKind {
     /// workspace boundary, but cannot name an external body. The dotted callee
     /// text is retained when the resolver produced one, so a fully-qualified
     /// unmaterialized external callee can still bind an activated summary (#1978).
-    External(Option<Box<str>>),
+    External {
+        callee_text: Option<Box<str>>,
+        /// Canonical Java owner proven by the definition resolver to be the
+        /// call's type qualifier rather than a runtime receiver. Other
+        /// languages and value receivers leave this absent.
+        normalized_static_owner: Option<Box<str>>,
+    },
     /// The exact resolver status is retained rather than collapsed into an
     /// empty target list.
     Unresolved(DefinitionLookupStatus),
@@ -111,6 +123,20 @@ pub(crate) struct CallDispatchLookup {
     pub(crate) boundary: Option<BoundaryStatus>,
     pub(crate) targets: Vec<CallDispatchTarget>,
     pub(crate) boundaries: Vec<CallDispatchBoundaryKind>,
+    /// The exact resolver proved that a no-definition answer is intentional
+    /// (for example a local binder), rather than failing to reach a target.
+    pub(crate) adjudicated_no_target: bool,
+    /// Receiver-application evidence produced by the same exact language
+    /// resolution that populated the dispatch boundaries.
+    pub(crate) call_application: CallApplicationKind,
+    /// Exact declaration-side dispatch extensibility retained from that same
+    /// resolution pass. Absence is unknown, never implicitly open or closed.
+    pub(crate) dispatch_extensibility: Option<DispatchExtensibility>,
+    /// Resolver-owned external identity and applicable call shape. Consumers
+    /// that mint an external model key must use this proof rather than combine
+    /// the boundary spelling with independently lowered receiver or arity
+    /// facts.
+    pub(crate) exact_external_call: Option<ExactExternalCallProof>,
     pub(crate) truncated: bool,
     pub(crate) cancelled: bool,
     pub(crate) budget_exhausted: bool,
@@ -118,10 +144,32 @@ pub(crate) struct CallDispatchLookup {
     pub(crate) work: CallRelationWork,
 }
 
+enum CallDispatchParse {
+    Uninitialized,
+    Ready(Option<tree_sitter::Tree>),
+}
+
+/// A serial exact-dispatch session for one immutable source snapshot.
+///
+/// Parsing is lazy, so merely opening a file window performs no semantic
+/// work. The first call that is actually requested pays the source scan and
+/// parse; later calls reuse that tree and pay only their own definition
+/// lookup. Definition resolution itself stays one-call-at-a-time so
+/// cancellation and budget outcomes keep request order.
+pub(crate) struct CallDispatchSession {
+    file: ProjectFile,
+    exact_source: Arc<str>,
+    language: Language,
+    parse: CallDispatchParse,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct CallRelationLimits {
     pub max_files: usize,
     pub max_source_bytes: usize,
+    /// Maximum retained dispatch targets for each exact call. In the batched
+    /// exact-call API this remains a per-call arm cap; the caller separately
+    /// bounds the number of submitted call sites.
     pub max_candidates: usize,
 }
 
@@ -198,6 +246,18 @@ pub struct CallRelationResult {
 pub struct CallBindingCache {
     formals: HashMap<CodeUnit, Option<FormalParameterLayout>>,
     python_receiver_is_class: HashMap<(ProjectFile, usize, usize), Option<bool>>,
+    /// One batch-resolved outcome per call site's callee range, keyed by
+    /// file and filled by [`Self::resolved_call_target`]'s one-shot per-file
+    /// prefetch (issue #2765). The per-site resolver path paid a fresh
+    /// `DefinitionBatchContext` -- sources, trees, line starts, per-language
+    /// import/alias contexts -- at every call site even though every site in
+    /// one file shares the same one; batching every callee range of a file
+    /// into one `resolve_call_target_batch_with_source` call derives that
+    /// context once per file instead.
+    call_targets: HashMap<(ProjectFile, Range), CallTargetLookupOutcome>,
+    /// Files whose call-target prefetch already ran. A file with zero call
+    /// sites is recorded too, so a later miss never re-scans it.
+    call_target_prefetched: HashSet<ProjectFile>,
 }
 
 impl CallBindingCache {
@@ -213,6 +273,117 @@ impl CallBindingCache {
             .entry(unit.clone())
             .or_insert_with(|| formal_slots_for_unit(analyzer, unit))
             .clone()
+    }
+
+    /// The production definition resolver's outcome for one call site's
+    /// callee token (issue #2765).
+    ///
+    /// The first request for a file resolves every call shape's callee range
+    /// that file's facts arena reports, in one
+    /// `resolve_call_target_batch_with_source` invocation, and caches each
+    /// outcome by its exact callee range. A later request for the same file
+    /// is served from that prefetch. A callee range the prefetch's call-shape
+    /// enumeration did not cover -- the pipeline's single-snapshot contract
+    /// does not admit this, but nothing here assumes it -- still resolves
+    /// through a single-request fallback; the fallback outcome is returned,
+    /// not cached, because caching it would let this method silently answer
+    /// for a range the prefetch never actually promised to cover.
+    pub fn resolved_call_target(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        callee_range: Range,
+        cancellation: Option<&CancellationToken>,
+    ) -> Option<CallTargetLookupOutcome> {
+        if self.call_target_prefetched.insert(file.clone()) {
+            self.prefetch_call_targets(analyzer, file, cancellation);
+        }
+        if let Some(outcome) = self.call_targets.get(&(file.clone(), callee_range)) {
+            return Some(outcome.clone());
+        }
+        let source = analyzer.indexed_source(file).map(Arc::<str>::from)?;
+        let scope = AnalyzerQueryScope::new(analyzer);
+        resolve_call_target_batch_with_source(
+            analyzer,
+            scope.token(),
+            vec![DefinitionLookupRequest {
+                file: file.clone(),
+                line: None,
+                column: None,
+                start_byte: Some(callee_range.start_byte),
+                end_byte: Some(callee_range.end_byte),
+            }],
+            file.clone(),
+            source,
+            cancellation,
+        )
+        .into_iter()
+        .next()
+    }
+
+    /// Batch-resolve every call site's callee range that `file`'s facts
+    /// arena reports, in source byte-range order, and cache each outcome by
+    /// its exact callee range.
+    fn prefetch_call_targets(
+        &mut self,
+        analyzer: &dyn IAnalyzer,
+        file: &ProjectFile,
+        cancellation: Option<&CancellationToken>,
+    ) {
+        let Some(source) = analyzer.indexed_source(file).map(Arc::<str>::from) else {
+            return;
+        };
+        let Some(facts) = analyzer
+            .structural_fact_providers()
+            .into_iter()
+            .find_map(|provider| provider.structural_facts(file))
+        else {
+            return;
+        };
+        let mut ranges: Vec<Range> = call_shapes_in_file(&facts, file, facts.nodes().len())
+            .into_iter()
+            .filter_map(|shape| shape.outcome.callee_range)
+            .collect();
+        // Deterministic request order, independent of arena traversal order:
+        // several call shapes sharing one callee range is degenerate but not
+        // impossible, so dedup keeps the batch one request per distinct
+        // range.
+        ranges.sort();
+        ranges.dedup();
+        if ranges.is_empty() {
+            return;
+        }
+        let requests = ranges
+            .iter()
+            .map(|range| DefinitionLookupRequest {
+                file: file.clone(),
+                line: None,
+                column: None,
+                start_byte: Some(range.start_byte),
+                end_byte: Some(range.end_byte),
+            })
+            .collect();
+        let scope = AnalyzerQueryScope::new(analyzer);
+        let outcomes = resolve_call_target_batch_with_source(
+            analyzer,
+            scope.token(),
+            requests,
+            file.clone(),
+            source,
+            cancellation,
+        );
+        // A cancelled batch answers a prefix of `ranges`, shorter than the
+        // request list it was handed (`resolve_definition_requests_traced`
+        // stops at the first cancelled poll): `zip` caches exactly that
+        // prefix, and every range past it stays a cache miss that
+        // `resolved_call_target`'s fallback resolves (and, with the same
+        // cancellation token already tripped, answers unresolved) on its own.
+        self.call_targets.extend(
+            ranges
+                .into_iter()
+                .zip(outcomes)
+                .map(|(range, outcome)| ((file.clone(), range), outcome)),
+        );
     }
 }
 
@@ -418,19 +589,23 @@ fn append_incoming_projection_omission(
     ));
 }
 
-impl CallRelationService {
-    /// Resolve one exact whole-call span against one exact source snapshot.
-    ///
-    /// The caller supplies the source owned by the semantic artifact's
-    /// revision. This method never rereads the file, so its byte span cannot
-    /// race a newer disk or overlay snapshot. The same batched definition
-    /// resolution core is used by legacy outgoing call relations below.
+impl CallDispatchSession {
+    /// Conservative live source, tree, and project-path footprint while this
+    /// session owns its exact snapshot. The shared syntax estimator also
+    /// budgets entries retained by the analyzer's prepared-syntax store.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        crate::analyzer::tree_sitter_analyzer::prepared_syntax_retained_bytes(
+            self.exact_source.len(),
+        )
+        .saturating_add(self.file.retained_bytes())
+    }
+
     pub(crate) fn dispatch_at_bounded(
+        &mut self,
         analyzer: &dyn IAnalyzer,
         token: QueryToken<'_>,
-        location: &ExactCallLocation,
-        exact_source: Arc<str>,
-        limits: CallRelationLimits,
+        call_span: &Range,
+        max_candidates: usize,
         cancellation: Option<&CancellationToken>,
     ) -> CallDispatchLookup {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -439,61 +614,46 @@ impl CallRelationService {
                 ..CallDispatchLookup::default()
             };
         }
-        if limits.max_files == 0 || limits.max_source_bytes == 0 || limits.max_candidates == 0 {
+        if max_candidates == 0 {
             return CallDispatchLookup {
                 budget_exhausted: true,
                 diagnostics: vec![format!(
-                    "exact call dispatch budget omitted {}",
-                    location.file
-                )],
-                ..CallDispatchLookup::default()
-            };
-        }
-        if exact_source.len() > limits.max_source_bytes {
-            return CallDispatchLookup {
-                budget_exhausted: true,
-                diagnostics: vec![format!(
-                    "exact call dispatch source budget omitted {}",
-                    location.file
+                    "exact call dispatch candidate budget omitted {}",
+                    self.file
                 )],
                 ..CallDispatchLookup::default()
             };
         }
 
-        let work = CallRelationWork {
-            scanned_files: 1,
-            scanned_source_bytes: exact_source.len(),
+        let mut work = CallRelationWork {
             examined_candidates: 1,
+            ..CallRelationWork::default()
         };
-        let language = language_for_file(&location.file);
-        if language == Language::None {
+        if matches!(self.parse, CallDispatchParse::Uninitialized) {
+            work.scanned_files = 1;
+            work.scanned_source_bytes = self.exact_source.len();
+            let tree = (self.language != Language::None)
+                .then(|| parse_tree_for_language(&self.file, self.language, &self.exact_source))
+                .flatten();
+            self.parse = CallDispatchParse::Ready(tree);
+        }
+        if self.language == Language::None {
             return unresolved_dispatch_lookup(
                 DefinitionLookupStatus::UnsupportedLanguage,
                 "exact call dispatch does not support this file language".to_string(),
                 work,
             );
         }
-        let Some(tree) = parse_tree_for_language(&location.file, language, &exact_source) else {
+        let CallDispatchParse::Ready(Some(tree)) = &self.parse else {
             return unresolved_dispatch_lookup(
                 DefinitionLookupStatus::NotFound,
-                format!("failed to parse {} for exact call dispatch", location.file),
+                format!("failed to parse {} for exact call dispatch", self.file),
                 work,
             );
         };
-        let Some(reference) = exact_call_reference_for_call(&tree, language, &location.call_span)
-        else {
-            return unresolved_dispatch_lookup(
-                DefinitionLookupStatus::InvalidLocation,
-                format!(
-                    "range [{}, {}) is not one exact supported call expression in {}",
-                    location.call_span.start_byte, location.call_span.end_byte, location.file
-                ),
-                work,
-            );
-        };
-        let callee_range = match reference {
-            ExactCallReference::Resolvable(range) => range,
-            ExactCallReference::Unsupported(ExactCallReferenceGap::RubyCallableObject) => {
+        let callee_range = match exact_call_reference_for_call(tree, self.language, call_span) {
+            Some(ExactCallReference::Resolvable(range)) => range,
+            Some(ExactCallReference::Unsupported(ExactCallReferenceGap::RubyCallableObject)) => {
                 return unresolved_dispatch_lookup(
                     DefinitionLookupStatus::NoDefinition,
                     "unsupported_ruby_callable_object_dispatch: resolving `receiver.(...)` requires value/heap callable-target information"
@@ -501,56 +661,255 @@ impl CallRelationService {
                     work,
                 );
             }
+            None => {
+                return unresolved_dispatch_lookup(
+                    DefinitionLookupStatus::InvalidLocation,
+                    format!(
+                        "range [{}, {}) is not one exact supported call expression in {}",
+                        call_span.start_byte, call_span.end_byte, self.file
+                    ),
+                    work,
+                );
+            }
         };
         let batch = resolve_call_references_with_source(
             analyzer,
             token,
-            &location.file,
-            Arc::clone(&exact_source),
-            &tree,
+            &self.file,
+            Arc::clone(&self.exact_source),
+            tree,
             std::slice::from_ref(&callee_range),
             cancellation,
         );
+        let cancelled =
+            batch.cancelled || cancellation.is_some_and(CancellationToken::is_cancelled);
+        let Some((_, outcome)) = batch.resolved.into_iter().next() else {
+            return if cancelled {
+                CallDispatchLookup {
+                    cancelled: true,
+                    work,
+                    ..CallDispatchLookup::default()
+                }
+            } else {
+                unresolved_dispatch_lookup(
+                    DefinitionLookupStatus::NotFound,
+                    "definition resolver returned no outcome for the exact call reference"
+                        .to_string(),
+                    work,
+                )
+            };
+        };
         let mut lookup = CallDispatchLookup {
-            cancelled: batch.cancelled,
+            cancelled,
             work,
             ..CallDispatchLookup::default()
         };
-        let Some((_, outcome)) = batch.resolved.into_iter().next() else {
-            if !lookup.cancelled {
-                lookup.status = Some(DefinitionLookupStatus::NotFound);
-                lookup.boundaries.push(CallDispatchBoundaryKind::Unresolved(
-                    DefinitionLookupStatus::NotFound,
-                ));
-                lookup.diagnostics.push(
-                    "definition resolver returned no outcome for the exact call reference"
-                        .to_string(),
-                );
-            }
-            return lookup;
-        };
         if outcome.outcome.status == DefinitionLookupStatus::UnresolvableImportBoundary {
-            let name = outcome
-                .outcome
-                .resolved_reference_target()
-                .unwrap_or_default();
-            let (boundary, _) =
-                super::get_definition::trace::boundary_evidence(analyzer, &location.file, name);
-            lookup.boundary = Some(boundary);
+            lookup.boundary = Some(call_target_boundary_evidence(
+                analyzer, &self.file, &outcome,
+            ));
         }
         apply_call_target_outcome(
             &mut lookup,
-            expand_imported_external_callee(analyzer, &location.file, outcome),
-            limits.max_candidates,
-            language,
+            expand_imported_external_callee(analyzer, &self.file, outcome),
+            max_candidates,
+            self.language,
             Some(&ExternalCalleeSite {
-                source: &exact_source,
-                tree: &tree,
+                source: &self.exact_source,
+                tree,
                 callee_start_byte: callee_range.start_byte,
             }),
         );
-        lookup.cancelled |= cancellation.is_some_and(CancellationToken::is_cancelled);
         lookup
+    }
+}
+
+impl CallRelationService {
+    pub(crate) fn dispatch_session(
+        file: ProjectFile,
+        exact_source: Arc<str>,
+    ) -> CallDispatchSession {
+        CallDispatchSession {
+            language: language_for_file(&file),
+            file,
+            exact_source,
+            parse: CallDispatchParse::Uninitialized,
+        }
+    }
+
+    /// Resolve one exact whole-call span against one exact source snapshot.
+    ///
+    /// The caller supplies the source owned by the semantic artifact's
+    /// revision. This method never rereads the file, so its byte span cannot
+    /// race a newer disk or overlay snapshot. The same batched definition
+    /// resolution core is used by legacy outgoing call relations below.
+    #[allow(dead_code)] // The serial session is production; this facade pins one-call accounting.
+    pub(crate) fn dispatch_at_bounded(
+        analyzer: &dyn IAnalyzer,
+        token: QueryToken<'_>,
+        location: &ExactCallLocation,
+        exact_source: Arc<str>,
+        limits: CallRelationLimits,
+        cancellation: Option<&CancellationToken>,
+    ) -> CallDispatchLookup {
+        Self::dispatch_many_at_bounded(
+            analyzer,
+            token,
+            &location.file,
+            std::slice::from_ref(&location.call_span),
+            exact_source,
+            limits,
+            cancellation,
+        )
+        .pop()
+        .expect("one exact call location produces one dispatch lookup")
+    }
+
+    /// Resolve several exact call spans in one source snapshot with one parse
+    /// and one definition-resolution batch.
+    ///
+    /// This is crate-visible only so analyzer-owned projections can reject
+    /// broad structural candidates before semantic lowering without exposing
+    /// low-level dispatch boundaries as public API. `max_candidates` applies
+    /// independently to each call's target set, not to `call_spans` itself.
+    pub(crate) fn dispatch_many_at_bounded(
+        analyzer: &dyn IAnalyzer,
+        token: QueryToken<'_>,
+        file: &ProjectFile,
+        call_spans: &[Range],
+        exact_source: Arc<str>,
+        limits: CallRelationLimits,
+        cancellation: Option<&CancellationToken>,
+    ) -> Vec<CallDispatchLookup> {
+        let repeated = |lookup: CallDispatchLookup| vec![lookup; call_spans.len()];
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return repeated(CallDispatchLookup {
+                cancelled: true,
+                ..CallDispatchLookup::default()
+            });
+        }
+        if limits.max_files == 0 || limits.max_source_bytes == 0 || limits.max_candidates == 0 {
+            return repeated(CallDispatchLookup {
+                budget_exhausted: true,
+                diagnostics: vec![format!("exact call dispatch budget omitted {file}")],
+                ..CallDispatchLookup::default()
+            });
+        }
+        if exact_source.len() > limits.max_source_bytes {
+            return repeated(CallDispatchLookup {
+                budget_exhausted: true,
+                diagnostics: vec![format!("exact call dispatch source budget omitted {file}")],
+                ..CallDispatchLookup::default()
+            });
+        }
+
+        let work = CallRelationWork {
+            scanned_files: 1,
+            scanned_source_bytes: exact_source.len(),
+            examined_candidates: 1,
+        };
+        let language = language_for_file(file);
+        if language == Language::None {
+            return repeated(unresolved_dispatch_lookup(
+                DefinitionLookupStatus::UnsupportedLanguage,
+                "exact call dispatch does not support this file language".to_string(),
+                work,
+            ));
+        }
+        let Some(tree) = parse_tree_for_language(file, language, &exact_source) else {
+            return repeated(unresolved_dispatch_lookup(
+                DefinitionLookupStatus::NotFound,
+                format!("failed to parse {file} for exact call dispatch"),
+                work,
+            ));
+        };
+        let mut lookups = vec![None; call_spans.len()];
+        let mut resolvable = Vec::with_capacity(call_spans.len());
+        for (index, call_span) in call_spans.iter().enumerate() {
+            match exact_call_reference_for_call(&tree, language, call_span) {
+                Some(ExactCallReference::Resolvable(range)) => resolvable.push((index, range)),
+                Some(ExactCallReference::Unsupported(
+                    ExactCallReferenceGap::RubyCallableObject,
+                )) => {
+                    lookups[index] = Some(unresolved_dispatch_lookup(
+                        DefinitionLookupStatus::NoDefinition,
+                        "unsupported_ruby_callable_object_dispatch: resolving `receiver.(...)` requires value/heap callable-target information"
+                            .to_string(),
+                        work,
+                    ));
+                }
+                None => {
+                    lookups[index] = Some(unresolved_dispatch_lookup(
+                        DefinitionLookupStatus::InvalidLocation,
+                        format!(
+                            "range [{}, {}) is not one exact supported call expression in {file}",
+                            call_span.start_byte, call_span.end_byte
+                        ),
+                        work,
+                    ));
+                }
+            }
+        }
+        let references = resolvable
+            .iter()
+            .map(|(_, range)| *range)
+            .collect::<Vec<_>>();
+        let batch = resolve_call_references_with_source(
+            analyzer,
+            token,
+            file,
+            Arc::clone(&exact_source),
+            &tree,
+            &references,
+            cancellation,
+        );
+        for ((index, callee_range), (_, outcome)) in resolvable.iter().zip(batch.resolved) {
+            let mut lookup = CallDispatchLookup {
+                cancelled: batch.cancelled,
+                work,
+                ..CallDispatchLookup::default()
+            };
+            if outcome.outcome.status == DefinitionLookupStatus::UnresolvableImportBoundary {
+                lookup.boundary = Some(call_target_boundary_evidence(analyzer, file, &outcome));
+            }
+            apply_call_target_outcome(
+                &mut lookup,
+                expand_imported_external_callee(analyzer, file, outcome),
+                limits.max_candidates,
+                language,
+                Some(&ExternalCalleeSite {
+                    source: &exact_source,
+                    tree: &tree,
+                    callee_start_byte: callee_range.start_byte,
+                }),
+            );
+            lookups[*index] = Some(lookup);
+        }
+        let cancelled =
+            batch.cancelled || cancellation.is_some_and(CancellationToken::is_cancelled);
+        lookups
+            .into_iter()
+            .map(|lookup| {
+                let mut lookup = lookup.unwrap_or_else(|| {
+                    if cancelled {
+                        CallDispatchLookup {
+                            cancelled: true,
+                            work,
+                            ..CallDispatchLookup::default()
+                        }
+                    } else {
+                        unresolved_dispatch_lookup(
+                            DefinitionLookupStatus::NotFound,
+                            "definition resolver returned no outcome for the exact call reference"
+                                .to_string(),
+                            work,
+                        )
+                    }
+                });
+                lookup.cancelled |= cancelled;
+                lookup
+            })
+            .collect()
     }
 
     pub fn incoming(
@@ -943,6 +1302,28 @@ struct CallReferenceResolutionBatch {
     cancelled: bool,
 }
 
+fn call_target_boundary_evidence(
+    analyzer: &dyn IAnalyzer,
+    file: &ProjectFile,
+    outcome: &CallTargetLookupOutcome,
+) -> BoundaryStatus {
+    let resolved_target = outcome
+        .outcome
+        .resolved_reference_target()
+        .unwrap_or_default();
+    if let Some(exact_target) = outcome.exact_external_call.as_ref() {
+        debug_assert_eq!(
+            exact_target.canonical_callee(),
+            resolved_target,
+            "exact external call proof must name the returned boundary"
+        );
+        if exact_target.canonical_callee() == resolved_target {
+            return BoundaryStatus::ExternalIndexed;
+        }
+    }
+    super::get_definition::trace::boundary_evidence(analyzer, file, resolved_target).0
+}
+
 /// Resolve already-structured call reference ranges in one shared batch.
 /// Exact semantic dispatch supplies one range; outgoing call relations supply
 /// every range in the caller. Cancellation may shorten the lower-level result
@@ -1061,15 +1442,41 @@ fn apply_call_target_outcome(
     language: Language,
     site: Option<&ExternalCalleeSite<'_>>,
 ) {
+    let CallTargetLookupOutcome {
+        outcome,
+        call_application,
+        dispatch_extensibility,
+        exact_external_call,
+        structure_unavailable,
+        unproven_link_unit,
+        truncated,
+    } = outcome;
+    if let Some(proof) = &exact_external_call {
+        debug_assert_eq!(proof.call_application(), call_application);
+        debug_assert_eq!(proof.dispatch_extensibility(), dispatch_extensibility);
+        debug_assert_eq!(
+            proof.canonical_callee(),
+            outcome.resolved_reference_target().unwrap_or_default(),
+            "exact external proof and returned boundary must retain one identity"
+        );
+    }
+    lookup.call_application = exact_external_call
+        .as_ref()
+        .map_or(call_application, ExactExternalCallProof::call_application);
+    lookup.dispatch_extensibility = exact_external_call.as_ref().map_or(
+        dispatch_extensibility,
+        ExactExternalCallProof::dispatch_extensibility,
+    );
+    lookup.exact_external_call = exact_external_call;
     apply_dispatch_outcome_with_flags(
         lookup,
-        outcome.outcome,
+        outcome,
         max_targets,
         language,
         site,
-        outcome.structure_unavailable,
-        outcome.unproven_link_unit,
-        outcome.truncated,
+        structure_unavailable,
+        unproven_link_unit,
+        truncated,
     );
 }
 
@@ -1089,7 +1496,7 @@ fn apply_dispatch_outcome_with_flags(
     let DefinitionLookupOutcome {
         status,
         mut definitions,
-        lexical_definition: _,
+        lexical_definition,
         diagnostics,
         reference,
     } = outcome;
@@ -1102,6 +1509,9 @@ fn apply_dispatch_outcome_with_flags(
         .as_ref()
         .and_then(|reference| canonical_external_callee(&reference.text, language, site))
         .map(Box::<str>::from);
+    let normalized_static_owner = external_callee_text
+        .as_deref()
+        .and_then(|callee_text| java_normalized_static_owner(callee_text, language, site));
     let unproven_target_identity = structure_unavailable || unproven_link_unit;
     let partial_external_boundary = diagnostics
         .iter()
@@ -1112,6 +1522,10 @@ fn apply_dispatch_outcome_with_flags(
     let import_bindings_truncated = diagnostics
         .iter()
         .any(|diagnostic| diagnostic.kind == IMPORT_BINDINGS_TRUNCATED_DIAGNOSTIC);
+    lookup.adjudicated_no_target |= lexical_definition.is_some()
+        || diagnostics
+            .iter()
+            .any(|diagnostic| is_adjudicated_answer_diagnostic_kind(&diagnostic.kind));
     lookup.status = Some(status);
     lookup.diagnostics.extend(
         diagnostics
@@ -1124,9 +1538,10 @@ fn apply_dispatch_outcome_with_flags(
         lookup.boundaries.push(CallDispatchBoundaryKind::Truncated);
     }
     if partial_external_boundary {
-        lookup.boundaries.push(CallDispatchBoundaryKind::External(
-            external_callee_text.clone(),
-        ));
+        lookup.boundaries.push(CallDispatchBoundaryKind::External {
+            callee_text: external_callee_text.clone(),
+            normalized_static_owner: normalized_static_owner.clone(),
+        });
     }
     if partial_unresolved_import {
         lookup.boundaries.push(CallDispatchBoundaryKind::Unresolved(
@@ -1182,9 +1597,12 @@ fn apply_dispatch_outcome_with_flags(
                 .push(CallDispatchBoundaryKind::Unresolved(status));
         }
         DefinitionLookupStatus::Resolved | DefinitionLookupStatus::Ambiguous => {}
-        DefinitionLookupStatus::UnresolvableImportBoundary => lookup
-            .boundaries
-            .push(CallDispatchBoundaryKind::External(external_callee_text)),
+        DefinitionLookupStatus::UnresolvableImportBoundary => {
+            lookup.boundaries.push(CallDispatchBoundaryKind::External {
+                callee_text: external_callee_text,
+                normalized_static_owner,
+            })
+        }
         // #1978: a fully-qualified callee with no workspace or classpath
         // definition (`java.net.URLDecoder.decode`) is external, not merely
         // unresolvable. Java classifies it `NoDefinition` rather than
@@ -1193,10 +1611,19 @@ fn apply_dispatch_outcome_with_flags(
         // other `NoDefinition` -- an unqualified or single-segment callee -- keeps
         // its unresolved boundary, so the classification blast radius is limited
         // to callees that name a bindable external identity.
+        // Go's resolver uses `UnresolvableImportBoundary` after it has proven
+        // and canonicalized an imported package qualifier. A `NoDefinition`
+        // selector such as `missing.Open` therefore has no package-binding
+        // proof: its dotted spelling alone must not mint an exact external
+        // identity or turn an applicable modeled member into a clean miss.
+        DefinitionLookupStatus::NoDefinition if language == Language::Go => lookup
+            .boundaries
+            .push(CallDispatchBoundaryKind::Unresolved(status)),
         DefinitionLookupStatus::NoDefinition => match external_callee_text {
-            Some(text) => lookup
-                .boundaries
-                .push(CallDispatchBoundaryKind::External(Some(text))),
+            Some(text) => lookup.boundaries.push(CallDispatchBoundaryKind::External {
+                callee_text: Some(text),
+                normalized_static_owner,
+            }),
             None => lookup
                 .boundaries
                 .push(CallDispatchBoundaryKind::Unresolved(status)),
@@ -1207,6 +1634,46 @@ fn apply_dispatch_outcome_with_flags(
             .boundaries
             .push(CallDispatchBoundaryKind::Unresolved(status)),
     }
+}
+
+/// The canonical owner of a Java method-invocation object that the definition
+/// resolver proved to be a type qualifier.
+///
+/// `callee_text` is already the resolver's canonical external identity. Java
+/// publishes that text only after its structured receiver/type ladder has
+/// rejected lexical value shadowing and resolved imports. Comparing the exact
+/// AST object with that resolved owner distinguishes `URLDecoder.decode` and
+/// `java.net.URLDecoder.decode` from an instance receiver such as `s.trim`
+/// without reimplementing Java name resolution here.
+fn java_normalized_static_owner(
+    callee_text: &str,
+    language: Language,
+    site: Option<&ExternalCalleeSite<'_>>,
+) -> Option<Box<str>> {
+    if language != Language::Java {
+        return None;
+    }
+    let site = site?;
+    let (owner, member) =
+        crate::analyzer::semantic::split_canonical_qualified_callee(callee_text, language)?;
+    let mut node = site.tree.root_node().named_descendant_for_byte_range(
+        site.callee_start_byte,
+        site.callee_start_byte.saturating_add(1),
+    )?;
+    while node.kind() != "method_invocation" {
+        node = node.parent()?;
+    }
+    let name = node.child_by_field_name("name")?;
+    if site.source.get(name.byte_range())? != member {
+        return None;
+    }
+    let object = node.child_by_field_name("object")?;
+    let object_text = site.source.get(object.byte_range())?;
+    let owner_matches = object_text == owner
+        || owner
+            .strip_suffix(object_text)
+            .is_some_and(|prefix| prefix.ends_with('.'));
+    owner_matches.then(|| owner.into_boxed_str())
 }
 
 /// The external identity `callee_text` names, or `None` when it names none.
@@ -1233,6 +1700,12 @@ fn apply_dispatch_outcome_with_flags(
 /// admitting it would need a checked-in prelude table -- reviewed content
 /// rather than resolution -- which Bifrost does not carry. Such a call keeps
 /// the boundary it already had and binds no authored summary.
+///
+/// Go's exact resolver is an additional structured route: it has already
+/// replaced the source qualifier with the canonical import path before this
+/// function runs. A one-segment Go standard-library path such as `os` is thus
+/// an identity, while a shadowed local receiver never reaches this boundary as
+/// that canonical unresolved import.
 fn canonical_external_callee(
     callee_text: &str,
     language: Language,
@@ -1241,6 +1714,9 @@ fn canonical_external_callee(
     let (owner, member) =
         crate::analyzer::semantic::split_canonical_qualified_callee(callee_text, language)?;
     if owner.contains('.') {
+        return Some(callee_text.to_owned());
+    }
+    if language == Language::Go {
         return Some(callee_text.to_owned());
     }
     let support = language_support(language)?;
@@ -1682,12 +2158,15 @@ mod tests {
     use crate::analyzer::CodeUnitIndex;
     use crate::analyzer::usages::get_definition::{
         DefinitionLookupDiagnostic, DefinitionLookupOutcome,
+        GO_MODELED_PACKAGE_CALL_NOT_APPLICABLE_DIAGNOSTIC_KIND,
+        GO_MODELED_PACKAGE_CALL_UNPROVEN_DIAGNOSTIC_KIND,
     };
     use crate::analyzer::{AnalyzerQueryScope, QueryScope};
     use crate::analyzer::{
         CodeUnitType, Language, PythonAnalyzer, TestProject, TypescriptAnalyzer,
     };
     use crate::test_support::AnalyzerFixture;
+    use brokk_bifrost_core::analyzer::usages::reference_site::ResolvedReferenceSite;
 
     fn call_span(source: &str, call: &str) -> Range {
         let start_byte = source.rfind(call).expect("call exists");
@@ -1705,6 +2184,152 @@ mod tests {
             max_source_bytes: usize::MAX,
             max_candidates: 100,
         }
+    }
+
+    fn activate_go_declaration_payload(
+        fixture: &AnalyzerFixture,
+        pack_id: &str,
+        import_path: &str,
+        package_name: &str,
+        mut types: Vec<serde_json::Value>,
+        members: Vec<serde_json::Value>,
+    ) {
+        use crate::analyzer::semantic_model::{
+            CatalogCoordinate, CatalogOptions, CompilerOptions, SemanticModelActivationControl,
+            SemanticModelActivationEvidence, SemanticModelActivationRequest,
+            SemanticModelControlAction, SemanticModelControlScope, SemanticModelPackSelector,
+            SemanticModelRuntimeLimits, SemanticModelRuntimeOutcome, SemanticPackCatalog,
+            SessionPackSource, SessionPackSourceKind, SourceFormat,
+            acquire_active_semantic_models_with_evidence, compile_source,
+        };
+
+        let id_namespace = pack_id.replace('-', ".");
+        let module_id = format!("type.{id_namespace}.module");
+        types.insert(
+            0,
+            serde_json::json!({
+                "id": module_id,
+                "name": import_path,
+                "type_kind": "module",
+                "visibility": "package",
+                "aliases": [package_name],
+                "locator": {
+                    "kind": "artifact",
+                    "path": "fixture.go",
+                    "symbol": import_path
+                }
+            }),
+        );
+        let source = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "pack_id": pack_id,
+            "version": "1.0.0",
+            "producer": { "name": "go-dispatch-fixture", "version": "1.0.0" },
+            "language": "go",
+            "ecosystem": "go",
+            "compatibility": { "bifrost": "*", "toolchains": [] },
+            "provenance": { "source": "fixture" },
+            "license": "NOASSERTION",
+            "completeness": "partial",
+            "safety": { "generated_code_only": false, "review_required": false },
+            "shards": [{
+                "id": format!("declarations.{pack_id}"),
+                "activation": [{}],
+                "payload": {
+                    "kind": "declaration_facts",
+                    "types": types,
+                    "members": members,
+                    "relations": []
+                }
+            }]
+        }))
+        .expect("serialize Go declaration fixture");
+        let pack = compile_source(SourceFormat::Json, &source, &CompilerOptions::default())
+            .unwrap_or_else(|diagnostics| {
+                panic!("Go declaration fixture must compile: {diagnostics:#?}")
+            });
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
+            .expect("ephemeral catalog");
+        catalog
+            .register_session_pack(
+                &pack,
+                &SessionPackSource {
+                    kind: SessionPackSourceKind::Embedded,
+                    source_id: pack_id.to_owned(),
+                },
+            )
+            .expect("register Go declaration fixture");
+        let request = SemanticModelActivationRequest {
+            bifrost_version: semver::Version::parse(env!("CARGO_PKG_VERSION"))
+                .expect("crate version"),
+            evidence: vec![SemanticModelActivationEvidence {
+                language: "go".to_owned(),
+                ecosystem: "go".to_owned(),
+                package: Some(CatalogCoordinate {
+                    name: import_path.to_owned(),
+                    version: None,
+                }),
+                module: None,
+                toolchain: None,
+                target: None,
+                configuration: None,
+                artifact_sha256: None,
+            }],
+            controls: vec![SemanticModelActivationControl {
+                scope: SemanticModelControlScope::Workspace,
+                action: SemanticModelControlAction::Enable,
+                selector: SemanticModelPackSelector {
+                    pack_id: pack_id.to_owned(),
+                    version: None,
+                    manifest_digest: None,
+                },
+            }],
+            limits: SemanticModelRuntimeLimits::default(),
+        };
+        let SemanticModelRuntimeOutcome::Ready { .. } =
+            acquire_active_semantic_models_with_evidence(
+                fixture.analyzer.analyzer(),
+                &catalog,
+                None,
+                &request,
+                None,
+                &CancellationToken::new(),
+            )
+        else {
+            panic!("Go declaration fixture must activate");
+        };
+    }
+
+    fn activate_go_function_declaration(
+        fixture: &AnalyzerFixture,
+        pack_id: &str,
+        import_path: &str,
+        package_name: &str,
+        member: &str,
+    ) {
+        let id_namespace = pack_id.replace('-', ".");
+        let module_id = format!("type.{id_namespace}.module");
+        activate_go_declaration_payload(
+            fixture,
+            pack_id,
+            import_path,
+            package_name,
+            Vec::new(),
+            vec![serde_json::json!({
+                "id": format!("member.{id_namespace}.{}", member.to_ascii_lowercase()),
+                "owner": module_id,
+                "name": member,
+                "member_kind": "function",
+                "visibility": "public",
+                "is_static": true,
+                "signature": { "parameters": [] },
+                "locator": {
+                    "kind": "artifact",
+                    "path": "fixture.go",
+                    "symbol": format!("{import_path}.{member}")
+                }
+            })],
+        );
     }
 
     #[test]
@@ -1737,6 +2362,144 @@ mod tests {
         assert!(!lookup.truncated);
     }
 
+    /// #2495: Python and TypeScript publish the same exact declaration
+    /// identities for the ordinary statically knowable call forms. This is the
+    /// source-owned pin beneath the policy fixtures: it asks the normalized
+    /// dispatch relation directly, so no rendered callee spelling can stand in
+    /// for target proof.
+    #[test]
+    fn exact_dispatch_proves_python_and_typescript_static_targets() {
+        const PYTHON: &str = r#"from typing import final
+
+def module_function() -> None:
+    pass
+
+@final
+class Store:
+    def __init__(self, tag: str) -> None:
+        self.tag = tag
+
+    def put(self, value: str) -> None:
+        pass
+
+    def self_call(self) -> None:
+        self.put("self")
+
+@final
+class Cache:
+    def __init__(self, tag: str) -> None:
+        self.tag = tag
+
+    def put(self, value: str) -> None:
+        pass
+
+def caller() -> None:
+    module_function()
+    Store("direct")
+    store = Store("local")
+    cache = Cache("local")
+    store.put("store")
+    cache.put("cache")
+"#;
+        const TYPESCRIPT: &str = r#"export function moduleFunction(): void {}
+
+export class Store {
+  private constructor(public tag: string) {}
+  put(value: string): void {}
+  selfCall(): void { this.put("this"); }
+  static direct(): Store { return new Store("direct"); }
+  static local(): void {
+    const store = new Store("local");
+    const cache = Cache.create("local");
+    store.put("store");
+    cache.put("cache");
+  }
+}
+
+export class Cache {
+  private constructor(public tag: string) {}
+  put(value: string): void {}
+  static create(tag: string): Cache { return new Cache(tag); }
+}
+
+export function caller(): void { moduleFunction(); }
+"#;
+
+        let cases = [
+            (
+                Language::Python,
+                "static_targets.py",
+                PYTHON,
+                vec![
+                    ("module_function()", "module_function", None),
+                    ("Store(\"direct\")", "Store", None),
+                    ("store.put(\"store\")", "put", Some("Store")),
+                    ("cache.put(\"cache\")", "put", Some("Cache")),
+                    ("self.put(\"self\")", "put", Some("Store")),
+                ],
+            ),
+            (
+                Language::TypeScript,
+                "static_targets.ts",
+                TYPESCRIPT,
+                vec![
+                    ("moduleFunction()", "moduleFunction", None),
+                    ("new Store(\"direct\")", "Store", None),
+                    ("store.put(\"store\")", "put", Some("Store")),
+                    ("cache.put(\"cache\")", "put", Some("Cache")),
+                    ("this.put(\"this\")", "put", Some("Store")),
+                ],
+            ),
+        ];
+
+        for (language, path, source, calls) in cases {
+            let fixture = AnalyzerFixture::new_for_language(language, &[(path, source)]);
+            let analyzer = fixture.analyzer.analyzer();
+            for (call, identifier, owner) in calls {
+                let scope = AnalyzerQueryScope::new(analyzer);
+                let lookup = CallRelationService::dispatch_at_bounded(
+                    analyzer,
+                    scope.token(),
+                    &ExactCallLocation {
+                        file: ProjectFile::new(fixture.project_root(), path),
+                        call_span: call_span(source, call),
+                    },
+                    Arc::from(source),
+                    generous_limits(),
+                    None,
+                );
+
+                assert_eq!(
+                    lookup.status,
+                    Some(DefinitionLookupStatus::Resolved),
+                    "{language:?} {call}: {lookup:#?}"
+                );
+                assert_eq!(lookup.targets.len(), 1, "{language:?} {call}: {lookup:#?}");
+                let target = &lookup.targets[0];
+                assert_eq!(
+                    target.proof,
+                    UsageProof::Proven,
+                    "{language:?} {call}: {lookup:#?}"
+                );
+                assert_eq!(
+                    target.definition.identifier(),
+                    identifier,
+                    "{language:?} {call}: {lookup:#?}"
+                );
+                if let Some(owner) = owner {
+                    assert!(
+                        target.definition.fq_name().contains(owner),
+                        "{language:?} {call} resolved to the wrong same-named owner: {lookup:#?}"
+                    );
+                }
+                assert!(
+                    lookup.boundaries.is_empty(),
+                    "{language:?} {call}: {lookup:#?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn exact_dispatch_resolves_java_methods_at_the_call_span() {
         let source = "class Example { static void helper() {} static void caller() { helper(); } }";
@@ -1763,9 +2526,740 @@ mod tests {
         assert!(lookup.boundaries.is_empty(), "{lookup:#?}");
     }
 
-    /// #1599: a boundary status carries its refined external evidence so the
-    /// dispatch oracle can classify quality from it. Nothing declares or
-    /// indexes `third-party` here, so the refinement is `external_unknown`.
+    #[test]
+    fn exact_dispatch_preserves_canonical_go_external_package_member() {
+        for (import, call) in [
+            ("\"os\"", "os.Open(\"book.xlsx\")"),
+            ("files \"os\"", "files.Open(\"book.xlsx\")"),
+        ] {
+            let source =
+                format!("package main\n\nimport {import}\n\nfunc caller() {{ _, _ = {call} }}\n");
+            let fixture = AnalyzerFixture::new_for_language(Language::Go, &[("main.go", &source)]);
+            let file = ProjectFile::new(fixture.project_root(), "main.go");
+            let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+            let lookup = CallRelationService::dispatch_at_bounded(
+                fixture.analyzer.analyzer(),
+                scope.token(),
+                &ExactCallLocation {
+                    file,
+                    call_span: call_span(&source, call),
+                },
+                Arc::from(source),
+                generous_limits(),
+                None,
+            );
+
+            assert_eq!(
+                lookup.status,
+                Some(DefinitionLookupStatus::UnresolvableImportBoundary),
+                "{lookup:#?}"
+            );
+            assert!(lookup.targets.is_empty(), "{lookup:#?}");
+            assert_eq!(
+                lookup.boundaries,
+                vec![CallDispatchBoundaryKind::External {
+                    callee_text: Some("os.Open".into()),
+                    normalized_static_owner: None,
+                }],
+                "{lookup:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_dispatch_keeps_model_proof_external_and_canonical() {
+        for (pack_id, import_path, package_name, import, call, expected_target) in [
+            (
+                "fixture.go.os",
+                "os",
+                "os",
+                "\"os\"",
+                "os.Open()",
+                "os.Open",
+            ),
+            (
+                "fixture.go.os-alias",
+                "os",
+                "os",
+                "files \"os\"",
+                "files.Open()",
+                "os.Open",
+            ),
+            (
+                "fixture.go.declared-name",
+                "example.com/m/postgres",
+                "pg",
+                "\"example.com/m/postgres\"",
+                "pg.Open()",
+                "example.com/m/postgres.Open",
+            ),
+            (
+                "fixture.go.dot-import",
+                "os",
+                "os",
+                ". \"os\"",
+                "Open()",
+                "os.Open",
+            ),
+        ] {
+            let source =
+                format!("package main\n\nimport {import}\n\nfunc caller() {{ _, _ = {call} }}\n");
+            let fixture = AnalyzerFixture::new_for_language(Language::Go, &[("main.go", &source)]);
+            activate_go_function_declaration(&fixture, pack_id, import_path, package_name, "Open");
+            let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+            let lookup = CallRelationService::dispatch_at_bounded(
+                fixture.analyzer.analyzer(),
+                scope.token(),
+                &ExactCallLocation {
+                    file: ProjectFile::new(fixture.project_root(), "main.go"),
+                    call_span: call_span(&source, call),
+                },
+                Arc::from(source),
+                generous_limits(),
+                None,
+            );
+
+            assert_eq!(
+                lookup.status,
+                Some(DefinitionLookupStatus::UnresolvableImportBoundary),
+                "{lookup:#?}"
+            );
+            assert_eq!(lookup.boundary, Some(BoundaryStatus::ExternalIndexed));
+            assert_eq!(
+                lookup.boundaries,
+                vec![CallDispatchBoundaryKind::External {
+                    callee_text: Some(expected_target.into()),
+                    normalized_static_owner: None,
+                }],
+                "{lookup:#?}"
+            );
+            assert_eq!(
+                lookup.call_application,
+                CallApplicationKind::PackageFunction,
+                "{lookup:#?}"
+            );
+            assert_eq!(lookup.dispatch_extensibility, None, "{lookup:#?}");
+        }
+    }
+
+    #[test]
+    fn dot_imported_model_function_shadows_package_scope_and_conflicts_stay_identityless() {
+        let source = r#"package main
+
+import . "example.com/model"
+
+func Open() {}
+func caller() { Open() }
+"#;
+        let fixture = AnalyzerFixture::new_for_language(
+            Language::Go,
+            &[("go.mod", "module example.com/app\n"), ("main.go", source)],
+        );
+        activate_go_function_declaration(
+            &fixture,
+            "fixture.go.dot-shadow",
+            "example.com/model",
+            "model",
+            "Open",
+        );
+        let lookup = CallRelationService::dispatch_at_bounded(
+            fixture.analyzer.analyzer(),
+            AnalyzerQueryScope::new(fixture.analyzer.analyzer()).token(),
+            &ExactCallLocation {
+                file: ProjectFile::new(fixture.project_root(), "main.go"),
+                call_span: call_span(source, "Open()"),
+            },
+            Arc::from(source),
+            generous_limits(),
+            None,
+        );
+        assert_eq!(
+            lookup.status,
+            Some(DefinitionLookupStatus::UnresolvableImportBoundary),
+            "{lookup:#?}"
+        );
+        assert!(lookup.targets.is_empty(), "{lookup:#?}");
+        assert_eq!(lookup.boundary, Some(BoundaryStatus::ExternalIndexed));
+        assert_eq!(
+            lookup.boundaries,
+            vec![CallDispatchBoundaryKind::External {
+                callee_text: Some("example.com/model.Open".into()),
+                normalized_static_owner: None,
+            }],
+            "{lookup:#?}"
+        );
+
+        let ambiguous_source = r#"package main
+
+import (
+    . "example.com/a"
+    . "example.com/b"
+)
+
+func caller() { Open() }
+"#;
+        let ambiguous = AnalyzerFixture::new_for_language(
+            Language::Go,
+            &[
+                ("go.mod", "module example.com/app\n"),
+                ("main.go", ambiguous_source),
+            ],
+        );
+        for (pack_id, import_path, package_name) in [
+            ("fixture.go.dot-a", "example.com/a", "a"),
+            ("fixture.go.dot-b", "example.com/b", "b"),
+        ] {
+            activate_go_function_declaration(
+                &ambiguous,
+                pack_id,
+                import_path,
+                package_name,
+                "Open",
+            );
+        }
+        let lookup = CallRelationService::dispatch_at_bounded(
+            ambiguous.analyzer.analyzer(),
+            AnalyzerQueryScope::new(ambiguous.analyzer.analyzer()).token(),
+            &ExactCallLocation {
+                file: ProjectFile::new(ambiguous.project_root(), "main.go"),
+                call_span: call_span(ambiguous_source, "Open()"),
+            },
+            Arc::from(ambiguous_source),
+            generous_limits(),
+            None,
+        );
+        assert_eq!(
+            lookup.status,
+            Some(DefinitionLookupStatus::UnresolvableImportBoundary),
+            "{lookup:#?}"
+        );
+        assert!(lookup.targets.is_empty(), "{lookup:#?}");
+        assert!(
+            lookup.boundaries.iter().all(|boundary| !matches!(
+                boundary,
+                CallDispatchBoundaryKind::External {
+                    callee_text: Some(_),
+                    ..
+                }
+            )),
+            "{lookup:#?}"
+        );
+    }
+
+    #[test]
+    fn modeled_go_package_calls_require_one_public_exact_function() {
+        let import_path = "example.com/model";
+        let pack_id = "fixture.go.package-calls";
+        let id_namespace = pack_id.replace('-', ".");
+        let module_id = format!("type.{id_namespace}.module");
+        let function =
+            |id: &str, name: &str, visibility: &str, parameters: Vec<serde_json::Value>| {
+                serde_json::json!({
+                    "id": id,
+                    "owner": module_id,
+                    "name": name,
+                    "member_kind": "function",
+                    "visibility": visibility,
+                    "is_static": true,
+                    "signature": { "parameters": parameters },
+                    "locator": {
+                        "kind": "artifact",
+                        "path": "fixture.go",
+                        "symbol": format!("{import_path}.{name}")
+                    }
+                })
+            };
+        let result_function =
+            |id: &str, name: &str, returns: serde_json::Value| -> serde_json::Value {
+                let mut declaration = function(id, name, "public", Vec::new());
+                declaration["signature"]["returns"] = returns;
+                declaration
+            };
+        let source = r#"package main
+
+import model "example.com/model"
+
+func pair() (int, int) { return 1, 2 }
+
+func caller() {
+    values := []int{1, 2}
+    model.Open()
+    model.Open(1)
+    model.Open(model.One())
+    model.Open(model.Pair())
+    model.Binary(model.Pair())
+    model.Zero()
+    model.NoResult()
+    model.Zero(model.NoResult())
+    model.Duration(1)
+    model.Vector(1)
+    model.Open[int](1)
+    model.Variadic()
+    model.Variadic(1)
+    model.Variadic(1, 2)
+    model.Variadic(model.Pair())
+    model.Variadic(pair())
+    model.Variadic((pair()))
+    model.Variadic(values...)
+    model.Flag()
+    model.Conflict()
+    model.Hidden()
+}
+"#;
+        let fixture = AnalyzerFixture::new_for_language(Language::Go, &[("main.go", source)]);
+        activate_go_declaration_payload(
+            &fixture,
+            pack_id,
+            import_path,
+            "model",
+            vec![
+                serde_json::json!({
+                    "id": format!("type.{id_namespace}.duration"),
+                    "name": format!("{import_path}.Duration"),
+                    "type_kind": "struct",
+                    "visibility": "public",
+                    "locator": {
+                        "kind": "artifact",
+                        "path": "fixture.go",
+                        "symbol": format!("{import_path}.Duration")
+                    }
+                }),
+                serde_json::json!({
+                    "id": format!("type.{id_namespace}.vector"),
+                    "name": format!("{import_path}.Vector"),
+                    "type_kind": "struct",
+                    "visibility": "public",
+                    "locator": {
+                        "kind": "artifact",
+                        "path": "fixture.go",
+                        "symbol": format!("{import_path}.Vector")
+                    }
+                }),
+            ],
+            vec![
+                function(
+                    "member.fixture.open",
+                    "Open",
+                    "public",
+                    vec![serde_json::json!({
+                        "name": "value",
+                        "type": { "kind": "named", "name": "int" }
+                    })],
+                ),
+                function(
+                    "member.fixture.variadic",
+                    "Variadic",
+                    "public",
+                    vec![serde_json::json!({
+                        "name": "values",
+                        "type": { "kind": "named", "name": "int" },
+                        "variadic": true
+                    })],
+                ),
+                function(
+                    "member.fixture.binary",
+                    "Binary",
+                    "public",
+                    vec![
+                        serde_json::json!({
+                            "name": "left",
+                            "type": { "kind": "named", "name": "int" }
+                        }),
+                        serde_json::json!({
+                            "name": "right",
+                            "type": { "kind": "named", "name": "int" }
+                        }),
+                    ],
+                ),
+                function("member.fixture.zero", "Zero", "public", Vec::new()),
+                function("member.fixture.no-result", "NoResult", "public", Vec::new()),
+                result_function(
+                    "member.fixture.one",
+                    "One",
+                    serde_json::json!({
+                        "kind": "named",
+                        "name": "int"
+                    }),
+                ),
+                result_function(
+                    "member.fixture.pair",
+                    "Pair",
+                    serde_json::json!({
+                        "kind": "tuple",
+                        "elements": [
+                            { "kind": "named", "name": "int" },
+                            { "kind": "named", "name": "int" }
+                        ]
+                    }),
+                ),
+                serde_json::json!({
+                    "id": "member.fixture.flag",
+                    "owner": module_id,
+                    "name": "Flag",
+                    "member_kind": "constant",
+                    "visibility": "public",
+                    "is_static": true,
+                    "locator": {
+                        "kind": "artifact",
+                        "path": "fixture.go",
+                        "symbol": format!("{import_path}.Flag")
+                    }
+                }),
+                function(
+                    "member.fixture.conflict.first",
+                    "Conflict",
+                    "public",
+                    Vec::new(),
+                ),
+                function(
+                    "member.fixture.conflict.second",
+                    "Conflict",
+                    "public",
+                    Vec::new(),
+                ),
+                function("member.fixture.hidden", "Hidden", "private", Vec::new()),
+            ],
+        );
+        let file = ProjectFile::new(fixture.project_root(), "main.go");
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let lookup = |call: &str| {
+            CallRelationService::dispatch_at_bounded(
+                fixture.analyzer.analyzer(),
+                scope.token(),
+                &ExactCallLocation {
+                    file: file.clone(),
+                    call_span: call_span(source, call),
+                },
+                Arc::from(source),
+                generous_limits(),
+                None,
+            )
+        };
+
+        for (call, canonical, effective_parameter_count) in [
+            ("model.Open(1)", "example.com/model.Open", 1),
+            ("model.Open(model.One())", "example.com/model.Open", 1),
+            ("model.Binary(model.Pair())", "example.com/model.Binary", 2),
+            ("model.One()", "example.com/model.One", 0),
+            ("model.Pair()", "example.com/model.Pair", 0),
+            ("model.Zero()", "example.com/model.Zero", 0),
+            ("model.NoResult()", "example.com/model.NoResult", 0),
+            ("model.Variadic()", "example.com/model.Variadic", 0),
+            ("model.Variadic(1)", "example.com/model.Variadic", 1),
+            ("model.Variadic(1, 2)", "example.com/model.Variadic", 2),
+            (
+                "model.Variadic(model.Pair())",
+                "example.com/model.Variadic",
+                2,
+            ),
+        ] {
+            let exact = lookup(call);
+            assert_eq!(
+                exact.status,
+                Some(DefinitionLookupStatus::UnresolvableImportBoundary),
+                "{call}: {exact:#?}"
+            );
+            assert_eq!(
+                exact.boundaries,
+                vec![CallDispatchBoundaryKind::External {
+                    callee_text: Some(canonical.into()),
+                    normalized_static_owner: None,
+                }],
+                "{call}: {exact:#?}"
+            );
+            let proof = exact
+                .exact_external_call
+                .as_ref()
+                .unwrap_or_else(|| panic!("{call}: exact external proof: {exact:#?}"));
+            assert_eq!(proof.canonical_callee(), canonical, "{call}: {exact:#?}");
+            assert_eq!(
+                proof.call_application(),
+                CallApplicationKind::PackageFunction,
+                "{call}: {exact:#?}"
+            );
+            assert_eq!(
+                proof.parameter_count(),
+                effective_parameter_count,
+                "{call}: {exact:#?}"
+            );
+        }
+
+        for (call, adjudicated_no_target) in [
+            ("model.Open()", true),
+            ("model.Duration(1)", true),
+            ("model.Vector(1)", true),
+            ("model.Open(model.Pair())", true),
+            ("model.Zero(model.NoResult())", false),
+            ("model.Variadic(pair())", false),
+            ("model.Variadic((pair()))", false),
+            ("model.Variadic(values...)", false),
+            ("model.Flag()", true),
+            ("model.Conflict()", false),
+            ("model.Hidden()", true),
+        ] {
+            let rejected = lookup(call);
+            assert_eq!(
+                rejected.status,
+                Some(DefinitionLookupStatus::NoDefinition),
+                "{call}: {rejected:#?}"
+            );
+            assert_eq!(
+                rejected.dispatch_extensibility, None,
+                "{call}: {rejected:#?}"
+            );
+            assert!(
+                rejected.exact_external_call.is_none(),
+                "{call}: rejected calls retain no partial external identity: {rejected:#?}"
+            );
+            assert_eq!(
+                rejected.adjudicated_no_target, adjudicated_no_target,
+                "{call}: {rejected:#?}"
+            );
+            let expected_diagnostic = if adjudicated_no_target {
+                GO_MODELED_PACKAGE_CALL_NOT_APPLICABLE_DIAGNOSTIC_KIND
+            } else {
+                GO_MODELED_PACKAGE_CALL_UNPROVEN_DIAGNOSTIC_KIND
+            };
+            assert!(
+                rejected
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.starts_with(expected_diagnostic)),
+                "{call}: {rejected:#?}"
+            );
+            assert!(
+                rejected
+                    .boundaries
+                    .iter()
+                    .all(|boundary| !matches!(boundary, CallDispatchBoundaryKind::External { .. })),
+                "{call}: {rejected:#?}"
+            );
+        }
+
+        let generic = lookup("model.Open[int](1)");
+        assert_eq!(
+            generic.status,
+            Some(DefinitionLookupStatus::InvalidLocation),
+            "{generic:#?}"
+        );
+        assert!(!generic.adjudicated_no_target, "{generic:#?}");
+        assert!(
+            generic
+                .boundaries
+                .iter()
+                .all(|boundary| !matches!(boundary, CallDispatchBoundaryKind::External { .. })),
+            "{generic:#?}"
+        );
+    }
+
+    #[test]
+    fn exact_go_package_call_keeps_declared_package_identity_static() {
+        let source = r#"package main
+import "example.com/driver"
+func caller() { db.Open() }
+"#;
+        let fixture = AnalyzerFixture::new_for_language(Language::Go, &[("main.go", source)]);
+        activate_go_function_declaration(
+            &fixture,
+            "fixture.go.declared-package-name",
+            "example.com/driver",
+            "db",
+            "Open",
+        );
+        let lookup = CallRelationService::dispatch_at_bounded(
+            fixture.analyzer.analyzer(),
+            AnalyzerQueryScope::new(fixture.analyzer.analyzer()).token(),
+            &ExactCallLocation {
+                file: ProjectFile::new(fixture.project_root(), "main.go"),
+                call_span: call_span(source, "db.Open()"),
+            },
+            Arc::from(source),
+            generous_limits(),
+            None,
+        );
+
+        assert_eq!(
+            lookup.status,
+            Some(DefinitionLookupStatus::UnresolvableImportBoundary),
+            "{lookup:#?}"
+        );
+        let proof = lookup
+            .exact_external_call
+            .as_ref()
+            .unwrap_or_else(|| panic!("declared package call must retain its proof: {lookup:#?}"));
+        assert_eq!(proof.canonical_callee(), "example.com/driver.Open");
+        assert_eq!(
+            proof.call_application(),
+            CallApplicationKind::PackageFunction
+        );
+        assert_eq!(proof.parameter_count(), 0);
+        assert!(!proof.has_receiver());
+    }
+
+    #[test]
+    fn a_model_cannot_turn_a_workspace_go_package_miss_external() {
+        for (pack_id, import_path, package_name, workspace_file) in [
+            (
+                "fixture.go.workspace-collision",
+                "example.com/app/service",
+                "service",
+                "service/service.go",
+            ),
+            (
+                "fixture.go.vendor-collision",
+                "example.com/dep/pkg",
+                "pkg",
+                "vendor/example.com/dep/pkg/pkg.go",
+            ),
+        ] {
+            let call = format!("{package_name}.Open()");
+            let source =
+                format!("package main\n\nimport \"{import_path}\"\n\nfunc caller() {{ {call} }}\n");
+            let workspace_source = format!("package {package_name}\n");
+            let fixture = AnalyzerFixture::new_for_language(
+                Language::Go,
+                &[
+                    ("go.mod", "module example.com/app\n"),
+                    (workspace_file, &workspace_source),
+                    ("main.go", &source),
+                ],
+            );
+            activate_go_function_declaration(&fixture, pack_id, import_path, package_name, "Open");
+            let file = ProjectFile::new(fixture.project_root(), "main.go");
+            let tree = crate::analyzer::usages::get_definition::parse_tree_for_language(
+                &file,
+                Language::Go,
+                &source,
+            )
+            .expect("Go tree");
+            let focus_start_byte = source.find("Open").expect("Open reference");
+            let focus_end_byte = focus_start_byte + "Open".len();
+            let focus_line = source[..focus_start_byte]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count()
+                + 1;
+            let site = ResolvedReferenceSite {
+                path: crate::path_utils::rel_path_string(&file),
+                text: "Open".to_owned(),
+                range: Range {
+                    start_byte: focus_start_byte,
+                    end_byte: focus_end_byte,
+                    start_line: focus_line,
+                    end_line: focus_line,
+                },
+                focus_start_byte,
+                focus_end_byte,
+            };
+            let go = crate::analyzer::resolve_analyzer::<crate::analyzer::GoAnalyzer>(
+                fixture.analyzer.analyzer(),
+            )
+            .expect("fixture Go analyzer");
+            let index_builds_before = go.workspace_path_index_build_count_for_test();
+            assert_eq!(
+                index_builds_before, 0,
+                "the bounded regression must exercise a cold workspace path index"
+            );
+            let bounded = crate::analyzer::usages::get_definition::resolve_go_bounded(
+                fixture.analyzer.analyzer(),
+                &file,
+                &source,
+                Some(&tree),
+                &site,
+                brokk_bifrost_core::analyzer::usages::receiver_analysis::ReceiverAnalysisBudget::default(
+                ),
+                None,
+            );
+            let crate::analyzer::usages::get_definition::BoundedResolution::Complete {
+                value: bounded,
+                ..
+            } = bounded
+            else {
+                panic!(
+                    "bounded Go lookup should complete without scanning the workspace: {bounded:#?}"
+                );
+            };
+            assert_eq!(bounded.status, DefinitionLookupStatus::NoDefinition);
+            assert!(bounded.reference.is_none(), "{bounded:#?}");
+            assert_eq!(
+                go.workspace_path_index_build_count_for_test(),
+                index_builds_before,
+                "bounded resolution must not initialize the whole-workspace path index"
+            );
+
+            let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+            let lookup = CallRelationService::dispatch_at_bounded(
+                fixture.analyzer.analyzer(),
+                scope.token(),
+                &ExactCallLocation {
+                    file,
+                    call_span: call_span(&source, &call),
+                },
+                Arc::from(source),
+                generous_limits(),
+                None,
+            );
+
+            assert_eq!(
+                lookup.status,
+                Some(DefinitionLookupStatus::NoDefinition),
+                "{import_path}: {lookup:#?}"
+            );
+            assert!(
+                lookup
+                    .boundaries
+                    .iter()
+                    .all(|boundary| !matches!(boundary, CallDispatchBoundaryKind::External { .. })),
+                "{import_path}: {lookup:#?}"
+            );
+            assert_eq!(
+                go.workspace_path_index_build_count_for_test(),
+                index_builds_before,
+                "bounded exact dispatch must not initialize the whole-workspace path index"
+            );
+        }
+    }
+
+    #[test]
+    fn local_go_value_named_like_package_is_not_an_external_member() {
+        let source = r#"package main
+
+type opener struct{}
+func (opener) Open(string) {}
+
+func caller(os opener) { os.Open("book.xlsx") }
+"#;
+        let fixture = AnalyzerFixture::new_for_language(Language::Go, &[("main.go", source)]);
+        let file = ProjectFile::new(fixture.project_root(), "main.go");
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let lookup = CallRelationService::dispatch_at_bounded(
+            fixture.analyzer.analyzer(),
+            scope.token(),
+            &ExactCallLocation {
+                file,
+                call_span: call_span(source, "os.Open(\"book.xlsx\")"),
+            },
+            Arc::from(source),
+            generous_limits(),
+            None,
+        );
+
+        assert!(
+            !lookup.boundaries.iter().any(|boundary| matches!(
+                boundary,
+                CallDispatchBoundaryKind::External {
+                    callee_text: Some(target),
+                    ..
+                } if target.as_ref() == "os.Open"
+            )),
+            "{lookup:#?}"
+        );
+    }
+
+    /// #1599/#2799: a boundary status carries its refined external evidence so
+    /// the dispatch oracle can classify quality from it. The named import
+    /// proves the exact external callable even though nothing declares or
+    /// indexes `third-party`; open dispatch remains a separate fact.
     #[test]
     fn exact_dispatch_refines_an_external_boundary_status() {
         let source = "import { work } from \"third-party\";\nexport function caller(): number { return work(); }\n";
@@ -1792,20 +3286,30 @@ mod tests {
         );
         assert_eq!(
             lookup.boundary,
-            Some(BoundaryStatus::ExternalUnknown),
+            Some(BoundaryStatus::ExternalIndexed),
             "{lookup:#?}"
         );
-        // The payload of an external boundary is the canonical external
-        // identity, not the raw callee text (#2598). `work` names no owner at
-        // all, so it identifies nothing an authored summary could be keyed
-        // under, and the boundary says so instead of carrying a spelling the
-        // minting side would discard anyway. The refined status above is what
-        // this test is about and is unchanged.
+        // The payload is the resolver-proven package plus imported symbol,
+        // never the source-local bare callee spelling.
         assert_eq!(
             lookup.boundaries,
-            vec![CallDispatchBoundaryKind::External(None)],
+            vec![CallDispatchBoundaryKind::External {
+                callee_text: Some("third-party.work".into()),
+                normalized_static_owner: None,
+            }],
             "{lookup:#?}"
         );
+        let proof = lookup
+            .exact_external_call
+            .as_ref()
+            .unwrap_or_else(|| panic!("named import must retain exact proof: {lookup:#?}"));
+        assert_eq!(proof.canonical_callee(), "third-party.work");
+        assert_eq!(
+            proof.call_application(),
+            CallApplicationKind::PackageFunction
+        );
+        assert_eq!(proof.parameter_count(), 0);
+        assert!(!proof.has_receiver());
     }
 
     #[test]
@@ -1995,6 +3499,9 @@ int caller() { return local_target(1); }
                 lexical_definition: None,
                 diagnostics: Vec::new(),
             },
+            call_application: CallApplicationKind::Unknown,
+            dispatch_extensibility: None,
+            exact_external_call: None,
             structure_unavailable,
             unproven_link_unit: false,
             truncated,
@@ -2461,6 +3968,116 @@ object Calls {
     }
 
     #[test]
+    fn exact_dispatch_session_charges_one_parse_and_preserves_reverse_call_order() {
+        let source: Arc<str> = Arc::from(
+            "function first() {}\nfunction second() {}\nfunction caller() { first(); second(); }\n",
+        );
+        let fixture =
+            AnalyzerFixture::new_for_language(Language::TypeScript, &[("sample.ts", &source)]);
+        let file = ProjectFile::new(fixture.project_root(), "sample.ts");
+        let spans = [
+            call_span(&source, "first()"),
+            call_span(&source, "second()"),
+        ];
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let token = scope.token();
+        let mut session = CallRelationService::dispatch_session(file.clone(), Arc::clone(&source));
+        assert_eq!(
+            session.retained_bytes(),
+            crate::analyzer::tree_sitter_analyzer::prepared_syntax_retained_bytes(source.len())
+                .saturating_add(file.retained_bytes()),
+            "the retained session owns both its parsed source and exact project path"
+        );
+        let second = session.dispatch_at_bounded(
+            fixture.analyzer.analyzer(),
+            token,
+            &spans[1],
+            generous_limits().max_candidates,
+            None,
+        );
+        let first = session.dispatch_at_bounded(
+            fixture.analyzer.analyzer(),
+            token,
+            &spans[0],
+            generous_limits().max_candidates,
+            None,
+        );
+
+        assert_eq!(second.work.scanned_files, 1);
+        assert_eq!(second.work.scanned_source_bytes, source.len());
+        assert_eq!(second.work.examined_candidates, 1);
+        assert_eq!(first.work.scanned_files, 0);
+        assert_eq!(first.work.scanned_source_bytes, 0);
+        assert_eq!(first.work.examined_candidates, 1);
+        assert_eq!(first.targets[0].definition.fq_name(), "first");
+        assert_eq!(second.targets[0].definition.fq_name(), "second");
+
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let single = CallRelationService::dispatch_at_bounded(
+            fixture.analyzer.analyzer(),
+            scope.token(),
+            &ExactCallLocation {
+                file,
+                call_span: spans[1],
+            },
+            source,
+            generous_limits(),
+            None,
+        );
+        assert_eq!(single.work.scanned_files, 1);
+        assert_eq!(
+            single.work.scanned_source_bytes,
+            second.work.scanned_source_bytes
+        );
+        assert_eq!(single.work.examined_candidates, 1);
+        assert_eq!(single.status, second.status);
+        assert_eq!(single.targets, second.targets);
+        assert_eq!(single.boundaries, second.boundaries);
+    }
+
+    #[test]
+    fn exact_dispatch_session_cancellation_does_not_reclassify_prior_calls() {
+        let source: Arc<str> = Arc::from(
+            "function first() {}\nfunction second() {}\nfunction caller() { first(); second(); }\n",
+        );
+        let fixture =
+            AnalyzerFixture::new_for_language(Language::TypeScript, &[("sample.ts", &source)]);
+        let file = ProjectFile::new(fixture.project_root(), "sample.ts");
+        let spans = [
+            call_span(&source, "first()"),
+            call_span(&source, "second()"),
+        ];
+        let scope = AnalyzerQueryScope::new(fixture.analyzer.analyzer());
+        let token = scope.token();
+        let cancellation = CancellationToken::default();
+        let source_len = source.len();
+        let mut session = CallRelationService::dispatch_session(file, source);
+
+        let first = session.dispatch_at_bounded(
+            fixture.analyzer.analyzer(),
+            token,
+            &spans[0],
+            generous_limits().max_candidates,
+            Some(&cancellation),
+        );
+        cancellation.cancel();
+        let second = session.dispatch_at_bounded(
+            fixture.analyzer.analyzer(),
+            token,
+            &spans[1],
+            generous_limits().max_candidates,
+            Some(&cancellation),
+        );
+
+        assert!(!first.cancelled);
+        assert_eq!(first.work.scanned_source_bytes, source_len);
+        assert!(second.cancelled);
+        assert_eq!(second.work.scanned_files, 0);
+        assert_eq!(second.work.scanned_source_bytes, 0);
+        assert_eq!(second.work.examined_candidates, 0);
+    }
+
+    #[test]
     fn dispatch_mapping_preserves_ambiguous_targets_and_empty_boundary() {
         let root = std::env::temp_dir();
         let file = ProjectFile::new(&root, "dispatch.ts");
@@ -2530,7 +4147,10 @@ object Calls {
         assert_eq!(
             partial_ambiguous.boundaries,
             vec![
-                CallDispatchBoundaryKind::External(None),
+                CallDispatchBoundaryKind::External {
+                    callee_text: None,
+                    normalized_static_owner: None,
+                },
                 CallDispatchBoundaryKind::Unresolved(DefinitionLookupStatus::NoDefinition),
             ]
         );
@@ -2573,7 +4193,10 @@ object Calls {
         );
         assert_eq!(
             external.boundaries,
-            vec![CallDispatchBoundaryKind::External(None)]
+            vec![CallDispatchBoundaryKind::External {
+                callee_text: None,
+                normalized_static_owner: None,
+            }]
         );
 
         for status in [
@@ -2601,6 +4224,59 @@ object Calls {
                 vec![CallDispatchBoundaryKind::Unresolved(status)]
             );
         }
+    }
+
+    #[test]
+    fn go_no_definition_does_not_fabricate_an_external_package_identity() {
+        let reference = ResolvedReferenceSite {
+            path: "main.go".to_owned(),
+            text: "missing.Open".to_owned(),
+            range: Range {
+                start_byte: 0,
+                end_byte: 12,
+                start_line: 1,
+                end_line: 1,
+            },
+            focus_start_byte: 8,
+            focus_end_byte: 12,
+        };
+        let outcome = |status| DefinitionLookupOutcome {
+            status,
+            reference: Some(reference.clone()),
+            definitions: Vec::new(),
+            lexical_definition: None,
+            diagnostics: Vec::new(),
+        };
+
+        let mut unresolved = CallDispatchLookup::default();
+        apply_dispatch_outcome(
+            &mut unresolved,
+            outcome(DefinitionLookupStatus::NoDefinition),
+            1,
+            Language::Go,
+        );
+        assert_eq!(
+            unresolved.boundaries,
+            vec![CallDispatchBoundaryKind::Unresolved(
+                DefinitionLookupStatus::NoDefinition
+            )],
+            "dotted spelling without an import-binding proof stays unresolved"
+        );
+
+        let mut imported = CallDispatchLookup::default();
+        apply_dispatch_outcome(
+            &mut imported,
+            outcome(DefinitionLookupStatus::UnresolvableImportBoundary),
+            1,
+            Language::Go,
+        );
+        assert!(
+            matches!(
+                imported.boundaries.as_slice(),
+                [CallDispatchBoundaryKind::External { .. }]
+            ),
+            "the resolver's proven imported-package boundary remains external: {imported:#?}"
+        );
     }
 
     fn empty_typescript_analyzer() -> (tempfile::TempDir, TypescriptAnalyzer, ProjectFile) {

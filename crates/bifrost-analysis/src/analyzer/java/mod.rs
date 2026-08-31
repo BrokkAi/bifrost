@@ -235,34 +235,6 @@ impl JavaAnalyzer {
         resolve_java_forward_type_name_candidates(self, token, file, raw_name)
     }
 
-    /// Expand `URLDecoder.decode` to `java.net.URLDecoder.decode` when the
-    /// file imports that type or the activated overlay names it (#2364).
-    /// Fully-qualified callees are left untouched; they already bind through
-    /// the #1978 identity.
-    pub(crate) fn expand_imported_external_callee(
-        &self,
-        token: QueryToken<'_>,
-        packs: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
-        file: &ProjectFile,
-        callee_text: &str,
-    ) -> Option<String> {
-        let (owner, member) = crate::analyzer::semantic::split_qualified_member(callee_text)?;
-        if owner.contains('.') {
-            return None;
-        }
-        match self.resolve_type_name_with_external(token, packs, file, owner) {
-            Some(JavaTypeResolution::External(external_type)) => {
-                Some(format!("{}.{}", external_type.fqn(), member))
-            }
-            Some(JavaTypeResolution::Source(unit)) => {
-                Some(format!("{}.{}", unit.fq_name(), member))
-            }
-            None => self
-                .explicit_imported_type_fqn(token, file, owner)
-                .map(|fqn| format!("{fqn}.{member}")),
-        }
-    }
-
     /// Whether `raw_name` names a type this file can see, in the workspace or
     /// past it. `packs` is the dispatching analyzer's activated overlay; see
     /// [`JavaAnalyzer::resolve_type_name_with_external`].
@@ -708,6 +680,15 @@ impl IAnalyzer for JavaAnalyzer {
         self.external_index.get().is_some()
     }
 
+    fn external_dispatch_behavior_identity(
+        &self,
+    ) -> Option<crate::analyzer::semantic::StableDigest> {
+        Some(
+            self.external_declaration_index()
+                .dispatch_behavior_identity(),
+        )
+    }
+
     fn invalidate_cached_file_identities(&self) {
         self.inner.invalidate_cached_file_identities();
     }
@@ -1000,6 +981,20 @@ impl IAnalyzer for JavaAnalyzer {
 
 #[cfg(any(test, feature = "test-support"))]
 impl crate::analyzer::AnalyzerTestHooks for JavaAnalyzer {
+    fn reset_java_usage_evidence_cache_stats_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .reset_java_usage_evidence_cache_stats_for_test();
+    }
+
+    fn java_usage_evidence_cache_stats_for_test(
+        &self,
+    ) -> crate::analyzer::JavaUsageEvidenceCacheStats {
+        self.inner
+            .test_hooks()
+            .java_usage_evidence_cache_stats_for_test()
+    }
+
     fn reset_full_declaration_scan_count_for_test(&self) {
         self.inner
             .test_hooks()
@@ -1112,22 +1107,6 @@ impl LanguageSupport for JavaSupport {
         crate::analyzer::languages::ReferenceLanguagePlugin::new(
             &JAVA_USAGE_STRATEGY,
             &JavaEdgePass,
-        )
-    }
-
-    fn expand_imported_external_callee(
-        &self,
-        analyzer: &dyn IAnalyzer,
-        file: &ProjectFile,
-        callee_text: &str,
-    ) -> Option<String> {
-        let scope = AnalyzerQueryScope::new(analyzer);
-        let token = scope.token();
-        resolve_analyzer::<JavaAnalyzer>(analyzer)?.expand_imported_external_callee(
-            token,
-            analyzer.semantic_model_overlay(),
-            file,
-            callee_text,
         )
     }
 

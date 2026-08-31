@@ -10,6 +10,7 @@ mod selector;
 use std::fmt;
 use std::path::Path;
 
+use brokk_bifrost_analysis::analyzer::IAnalyzer;
 use brokk_bifrost_analysis::analyzer::semantic::{
     WorkspaceRelativePath, WorkspaceRelativePathError,
 };
@@ -17,6 +18,7 @@ use brokk_bifrost_analysis::workspace_document::{
     WorkspaceDocument, WorkspaceDocumentError, WorkspaceRoot, read_workspace_document,
 };
 
+use super::locator::resolve_selector_locators;
 use super::source::{
     MAX_RQLP_SOURCE_BYTES, ParsedRqlpDocument, PolicySourceError, PolicySourceIdentity,
     PolicySourceIdentityError, parse_rqlp_source, workspace_policy_source_identity,
@@ -126,13 +128,15 @@ pub(crate) fn load_endpoint_closure(
     root: Option<&WorkspaceRoot>,
     parsed: ParsedRqlpDocument,
     source_bytes: &[u8],
+    analyzer: Option<&dyn IAnalyzer>,
 ) -> Result<LoadedEndpointClosure, EndpointClosureError> {
     let source = parsed.identity().clone();
     let schema_resolution = parsed.schema_resolution();
-    let definition = match parsed.document() {
+    let mut definition = match parsed.document() {
         RqlpDocument::Endpoint { definition } => definition.as_ref().clone(),
         RqlpDocument::Policy { .. } => return Err(EndpointClosureError::WrongDocumentKind),
     };
+    resolve_selector_locators(&mut definition.selector, analyzer)?;
     let selector_path = PolicySelectorPath::new("/endpoint/selector")?;
     let resolved = resolve_parsed_selector(root, &parsed, selector_path, &definition.selector)?;
     let referenced_bytes = resolved
@@ -241,6 +245,7 @@ pub(crate) enum EndpointClosureError {
     SelectorPath(PolicySelectorPathError),
     Selector(SelectorLoadError),
     Model(LoadedModelError),
+    Source(PolicySourceError),
     RetainedByteCountOverflow,
 }
 
@@ -253,6 +258,7 @@ impl fmt::Display for EndpointClosureError {
             Self::SelectorPath(error) => error.fmt(formatter),
             Self::Selector(error) => error.fmt(formatter),
             Self::Model(error) => error.fmt(formatter),
+            Self::Source(error) => error.fmt(formatter),
             Self::RetainedByteCountOverflow => {
                 formatter.write_str("endpoint retained byte count overflowed")
             }
@@ -266,6 +272,7 @@ impl std::error::Error for EndpointClosureError {
             Self::SelectorPath(error) => Some(error),
             Self::Selector(error) => Some(error),
             Self::Model(error) => Some(error),
+            Self::Source(error) => Some(error),
             Self::WrongDocumentKind | Self::RetainedByteCountOverflow => None,
         }
     }
@@ -289,6 +296,12 @@ impl From<LoadedModelError> for EndpointClosureError {
     }
 }
 
+impl From<PolicySourceError> for EndpointClosureError {
+    fn from(error: PolicySourceError) -> Self {
+        Self::Source(error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,7 +320,7 @@ mod tests {
         let parsed =
             parse_rqlp_source(&source, PolicySourceIdentity::new("embedded:endpoint-a")).unwrap();
 
-        let loaded = load_endpoint_closure(None, parsed, source.as_bytes()).unwrap();
+        let loaded = load_endpoint_closure(None, parsed, source.as_bytes(), None).unwrap();
 
         assert_eq!(loaded.endpoint().definition().id.as_str(), "source-a");
         assert!(loaded.referenced_selector().is_none());
@@ -328,7 +341,7 @@ mod tests {
         .unwrap();
         let root = WorkspaceRoot::open(temp.path()).unwrap();
 
-        let loaded = load_endpoint_closure(Some(&root), parsed, source.as_bytes()).unwrap();
+        let loaded = load_endpoint_closure(Some(&root), parsed, source.as_bytes(), None).unwrap();
 
         let reference = loaded.referenced_selector().unwrap();
         assert_eq!(reference.wrapper_authored_schema_version(), Some(1));
@@ -351,7 +364,7 @@ mod tests {
             parse_rqlp_source(source, PolicySourceIdentity::new("embedded:policy-a")).unwrap();
 
         assert!(matches!(
-            load_endpoint_closure(None, parsed, source.as_bytes()),
+            load_endpoint_closure(None, parsed, source.as_bytes(), None),
             Err(EndpointClosureError::WrongDocumentKind)
         ));
     }

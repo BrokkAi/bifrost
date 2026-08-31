@@ -575,6 +575,7 @@ pub struct ScalaAnalyzer {
     referencing_files: Cache<ProjectFile, Arc<HashSet<ProjectFile>>>,
     direct_ancestors: Cache<CodeUnit, Arc<Vec<CodeUnit>>>,
     reverse_import_index: Arc<PoolSafeMemo<HashMap<ProjectFile, Arc<HashSet<ProjectFile>>>>>,
+    file_dependency_index: Arc<OnceLock<imports::ScalaFileDependencyIndex>>,
     importable_declarations_by_package: Arc<OnceLock<HashMap<String, Arc<Vec<CodeUnit>>>>>,
     package_namespaces: Arc<OnceLock<Vec<String>>>,
     same_package_reference_index:
@@ -816,6 +817,7 @@ impl ScalaAnalyzer {
         let mut clone = self.clone();
         clone.inner = clone.inner.clone_with_project(project);
         clone.external_index = Arc::new(OnceLock::new());
+        clone.file_dependency_index = Arc::new(OnceLock::new());
         clone.project_types = Arc::new(OnceLock::new());
         clone.full_usage_edges =
             build_weighted_cache(self.memo_budget / 8, weight_scala_usage_edges);
@@ -853,6 +855,7 @@ impl ScalaAnalyzer {
             referencing_files: build_weighted_cache(memo_budget / 8, weight_project_file_set),
             direct_ancestors: build_weighted_cache(memo_budget / 8, weight_code_unit_vec_by_unit),
             reverse_import_index: Arc::new(PoolSafeMemo::new()),
+            file_dependency_index: Arc::new(OnceLock::new()),
             importable_declarations_by_package: Arc::new(OnceLock::new()),
             package_namespaces: Arc::new(OnceLock::new()),
             same_package_reference_index: Arc::new(PoolSafeMemo::new()),
@@ -1711,6 +1714,15 @@ impl IAnalyzer for ScalaAnalyzer {
         self.external_index.get().is_some()
     }
 
+    fn external_dispatch_behavior_identity(
+        &self,
+    ) -> Option<crate::analyzer::semantic::StableDigest> {
+        Some(
+            self.external_declaration_index()
+                .dispatch_behavior_identity(),
+        )
+    }
+
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
         let external_index = if changed_files.iter().any(is_jvm_dependency_input) {
             Arc::new(OnceLock::new())
@@ -2113,6 +2125,15 @@ class Use(api: Api) { def call(): Int = api.choose(1) }
             disk.project_types.get().is_some(),
             "disk cache should be warm"
         );
+        disk.prefetch_file_dependency_targets(
+            &disk.analyzed_files(),
+            None,
+            &crate::CancellationToken::new(),
+        );
+        assert!(
+            disk.file_dependency_index.get().is_some(),
+            "disk file-dependency index should be warm"
+        );
 
         let overlay_source = r#"package app
 // This overlay shifts every exact declaration range and changes the callable shape.
@@ -2125,6 +2146,10 @@ class Use(api: Api) { def call(): Int = api.choose(1)("overlay") }
         assert!(
             snapshot.project_types.get().is_none(),
             "an overlay clone needs an independent source-facts generation"
+        );
+        assert!(
+            snapshot.file_dependency_index.get().is_none(),
+            "an overlay clone needs an independent file-dependency index"
         );
         let overlay_target = snapshot
             .get_definitions("app.Api.choose")

@@ -2105,6 +2105,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 callee,
                 receiver,
                 arguments: argument_values.into_boxed_slice(),
+                normal_results: Box::new([]),
                 result: Some(result),
                 thrown: Some(thrown),
                 declared_targets: resolution.clone(),

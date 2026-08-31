@@ -2831,9 +2831,12 @@ where
             let summary = &self.summaries[summary_id];
             let transfer = self.cached_incoming_transfer(incoming)?;
             let projection = match summary.exit.project_matched_return(transfer)? {
-                MatchedReturnProjection::Edge(edge) => CachedMatchedReturnProjection::Edge(
-                    Arc::new(SummaryEdge::from_owned_procedure_edge(edge)),
-                ),
+                MatchedReturnProjection::Edge {
+                    edge,
+                    implicit_abort_only,
+                } => CachedMatchedReturnProjection::Edge(Arc::new(
+                    SummaryEdge::from_matched_return(edge, implicit_abort_only),
+                )),
                 MatchedReturnProjection::Absent => CachedMatchedReturnProjection::Absent,
                 MatchedReturnProjection::Boundary(boundary) => {
                     CachedMatchedReturnProjection::Boundary(boundary)

@@ -1111,6 +1111,14 @@ fn run_policy_mode(request: PolicyModeRequest, policy_inputs: &[PolicyEvaluation
             return POLICY_EXIT_UNRELIABLE;
         }
     };
+    if brokk_bifrost::profiling::enabled() {
+        for timing in outcome.stage_attribution() {
+            brokk_bifrost::profiling::duration(
+                format!("policy.stage.{:?}", timing.stage()),
+                std::time::Duration::from_millis(timing.elapsed_ms()),
+            );
+        }
+    }
     if request.accept_current {
         // Only a clean status (reliable, exhaustive, nothing gating under the
         // forced fail-on Never) may define a baseline; an unreliable run is
@@ -1473,12 +1481,12 @@ OPTIONS:
                            Root and nested .bifrostignore files exclude matching tracked or
                            untracked files from code intelligence, but not file-level tools.
     --diff-snapshot-object-dir DIR
-                           Trusted Git objects directory for immutable analyze_diff endpoints;
+                           Trusted Git objects directory for immutable diff-tool endpoints;
                            valid only with --tool and MCP server modes.
     --args JSON            Inline JSON arguments for --tool, e.g. '{"patterns":["MyClass"]}'.
                            File path arguments may use <commit-ish>:<path> in --tool mode.
-                           Required for tools that take arguments; omit for those that don't
-                           (defaults to {}, which suits e.g. get_active_workspace).
+                           Optional; omission supplies {}, which suits get_active_workspace and
+                           the default diff-tool worktree comparison.
     --query-file PATH      Run a workspace-relative .rql or .json CodeQuery directly.
     --sources PATH         Restrict one-shot --tool workspace construction to selected files,
                            directories, or globs. Repeatable; valid only with --tool. Explicit
@@ -1541,7 +1549,7 @@ OPTIONS:
 
 MCP TOOLSETS (--mcp):
     searchtools   every toolset below
-    core          symbol + workspace (the set agents typically connect to)
+    core          symbol + workspace + diff (the set agents typically connect to)
 "#;
     print!("{top}");
 

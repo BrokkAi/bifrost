@@ -22,8 +22,7 @@ use crate::analyzer::js_ts::clones::build_js_ts_clone_candidate_data;
 use crate::analyzer::js_ts::diagnostics::collect_typescript_semantic_diagnostics;
 use crate::analyzer::js_ts::providers::{self, JsTsMemoSource};
 use crate::analyzer::js_ts::{
-    path_contains_tests as js_ts_path_contains_tests,
-    source_contains_tests as js_ts_source_contains_tests,
+    contains_tests as js_ts_contains_tests, path_contains_tests as js_ts_path_contains_tests,
     synthesize_hydrated_module as synthesize_js_ts_hydrated_module_unit,
     synthesize_summary_module as synthesize_js_ts_summary_module_unit,
 };
@@ -51,7 +50,21 @@ impl crate::analyzer::LanguageAdapter for TypescriptAdapter {
         TYPESCRIPT_QUERY_DIRECTORY
     }
 
+    /// The `.ts`/`.tsx` split applies only to files whose OWN language is
+    /// TypeScript. Every other file must answer its own language's key, as
+    /// the trait contract (`LanguageAdapter::storage_language_key_for_file`)
+    /// and the cpp override demand: the cross-adapter guards
+    /// (`storage_key_and_generation`, #1189/#1805) discriminate on that
+    /// answer. Returning "typescript:ts" for a foreign file (say a `.rb`
+    /// file) arms those guards with this adapter's own key, so a
+    /// request-scoped cross-language lookup that reaches this analyzer with
+    /// the foreign file parses and persists it as TypeScript, and the
+    /// phantom units flip same-name resolution session-wide (#2748).
     fn storage_language_key_for_file(&self, file: &ProjectFile) -> &'static str {
+        let own_language = file_language(file);
+        if own_language != Language::TypeScript {
+            return own_language.config_label();
+        }
         if file.rel_path().extension().is_some_and(|ext| ext == "tsx") {
             "typescript:tsx"
         } else {
@@ -92,11 +105,11 @@ impl crate::analyzer::LanguageAdapter for TypescriptAdapter {
         &self,
         state: &crate::analyzer::tree_sitter_analyzer::FileState,
     ) -> bool {
-        js_ts_source_contains_tests(&state.source)
+        state.contains_tests
     }
 
-    fn hydrate_contains_tests(&self, stored: bool, file: &ProjectFile, source: &str) -> bool {
-        stored || js_ts_path_contains_tests(file) || js_ts_source_contains_tests(source)
+    fn hydrate_contains_tests(&self, stored: bool, file: &ProjectFile, _source: &str) -> bool {
+        stored || js_ts_path_contains_tests(file)
     }
 
     fn synthesize_hydrated_units(
@@ -145,7 +158,7 @@ impl crate::analyzer::LanguageAdapter for TypescriptAdapter {
         _tree: &Tree,
         _parsed: &crate::analyzer::tree_sitter_analyzer::ParsedFile,
     ) -> bool {
-        js_ts_path_contains_tests(file) || js_ts_source_contains_tests(source)
+        js_ts_contains_tests(file, source, _tree)
     }
 
     fn parse_file(
@@ -382,6 +395,13 @@ impl TypescriptAnalyzer {
 }
 
 impl ImportAnalysisProvider for TypescriptAnalyzer {
+    fn file_dependency_facts_for_files(
+        &self,
+        files: &[ProjectFile],
+    ) -> Option<crate::hash::HashMap<ProjectFile, crate::analyzer::FileDependencyFacts>> {
+        Some(self.inner.bulk_file_dependency_facts(files.iter().cloned()))
+    }
+
     fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();
@@ -901,5 +921,22 @@ impl crate::analyzer::AnalyzerTestHooks for TypescriptAnalyzer {
 
     fn workspace_path_scan_count_for_test(&self) -> usize {
         self.inner.test_hooks().workspace_path_scan_count_for_test()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analyzer::tree_sitter_analyzer::LanguageAdapter;
+
+    #[test]
+    fn hydration_uses_persisted_facts_and_path_conventions_only() {
+        let production = ProjectFile::new("/tmp/project", "src/runtime.ts");
+        let test_file = ProjectFile::new("/tmp/project", "test/parallel/test-runtime.ts");
+        let source = r#"test("runtime", () => {});"#;
+
+        assert!(!TypescriptAdapter.hydrate_contains_tests(false, &production, source));
+        assert!(TypescriptAdapter.hydrate_contains_tests(true, &production, ""));
+        assert!(!TypescriptAdapter.hydrate_contains_tests(false, &test_file, ""));
     }
 }

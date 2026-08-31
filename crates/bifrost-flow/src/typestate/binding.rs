@@ -22,10 +22,11 @@ use super::{
     TypestateProtocolHash,
 };
 
-pub const BINDING_PLAN_SCHEMA_VERSION: u32 = 1;
+pub const BINDING_PLAN_SCHEMA_VERSION: u32 = 3;
 pub const MAX_TYPESTATE_SUBJECTS: usize = 4_096;
 pub const MAX_TYPESTATE_INITIAL_SEEDS: usize = 4_096;
 pub const MAX_TYPESTATE_EVENT_BINDINGS: usize = 16_384;
+pub const MAX_TYPESTATE_CALL_NONINTERFERENCE_BINDINGS: usize = 16_384;
 pub const MAX_TYPESTATE_TERMINAL_BINDINGS: usize = 4_096;
 pub const MAX_TYPESTATE_CONTEXT_DEPTH: usize = 64;
 pub const MAX_TYPESTATE_SUBJECT_CLASS_BYTES: usize = 128;
@@ -76,6 +77,7 @@ pub enum TypestateProcedurePortKey {
     Receiver,
     Parameter { ordinal: u32 },
     NormalReturn,
+    IndexedNormalReturn { ordinal: u32 },
     ExceptionalReturn,
     Capture { identity: SemanticLocator },
 }
@@ -445,6 +447,14 @@ impl BoundTypestateSubjectSpec {
     pub fn key(&self) -> &TypestateSubjectKey {
         &self.key
     }
+
+    pub fn mark_discovery_incomplete(&mut self, reason: impl Into<Box<str>>) {
+        self.quality = TypestateBindingQuality::new(
+            self.quality.proof.clone(),
+            EvidenceCompleteness::Partial(reason.into()),
+            self.quality.multiplicity,
+        );
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -452,8 +462,10 @@ pub struct TypestateInitialSeedSpec {
     subject: TypestateSubjectKey,
     state: ProtocolStateKey,
     site: TypestateObservationSite,
+    activation_edge: Option<crate::analyzer::semantic::ControlEdgeHandle>,
     role: TypestateObjectRole,
     quality: TypestateBindingQuality,
+    reviewed_fresh_result: bool,
 }
 
 impl TypestateInitialSeedSpec {
@@ -468,8 +480,66 @@ impl TypestateInitialSeedSpec {
             subject,
             state,
             site,
+            activation_edge: None,
             role,
             quality,
+            reviewed_fresh_result: false,
+        }
+    }
+
+    pub fn new_on_control_edge(
+        subject: TypestateSubjectKey,
+        state: ProtocolStateKey,
+        site: TypestateObservationSite,
+        activation_edge: crate::analyzer::semantic::ControlEdgeHandle,
+        role: TypestateObjectRole,
+        quality: TypestateBindingQuality,
+    ) -> Self {
+        Self {
+            subject,
+            state,
+            site,
+            activation_edge: Some(activation_edge),
+            role,
+            quality,
+            reviewed_fresh_result: false,
+        }
+    }
+
+    pub fn new_reviewed_fresh_result(
+        subject: TypestateSubjectKey,
+        state: ProtocolStateKey,
+        site: TypestateObservationSite,
+        role: TypestateObjectRole,
+        quality: TypestateBindingQuality,
+    ) -> Self {
+        Self {
+            subject,
+            state,
+            site,
+            activation_edge: None,
+            role,
+            quality,
+            reviewed_fresh_result: true,
+        }
+    }
+
+    pub fn new_reviewed_fresh_result_on_control_edge(
+        subject: TypestateSubjectKey,
+        state: ProtocolStateKey,
+        site: TypestateObservationSite,
+        activation_edge: crate::analyzer::semantic::ControlEdgeHandle,
+        role: TypestateObjectRole,
+        quality: TypestateBindingQuality,
+    ) -> Self {
+        Self {
+            subject,
+            state,
+            site,
+            activation_edge: Some(activation_edge),
+            role,
+            quality,
+            reviewed_fresh_result: true,
         }
     }
 }
@@ -482,6 +552,28 @@ pub struct TypestateEventBindingSpec {
     order: u32,
     role: TypestateObjectRole,
     quality: TypestateBindingQuality,
+    modeled_external_effect: Option<String>,
+}
+
+/// A compiler-proven fact that one call cannot reach one live typestate
+/// subject through its receiver, arguments, or any unreviewed prior
+/// publication of that fresh object.
+#[derive(Debug, Clone)]
+pub struct TypestateCallNonInterferenceSpec {
+    subject: TypestateSubjectKey,
+    site: TypestateObservationSite,
+}
+
+impl TypestateCallNonInterferenceSpec {
+    pub fn new(
+        subject: TypestateSubjectKey,
+        call: crate::analyzer::semantic::CallSiteHandle,
+    ) -> Self {
+        Self {
+            subject,
+            site: TypestateObservationSite::call_site(call, TypestateBindingContext::root()),
+        }
+    }
 }
 
 impl TypestateEventBindingSpec {
@@ -500,6 +592,31 @@ impl TypestateEventBindingSpec {
             order,
             role,
             quality,
+            modeled_external_effect: None,
+        }
+    }
+
+    pub fn new_modeled_external_effect(
+        event: ProtocolEventKey,
+        subject: TypestateSubjectKey,
+        site: TypestateObservationSite,
+        order: u32,
+        role: TypestateObjectRole,
+        quality: TypestateBindingQuality,
+        effect_id: String,
+    ) -> Self {
+        assert!(
+            !effect_id.is_empty(),
+            "modeled external effect id is non-empty"
+        );
+        Self {
+            event,
+            subject,
+            site,
+            order,
+            role,
+            quality,
+            modeled_external_effect: Some(effect_id),
         }
     }
 }
@@ -570,8 +687,10 @@ pub struct BoundTypestateInitialSeed {
     subject: TypestateSubjectId,
     state: ProtocolStateId,
     site: TypestateObservationSite,
+    activation_edge: Option<crate::analyzer::semantic::ControlEdgeHandle>,
     role: TypestateObjectRole,
     quality: TypestateBindingQuality,
+    reviewed_fresh_result: bool,
 }
 
 impl BoundTypestateInitialSeed {
@@ -587,12 +706,20 @@ impl BoundTypestateInitialSeed {
         &self.site
     }
 
+    pub fn activation_edge(&self) -> Option<&crate::analyzer::semantic::ControlEdgeHandle> {
+        self.activation_edge.as_ref()
+    }
+
     pub const fn role(&self) -> TypestateObjectRole {
         self.role
     }
 
     pub fn quality(&self) -> &TypestateBindingQuality {
         &self.quality
+    }
+
+    pub const fn reviewed_fresh_result(&self) -> bool {
+        self.reviewed_fresh_result
     }
 }
 
@@ -605,6 +732,7 @@ pub struct BoundTypestateEvent {
     order: u32,
     role: TypestateObjectRole,
     quality: TypestateBindingQuality,
+    modeled_external_effect: Option<String>,
 }
 
 impl BoundTypestateEvent {
@@ -634,6 +762,26 @@ impl BoundTypestateEvent {
 
     pub fn quality(&self) -> &TypestateBindingQuality {
         &self.quality
+    }
+
+    pub fn modeled_external_effect(&self) -> Option<&str> {
+        self.modeled_external_effect.as_deref()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BoundTypestateCallNonInterference {
+    subject: TypestateSubjectId,
+    site: TypestateObservationSite,
+}
+
+impl BoundTypestateCallNonInterference {
+    pub const fn subject(&self) -> TypestateSubjectId {
+        self.subject
+    }
+
+    pub fn site(&self) -> &TypestateObservationSite {
+        &self.site
     }
 }
 
@@ -679,6 +827,7 @@ pub struct TypestateBindingPlan {
     subjects: Box<[BoundTypestateSubject]>,
     initial_seeds: Box<[BoundTypestateInitialSeed]>,
     event_bindings: Box<[BoundTypestateEvent]>,
+    call_noninterference_bindings: Box<[BoundTypestateCallNonInterference]>,
     terminal_bindings: Box<[BoundTypestateTerminal]>,
     subject_by_object:
         HashMap<TypestateSubjectClassKey, HashMap<AbstractObject, TypestateSubjectId>>,
@@ -696,6 +845,8 @@ pub struct TypestateBindingPlan {
     events_by_point_all_contexts: HashMap<ProgramPointHandle, Box<[usize]>>,
     events_by_call_all_contexts: HashMap<crate::analyzer::semantic::CallSiteHandle, Box<[usize]>>,
     events_by_call_point_all_contexts: HashMap<ProgramPointHandle, Box<[usize]>>,
+    call_noninterference_by_call: SubjectIndexByCall,
+    call_noninterference_by_point: SubjectIndexByPoint,
     terminals_by_point_all_contexts: HashMap<ProgramPointHandle, Box<[usize]>>,
     terminals_by_call_all_contexts:
         HashMap<crate::analyzer::semantic::CallSiteHandle, Box<[usize]>>,
@@ -708,12 +859,34 @@ pub struct TypestateBindingPlan {
     empty_summary_hash: TypestateBindingSummaryHash,
 }
 
+type SubjectIndexByCall =
+    HashMap<crate::analyzer::semantic::CallSiteHandle, Box<[TypestateSubjectId]>>;
+type SubjectIndexByPoint = HashMap<ProgramPointHandle, Box<[TypestateSubjectId]>>;
+
 impl TypestateBindingPlan {
     pub fn try_new(
+        protocol: &CompiledProtocol,
+        subjects: Vec<BoundTypestateSubjectSpec>,
+        initial_seeds: Vec<TypestateInitialSeedSpec>,
+        event_bindings: Vec<TypestateEventBindingSpec>,
+        terminal_bindings: Vec<TypestateTerminalBindingSpec>,
+    ) -> Result<Self, TypestateBindingPlanError> {
+        Self::try_new_with_call_noninterference(
+            protocol,
+            subjects,
+            initial_seeds,
+            event_bindings,
+            Vec::new(),
+            terminal_bindings,
+        )
+    }
+
+    pub fn try_new_with_call_noninterference(
         protocol: &CompiledProtocol,
         mut subjects: Vec<BoundTypestateSubjectSpec>,
         mut initial_seeds: Vec<TypestateInitialSeedSpec>,
         mut event_bindings: Vec<TypestateEventBindingSpec>,
+        mut call_noninterference_bindings: Vec<TypestateCallNonInterferenceSpec>,
         mut terminal_bindings: Vec<TypestateTerminalBindingSpec>,
     ) -> Result<Self, TypestateBindingPlanError> {
         check_count("subjects", subjects.len(), MAX_TYPESTATE_SUBJECTS)?;
@@ -726,6 +899,11 @@ impl TypestateBindingPlan {
             "event_bindings",
             event_bindings.len(),
             MAX_TYPESTATE_EVENT_BINDINGS,
+        )?;
+        check_count(
+            "call_noninterference_bindings",
+            call_noninterference_bindings.len(),
+            MAX_TYPESTATE_CALL_NONINTERFERENCE_BINDINGS,
         )?;
         check_count(
             "terminal_bindings",
@@ -755,6 +933,12 @@ impl TypestateBindingPlan {
         {
             return Err(TypestateBindingPlanError::ConflictingEventOrder);
         }
+        call_noninterference_bindings.sort_by(compare_call_noninterference_specs);
+        reject_adjacent_duplicates(
+            &call_noninterference_bindings,
+            compare_call_noninterference_specs,
+            TypestateBindingPlanError::DuplicateCallNonInterferenceBinding,
+        )?;
         terminal_bindings.sort_by(compare_terminal_specs);
         reject_adjacent_duplicates(
             &terminal_bindings,
@@ -792,13 +976,15 @@ impl TypestateBindingPlan {
             let state = protocol
                 .state_id(&seed.state)
                 .ok_or(TypestateBindingPlanError::UnknownState)?;
-            validate_seed_site(&seed.site)?;
+            validate_seed_site(&seed.site, seed.activation_edge.as_ref())?;
             compiled_seeds.push(BoundTypestateInitialSeed {
                 subject,
                 state,
                 site: seed.site.clone(),
+                activation_edge: seed.activation_edge.clone(),
                 role: seed.role,
                 quality: seed.quality.clone(),
+                reviewed_fresh_result: seed.reviewed_fresh_result,
             });
         }
 
@@ -823,6 +1009,20 @@ impl TypestateBindingPlan {
                 order: binding.order,
                 role: binding.role,
                 quality: binding.quality.clone(),
+                modeled_external_effect: binding.modeled_external_effect.clone(),
+            });
+        }
+
+        let mut compiled_call_noninterference =
+            Vec::with_capacity(call_noninterference_bindings.len());
+        for binding in &call_noninterference_bindings {
+            let subject = subject_id(&subject_ids, &binding.subject)?;
+            if binding.site.call_site_handle().is_none() {
+                return Err(TypestateBindingPlanError::InvalidCallNonInterferenceSite);
+            }
+            compiled_call_noninterference.push(BoundTypestateCallNonInterference {
+                subject,
+                site: binding.site.clone(),
             });
         }
 
@@ -868,8 +1068,10 @@ impl TypestateBindingPlan {
                     subject: canonical_subject_key(&seed.subject),
                     state: seed.state.as_str(),
                     site: canonical_site(&seed.site),
+                    activation_edge: seed.activation_edge.as_ref().map(canonical_activation_edge),
                     role: seed.role,
                     quality: canonical_quality(&seed.quality),
+                    reviewed_fresh_result: seed.reviewed_fresh_result,
                 })
                 .collect(),
             event_bindings: event_bindings
@@ -881,6 +1083,14 @@ impl TypestateBindingPlan {
                     order: binding.order,
                     role: binding.role,
                     quality: canonical_quality(&binding.quality),
+                    modeled_external_effect: binding.modeled_external_effect.as_deref(),
+                })
+                .collect(),
+            call_noninterference_bindings: call_noninterference_bindings
+                .iter()
+                .map(|binding| CanonicalCallNonInterferenceBinding {
+                    subject: canonical_subject_key(&binding.subject),
+                    site: canonical_site(&binding.site),
                 })
                 .collect(),
             terminal_bindings: terminal_bindings
@@ -904,6 +1114,7 @@ impl TypestateBindingPlan {
             &subjects,
             &initial_seeds,
             &event_bindings,
+            &call_noninterference_bindings,
             &terminal_bindings,
         )
         .map_err(TypestateBindingPlanError::Canonicalization)?;
@@ -918,9 +1129,11 @@ impl TypestateBindingPlan {
         }
         let event_indexes = index_sites(&compiled_events, |binding| &binding.site);
         let terminal_indexes = index_sites(&compiled_terminals, |binding| &binding.site);
-        let initial_seed_indexes = index_point_sites(&compiled_seeds, |binding| &binding.site);
+        let initial_seed_indexes = index_initial_seed_points(&compiled_seeds);
         let event_call_point_indexes =
             index_call_point_sites(&compiled_events, |binding| &binding.site);
+        let (call_noninterference_by_call, call_noninterference_by_point) =
+            index_call_noninterference(&compiled_call_noninterference);
         let terminal_call_point_indexes =
             index_call_point_sites(&compiled_terminals, |binding| &binding.site);
 
@@ -929,6 +1142,7 @@ impl TypestateBindingPlan {
             subjects: compiled_subjects.into_boxed_slice(),
             initial_seeds: compiled_seeds.into_boxed_slice(),
             event_bindings: compiled_events.into_boxed_slice(),
+            call_noninterference_bindings: compiled_call_noninterference.into_boxed_slice(),
             terminal_bindings: compiled_terminals.into_boxed_slice(),
             subject_by_object,
             events_by_point: event_indexes.points,
@@ -939,6 +1153,8 @@ impl TypestateBindingPlan {
             events_by_point_all_contexts: event_indexes.all_points,
             events_by_call_all_contexts: event_indexes.all_calls,
             events_by_call_point_all_contexts: event_call_point_indexes,
+            call_noninterference_by_call,
+            call_noninterference_by_point,
             terminals_by_point_all_contexts: terminal_indexes.all_points,
             terminals_by_call_all_contexts: terminal_indexes.all_calls,
             terminals_by_call_point_all_contexts: terminal_call_point_indexes,
@@ -969,6 +1185,11 @@ impl TypestateBindingPlan {
             .map(BoundTypestateInitialSeed::site)
             .chain(self.event_bindings.iter().map(BoundTypestateEvent::site))
             .chain(
+                self.call_noninterference_bindings
+                    .iter()
+                    .map(BoundTypestateCallNonInterference::site),
+            )
+            .chain(
                 self.terminal_bindings
                     .iter()
                     .map(BoundTypestateTerminal::site),
@@ -990,6 +1211,11 @@ impl TypestateBindingPlan {
             .iter()
             .map(BoundTypestateInitialSeed::site)
             .chain(self.event_bindings.iter().map(BoundTypestateEvent::site))
+            .chain(
+                self.call_noninterference_bindings
+                    .iter()
+                    .map(BoundTypestateCallNonInterference::site),
+            )
             .chain(
                 self.terminal_bindings
                     .iter()
@@ -1044,6 +1270,23 @@ impl TypestateBindingPlan {
 
     pub fn event_binding(&self, id: TypestateEventBindingId) -> Option<&BoundTypestateEvent> {
         self.event_bindings.get(id.index())
+    }
+
+    pub fn call_noninterference_bindings(&self) -> &[BoundTypestateCallNonInterference] {
+        &self.call_noninterference_bindings
+    }
+
+    pub fn call_is_proven_noninterfering(
+        &self,
+        subject: TypestateSubjectId,
+        origin: Option<&crate::analyzer::semantic::CallSiteHandle>,
+        point: &ProgramPointHandle,
+    ) -> bool {
+        let subjects = match origin {
+            Some(call) => self.call_noninterference_by_call.get(call),
+            None => self.call_noninterference_by_point.get(point),
+        };
+        subjects.is_some_and(|subjects| subjects.binary_search(&subject).is_ok())
     }
 
     pub fn terminal_bindings(&self) -> &[BoundTypestateTerminal] {
@@ -1283,12 +1526,14 @@ pub enum TypestateBindingPlanError {
     DuplicateInitialSeed,
     DuplicateEventBinding,
     ConflictingEventOrder,
+    DuplicateCallNonInterferenceBinding,
     DuplicateTerminalBinding,
     UnknownSubject,
     UnknownState,
     UnknownEvent,
     UnknownExpectation,
     InvalidSeedSite,
+    InvalidCallNonInterferenceSite,
     InvalidObservationShape,
     Canonicalization(serde_json::Error),
 }
@@ -1320,6 +1565,8 @@ impl fmt::Display for TypestateBindingPlanError {
             Self::ConflictingEventOrder => formatter.write_str(
                 "binding plan assigns more than one event to the same subject/site order",
             ),
+            Self::DuplicateCallNonInterferenceBinding => formatter
+                .write_str("binding plan contains a duplicate call non-interference binding"),
             Self::DuplicateTerminalBinding => {
                 formatter.write_str("binding plan contains a duplicate terminal binding")
             }
@@ -1334,6 +1581,8 @@ impl fmt::Display for TypestateBindingPlanError {
             Self::InvalidSeedSite => formatter.write_str(
                 "initial seeds must bind one object at a program point before propagation",
             ),
+            Self::InvalidCallNonInterferenceSite => formatter
+                .write_str("call non-interference bindings must retain one exact call site"),
             Self::InvalidObservationShape => formatter.write_str(
                 "binding site or object role is incompatible with the protocol observation",
             ),
@@ -1354,12 +1603,14 @@ impl std::error::Error for TypestateBindingPlanError {
             | Self::DuplicateInitialSeed
             | Self::DuplicateEventBinding
             | Self::ConflictingEventOrder
+            | Self::DuplicateCallNonInterferenceBinding
             | Self::DuplicateTerminalBinding
             | Self::UnknownSubject
             | Self::UnknownState
             | Self::UnknownEvent
             | Self::UnknownExpectation
             | Self::InvalidSeedSite
+            | Self::InvalidCallNonInterferenceSite
             | Self::InvalidObservationShape => None,
         }
     }
@@ -1446,6 +1697,9 @@ fn procedure_port_key(port: DurablePortIdentity) -> TypestateProcedurePortKey {
             TypestateProcedurePortKey::Parameter { ordinal }
         }
         DurablePortIdentity::NormalReturn => TypestateProcedurePortKey::NormalReturn,
+        DurablePortIdentity::IndexedNormalReturn { ordinal } => {
+            TypestateProcedurePortKey::IndexedNormalReturn { ordinal }
+        }
         DurablePortIdentity::ExceptionalReturn => TypestateProcedurePortKey::ExceptionalReturn,
         DurablePortIdentity::Capture { locator, .. } => {
             TypestateProcedurePortKey::Capture { identity: locator }
@@ -1483,12 +1737,17 @@ fn source_locator(
         .clone()
 }
 
-fn validate_seed_site(site: &TypestateObservationSite) -> Result<(), TypestateBindingPlanError> {
-    if matches!(site, TypestateObservationSite::ProgramPoint { .. }) {
-        Ok(())
-    } else {
-        Err(TypestateBindingPlanError::InvalidSeedSite)
+fn validate_seed_site(
+    site: &TypestateObservationSite,
+    activation_edge: Option<&crate::analyzer::semantic::ControlEdgeHandle>,
+) -> Result<(), TypestateBindingPlanError> {
+    let TypestateObservationSite::ProgramPoint { point, .. } = site else {
+        return Err(TypestateBindingPlanError::InvalidSeedSite);
+    };
+    if activation_edge.is_some_and(|edge| edge.procedure() != point.procedure()) {
+        return Err(TypestateBindingPlanError::InvalidSeedSite);
     }
+    Ok(())
 }
 
 fn validate_terminal_exit(
@@ -1623,7 +1882,26 @@ fn compare_seed_specs(
         .cmp(&right.subject)
         .then_with(|| left.state.cmp(&right.state))
         .then_with(|| compare_sites(&left.site, &right.site))
+        .then_with(|| {
+            compare_activation_edges(
+                left.activation_edge.as_ref(),
+                right.activation_edge.as_ref(),
+            )
+        })
         .then_with(|| left.role.cmp(&right.role))
+        .then_with(|| left.reviewed_fresh_result.cmp(&right.reviewed_fresh_result))
+}
+
+fn compare_activation_edges(
+    left: Option<&crate::analyzer::semantic::ControlEdgeHandle>,
+    right: Option<&crate::analyzer::semantic::ControlEdgeHandle>,
+) -> Ordering {
+    match (left, right) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
+        (Some(left), Some(right)) => left.durable_key().cmp(&right.durable_key()),
+    }
 }
 
 fn compare_event_specs(
@@ -1635,6 +1913,10 @@ fn compare_event_specs(
         .then_with(|| left.subject.cmp(&right.subject))
         .then_with(|| left.event.cmp(&right.event))
         .then_with(|| left.role.cmp(&right.role))
+        .then_with(|| {
+            left.modeled_external_effect
+                .cmp(&right.modeled_external_effect)
+        })
 }
 
 fn compare_event_order_keys(
@@ -1644,6 +1926,13 @@ fn compare_event_order_keys(
     compare_sites(&left.site, &right.site)
         .then_with(|| left.order.cmp(&right.order))
         .then_with(|| left.subject.cmp(&right.subject))
+}
+
+fn compare_call_noninterference_specs(
+    left: &TypestateCallNonInterferenceSpec,
+    right: &TypestateCallNonInterferenceSpec,
+) -> Ordering {
+    compare_sites(&left.site, &right.site).then_with(|| left.subject.cmp(&right.subject))
 }
 
 fn compare_terminal_specs(
@@ -1717,15 +2006,30 @@ fn index_sites<T>(values: &[T], site: impl Fn(&T) -> &TypestateObservationSite) 
     }
 }
 
-fn index_point_sites<T>(
-    values: &[T],
-    site: impl Fn(&T) -> &TypestateObservationSite,
+fn index_initial_seed_points(
+    seeds: &[BoundTypestateInitialSeed],
 ) -> HashMap<ProgramPointHandle, Box<[usize]>> {
     let mut indexes = HashMap::<ProgramPointHandle, Vec<usize>>::new();
-    for (index, value) in values.iter().enumerate() {
-        if let TypestateObservationSite::ProgramPoint { point, .. } = site(value) {
-            indexes.entry(point.clone()).or_default().push(index);
-        }
+    for (index, seed) in seeds.iter().enumerate() {
+        let point = match seed.activation_edge() {
+            Some(edge) => {
+                let row = edge
+                    .procedure()
+                    .semantics()
+                    .control_edge(edge.id())
+                    .expect("validated control-edge handles resolve");
+                edge.procedure()
+                    .point_handle(row.source_point)
+                    .expect("validated control edges retain source points")
+            }
+            None => match seed.site() {
+                TypestateObservationSite::ProgramPoint { point, .. } => point.clone(),
+                TypestateObservationSite::CallSite { .. } => {
+                    unreachable!("validated initial seeds use program-point observation sites")
+                }
+            },
+        };
+        indexes.entry(point).or_default().push(index);
     }
     indexes
         .into_iter()
@@ -1755,6 +2059,50 @@ fn index_call_point_sites<T>(
     indexes
         .into_iter()
         .map(|(point, indexes)| (point, indexes.into_boxed_slice()))
+        .collect()
+}
+
+fn index_call_noninterference(
+    bindings: &[BoundTypestateCallNonInterference],
+) -> (SubjectIndexByCall, SubjectIndexByPoint) {
+    let mut by_call = HashMap::<_, Vec<_>>::new();
+    let mut by_point = HashMap::<_, Vec<_>>::new();
+    for binding in bindings {
+        let call = binding
+            .site()
+            .call_site_handle()
+            .expect("validated non-interference bindings retain call sites");
+        let row = call
+            .procedure()
+            .semantics()
+            .call_site(call.id())
+            .expect("validated call-site handles resolve");
+        let point = call
+            .procedure()
+            .point_handle(row.point)
+            .expect("validated call sites retain program points");
+        by_call
+            .entry(call.clone())
+            .or_default()
+            .push(binding.subject());
+        by_point.entry(point).or_default().push(binding.subject());
+    }
+    (box_subject_indexes(by_call), box_subject_indexes(by_point))
+}
+
+fn box_subject_indexes<K>(
+    indexes: HashMap<K, Vec<TypestateSubjectId>>,
+) -> HashMap<K, Box<[TypestateSubjectId]>>
+where
+    K: Eq + std::hash::Hash,
+{
+    indexes
+        .into_iter()
+        .map(|(key, mut subjects)| {
+            subjects.sort_unstable();
+            subjects.dedup();
+            (key, subjects.into_boxed_slice())
+        })
         .collect()
 }
 
@@ -1830,6 +2178,7 @@ where
 struct ProcedureBindingIndexes {
     seeds: Vec<usize>,
     events: Vec<usize>,
+    call_noninterference: Vec<usize>,
     terminals: Vec<usize>,
 }
 
@@ -1843,6 +2192,7 @@ fn procedure_summary_hashes(
     subjects: &[BoundTypestateSubjectSpec],
     initial_seeds: &[TypestateInitialSeedSpec],
     event_bindings: &[TypestateEventBindingSpec],
+    call_noninterference_bindings: &[TypestateCallNonInterferenceSpec],
     terminal_bindings: &[TypestateTerminalBindingSpec],
 ) -> ProcedureBindingSummaryHashResult {
     type ProcedureKey = (SemanticArtifactKey, DeclarationLocator);
@@ -1861,6 +2211,13 @@ fn procedure_summary_hashes(
             .events
             .push(index);
     }
+    for (index, binding) in call_noninterference_bindings.iter().enumerate() {
+        indexes
+            .entry(summary_binding_procedure_key(&binding.site))
+            .or_default()
+            .call_noninterference
+            .push(index);
+    }
     for (index, terminal) in terminal_bindings.iter().enumerate() {
         indexes
             .entry(summary_binding_procedure_key(&terminal.site))
@@ -1875,6 +2232,7 @@ fn procedure_summary_hashes(
         subjects: Vec::new(),
         initial_seeds: Vec::new(),
         event_bindings: Vec::new(),
+        call_noninterference_bindings: Vec::new(),
         terminal_bindings: Vec::new(),
     };
     let empty_summary_hash =
@@ -1890,6 +2248,12 @@ fn procedure_summary_hashes(
                     .events
                     .iter()
                     .map(|index| &event_bindings[*index].subject),
+            )
+            .chain(
+                indexes
+                    .call_noninterference
+                    .iter()
+                    .map(|index| &call_noninterference_bindings[*index].subject),
             )
             .chain(
                 indexes
@@ -1921,8 +2285,13 @@ fn procedure_summary_hashes(
                         subject: canonical_subject_key(&seed.subject),
                         state: seed.state.as_str(),
                         site: canonical_site(&seed.site),
+                        activation_edge: seed
+                            .activation_edge
+                            .as_ref()
+                            .map(canonical_activation_edge),
                         role: seed.role,
                         quality: canonical_quality(&seed.quality),
+                        reviewed_fresh_result: seed.reviewed_fresh_result,
                     }
                 })
                 .collect(),
@@ -1938,6 +2307,18 @@ fn procedure_summary_hashes(
                         order: binding.order,
                         role: binding.role,
                         quality: canonical_quality(&binding.quality),
+                        modeled_external_effect: binding.modeled_external_effect.as_deref(),
+                    }
+                })
+                .collect(),
+            call_noninterference_bindings: indexes
+                .call_noninterference
+                .iter()
+                .map(|index| {
+                    let binding = &call_noninterference_bindings[*index];
+                    CanonicalCallNonInterferenceBinding {
+                        subject: canonical_subject_key(&binding.subject),
+                        site: canonical_site(&binding.site),
                     }
                 })
                 .collect(),
@@ -1986,6 +2367,7 @@ struct CanonicalBindingPlan<'a> {
     subjects: Vec<CanonicalSubject<'a>>,
     initial_seeds: Vec<CanonicalSeed<'a>>,
     event_bindings: Vec<CanonicalEventBinding<'a>>,
+    call_noninterference_bindings: Vec<CanonicalCallNonInterferenceBinding<'a>>,
     terminal_bindings: Vec<CanonicalTerminalBinding<'a>>,
 }
 
@@ -2049,6 +2431,7 @@ enum CanonicalProcedurePortKey<'a> {
     Receiver,
     Parameter { ordinal: u32 },
     NormalReturn,
+    IndexedNormalReturn { ordinal: u32 },
     ExceptionalReturn,
     Capture { identity: CanonicalLocator<'a> },
 }
@@ -2058,8 +2441,18 @@ struct CanonicalSeed<'a> {
     subject: CanonicalSubjectKey<'a>,
     state: &'a str,
     site: CanonicalSite<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    activation_edge: Option<CanonicalActivationEdge>,
     role: TypestateObjectRole,
     quality: CanonicalQuality,
+    reviewed_fresh_result: bool,
+}
+
+#[derive(Serialize)]
+struct CanonicalActivationEdge {
+    artifact: String,
+    procedure: u32,
+    edge: u32,
 }
 
 #[derive(Serialize)]
@@ -2070,6 +2463,14 @@ struct CanonicalEventBinding<'a> {
     order: u32,
     role: TypestateObjectRole,
     quality: CanonicalQuality,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    modeled_external_effect: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct CanonicalCallNonInterferenceBinding<'a> {
+    subject: CanonicalSubjectKey<'a>,
+    site: CanonicalSite<'a>,
 }
 
 #[derive(Serialize)]
@@ -2209,6 +2610,9 @@ fn canonical_procedure_port_key(key: &TypestateProcedurePortKey) -> CanonicalPro
             CanonicalProcedurePortKey::Parameter { ordinal: *ordinal }
         }
         TypestateProcedurePortKey::NormalReturn => CanonicalProcedurePortKey::NormalReturn,
+        TypestateProcedurePortKey::IndexedNormalReturn { ordinal } => {
+            CanonicalProcedurePortKey::IndexedNormalReturn { ordinal: *ordinal }
+        }
         TypestateProcedurePortKey::ExceptionalReturn => {
             CanonicalProcedurePortKey::ExceptionalReturn
         }
@@ -2224,6 +2628,16 @@ fn canonical_quality(quality: &TypestateBindingQuality) -> CanonicalQuality {
         completeness: quality.completeness.label(),
         coverage: coverage_label(quality.multiplicity.coverage),
         retained: quality.multiplicity.retained,
+    }
+}
+
+fn canonical_activation_edge(
+    edge: &crate::analyzer::semantic::ControlEdgeHandle,
+) -> CanonicalActivationEdge {
+    CanonicalActivationEdge {
+        artifact: edge.procedure().artifact().key().fingerprint().to_string(),
+        procedure: edge.procedure().id().get(),
+        edge: edge.id().get(),
     }
 }
 

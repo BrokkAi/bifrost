@@ -76,9 +76,9 @@ use selectors::{language_name, likely_file_target_extension};
 // external crate/pub surface below) and only referenced under `#[cfg(test)]`.
 #[cfg(test)]
 use scan_usages::{
-    ScanUsageRequest, ScanUsagesExecutionContext, ScanUsagesWorkEntry, SymbolUsageRenderState,
-    UsageHitRow, build_scan_usages_summary, classify_scan_usages_entry, function_like_macro_query,
-    scan_usages_by_location_with_context, usage_failure_hint,
+    ScanUsageRequest, ScanUsagesWorkEntry, SymbolUsageRenderState, UsageHitRow,
+    build_scan_usages_summary, classify_scan_usages_entry, function_like_macro_query,
+    usage_failure_hint,
 };
 #[cfg(test)]
 use selectors::{DefinitionCandidateRenderCache, definition_candidate_from_range};
@@ -138,12 +138,10 @@ pub use scan_usages::AmbiguousUsageCandidateDetail;
 pub use scan_usages::AmbiguousUsageSymbol;
 pub use scan_usages::ClassifyTestFilesParams;
 pub use scan_usages::ClassifyTestFilesResult;
-pub use scan_usages::SCAN_USAGES_MAX_DURATION_CEILING;
 pub use scan_usages::ScanUsagesAbsenceCaveat;
 pub use scan_usages::ScanUsagesByLocationParams;
 pub use scan_usages::ScanUsagesByReferenceParams;
 pub use scan_usages::ScanUsagesCandidateFilesSample;
-pub use scan_usages::ScanUsagesDurationClamp;
 pub use scan_usages::ScanUsagesEntry;
 pub use scan_usages::ScanUsagesIncompleteReason;
 pub use scan_usages::ScanUsagesInput;
@@ -171,11 +169,12 @@ pub use scan_usages::UsageGraphTruncatedSymbol;
 pub use scan_usages::UsageLocation;
 pub use scan_usages::UsageRendering;
 pub use scan_usages::classify_test_files;
+/// Shared with `diff_scoring`, whose verification group must classify a
+/// reference site's file exactly the way a usage scan does.
+pub(crate) use scan_usages::is_test_like_file;
 pub use scan_usages::scan_usages_by_location;
 pub use scan_usages::scan_usages_by_reference;
 pub use scan_usages::usage_graph;
-#[cfg(any(test, feature = "test-support"))]
-pub use scan_usages::{ScanUsagesTimeBudgetGuard, disable_time_budget_for_test};
 pub use scan_usages::{
     scan_usages_by_location_with_cancellation, scan_usages_by_reference_with_cancellation,
 };
@@ -221,6 +220,7 @@ pub use summaries::most_relevant_files_with_cancellation;
 #[allow(unused_imports)]
 pub(crate) use scan_usages::ScanUsagesSurface;
 pub use scan_usages::scan_usages_target_label;
+pub(crate) use scan_usages::{ScanUsagesExecutionContext, scan_usages_by_location_with_context};
 pub use sources::symbol_source_candidate_files;
 pub use summaries::summarize_files;
 

@@ -141,14 +141,7 @@ fn java_extends_testcase(node: Node<'_>, source: &str) -> bool {
     let Some(superclass) = node.child_by_field_name("superclass") else {
         return false;
     };
-    let text = compact_no_whitespace(node_text(superclass, source));
-    matches!(
-        text.as_str(),
-        "TestCase"
-            | "junit.framework.TestCase"
-            | "extendsTestCase"
-            | "extendsjunit.framework.TestCase"
-    )
+    final_identifier_text(superclass, source).is_some_and(|name| name.ends_with("TestCase"))
 }
 
 fn first_named_descendant<'tree>(node: Node<'tree>, kinds: &[&str]) -> Option<Node<'tree>> {
@@ -180,10 +173,6 @@ fn final_identifier_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str>
         }
     }
     last.filter(|text| !text.is_empty())
-}
-
-fn compact_no_whitespace(text: &str) -> String {
-    text.chars().filter(|ch| !ch.is_whitespace()).collect()
 }
 
 pub fn detect_test_assertion_smells_java(
@@ -781,4 +770,27 @@ struct PendingTestSmell<'a> {
     reasons: Vec<String>,
     excerpt_source: &'a str,
     start_byte: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn contains_tests(source: &str) -> bool {
+        let tree = parse_tree(source).expect("parse Java fixture");
+        java_source_contains_tests(tree.root_node(), source)
+    }
+
+    #[test]
+    fn recognizes_framework_specific_testcase_subclasses_structurally() {
+        assert!(contains_tests(
+            "class SSLServiceTests extends ESTestCase { void testReload() {} }"
+        ));
+        assert!(contains_tests(
+            "class LegacyTests extends framework.IntegrationTestCase {}"
+        ));
+        assert!(!contains_tests(
+            "class ProductionService extends UseCase {}"
+        ));
+    }
 }

@@ -2,12 +2,12 @@ use crate::analyzer::common::language_for_file;
 use crate::analyzer::jvm::realm_builder::jvm_source_realm;
 use crate::analyzer::store::StoreError;
 use crate::analyzer::{
-    AnalyzerConfig, AnalyzerStoreContext, BuildProgress, CSharpAnalyzer, CloneSmell,
-    CloneSmellWeights, CodeUnit, CommentDensityStats, CppAnalyzer, DeclarationInfo,
-    DefinitionLanguageScope, ExceptionHandlingAnalysis, ExceptionSmellWeights, GoAnalyzer,
-    IAnalyzer, ImportAnalysisProvider, ImportInfo, ImportReachability, JavaAnalyzer,
-    JavascriptAnalyzer, KotlinAnalyzer, Language, PhpAnalyzer, Project, ProjectFile,
-    PythonAnalyzer, Range, RelationalBatchError, RelationalBatchOutcome,
+    AdditionalFileDependencies, AnalyzerConfig, AnalyzerStoreContext, BuildProgress,
+    CSharpAnalyzer, CloneSmell, CloneSmellWeights, CodeUnit, CommentDensityStats, CppAnalyzer,
+    DeclarationInfo, DefinitionLanguageScope, ExceptionHandlingAnalysis, ExceptionSmellWeights,
+    FileDependencyFacts, GoAnalyzer, IAnalyzer, ImportAnalysisProvider, ImportInfo,
+    ImportReachability, JavaAnalyzer, JavascriptAnalyzer, KotlinAnalyzer, Language, PhpAnalyzer,
+    Project, ProjectFile, PythonAnalyzer, Range, RelationalBatchError, RelationalBatchOutcome,
     RelationalDefinitionRequest, RelationalDefinitionResult, RelationalDefinitionValue,
     RubyAnalyzer, RustAnalyzer, ScalaAnalyzer, SearchSymbolCandidates, SearchSymbolPatternBatch,
     SignatureMetadata, SummaryFileProjection, TestAssertionAnalysis, TestAssertionSmell,
@@ -691,6 +691,76 @@ impl ImportAnalysisProvider for MultiAnalyzer {
         any.then_some(out)
     }
 
+    fn file_dependency_facts_for_files(
+        &self,
+        files: &[ProjectFile],
+    ) -> Option<HashMap<ProjectFile, FileDependencyFacts>> {
+        if files.is_empty() {
+            return None;
+        }
+        let mut grouped: BTreeMap<Language, Vec<ProjectFile>> = BTreeMap::new();
+        for file in files {
+            grouped
+                .entry(self.dispatch_language(file))
+                .or_default()
+                .push(file.clone());
+        }
+        let mut out = HashMap::default();
+        let mut any = false;
+        for (language, group) in grouped {
+            let Some(provider) = self
+                .delegates
+                .get(&language)
+                .and_then(AnalyzerDelegate::import_analysis_provider)
+            else {
+                continue;
+            };
+            any = true;
+            if let Some(facts) = provider.file_dependency_facts_for_files(&group) {
+                out.extend(facts);
+            }
+        }
+        any.then_some(out)
+    }
+
+    fn additional_direct_file_dependencies(
+        &self,
+        files: &[ProjectFile],
+        cancellation: &crate::CancellationToken,
+    ) -> Option<AdditionalFileDependencies> {
+        let mut grouped: BTreeMap<Language, Vec<ProjectFile>> = BTreeMap::new();
+        for file in files {
+            grouped
+                .entry(self.dispatch_language(file))
+                .or_default()
+                .push(file.clone());
+        }
+        let mut out: HashMap<ProjectFile, HashSet<ProjectFile>> = HashMap::default();
+        let mut complete = true;
+        for (language, group) in grouped {
+            if cancellation.is_cancelled() {
+                return None;
+            }
+            let Some(provider) = self
+                .delegates
+                .get(&language)
+                .and_then(AnalyzerDelegate::import_analysis_provider)
+            else {
+                continue;
+            };
+            let outcome = provider.additional_direct_file_dependencies(&group, cancellation)?;
+            complete &= outcome.complete;
+            for (file, targets) in outcome.dependencies {
+                out.entry(file).or_default().extend(targets);
+            }
+        }
+        Some(if complete {
+            AdditionalFileDependencies::complete(out)
+        } else {
+            AdditionalFileDependencies::incomplete(out)
+        })
+    }
+
     fn relevant_imports_for(&self, code_unit: &CodeUnit) -> HashSet<String> {
         self.delegate_for_code_unit(code_unit)
             .and_then(AnalyzerDelegate::import_analysis_provider)
@@ -759,6 +829,37 @@ impl ImportAnalysisProvider for MultiAnalyzer {
                 continue;
             };
             provider.prefetch_import_targets(&group, import_infos, cancellation);
+        }
+    }
+
+    fn prefetch_file_dependency_targets(
+        &self,
+        files: &[ProjectFile],
+        import_infos: Option<&HashMap<ProjectFile, Vec<ImportInfo>>>,
+        cancellation: &crate::cancellation::CancellationToken,
+    ) {
+        if files.is_empty() {
+            return;
+        }
+        let mut grouped: BTreeMap<Language, Vec<ProjectFile>> = BTreeMap::new();
+        for file in files {
+            grouped
+                .entry(language_for_file(file))
+                .or_default()
+                .push(file.clone());
+        }
+        for (language, group) in grouped {
+            if cancellation.is_cancelled() {
+                return;
+            }
+            let Some(provider) = self
+                .delegates
+                .get(&language)
+                .and_then(AnalyzerDelegate::import_analysis_provider)
+            else {
+                continue;
+            };
+            provider.prefetch_file_dependency_targets(&group, import_infos, cancellation);
         }
     }
 
@@ -922,12 +1023,25 @@ impl TypeHierarchyProvider for MultiAnalyzer {
 /// Language support is stated per member, never defaulted: a member whose
 /// language has no landed family answers `unsupported`, even though this
 /// composite exposes a provider for the workspace as a whole.
+/// Java keeps an explicit arm because its relation needs the *composite*
+/// hierarchy: a Kotlin class can extend a Java class, so passing `self` as the
+/// hierarchy source is the whole reason the relation takes it separately.
+/// Every other language's family is answered by its own delegate, which is
+/// what a structural relation like Go's requires: its satisfaction index is
+/// built from Go sources alone, and no other realm can contribute an edge to
+/// it.
 impl crate::analyzer::usages::MemberFamilyProvider for MultiAnalyzer {
     fn member_family_capability(
         &self,
         member: &CodeUnit,
     ) -> crate::analyzer::structural::resolution::MemberFamilyCapability {
-        crate::analyzer::usages::java_member_family_capability(self, member)
+        if language_for_file(member.source()) == Language::Java {
+            return crate::analyzer::usages::java_member_family_capability(self, member);
+        }
+        self.delegate_for_code_unit(member)
+            .and_then(|delegate| delegate.analyzer().member_family_provider())
+            .map(|provider| provider.member_family_capability(member))
+            .unwrap_or(crate::analyzer::structural::resolution::MemberFamilyCapability::Unsupported)
     }
 
     fn member_family(
@@ -935,7 +1049,13 @@ impl crate::analyzer::usages::MemberFamilyProvider for MultiAnalyzer {
         member: &CodeUnit,
         cancellation: Option<&crate::cancellation::CancellationToken>,
     ) -> crate::analyzer::usages::MemberFamilyAnswer {
-        crate::analyzer::usages::java_member_family(self, self, member, cancellation)
+        if language_for_file(member.source()) == Language::Java {
+            return crate::analyzer::usages::java_member_family(self, self, member, cancellation);
+        }
+        self.delegate_for_code_unit(member)
+            .and_then(|delegate| delegate.analyzer().member_family_provider())
+            .map(|provider| provider.member_family(member, cancellation))
+            .unwrap_or_else(crate::analyzer::usages::MemberFamilyAnswer::unsupported_answer)
     }
 }
 
@@ -1346,6 +1466,30 @@ impl IAnalyzer for MultiAnalyzer {
             .find_map(|context| context.cancellation().cloned())
     }
 
+    fn active_query_semantic_model_overlay(
+        &self,
+    ) -> Option<Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>> {
+        self.query_contexts
+            .lock()
+            .expect("multi-analyzer query context mutex poisoned")
+            .iter()
+            .rev()
+            .find_map(|context| context.semantic_model_overlay_override_for_current_thread())
+    }
+
+    fn active_query_semantic_model_snapshot(
+        &self,
+    ) -> Option<Option<Arc<crate::analyzer::semantic_model::ActiveSemanticModelSnapshot>>> {
+        self.query_contexts
+            .lock()
+            .expect("multi-analyzer query context mutex poisoned")
+            .iter()
+            .rev()
+            .find_map(|context| {
+                context.active_semantic_model_snapshot_override_for_current_thread()
+            })
+    }
+
     fn relational_definition_batch(
         &self,
         requests: &[RelationalDefinitionRequest],
@@ -1466,6 +1610,33 @@ impl IAnalyzer for MultiAnalyzer {
         self.delegates
             .values()
             .all(|delegate| delegate.analyzer().query_indexes_warm())
+    }
+
+    fn external_dispatch_behavior_identity(
+        &self,
+    ) -> Option<crate::analyzer::semantic::StableDigest> {
+        let contributions = self
+            .delegates
+            .iter()
+            .filter_map(|(language, delegate)| {
+                delegate
+                    .analyzer()
+                    .external_dispatch_behavior_identity()
+                    .map(|identity| (*language, identity))
+            })
+            .collect::<Vec<_>>();
+        if contributions.is_empty() {
+            return None;
+        }
+
+        let mut digest = crate::analyzer::semantic::LengthDelimitedDigest::new(
+            b"bifrost-multi-analyzer-external-dispatch-behavior/v1",
+        );
+        for (language, identity) in contributions {
+            digest.push(language.config_label().as_bytes());
+            digest.push(identity.as_bytes());
+        }
+        Some(digest.finish())
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
@@ -2014,6 +2185,11 @@ impl IAnalyzer for MultiAnalyzer {
             .unwrap_or(false)
     }
 
+    fn contains_tests_for_changed_file(&self, file: &ProjectFile) -> bool {
+        self.delegate_for_file(file)
+            .is_some_and(|delegate| delegate.analyzer().contains_tests_for_changed_file(file))
+    }
+
     fn in_test_region(&self, code_unit: &CodeUnit) -> bool {
         self.delegate_for_file(code_unit.source())
             .is_some_and(|delegate| delegate.analyzer().in_test_region(code_unit))
@@ -2069,6 +2245,66 @@ impl IAnalyzer for MultiAnalyzer {
 
 #[cfg(any(test, feature = "test-support"))]
 impl crate::analyzer::AnalyzerTestHooks for MultiAnalyzer {
+    fn arm_selector_continuation_semantic_cache_invalidation_for_test(&self) {
+        for delegate in self.delegates.values() {
+            delegate
+                .analyzer()
+                .test_hooks()
+                .arm_selector_continuation_semantic_cache_invalidation_for_test();
+        }
+    }
+
+    fn invalidate_selector_continuation_semantic_cache_if_armed_for_test(&self) {
+        for delegate in self.delegates.values() {
+            delegate
+                .analyzer()
+                .test_hooks()
+                .invalidate_selector_continuation_semantic_cache_if_armed_for_test();
+        }
+    }
+
+    fn selector_continuation_semantic_cache_revivals_for_test(&self) -> u64 {
+        self.delegates
+            .values()
+            .map(|delegate| {
+                delegate
+                    .analyzer()
+                    .test_hooks()
+                    .selector_continuation_semantic_cache_revivals_for_test()
+            })
+            .sum()
+    }
+
+    fn arm_evaluation_root_continuation_semantic_cache_invalidation_for_test(&self) {
+        for delegate in self.delegates.values() {
+            delegate
+                .analyzer()
+                .test_hooks()
+                .arm_evaluation_root_continuation_semantic_cache_invalidation_for_test();
+        }
+    }
+
+    fn invalidate_evaluation_root_continuation_semantic_cache_if_armed_for_test(&self) {
+        for delegate in self.delegates.values() {
+            delegate
+                .analyzer()
+                .test_hooks()
+                .invalidate_evaluation_root_continuation_semantic_cache_if_armed_for_test();
+        }
+    }
+
+    fn evaluation_root_continuation_semantic_cache_revivals_for_test(&self) -> u64 {
+        self.delegates
+            .values()
+            .map(|delegate| {
+                delegate
+                    .analyzer()
+                    .test_hooks()
+                    .evaluation_root_continuation_semantic_cache_revivals_for_test()
+            })
+            .sum()
+    }
+
     fn reset_definition_candidates_query_count_for_test(&self) {
         for delegate in self.delegates.values() {
             delegate
@@ -2154,6 +2390,18 @@ impl crate::analyzer::AnalyzerTestHooks for MultiAnalyzer {
                     .bulk_candidate_hydration_count_for_test()
             })
             .sum()
+    }
+
+    fn reset_java_usage_evidence_cache_stats_for_test(&self) {
+        self.snapshot_caches
+            .java_usage_evidence()
+            .reset_stats_for_test();
+    }
+
+    fn java_usage_evidence_cache_stats_for_test(
+        &self,
+    ) -> crate::analyzer::JavaUsageEvidenceCacheStats {
+        self.snapshot_caches.java_usage_evidence().stats_for_test()
     }
 
     fn reset_workspace_path_scan_count_for_test(&self) {
@@ -2493,6 +2741,9 @@ mod tests {
         );
         match acquisition {
             WorkspaceUsageGraphCacheAcquisition::Ready { lifecycle, .. } => lifecycle,
+            WorkspaceUsageGraphCacheAcquisition::Incomplete(_) => {
+                panic!("complete test graph unexpectedly incomplete")
+            }
             WorkspaceUsageGraphCacheAcquisition::Cancelled => panic!("unexpected cancellation"),
             WorkspaceUsageGraphCacheAcquisition::Stale => panic!("unexpected stale result"),
         }

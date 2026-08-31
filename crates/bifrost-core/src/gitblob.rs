@@ -30,6 +30,13 @@ pub const CACHE_SUBDIR_NAME: &str = "cache";
 pub const CACHE_DIR_ENV: &str = "BIFROST_CACHE_DIR";
 pub const CACHE_ROOT_ENV: &str = "BIFROST_CACHE_ROOT";
 
+/// Directory name Bifrost owns inside a machine-local cache location.
+const MACHINE_CACHE_APP_NAME: &str = "bifrost";
+
+/// Subdirectory of the machine-local cache root that holds one database per
+/// set of workspace roots (see [`multiroot_persistence_dir`]).
+const MULTIROOT_SUBDIR_NAME: &str = "multiroot";
+
 /// Discover the repository containing `root`, if any.
 pub fn discover(root: &Path) -> Option<Repository> {
     Repository::discover(root)
@@ -37,9 +44,52 @@ pub fn discover(root: &Path) -> Option<Repository> {
         .filter(|repo| !repo.is_bare())
 }
 
-/// Whether `root` is inside a non-bare git repository.
-pub fn is_git_repo(root: &Path) -> bool {
-    discover(root).is_some()
+/// The repository's default branch reference, or `HEAD` when the checkout
+/// does not advertise one through `refs/remotes/origin/HEAD`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefaultBranchRef {
+    pub ref_name: String,
+    pub display_name: String,
+    pub fallback: bool,
+}
+
+/// Resolve the default branch without consulting a network host.
+///
+/// A remote's symbolic `origin/HEAD` is the only local Git record that
+/// identifies its default branch unambiguously. Checkouts that do not carry
+/// that record fall back to their current `HEAD` and report the fallback so
+/// callers can describe the reduced evidence honestly.
+pub fn resolve_default_branch_ref(repo: &Repository) -> DefaultBranchRef {
+    if let Ok(head_ref) = repo.find_reference("refs/remotes/origin/HEAD")
+        && let Some(target) = head_ref.symbolic_target()
+    {
+        let display_name = target.rsplit('/').next().unwrap_or(target).to_string();
+        return DefaultBranchRef {
+            ref_name: target.to_string(),
+            display_name,
+            fallback: false,
+        };
+    }
+    DefaultBranchRef {
+        ref_name: "HEAD".to_string(),
+        display_name: "HEAD (default branch unavailable)".to_string(),
+        fallback: true,
+    }
+}
+
+/// Whether `root` resolves to a Git object database, a bare repository
+/// included.
+///
+/// This deliberately does not go through [`discover`], which filters bare
+/// repositories out because the analyses built on it walk a checkout. Reading
+/// an immutable revision needs no checkout: the blobs come out of the object
+/// database, which a bare repository has, and `git clone --bare` is a normal
+/// way to hand a tool history without a worktree. The cache location agrees --
+/// [`cache_dir_path`] falls back to the given root, so a bare repository's
+/// cache lands beside its object database, which is where the location
+/// contract puts every other repository's cache too.
+pub fn has_object_database(root: &Path) -> bool {
+    Repository::discover(root).is_ok()
 }
 
 /// Resolve the primary repository root. Linked worktrees collapse to the
@@ -120,8 +170,23 @@ fn cache_db_path_with_overrides(
 }
 
 fn cache_repository_key(primary_root: &Path) -> String {
-    let readable = primary_root
-        .file_name()
+    let digest = hash_domain_bytes(
+        b"bifrost-cache-primary-root-v1",
+        &platform_path_bytes(primary_root),
+    );
+    format!(
+        "{}-{}",
+        readable_path_name(primary_root),
+        &lower_hex_string(&digest)[..16]
+    )
+}
+
+/// The last path component, reduced to characters every supported filesystem
+/// accepts in a directory name. Cache keys carry it so a human listing the
+/// cache can tell the entries apart; the digest beside it, not this name, is
+/// what makes an entry unique.
+fn readable_path_name(path: &Path) -> String {
+    path.file_name()
         .and_then(|name| name.to_str())
         .map(|name| {
             name.chars()
@@ -135,13 +200,146 @@ fn cache_repository_key(primary_root: &Path) -> String {
                 .collect::<String>()
         })
         .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "workspace".to_string());
-    let digest = hash_domain_bytes(
-        b"bifrost-cache-primary-root-v1",
-        &platform_path_bytes(primary_root),
+        .unwrap_or_else(|| "workspace".to_string())
+}
+
+/// Machine-local cache root for state that no single repository owns.
+///
+/// `BIFROST_CACHE_ROOT` wins when it is set and non-empty, exactly as it does
+/// in [`cache_dir_path`], so one environment variable still relocates every
+/// Bifrost cache on the machine. Otherwise this is the platform's conventional
+/// per-user cache directory. No platform-directory crate is in this workspace,
+/// and these environment variables are the platform contract on each system, so
+/// resolve them directly, the way the MCP installer resolves its own
+/// directories (`src/mcp_install.rs`).
+///
+/// A host with no resolvable home directory -- a stripped container, a service
+/// account with no `%LOCALAPPDATA%` -- gets `None`. Its caller reports that
+/// instead of inventing a location the next process would not find again.
+fn machine_cache_root() -> Option<PathBuf> {
+    machine_cache_root_with_overrides(
+        std::env::var_os(CACHE_ROOT_ENV).filter(|value| !value.is_empty()),
+    )
+}
+
+fn machine_cache_root_with_overrides(cache_root: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    match cache_root {
+        Some(cache_root) => Some(PathBuf::from(cache_root)),
+        None => platform_cache_root(),
+    }
+}
+
+#[cfg(windows)]
+fn platform_cache_root() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .filter(|value| !value.is_empty())
+        .map(|local_app_data| {
+            PathBuf::from(local_app_data)
+                .join(MACHINE_CACHE_APP_NAME)
+                .join(CACHE_SUBDIR_NAME)
+        })
+}
+
+#[cfg(target_os = "macos")]
+fn platform_cache_root() -> Option<PathBuf> {
+    home_dir().map(|home| {
+        home.join("Library")
+            .join("Caches")
+            .join(MACHINE_CACHE_APP_NAME)
+    })
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn platform_cache_root() -> Option<PathBuf> {
+    match std::env::var_os("XDG_CACHE_HOME").filter(|value| !value.is_empty()) {
+        Some(xdg_cache_home) => Some(PathBuf::from(xdg_cache_home).join(MACHINE_CACHE_APP_NAME)),
+        None => home_dir().map(|home| home.join(".cache").join(MACHINE_CACHE_APP_NAME)),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn platform_cache_root() -> Option<PathBuf> {
+    None
+}
+
+#[cfg(unix)]
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Persistence root for a workspace assembled from several repositories.
+///
+/// Such a workspace owns no repository of its own to hold a cache, and writing
+/// into any one member would make that member's database depend on which other
+/// folders happened to be open beside it. The database therefore lives at a
+/// machine-local location named by the root set itself, so the same folders --
+/// opened in any order, by any session -- find the same database and reuse the
+/// parse work already in it.
+///
+/// The name is the first root's directory name, for a human reading the cache,
+/// plus a digest over every canonical root path. Distinct root sets get
+/// distinct directories; ordering does not matter, because the roots are
+/// sorted before hashing. `None` means this machine has no resolvable cache
+/// root (see [`machine_cache_root`]).
+///
+/// This resolves a path and creates nothing. The directory appears when a
+/// store opens beneath it, at the location the [`cache_dir_path`] funnel picks
+/// for this root -- which is `<dir>/.bifrost/cache` for a non-git directory,
+/// and an override's own location when one is set.
+pub fn multiroot_persistence_dir(roots: &[PathBuf]) -> Option<PathBuf> {
+    multiroot_persistence_dir_under(machine_cache_root(), roots)
+}
+
+/// [`multiroot_persistence_dir`] with the machine cache root supplied directly.
+///
+/// A host that places its own caches, and a test that must not depend on the
+/// developer's environment or mutate the process's, passes the root instead of
+/// setting `BIFROST_CACHE_ROOT`.
+pub fn multiroot_persistence_dir_with_overrides(
+    roots: &[PathBuf],
+    cache_root: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    multiroot_persistence_dir_under(machine_cache_root_with_overrides(cache_root), roots)
+}
+
+fn multiroot_persistence_dir_under(
+    cache_root: Option<PathBuf>,
+    roots: &[PathBuf],
+) -> Option<PathBuf> {
+    debug_assert!(
+        !roots.is_empty(),
+        "a multi-root workspace has at least one root"
     );
-    let digest = lower_hex_string(&digest);
-    format!("{readable}-{}", &digest[..16])
+    Some(
+        cache_root?
+            .join(MULTIROOT_SUBDIR_NAME)
+            .join(multiroot_key(roots)),
+    )
+}
+
+fn multiroot_key(roots: &[PathBuf]) -> String {
+    let mut roots = roots
+        .iter()
+        .map(|root| root.canonicalize().unwrap_or_else(|_| root.clone()))
+        .collect::<Vec<_>>();
+    roots.sort();
+    roots.dedup();
+    let mut bytes = Vec::new();
+    for root in &roots {
+        // Length-prefix each path so that no two different root sets can
+        // flatten to the same byte stream.
+        let path_bytes = platform_path_bytes(root);
+        bytes.extend_from_slice(&(path_bytes.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&path_bytes);
+    }
+    let digest = hash_domain_bytes(b"bifrost-multiroot-roots-v1", &bytes);
+    let readable = match roots.first() {
+        Some(root) => readable_path_name(root),
+        None => "workspace".to_string(),
+    };
+    format!("{readable}-{}", &lower_hex_string(&digest)[..16])
 }
 
 /// Stable machine-local identity of one bound workspace root.
@@ -209,7 +407,7 @@ pub fn working_tree_oid_values(
     let mut index = repo.index().map_err(|e| e.to_string())?;
     // A long-lived Bifrost process can observe an external Git command.
     index.read(true).map_err(|e| e.to_string())?;
-    let dirty = dirty_worktree_paths(repo)?;
+    let dirty = dirty_worktree_paths(repo, None)?;
     let index_oids: HashMap<String, Oid> = index
         .iter()
         .map(|entry| Ok((index_path_to_string(&entry)?, entry.id)))
@@ -439,7 +637,7 @@ pub fn working_tree_identity(repo: &Repository) -> Result<WorkingTreeIdentity> {
     let started = std::time::Instant::now();
     let mut index = repo.index().map_err(|e| e.to_string())?;
     index.read(true).map_err(|e| e.to_string())?;
-    let dirty = dirty_worktree_paths(repo)?;
+    let dirty = dirty_worktree_paths(repo, None)?;
     // Keep the startup scan to index and dirty-tree data. Canonical blob sizes
     // and attributes are checked only when an analyzer requests that path.
     // This avoids object-database work for unrelated languages and files.
@@ -538,14 +736,50 @@ fn canonical_blob_size(repo: &Repository, oid: Oid) -> Option<u64> {
 /// [`all_working_tree_oid_values`]; this path-only form avoids hashing dirty
 /// files when a caller only needs the active file set.
 pub fn all_working_tree_paths(repo: &Repository) -> Result<HashSet<String>> {
+    working_tree_paths(repo, None)
+}
+
+/// The Git pathspec that selects `canonical_root` inside `canonical_workdir`,
+/// or `None` when both name the same directory.
+///
+/// Git spells pathspecs and index paths with `/` on every platform, so the
+/// workdir-relative path is converted from the host separator. The trailing
+/// `/` keeps the value usable as a prefix test against those index paths.
+/// A root outside the working directory yields `None`, which asks for the
+/// whole repository.
+pub fn subtree_pathspec(canonical_workdir: &Path, canonical_root: &Path) -> Option<String> {
+    let rel = canonical_root.strip_prefix(canonical_workdir).ok()?;
+    if rel.as_os_str().is_empty() {
+        return None;
+    }
+    let mut pathspec = crate::path_utils::normalize_pattern(&rel.to_string_lossy());
+    pathspec.push('/');
+    Some(pathspec)
+}
+
+/// [`all_working_tree_paths`] narrowed to the subtree that `subtree` selects.
+///
+/// An ancestor repository can own a workspace root. Scanning the whole
+/// repository then costs the ancestor's size on every call, which a
+/// filesystem-event-driven caller pays per event. `subtree` is a
+/// [`subtree_pathspec`] value and prunes both the index iteration and Git's
+/// worktree scan to the workspace.
+pub fn working_tree_paths_under(repo: &Repository, subtree: &str) -> Result<HashSet<String>> {
+    working_tree_paths(repo, Some(subtree))
+}
+
+fn working_tree_paths(repo: &Repository, subtree: Option<&str>) -> Result<HashSet<String>> {
     let workdir = workdir(repo)?;
     let mut index = repo.index().map_err(|e| e.to_string())?;
     index.read(true).map_err(|e| e.to_string())?;
-    let dirty = dirty_worktree_paths(repo)?;
+    let dirty = dirty_worktree_paths(repo, subtree)?;
     let mut paths = HashSet::with_capacity(index.len() + dirty.len());
 
     for entry in index.iter() {
         let rel = index_path_to_string(&entry)?;
+        if subtree.is_some_and(|prefix| !rel.starts_with(prefix)) {
+            continue;
+        }
         if !dirty.contains(&rel) || workdir.join(&rel).is_file() {
             paths.insert(rel);
         }
@@ -962,15 +1196,23 @@ fn dirty_paths(repo: &Repository) -> Result<HashSet<String>> {
     Ok(dirty)
 }
 
-fn dirty_worktree_paths(repo: &Repository) -> Result<HashSet<String>> {
+fn dirty_worktree_paths(repo: &Repository, subtree: Option<&str>) -> Result<HashSet<String>> {
     let _scope = crate::profiling::scope("gitblob::dirty_worktree_paths");
     let workdir = workdir(repo)?;
     // libgit2's recursive index-to-worktree diff can rescan very large trees
     // one entry at a time. Native Git uses its optimized index and filesystem
     // checks for the same dirty overlay. This matters for repositories such as
     // Firefox, where the libgit2 scan exceeded the MCP request budget.
-    let output = background_git(workdir)
-        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+    let mut command = background_git(workdir);
+    command.args(["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+    if let Some(subtree) = subtree {
+        // Porcelain paths stay relative to the working directory root, so the
+        // pathspec changes only which part of the tree Git walks. `:(literal)`
+        // keeps a directory name containing `*`, `?`, `[`, or a leading `:`
+        // from being read as pathspec magic.
+        command.arg("--").arg(format!(":(literal){subtree}"));
+    }
+    let output = command
         .output()
         .map_err(|error| format!("git status failed to spawn: {error}"))?;
     if !output.status.success() {
@@ -1197,6 +1439,112 @@ mod tests {
     }
 
     #[test]
+    fn multiroot_persistence_dir_is_order_insensitive() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let cache_root = temp.path().join("machine-cache");
+        let first = temp.path().join("service-a");
+        let second = temp.path().join("service-b");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+
+        let forward = multiroot_persistence_dir_with_overrides(
+            &[first.clone(), second.clone()],
+            Some(cache_root.as_os_str().to_owned()),
+        )
+        .unwrap();
+        let reversed = multiroot_persistence_dir_with_overrides(
+            &[second.clone(), first.clone()],
+            Some(cache_root.as_os_str().to_owned()),
+        )
+        .unwrap();
+        let repeated = multiroot_persistence_dir_with_overrides(
+            &[second, first.clone(), first],
+            Some(cache_root.as_os_str().to_owned()),
+        )
+        .unwrap();
+
+        assert_eq!(forward, reversed);
+        assert_eq!(
+            forward, repeated,
+            "a repeated root names the same workspace"
+        );
+        assert_eq!(
+            forward.parent(),
+            Some(cache_root.join("multiroot").as_path())
+        );
+        assert!(
+            forward
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("service-a-"),
+            "the first root should name the directory: {}",
+            forward.display()
+        );
+        assert!(
+            !forward.exists(),
+            "resolving a persistence directory must not create it"
+        );
+    }
+
+    #[test]
+    fn distinct_root_sets_get_distinct_dirs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let cache_root = temp.path().join("machine-cache");
+        let first = temp.path().join("service-a");
+        let second = temp.path().join("service-b");
+        let third = temp.path().join("service-c");
+        for root in [&first, &second, &third] {
+            std::fs::create_dir_all(root).unwrap();
+        }
+        let dir_for = |roots: &[PathBuf]| {
+            multiroot_persistence_dir_with_overrides(roots, Some(cache_root.as_os_str().to_owned()))
+                .unwrap()
+        };
+
+        let pair = dir_for(&[first.clone(), second.clone()]);
+        let other_pair = dir_for(&[first.clone(), third.clone()]);
+        let triple = dir_for(&[first.clone(), second.clone(), third]);
+        let single = dir_for(&[first]);
+
+        assert_ne!(pair, other_pair);
+        assert_ne!(pair, triple, "a superset is a different workspace");
+        assert_ne!(pair, single);
+        assert_ne!(second, other_pair);
+    }
+
+    #[test]
+    fn cache_root_override_relocates_the_dir() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let first = temp.path().join("service-a");
+        let second = temp.path().join("service-b");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let roots = [first, second];
+        let one = temp.path().join("cache-one");
+        let other = temp.path().join("cache-other");
+
+        let under_one =
+            multiroot_persistence_dir_with_overrides(&roots, Some(one.as_os_str().to_owned()))
+                .unwrap();
+        let under_other =
+            multiroot_persistence_dir_with_overrides(&roots, Some(other.as_os_str().to_owned()))
+                .unwrap();
+
+        assert!(under_one.starts_with(&one));
+        assert!(under_other.starts_with(&other));
+        assert_eq!(
+            under_one.strip_prefix(&one),
+            under_other.strip_prefix(&other),
+            "the same roots keep the same name under either cache root"
+        );
+        assert_eq!(
+            machine_cache_root_with_overrides(Some(one.as_os_str().to_owned())),
+            Some(one)
+        );
+    }
+
+    #[test]
     fn exact_cache_directory_override_wins_over_cache_root() {
         let temp = tempfile::TempDir::new().unwrap();
         let workspace = temp.path().join("workspace");
@@ -1315,6 +1663,48 @@ mod tests {
         let paths = all_working_tree_paths(&repo).unwrap();
         assert!(!paths.contains("tracked.rs"), "{paths:?}");
         assert!(paths.contains("dirty.rs"), "{paths:?}");
+    }
+
+    #[test]
+    fn subtree_pathspec_selects_the_workdir_relative_directory() {
+        let workdir = Path::new("/repo");
+        assert_eq!(subtree_pathspec(workdir, workdir), None);
+        assert_eq!(
+            subtree_pathspec(workdir, Path::new("/repo/packages/app")).as_deref(),
+            Some("packages/app/")
+        );
+        assert_eq!(subtree_pathspec(workdir, Path::new("/elsewhere")), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn subtree_pathspec_spells_windows_roots_with_forward_slashes() {
+        assert_eq!(
+            subtree_pathspec(Path::new(r"C:\repo"), Path::new(r"C:\repo\packages\app")).as_deref(),
+            Some("packages/app/")
+        );
+    }
+
+    #[test]
+    fn working_tree_paths_under_returns_only_the_subtree() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = init_repo(temp.path());
+        for rel in ["sub/tracked.rs", "outside/tracked.rs"] {
+            let path = temp.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "fn tracked() {}\n").unwrap();
+        }
+        commit_all(&repo, "init");
+        for rel in ["sub/untracked.rs", "outside/untracked.rs"] {
+            std::fs::write(temp.path().join(rel), "fn untracked() {}\n").unwrap();
+        }
+
+        let paths = working_tree_paths_under(&repo, "sub/").unwrap();
+        assert_eq!(
+            paths,
+            HashSet::from(["sub/tracked.rs".to_string(), "sub/untracked.rs".to_string()])
+        );
+        assert!(all_working_tree_paths(&repo).unwrap().is_superset(&paths));
     }
 
     #[test]

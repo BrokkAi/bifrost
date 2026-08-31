@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "id": "bifrost.code-smells",
-  "version": "2.2.0",
+  "version": "2.6.0",
   "name": "Bifrost code smells",
   "description": "Curated structured RQLP checks for bug-prone and potentially expensive source patterns.",
   "policies": [
@@ -36,6 +36,26 @@
       ],
       "severity_rationale": "General-purpose object deserializers can construct unexpected objects or execute attacker-controlled behavior.",
       "remediation": "Use a data-only format, then validate the decoded schema before use."
+    },
+    {
+      "path": "policies/go-result-used-before-success-check.rqlp",
+      "id": "bifrost.correctness.go-result-used-before-success-check",
+      "semantic_hash": "8723231e67bb0d77dbee1736c2b44ab0a598170e1e0d5c5c46f688dac1a48bbb",
+      "category": "correctness",
+      "supported_languages": [
+        "go"
+      ],
+      "required_capabilities": [
+        "structural-match",
+        "canonical-external-dispatch",
+        "conditional-result-contracts",
+        "operation-precondition-contracts",
+        "result-contract-operation-uses",
+        "reaching-definitions",
+        "guard-dominance"
+      ],
+      "severity_rationale": "Using a success-gated result for an operation that requires a valid value before its reviewed success condition is proved can panic on the API's failure path.",
+      "remediation": "Establish the reviewed success condition before operations that require a valid result: check a paired error for nil, or check a directly nullable result for non-nil. Reviewed nil-tolerant operations need no such guard."
     },
     {
       "path": "policies/loop-invariant-sort.rqlp",

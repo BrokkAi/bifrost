@@ -1875,7 +1875,7 @@ ABSL_NAMESPACE_END
             &root,
             crate::analyzer::Language::Cpp,
         ));
-        let workspace = crate::analyzer::WorkspaceAnalyzer::build_ephemeral(
+        let workspace = crate::analyzer::WorkspaceAnalyzer::build_ephemeral_footgun(
             project,
             crate::analyzer::AnalyzerConfig::default(),
         )
@@ -1983,7 +1983,7 @@ ABSL_NAMESPACE_END
             &root,
             crate::analyzer::Language::Cpp,
         ));
-        let workspace = crate::analyzer::WorkspaceAnalyzer::build_ephemeral(
+        let workspace = crate::analyzer::WorkspaceAnalyzer::build_ephemeral_footgun(
             project,
             crate::analyzer::AnalyzerConfig::default(),
         )
@@ -2101,7 +2101,7 @@ ABSL_NAMESPACE_END
             &root,
             crate::analyzer::Language::Cpp,
         ));
-        let workspace = crate::analyzer::WorkspaceAnalyzer::build_ephemeral(
+        let workspace = crate::analyzer::WorkspaceAnalyzer::build_ephemeral_footgun(
             project,
             crate::analyzer::AnalyzerConfig::default(),
         )
@@ -2232,7 +2232,7 @@ ABSL_NAMESPACE_END
             &root,
             crate::analyzer::Language::Cpp,
         ));
-        let workspace = crate::analyzer::WorkspaceAnalyzer::build_ephemeral(
+        let workspace = crate::analyzer::WorkspaceAnalyzer::build_ephemeral_footgun(
             project,
             crate::analyzer::AnalyzerConfig::default(),
         )
@@ -2309,7 +2309,7 @@ ABSL_NAMESPACE_END
             &root,
             crate::analyzer::Language::Cpp,
         ));
-        let workspace = crate::analyzer::WorkspaceAnalyzer::build_ephemeral(
+        let workspace = crate::analyzer::WorkspaceAnalyzer::build_ephemeral_footgun(
             project,
             crate::analyzer::AnalyzerConfig::default(),
         )

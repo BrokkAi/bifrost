@@ -6,7 +6,7 @@ use super::super::ids::{MemoryLocationId, SemanticLocator, SemanticRole, SourceM
 use super::super::ir::{
     AllocationHandle, CallSiteHandle, EvidenceCompleteness, FormalMultiplicity,
     MemoryLocationHandle, MemoryLocationKind, ProcedureHandle, ProgramPointHandle, ProofStatus,
-    SemanticArtifact, SemanticEffect, SemanticValueKind, ValueHandle,
+    SemanticArtifact, SemanticEffect, SemanticValueKind, ValueFlowKind, ValueHandle,
 };
 use super::call::{CallBinding, CallBindings};
 use super::error::{OracleContractError, require_same_procedure};
@@ -102,6 +102,7 @@ pub enum ProcedurePortKind {
     Receiver,
     Parameter { ordinal: u32 },
     NormalReturn,
+    IndexedNormalReturn { ordinal: u32 },
     ExceptionalReturn,
     Capture { slot: MemoryLocationId },
 }
@@ -141,6 +142,21 @@ impl ProcedurePortHandle {
             {
                 return Err(OracleContractError::InvalidParameterOrdinal { ordinal });
             }
+            ProcedurePortKind::IndexedNormalReturn { ordinal }
+                if !procedure.semantics().points().iter().any(|point| {
+                    point.events.iter().any(|event| {
+                        matches!(
+                            event.effect,
+                            SemanticEffect::ValueFlow {
+                                kind: ValueFlowKind::IndexedReturn { ordinal: actual },
+                                ..
+                            } if actual == ordinal
+                        )
+                    })
+                }) =>
+            {
+                return Err(OracleContractError::InvalidReturnOrdinal { ordinal });
+            }
             ProcedurePortKind::Capture { slot } => {
                 let Some(location) = procedure.semantics().memory_location(slot) else {
                     return Err(OracleContractError::InvalidCaptureSlot { slot });
@@ -152,6 +168,7 @@ impl ProcedurePortHandle {
             ProcedurePortKind::Receiver
             | ProcedurePortKind::Parameter { .. }
             | ProcedurePortKind::NormalReturn
+            | ProcedurePortKind::IndexedNormalReturn { .. }
             | ProcedurePortKind::ExceptionalReturn => {}
         }
         Ok(Self { procedure, kind })
@@ -173,6 +190,16 @@ impl ProcedurePortHandle {
             procedure,
             kind: ProcedurePortKind::NormalReturn,
         }
+    }
+
+    pub fn indexed_normal_return(
+        procedure: ProcedureHandle,
+        ordinal: u32,
+    ) -> Result<Self, OracleContractError> {
+        Self::new(
+            procedure,
+            ProcedurePortKind::IndexedNormalReturn { ordinal },
+        )
     }
 
     pub fn exceptional_return(procedure: ProcedureHandle) -> Self {
@@ -303,6 +330,7 @@ impl CallResultHandle {
     pub(crate) fn new(
         bindings: &CallBindings,
         flow: &ValueFlowSnapshot,
+        expected_result: &ValueHandle,
         limits: OracleLimits,
     ) -> Result<Self, OracleContractError> {
         bindings.candidate().validate_for_call(bindings.call())?;
@@ -314,7 +342,8 @@ impl CallResultHandle {
                     relation,
                     formal,
                     result,
-                } => Some((relation.clone(), formal, result.clone())),
+                } if result == expected_result => Some((relation.clone(), formal, result.clone())),
+                CallBinding::NormalReturn { .. } => None,
                 CallBinding::Receiver { .. }
                 | CallBinding::ArgumentGroup(_)
                 | CallBinding::ImplicitArgument { .. }
@@ -409,7 +438,10 @@ impl CallResultHandle {
             .semantics()
             .call_site(self.call.id())
             .expect("call-site handles are validated at construction");
-        if call.result != Some(self.result.id()) {
+        if !call
+            .normal_result_values()
+            .any(|result| result == self.result.id())
+        {
             return Err(OracleContractError::InvalidAccessRoot(
                 "call-result root does not name the call's normal result",
             ));
@@ -499,7 +531,8 @@ pub enum AccessPathRoot {
 }
 
 impl AccessPathRoot {
-    fn scoped_procedure(&self) -> Option<&ProcedureHandle> {
+    /// The procedure whose local handle domain scopes this root, if any.
+    pub fn scoped_procedure(&self) -> Option<&ProcedureHandle> {
         match self {
             Self::Value(value) => Some(value.procedure()),
             Self::CallResult(result) => Some(result.result().procedure()),
@@ -829,6 +862,7 @@ pub enum DurablePortIdentity {
     Receiver,
     Parameter { ordinal: u32 },
     NormalReturn,
+    IndexedNormalReturn { ordinal: u32 },
     ExceptionalReturn,
     Capture { slot: u32, locator: SemanticLocator },
 }
@@ -839,6 +873,9 @@ impl DurablePortIdentity {
             ProcedurePortKind::Receiver => Self::Receiver,
             ProcedurePortKind::Parameter { ordinal } => Self::Parameter { ordinal },
             ProcedurePortKind::NormalReturn => Self::NormalReturn,
+            ProcedurePortKind::IndexedNormalReturn { ordinal } => {
+                Self::IndexedNormalReturn { ordinal }
+            }
             ProcedurePortKind::ExceptionalReturn => Self::ExceptionalReturn,
             ProcedurePortKind::Capture { slot } => {
                 let row = port
@@ -1088,6 +1125,122 @@ pub struct AliasQuery {
     right: AccessPathAtPoint,
 }
 
+/// The publication sites reachable between ownership establishment and one
+/// exact observation of a fresh object.
+///
+/// This query is deliberately about publication, not whole-program escape.
+/// Its caller supplies the point at which fresh ownership was established;
+/// the heap oracle then reports every structured operation on a path to the
+/// observation that can make the object reachable through another effect
+/// boundary.  Consumers may interpret a reviewed, complete call summary more
+/// precisely than an unmodeled publication, while a memory store, capture, or
+/// return remains an explicit publication rather than being flattened into a
+/// Boolean.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FreshObjectPublicationQuery {
+    object: AbstractObject,
+    ownership_start: ProgramPointHandle,
+    observation: ProgramPointHandle,
+    context: OracleCallContext,
+}
+
+impl FreshObjectPublicationQuery {
+    pub fn new(
+        object: AbstractObject,
+        ownership_start: ProgramPointHandle,
+        observation: ProgramPointHandle,
+        context: OracleCallContext,
+    ) -> Result<Self, OracleContractError> {
+        require_same_procedure(ownership_start.procedure(), observation.procedure())?;
+        object.validate_at(observation.procedure())?;
+        Ok(Self {
+            object,
+            ownership_start,
+            observation,
+            context,
+        })
+    }
+
+    pub fn object(&self) -> &AbstractObject {
+        &self.object
+    }
+
+    pub fn ownership_start(&self) -> &ProgramPointHandle {
+        &self.ownership_start
+    }
+
+    pub fn observation(&self) -> &ProgramPointHandle {
+        &self.observation
+    }
+
+    pub fn context(&self) -> &OracleCallContext {
+        &self.context
+    }
+}
+
+/// The structured operation that published a fresh object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FreshObjectPublicationKind {
+    Call,
+    MemoryStore,
+    Return,
+    Throw,
+    AsyncSuspend,
+    Capture,
+}
+
+/// One possible publication on a path covered by a
+/// [`FreshObjectPublicationQuery`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FreshObjectPublication {
+    point: ProgramPointHandle,
+    kind: FreshObjectPublicationKind,
+    call: Option<CallSiteHandle>,
+}
+
+impl FreshObjectPublication {
+    pub fn call(call: CallSiteHandle) -> Result<Self, OracleContractError> {
+        let row = call
+            .procedure()
+            .semantics()
+            .call_site(call.id())
+            .ok_or(OracleContractError::InvalidSemanticScope)?;
+        let point = call
+            .procedure()
+            .point_handle(row.point)
+            .ok_or(OracleContractError::InvalidSemanticScope)?;
+        Ok(Self {
+            point,
+            kind: FreshObjectPublicationKind::Call,
+            call: Some(call),
+        })
+    }
+
+    pub fn at(point: ProgramPointHandle, kind: FreshObjectPublicationKind) -> Self {
+        assert!(
+            kind != FreshObjectPublicationKind::Call,
+            "call publications retain their exact call-site handle"
+        );
+        Self {
+            point,
+            kind,
+            call: None,
+        }
+    }
+
+    pub fn point(&self) -> &ProgramPointHandle {
+        &self.point
+    }
+
+    pub const fn kind(&self) -> FreshObjectPublicationKind {
+        self.kind
+    }
+
+    pub fn call_site(&self) -> Option<&CallSiteHandle> {
+        self.call.as_ref()
+    }
+}
+
 impl AliasQuery {
     pub fn new(
         left: AccessPathAtPoint,
@@ -1330,6 +1483,7 @@ fn access_root_matches_value(root: &AccessPathRoot, value: &ValueHandle) -> bool
                             )
                         }),
                     ProcedurePortKind::NormalReturn
+                    | ProcedurePortKind::IndexedNormalReturn { .. }
                     | ProcedurePortKind::ExceptionalReturn
                     | ProcedurePortKind::Capture { .. } => false,
                 }

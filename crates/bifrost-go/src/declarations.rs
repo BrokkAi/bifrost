@@ -16,6 +16,49 @@ pub fn go_node_text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     brokk_bifrost_core::analyzer::common::node_source_text(node, source)
 }
 
+/// Whether a Go identifier is exported from its declaring package.
+///
+/// Go exposes only identifiers whose first character is uppercase. Keep this
+/// predicate shared by declaration production and reference resolution so a
+/// dot import cannot make a package-private name visible to another package.
+pub fn go_identifier_is_exported(name: &str) -> bool {
+    name.chars().next().is_some_and(char::is_uppercase)
+}
+
+/// Whether `name` is declared by Go's universe block as a type.
+///
+/// Keep this list beside the parser-backed declaration helpers so source
+/// artifact production, hierarchy comparison, and exact type-identity proofs
+/// agree on the language's predeclared type namespace. Callers must still
+/// establish that the written name is not shadowed at its source location.
+pub fn is_predeclared_go_type(name: &str) -> bool {
+    matches!(
+        name,
+        "any"
+            | "bool"
+            | "byte"
+            | "comparable"
+            | "complex64"
+            | "complex128"
+            | "error"
+            | "float32"
+            | "float64"
+            | "int"
+            | "int8"
+            | "int16"
+            | "int32"
+            | "int64"
+            | "rune"
+            | "string"
+            | "uint"
+            | "uint8"
+            | "uint16"
+            | "uint32"
+            | "uint64"
+            | "uintptr"
+    )
+}
+
 /// Intern one qualified-name segment in the process-global interner.
 pub fn go_segment(text: &str, kind: SegmentKind) -> SegmentId {
     segment_interner().intern(text, kind)

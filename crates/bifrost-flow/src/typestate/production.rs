@@ -8,20 +8,22 @@
 //! carries the procedure's `SemanticArtifactKey` -- a digest over mount, path,
 //! language, exact source revision, adapter semantics version, IR version,
 //! configuration fingerprint, and dependency fingerprint -- closed over the
-//! exact dependency and recursive-group closure. A protocol summary adds the
-//! protocol and binding hashes. A whole solved result adds the entry facts, the
-//! provider execution context, and both remaining budgets. An edit to one file
-//! therefore mints new keys for that file's procedures and leaves every other
-//! procedure's key untouched, so retention needs no generation axis to stay
-//! honest: a stale entry is simply an entry nothing asks for again, and the
-//! byte and entry limits retire it.
+//! exact dependency and recursive-group closure. A call-bearing procedure also
+//! carries the ICFG provider behavior because workspace dispatch can change its
+//! transfers without changing its own source. A procedure with no call sites
+//! uses one provider-independent behavior: this projection never asks the
+//! provider for a transfer or boundary effect, so rotating it would discard an
+//! exact reusable leaf summary for an unrelated edit. A protocol summary adds
+//! the protocol and binding hashes. A whole solved result adds the entry facts,
+//! the full provider execution behavior, and both remaining budgets.
 //!
-//! This replaces an earlier generation gate that rotated the whole repository
-//! on every workspace update. That gate cost every unchanged procedure its
-//! summary on each edit, and because the two production surfaces leased
-//! different generations from different repositories -- the policy evaluator
-//! hardcoded generation 0 -- no result computed on one surface could ever be
-//! reused by the other.
+//! This remains generation-independent: a stale entry is simply an entry
+//! nothing asks for again, and the byte and entry limits retire it. The full
+//! workspace behavior conservatively rotates call-bearing summaries after an
+//! analyzed edit, while provider-independent leaves remain reusable. This
+//! replaces an earlier generation gate that rotated the whole repository on
+//! every workspace update and prevented the policy and search surfaces from
+//! sharing exact retained work.
 //!
 //! Budget-dependent results are still refused rather than retained, on the same
 //! grounds `memoizable_outcome` states for value flow: exceeding a budget or
@@ -30,7 +32,7 @@
 //! better answer it could reach. See [`publish_exact_result`].
 
 use std::fmt;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::{cmp::Reverse, collections::BinaryHeap};
 
 use crate::analyzer::semantic::cfg_algorithms::{
@@ -38,9 +40,9 @@ use crate::analyzer::semantic::cfg_algorithms::{
     strongly_connected_components,
 };
 use crate::analyzer::semantic::{
-    CallBoundary, IcfgProvider, ProcedureHandle, SemanticCallSite, SemanticExecutionBudget,
-    SemanticExecutionBudgetCharge, SemanticExecutionBudgetSnapshot, SemanticOutcome,
-    SemanticProviderError, SemanticRequest, SemanticWork,
+    CallBoundary, IcfgProvider, IcfgProviderBehaviorIdentity, ProcedureHandle, SemanticCallSite,
+    SemanticExecutionBudget, SemanticExecutionBudgetCharge, SemanticExecutionBudgetSnapshot,
+    SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticWork,
 };
 use crate::dataflow::{
     CompleteSummaryRepository, DataflowRequest, ProcedureSummaryIdentity, ProcedureSummaryKey,
@@ -63,7 +65,9 @@ use super::{
 
 const PRODUCTION_SUMMARY_SEMANTICS: &[u8] = b"bifrost-production-typestate-summary-v1";
 const EMPTY_CALL_CONTEXT: &[u8] = b"bifrost-production-empty-call-context-v1";
-const CONSERVATIVE_ICFG_BEHAVIOR: &[u8] = b"bifrost-production-conservative-icfg-v1";
+const PRODUCTION_ICFG_BEHAVIOR_DOMAIN: &[u8] = b"bifrost-production-icfg-behavior-v2";
+const PROVIDER_INDEPENDENT_LEAF_BEHAVIOR: &[u8] =
+    b"bifrost-production-provider-independent-leaf/v1";
 const CALL_EFFECT_DOMAIN: &[u8] = b"bifrost-production-call-effect-v1";
 const WORKSPACE_PROVIDER_CONTEXT: &[u8] = b"bifrost-production-workspace-provider-v1";
 
@@ -548,6 +552,7 @@ impl CachedTypestateSummaryResult {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ProductionSummaryResultKey {
     root: ProcedureSummaryIdentity,
+    provider_behavior: SummaryBehaviorKey,
     protocol: TypestateProtocolHash,
     bindings: TypestateBindingPlanHash,
     entry_facts: Box<[ProtocolFactKey]>,
@@ -677,8 +682,11 @@ where
     let semantic_work_before = semantic_budget.used();
     let solver_work_before = request.budget.used();
     let execution_before = execution_context.snapshot();
+    let provider_behavior = production_icfg_behavior(provider.behavior_identity());
+    let projection_behavior = production_icfg_behavior(projection_provider.behavior_identity());
     let result_key = production_result_key(
-        summary_identity(root),
+        summary_identity(root, projection_behavior),
+        provider_behavior,
         entry_facts,
         protocol,
         bindings,
@@ -747,9 +755,10 @@ where
 
     repository.record_recomputation();
     lifecycle.recomputations = lifecycle.recomputations.saturating_add(1);
-    let semantic_summaries = match project_production_semantic_summaries(
+    let semantic_summaries = match project_production_semantic_summaries_with_behavior(
         std::slice::from_ref(root),
         projection_provider,
+        projection_behavior,
         &mut SemanticRequest::new(semantic_budget, request.cancellation),
     ) {
         Ok(summaries) => summaries,
@@ -871,8 +880,10 @@ where
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn production_result_key(
     root: ProcedureSummaryIdentity,
+    provider_behavior: SummaryBehaviorKey,
     entry_facts: &[TypestateFact],
     protocol: &CompiledProtocol,
     bindings: &TypestateBindingPlan,
@@ -891,6 +902,7 @@ fn production_result_key(
     stable_entry_facts.dedup();
     Ok(ProductionSummaryResultKey {
         root,
+        provider_behavior,
         protocol: protocol.hash(),
         bindings: bindings.hash(),
         entry_facts: stable_entry_facts.into_boxed_slice(),
@@ -951,6 +963,7 @@ fn publish_exact_result(
 pub struct ProductionSemanticSummarySet {
     summaries: Vec<SemanticProcedureSummary>,
     components: Vec<std::ops::Range<usize>>,
+    behavior: SummaryBehaviorKey,
 }
 
 impl ProductionSemanticSummarySet {
@@ -967,7 +980,7 @@ impl ProductionSemanticSummarySet {
     }
 
     pub fn summary_for(&self, procedure: &ProcedureHandle) -> Option<&SemanticProcedureSummary> {
-        let identity = summary_identity(procedure);
+        let identity = summary_identity(procedure, self.behavior);
         self.summaries
             .iter()
             .find(|summary| summary.key().identity() == &identity)
@@ -1047,8 +1060,21 @@ pub fn project_production_semantic_summaries<Provider>(
 where
     Provider: IcfgProvider + ?Sized,
 {
+    let behavior = production_icfg_behavior(provider.behavior_identity());
+    project_production_semantic_summaries_with_behavior(roots, provider, behavior, request)
+}
+
+fn project_production_semantic_summaries_with_behavior<Provider>(
+    roots: &[ProcedureHandle],
+    provider: &Provider,
+    behavior: SummaryBehaviorKey,
+    request: &mut SemanticRequest<'_>,
+) -> Result<ProductionSemanticSummarySet, ProductionSummaryProjectionError>
+where
+    Provider: IcfgProvider + ?Sized,
+{
     let mut procedures = roots.to_vec();
-    canonicalize_procedures(&mut procedures);
+    canonicalize_procedures(&mut procedures, behavior);
     let mut index_by_handle = procedures
         .iter()
         .cloned()
@@ -1072,7 +1098,7 @@ where
                 }
                 SemanticOutcome::Ambiguous { .. } => {
                     return Err(ProductionSummaryProjectionError::IncompleteCallTransfers {
-                        procedure: Box::new(summary_identity(&procedure)),
+                        procedure: Box::new(summary_identity(&procedure, behavior)),
                     });
                 }
                 SemanticOutcome::Unproven { partial, .. } => (
@@ -1087,7 +1113,7 @@ where
                 | SemanticOutcome::ExceededBudget { .. }
                 | SemanticOutcome::Cancelled { .. } => {
                     return Err(ProductionSummaryProjectionError::IncompleteCallTransfers {
-                        procedure: Box::new(summary_identity(&procedure)),
+                        procedure: Box::new(summary_identity(&procedure, behavior)),
                     });
                 }
             };
@@ -1100,7 +1126,7 @@ where
                 )?);
             }
             for transfer in value.transfers {
-                let dependency = summary_identity(&transfer.callee);
+                let dependency = summary_identity(&transfer.callee, behavior);
                 let evidence =
                     SummaryEvidence::from_semantic(&transfer.proof, &transfer.completeness)?
                         .conjoin(&outcome_evidence)?;
@@ -1112,7 +1138,7 @@ where
                 dependencies.push(transfer.callee);
             }
         }
-        canonicalize_procedures(&mut dependencies);
+        canonicalize_procedures(&mut dependencies, behavior);
         for dependency in &dependencies {
             if !index_by_handle.contains_key(dependency) {
                 let index = procedures.len();
@@ -1129,7 +1155,8 @@ where
 
     let mut canonical_order = (0..procedures.len()).collect::<Vec<_>>();
     canonical_order.sort_unstable_by(|&left, &right| {
-        summary_identity(&procedures[left]).cmp(&summary_identity(&procedures[right]))
+        summary_identity(&procedures[left], behavior)
+            .cmp(&summary_identity(&procedures[right], behavior))
     });
     let mut canonical_by_old = vec![0usize; procedures.len()];
     for (canonical, old) in canonical_order.iter().copied().enumerate() {
@@ -1179,6 +1206,7 @@ where
         &canonical_boundary_effects,
         &graph,
         &sccs.components,
+        behavior,
         request.cancellation,
     )
 }
@@ -1221,9 +1249,13 @@ fn build_summary_set(
     direct_boundary_effects: &[Vec<SummaryEffect>],
     graph: &ProcedureDependencyGraph,
     components: &[Box<[usize]>],
+    behavior: SummaryBehaviorKey,
     cancellation: &crate::cancellation::CancellationToken,
 ) -> Result<ProductionSemanticSummarySet, ProductionSummaryProjectionError> {
-    let identities = procedures.iter().map(summary_identity).collect::<Vec<_>>();
+    let identities = procedures
+        .iter()
+        .map(|procedure| summary_identity(procedure, behavior))
+        .collect::<Vec<_>>();
     let mut component_by_node = vec![0usize; procedures.len()];
     for (component, members) in components.iter().enumerate() {
         for &member in members.iter() {
@@ -1390,24 +1422,55 @@ fn build_summary_set(
     Ok(ProductionSemanticSummarySet {
         summaries,
         components: summary_components,
+        behavior,
     })
 }
 
-fn summary_identity(procedure: &ProcedureHandle) -> ProcedureSummaryIdentity {
+fn production_icfg_behavior(provider: IcfgProviderBehaviorIdentity) -> SummaryBehaviorKey {
+    let mut bytes = Vec::with_capacity(
+        PRODUCTION_ICFG_BEHAVIOR_DOMAIN
+            .len()
+            .saturating_add(provider.as_bytes().len()),
+    );
+    bytes.extend_from_slice(PRODUCTION_ICFG_BEHAVIOR_DOMAIN);
+    bytes.extend_from_slice(provider.as_bytes());
+    SummaryBehaviorKey::hash_bytes(bytes)
+}
+
+fn provider_independent_leaf_behavior() -> SummaryBehaviorKey {
+    static BEHAVIOR: OnceLock<SummaryBehaviorKey> = OnceLock::new();
+    *BEHAVIOR.get_or_init(|| SummaryBehaviorKey::hash_bytes(PROVIDER_INDEPENDENT_LEAF_BEHAVIOR))
+}
+
+fn summary_identity(
+    procedure: &ProcedureHandle,
+    provider_behavior: SummaryBehaviorKey,
+) -> ProcedureSummaryIdentity {
+    // Production summary projection consults the provider only while walking
+    // semantic call sites. A leaf's immutable artifact therefore states every
+    // input to its summary; the solved-result key still retains the full
+    // provider behavior independently.
+    let behavior = if procedure.semantics().call_sites().is_empty() {
+        provider_independent_leaf_behavior()
+    } else {
+        provider_behavior
+    };
     ProcedureSummaryIdentity::new(
         procedure.artifact().key().clone(),
         procedure.semantics().locator().declaration().clone(),
         SummarySchemaVersion::CURRENT,
         SummarySemanticsVersion::hash_bytes(PRODUCTION_SUMMARY_SEMANTICS),
         SummaryContextKey::hash_bytes(EMPTY_CALL_CONTEXT),
-        SummaryBehaviorKey::hash_bytes(CONSERVATIVE_ICFG_BEHAVIOR),
+        behavior,
         SummaryOrigin::Inferred,
     )
 }
 
-fn canonicalize_procedures(procedures: &mut Vec<ProcedureHandle>) {
-    procedures.sort_unstable_by_key(summary_identity);
-    procedures.dedup_by(|left, right| summary_identity(left) == summary_identity(right));
+fn canonicalize_procedures(procedures: &mut Vec<ProcedureHandle>, behavior: SummaryBehaviorKey) {
+    procedures.sort_unstable_by_key(|procedure| summary_identity(procedure, behavior));
+    procedures.dedup_by(|left, right| {
+        summary_identity(left, behavior) == summary_identity(right, behavior)
+    });
 }
 
 #[derive(Debug)]

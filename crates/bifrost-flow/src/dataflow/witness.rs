@@ -1409,12 +1409,18 @@ impl WitnessStore {
 
         #[derive(Debug)]
         enum Task {
-            Expand(WitnessEvidenceId),
+            Expand {
+                evidence: WitnessEvidenceId,
+                suppress_relative_seed: bool,
+            },
             Emit(Box<SummaryWitnessStep>),
             OmittedReusableSummary,
         }
 
-        let mut stack = vec![Task::Expand(evidence)];
+        let mut stack = vec![Task::Expand {
+            evidence,
+            suppress_relative_seed: false,
+        }];
         let mut steps = Vec::new();
         let mut expansions = 0usize;
         let mut truncation_cause = None::<WitnessTruncationCause>;
@@ -1422,14 +1428,18 @@ impl WitnessStore {
 
         while let Some(task) = stack.pop() {
             match task {
-                Task::Expand(id) => {
+                Task::Expand {
+                    evidence: id,
+                    suppress_relative_seed,
+                } => {
                     if expansions >= limits.max_expansions() {
                         truncation_cause = truncation_cause
                             .or(Some(WitnessTruncationCause::ReconstructionExpansionLimit));
-                        omitted_steps_lower_bound = 1 + stack
-                            .iter()
-                            .filter(|task| matches!(task, Task::Emit(_)))
-                            .count();
+                        omitted_steps_lower_bound = usize::from(!suppress_relative_seed)
+                            + stack
+                                .iter()
+                                .filter(|task| matches!(task, Task::Emit(_)))
+                                .count();
                         break;
                     }
                     expansions = expansions.saturating_add(1);
@@ -1440,16 +1450,28 @@ impl WitnessStore {
                     self.validate_node(node)?;
                     match &node.kind {
                         WitnessEvidenceKind::Step { predecessor, step } => {
-                            stack.push(Task::Emit(Box::new(step.clone())));
+                            // An applied summary is relative to its callee entry. Its
+                            // predecessorless seed is a join boundary, not another
+                            // source on the caller-realizable path. Validation above
+                            // still checks the seed before reconstruction omits it.
+                            if predecessor.is_some() || !suppress_relative_seed {
+                                stack.push(Task::Emit(Box::new(step.clone())));
+                            }
                             if let Some(predecessor) = predecessor {
-                                stack.push(Task::Expand(*predecessor));
+                                stack.push(Task::Expand {
+                                    evidence: *predecessor,
+                                    suppress_relative_seed,
+                                });
                             }
                         }
                         WitnessEvidenceKind::EndSummary { predecessor, .. } => {
                             if let Some(gap_step) = node.end_summary_gap_step() {
                                 stack.push(Task::Emit(Box::new(gap_step)));
                             }
-                            stack.push(Task::Expand(*predecessor));
+                            stack.push(Task::Expand {
+                                evidence: *predecessor,
+                                suppress_relative_seed,
+                            });
                         }
                         WitnessEvidenceKind::SummaryApplication {
                             incoming,
@@ -1457,8 +1479,14 @@ impl WitnessStore {
                             return_step,
                         } => {
                             stack.push(Task::Emit(Box::new(return_step.clone())));
-                            stack.push(Task::Expand(*summary));
-                            stack.push(Task::Expand(*incoming));
+                            stack.push(Task::Expand {
+                                evidence: *summary,
+                                suppress_relative_seed: true,
+                            });
+                            stack.push(Task::Expand {
+                                evidence: *incoming,
+                                suppress_relative_seed,
+                            });
                         }
                         WitnessEvidenceKind::ReusableSummaryApplication {
                             incoming,
@@ -1467,7 +1495,10 @@ impl WitnessStore {
                         } => {
                             stack.push(Task::Emit(Box::new(return_step.clone())));
                             stack.push(Task::OmittedReusableSummary);
-                            stack.push(Task::Expand(*incoming));
+                            stack.push(Task::Expand {
+                                evidence: *incoming,
+                                suppress_relative_seed,
+                            });
                         }
                     }
                 }

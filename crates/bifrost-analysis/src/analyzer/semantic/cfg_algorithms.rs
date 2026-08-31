@@ -180,7 +180,7 @@ impl<'request> CfgAlgorithmRequest<'request> {
         }
     }
 
-    fn visit_node<Node>(&mut self) -> Result<(), CfgAlgorithmError<Node>> {
+    pub(crate) fn visit_node<Node>(&mut self) -> Result<(), CfgAlgorithmError<Node>> {
         self.checkpoint()?;
         self.budget
             .charge(CfgAlgorithmWork {
@@ -201,7 +201,7 @@ impl<'request> CfgAlgorithmRequest<'request> {
         self.visit_node()
     }
 
-    fn visit_edge<Node>(&mut self) -> Result<(), CfgAlgorithmError<Node>> {
+    pub(crate) fn visit_edge<Node>(&mut self) -> Result<(), CfgAlgorithmError<Node>> {
         self.checkpoint()?;
         self.budget
             .charge(CfgAlgorithmWork {

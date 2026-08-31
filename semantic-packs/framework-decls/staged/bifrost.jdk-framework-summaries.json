@@ -145,6 +145,170 @@
             ]
           },
           {
+            "id": "java.io.printwriter.format-format",
+            "target": {
+              "path": "java.base/java/io/PrintWriter.java",
+              "symbol": "java.io.PrintWriter.format(java.lang.String,java.lang.Object[])",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "covers_overrides": true,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "receiver"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "java.io.printwriter.output",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              },
+              {
+                "kind": "escape",
+                "event": "java.io.printwriter.output",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 1
+                }
+              }
+            ]
+          },
+          {
+            "id": "java.io.printwriter.format-locale-format",
+            "target": {
+              "path": "java.base/java/io/PrintWriter.java",
+              "symbol": "java.io.PrintWriter.format(java.util.Locale,java.lang.String,java.lang.Object[])",
+              "has_receiver": true,
+              "parameter_count": 3
+            },
+            "completeness": "complete",
+            "covers_overrides": true,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "receiver"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "java.io.printwriter.output",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 1
+                }
+              },
+              {
+                "kind": "escape",
+                "event": "java.io.printwriter.output",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 2
+                }
+              }
+            ]
+          },
+          {
+            "id": "java.io.printwriter.printf-format",
+            "target": {
+              "path": "java.base/java/io/PrintWriter.java",
+              "symbol": "java.io.PrintWriter.printf(java.lang.String,java.lang.Object[])",
+              "has_receiver": true,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "covers_overrides": true,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "receiver"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "java.io.printwriter.output",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                }
+              },
+              {
+                "kind": "escape",
+                "event": "java.io.printwriter.output",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 1
+                }
+              }
+            ]
+          },
+          {
+            "id": "java.io.printwriter.printf-locale-format",
+            "target": {
+              "path": "java.base/java/io/PrintWriter.java",
+              "symbol": "java.io.PrintWriter.printf(java.util.Locale,java.lang.String,java.lang.Object[])",
+              "has_receiver": true,
+              "parameter_count": 3
+            },
+            "completeness": "complete",
+            "covers_overrides": true,
+            "locations": [],
+            "transfers": [
+              {
+                "input": {
+                  "kind": "receiver"
+                },
+                "exit_kind": "normal",
+                "output": {
+                  "kind": "receiver"
+                }
+              }
+            ],
+            "effects": [
+              {
+                "kind": "escape",
+                "event": "java.io.printwriter.output",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 1
+                }
+              },
+              {
+                "kind": "escape",
+                "event": "java.io.printwriter.output",
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 2
+                }
+              }
+            ]
+          },
+          {
             "id": "java.sql.connection.preparestatement",
             "target": {
               "path": "java.sql/java/sql/Connection.java",

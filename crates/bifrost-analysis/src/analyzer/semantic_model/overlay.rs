@@ -199,6 +199,8 @@ pub struct SemanticModelSymbol {
     pub(crate) has_explicit_type_terms: bool,
     #[serde(skip)]
     pub(crate) callable_shape: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub callable_family_complete: bool,
     pub aliases: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub type_parameter_constraints: Vec<TypeParameterConstraint>,
@@ -727,6 +729,107 @@ impl SemanticModelOverlay {
         self.symbol_match(self.symbols_by_owner.get(owner_id))
     }
 
+    /// Resolve a TypeScript ambient global value's member through its
+    /// structured declaration-model type.
+    ///
+    /// TypeScript's standard library spells `Array.isArray` as a global value
+    /// `Array` typed as `ArrayConstructor`; the member is therefore published
+    /// on `ArrayConstructor`, not on the `Array` interface. Keep this lookup
+    /// bounded to one value-to-type hop and require one complete, unambiguous
+    /// model record so a missing or competing pack cannot become a clean
+    /// resolution.
+    pub fn typescript_global_member_target(
+        &self,
+        receiver: &str,
+        member: &str,
+    ) -> Option<&SemanticModelSymbol> {
+        let reference = format!("{receiver}.{member}");
+        let mut direct = self
+            .symbols_named(&reference)
+            .records
+            .into_iter()
+            .filter(|symbol| {
+                symbol.language == "typescript"
+                    && symbol.owner_id.is_some()
+                    && symbol.name == member
+                    && !symbol.provenance.ambiguous
+                    && symbol.provenance.completeness == SemanticModelCompleteness::Complete
+            })
+            .collect::<Vec<_>>();
+        direct.sort_by(|left, right| left.id.cmp(&right.id));
+        direct.dedup_by(|left, right| left.id == right.id);
+        if let [symbol] = direct.as_slice() {
+            return Some(*symbol);
+        }
+        if !direct.is_empty() {
+            return None;
+        }
+
+        let mut receiver_type_ids = HashSet::default();
+        let mut receiver_values = 0usize;
+        for value in self
+            .symbols_named(receiver)
+            .records
+            .into_iter()
+            .filter(|symbol| {
+                symbol.language == "typescript"
+                    && symbol.owner_id.is_some()
+                    && symbol.name == receiver
+                    && !symbol.provenance.ambiguous
+                    && symbol.provenance.completeness == SemanticModelCompleteness::Complete
+            })
+        {
+            receiver_values += 1;
+            let Some(signature) = value.structured_signature.as_ref() else {
+                continue;
+            };
+            let Some(return_type) = signature.returns.as_ref() else {
+                continue;
+            };
+            match return_type {
+                TypeRef::Declared { id, .. } => {
+                    receiver_type_ids.insert(id.clone());
+                }
+                TypeRef::Named { name, .. } => {
+                    let owners = self
+                        .symbols_named(name)
+                        .records
+                        .into_iter()
+                        .filter(|owner| {
+                            owner.owner_id.is_none()
+                                && owner.qualified_name == *name
+                                && owner.language == "typescript"
+                                && !owner.provenance.ambiguous
+                                && owner.provenance.completeness
+                                    == SemanticModelCompleteness::Complete
+                        });
+                    receiver_type_ids.extend(owners.map(|owner| owner.id.clone()));
+                }
+                _ => {}
+            }
+        }
+        if receiver_values != 1 || receiver_type_ids.len() != 1 {
+            return None;
+        }
+
+        let mut members = receiver_type_ids
+            .into_iter()
+            .flat_map(|owner_id| self.members_of(&owner_id).records)
+            .filter(|symbol| {
+                symbol.language == "typescript"
+                    && symbol.name == member
+                    && !symbol.provenance.ambiguous
+                    && symbol.provenance.completeness == SemanticModelCompleteness::Complete
+            })
+            .collect::<Vec<_>>();
+        members.sort_by(|left, right| left.id.cmp(&right.id));
+        members.dedup_by(|left, right| left.id == right.id);
+        match members.as_slice() {
+            [symbol] => Some(*symbol),
+            _ => None,
+        }
+    }
+
     /// Resolve one oracle-owned external callable identity against the active
     /// declaration model.
     ///
@@ -765,7 +868,8 @@ impl SemanticModelOverlay {
             .iter()
             .map(|owner| owner.id.as_str())
             .collect::<HashSet<_>>();
-        let mut candidates = Vec::new();
+        let mut exact_arity_candidates = Vec::new();
+        let mut variadic_candidates = Vec::new();
         let mut arity_mismatches = false;
 
         for owner_id in owner_ids {
@@ -778,16 +882,37 @@ impl SemanticModelOverlay {
                     continue;
                 }
                 let Some(signature) = member.structured_signature.as_ref() else {
-                    candidates.push(member);
+                    exact_arity_candidates.push(member);
                     continue;
                 };
-                if u32::try_from(signature.parameters.len()).ok() == Some(key.parameter_count) {
-                    candidates.push(member);
+                let declared_parameter_count = u32::try_from(signature.parameters.len()).ok();
+                let accepts_variadic_actuals =
+                    signature.parameters.last().is_some_and(|parameter| {
+                        parameter.variadic
+                            && declared_parameter_count
+                                .is_some_and(|count| key.parameter_count >= count)
+                    });
+                if declared_parameter_count == Some(key.parameter_count) {
+                    exact_arity_candidates.push(member);
+                } else if accepts_variadic_actuals {
+                    variadic_candidates.push(member);
                 } else {
                     arity_mismatches = true;
                 }
             }
         }
+
+        // A target that already carries the declaration's parameter count is
+        // stronger evidence than the fallback "this variadic declaration can
+        // accept that many written actuals". This matters when a fixed-prefix
+        // overload has the same declared count as another overload's expanded
+        // varargs call, as with PrintWriter.format(String, Object...) and
+        // format(Locale, String, Object...).
+        let candidates = if exact_arity_candidates.is_empty() {
+            variadic_candidates
+        } else {
+            exact_arity_candidates
+        };
 
         if candidates.is_empty() {
             return SemanticModelCallableMatch {
@@ -814,8 +939,9 @@ impl SemanticModelOverlay {
             SemanticModelCallableDisposition::Incomplete(
                 SemanticModelCallableIncompleteReason::AmbiguousModel,
             )
-        } else if owner_model_is_partial
-            || candidate.provenance.completeness == SemanticModelCompleteness::Partial
+        } else if (owner_model_is_partial
+            || candidate.provenance.completeness == SemanticModelCompleteness::Partial)
+            && !candidate.callable_family_complete
         {
             SemanticModelCallableDisposition::Incomplete(
                 SemanticModelCallableIncompleteReason::PartialModel,
@@ -3250,6 +3376,7 @@ fn emit_rule_match(
                         structured_signature: None,
                         has_explicit_type_terms: false,
                         callable_shape: None,
+                        callable_family_complete: false,
                         aliases: Vec::new(),
                         type_parameter_constraints: Vec::new(),
                         underlying_type: None,
@@ -3299,6 +3426,7 @@ fn emit_rule_match(
                             callable_shape: signature.as_ref().and_then(|signature| {
                                 render_template_callable_shape(signature, captures)
                             }),
+                            callable_family_complete: false,
                             aliases: Vec::new(),
                             type_parameter_constraints: Vec::new(),
                             underlying_type: None,
@@ -3699,6 +3827,7 @@ fn type_symbol(
         structured_signature: None,
         has_explicit_type_terms: record.has_explicit_type_terms,
         callable_shape: None,
+        callable_family_complete: false,
         aliases: record.aliases.clone(),
         type_parameter_constraints: record.type_parameter_constraints.clone(),
         underlying_type: record.underlying_type.clone(),
@@ -3756,6 +3885,7 @@ fn member_symbol(
         structured_signature: record.signature.clone(),
         has_explicit_type_terms: false,
         callable_shape: record.signature.as_ref().map(render_callable_shape),
+        callable_family_complete: record.callable_family_complete,
         aliases: record.aliases.clone(),
         type_parameter_constraints: Vec::new(),
         underlying_type: None,
@@ -3941,6 +4071,15 @@ fn model_location(
             end_line: 1,
         },
     })
+}
+
+pub(super) fn activated_record_provenance(
+    active: &ResolvedActiveSemanticModels,
+    shard: &ActiveSemanticModelShard,
+    record_id: &str,
+) -> SemanticModelProvenance {
+    let location = model_location(shard, "procedure_summary", record_id);
+    provenance(active, shard, record_id, &location, None, false)
 }
 
 fn provenance(
@@ -4342,6 +4481,7 @@ mod tests {
             structured_signature: None,
             has_explicit_type_terms: false,
             callable_shape: None,
+            callable_family_complete: false,
             aliases: Vec::new(),
             type_parameter_constraints: Vec::new(),
             underlying_type: None,
@@ -4415,6 +4555,7 @@ mod tests {
             structured_signature: signature,
             has_explicit_type_terms: false,
             callable_shape: None,
+            callable_family_complete: false,
             aliases: Vec::new(),
             type_parameter_constraints: Vec::new(),
             underlying_type: None,
@@ -4439,6 +4580,32 @@ mod tests {
             .as_ref()
             .map(render_callable_shape);
         symbol
+    }
+
+    fn global_value(
+        owner: &SemanticModelSymbol,
+        id: &str,
+        name: &str,
+        return_type: &str,
+    ) -> SemanticModelSymbol {
+        let mut value = method(
+            owner,
+            id,
+            name,
+            Some(Signature {
+                type_parameters: Vec::new(),
+                parameters: Vec::new(),
+                returns: Some(TypeRef::Named {
+                    name: return_type.to_string(),
+                    arguments: Vec::new(),
+                    nullable: false,
+                }),
+            }),
+        );
+        value.kind = SemanticModelSymbolKind::Constant;
+        value.is_static = true;
+        value.callable_shape = None;
+        value
     }
 
     fn signature(names: &[Option<&str>], variadic: bool) -> Signature {
@@ -4468,6 +4635,27 @@ mod tests {
         SemanticModelCallableKey::new("java", "pkg.Owner", "run", true, parameter_count)
     }
 
+    fn go_package_function(
+        owner: &SemanticModelSymbol,
+        id: &str,
+        name: &str,
+        returns: TypeRef,
+    ) -> SemanticModelSymbol {
+        let mut function = method(
+            owner,
+            id,
+            name,
+            Some(Signature {
+                type_parameters: Vec::new(),
+                parameters: Vec::new(),
+                returns: Some(returns),
+            }),
+        );
+        function.kind = SemanticModelSymbolKind::Function;
+        function.is_static = true;
+        function
+    }
+
     #[test]
     fn external_callable_lookup_returns_the_structured_signature() {
         let owner = class("pkg.Owner", "java");
@@ -4492,19 +4680,24 @@ mod tests {
 
     #[test]
     fn external_callable_lookup_keeps_same_arity_overloads_ambiguous() {
-        let owner = class("pkg.Owner", "java");
-        let first = method(
+        let mut owner = class("pkg.Owner", "java");
+        owner.provenance.completeness = SemanticModelCompleteness::Partial;
+        let mut first = method(
             &owner,
             "member.run.first",
             "run",
             Some(signature(&[Some("value")], false)),
         );
-        let second = method(
+        first.provenance.completeness = SemanticModelCompleteness::Partial;
+        first.callable_family_complete = true;
+        let mut second = method(
             &owner,
             "member.run.second",
             "run",
             Some(signature(&[Some("other")], false)),
         );
+        second.provenance.completeness = SemanticModelCompleteness::Partial;
+        second.callable_family_complete = true;
         let overlay = overlay(vec![owner, first, second], Vec::new());
 
         let result = overlay.callable_for_target(callable_key(1));
@@ -4515,6 +4708,44 @@ mod tests {
         );
         assert_eq!(result.records.len(), 2);
         assert!(result.unique().is_none());
+    }
+
+    #[test]
+    fn external_callable_lookup_uses_scoped_completeness_without_promoting_provenance() {
+        let mut owner = class("pkg.Owner", "java");
+        owner.provenance.completeness = SemanticModelCompleteness::Partial;
+        let mut claimed = method(
+            &owner,
+            "member.run.claimed",
+            "run",
+            Some(signature(&[Some("value")], false)),
+        );
+        claimed.provenance.completeness = SemanticModelCompleteness::Partial;
+        claimed.callable_family_complete = true;
+
+        let claimed_overlay = overlay(vec![owner.clone(), claimed.clone()], Vec::new());
+        let claimed_result = claimed_overlay.callable_for_target(callable_key(1));
+        assert_eq!(
+            claimed_result.disposition,
+            SemanticModelCallableDisposition::Unique
+        );
+        let selected = claimed_result.unique().expect("one claimed family");
+        assert!(selected.callable_family_complete);
+        assert_eq!(
+            selected.provenance.completeness,
+            SemanticModelCompleteness::Partial,
+            "the family claim must not promote pack provenance"
+        );
+
+        claimed.callable_family_complete = false;
+        let unclaimed_overlay = overlay(vec![owner, claimed], Vec::new());
+        let unclaimed_result = unclaimed_overlay.callable_for_target(callable_key(1));
+        assert_eq!(
+            unclaimed_result.disposition,
+            SemanticModelCallableDisposition::Incomplete(
+                SemanticModelCallableIncompleteReason::PartialModel
+            )
+        );
     }
 
     #[test]
@@ -4575,6 +4806,664 @@ mod tests {
                 .unwrap()
                 .parameters[0]
                 .variadic
+        );
+
+        let repeated = overlay.callable_for_target(callable_key(3));
+        assert_eq!(
+            repeated.disposition,
+            SemanticModelCallableDisposition::Unique
+        );
+        assert!(
+            repeated
+                .unique()
+                .unwrap()
+                .structured_signature()
+                .unwrap()
+                .parameters[0]
+                .variadic
+        );
+    }
+
+    #[test]
+    fn external_callable_lookup_prefers_declared_arity_over_variadic_fallback() {
+        let owner = class("pkg.Owner", "java");
+        let variadic = method(
+            &owner,
+            "member.run.variadic",
+            "run",
+            Some(signature(&[Some("values")], true)),
+        );
+        let exact = method(
+            &owner,
+            "member.run.exact",
+            "run",
+            Some(signature(
+                &[Some("locale"), Some("format"), Some("values")],
+                true,
+            )),
+        );
+        let overlay = overlay(vec![owner, variadic, exact], Vec::new());
+
+        let result = overlay.callable_for_target(callable_key(3));
+
+        assert_eq!(result.disposition, SemanticModelCallableDisposition::Unique);
+        assert_eq!(result.unique().unwrap().id, "member.run.exact");
+    }
+
+    #[test]
+    fn go_visible_symbol_checks_uniqueness_before_language_and_visibility() {
+        use crate::analyzer::go::package_identity::GoOverlayPackages;
+
+        let public = class("example.com/external.Widget", "go");
+        let unique = overlay(vec![public.clone()], Vec::new());
+        assert!(
+            GoOverlayPackages::new(Some(&unique))
+                .visible_symbol("example.com/external.Widget")
+                .is_some(),
+            "one public Go declaration is visible"
+        );
+
+        let mut private = public.clone();
+        private.id = "type.example.com/external.Widget.private".to_owned();
+        private.visibility = Visibility::Private;
+        private.provenance.pack_digest = "private-pack".to_owned();
+        let visibility_conflict = overlay(vec![public.clone(), private], Vec::new());
+        assert!(
+            GoOverlayPackages::new(Some(&visibility_conflict))
+                .visible_symbol("example.com/external.Widget")
+                .is_none(),
+            "a private same-name record cannot be filtered out before uniqueness"
+        );
+
+        let mut ambiguous = public;
+        ambiguous.provenance.ambiguous = true;
+        let ambiguous = overlay(vec![ambiguous], Vec::new());
+        assert!(
+            GoOverlayPackages::new(Some(&ambiguous))
+                .visible_symbol("example.com/external.Widget")
+                .is_none(),
+            "one individually ambiguous record is not visible"
+        );
+    }
+
+    #[test]
+    fn go_package_member_publication_unifies_both_storage_names_before_uniqueness() {
+        use crate::analyzer::go::package_identity::GoOverlayPackages;
+
+        let public_type = class("example.com/external.Widget", "go");
+        let type_only = overlay(vec![public_type.clone()], Vec::new());
+        assert!(
+            GoOverlayPackages::new(Some(&type_only))
+                .publishes_member("example.com/external", "Widget"),
+            "the canonical package-type name remains supported"
+        );
+
+        let mut module = class("example.com/external._module_", "go");
+        module.kind = SemanticModelSymbolKind::Module;
+        module.visibility = Visibility::Package;
+        let function = go_package_function(
+            &module,
+            "member.example-widget",
+            "Widget",
+            TypeRef::Named {
+                name: "string".to_owned(),
+                arguments: Vec::new(),
+                nullable: false,
+            },
+        );
+        let module_only = overlay(vec![module.clone(), function.clone()], Vec::new());
+        assert!(
+            GoOverlayPackages::new(Some(&module_only))
+                .publishes_member("example.com/external", "Widget"),
+            "the generated module-scope member name remains supported"
+        );
+
+        let competing_shapes = overlay(
+            vec![public_type.clone(), module.clone(), function],
+            Vec::new(),
+        );
+        assert!(
+            !GoOverlayPackages::new(Some(&competing_shapes))
+                .publishes_member("example.com/external", "Widget"),
+            "a type and module-scope member with the same selected name conflict"
+        );
+
+        let mut private_type = public_type;
+        private_type.id = "type.example.com/external.Widget.private".to_owned();
+        private_type.visibility = Visibility::Private;
+        private_type.provenance.pack_digest = "private-pack".to_owned();
+        let public_function = go_package_function(
+            &module,
+            "member.example-widget.public",
+            "Widget",
+            TypeRef::Named {
+                name: "string".to_owned(),
+                arguments: Vec::new(),
+                nullable: false,
+            },
+        );
+        let cross_name_visibility_conflict =
+            overlay(vec![module, public_function, private_type], Vec::new());
+        assert!(
+            !GoOverlayPackages::new(Some(&cross_name_visibility_conflict))
+                .publishes_member("example.com/external", "Widget"),
+            "a private record under the alternate accepted name remains a conflict"
+        );
+    }
+
+    #[test]
+    fn go_callable_results_require_exact_declared_nominals_and_ordinals() {
+        use crate::analyzer::go::package_identity::{
+            GoModeledNominalType, GoOverlayPackages, modeled_go_callable_result_pointer_field,
+        };
+
+        let mut package = class("example.com/external", "go");
+        package.kind = SemanticModelSymbolKind::Module;
+        package.visibility = Visibility::Package;
+        package.provenance.completeness = SemanticModelCompleteness::Partial;
+        let mut first = class("testing.T", "go");
+        first.kind = SemanticModelSymbolKind::Struct;
+        let mut second = class("testing.F", "go");
+        second.kind = SemanticModelSymbolKind::Struct;
+        let mut file = class("os.File", "go");
+        file.kind = SemanticModelSymbolKind::Struct;
+        let function = go_package_function(
+            &package,
+            "member.make-pair",
+            "MakePair",
+            TypeRef::Tuple {
+                elements: vec![
+                    TypeRef::Pointer {
+                        element: Box::new(TypeRef::Declared {
+                            id: first.id.clone(),
+                            arguments: Vec::new(),
+                            nullable: false,
+                        }),
+                    },
+                    TypeRef::Declared {
+                        id: second.id.clone(),
+                        arguments: Vec::new(),
+                        nullable: false,
+                    },
+                    TypeRef::Named {
+                        name: "custom.Result".to_owned(),
+                        arguments: Vec::new(),
+                        nullable: false,
+                    },
+                    TypeRef::Declared {
+                        id: first.id.clone(),
+                        arguments: vec![TypeRef::Named {
+                            name: "string".to_owned(),
+                            arguments: Vec::new(),
+                            nullable: false,
+                        }],
+                        nullable: false,
+                    },
+                    TypeRef::Slice {
+                        element: Box::new(TypeRef::Declared {
+                            id: first.id.clone(),
+                            arguments: Vec::new(),
+                            nullable: false,
+                        }),
+                    },
+                ],
+            },
+        );
+        let mut listen = go_package_function(
+            &package,
+            "member.listen",
+            "Listen",
+            TypeRef::Tuple {
+                elements: vec![
+                    TypeRef::Declared {
+                        id: second.id.clone(),
+                        arguments: Vec::new(),
+                        nullable: false,
+                    },
+                    TypeRef::Named {
+                        name: "error".to_owned(),
+                        arguments: Vec::new(),
+                        nullable: false,
+                    },
+                ],
+            },
+        );
+        listen.provenance.completeness = SemanticModelCompleteness::Partial;
+        let mut public_field = method(
+            &first,
+            "member.testing-t-name",
+            "Name",
+            Some(Signature {
+                type_parameters: Vec::new(),
+                parameters: Vec::new(),
+                returns: Some(TypeRef::Named {
+                    name: "string".to_owned(),
+                    arguments: Vec::new(),
+                    nullable: false,
+                }),
+            }),
+        );
+        public_field.kind = SemanticModelSymbolKind::Field;
+        public_field.receiver = None;
+        let mut public_value_field = method(
+            &second,
+            "member.testing-f-label",
+            "Label",
+            Some(Signature {
+                type_parameters: Vec::new(),
+                parameters: Vec::new(),
+                returns: Some(TypeRef::Named {
+                    name: "string".to_owned(),
+                    arguments: Vec::new(),
+                    nullable: false,
+                }),
+            }),
+        );
+        public_value_field.kind = SemanticModelSymbolKind::Field;
+        public_value_field.receiver = None;
+        let mut stat = method(
+            &file,
+            "member.os-file-stat",
+            "Stat",
+            Some(Signature {
+                type_parameters: Vec::new(),
+                parameters: Vec::new(),
+                returns: Some(TypeRef::Tuple {
+                    elements: vec![
+                        TypeRef::Declared {
+                            id: second.id.clone(),
+                            arguments: Vec::new(),
+                            nullable: false,
+                        },
+                        TypeRef::Named {
+                            name: "error".to_owned(),
+                            arguments: Vec::new(),
+                            nullable: false,
+                        },
+                    ],
+                }),
+            }),
+        );
+        stat.receiver = Some(ReceiverFact { pointer: true });
+        let overlay = overlay(
+            vec![
+                package,
+                first,
+                second,
+                file,
+                function,
+                listen,
+                public_field,
+                public_value_field,
+                stat,
+            ],
+            Vec::new(),
+        );
+        let packages = GoOverlayPackages::new(Some(&overlay));
+
+        assert!(matches!(
+            packages.callable_result_type_ref("example.com/external", "Listen", false, 0, 0),
+            Some(TypeRef::Declared { id, .. }) if id == "type.testing.F"
+        ));
+        assert!(matches!(
+            packages.callable_result_type_ref("example.com/external", "Listen", false, 0, 1),
+            Some(TypeRef::Named {
+                name,
+                arguments,
+                nullable: false,
+            }) if name == "error" && arguments.is_empty()
+        ));
+
+        assert_eq!(
+            packages.callable_result_nominal_type("example.com/external", "MakePair", false, 0, 0,),
+            Some(GoModeledNominalType {
+                declaration_id: "type.testing.T".to_owned(),
+                qualified_name: "testing.T".to_owned(),
+                pointer: true,
+            }),
+            "a unique positive fact remains usable from a partial package"
+        );
+        assert!(modeled_go_callable_result_pointer_field(
+            Some(&overlay),
+            "example.com/external",
+            "MakePair",
+            false,
+            0,
+            0,
+            "Name",
+        ));
+        assert!(
+            !modeled_go_callable_result_pointer_field(
+                Some(&overlay),
+                "example.com/external",
+                "MakePair",
+                false,
+                0,
+                0,
+                "Missing",
+            ),
+            "a missing field in the partial result-type pack is not negative evidence"
+        );
+        assert!(
+            !modeled_go_callable_result_pointer_field(
+                Some(&overlay),
+                "example.com/external",
+                "MakePair",
+                false,
+                0,
+                1,
+                "Label",
+            ),
+            "a declared field on a value-struct result does not prove a non-null precondition"
+        );
+        assert_eq!(
+            packages.callable_result_nominal_type("example.com/external", "MakePair", false, 0, 1,),
+            Some(GoModeledNominalType {
+                declaration_id: "type.testing.F".to_owned(),
+                qualified_name: "testing.F".to_owned(),
+                pointer: false,
+            })
+        );
+        assert_eq!(
+            packages.callable_result_nominal_type("os.File", "Stat", true, 0, 0,),
+            Some(GoModeledNominalType {
+                declaration_id: "type.testing.F".to_owned(),
+                qualified_name: "testing.F".to_owned(),
+                pointer: false,
+            }),
+            "an exact receiver callable preserves its own tuple result ordinal"
+        );
+        assert!(
+            packages
+                .callable_result_nominal_type("os.File", "Stat", true, 0, 1,)
+                .is_none(),
+            "the receiver call's named error result is not a modeled nominal receiver"
+        );
+        assert!(matches!(
+            packages.callable_result_type_ref("os.File", "Stat", true, 0, 1),
+            Some(TypeRef::Named {
+                name,
+                arguments,
+                nullable: false,
+            }) if name == "error" && arguments.is_empty()
+        ));
+        assert!(
+            packages
+                .callable_result_type_ref("os.File", "Stat", true, 0, 2)
+                .is_none(),
+            "an absent tuple ordinal is not a result type fact"
+        );
+        for ordinal in [2, 3, 4, 5] {
+            assert!(
+                packages
+                    .callable_result_nominal_type(
+                        "example.com/external",
+                        "MakePair",
+                        false,
+                        0,
+                        ordinal,
+                    )
+                    .is_none(),
+                "unsupported or missing result ordinal {ordinal} must remain open"
+            );
+        }
+        assert!(
+            packages
+                .callable_result_nominal_type("example.com/external", "MakePair", false, 1, 0,)
+                .is_none(),
+            "a wrong call arity must not borrow the zero-arity declaration"
+        );
+    }
+
+    #[test]
+    fn go_callable_result_lookup_abstains_on_competing_or_nonstatic_facts() {
+        use crate::analyzer::go::package_identity::GoOverlayPackages;
+
+        let mut package = class("example.com/external", "go");
+        package.kind = SemanticModelSymbolKind::Module;
+        package.visibility = Visibility::Package;
+        let mut result = class("testing.T", "go");
+        result.kind = SemanticModelSymbolKind::Struct;
+        let returns = TypeRef::Declared {
+            id: result.id.clone(),
+            arguments: Vec::new(),
+            nullable: false,
+        };
+        let first = go_package_function(&package, "member.first", "Make", returns.clone());
+        let second = go_package_function(&package, "member.second", "Make", returns.clone());
+        let conflict = overlay(
+            vec![package.clone(), result.clone(), first, second],
+            Vec::new(),
+        );
+        assert!(
+            GoOverlayPackages::new(Some(&conflict))
+                .callable_result_nominal_type("example.com/external", "Make", false, 0, 0,)
+                .is_none(),
+            "competing exact declarations are not a positive fact"
+        );
+
+        let mut nonstatic = go_package_function(&package, "member.nonstatic", "Make", returns);
+        nonstatic.is_static = false;
+        let malformed = overlay(vec![package, result, nonstatic], Vec::new());
+        assert!(
+            GoOverlayPackages::new(Some(&malformed))
+                .callable_result_nominal_type("example.com/external", "Make", false, 0, 0,)
+                .is_none(),
+            "a nonstatic member cannot prove a package function call"
+        );
+
+        let mut forged_package = class("example.com/forged", "go");
+        forged_package.kind = SemanticModelSymbolKind::Module;
+        forged_package.visibility = Visibility::Package;
+        let mut forged_type = class("example.com/external.Forged", "go");
+        forged_type.kind = SemanticModelSymbolKind::Function;
+        let forged_return = TypeRef::Declared {
+            id: forged_type.id.clone(),
+            arguments: Vec::new(),
+            nullable: false,
+        };
+        let callable = go_package_function(&forged_package, "member.forged", "Make", forged_return);
+        let forged = overlay(
+            vec![forged_package, forged_type.clone(), callable],
+            Vec::new(),
+        );
+        let packages = GoOverlayPackages::new(Some(&forged));
+        assert!(
+            packages
+                .declared_type_qualified_name(&forged_type.id)
+                .is_none(),
+            "a top-level callable-shaped symbol cannot satisfy a Declared type reference"
+        );
+        assert!(
+            packages
+                .callable_result_nominal_type("example.com/forged", "Make", false, 0, 0)
+                .is_none(),
+            "a forged callable symbol cannot become a modeled nominal result"
+        );
+    }
+
+    #[test]
+    fn go_pointer_field_proof_abstains_on_same_name_wrong_shape_facts() {
+        use crate::analyzer::go::package_identity::modeled_go_callable_result_pointer_field;
+
+        let mut package = class("example.com/external", "go");
+        package.kind = SemanticModelSymbolKind::Module;
+        package.visibility = Visibility::Package;
+        package.provenance.completeness = SemanticModelCompleteness::Partial;
+        let mut result = class("testing.T", "go");
+        result.kind = SemanticModelSymbolKind::Struct;
+        result.provenance.completeness = SemanticModelCompleteness::Partial;
+        let returns = TypeRef::Pointer {
+            element: Box::new(TypeRef::Declared {
+                id: result.id.clone(),
+                arguments: Vec::new(),
+                nullable: false,
+            }),
+        };
+        let mut callable =
+            go_package_function(&package, "member.make.valid", "Make", returns.clone());
+        callable.provenance.completeness = SemanticModelCompleteness::Partial;
+        let mut field = method(
+            &result,
+            "member.testing-t-name",
+            "Name",
+            Some(Signature {
+                type_parameters: Vec::new(),
+                parameters: Vec::new(),
+                returns: Some(TypeRef::Named {
+                    name: "string".to_owned(),
+                    arguments: Vec::new(),
+                    nullable: false,
+                }),
+            }),
+        );
+        field.kind = SemanticModelSymbolKind::Field;
+        field.receiver = None;
+        field.provenance.completeness = SemanticModelCompleteness::Partial;
+
+        let proves = |conflict: Option<SemanticModelSymbol>| {
+            let mut symbols = vec![
+                package.clone(),
+                result.clone(),
+                callable.clone(),
+                field.clone(),
+            ];
+            symbols.extend(conflict);
+            let overlay = overlay(symbols, Vec::new());
+            modeled_go_callable_result_pointer_field(
+                Some(&overlay),
+                "example.com/external",
+                "Make",
+                false,
+                0,
+                0,
+                "Name",
+            )
+        };
+        assert!(
+            proves(None),
+            "one partial positive callable and field remain usable"
+        );
+
+        let mut wrong_arity = method(
+            &package,
+            "member.make.wrong-arity",
+            "Make",
+            Some(Signature {
+                type_parameters: Vec::new(),
+                parameters: signature(&[Some("value")], false).parameters,
+                returns: Some(returns.clone()),
+            }),
+        );
+        wrong_arity.kind = SemanticModelSymbolKind::Function;
+        wrong_arity.is_static = true;
+        assert!(
+            !proves(Some(wrong_arity)),
+            "a same-name wrong-arity callable is a Go declaration conflict"
+        );
+
+        let mut wrong_kind = method(&package, "member.make.wrong-kind", "Make", None);
+        wrong_kind.kind = SemanticModelSymbolKind::Constant;
+        wrong_kind.is_static = true;
+        assert!(
+            !proves(Some(wrong_kind)),
+            "a same-name non-callable is a Go declaration conflict"
+        );
+
+        let mut method_conflict = method(
+            &result,
+            "member.testing-t-name-method",
+            "Name",
+            Some(Signature {
+                type_parameters: Vec::new(),
+                parameters: Vec::new(),
+                returns: Some(TypeRef::Named {
+                    name: "string".to_owned(),
+                    arguments: Vec::new(),
+                    nullable: false,
+                }),
+            }),
+        );
+        method_conflict.receiver = Some(ReceiverFact { pointer: true });
+        assert!(
+            !proves(Some(method_conflict)),
+            "a same-name method conflicts with the field fact"
+        );
+
+        let mut property_conflict = method(&result, "member.testing-t-name-property", "Name", None);
+        property_conflict.kind = SemanticModelSymbolKind::Property;
+        property_conflict.receiver = None;
+        assert!(
+            !proves(Some(property_conflict)),
+            "a same-name property conflicts with the field fact"
+        );
+    }
+
+    #[test]
+    fn typescript_global_value_follows_declared_constructor_to_exact_member() {
+        let global = class("global.es5", "typescript");
+        let constructor = class("ArrayConstructor", "typescript");
+        let value = global_value(
+            &global,
+            "typescript-global-array",
+            "Array",
+            "ArrayConstructor",
+        );
+        let member = method(&constructor, "typescript-array-is-array", "isArray", None);
+        let resolved_overlay = overlay(
+            vec![
+                global.clone(),
+                constructor.clone(),
+                value.clone(),
+                member.clone(),
+            ],
+            Vec::new(),
+        );
+
+        assert_eq!(
+            resolved_overlay
+                .typescript_global_member_target("Array", "isArray")
+                .map(|symbol| symbol.id.as_str()),
+            Some("typescript-array-is-array")
+        );
+        assert!(
+            resolved_overlay
+                .typescript_global_member_target("Array", "missing")
+                .is_none()
+        );
+
+        let mut ambiguous_member = member.clone();
+        ambiguous_member.id = "typescript-array-is-array-duplicate".to_string();
+        let ambiguous_overlay = overlay(
+            vec![
+                global.clone(),
+                constructor.clone(),
+                value.clone(),
+                member.clone(),
+                ambiguous_member,
+            ],
+            Vec::new(),
+        );
+        assert!(
+            ambiguous_overlay
+                .typescript_global_member_target("Array", "isArray")
+                .is_none(),
+            "competing member records must not produce an exact target"
+        );
+
+        let mut partial_member = method(
+            &constructor,
+            "typescript-array-is-array-partial",
+            "isArray",
+            None,
+        );
+        partial_member.provenance.completeness = SemanticModelCompleteness::Partial;
+        let partial_overlay = overlay(vec![global, constructor, value, partial_member], Vec::new());
+        assert!(
+            partial_overlay
+                .typescript_global_member_target("Array", "isArray")
+                .is_none(),
+            "a partial member record must not produce an exact target"
         );
     }
 

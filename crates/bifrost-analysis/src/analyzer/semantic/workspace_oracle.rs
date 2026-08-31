@@ -18,28 +18,33 @@ pub(crate) use dispatch::{
 // Policy lowering resolves authored source ranges to procedures through these
 // two, so they are public where the rest of dispatch stays crate-internal.
 pub use dispatch::{ProcedureRangeLookupStatus, procedures_for_source_ranges};
+#[doc(hidden)]
+pub use source::PreparedSourceDispatchSession;
 pub use source::{SourceDispatchObservation, SourceDispatchResult, SourcePointsToResult};
 // The value-flow plan re-applies these relevance rules when it decides
 // whether a snapshot's residual openness was refined by its own complete
 // call resolutions (#1952).
 pub use value_flow::{
-    abort_paths_run_user_code, allocation_call_is_dischargeable, call_target_refinement_call,
-    constructor_call_gap_is_discharged, gap_impacts_value_flow, implicit_abort_gap_is_discharged,
-    value_flow_capabilities_are_open,
+    abort_paths_run_user_code, abort_paths_run_user_code_bounded, allocation_call_is_dischargeable,
+    call_target_refinement_call, constructor_call_gap_is_discharged, gap_impacts_value_flow,
+    implicit_abort_gap_is_discharged, value_flow_capabilities_are_open,
 };
 
 use std::fmt;
+use std::sync::Arc;
 
+use crate::analyzer::semantic_model::SemanticModelOverlay;
 use crate::analyzer::{DispatchHierarchyExpansion, WorkspaceAnalyzer};
 
 use super::OracleLimits;
 
 /// Workspace semantic oracles bound to one immutable analyzer generation.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct WorkspaceSemanticOracle<'a> {
     workspace: &'a WorkspaceAnalyzer,
     limits: OracleLimits,
     hierarchy_expansion: DispatchHierarchyExpansion,
+    semantic_model_overlay: Option<Arc<SemanticModelOverlay>>,
 }
 
 impl<'a> WorkspaceSemanticOracle<'a> {
@@ -67,10 +72,37 @@ impl<'a> WorkspaceSemanticOracle<'a> {
         limits: OracleLimits,
         hierarchy_expansion: DispatchHierarchyExpansion,
     ) -> Self {
+        Self::with_limits_expansion_and_semantic_model_overlay(
+            workspace,
+            limits,
+            hierarchy_expansion,
+            workspace.analyzer().semantic_model_overlay(),
+        )
+    }
+
+    pub(crate) fn with_semantic_model_overlay(
+        workspace: &'a WorkspaceAnalyzer,
+        semantic_model_overlay: Option<Arc<SemanticModelOverlay>>,
+    ) -> Self {
+        Self::with_limits_expansion_and_semantic_model_overlay(
+            workspace,
+            OracleLimits::default(),
+            workspace.dispatch_hierarchy_expansion(),
+            semantic_model_overlay,
+        )
+    }
+
+    fn with_limits_expansion_and_semantic_model_overlay(
+        workspace: &'a WorkspaceAnalyzer,
+        limits: OracleLimits,
+        hierarchy_expansion: DispatchHierarchyExpansion,
+        semantic_model_overlay: Option<Arc<SemanticModelOverlay>>,
+    ) -> Self {
         Self {
             workspace,
             limits,
             hierarchy_expansion,
+            semantic_model_overlay,
         }
     }
 
@@ -86,6 +118,10 @@ impl<'a> WorkspaceSemanticOracle<'a> {
     pub const fn hierarchy_expansion(&self) -> DispatchHierarchyExpansion {
         self.hierarchy_expansion
     }
+
+    pub(super) fn semantic_model_overlay(&self) -> Option<Arc<SemanticModelOverlay>> {
+        self.semantic_model_overlay.as_ref().map(Arc::clone)
+    }
 }
 
 impl fmt::Debug for WorkspaceSemanticOracle<'_> {
@@ -94,6 +130,10 @@ impl fmt::Debug for WorkspaceSemanticOracle<'_> {
             .debug_struct("WorkspaceSemanticOracle")
             .field("limits", &self.limits)
             .field("hierarchy_expansion", &self.hierarchy_expansion)
+            .field(
+                "has_semantic_model_overlay",
+                &self.semantic_model_overlay.is_some(),
+            )
             .finish_non_exhaustive()
     }
 }

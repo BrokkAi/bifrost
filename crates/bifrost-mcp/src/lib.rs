@@ -5,10 +5,10 @@
 
 pub use brokk_bifrost_analysis::{
     AnalyzerConfig, BIFROST_IGNORE_FILE_NAME, CancellationToken, FilesystemProject, Project,
-    ProjectFile, WorkspaceAnalyzer, WorkspaceFileListingCache, analyzer, cache_db, cache_gc,
-    cancellation, code_quality, collect_workspace_files, diff_analysis, file_tools, git_file,
-    gitblob, hash, path_normalization, path_utils, profiling, searchtools, searchtools_render,
-    symbol_rename, workspace_document,
+    ProjectFile, WorkspaceAnalyzer, WorkspaceFileListingCache, analyzer, blast_radius, cache_db,
+    cache_gc, cancellation, code_quality, collect_workspace_files, cyclomatic_complexity_diff,
+    diff_analysis, diff_scoring, file_tools, git_file, gitblob, hash, path_normalization,
+    path_utils, profiling, searchtools, searchtools_render, symbol_rename, workspace_document,
 };
 pub use brokk_bifrost_flow as flow;
 pub use brokk_bifrost_policy as policy;
@@ -19,6 +19,7 @@ pub mod analyzer_pool;
 pub mod mcp_cli;
 pub mod mcp_common;
 pub mod mcp_core;
+pub mod mcp_diff;
 pub mod mcp_extended;
 pub mod mcp_registry;
 pub mod mcp_slopcop;

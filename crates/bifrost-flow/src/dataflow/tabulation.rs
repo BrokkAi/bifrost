@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 
 use crate::analyzer::semantic::{
-    EvidenceCompleteness, IcfgEdgeId, IcfgNodeId, IcfgSnapshot, ProofStatus,
+    EvidenceCompleteness, IcfgEdge, IcfgEdgeId, IcfgEdgeKind, IcfgNodeId, IcfgSnapshot, ProofStatus,
 };
 use crate::hash::{HashMap, HashSet};
 
@@ -19,6 +19,26 @@ use super::{
 };
 
 const ZERO_FACT_ID: FactId = FactId::new(0);
+
+/// Whether the kernel must withhold this edge from a problem that did not
+/// declare `resolved_call_to_return`.
+///
+/// The bounded snapshot carries a caller-side continuation for every resolved
+/// call (#2782), which is what lets a value the callee neither receives nor
+/// returns survive the call. A problem that has not declared it can take that
+/// edge would otherwise gain a path around the callee it never modelled, so it
+/// keeps seeing a resolved call as call and matched-return edges only.
+///
+/// A continuation projected for a dispatch *boundary* is a different row: it
+/// carries that boundary, and it reaches every problem exactly as before.
+fn withheld_call_to_return(edge: &IcfgEdge, resolved_call_to_return: bool) -> bool {
+    !resolved_call_to_return
+        && edge.boundary.is_none()
+        && matches!(
+            edge.kind,
+            IcfgEdgeKind::CallToNormalContinuation | IcfgEdgeKind::CallToExceptionalContinuation
+        )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct ExplodedState {
@@ -308,6 +328,9 @@ where
             let fact = self.facts[queued.state.fact.index()];
 
             for (edge_id, edge) in self.snapshot.successor_edges(queued.state.node) {
+                if withheld_call_to_return(edge, problem.resolved_call_to_return()) {
+                    continue;
+                }
                 self.observe_edge(edge_id, edge);
                 if request.cancellation.is_cancelled() {
                     return Ok(SolverTermination::Cancelled);
@@ -361,6 +384,9 @@ where
             let output_fact = self.facts[queued.state.fact.index()];
 
             for (edge_id, edge) in self.snapshot.predecessor_edges(queued.state.node) {
+                if withheld_call_to_return(edge, problem.resolved_call_to_return()) {
+                    continue;
+                }
                 self.observe_edge(edge_id, edge);
                 if request.cancellation.is_cancelled() {
                     return Ok(SolverTermination::Cancelled);

@@ -311,6 +311,16 @@ pub(crate) trait LanguageSupport: Send + Sync {
         None
     }
 
+    /// The identifier a declaration names, for languages whose grammar names it
+    /// positionally rather than by field, or `None` when the field lookup or
+    /// document-order search already finds it.
+    fn declaration_name_node<'t>(
+        &self,
+        _declaration: tree_sitter::Node<'t>,
+    ) -> Option<tree_sitter::Node<'t>> {
+        None
+    }
+
     /// The argument-list nodes of a call whose grammar nests them out of reach of the
     /// generic field and child-kind lookup. `Some` replaces that lookup entirely, so an
     /// empty vector means "this call has no arguments", not "look elsewhere".

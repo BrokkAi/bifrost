@@ -26,8 +26,9 @@
 //!   spawned binary needs and what an in-process test cannot have.
 //!
 //! Both assert that the cache they hand out really is outside the checkout, so
-//! a change that quietly re-binds the repository database fails the tests that
-//! rely on it instead of corrupting them.
+//! a change that quietly re-binds the repository database or generated
+//! semantic-pack catalog fails the tests that rely on it instead of corrupting
+//! them. The catalog shares the analyzer cache parent.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -116,10 +117,14 @@ impl Default for ScratchCacheDir {
 /// that takes a scratch root rather than recorded once somewhere it can rot.
 /// It also catches an ambient `BIFROST_CACHE_DIR`, which would silently defeat
 /// the isolation by pointing every root at one shared database.
-fn assert_cache_is_scratch(scratch_root: &Path) {
+pub(crate) fn cache_is_scratch(scratch_root: &Path) -> bool {
+    cache_db_path(scratch_root).starts_with(scratch_root)
+}
+
+pub(crate) fn assert_cache_is_scratch(scratch_root: &Path) {
     let resolved = cache_db_path(scratch_root);
     assert!(
-        resolved.starts_with(scratch_root),
+        cache_is_scratch(scratch_root),
         "a test workspace must own its cache: {} resolved to {}. \
          A scratch root inside a Git checkout resolves to that checkout's shared \
          `.bifrost/cache` database, and an ambient {CACHE_DIR_ENV} redirects every \

@@ -1,0 +1,148 @@
+{
+  "schema_version": 1,
+  "pack_id": "bifrost.go.testify.assert-declarations",
+  "version": "1.0.0",
+  "producer": {
+    "name": "bifrost",
+    "version": "0.10.6"
+  },
+  "language": "go",
+  "ecosystem": "go-module",
+  "compatibility": {
+    "bifrost": ">=0.10.6, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "https://pkg.go.dev/github.com/stretchr/testify/assert",
+    "revision": "v1.11.1"
+  },
+  "license": "MIT",
+  "completeness": "partial",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "go.testify.assert.declarations",
+      "activation": [
+        {
+          "module": {
+            "name": "github.com/stretchr/testify",
+            "version": "=1.11.1"
+          }
+        }
+      ],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "type.e7c2e010e38d28ef033ed9e87af4fc76e9606dc0ea77ccdfcf401bb586f3033b",
+            "name": "github.com/stretchr/testify/assert",
+            "type_kind": "module",
+            "visibility": "package",
+            "is_abstract": false,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [],
+            "aliases": [
+              "assert"
+            ],
+            "extension_surfaces": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "assert/assertions.go",
+              "symbol": "github.com/stretchr/testify/assert"
+            }
+          },
+          {
+            "id": "type.a72411f16a9045f73eb852c72f53af4caada3eb3eeb9b350e4eef9665e913d08",
+            "name": "github.com/stretchr/testify/assert.TestingT",
+            "type_kind": "interface",
+            "visibility": "public",
+            "is_abstract": true,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [],
+            "aliases": [],
+            "extension_surfaces": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "assert/assertions.go",
+              "symbol": "github.com/stretchr/testify/assert.TestingT"
+            }
+          }
+        ],
+        "members": [
+          {
+            "id": "member.a122fd9a4bbd575d30d356130a13f0d70da5f107d578c96a97c583983c397b3f",
+            "owner": "type.e7c2e010e38d28ef033ed9e87af4fc76e9606dc0ea77ccdfcf401bb586f3033b",
+            "name": "NoError",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "t",
+                  "type": {
+                    "kind": "declared",
+                    "id": "type.a72411f16a9045f73eb852c72f53af4caada3eb3eeb9b350e4eef9665e913d08",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                },
+                {
+                  "name": "err",
+                  "type": {
+                    "kind": "named",
+                    "name": "error",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                },
+                {
+                  "name": "msgAndArgs",
+                  "type": {
+                    "kind": "named",
+                    "name": "interface{}",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": true
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "bool",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "assert/assertions.go",
+              "symbol": "github.com/stretchr/testify/assert.NoError"
+            }
+          }
+        ],
+        "relations": []
+      }
+    }
+  ]
+}

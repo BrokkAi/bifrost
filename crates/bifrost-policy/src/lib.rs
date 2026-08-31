@@ -24,6 +24,7 @@ mod format;
 mod future_evidence;
 mod identity;
 mod loading;
+mod locator;
 mod projection;
 mod registry;
 mod relational;
@@ -45,6 +46,9 @@ mod witness_projection;
 mod adapter_seam_tests;
 #[cfg(test)]
 mod flow_policy_tests;
+#[cfg(test)]
+#[path = "../../../test-support/inline_project.rs"]
+mod inline_project;
 
 pub use assertion_policy::*;
 pub use baseline::*;

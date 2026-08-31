@@ -46,6 +46,13 @@ impl RubyAnalyzer {
 }
 
 impl ImportAnalysisProvider for RubyAnalyzer {
+    fn file_dependency_facts_for_files(
+        &self,
+        files: &[ProjectFile],
+    ) -> Option<crate::hash::HashMap<ProjectFile, crate::analyzer::FileDependencyFacts>> {
+        Some(self.inner.bulk_file_dependency_facts(files.iter().cloned()))
+    }
+
     fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();

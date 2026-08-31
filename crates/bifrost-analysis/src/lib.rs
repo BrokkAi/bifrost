@@ -9,13 +9,23 @@
 //! historical path, so a consumer never has to know which side of the seam a
 //! name came from.
 
+#[cfg(test)]
+extern crate self as brokk_bifrost_analysis;
+
+#[cfg(test)]
+#[path = "../../../test-support/inline_project.rs"]
+pub(crate) mod inline_project;
+
 pub mod analyzer;
+pub mod blast_radius;
 // `cache_gc` and `path_utils` keep a module here rather than a re-export: each
 // has a small tail that needs an `AnalyzerStore` or an `IAnalyzer`, which core
 // cannot see. Both re-export their core half at the top of the file.
 pub mod cache_gc;
 pub mod code_quality;
+pub mod cyclomatic_complexity_diff;
 pub mod diff_analysis;
+pub mod diff_scoring;
 pub mod file_tools;
 pub mod model_context;
 pub mod navigation;

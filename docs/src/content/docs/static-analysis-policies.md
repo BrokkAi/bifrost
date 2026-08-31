@@ -34,15 +34,16 @@ into a match policy behind the author's back.
 
 ### Built-in code-smell pack
 
-The installed binary embeds `bifrost.code-smells`, a catalog of thirteen
-structured policies: twelve match policies and one assertion policy. It covers
-dynamic evaluation, unsafe Python object deserialization, rayon parallelism
-inside blocking Rust lazy initializers, loop-invariant sorting, and review
-prompts for regular-expression compilation, file reads, serialization, parsing,
-database calls, network calls, subprocesses, sleep, and expensive operations
-beneath nested loops. Every rule is an ordinary checked-in `.rqlp` source with a
-stable ID and semantic hash; the manifest also records its category, claimed
-languages, required capabilities, severity rationale, and remediation.
+The installed binary embeds `bifrost.code-smells`, a catalog of fourteen
+structured policies: ten match policies and four assertion policies. It covers
+dynamic evaluation, unsafe Python object deserialization, success-gated Go API
+results, rayon parallelism inside blocking Rust lazy initializers,
+loop-invariant sorting, and review prompts for regular-expression compilation,
+file reads, serialization, parsing, database calls, network calls,
+subprocesses, sleep, and expensive operations beneath nested loops. Every rule
+is an ordinary checked-in `.rqlp` source with a stable ID and semantic hash; the
+manifest also records its category, claimed languages, required capabilities,
+severity rationale, and remediation.
 
 Pack version 1.1 adds Rust coverage to eight performance policies. The Rust
 selectors recognize the standard slice `sort*` family, `Regex::new`,
@@ -116,6 +117,53 @@ results, parameters, Java fields, and Python names bound only by assignment,
 which carry no lexical-binding rows in Python's scope-categorical model. A
 Rust `[value; length]` repeat array never qualifies because its run-time size
 is not its spelled element count.
+
+Pack version 2.3 adds
+`bifrost.correctness.go-result-used-before-success-check`. It starts from an
+exact activated result contract, follows the acquisition's indexed result and
+modeled success condition through procedure-local flow, and evaluates each
+structured use against the reviewed operation preconditions. A use becomes a
+finding only when its operation requires a valid result and that result's
+success condition has not been proved at the operation. The initial `os` scope
+models the usual paired-result shape, where the protected result is valid when
+its paired error is nil. An ignored error is therefore not automatically safe:
+it reports when a later success-gated operation uses the result. Reviewed
+nil-tolerant operations such as `(*os.File).Close`, `Read`, `Seek`, and `Stat`
+need no guard and do not report; `File.Name` and operations on a possibly nil
+`FileInfo` do. Missing or ambiguous operation knowledge stays incomplete rather
+than becoming a finding or a clean negative.
+
+Pack version 2.4 extends that exact result-contract rule to `net.Dial` and
+`net.DialTimeout`. A required operation on the returned connection reports
+when the paired error has not been proved nil; guarded operations stay clean,
+and canonical dispatch identity prevents unrelated local `Dial` methods from
+entering the rule.
+
+Pack version 2.5 adds exact `net.Listen` acquisitions. The reviewed
+`net.Listener` operations `Accept`, `Close`, and `Addr` require a valid
+listener, so using them before the paired error is proved nil reports while
+guarded listeners and unrelated functions or methods named `Listen` stay out
+of the rule.
+
+Pack version 2.6 adds the direct-result form through exact
+`encoding/pem.Decode` acquisitions. `Decode` returns a nullable `*pem.Block`
+as result zero and unconsumed input as result one; the block is valid when the
+block itself is non-nil, not when the remainder has some value. Dereferencing
+the block, including accessing fields such as `Block.Bytes`, reports unless a
+non-nil guard has been proved. Unrelated functions or methods named `Decode`
+remain outside the rule through canonical dispatch identity.
+
+The same rule also recognizes exact call arguments when an activated procedure
+summary publishes a reviewed entry precondition. The built-in Go 1.26
+`crypto/x509` pack models `IsEncryptedPEMBlock` parameter zero as requiring a
+non-null block. Passing an unchecked `pem.Decode` result therefore reports at
+the argument itself; a dominating block nil check is clean. Local or
+other-package functions with the same name, incomplete target resolution, and
+unreviewed parameter requirements remain inconclusive rather than inheriting
+the standard-library claim. A declarations-only `bytes` pack records the exact
+`TrimSpace([]byte) []byte` signature so Go's possible multi-result forwarding
+rule can prove that `pem.Decode(bytes.TrimSpace(data))` still receives exactly
+one argument; the pack makes no broader behavioral claim about `bytes`.
 
 Use `bifrost --list-policies` or MCP `list_policies` to inspect the exact catalog
 in the running build. Select it with `--policy-pack bifrost.code-smells`, a
@@ -359,6 +407,44 @@ solver run or duplicate finding.
 Categories, display phrases, and finding messages select and present this
 composition. They do not become propagation keys or change the solver's
 set-oriented run identity.
+
+### Policy-local sanitizers: bind the declared entity and value
+
+A taint policy can declare a sanitizer directly under `:sanitizers`. This is
+different from a `sanitize` effect in a semantic-pack procedure summary: the
+policy-local form selects the sanitizer call, binds its declared input and
+output ports, and removes only the labels listed in `:removes` from that
+declared value flow.
+
+The selector is part of the sanitizer's identity. When a policy means one
+specific declaration, select that declaration and lift it to its proven call
+sites; do not use a bare callee name that could also match an unrelated
+method. The following fragment models `Clean.scrub(String)` and removes the
+`input.user-controlled` label from its returned value:
+
+```lisp
+:sanitizers
+  (endpoint-set :entries [
+    (sanitizer :id clean-scrub
+      :selector (rql :schema-version 1
+        (language java
+          (call-sites-to :proof proven
+            (enclosing-decl
+              (inside-decl
+                (class :name "Clean")
+                (method :name "scrub"))))))
+      :input (argument :name "value")
+      :output return-value
+      :removes [input.user-controlled])])
+```
+
+`inside-decl` scopes the declaration to `Clean`, and `call-sites-to
+:proof proven` retains only calls bound to that declaration. `:input` and
+`:output` are value-flow ports, so an unrelated same-named method, a
+non-reaching sanitizer call, or a different argument does not receive the
+removal. If the selected sanitizer is unresolved or ambiguous, the policy
+run must remain non-conclusive (or retain the finding); an empty finding set
+alone is never evidence that an uncertain sanitizer made the value safe.
 
 ### Assertion: what the parser must say about a token
 

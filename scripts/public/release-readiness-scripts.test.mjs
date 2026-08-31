@@ -501,7 +501,7 @@ const releaseCrateCount = Number(
   ).trim(),
 );
 
-function completeBundle(dir, { crates = releaseCrateCount, wheels = 10, vsix = 1, tgz = 1, sidecars = 8, notices = true } = {}) {
+function completeBundle(dir, { crates = releaseCrateCount, wheels = 10, vsix = 1, tgz = 1, sidecars = 7, notices = true } = {}) {
   const bundle = path.join(dir, "qualification-bundle");
   fs.mkdirSync(bundle, { recursive: true });
   for (let index = 0; index < crates; index += 1) {
@@ -554,16 +554,170 @@ test("a bundle missing every wheel is refused", () => {
 });
 
 test("a bundle of sidecars alone is refused", () => {
-  // The re-qualification path used to assert only that eight sidecars were
+  // The re-qualification path used to assert only that seven sidecars were
   // present, which this bundle satisfies.
   withTempDir((dir) => {
     const bundle = path.join(dir, "qualification-bundle");
     fs.mkdirSync(bundle, { recursive: true });
-    for (let index = 0; index < 8; index += 1) {
+    for (let index = 0; index < 7; index += 1) {
       fs.writeFileSync(path.join(bundle, `archive-${index}.sha256`), "");
     }
     assert.notEqual(inventoryRun(bundle).status, 0);
   });
+});
+
+function elfVerifierRun(dir, target, overrides = {}) {
+  const fakeBin = path.join(dir, "bin");
+  fs.mkdirSync(fakeBin, { recursive: true });
+  const fakeReadelf = path.join(fakeBin, "readelf");
+  fs.writeFileSync(
+    fakeReadelf,
+    `#!/usr/bin/env bash
+set -euo pipefail
+case "$1" in
+  -hW)
+    printf '  Machine:                           %s\\n' "$FAKE_MACHINE"
+    ;;
+  -lW)
+    printf '      [Requesting program interpreter: %s]\\n' "$FAKE_INTERPRETER"
+    ;;
+  --version-info)
+    for version in $FAKE_GLIBC_VERSIONS; do
+      printf '  Name: GLIBC_%s  Flags: none  Version: 1\\n' "$version"
+    done
+    ;;
+  -dW)
+    for library in $FAKE_NEEDED; do
+      printf ' 0x0000000000000001 (NEEDED) Shared library: [%s]\\n' "$library"
+    done
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+`,
+  );
+  fs.chmodSync(fakeReadelf, 0o755);
+  const binary = path.join(dir, "bifrost");
+  fs.writeFileSync(binary, "fake ELF");
+  return run(BASH, [script("verify-linux-release-elf.sh"), binary, target], {
+    env: {
+      PATH: `${fakeBin}:${process.env.PATH}`,
+      FAKE_MACHINE: "Advanced Micro Devices X86-64",
+      FAKE_INTERPRETER: "/lib64/ld-linux-x86-64.so.2",
+      FAKE_GLIBC_VERSIONS: "2.2.5 2.17 2.28",
+      FAKE_NEEDED: "libm.so.6 libpthread.so.0 libc.so.6 libdl.so.2 ld-linux-x86-64.so.2",
+      ...overrides,
+    },
+  });
+}
+
+test("the ELF verifier accepts the approved GNU runtime contract for both architectures", () => {
+  withTempDir((dir) => {
+    const x86 = elfVerifierRun(dir, "x86_64-unknown-linux-gnu");
+    assert.equal(x86.status, 0, x86.stderr);
+    assert.match(x86.stdout, /maximum GLIBC version: 2\.28/u);
+  });
+  withTempDir((dir) => {
+    const arm = elfVerifierRun(dir, "aarch64-unknown-linux-gnu", {
+      FAKE_MACHINE: "AArch64",
+      FAKE_INTERPRETER: "/lib/ld-linux-aarch64.so.1",
+      FAKE_NEEDED: "libgcc_s.so.1 libm.so.6 libc.so.6 ld-linux-aarch64.so.1",
+    });
+    assert.equal(arm.status, 0, arm.stderr);
+    assert.match(arm.stdout, /aarch64-unknown-linux-gnu/u);
+  });
+});
+
+test("the ELF verifier rejects a glibc requirement above the release floor", () => {
+  withTempDir((dir) => {
+    const result = elfVerifierRun(dir, "x86_64-unknown-linux-gnu", {
+      FAKE_GLIBC_VERSIONS: "2.2.5 2.28 2.29",
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /maximum GLIBC version is 2\.29/u);
+  });
+});
+
+test("the ELF verifier rejects unexpected shared libraries with the complete dependency set", () => {
+  withTempDir((dir) => {
+    const result = elfVerifierRun(dir, "x86_64-unknown-linux-gnu", {
+      FAKE_NEEDED: "libc.so.6 libz.so.1 ld-linux-x86-64.so.2",
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /unexpected dynamic dependency libz\.so\.1/u);
+    assert.match(result.stderr, /libc\.so\.6 libz\.so\.1 ld-linux-x86-64\.so\.2/u);
+  });
+});
+
+test("the ELF verifier rejects the wrong architecture or dynamic loader", () => {
+  withTempDir((dir) => {
+    const wrongMachine = elfVerifierRun(dir, "x86_64-unknown-linux-gnu", {
+      FAKE_MACHINE: "AArch64",
+    });
+    assert.notEqual(wrongMachine.status, 0);
+    assert.match(wrongMachine.stderr, /requires machine/u);
+  });
+  withTempDir((dir) => {
+    const wrongLoader = elfVerifierRun(dir, "x86_64-unknown-linux-gnu", {
+      FAKE_INTERPRETER: "/lib/ld-linux-aarch64.so.1",
+    });
+    assert.notEqual(wrongLoader.status, 0);
+    assert.match(wrongLoader.stderr, /requires interpreter/u);
+  });
+});
+
+test("the ELF verifier rejects binaries without glibc symbol versions", () => {
+  withTempDir((dir) => {
+    const result = elfVerifierRun(dir, "x86_64-unknown-linux-gnu", {
+      FAKE_GLIBC_VERSIONS: "",
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /no GLIBC symbol versions found/u);
+  });
+});
+
+function muslInstallerRun(dir, architecture) {
+  const fakeBin = path.join(dir, "bin");
+  fs.mkdirSync(fakeBin, { recursive: true });
+  writeFile(
+    fakeBin,
+    "uname",
+    `#!/usr/bin/env bash
+case "\${1:-}" in
+  -s) printf 'Linux\\n' ;;
+  -m) printf '%s\\n' "$FAKE_ARCH" ;;
+  -o) printf 'GNU/Linux\\n' ;;
+esac
+`,
+  );
+  writeFile(fakeBin, "ldd", "#!/usr/bin/env bash\nprintf 'musl libc (test)\\n'\n");
+  writeFile(fakeBin, "curl", "#!/usr/bin/env bash\ntouch \"$CURL_MARKER\"\nexit 99\n");
+  for (const command of ["uname", "ldd", "curl"]) {
+    fs.chmodSync(path.join(fakeBin, command), 0o755);
+  }
+  const curlMarker = path.join(dir, "curl-called");
+  const result = run(BASH, [path.join(repoRoot, "install.sh")], {
+    env: {
+      PATH: `${fakeBin}:${process.env.PATH}`,
+      HOME: dir,
+      FAKE_ARCH: architecture,
+      CURL_MARKER: curlMarker,
+    },
+  });
+  return { ...result, curlCalled: fs.existsSync(curlMarker) };
+}
+
+test("the installer rejects x86-64 and ARM64 musl before consulting a release", () => {
+  for (const architecture of ["x86_64", "aarch64"]) {
+    withTempDir((dir) => {
+      const result = muslInstallerRun(dir, architecture);
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /no prebuilt musl release is published/u);
+      assert.match(result.stderr, /Musl is unsupported/u);
+      assert.equal(result.curlCalled, false, "musl rejection must happen before release download");
+    });
+  }
 });
 
 test("a bundle without third-party notices is refused", () => {

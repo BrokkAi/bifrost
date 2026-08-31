@@ -2,11 +2,16 @@
 //! dropped one explicit candidate.
 //!
 //! The selector of a match policy is one `CodeQuery`: a plan source followed by
-//! at most `MAX_QUERY_STEPS` (16) typed steps. This adapter runs the source
-//! alone, then the source plus `steps[0..1]`, then `steps[0..2]`, and so on,
-//! testing after each prefix whether any returned row still covers the
-//! candidate. The first prefix whose rows no longer cover it names the stage
-//! that dropped it.
+//! at most `MAX_QUERY_STEPS` (16) typed steps. This adapter re-executes the
+//! source alone, then the source plus `steps[0..1]`, then `steps[0..2]`, and so
+//! on, testing each prefix in authored order even though it executes prefixes
+//! deepest-first to acquire the deepest candidate-bearing lineage. When a
+//! prefix retains the candidate, its
+//! typed detailed provenance identifies the exact seed and intermediate rows;
+//! this matters for relations that deliberately move the source anchor. When
+//! no such lineage exists, the adapter falls back to source-span containment.
+//! The first prefix that cannot retain or safely correlate the candidate names
+//! the stage that dropped it or makes the answer unknown.
 //!
 //! Nothing here instruments the matcher, and nothing here changes ordinary
 //! evaluation: prefix queries are built by cloning the resolved selector and
@@ -14,13 +19,17 @@
 
 use std::ops::Range;
 
+use brokk_bifrost_analysis::analyzer::ProjectFile;
 use brokk_bifrost_analysis::analyzer::semantic::{
     WorkspaceRelativePath, WorkspaceRelativePathError,
 };
 use brokk_bifrost_rql::structural::search::{
     execute_code_query_detailed_eager_index, execute_code_query_detailed_eager_index_workspace,
 };
-use brokk_bifrost_rql::structural::{CodeQuery, CodeQueryCompletion, CodeQueryResultDetail};
+use brokk_bifrost_rql::structural::{
+    CodeQuery, CodeQueryCompletion, CodeQueryResultDetail, DetailedCodeQueryEvidence,
+    DetailedCodeQueryProvenanceEvidence,
+};
 use brokk_bifrost_rql::{CodeQueryPlanSource, SetOperator};
 
 use crate::budget::PolicyBudget;
@@ -184,31 +193,38 @@ pub(super) fn row_covers_candidate(
 
 /// Explain why one explicit candidate is not reported by a match policy.
 ///
-/// The tree is rooted at the candidate and carries one `selector_stage` node
-/// per executed prefix, in execution order: the plan source first, then one
-/// node per typed step. Each stage says whether the candidate was still
-/// covered by a returned row after that prefix ran.
+/// The tree is rooted at the candidate and renders one `selector_stage` node
+/// per presented prefix, in authored order: the plan source first, then one
+/// node per typed step. Prefix queries execute deepest-first so the adapter can
+/// acquire the deepest candidate-bearing lineage and learn whether later
+/// anchor-changing prefixes were exhaustive. Each rendered stage says whether
+/// that lineage still passes through a returned row after the prefix ran.
 ///
 /// # Failed versus unknown
 ///
-/// A stage is `failed` only when the prefix query's completion is
-/// `Complete`: only then did the analyzer both finish and declare its result
-/// exhaustive, so the candidate's absence is evidence of absence.
+/// A stage is `failed` only when its prefix query is `Complete`, no allowed
+/// prefix was omitted, and the retained evidence rules out a later
+/// anchor-changing introduction. The last condition comes either from an exact
+/// candidate lineage or from an exhaustive strict suffix.
 ///
-/// A stage is `unknown` when the candidate is absent and the prefix query
-/// reported `ProvenSubset`, `Incomplete`, `Cancelled`, or `Invalid`. The
-/// `ProvenSubset` case is the deliberately conservative one: a proven subset
-/// licenses every row it returned but says nothing about what it left out, so
-/// an absence inside it is undecided. The stage's `reasons` carry the mapped
+/// A stage is `unknown` when its prefix or a relevant later prefix reported
+/// `ProvenSubset`, `Incomplete`, `Cancelled`, or `Invalid`; when the
+/// prefix budget omitted part of the selector; or when retained provenance
+/// cannot correlate a known candidate-bearing prefix. The `ProvenSubset` case
+/// is deliberately conservative: a proven subset licenses every row it
+/// returned but says nothing about what it left out, so an absence inside it is
+/// undecided. The stage's `reasons` carry the mapped
 /// [`PolicyIncompleteReason`]s, using the same diagnostic-code mapping the
 /// evaluator uses for run completion.
 ///
 /// A row that *is* returned is a positive fact regardless of completion, so a
 /// covered candidate is `satisfied` under every completion.
 ///
-/// Evaluation stops at the first stage that is not `satisfied`: once a stage
-/// dropped the candidate, later prefixes cannot restore it, and running them
-/// would spend budget to learn nothing.
+/// Every prefix allowed by the execution limit runs before presentation. The
+/// authored-order rendering stops at the first stage that is not `satisfied`;
+/// results from deeper executions remain internal evidence for provenance and
+/// suffix completeness because an anchor-changing step can introduce, move,
+/// or lose the candidate.
 ///
 /// # Locations
 ///
@@ -315,10 +331,12 @@ impl StageOutcome {
     }
 }
 
-/// Every stage that ran, plus whether the prefix budget cut the walk short.
+/// Rendered authored-order stages, actual executions, and prefix-budget
+/// truncation for one walk.
 #[derive(Debug)]
 pub(super) struct StageWalk {
     stages: Vec<StageOutcome>,
+    executed: usize,
     prefixes_truncated: bool,
     omitted_prefixes: u64,
 }
@@ -332,8 +350,8 @@ impl StageWalk {
     }
     /// How many prefix queries this walk actually executed, which is what a
     /// caller charges against a shared execution budget.
-    pub(super) fn executed(&self) -> usize {
-        self.stages.len()
+    pub(super) const fn executed(&self) -> usize {
+        self.executed
     }
     /// The first stage that did not retain the candidate, if any.
     pub(super) fn decided(&self) -> Option<&StageOutcome> {
@@ -358,14 +376,11 @@ pub(super) fn run_prefixes(
     let step_count = selector.plan.steps.len();
     let wanted = step_count.saturating_add(1);
     let executable = wanted.min(max_executions);
+    let prefixes_omitted = executable < wanted;
     let mut stages = Vec::with_capacity(executable);
-    let mut stopped_early = false;
+    let mut executed_count = 0usize;
 
-    for prefix in 0..executable {
-        let label = match prefix.checked_sub(1) {
-            None => plan_source_label(&selector.plan.source).to_string(),
-            Some(index) => selector.plan.steps[index].op().label().to_string(),
-        };
+    let execute_prefix = |prefix: usize| {
         let mut query = selector.clone();
         query.plan.steps.truncate(prefix);
         // Author-controlled presentation is not policy semantics: the
@@ -374,20 +389,12 @@ pub(super) fn run_prefixes(
         // caller passes the one its evaluator uses.
         query.result_detail = CodeQueryResultDetail::Full;
         query.limit = row_limit;
+        assert!(
+            query.validate_steps().is_ok(),
+            "every prefix of a resolved selector must remain executable"
+        );
 
-        if query.validate_steps().is_err() {
-            stages.push(StageOutcome {
-                label,
-                outcome: ExplanationOutcome::Unknown,
-                actual: String::from("the truncated prefix plan is not executable"),
-                reasons: vec![PolicyIncompleteReason::CapabilityIncomplete],
-                completion_label: Some("invalid"),
-            });
-            stopped_early = true;
-            break;
-        }
-
-        let executed = match (execution, context.workspace) {
+        match (execution, context.workspace) {
             (PrefixExecution::PreferWorkspace, Some(workspace)) => {
                 execute_code_query_detailed_eager_index_workspace(
                     workspace,
@@ -402,32 +409,69 @@ pub(super) fn run_prefixes(
                 budget.query_limits(),
                 context.cancellation,
             ),
+        }
+    };
+
+    // Run prefixes deepest-first. The deepest candidate-bearing result carries
+    // the most complete identity-safe lineage available even when a later
+    // relation moved away from, or dropped, the candidate anchor. Every result
+    // is retained and reused by the authored-order presentation walk.
+    let mut executed_prefixes = Vec::with_capacity(executable);
+    for prefix in (0..executable).rev() {
+        executed_count = executed_count.saturating_add(1);
+        executed_prefixes.push((prefix, execute_prefix(prefix)));
+    }
+    let lineage = executed_prefixes
+        .iter()
+        .find_map(|(prefix, result)| {
+            let lineage = CandidateLineage::from_result(
+                *prefix,
+                &result.result.results,
+                &result.evidence,
+                candidate,
+            );
+            lineage.target_retained.then_some(lineage)
+        })
+        .unwrap_or_default();
+    executed_prefixes.reverse();
+
+    // An absent source-span fallback is not conclusive when a later prefix was
+    // non-exhaustive: an anchor-changing relation may have introduced the
+    // candidate in rows that prefix omitted. Retain the completion state and
+    // reasons of every strict suffix before consuming the results for
+    // authored-order presentation.
+    let mut suffix_exhaustive = true;
+    let mut suffix_reasons = Vec::new();
+    let mut later_prefix_state = Vec::with_capacity(executable);
+    for (_, executed) in executed_prefixes.iter().rev() {
+        later_prefix_state.push((suffix_exhaustive, suffix_reasons.clone()));
+        let completion = executed.result.completion();
+        if !matches!(completion, CodeQueryCompletion::Complete) {
+            suffix_exhaustive = false;
+            suffix_reasons.extend(absence_reasons(&completion, executed.result.truncated));
+            suffix_reasons.sort();
+            suffix_reasons.dedup();
+        }
+    }
+    later_prefix_state.reverse();
+
+    for ((prefix, executed), (later_prefixes_exhaustive, later_prefix_reasons)) in
+        executed_prefixes.into_iter().zip(later_prefix_state)
+    {
+        let label = match prefix.checked_sub(1) {
+            None => plan_source_label(&selector.plan.source).to_string(),
+            Some(index) => selector.plan.steps[index].op().label().to_string(),
         };
         let completion = executed.result.completion();
-        let covering = executed
-            .evidence
-            .iter()
-            .find(|evidence| {
-                evidence
-                    .file
-                    .rel_path()
-                    .to_str()
-                    .and_then(|path| WorkspaceRelativePath::new(path).ok())
-                    .is_some_and(|path| path == candidate.path)
-                    && row_covers_candidate(evidence.byte_span.as_ref(), candidate)
-            })
-            .map(|evidence| match evidence.byte_span.as_ref() {
-                Some(span) => format!(
-                    "a {} row covering bytes [{}, {}) retains the candidate",
-                    evidence.domain.label(),
-                    span.start,
-                    span.end
-                ),
-                None => format!(
-                    "a whole-file {} row retains the candidate",
-                    evidence.domain.label()
-                ),
-            });
+        let covering = if lineage.target_retained {
+            lineage_covering(prefix, &executed.evidence, &lineage).map(describe_lineage_covering)
+        } else {
+            executed
+                .evidence
+                .iter()
+                .find(|evidence| evidence_covers_candidate(evidence, candidate))
+                .map(describe_span_covering)
+        };
 
         let stage = match covering {
             Some(actual) => StageOutcome {
@@ -438,24 +482,67 @@ pub(super) fn run_prefixes(
                 completion_label: non_complete_label(&completion),
             },
             None => {
-                let trustworthy = matches!(completion, CodeQueryCompletion::Complete);
+                // A candidate-bearing prefix proves the candidate exists, but
+                // absence of a retained provenance prefix does not prove which
+                // other stage lost it. Provenance may itself be bounded, or a
+                // producer may lack an identity-preserving detailed reference.
+                // Never turn that evidence gap into a false "seed dropped it"
+                // verdict.
+                let after_candidate_bearing_prefix = lineage
+                    .source_prefix
+                    .is_some_and(|source_prefix| prefix > source_prefix);
+                let lineage_unresolved = lineage.target_retained && !after_candidate_bearing_prefix;
+                let later_introduction_unresolved =
+                    !lineage.target_retained && !later_prefixes_exhaustive;
+                let trustworthy = !lineage_unresolved
+                    && !later_introduction_unresolved
+                    && !prefixes_omitted
+                    && matches!(completion, CodeQueryCompletion::Complete);
                 let outcome = if trustworthy {
                     ExplanationOutcome::Failed
                 } else {
                     ExplanationOutcome::Unknown
                 };
                 let rows = executed.result.results.len();
+                let mut reasons = absence_reasons(&completion, executed.result.truncated);
+                if prefixes_omitted {
+                    reasons.push(PolicyIncompleteReason::ReportRetentionBudget);
+                }
+                if lineage_unresolved {
+                    reasons.push(if lineage.provenance_truncated {
+                        PolicyIncompleteReason::ReportRetentionBudget
+                    } else {
+                        PolicyIncompleteReason::CapabilityIncomplete
+                    });
+                }
+                if later_introduction_unresolved {
+                    reasons.extend(later_prefix_reasons);
+                }
+                reasons.sort();
+                reasons.dedup();
                 StageOutcome {
                     label,
                     outcome,
                     actual: if trustworthy {
                         format!("{rows} rows, none covering the candidate")
+                    } else if lineage_unresolved {
+                        format!(
+                            "an executed prefix retains the candidate, but none of these {rows} rows has a retained identity-preserving provenance path to it"
+                        )
+                    } else if prefixes_omitted {
+                        format!(
+                            "{rows} rows, none covering the candidate, but the prefix budget omitted later selector stages or results"
+                        )
+                    } else if later_introduction_unresolved {
+                        format!(
+                            "{rows} rows, none covering the candidate, but a later executed selector prefix was non-exhaustive and may still introduce it"
+                        )
                     } else {
                         format!(
                             "{rows} rows, none covering the candidate, from a non-exhaustive query"
                         )
                     },
-                    reasons: absence_reasons(&completion, executed.result.truncated),
+                    reasons,
                     completion_label: non_complete_label(&completion),
                 }
             }
@@ -463,22 +550,169 @@ pub(super) fn run_prefixes(
         let decided = stage.outcome != ExplanationOutcome::Satisfied;
         stages.push(stage);
         if decided {
-            stopped_early = true;
             break;
         }
     }
 
-    let executed_count = stages.len();
-    let omitted_prefixes = if stopped_early {
-        0
+    let presented_count = stages.len();
+    let omitted_prefixes = if prefixes_omitted {
+        u64::try_from(wanted.saturating_sub(presented_count)).unwrap_or(u64::MAX)
     } else {
-        u64::try_from(wanted.saturating_sub(executed_count)).unwrap_or(u64::MAX)
+        0
     };
     StageWalk {
         stages,
+        executed: executed_count,
         prefixes_truncated: omitted_prefixes > 0,
         omitted_prefixes,
     }
+}
+
+#[derive(Default)]
+struct CandidateLineage {
+    target_retained: bool,
+    source_prefix: Option<usize>,
+    provenance_truncated: bool,
+    targets: Vec<DetailedRowIdentity>,
+    traces: Vec<DetailedCodeQueryProvenanceEvidence>,
+}
+
+#[derive(PartialEq, Eq)]
+struct DetailedRowIdentity {
+    domain: brokk_bifrost_rql::structural::DetailedCodeQueryDomain,
+    key: brokk_bifrost_rql::structural::DetailedCodeQueryKey,
+    file: ProjectFile,
+    byte_span: Option<Range<usize>>,
+    identities: brokk_bifrost_rql::structural::DetailedCodeQueryProvenanceIdentities,
+    source_slice_sha256: Option<[u8; 32]>,
+}
+
+impl CandidateLineage {
+    fn from_result(
+        prefix: usize,
+        results: &[brokk_bifrost_rql::structural::CodeQueryResultItem],
+        evidence: &[DetailedCodeQueryEvidence],
+        candidate: &ExplanationCandidate,
+    ) -> Self {
+        let mut lineage = Self::default();
+        for evidence in evidence {
+            if !evidence_covers_candidate(evidence, candidate) {
+                continue;
+            }
+            lineage.target_retained = true;
+            lineage.source_prefix = Some(prefix);
+            let item = &results[evidence.result_index];
+            lineage.provenance_truncated |= item.provenance_truncated;
+            lineage.targets.push(DetailedRowIdentity {
+                domain: evidence.domain,
+                key: evidence.key.clone(),
+                file: evidence.file.clone(),
+                byte_span: evidence.byte_span.clone(),
+                identities: evidence.identities.clone(),
+                source_slice_sha256: evidence.source_slice_sha256,
+            });
+            lineage.traces.extend(evidence.provenance.iter().cloned());
+        }
+        lineage
+    }
+}
+
+fn evidence_covers_candidate(
+    evidence: &DetailedCodeQueryEvidence,
+    candidate: &ExplanationCandidate,
+) -> bool {
+    evidence
+        .file
+        .rel_path()
+        .to_str()
+        .and_then(|path| WorkspaceRelativePath::new(path).ok())
+        .is_some_and(|path| path == candidate.path)
+        && row_covers_candidate(evidence.byte_span.as_ref(), candidate)
+}
+
+fn describe_span_covering(evidence: &DetailedCodeQueryEvidence) -> String {
+    match evidence.byte_span.as_ref() {
+        Some(span) => format!(
+            "a {} row covering bytes [{}, {}) retains the candidate",
+            evidence.domain.label(),
+            span.start,
+            span.end
+        ),
+        None => format!(
+            "a whole-file {} row retains the candidate",
+            evidence.domain.label()
+        ),
+    }
+}
+
+fn describe_lineage_covering(evidence: &DetailedCodeQueryEvidence) -> String {
+    match evidence.byte_span.as_ref() {
+        Some(span) => format!(
+            "a {} row at bytes [{}, {}) on the candidate's identity-preserving provenance path retains it",
+            evidence.domain.label(),
+            span.start,
+            span.end
+        ),
+        None => format!(
+            "a whole-file {} row on the candidate's identity-preserving provenance path retains it",
+            evidence.domain.label()
+        ),
+    }
+}
+
+fn lineage_covering<'a>(
+    prefix: usize,
+    evidence: &'a [DetailedCodeQueryEvidence],
+    lineage: &CandidateLineage,
+) -> Option<&'a DetailedCodeQueryEvidence> {
+    if lineage
+        .source_prefix
+        .is_some_and(|source_prefix| prefix > source_prefix)
+    {
+        return None;
+    }
+    evidence.iter().find(|candidate| {
+        lineage.targets.iter().any(|target| {
+            candidate.domain == target.domain
+                && candidate.key == target.key
+                && candidate.file == target.file
+                && candidate.byte_span == target.byte_span
+                && candidate.identities == target.identities
+                && candidate.source_slice_sha256 == target.source_slice_sha256
+        }) || lineage.traces.iter().any(|terminal| {
+            evidence_matches_ref(candidate, &terminal.seed)
+                || candidate
+                    .provenance
+                    .iter()
+                    .any(|prefix| provenance_is_prefix(prefix, terminal))
+        })
+    })
+}
+
+fn evidence_matches_ref(
+    evidence: &DetailedCodeQueryEvidence,
+    reference: &brokk_bifrost_rql::structural::DetailedCodeQueryProvenanceRefEvidence,
+) -> bool {
+    evidence.domain == reference.domain
+        && evidence.key == reference.key
+        && evidence.file == reference.file
+        && evidence.byte_span == reference.byte_span
+        && evidence.identities == reference.identities
+        && evidence.source_slice_sha256 == reference.source_slice_sha256
+}
+
+fn provenance_is_prefix(
+    prefix: &DetailedCodeQueryProvenanceEvidence,
+    terminal: &DetailedCodeQueryProvenanceEvidence,
+) -> bool {
+    prefix.branch == terminal.branch
+        && prefix.seed == terminal.seed
+        && prefix.steps.len() <= terminal.steps.len()
+        && prefix
+            .steps
+            .iter()
+            .zip(&terminal.steps)
+            .all(|(left, right)| left == right)
 }
 
 /// Map a non-exhaustive completion to the reasons an absence is undecided.

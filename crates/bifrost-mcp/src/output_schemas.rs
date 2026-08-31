@@ -7,6 +7,8 @@
 //! tool-name-to-schema mapping in the codebase;
 //! `mcp_common::build_server_spec_with_hidden` is the only place that reads it.
 
+use brokk_bifrost_analysis::blast_radius::{BlastRadiusResult, MissingTestsResult};
+use brokk_bifrost_analysis::cyclomatic_complexity_diff::CyclomaticComplexityDiffResult;
 use brokk_bifrost_analysis::searchtools::{
     ActiveWorkspaceResult, GetDefinitionResult, SearchSymbolsResult,
 };
@@ -16,6 +18,15 @@ use serde_json::Value;
 type OutputSchemaSource = fn() -> Value;
 
 const OUTPUT_SCHEMAS: &[(&str, OutputSchemaSource)] = &[
+    ("blast_radius", generate_output_schema::<BlastRadiusResult>),
+    (
+        "cyclomatic_complexity",
+        generate_output_schema::<CyclomaticComplexityDiffResult>,
+    ),
+    (
+        "missing_tests",
+        generate_output_schema::<MissingTestsResult>,
+    ),
     (
         "get_active_workspace",
         generate_output_schema::<ActiveWorkspaceResult>,
@@ -104,6 +115,22 @@ mod tests {
     fn an_unregistered_tool_has_no_schema() {
         assert!(output_schema_for("get_file_contents").is_none());
         assert!(output_schema_for("no_such_tool").is_none());
+    }
+
+    #[test]
+    fn blast_radius_names_callable_test_evidence_as_context() {
+        let schema = output_schema_for("blast_radius").expect("blast-radius schema");
+        let analysis_properties = schema
+            .pointer("/$defs/BlastRadiusAnalysis/properties")
+            .and_then(Value::as_object)
+            .unwrap_or_else(|| panic!("analysis properties missing: {schema}"));
+        assert!(analysis_properties.contains_key("analyzer_changed_test_paths"));
+        let properties = schema
+            .pointer("/$defs/BlastRadiusCallableSymbol/properties")
+            .and_then(Value::as_object)
+            .unwrap_or_else(|| panic!("callable-symbol properties missing: {schema}"));
+        assert!(properties.contains_key("in_test_context"));
+        assert!(!properties.contains_key("is_test"));
     }
 
     /// A renamed or removed tool must not leave its schema stranded under the

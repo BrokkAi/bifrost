@@ -27,6 +27,24 @@ slow-timeout = { period = "60s", terminate-after = 10 }
 [profile.default.junit]
 path = "junit.xml"
 
+# These suite_bench_policy modules launch the shipped Bifrost process and
+# compete for analyzer, filesystem, and child-process resources. Serialize the
+# process-launching group while unrelated tests remain globally scheduled.
+[test-groups]
+suite-bench-policy-bifrost = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'test(/^bifrost_policy_cli::/) | test(/^issue_2690_sanitizer_lowering::/) | test(/^policy_assertion_conformance::/) | test(/^policy_assertion_evaluation::/) | test(/^policy_control_relations::/) | test(/^policy_docs::/) | test(/^policy_project_topology_jvm::/) | test(/^policy_resolution_assertions::/) | test(/^policy_substrate_p0_cli::/)'
+test-group = "suite-bench-policy-bifrost"
+
+# The determinism test launches repeated child runs and needs the whole machine
+# to avoid scheduler starvation. Keep it in the same process-launching group,
+# but give it an explicit reservation separate from the group filter above.
+[[profile.default.overrides]]
+filter = 'test(/^issue_2659_determinism::/)'
+test-group = "suite-bench-policy-bifrost"
+threads-required = "num-cpus"
+
 # Start the real-process repository corpus checks before the short unit tests
 # so their analyzer/server setup overlaps the rest of the run instead of
 # becoming a serial tail. They still reserve only the default single slot.
@@ -48,4 +66,79 @@ threads-required = "num-cpus"
 # starve the worker thread long enough to mimic the deadlock it detects.
 [[profile.default.overrides]]
 filter = 'test(jsts_usage_graph_receiver_analysis_does_not_deadlock_on_pool)'
+threads-required = "num-cpus"
+
+# The process-isolated Go typestate eviction tests compare exact semantic-work
+# ledgers across resident and deliberately invalidated caches. In the full gate,
+# the solve-only case took 6.7s and observed an extra caller materialization;
+# the same binary then passed 30/30 fresh-process runs in 0.85-1.26s when it was
+# not competing with the cross-binary scheduler. Reserve the nextest worker
+# budget so the cache-invalidation oracle measures the intended single-worker
+# execution instead of whole-suite starvation.
+[[profile.default.overrides]]
+filter = 'binary(=issue_2774_go_typestate_eviction)'
+threads-required = "num-cpus"
+
+# The two cold-start latency guards are the only spawned servers intentionally
+# exposed to the production cold-workspace request budget
+# (COLD_WORKSPACE_REQUEST_BUDGET, 4.5s, crates/bifrost-mcp/src/mcp_common.rs).
+# Ordinary functional servers take the 60-second test budget so that a protocol
+# assertion cannot fail merely because the box is busy. On 2026-08-29 that
+# incidental coupling failed five tests 3/3 in one 13,692-test run and a
+# disjoint six in the next, out of 156 server-spawning tests -- a set that moved
+# between runs, so naming the casualties could never converge.
+#
+# The runtime workspace-switch test is the one other server without a configured
+# budget. It first warms through `search_symbols`, which is exempt from the cold
+# fallback, and then exercises the production contract that warm serial
+# `activate_workspace` is unbounded. The profile-wide 10-minute termination
+# threshold above remains its hang detector; it is not a wall-clock assertion
+# and does not need a quiet machine.
+#
+# Because these two now carry the entire cold-start claim, they have to measure
+# it on a quiet machine: a wall-clock bound measured on a saturated box measures
+# the box, not the product.
+[[profile.default.overrides]]
+filter = 'test(cold_first_call_stays_within_the_production)'
+threads-required = "num-cpus"
+
+# Assertions that are intrinsically about machine-relative timing, each over its
+# own temporary root, so cache contention is not available as an explanation and
+# the only way any of them misses its bound is CPU starvation.
+#
+# persisted_open_populates_a_cache_the_reopen_hydrates_from asserts a first
+# persisted open under five seconds: 1.5s scoped, panicked at 7.9s in the
+# saturated 2026-08-29 run.
+#
+# cli_reruns_and_one_file_edit_stay_in_the_interactive_latency_class holds the
+# cold, warm, and edited policy CLI runs to the five-second interactive class:
+# 0.89s / 0.83s / 0.86s scoped, but 9.3s and then 12.7s cold in two saturated
+# runs. It also bounds warm and edited against the cold run it just measured, so
+# a starved cold run corrupts the relative limit as well as the absolute one.
+#
+# light_lookup_overtakes_long_usage_scan asserts that a light request overtakes
+# an in-flight heavy scan. It is an ordering assertion rather than a duration
+# threshold, but the ordering it observes is produced by the scheduler, and on
+# an oversubscribed box the observation says nothing about the scheduler.
+#
+# The rest are absolute or relative wall-clock bounds found by sweeping the
+# suites for elapsed-time assertions, reserved as a class rather than one at a
+# time: patching only the test that happened to fail meant each ~70-minute run
+# could discover exactly one more, which never converges. Hang detectors with
+# very large margins are deliberately NOT here -- load cannot plausibly flip
+# them, and reserving the machine for them would cost more than it protects.
+#
+# c_wide_translation_unit_indexes_in_linear_time    6.2s against a 5s bound.
+# large_rust_file_definition_and_hover_stay_interactive   5s interactive bound.
+# deeply_nested_javascript_extraction_is_linear     60s super-linearity ceiling;
+#     a starved box can cross a guard meant to catch algorithmic blowup.
+# exact_go_source_set_produces_and_compiles_api_pack   two 5s lookup bounds.
+# bifrost_lsp_server_formatting_shutdown_cancels_active_formatter   5s, against
+#     a stub formatter that sleeps 10s: only a 2x margin.
+# explicit_file_fifo_is_rejected_without_blocking and
+# directory_entries_reject_fifo_replacement_without_blocking   1s, each racing a
+#     peer thread that sleeps 2s; scheduler starvation can spuriously delay the
+#     non-blocking open these discriminate on.
+[[profile.default.overrides]]
+filter = 'test(persisted_open_populates_a_cache_the_reopen_hydrates_from) | test(cli_reruns_and_one_file_edit_stay_in_the_interactive_latency_class) | test(light_lookup_overtakes_long_usage_scan) | test(c_wide_translation_unit_indexes_in_linear_time) | test(large_rust_file_definition_and_hover_stay_interactive) | test(deeply_nested_javascript_extraction_is_linear) | test(exact_go_source_set_produces_and_compiles_api_pack) | test(bifrost_lsp_server_formatting_shutdown_cancels_active_formatter) | test(explicit_file_fifo_is_rejected_without_blocking) | test(directory_entries_reject_fifo_replacement_without_blocking)'
 threads-required = "num-cpus"

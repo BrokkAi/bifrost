@@ -125,7 +125,7 @@ pub enum TypestateFindingKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TypestateFindingEvidence {
     path_proven: bool,
-    path_complete: bool,
+    path_proven_complete: bool,
     analysis_complete: bool,
     uncertainty: TypestateUncertaintySet,
     abstained: bool,
@@ -136,12 +136,28 @@ impl TypestateFindingEvidence {
         self.path_proven
     }
 
+    /// Whether one concrete proven path is also complete.
+    ///
+    /// Proof and completeness must belong to the same path. In particular, a
+    /// proven-partial path beside an unproven-complete path does not satisfy
+    /// this predicate.
     pub const fn path_complete(self) -> bool {
-        self.path_complete
+        self.path_proven_complete
     }
 
     pub const fn analysis_complete(self) -> bool {
         self.analysis_complete
+    }
+
+    pub const fn proof_complete_for(self, certainty: TypestateFindingCertainty) -> bool {
+        match certainty {
+            TypestateFindingCertainty::May => {
+                self.path_proven_complete || (self.path_proven && self.analysis_complete)
+            }
+            TypestateFindingCertainty::Must | TypestateFindingCertainty::Inconclusive => {
+                self.path_proven_complete && self.analysis_complete
+            }
+        }
     }
 
     pub const fn uncertainty(self) -> TypestateUncertaintySet {
@@ -154,7 +170,7 @@ impl TypestateFindingEvidence {
 
     fn merge(&mut self, other: Self) {
         self.path_proven |= other.path_proven;
-        self.path_complete |= other.path_complete;
+        self.path_proven_complete |= other.path_proven_complete;
         self.analysis_complete &= other.analysis_complete;
         self.uncertainty = self.uncertainty.union(other.uncertainty);
         self.abstained |= other.abstained;
@@ -623,12 +639,7 @@ pub fn collect_summary_findings_with_limits(
                 to: key.to,
             },
             certainty,
-            evidence: finding_evidence(
-                aggregate.paths,
-                analysis_complete,
-                aggregate.uncertainty,
-                aggregate.abstained,
-            ),
+            evidence: finding_evidence(&aggregate, analysis_complete),
             witness_targets: vec![PendingFindingWitness {
                 observed_state: None,
                 target: witness_target,
@@ -699,17 +710,11 @@ pub fn collect_summary_findings_with_limits(
         let Some(certainty) = certainty else {
             continue;
         };
-        let path_proven = observations
-            .states
-            .values()
-            .any(|observation| observation.paths.has_proven_path());
-        let path_complete = observations
-            .states
-            .values()
-            .any(|observation| observation.paths.has_complete_path());
-        let uncertainty = observations.states.values().fold(
-            TypestateUncertaintySet::default(),
-            |uncertainty, observation| uncertainty.union(observation.uncertainty),
+        let evidence = terminal_finding_evidence(
+            terminal.expected_states(),
+            observations,
+            analysis_complete,
+            binding_definitive,
         );
         let targets_for_state = |state: ProtocolStateId| match root_point.as_ref() {
             Some(point) => state_witnesses
@@ -824,17 +829,7 @@ pub fn collect_summary_findings_with_limits(
                 actual_states: actual_states.into_boxed_slice(),
             },
             certainty,
-            evidence: TypestateFindingEvidence {
-                path_proven,
-                path_complete,
-                analysis_complete,
-                uncertainty,
-                abstained: !binding_definitive
-                    || observations
-                        .states
-                        .values()
-                        .any(|observation| observation.abstained),
-            },
+            evidence,
             witness_targets,
             omitted_witnesses,
         });
@@ -1017,7 +1012,6 @@ fn retain_preferred_witness_target<Key>(
 
 #[derive(Debug, Clone, Copy)]
 struct PathEvidenceAggregate {
-    paths: PathQualityFrontier,
     uncertainty: TypestateUncertaintySet,
     abstained: bool,
     has_definite_proven_path: bool,
@@ -1032,7 +1026,6 @@ impl PathEvidenceAggregate {
     ) -> Self {
         let definitive = uncertainty.is_empty() && !abstained;
         Self {
-            paths,
             uncertainty,
             abstained,
             has_definite_proven_path: definitive && paths.has_proven_path(),
@@ -1049,7 +1042,6 @@ impl PathEvidenceAggregate {
         let definitive = uncertainty.is_empty() && !abstained;
         self.has_definite_proven_path |= definitive && paths.has_proven_path();
         self.has_definite_proven_complete_path |= definitive && paths.has_proven_complete_path();
-        merge_paths(&mut self.paths, paths);
         self.uncertainty = self.uncertainty.union(uncertainty);
         self.abstained |= abstained;
     }
@@ -1133,12 +1125,6 @@ impl ObservationAggregate {
 
 type ObservationEvidence = PathEvidenceAggregate;
 
-fn merge_paths(target: &mut PathQualityFrontier, incoming: PathQualityFrontier) {
-    for quality in incoming.iter() {
-        target.insert(quality);
-    }
-}
-
 fn check_cancellation(
     cancellation: &CancellationToken,
     index: usize,
@@ -1167,14 +1153,43 @@ fn charge_candidate(retained: &mut usize, maximum: usize) -> Result<(), Typestat
 }
 
 fn finding_evidence(
-    paths: PathQualityFrontier,
+    aggregate: &PathEvidenceAggregate,
     analysis_complete: bool,
-    uncertainty: TypestateUncertaintySet,
-    abstained: bool,
 ) -> TypestateFindingEvidence {
     TypestateFindingEvidence {
-        path_proven: paths.has_proven_path(),
-        path_complete: paths.has_complete_path(),
+        path_proven: aggregate.has_definite_proven_path,
+        path_proven_complete: aggregate.has_definite_proven_complete_path,
+        analysis_complete,
+        uncertainty: aggregate.uncertainty,
+        abstained: aggregate.abstained,
+    }
+}
+
+fn terminal_finding_evidence(
+    expected_states: &[ProtocolStateId],
+    observations: &ObservationAggregate,
+    analysis_complete: bool,
+    binding_definitive: bool,
+) -> TypestateFindingEvidence {
+    let mut path_proven = false;
+    let mut path_proven_complete = false;
+    let mut uncertainty = TypestateUncertaintySet::default();
+    let mut abstained = !binding_definitive;
+    let mut saw_failing_state = false;
+    for (state, observation) in &observations.states {
+        if expected_states.binary_search(state).is_ok() {
+            continue;
+        }
+        saw_failing_state = true;
+        path_proven |= binding_definitive && observation.has_definite_proven_path;
+        path_proven_complete |= binding_definitive && observation.has_definite_proven_complete_path;
+        uncertainty = uncertainty.union(observation.uncertainty);
+        abstained |= observation.abstained;
+    }
+    debug_assert!(saw_failing_state);
+    TypestateFindingEvidence {
+        path_proven,
+        path_proven_complete,
         analysis_complete,
         uncertainty,
         abstained,
@@ -1302,6 +1317,7 @@ fn materialize_findings(
                 .witness_for_reached_index(
                     pending.target.reached_index,
                     pending.target.quality,
+                    0,
                     reconstruction_limits,
                 )
                 .map_err(TypestateFlowProblemError::WitnessReconstruction)?;
@@ -1360,6 +1376,78 @@ mod tests {
             TypestateFindingCertainty::May
         );
         assert!(!aggregate.uncertainty.is_empty());
+    }
+
+    #[test]
+    fn may_finding_proof_can_be_complete_when_global_discovery_is_not() {
+        let locally_complete = TypestateFindingEvidence {
+            path_proven: true,
+            path_proven_complete: true,
+            analysis_complete: false,
+            uncertainty: TypestateUncertaintySet::default(),
+            abstained: false,
+        };
+
+        assert!(locally_complete.proof_complete_for(TypestateFindingCertainty::May));
+        assert!(!locally_complete.proof_complete_for(TypestateFindingCertainty::Must));
+        assert!(!locally_complete.proof_complete_for(TypestateFindingCertainty::Inconclusive));
+
+        let globally_closed = TypestateFindingEvidence {
+            path_proven_complete: false,
+            analysis_complete: true,
+            ..locally_complete
+        };
+        assert!(globally_closed.proof_complete_for(TypestateFindingCertainty::May));
+
+        let incomplete = TypestateFindingEvidence {
+            analysis_complete: false,
+            ..globally_closed
+        };
+        assert!(!incomplete.proof_complete_for(TypestateFindingCertainty::May));
+    }
+
+    #[test]
+    fn incomparable_path_qualities_do_not_invent_a_complete_proof() {
+        let mut paths = PathQualityFrontier::singleton(PathQuality::PROVEN_PARTIAL);
+        assert!(paths.insert(PathQuality::UNPROVEN_COMPLETE));
+        assert!(paths.has_proven_path());
+        assert!(paths.has_complete_path());
+        assert!(!paths.has_proven_complete_path());
+
+        let aggregate =
+            PathEvidenceAggregate::new(paths, TypestateUncertaintySet::default(), false);
+        let evidence = finding_evidence(&aggregate, false);
+
+        assert!(evidence.path_proven());
+        assert!(!evidence.path_complete());
+        assert!(!evidence.proof_complete_for(TypestateFindingCertainty::May));
+    }
+
+    #[test]
+    fn accepting_state_cannot_complete_a_failing_terminal_path() {
+        let failing = ProtocolStateId::try_from_index(0).expect("failing state ID");
+        let accepting = ProtocolStateId::try_from_index(1).expect("accepting state ID");
+        let mut observations = ObservationAggregate::default();
+        observations.insert(
+            failing,
+            PathQualityFrontier::singleton(PathQuality::PROVEN_PARTIAL),
+            TypestateUncertaintySet::default(),
+            false,
+        );
+        observations.insert(
+            accepting,
+            PathQualityFrontier::singleton(PathQuality::PROVEN_COMPLETE),
+            TypestateUncertaintySet::default().with(TypestateUncertainty::IncompleteAnalysis),
+            true,
+        );
+
+        let evidence = terminal_finding_evidence(&[accepting], &observations, false, true);
+
+        assert!(evidence.path_proven());
+        assert!(!evidence.path_complete());
+        assert!(evidence.uncertainty().is_empty());
+        assert!(!evidence.abstained());
+        assert!(!evidence.proof_complete_for(TypestateFindingCertainty::May));
     }
 
     #[test]

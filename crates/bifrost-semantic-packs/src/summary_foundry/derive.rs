@@ -113,14 +113,13 @@ pub fn derive_jvm_summaries(
         error,
     })?;
     let project: Arc<dyn Project> = Arc::new(project);
-    let analyzer = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default()).map_err(
-        |error| FoundryError::Derivation {
-            detail: format!(
-                "cannot build an analyzer over {}: {error}",
-                sources.display()
-            ),
-        },
-    )?;
+    let analyzer = WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
+        .map_err(|error| FoundryError::Derivation {
+        detail: format!(
+            "cannot build an analyzer over {}: {error}",
+            sources.display()
+        ),
+    })?;
 
     let mut files = analyzer
         .analyzer()
@@ -503,6 +502,9 @@ fn port_key_label(port: ValueFlowPortKey) -> Option<String> {
         ValueFlowPortKey::Receiver => Some("receiver".to_owned()),
         ValueFlowPortKey::Parameter { ordinal } => Some(format!("parameter[{ordinal}]")),
         ValueFlowPortKey::NormalReturn => Some("normal_return".to_owned()),
+        ValueFlowPortKey::IndexedNormalReturn { ordinal } => {
+            Some(format!("normal_return[{ordinal}]"))
+        }
         ValueFlowPortKey::ExceptionalReturn => Some("exceptional_return".to_owned()),
         ValueFlowPortKey::Capture { .. } => None,
     }
@@ -606,6 +608,10 @@ fn authored_output(
     match root_port(carrier)? {
         ValueFlowPortKey::NormalReturn => Some((
             AuthoredSummaryOutput::NormalReturn {},
+            AuthoredSummaryExitKind::Normal,
+        )),
+        ValueFlowPortKey::IndexedNormalReturn { ordinal } => Some((
+            AuthoredSummaryOutput::IndexedNormalReturn { ordinal },
             AuthoredSummaryExitKind::Normal,
         )),
         ValueFlowPortKey::ExceptionalReturn => Some((
@@ -1235,9 +1241,9 @@ mod tests {
             parallelism: Some(1),
             ..AnalyzerConfig::default()
         };
-        let first = WorkspaceAnalyzer::build_ephemeral(Arc::clone(&project), config())
+        let first = WorkspaceAnalyzer::build_ephemeral_footgun(Arc::clone(&project), config())
             .expect("an analyzer over the fixture");
-        let second = WorkspaceAnalyzer::build_ephemeral(project, config())
+        let second = WorkspaceAnalyzer::build_ephemeral_footgun(project, config())
             .expect("a second analyzer over the fixture");
 
         let files = first.analyzer().get_analyzed_files();
@@ -1370,8 +1376,9 @@ mod tests {
 
         let project: Arc<dyn Project> =
             Arc::new(FilesystemProject::new(workspace.path()).expect("fixture project"));
-        let analyzer = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
-            .expect("an analyzer over the fixture");
+        let analyzer =
+            WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
+                .expect("an analyzer over the fixture");
         let files = analyzer.analyzer().get_analyzed_files();
         let file = files
             .into_iter()

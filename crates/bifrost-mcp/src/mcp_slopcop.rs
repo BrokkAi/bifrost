@@ -16,7 +16,6 @@ pub const SLOPCOP_TOOL_NAMES: &[&str] = &[
     "report_long_method_and_god_object_smells",
     "report_dead_code_and_unused_abstraction_smells",
     "report_secret_like_code",
-    "analyze_diff",
 ];
 
 pub fn run_slopcop_stdio_server(
@@ -419,30 +418,6 @@ pub(crate) fn slopcop_tool_descriptors() -> Vec<Value> {
                         "type": "boolean",
                         "default": false,
                         "description": "Include lower-confidence short credential-like assignments."
-                    }
-                }
-            }),
-        ),
-        tool_descriptor(
-            "analyze_diff",
-            "Diff two endpoints and return Bifrost-resolved semantic patch effects: changed files with `git diff --numstat` insertion/deletion counts, symbols edited (one record naming the symbol at both endpoints, with the old and new lines each hunk touched), introduced, deleted, moved or resignatured, dependency symbols, import changes, and large-callsite truncation notices. Every reported symbol carries `is_test`. Call-edge changes arrive already attributed to the symbol that makes the calls: an edited or moved record carries `added_calls` and `removed_calls`, an introduced record carries `calls`, and a deleted record carries `called`; `unattributed_call_edge_changes` holds only the edges whose caller is no patch symbol. A move that renames a symbol is not itself a call-edge change, because the preimage graph is compared under the postimage names. An explicit endpoint accepts a commit-ish or tree-ish; commit resolution wins when a spelling can resolve to either. Omit both parameters to compare HEAD against the live working tree. With `target` alone, a commit compares against its first parent; a tree-only target is rejected because a tree has no parent, so provide `base`. Endpoint labels report a full commit hash or `tree:<full-oid>`. When both endpoints are immutable commits or trees, comparison ignores the live working tree, index, and `.gitattributes`. Objects available only in a snapshot store require the host to launch Bifrost with `--diff-snapshot-object-dir`; this tool never accepts an object-store filesystem path argument.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "base": {
-                        "type": "string",
-                        "minLength": 1,
-                        "description": "Commit-ish or tree-ish \"before\" endpoint. Commit resolution wins when both apply. Defaults to the first parent of a commit `target`, or HEAD when `target` is omitted. Snapshot-store objects require host launch configuration; no filesystem path is accepted here."
-                    },
-                    "target": {
-                        "type": "string",
-                        "minLength": 1,
-                        "description": "Commit-ish or tree-ish \"after\" endpoint. Commit resolution wins when both apply. Omit for the live working tree. A tree-only target requires explicit `base` because trees have no parents; immutable pairs ignore the live worktree, index, and .gitattributes. Snapshot-store objects require host launch configuration; no filesystem path is accepted here."
-                    },
-                    "include_tests": {
-                        "type": "boolean",
-                        "default": true,
-                        "description": "Include symbols and call edges from detected test files."
                     }
                 }
             }),

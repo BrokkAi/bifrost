@@ -1116,7 +1116,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
     ///
     /// A literal, a binding already proven non-dropping, a borrow of a place,
     /// an operator applied to non-dropping operands, a cast to a primitive, a
-    /// call to a same-file `fn` with a primitive return type, an array or
+    /// call to a same-file `fn` with a non-dropping return type, an array or
     /// struct literal whose parts are themselves proven, and a read of a
     /// primitive field or element all produce a value that runs no destructor.
     /// Anything else answers `false`, which keeps the drop-omission gaps.
@@ -1222,14 +1222,14 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     }
                 }
                 "call_expression" => {
-                    let primitive_result = node
+                    let non_dropping_result = node
                         .child_by_field_name("function")
                         .filter(|function| function.kind() == "identifier")
                         .and_then(|function| node_text(self.source, function))
-                        .and_then(|name| self.facts.primitive_return_functions.get(name))
+                        .and_then(|name| self.facts.non_dropping_return_functions.get(name))
                         .copied()
                         .unwrap_or(false);
-                    if !primitive_result {
+                    if !non_dropping_result {
                         return false;
                     }
                 }
@@ -1271,6 +1271,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let Some(pattern) = node.child_by_field_name("pattern") else {
             return true;
         };
+        if is_wildcard_pattern(pattern) {
+            return false;
+        }
         let Some(name) = identity_binding_identifier(pattern) else {
             return true;
         };
@@ -1726,7 +1729,20 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         };
         let binding = self.point(builder, node, Vec::new())?;
         if let Some(pattern) = node.child_by_field_name("pattern") {
-            if let Some(name) = identity_binding_identifier(pattern) {
+            if is_wildcard_pattern(pattern) {
+                // `_` binds and moves nothing. A place expression such as a
+                // local parameter therefore creates neither local value flow
+                // nor a lexical-scope cleanup obligation. A fresh temporary
+                // can still be dropped at the end of this statement; retain
+                // that distinct omission at the binding point.
+                if !self.is_place(value) && !self.expression_is_definitely_non_dropping(value) {
+                    self.add_drop_omission_gaps(
+                        builder,
+                        binding,
+                        "a temporary discarded by a wildcard let may require immediate Drop at the end of the statement",
+                    )?;
+                }
+            } else if let Some(name) = identity_binding_identifier(pattern) {
                 let name_text = node_text(self.source, name).ok_or_else(|| {
                     RustLoweringError::Invalid("Rust binding has an invalid name range".into())
                 })?;
@@ -2318,12 +2334,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 .expect("operator expressions carry an implicit-call reason"),
         )?;
         if rust_operation_can_abort(node) {
-            self.add_gap(
+            self.add_non_rejoining_exceptional_exit_gap(
                 builder,
                 terminal,
-                SemanticGapSubject::Point,
-                SemanticCapability::ExceptionalControlFlow,
-                SemanticGapKind::Unsupported,
+                scope,
                 "arithmetic overflow, division by zero, or an invalid dereference may abort here; that abort edge is not lowered",
             )?;
         }
@@ -3387,6 +3401,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 callee,
                 receiver,
                 arguments: argument_values.into_boxed_slice(),
+                normal_results: Box::new([]),
                 result: Some(result),
                 thrown: Some(thrown),
                 declared_targets: resolution.clone(),
@@ -3776,6 +3791,37 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         Ok(())
     }
 
+    /// Rust aborts do not resume normal evaluation after the failing
+    /// operation. Preserve that proof on this exceptional-flow gap only when
+    /// the exact evaluation scope has no already-active cleanup user code.
+    fn add_non_rejoining_exceptional_exit_gap(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        scope: ScopeFrameId,
+        detail: &str,
+    ) -> Result<(), RustLoweringError> {
+        let route = builder
+            .resolve_completion(scope, &CompletionRequest::new(CompletionKind::Throw, None))
+            .expect("a Rust evaluation scope must resolve abort completion");
+        let discharge = if route.cleanups().is_empty() {
+            SemanticGapDischarge::NonRejoiningExceptionalExit
+        } else {
+            SemanticGapDischarge::None
+        };
+        self.session.add_gap_with_impacts_and_discharge(
+            builder,
+            point,
+            SemanticGapSubject::Point,
+            SemanticCapability::ExceptionalControlFlow,
+            SemanticGapImpacts::NONE,
+            SemanticGapKind::Unsupported,
+            discharge,
+            detail,
+        )?;
+        Ok(())
+    }
+
     fn edge(
         &self,
         builder: &mut ProcedureCfgBuilder,
@@ -3855,6 +3901,10 @@ fn identity_binding_identifier(mut pattern: Node<'_>) -> Option<Node<'_>> {
             _ => return None,
         }
     }
+}
+
+fn is_wildcard_pattern(pattern: Node<'_>) -> bool {
+    pattern.kind() == "_"
 }
 
 /// Whether this pattern introduces a binding.
@@ -4035,8 +4085,8 @@ struct RustFieldDeclaration {
 /// Python adapter's `instance_field_proofs` takes, and it is stated here so a
 /// reader does not mistake any of these for a whole-crate proof.
 struct RustFileFacts {
-    /// Same-file `fn` names whose declared return type is a primitive.
-    primitive_return_functions: HashMap<Box<str>, bool>,
+    /// Same-file `fn` names whose declared return type owns no `Drop`.
+    non_dropping_return_functions: HashMap<Box<str>, bool>,
     /// Every `(struct, field)` this file declares. `None` marks a pair the
     /// file states more than once, which no longer picks a declaration.
     struct_fields: HashMap<(Box<str>, Box<str>), Option<RustFieldDeclaration>>,
@@ -4048,7 +4098,7 @@ struct RustFileFacts {
 
 fn rust_file_facts(prepared: &PreparedSyntaxTree) -> RustFileFacts {
     let source = prepared.source();
-    let mut primitive_return_functions: HashMap<Box<str>, bool> = HashMap::default();
+    let mut non_dropping_return_functions: HashMap<Box<str>, bool> = HashMap::default();
     let mut struct_fields: HashMap<(Box<str>, Box<str>), Option<RustFieldDeclaration>> =
         HashMap::default();
     // Every struct this file declares, with the field types it states, plus
@@ -4065,13 +4115,13 @@ fn rust_file_facts(prepared: &PreparedSyntaxTree) -> RustFileFacts {
                     .child_by_field_name("name")
                     .and_then(|name| node_text(source, name))
                 {
-                    let primitive = node
+                    let non_dropping = node
                         .child_by_field_name("return_type")
-                        .is_some_and(|ty| ty.kind() == "primitive_type");
-                    primitive_return_functions
+                        .is_some_and(rust_type_is_definitely_non_dropping);
+                    non_dropping_return_functions
                         .entry(name.into())
-                        .and_modify(|agreed| *agreed = *agreed && primitive)
-                        .or_insert(primitive);
+                        .and_modify(|agreed| *agreed = *agreed && non_dropping)
+                        .or_insert(non_dropping);
                 }
             }
             "struct_item" => {
@@ -4182,7 +4232,7 @@ fn rust_file_facts(prepared: &PreparedSyntaxTree) -> RustFileFacts {
     }
 
     RustFileFacts {
-        primitive_return_functions,
+        non_dropping_return_functions,
         struct_fields,
         plain_structs,
     }

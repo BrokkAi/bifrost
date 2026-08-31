@@ -4,7 +4,7 @@
 //! analyzer-backed evaluation, canonical report assembly, and CLI status
 //! selection. Renderers consume only the returned [`PolicyReportDocument`].
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -13,7 +13,6 @@ use std::time::{Duration, Instant};
 use sha2::{Digest, Sha256};
 
 use brokk_bifrost_analysis::CancellationToken;
-use brokk_bifrost_analysis::FileSetProject;
 use brokk_bifrost_analysis::analyzer::IAnalyzer;
 use brokk_bifrost_analysis::analyzer::packs_document::{
     WORKSPACE_PACKS_DOCUMENT_PATH, WorkspaceActivationError, WorkspaceActivationSources,
@@ -22,16 +21,18 @@ use brokk_bifrost_analysis::analyzer::packs_document::{
 };
 use brokk_bifrost_analysis::analyzer::semantic::{WorkspaceRelativePath, split_qualified_member};
 use brokk_bifrost_analysis::analyzer::semantic_model::{
-    ActiveSemanticModelShard, CatalogPackSourceKind, ResolvedActiveSemanticModels,
-    SemanticModelActivationExplanation, SemanticModelActivationPersistence,
-    SemanticModelActivationRequest, SemanticModelActivationStatus, SemanticModelRuntimeOutcome,
-    SemanticPackCatalog, WORKSPACE_SEMANTIC_MODEL_DIRECTORY, acquire_active_semantic_models,
+    ActiveSemanticModelShard, ActiveSemanticModelSnapshot, CatalogPackSourceKind,
+    ResolvedActiveSemanticModels, SemanticModelActivationExplanation,
+    SemanticModelActivationPersistence, SemanticModelActivationRequest,
+    SemanticModelActivationStatus, SemanticModelRuntimeOutcome, SemanticPackCatalog,
+    WORKSPACE_SEMANTIC_MODEL_DIRECTORY, acquire_active_semantic_models,
     workspace_semantic_models_not_active,
 };
 use brokk_bifrost_analysis::analyzer::usages::effects::ModeledProcedureKey;
 use brokk_bifrost_analysis::analyzer::usages::effects::modeled_procedure_key_for_unit;
 use brokk_bifrost_analysis::analyzer::{
-    AnalyzerConfig, DependencyPackEcosystem, FilesystemProject, Project, WorkspaceAnalyzer,
+    AnalyzerConfig, AnalyzerQueryScope, CodeUnit, DependencyPackEcosystem, FilesystemProject,
+    GoDependencyDiscoveryMode, Project, WorkspaceAnalyzer,
 };
 use brokk_bifrost_analysis::diff_analysis::export_revision;
 use brokk_bifrost_analysis::schema_version::SchemaVersionOrigin;
@@ -84,6 +85,7 @@ use super::suppression::{
     PolicySuppressionSourceState, PolicySuppressionTemporalState,
     load_policy_suppressions_from_root,
 };
+
 use super::taint_policy::ProductionTaintPolicyEvaluator;
 use super::typestate_policy::ProductionTypestatePolicyEvaluator;
 use super::{PolicyBatchBudget, PolicyBudget};
@@ -1161,13 +1163,123 @@ fn analyzed_source_volume(workspace: &WorkspaceAnalyzer) -> (u64, usize) {
     (bytes, files.len())
 }
 
-/// The workspace location the pack-activation review is attributed to.
+/// Activate every semantic source an owned policy workspace uses.
 ///
-/// Dependency activation is attributed to the conventional packs document,
-/// including ambient default activation without a document. Workspace-local
-/// model paths remain available through their typed decisions and diagnostics.
-fn pack_activation_source_path(_config: Option<&WorkspacePacksConfig>) -> String {
-    WORKSPACE_PACKS_DOCUMENT_PATH.to_owned()
+/// Ordinary evaluation and explanation both build short-lived workspace
+/// analyzers. Keep their activation authority in one place so shipped models,
+/// reviewed workspace models, and dependency packs cannot diverge between the
+/// report and the explanation of that report.
+pub(crate) fn owned_policy_analyzer_config() -> AnalyzerConfig {
+    let mut config = AnalyzerConfig::default();
+    config.go.dependency_discovery.mode = GoDependencyDiscoveryMode::CuratedPackEvidence;
+    config
+}
+
+pub(crate) fn activate_owned_policy_workspace(
+    root: &Path,
+    workspace: &WorkspaceAnalyzer,
+    config: Option<&WorkspacePacksConfig>,
+    cancellation: &CancellationToken,
+) -> Result<Option<WorkspacePacksActivation>, WorkspaceActivationError> {
+    activate_workspace_semantic_sources(
+        workspace,
+        &owned_policy_analyzer_config(),
+        WorkspaceActivationSources {
+            catalog_root: root,
+            workspace_model_root: Some(root),
+            config,
+            intrinsic_shipped_models: true,
+        },
+        cancellation,
+    )
+}
+
+/// Scale one policy's host budget to the analyzer snapshot it will scan.
+pub(crate) fn policy_budget_for_workspace(
+    budget: PolicyBudget,
+    workspace: Option<&WorkspaceAnalyzer>,
+) -> PolicyBudget {
+    match workspace {
+        Some(workspace) => {
+            let (bytes, files) = analyzed_source_volume(workspace);
+            budget.scaled_for_workspace(bytes, files)
+        }
+        None => budget,
+    }
+}
+
+/// Freeze the exact ready semantic-model publication produced by activation.
+pub(crate) fn ready_policy_semantic_model_snapshot(
+    activation: Option<&WorkspacePacksActivation>,
+) -> Option<Arc<ActiveSemanticModelSnapshot>> {
+    activation
+        .and_then(|activation| activation.outcome.runtime.as_ref())
+        .and_then(|runtime| match runtime {
+            SemanticModelRuntimeOutcome::Ready { snapshot, .. } => Some(Arc::clone(snapshot)),
+            SemanticModelRuntimeOutcome::Incomplete { .. }
+            | SemanticModelRuntimeOutcome::Cancelled(_)
+            | SemanticModelRuntimeOutcome::Unavailable(_) => None,
+        })
+}
+
+/// The workspace location to which a pack-activation review is attributed.
+///
+/// A dependency activation attempt, including a host-owned absent-document
+/// default, belongs to the conventional packs path. Otherwise, reviewed
+/// workspace-local models belong to their directory. Intrinsic shipped models
+/// are runtime inputs, not evidence that either workspace path exists, so they
+/// do not add a top-level review by themselves (#1868, #2493).
+fn pack_activation_source_path(
+    config: Option<&WorkspacePacksConfig>,
+    activation: Option<&WorkspacePacksActivation>,
+    attempted_ecosystems: Option<&[DependencyPackEcosystem]>,
+    activation_failure: Option<&str>,
+) -> Option<&'static str> {
+    if config.is_some()
+        || attempted_ecosystems.is_some()
+        || activation_failure.is_some()
+        || activation.is_some_and(|activation| !activation.ecosystems.is_empty())
+    {
+        Some(WORKSPACE_PACKS_DOCUMENT_PATH)
+    } else if activation.is_some_and(|activation| !activation.workspace_models.is_empty()) {
+        Some(WORKSPACE_SEMANTIC_MODEL_DIRECTORY)
+    } else {
+        None
+    }
+}
+
+/// Find declarations whose terminal names are named by active procedure
+/// summaries. Tree-sitter analyzers expose an indexed identifier lookup, but
+/// that lookup also includes definition-lookup-only units for resolver use, so
+/// filter candidates back to the authoritative per-file declaration set.
+/// An analyzer without the complete index keeps the full-declaration fallback.
+fn procedure_summary_candidate_declarations(
+    analyzer: &dyn IAnalyzer,
+    target_member_identifiers: &HashSet<String>,
+) -> BTreeSet<CodeUnit> {
+    let indexed_lookup = analyzer.has_complete_symbol_lookup_index();
+    let candidate_units = if indexed_lookup {
+        target_member_identifiers
+            .iter()
+            .flat_map(|member| analyzer.lookup_candidates_by_identifier(member))
+            .collect::<BTreeSet<_>>()
+    } else {
+        analyzer.all_declarations().collect::<BTreeSet<_>>()
+    };
+    if !indexed_lookup {
+        return candidate_units;
+    }
+
+    let mut declarations_by_file = HashMap::<_, BTreeSet<_>>::new();
+    candidate_units
+        .into_iter()
+        .filter(|unit| {
+            declarations_by_file
+                .entry(unit.source().clone())
+                .or_insert_with(|| analyzer.declarations(unit.source()))
+                .contains(unit)
+        })
+        .collect()
 }
 
 /// Count the workspace declarations that reach each active procedure summary
@@ -1180,12 +1292,14 @@ fn procedure_summary_match_evidence(
 ) -> BTreeMap<String, Vec<PolicyPackProcedureSummaryEvidence>> {
     let mut counts = BTreeMap::<(String, String), u64>::new();
     let mut target_members = HashSet::new();
+    let mut target_member_identifiers = HashSet::new();
     let mut summaries_by_key = HashMap::<ModeledProcedureKey, Vec<(String, String)>>::new();
     for shard in active.shards() {
         if let Some(summaries) = shard.shard.payload().procedure_summaries() {
             for summary in summaries {
                 if let Some((owner, member)) = split_qualified_member(&summary.target.symbol) {
                     target_members.insert((owner.to_owned(), member.to_owned()));
+                    target_member_identifiers.insert(member.to_owned());
                     summaries_by_key
                         .entry(ModeledProcedureKey {
                             language: shard.manifest.language.clone(),
@@ -1204,11 +1318,14 @@ fn procedure_summary_match_evidence(
             }
         }
     }
-    for unit in analyzer.all_declarations().filter(|unit| {
-        split_qualified_member(&unit.fq_name()).is_some_and(|(owner, member)| {
-            target_members.contains(&(owner.to_owned(), member.to_owned()))
-        })
-    }) {
+    for unit in procedure_summary_candidate_declarations(analyzer, &target_member_identifiers) {
+        let fq_name = unit.fq_name();
+        let Some((owner, member)) = split_qualified_member(&fq_name) else {
+            continue;
+        };
+        if !target_members.contains(&(owner.to_owned(), member.to_owned())) {
+            continue;
+        }
         let Some(key) = modeled_procedure_key_for_unit(analyzer, &unit) else {
             continue;
         };
@@ -1244,6 +1361,36 @@ fn procedure_summary_match_evidence(
         }
     }
     evidence
+}
+
+/// Build procedure-summary evidence only when a dependency or reviewed
+/// workspace-model route contributed to the activation. Intrinsic models stay
+/// active for policy evaluation, but an intrinsic-only activation has no
+/// authored pack whose review can consume this whole-workspace scan.
+fn procedure_summary_match_evidence_for_review(
+    analyzer: &dyn IAnalyzer,
+    config: Option<&WorkspacePacksConfig>,
+    activation: &WorkspacePacksActivation,
+) -> Option<BTreeMap<String, Vec<PolicyPackProcedureSummaryEvidence>>> {
+    let dependency_pack_contributed = activation
+        .outcome
+        .ecosystems
+        .iter()
+        .filter_map(|ecosystem| ecosystem.preparation.as_ref())
+        .any(|preparation| {
+            !preparation.packs.is_empty() || !preparation.installed_packs.is_empty()
+        });
+    if config.is_none() && activation.workspace_models.is_empty() && !dependency_pack_contributed {
+        return None;
+    }
+    let active = match activation.outcome.runtime.as_ref()? {
+        SemanticModelRuntimeOutcome::Ready { active, .. } => Some(active),
+        SemanticModelRuntimeOutcome::Incomplete { usable, .. } => usable.as_ref(),
+        SemanticModelRuntimeOutcome::Cancelled(_) | SemanticModelRuntimeOutcome::Unavailable(_) => {
+            None
+        }
+    }?;
+    Some(procedure_summary_match_evidence(analyzer, active))
 }
 
 /// Warn when an active, reviewed workspace model publishes a procedure
@@ -1311,17 +1458,18 @@ fn active_workspace_model_zero_match_diagnostics(
 /// Project one workspace activation transaction into the report's
 /// pack-activation review (#1868, #1884, #2493).
 ///
-/// `None` activation means neither route contributed: the document named no
-/// ecosystem that serves a language present in the workspace and no reviewed
-/// workspace model was found. The review still records the opt-in so it stays
-/// auditable.
+/// A `None` activation still records an explicit document or host-owned
+/// dependency attempt. An activation containing only intrinsic shipped models
+/// returns no optional review.
 fn pack_activation_review(
     config: Option<&WorkspacePacksConfig>,
     activation: Option<&WorkspacePacksActivation>,
     attempted_ecosystems: Option<&[DependencyPackEcosystem]>,
     activation_failure: Option<&str>,
     summary_evidence: Option<&BTreeMap<String, Vec<PolicyPackProcedureSummaryEvidence>>>,
-) -> PolicyPackActivationReview {
+) -> Option<PolicyPackActivationReview> {
+    let source_path =
+        pack_activation_source_path(config, activation, attempted_ecosystems, activation_failure)?;
     let dependency_mode = policy_dependency_pack_activation_mode(config);
     let Some(activation) = activation else {
         let decisions = activation_failure
@@ -1333,8 +1481,8 @@ fn pack_activation_review(
                 )]
             })
             .unwrap_or_default();
-        return PolicyPackActivationReview::new_with_mode(
-            pack_activation_source_path(config),
+        return Some(PolicyPackActivationReview::new_with_mode(
+            source_path.to_owned(),
             dependency_mode,
             attempted_ecosystems
                 .unwrap_or_else(|| config.map_or(&[], WorkspacePacksConfig::ecosystems))
@@ -1343,7 +1491,7 @@ fn pack_activation_review(
                 .collect(),
             activation_failure.is_none(),
             decisions,
-        );
+        ));
     };
     let mut decisions = Vec::new();
     for ecosystem in &activation.outcome.ecosystems {
@@ -1404,8 +1552,8 @@ fn pack_activation_review(
             Some(failure.to_owned()),
         ));
     }
-    PolicyPackActivationReview::new_with_mode(
-        pack_activation_source_path(config),
+    Some(PolicyPackActivationReview::new_with_mode(
+        source_path.to_owned(),
         dependency_mode,
         activation
             .ecosystems
@@ -1414,7 +1562,7 @@ fn pack_activation_review(
             .collect(),
         activation.outcome.complete() && activation_failure.is_none(),
         decisions,
-    )
+    ))
 }
 
 fn policy_dependency_pack_activation_mode(
@@ -1446,6 +1594,13 @@ fn workspace_activation_diagnostic(
             None,
             Vec::new(),
         ),
+        WorkspaceActivationError::ShippedModels(error) => report_diagnostic(
+            PolicyReportDiagnosticCode::PackActivationFailed,
+            format!("failed to activate shipped semantic models: {error}"),
+            None,
+            None,
+            Vec::new(),
+        ),
         WorkspaceActivationError::WorkspaceModels(models) => {
             // The per-file variants already carry the full workspace-relative
             // path discovery reported; only a whole-directory failure has to
@@ -1460,6 +1615,45 @@ fn workspace_activation_diagnostic(
             )
         }
     }
+}
+
+/// Condemn a semantic-pack transaction that returned without one publishable
+/// active-model snapshot.
+///
+/// `activate_workspace_semantic_sources` reserves `Err` for setup failures;
+/// runtime refusal is carried inside an otherwise successful activation. An
+/// owned policy analyzer always requests the intrinsic shipped models, so
+/// treating one of these outcomes as ordinary model absence could turn a
+/// shipped-model-dependent policy into a false clean result. Incomplete
+/// optional dependency discovery is different: when the runtime is ready, its
+/// independent intrinsic and workspace models are valid and useful even though
+/// the pack review retains that incomplete dependency route.
+fn nonready_activation_diagnostic(
+    activation: &WorkspacePacksActivation,
+) -> Result<Option<PolicyReportDiagnostic>, PolicyCoordinatorError> {
+    let message = match activation.outcome.runtime.as_ref() {
+        Some(SemanticModelRuntimeOutcome::Ready { .. }) => return Ok(None),
+        Some(SemanticModelRuntimeOutcome::Incomplete { report, .. }) => {
+            format!("semantic-model runtime was incomplete: {report:?}")
+        }
+        Some(SemanticModelRuntimeOutcome::Cancelled(report)) => {
+            format!("semantic-model runtime was cancelled: {report:?}")
+        }
+        Some(SemanticModelRuntimeOutcome::Unavailable(report)) => {
+            format!("semantic-model runtime was unavailable: {report:?}")
+        }
+        None => "semantic-model runtime was not attempted".to_owned(),
+    };
+    let source = (!activation.outcome.ecosystems.is_empty())
+        .then(|| PolicySourceIdentity::new(WORKSPACE_PACKS_DOCUMENT_PATH));
+    report_diagnostic(
+        PolicyReportDiagnosticCode::PackActivationFailed,
+        message,
+        source,
+        None,
+        Vec::new(),
+    )
+    .map(Some)
 }
 
 /// Report every reviewed workspace model that did not reach the active set.
@@ -1772,6 +1966,113 @@ fn evaluate_prepared_policy_inputs(
         PolicyCoordinatorError::new(format!("failed to initialize policy registry: {error}"))
     })?;
 
+    // Qualified policy locators need the same analyzer snapshot and active
+    // model publication that evaluation will use. Prepare both before closing
+    // any policy so the loaded-policy boundary can resolve them exactly once.
+    let needs_workspace = inputs
+        .iter()
+        .any(|input| matches!(input, InputOutcome::Pending(_) | InputOutcome::Runnable(_)));
+    let owned_analyzer = if needs_workspace && supplied_workspace.is_none() {
+        let project = FilesystemProject::new(root).map_err(|error| {
+            PolicyCoordinatorError::new(format!(
+                "failed to construct analyzer project {}: {error}",
+                root.display()
+            ))
+        })?;
+        let project: Arc<dyn Project> = Arc::new(project);
+        // Persisted, so consecutive policy runs over one root reuse the blobs
+        // the first run parsed instead of re-parsing the world into a
+        // delete-on-drop database. This is the fallback for every host that does
+        // not hand us its own analyzer: the `--policy-file` CLI, the MCP
+        // workspace-less arm, and any LSP request that arrives before the
+        // server's workspace is ready.
+        Some(
+            WorkspaceAnalyzer::build_persisted(project, owned_policy_analyzer_config()).map_err(
+                |error| {
+                    PolicyCoordinatorError::new(format!(
+                        "failed to build the analyzer workspace at {}: {error}",
+                        root.display()
+                    ))
+                },
+            )?,
+        )
+    } else {
+        None
+    };
+    let workspace = supplied_workspace.or(owned_analyzer.as_ref());
+    let workspace_has_analyzable_files =
+        workspace.is_some_and(|workspace| !workspace.analyzer().analyzed_files().is_empty());
+    let uncancelled = CancellationToken::default();
+    let semantic_cancellation = cancellation.unwrap_or(&uncancelled);
+    let workspace_activation = match owned_analyzer.as_ref() {
+        Some(_) if packs_load_failure.is_some() => Some(None),
+        Some(analyzer_workspace) => {
+            match activate_owned_policy_workspace(
+                root,
+                analyzer_workspace,
+                packs_config.as_ref(),
+                semantic_cancellation,
+            ) {
+                Ok(activation) => Some(activation),
+                Err(error) => {
+                    secondary_diagnostics.push(workspace_activation_diagnostic(&error)?);
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+    let document_semantic_model_snapshot = ready_policy_semantic_model_snapshot(
+        workspace_activation
+            .as_ref()
+            .and_then(Option::as_ref)
+            .or_else(|| host_activation.and_then(|context| context.activation)),
+    );
+    let host_semantic_model_snapshot = supplied_workspace
+        .and_then(|workspace| workspace.analyzer().active_semantic_model_snapshot());
+    let active_semantic_model_snapshot = match semantic_models {
+        None => Ok(document_semantic_model_snapshot.or(host_semantic_model_snapshot)),
+        Some(context) => {
+            let workspace = workspace.ok_or_else(|| {
+                PolicyCoordinatorError::new(
+                    "semantic-model policy evaluation requires an analyzer snapshot",
+                )
+            })?;
+            match acquire_active_semantic_models(
+                workspace.analyzer(),
+                context.catalog,
+                context.persistence,
+                context.request,
+                semantic_cancellation,
+            ) {
+                SemanticModelRuntimeOutcome::Ready { snapshot, .. } => Ok(Some(snapshot)),
+                SemanticModelRuntimeOutcome::Incomplete { report, .. } => Err(format!(
+                    "semantic-model activation was incomplete: {report:?}"
+                )),
+                SemanticModelRuntimeOutcome::Cancelled(report) => Err(format!(
+                    "semantic-model activation was cancelled: {report:?}"
+                )),
+                SemanticModelRuntimeOutcome::Unavailable(report) => Err(format!(
+                    "semantic-model activation was unavailable: {report:?}"
+                )),
+            }
+        }
+    };
+    let icfg_active_semantic_model_snapshot = active_semantic_model_snapshot
+        .as_ref()
+        .ok()
+        .and_then(|snapshot| snapshot.as_ref().map(Arc::clone));
+    // Policy registration resolves qualified locators, so it is part of the
+    // same semantic-model transaction as preparation and execution. Pin both a
+    // successful publication and a deliberate absence before registration; a
+    // supplied workspace may publish a newer model set concurrently.
+    let _semantic_model_scope = workspace.map(|workspace| {
+        AnalyzerQueryScope::with_active_semantic_model_snapshot(
+            workspace.analyzer(),
+            icfg_active_semantic_model_snapshot.clone(),
+        )
+    });
+
     let mut pending_indexes = inputs
         .iter()
         .enumerate()
@@ -1807,9 +2108,18 @@ fn evaluate_prepared_policy_inputs(
                 "pending policy input changed during stable registration",
             ));
         };
-        let registration = registry
-            .register_policy_bytes(prepared.source.clone(), prepared.bytes.as_bytes())
-            .map(|policy| policy.definition().metadata.id.clone());
+        let registration = match workspace {
+            Some(workspace) => registry
+                .register_policy_bytes_with_analyzer(
+                    prepared.source.clone(),
+                    prepared.bytes.as_bytes(),
+                    workspace.analyzer(),
+                )
+                .map(|policy| policy.definition().metadata.id.clone()),
+            None => registry
+                .register_policy_bytes(prepared.source.clone(), prepared.bytes.as_bytes())
+                .map(|policy| policy.definition().metadata.id.clone()),
+        };
         match registration {
             Ok(policy_id) => {
                 input_by_policy_id.insert(policy_id.clone(), input_index);
@@ -1871,45 +2181,7 @@ fn evaluate_prepared_policy_inputs(
     }
 
     let preparation_started = Instant::now();
-    let owned_analyzer = if runnable_ids.is_empty() || supplied_workspace.is_some() {
-        None
-    } else {
-        let project = FilesystemProject::new(root).map_err(|error| {
-            PolicyCoordinatorError::new(format!(
-                "failed to construct analyzer project {}: {error}",
-                root.display()
-            ))
-        })?;
-        let project: Arc<dyn Project> = Arc::new(project);
-        Some(
-            WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
-                .expect("ephemeral workspace should build"),
-        )
-    };
-    if policy_deadline_reached(cancellation)? {
-        return deadline_before_evaluation_outcome(
-            options,
-            batch_budget,
-            suppression_sources.clone(),
-            scope_document_state,
-            vec![
-                PolicyStageTiming::from_duration(
-                    PolicyExecutionStage::PolicyRegistration,
-                    registration_elapsed,
-                ),
-                PolicyStageTiming::from_duration(
-                    PolicyExecutionStage::PolicyPreparation,
-                    preparation_started.elapsed(),
-                ),
-            ],
-            PolicyExecutionStage::PolicyPreparation,
-            evaluation_policy_ids,
-            None,
-        );
-    }
-
     let mut runs = HashMap::with_capacity(runnable_ids.len());
-    let workspace = supplied_workspace.or(owned_analyzer.as_ref());
     let owned_flow_state = supplied_flow_state
         .is_none()
         .then(brokk_bifrost_flow::FlowWorkspaceState::new);
@@ -1920,100 +2192,55 @@ fn evaluate_prepared_policy_inputs(
     // follow the audited workspace (#1771).  Scaling is a per-lane max, so an
     // explicitly widened caller budget survives and an explicitly narrowed one
     // is raised back to the fixed defaults.
-    let per_policy_budget = match workspace {
-        Some(workspace) => {
-            let (bytes, files) = analyzed_source_volume(workspace);
-            batch_budget.per_policy().scaled_for_workspace(bytes, files)
-        }
-        None => *batch_budget.per_policy(),
-    };
-    let uncancelled = CancellationToken::default();
-    let semantic_cancellation = cancellation.unwrap_or(&uncancelled);
-    // Workspace-driven pack activation runs only on the coordinator's own
-    // analyzer: a supplied workspace belongs to a host that owns its own
-    // activation lifecycle (LSP, MCP), and re-activating here would race it.
-    // The diff-base run activates against its exported base tree inside
-    // `evaluate_policy_diff_baseline` for the same ownership reason.
-    // The activation transaction is retained, not just projected into the
-    // review: its already-resolved runtime carries the procedure summaries the
-    // taint evaluator reads, so the CLI route reuses this one activation rather
-    // than opening a second (#1915). The declaration-facts strand (#1893)
-    // reaches the resolver through the overlay this same transaction publishes
-    // onto the owned analyzer.
-    //
-    // Two sources feed the one transaction (#2493): the `.bifrost/packs.json`
-    // document, and the reviewed models the repository checked in at
-    // `.bifrost/semantic-models/`. The directory's presence is the opt-in for
-    // the second, so a policy that depends on a checked-in model runs from
-    // `bifrost --policy-file` alone.
-    let workspace_activation = match owned_analyzer.as_ref() {
-        Some(_) if packs_load_failure.is_some() => Some(None),
-        Some(analyzer_workspace) => {
-            match activate_workspace_semantic_sources(
-                analyzer_workspace,
-                &AnalyzerConfig::default(),
-                WorkspaceActivationSources {
-                    catalog_root: root,
-                    workspace_model_root: Some(root),
-                    config: packs_config.as_ref(),
-                },
-                semantic_cancellation,
-            ) {
-                Ok(activation) => Some(activation),
-                Err(error) => {
-                    secondary_diagnostics.push(workspace_activation_diagnostic(&error)?);
-                    None
-                }
-            }
-        }
-        None => None,
-    };
+    let per_policy_budget = policy_budget_for_workspace(*batch_budget.per_policy(), workspace);
     let activation_for_report = workspace_activation
         .as_ref()
         .and_then(Option::as_ref)
         .or_else(|| host_activation.and_then(|context| context.activation));
+    let activation_config_for_report = match workspace_activation.as_ref() {
+        Some(_) => packs_config.as_ref(),
+        None => host_activation.and_then(|context| context.config),
+    };
+    let host_activation_failure = host_activation.and_then(|context| context.failure);
+    if host_activation_failure.is_none()
+        && let Some(activation) = activation_for_report
+        && let Some(diagnostic) = nonready_activation_diagnostic(activation)?
+    {
+        secondary_diagnostics.push(diagnostic);
+    }
     let summary_evidence = workspace.and_then(|workspace| {
         let activation = activation_for_report?;
-        let active = match activation.outcome.runtime.as_ref()? {
-            SemanticModelRuntimeOutcome::Ready { active, .. } => Some(active),
-            SemanticModelRuntimeOutcome::Incomplete { usable, .. } => usable.as_ref(),
-            SemanticModelRuntimeOutcome::Cancelled(_)
-            | SemanticModelRuntimeOutcome::Unavailable(_) => None,
-        }?;
-        Some(procedure_summary_match_evidence(
+        procedure_summary_match_evidence_for_review(
             workspace.analyzer(),
-            active,
-        ))
+            activation_config_for_report,
+            activation,
+        )
     });
     let packs_review = match workspace_activation.as_ref() {
-        // The transaction ran and has something to audit.
-        Some(Some(activation)) => Some(pack_activation_review(
+        // Dependency activation or a reviewed workspace model earns an audit
+        // row. Intrinsic shipped models can share the transaction without
+        // changing the top-level wire shape by themselves.
+        Some(Some(activation)) => pack_activation_review(
             packs_config.as_ref(),
             Some(activation),
             None,
             None,
             summary_evidence.as_ref(),
-        )),
+        ),
         // The transaction ran and neither route contributed. A document still
         // earns a review row so its opt-in stays auditable; a run with no
         // document and no reviewed model keeps its exact schema-version-5
         // shape and attaches nothing.
-        Some(None) => match (packs_config.as_ref(), packs_load_failure.as_deref()) {
-            (_, Some(failure)) => Some(pack_activation_review(
-                None,
-                None,
-                None,
-                Some(failure),
-                None,
-            )),
-            (Some(config), None) => {
-                Some(pack_activation_review(Some(config), None, None, None, None))
-            }
-            (None, None) => None,
-        },
+        Some(None) => pack_activation_review(
+            packs_config.as_ref(),
+            None,
+            None,
+            packs_load_failure.as_deref(),
+            None,
+        ),
         // A supplied analyzer's host owns the transaction. Preserve its exact
         // activation evidence instead of re-running it here.
-        None => host_activation.map(|context| {
+        None => host_activation.and_then(|context| {
             pack_activation_review(
                 context.config,
                 context.activation,
@@ -2023,7 +2250,7 @@ fn evaluate_prepared_policy_inputs(
             )
         }),
     };
-    if let Some(failure) = host_activation.and_then(|context| context.failure) {
+    if let Some(failure) = host_activation_failure {
         secondary_diagnostics.push(report_diagnostic(
             PolicyReportDiagnosticCode::PackActivationFailed,
             format!("host-owned workspace pack activation failed: {failure}"),
@@ -2053,60 +2280,24 @@ fn evaluate_prepared_policy_inputs(
     // Reuse the resolved runtime the activation already built, exactly as an
     // API caller would, and only when it is `Ready`: an incomplete activation
     // must not silently model calls it never resolved.
-    let document_summary_models = workspace_activation
-        .as_ref()
-        .and_then(Option::as_ref)
-        .or_else(|| host_activation.and_then(|context| context.activation))
-        .and_then(|activation| activation.outcome.runtime.as_ref())
-        .and_then(|runtime| match runtime {
-            SemanticModelRuntimeOutcome::Ready { active, .. } => Some(Arc::clone(active)),
-            SemanticModelRuntimeOutcome::Incomplete { .. }
-            | SemanticModelRuntimeOutcome::Cancelled(_)
-            | SemanticModelRuntimeOutcome::Unavailable(_) => None,
-        });
-    let active_semantic_models = match semantic_models {
-        None => Ok(document_summary_models),
-        Some(context) => {
-            let workspace = workspace.ok_or_else(|| {
-                PolicyCoordinatorError::new(
-                    "semantic-model policy evaluation requires an analyzer snapshot",
-                )
-            })?;
-            match acquire_active_semantic_models(
-                workspace.analyzer(),
-                context.catalog,
-                context.persistence,
-                context.request,
-                semantic_cancellation,
-            ) {
-                SemanticModelRuntimeOutcome::Ready { active, .. } => Ok(Some(active)),
-                SemanticModelRuntimeOutcome::Incomplete { report, .. } => Err(format!(
-                    "semantic-model activation was incomplete: {report:?}"
-                )),
-                SemanticModelRuntimeOutcome::Cancelled(report) => Err(format!(
-                    "semantic-model activation was cancelled: {report:?}"
-                )),
-                SemanticModelRuntimeOutcome::Unavailable(report) => Err(format!(
-                    "semantic-model activation was unavailable: {report:?}"
-                )),
-            }
-        }
-    };
     let taint = workspace.map_or_else(ProductionTaintPolicyEvaluator::default, |workspace| {
         ProductionTaintPolicyEvaluator::prepare(
             registry
                 .policies()
                 .filter(|policy| runnable_ids.contains(&policy.definition().metadata.id)),
             workspace,
-            active_semantic_models,
+            active_semantic_model_snapshot,
             cancellation,
             &per_policy_budget,
         )
     });
-    let typestate = ProductionTypestatePolicyEvaluator::default();
+    let typestate = ProductionTypestatePolicyEvaluator::with_active_semantic_model_snapshot(
+        icfg_active_semantic_model_snapshot.clone(),
+    );
     let evaluator = DefaultPolicyEvaluator::new()
         .with_taint(&taint)
-        .with_typestate(&typestate);
+        .with_typestate(&typestate)
+        .with_active_semantic_model_snapshot(icfg_active_semantic_model_snapshot.clone());
     let preparation_elapsed = preparation_started.elapsed();
     if policy_deadline_reached(cancellation)? {
         return deadline_before_evaluation_outcome(
@@ -2160,6 +2351,14 @@ fn evaluate_prepared_policy_inputs(
             Ok(run) => run,
             Err(error) => failed_evaluation_run(policy, error.to_string(), &evaluation_budget)?,
         };
+        if !workspace_has_analyzable_files {
+            run.mark_inconclusive(PolicyIncompleteReason::NoAnalyzableFiles)
+                .map_err(|error| {
+                    PolicyCoordinatorError::new(format!(
+                        "failed to retain empty workspace completion reason: {error}"
+                    ))
+                })?;
+        }
         let deadline_exceeded = policy_deadline_reached(cancellation)?;
         if deadline_exceeded {
             deadline_stage.get_or_insert(PolicyExecutionStage::PolicyEvaluation);
@@ -2602,16 +2801,17 @@ fn evaluate_policy_diff_baseline(
             ),
         });
     }
-    let project = Arc::new(FileSetProject::new(
-        export.root().to_path_buf(),
-        export.files().iter().cloned(),
-    ));
-    let base_workspace = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
-        .map_err(|error| {
-            PolicyCoordinatorError::new(format!(
-                "failed to build the diff base analyzer for `{revision}`: {error}"
-            ))
-        })?;
+    // The base analyzes the whole exported revision through the *head*
+    // repository's shared content-addressed cache: the export's own root is a
+    // self-deleting temp directory that no cache funnel can resolve, while the
+    // revision's blobs are immutable committed content whose parsed facts the
+    // worktree build and every later base run reuse (#2769). The export must
+    // outlive the workspace, and it does: it is declared above.
+    let base = export.build_workspace(head_root).map_err(|error| {
+        PolicyCoordinatorError::new(format!(
+            "failed to build the diff base analyzer for `{revision}`: {error}"
+        ))
+    })?;
     // The base activates the packs its own committed document names and the
     // reviewed semantic models its own tree checks in, the same way it loads
     // its own committed suppressions (#1868, #2493). Both sides of the
@@ -2625,15 +2825,17 @@ fn evaluate_policy_diff_baseline(
     // the same document, reports `packs-load-failed`, and the baseline
     // degrades through the standard unreliability path.
     {
+        let base_analyzer_config = owned_policy_analyzer_config();
         let base_packs = load_workspace_packs_config_at(export.root()).ok().flatten();
         let uncancelled = CancellationToken::default();
         if let Err(error) = activate_workspace_semantic_sources(
-            &base_workspace,
-            &AnalyzerConfig::default(),
+            base.workspace(),
+            &base_analyzer_config,
             WorkspaceActivationSources {
                 catalog_root: head_root,
                 workspace_model_root: Some(export.root()),
                 config: base_packs.as_ref(),
+                intrinsic_shipped_models: true,
             },
             cancellation.unwrap_or(&uncancelled),
         ) {
@@ -2659,7 +2861,7 @@ fn evaluate_policy_diff_baseline(
         &base_options,
         batch_budget,
         registry_limits,
-        Some(&base_workspace),
+        Some(base.workspace()),
         None,
         None,
         None,
@@ -3649,11 +3851,20 @@ mod tests {
     use std::collections::HashSet;
     use std::fs;
 
+    use brokk_bifrost_analysis::analyzer::DependencyPackActivationOutcome;
+    use brokk_bifrost_analysis::analyzer::Language;
+    use brokk_bifrost_analysis::analyzer::packs_document::parse_workspace_packs_config;
+    use brokk_bifrost_analysis::analyzer::semantic_model::{
+        CatalogOptions, CompilerOptions, SemanticModelActivationEvidence,
+        SemanticModelActivationReport, SemanticModelRuntimeLimits, SessionPackSource,
+        SessionPackSourceKind, SourceFormat, compile_source,
+    };
     use cap_std::ambient_authority;
     use cap_std::fs::Dir;
     use serde_json::json;
 
     use super::*;
+    use crate::inline_project::{BuiltInlineTestProject, InlineTestProject};
     use crate::source::MAX_POLICY_SOURCE_IDENTITY_BYTES;
     use crate::suppression::{
         DEFAULT_POLICY_SUPPRESSION_PATH, LOCAL_POLICY_SUPPRESSION_PATH,
@@ -3665,6 +3876,298 @@ mod tests {
         PolicyEvaluationOptions::new(
             PolicyEvaluationDate::from_ymd(2026, 7, 27).expect("fixed test date"),
         )
+    }
+
+    #[test]
+    fn owned_policy_workspaces_enable_curated_go_evidence_without_changing_the_global_default() {
+        assert_eq!(
+            AnalyzerConfig::default().go.dependency_discovery.mode,
+            GoDependencyDiscoveryMode::Disabled
+        );
+        assert_eq!(
+            owned_policy_analyzer_config().go.dependency_discovery.mode,
+            GoDependencyDiscoveryMode::CuratedPackEvidence
+        );
+    }
+
+    const REVIEW_SUMMARY_MODEL: &str = r#"{
+  "schema_version": 1,
+  "pack_id": "test.review-summary",
+  "version": "1.0.0",
+  "producer": { "name": "bifrost-test", "version": "1.0.0" },
+  "language": "go",
+  "ecosystem": "go",
+  "compatibility": { "bifrost": ">=0.10.5, <1.0.0", "toolchains": [] },
+  "provenance": { "source": "test:review-summary", "revision": "reviewed" },
+  "license": "Apache-2.0",
+  "completeness": "complete",
+  "safety": { "generated_code_only": false, "review_required": false },
+  "shards": [{
+    "id": "test.review-summary.open",
+    "activation": [{}],
+    "payload": {
+      "kind": "procedure_summaries",
+      "summaries": [{
+        "id": "summary.review-open",
+        "target": {
+          "path": "review.go",
+          "symbol": "example.com/review.Open(name string)",
+          "has_receiver": false,
+          "parameter_count": 1
+        },
+        "completeness": "complete",
+        "transfers": [{
+          "input": { "kind": "parameter", "ordinal": 0 },
+          "exit_kind": "normal",
+          "output": { "kind": "normal_return" }
+        }],
+        "effects": []
+      }]
+    }
+  }]
+}"#;
+
+    struct SummaryActivationFixture {
+        _project: BuiltInlineTestProject,
+        _catalog: Option<SemanticPackCatalog>,
+        workspace: WorkspaceAnalyzer,
+        activation: WorkspacePacksActivation,
+    }
+
+    fn summary_project(with_workspace_model: bool) -> BuiltInlineTestProject {
+        let project = InlineTestProject::with_language(Language::Go)
+            .file("go.mod", "module example.com/review\n")
+            .file(
+                "review.go",
+                "package review\n\nfunc Open(name string) string { return name }\n",
+            );
+        if with_workspace_model {
+            project
+                .file(
+                    ".bifrost/semantic-models/review-summary.json",
+                    REVIEW_SUMMARY_MODEL,
+                )
+                .build()
+        } else {
+            project.build()
+        }
+    }
+
+    fn intrinsic_summary_activation() -> SummaryActivationFixture {
+        let project = summary_project(false);
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let pack = compile_source(
+            SourceFormat::Json,
+            REVIEW_SUMMARY_MODEL.as_bytes(),
+            &CompilerOptions::default(),
+        )
+        .unwrap_or_else(|diagnostics| panic!("summary model must compile: {diagnostics:#?}"));
+        let catalog = SemanticPackCatalog::open_ephemeral(CatalogOptions::default())
+            .expect("ephemeral summary catalog");
+        catalog
+            .register_session_pack(
+                &pack,
+                &SessionPackSource {
+                    kind: SessionPackSourceKind::Embedded,
+                    source_id: "test:intrinsic-review-summary".to_owned(),
+                },
+            )
+            .expect("intrinsic summary pack registers");
+        let runtime = acquire_active_semantic_models(
+            workspace.analyzer(),
+            &catalog,
+            None,
+            &SemanticModelActivationRequest {
+                bifrost_version: env!("CARGO_PKG_VERSION")
+                    .parse()
+                    .expect("crate version is semver"),
+                evidence: vec![SemanticModelActivationEvidence {
+                    language: "go".to_owned(),
+                    ecosystem: "go".to_owned(),
+                    package: None,
+                    module: None,
+                    toolchain: None,
+                    target: None,
+                    configuration: None,
+                    artifact_sha256: None,
+                }],
+                controls: Vec::new(),
+                limits: SemanticModelRuntimeLimits::default(),
+            },
+            &CancellationToken::default(),
+        );
+        assert!(
+            matches!(runtime, SemanticModelRuntimeOutcome::Ready { .. }),
+            "intrinsic summary model must activate: {runtime:#?}"
+        );
+        SummaryActivationFixture {
+            _project: project,
+            _catalog: Some(catalog),
+            workspace,
+            activation: WorkspacePacksActivation {
+                ecosystems: Vec::new(),
+                workspace_models: Vec::new(),
+                outcome: DependencyPackActivationOutcome {
+                    ecosystems: Vec::new(),
+                    runtime: Some(runtime),
+                    diagnostic_refresh_required: true,
+                },
+            },
+        }
+    }
+
+    fn workspace_summary_activation() -> SummaryActivationFixture {
+        let project = summary_project(true);
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let activation = activate_workspace_semantic_sources(
+            &workspace,
+            &AnalyzerConfig::default(),
+            WorkspaceActivationSources {
+                catalog_root: project.root(),
+                workspace_model_root: Some(project.root()),
+                config: None,
+                intrinsic_shipped_models: false,
+            },
+            &CancellationToken::default(),
+        )
+        .expect("workspace summary activation must succeed")
+        .expect("reviewed workspace model must contribute an activation");
+        assert_eq!(activation.workspace_models.len(), 1);
+        SummaryActivationFixture {
+            _project: project,
+            _catalog: None,
+            workspace,
+            activation,
+        }
+    }
+
+    #[test]
+    fn configless_intrinsic_activation_skips_review_and_declaration_scan() {
+        let fixture = intrinsic_summary_activation();
+        let analyzer = fixture.workspace.analyzer();
+        analyzer
+            .test_hooks()
+            .reset_full_declaration_scan_count_for_test();
+
+        let evidence =
+            procedure_summary_match_evidence_for_review(analyzer, None, &fixture.activation);
+
+        assert!(evidence.is_none());
+        assert_eq!(
+            analyzer.test_hooks().full_declaration_scan_count_for_test(),
+            0,
+            "an intrinsic-only activation has no review that could consume summary evidence"
+        );
+        assert!(
+            pack_activation_review(None, Some(&fixture.activation), None, None, None).is_none()
+        );
+    }
+
+    #[test]
+    fn default_ecosystem_attempt_without_a_dependency_pack_skips_declaration_scan() {
+        let mut fixture = intrinsic_summary_activation();
+        fixture
+            .activation
+            .ecosystems
+            .push(DependencyPackEcosystem::Go);
+        let analyzer = fixture.workspace.analyzer();
+        analyzer
+            .test_hooks()
+            .reset_full_declaration_scan_count_for_test();
+
+        let evidence =
+            procedure_summary_match_evidence_for_review(analyzer, None, &fixture.activation);
+
+        assert!(evidence.is_none());
+        assert_eq!(
+            analyzer.test_hooks().full_declaration_scan_count_for_test(),
+            0,
+            "attempting an ecosystem without selecting a dependency pack must not scan declarations"
+        );
+    }
+
+    #[test]
+    fn configured_intrinsic_activation_computes_summary_evidence_for_review() {
+        let fixture = intrinsic_summary_activation();
+        assert!(fixture.activation.workspace_models.is_empty());
+        let config =
+            parse_workspace_packs_config(r#"{ "schema_version": 1, "ecosystems": ["go"] }"#)
+                .expect("Go pack configuration parses");
+        let analyzer = fixture.workspace.analyzer();
+        analyzer
+            .test_hooks()
+            .reset_full_declaration_scan_count_for_test();
+
+        let evidence = procedure_summary_match_evidence_for_review(
+            analyzer,
+            Some(&config),
+            &fixture.activation,
+        )
+        .expect("an explicit pack configuration needs summary evidence");
+
+        assert_eq!(
+            analyzer.test_hooks().full_declaration_scan_count_for_test(),
+            0,
+            "a pack configuration review uses indexed declaration candidates"
+        );
+        assert!(
+            evidence
+                .values()
+                .flatten()
+                .any(|summary| summary.summary_id() == "summary.review-open"),
+            "the review evidence must retain the active intrinsic summary"
+        );
+        let review = pack_activation_review(
+            Some(&config),
+            Some(&fixture.activation),
+            None,
+            None,
+            Some(&evidence),
+        )
+        .expect("an explicit pack configuration emits a pack review");
+        assert_eq!(review.document_path(), WORKSPACE_PACKS_DOCUMENT_PATH);
+        assert!(review.decisions().iter().any(|decision| {
+            decision
+                .summary_matches()
+                .iter()
+                .any(|summary| summary.summary_id() == "summary.review-open")
+        }));
+    }
+
+    #[test]
+    fn reviewed_workspace_activation_computes_summary_evidence_for_review() {
+        let fixture = workspace_summary_activation();
+        let analyzer = fixture.workspace.analyzer();
+        analyzer
+            .test_hooks()
+            .reset_full_declaration_scan_count_for_test();
+
+        let evidence =
+            procedure_summary_match_evidence_for_review(analyzer, None, &fixture.activation)
+                .expect("reviewed workspace activation needs summary evidence");
+
+        assert_eq!(
+            analyzer.test_hooks().full_declaration_scan_count_for_test(),
+            0,
+            "a real workspace review uses indexed declaration candidates"
+        );
+        assert!(
+            evidence
+                .values()
+                .flatten()
+                .any(|summary| summary.summary_id() == "summary.review-open"),
+            "the review evidence must retain the active summary"
+        );
+        let review =
+            pack_activation_review(None, Some(&fixture.activation), None, None, Some(&evidence))
+                .expect("reviewed workspace model emits a pack review");
+        assert_eq!(review.document_path(), WORKSPACE_PACKS_DOCUMENT_PATH);
+        assert!(review.decisions().iter().any(|decision| {
+            decision
+                .summary_matches()
+                .iter()
+                .any(|summary| summary.summary_id() == "summary.review-open")
+        }));
     }
 
     fn match_policy(policy_id: &str, name: &str) -> String {
@@ -3682,6 +4185,103 @@ mod tests {
         (rql :schema-version 1
           (language typescript (function :name "target")))))"#,
         )
+    }
+
+    #[test]
+    fn nonready_intrinsic_activation_condemns_an_otherwise_clean_evaluation() {
+        let project = InlineTestProject::with_language(Language::TypeScript)
+            .file("app.ts", "export function target() {}\n")
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let report = SemanticModelActivationReport::default();
+        let cases = [
+            ("absent", "not attempted", None),
+            (
+                "incomplete",
+                "incomplete",
+                Some(SemanticModelRuntimeOutcome::Incomplete {
+                    usable: None,
+                    report: report.clone(),
+                }),
+            ),
+            (
+                "cancelled",
+                "cancelled",
+                Some(SemanticModelRuntimeOutcome::Cancelled(report.clone())),
+            ),
+            (
+                "unavailable",
+                "unavailable",
+                Some(SemanticModelRuntimeOutcome::Unavailable(report)),
+            ),
+        ];
+
+        for (label, message, runtime) in cases {
+            let activation = WorkspacePacksActivation {
+                ecosystems: Vec::new(),
+                workspace_models: Vec::new(),
+                outcome: DependencyPackActivationOutcome {
+                    ecosystems: Vec::new(),
+                    runtime,
+                    diagnostic_refresh_required: true,
+                },
+            };
+            assert!(
+                pack_activation_review(None, Some(&activation), None, None, None).is_none(),
+                "an owned intrinsic-only activation keeps the optional review absent"
+            );
+            assert_eq!(
+                nonready_activation_diagnostic(&activation)
+                    .expect("activation diagnostic")
+                    .expect("non-ready activation is diagnosed")
+                    .code(),
+                PolicyReportDiagnosticCode::PackActivationFailed,
+            );
+            let outcome = evaluate_policy_source_with_host_activation(
+                project.root(),
+                PolicySourceIdentity::new(format!("policies/{label}.rqlp")),
+                &match_policy(
+                    &format!("test.activation-{label}"),
+                    "Activation reliability",
+                ),
+                &workspace,
+                &brokk_bifrost_flow::FlowWorkspaceState::new(),
+                &evaluation_options(),
+                PolicyHostActivationContext::new(None, Some(&activation), &[], None),
+                None,
+            )
+            .expect("non-ready activation produces a canonical report");
+
+            assert_eq!(outcome.exit_status(), POLICY_EXIT_UNRELIABLE, "{label}");
+            assert_eq!(outcome.report().runs().len(), 1, "{label}");
+            assert!(
+                outcome.report().runs()[0].completion().is_complete(),
+                "the activation diagnostic, not a coincidental policy failure, condemns {label}"
+            );
+            assert_eq!(outcome.report().runs()[0].findings().len(), 1, "{label}");
+            assert!(
+                !outcome
+                    .report()
+                    .packs()
+                    .expect("the host attempt itself is audited")
+                    .complete(),
+                "a non-ready runtime cannot publish a complete activation review"
+            );
+            let [diagnostic] = outcome.report().diagnostics() else {
+                panic!(
+                    "one structured activation diagnostic for {label}: {:#?}",
+                    outcome.report()
+                )
+            };
+            assert_eq!(
+                diagnostic.code(),
+                PolicyReportDiagnosticCode::PackActivationFailed,
+                "{label}"
+            );
+            assert_eq!(diagnostic.severity(), PolicyDiagnosticSeverity::Error);
+            assert!(diagnostic.source().is_none());
+            assert!(diagnostic.message().contains(message), "{diagnostic:#?}");
+        }
     }
 
     fn write_policy(root: &Path, relative: &str, source: &str) {
@@ -3814,6 +4414,36 @@ mod tests {
         write_suppressions(
             root,
             vec![suppression_record(policy_id, policy_hash, finding_id, None)],
+        );
+    }
+
+    #[test]
+    fn procedure_summary_candidates_use_the_identifier_index() {
+        let project = crate::inline_project::InlineTestProject::with_language(Language::Rust)
+            .file(
+                "src/lib.rs",
+                "pub struct Acme;\nimpl Acme { pub fn run(&self) {} }\n",
+            )
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let analyzer = workspace.analyzer();
+        analyzer
+            .test_hooks()
+            .reset_full_declaration_scan_count_for_test();
+
+        let candidates = procedure_summary_candidate_declarations(
+            analyzer,
+            &HashSet::from([String::from("run")]),
+        );
+
+        assert!(
+            candidates.iter().any(|unit| unit.terminal_name() == "run"),
+            "the indexed lookup must retain the modeled declaration"
+        );
+        assert_eq!(
+            analyzer.test_hooks().full_declaration_scan_count_for_test(),
+            0,
+            "summary evidence must not enumerate every workspace declaration"
         );
     }
 
@@ -4182,8 +4812,9 @@ mod tests {
 
         let project = FilesystemProject::new(workspace.path().to_path_buf()).expect("project");
         let project: Arc<dyn Project> = Arc::new(project);
-        let analyzer = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
-            .expect("ephemeral workspace should build");
+        let analyzer =
+            WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
+                .expect("ephemeral workspace should build");
         let live_source = match_policy("test.unsaved", "Unsaved source");
 
         let outcome = evaluate_policy_source(
@@ -4221,8 +4852,9 @@ mod tests {
             .expect("source fixture");
         let project = FilesystemProject::new(workspace.path().to_path_buf()).expect("project");
         let project: Arc<dyn Project> = Arc::new(project);
-        let analyzer = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
-            .expect("ephemeral workspace should build");
+        let analyzer =
+            WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
+                .expect("ephemeral workspace should build");
 
         let mut outcome = evaluate_policy_source(
             workspace.path(),
@@ -4304,8 +4936,9 @@ mod tests {
             .expect("source fixture");
         let project = FilesystemProject::new(workspace.path().to_path_buf()).expect("project");
         let project: Arc<dyn Project> = Arc::new(project);
-        let analyzer = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
-            .expect("ephemeral workspace should build");
+        let analyzer =
+            WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
+                .expect("ephemeral workspace should build");
         let endpoint = r#"(endpoint
   :id "endpoint.input"
   :name "Input"
@@ -4352,8 +4985,9 @@ mod tests {
             .expect("source fixture");
         let project = FilesystemProject::new(workspace.path().to_path_buf()).expect("project");
         let project: Arc<dyn Project> = Arc::new(project);
-        let analyzer = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
-            .expect("ephemeral workspace should build");
+        let analyzer =
+            WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
+                .expect("ephemeral workspace should build");
         let cancellation = CancellationToken::default();
         cancellation.cancel();
 
@@ -4380,8 +5014,9 @@ mod tests {
             .expect("source fixture");
         let project = FilesystemProject::new(workspace.path().to_path_buf()).expect("project");
         let project: Arc<dyn Project> = Arc::new(project);
-        let analyzer = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
-            .expect("ephemeral workspace should build");
+        let analyzer =
+            WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
+                .expect("ephemeral workspace should build");
         let cancellation = CancellationToken::timeout_after_checks_for_test(9);
 
         let outcome = evaluate_policy_source(
@@ -4423,8 +5058,9 @@ mod tests {
             .expect("source fixture");
         let project = FilesystemProject::new(workspace.path().to_path_buf()).expect("project");
         let project: Arc<dyn Project> = Arc::new(project);
-        let analyzer = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
-            .expect("ephemeral workspace should build");
+        let analyzer =
+            WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
+                .expect("ephemeral workspace should build");
         let cancellation = CancellationToken::default().with_timeout(std::time::Duration::ZERO);
 
         let outcome = evaluate_policy_source(
@@ -4533,8 +5169,9 @@ mod tests {
             .expect("source fixture");
         let project = FilesystemProject::new(workspace.path().to_path_buf()).expect("project");
         let project: Arc<dyn Project> = Arc::new(project);
-        let analyzer = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
-            .expect("ephemeral workspace should build");
+        let analyzer =
+            WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
+                .expect("ephemeral workspace should build");
         let cancellation = CancellationToken::default().with_timeout(std::time::Duration::ZERO);
         cancellation.cancel();
 

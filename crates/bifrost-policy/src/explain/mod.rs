@@ -42,8 +42,10 @@
 //!
 //! # Zero cost when unused
 //!
-//! This module is additive. Ordinary policy evaluation calls nothing here, and
-//! nothing here mutates analyzer or evaluator state.
+//! This module is additive. Ordinary policy evaluation calls nothing here. A
+//! host-facing explanation activates semantic sources only when it owns the
+//! disposable analyzer snapshot; a caller-owned analyzer is read under one
+//! pinned active-model publication and is not re-activated.
 
 mod host;
 mod model;

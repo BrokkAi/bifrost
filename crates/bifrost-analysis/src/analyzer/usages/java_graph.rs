@@ -21,7 +21,10 @@ use crate::analyzer::usages::traits::{UsageQueryResolver, UsageScanScope};
 use crate::analyzer::{CodeUnit, IAnalyzer, JavaAnalyzer, Language, ProjectFile, resolve_analyzer};
 use crate::hash::HashSet;
 use brokk_bifrost_jvm::java::graph::JavaGraphSource;
-use brokk_bifrost_jvm::java::graph::extractor::{self, ReturnTypeCaches, ScanState};
+use brokk_bifrost_jvm::java::graph::extractor::{
+    self, JavaFileEvidenceBuildOutcome, JavaFileEvidenceOmission, JavaFileUsageEvidence,
+    ReturnTypeCaches, ScanState,
+};
 use brokk_bifrost_jvm::java::graph::inverted::{
     JavaEdgeScanCaches, scan_file as scan_inverted_file,
 };
@@ -69,24 +72,18 @@ pub(in crate::analyzer::usages) fn with_java_graph_source<R>(
     }
 }
 
-/// Scan one Java file inside a replayable frontier and publish only the final
-/// owned result. Each evaluation starts from the caller's same accumulated
-/// hit state and fresh return-type caches, so provisional empty answers cannot
-/// leak through either mutable output or memoized inference.
-pub(super) fn scan_java_file_replayable(
+/// Build one Java file's exact, uncapped evidence inside the shared relational
+/// frontier. The returned value owns every row and can therefore be handed to
+/// a snapshot cache without retaining request-local mutable state.
+pub(crate) fn build_java_file_usage_evidence(
     relational_session: &crate::analyzer::relational_frontier::RelationalFrontierSession<'_>,
     analyzer: &dyn IAnalyzer,
     java: &JavaAnalyzer,
     token: QueryToken<'_>,
     file: &ProjectFile,
     spec: &TargetSpec,
-    state: &mut ScanState<'_>,
-) -> crate::analyzer::RelationalFrontierOutcome<()> {
-    let initial_hits = state.hits.clone();
-    let initial_unproven_hits = state.unproven_hits.clone();
-    let initial_raw_match_count = *state.raw_match_count;
-    let initial_limit_exceeded = *state.limit_exceeded;
-    let max_usages = state.max_usages;
+    cancellation: &crate::CancellationToken,
+) -> JavaFileEvidenceBuildOutcome {
     let outcome = relational_session.resolve_owned("java_semantic_scan", |frontier| {
         let import_statements = |file: &ProjectFile| analyzer.import_statements(file);
         let graph = JavaGraphSource {
@@ -96,10 +93,6 @@ pub(super) fn scan_java_file_replayable(
             relational_definitions: frontier.as_ref(),
             import_statements: &import_statements,
         };
-        let mut hits = initial_hits.clone();
-        let mut unproven_hits = initial_unproven_hits.clone();
-        let mut raw_match_count = initial_raw_match_count;
-        let mut limit_exceeded = initial_limit_exceeded;
         let method_return_cache = Mutex::new(crate::hash::HashMap::default());
         let method_anonymous_return_cache = Mutex::new(crate::hash::HashMap::default());
         let file_return_cache = Mutex::new(crate::hash::HashMap::default());
@@ -108,44 +101,115 @@ pub(super) fn scan_java_file_replayable(
             method_anonymous_return: &method_anonymous_return_cache,
             file_return: &file_return_cache,
         };
-        let mut provisional = ScanState {
-            max_usages,
-            hits: &mut hits,
-            unproven_hits: &mut unproven_hits,
-            raw_match_count: &mut raw_match_count,
-            limit_exceeded: &mut limit_exceeded,
-        };
-        extractor::scan_file(
+        extractor::scan_file_evidence(
             java,
             token,
             &graph,
             file,
             spec,
             &return_caches,
-            &mut provisional,
-        );
-        (hits, unproven_hits, raw_match_count, limit_exceeded)
+            cancellation,
+        )
     });
     match outcome {
-        crate::analyzer::RelationalFrontierOutcome::Complete((
-            hits,
-            unproven_hits,
-            raw_match_count,
-            limit_exceeded,
-        )) => {
-            *state.hits = hits;
-            *state.unproven_hits = unproven_hits;
-            *state.raw_match_count = raw_match_count;
-            *state.limit_exceeded = limit_exceeded;
-            crate::analyzer::RelationalFrontierOutcome::Complete(())
-        }
+        crate::analyzer::RelationalFrontierOutcome::Complete(evidence) => evidence,
         crate::analyzer::RelationalFrontierOutcome::Cancelled => {
-            crate::analyzer::RelationalFrontierOutcome::Cancelled
+            JavaFileEvidenceBuildOutcome::Cancelled
         }
-        crate::analyzer::RelationalFrontierOutcome::Failed(error) => {
-            crate::analyzer::RelationalFrontierOutcome::Failed(error)
+        crate::analyzer::RelationalFrontierOutcome::Failed(_) => {
+            JavaFileEvidenceBuildOutcome::Omitted(JavaFileEvidenceOmission::RelationalFrontier)
         }
     }
+}
+
+pub(crate) fn merge_java_file_evidence(evidence: JavaFileUsageEvidence, state: &mut ScanState<'_>) {
+    state.hits.extend(evidence.hits);
+    state.unproven_hits.extend(evidence.unproven_hits);
+    *state.raw_match_count += evidence.raw_match_count;
+    *state.limit_exceeded =
+        crate::analyzer::usages::common::external_usage_hit_count(state.hits) > state.max_usages;
+}
+
+/// Adapt the JVM-owned producer result to the snapshot cache's owned value.
+///
+/// The cache deliberately has its own representation so it can account for
+/// retained bytes without making the language crate depend on analysis. This
+/// conversion is the only boundary between those representations; omitted
+/// and cancelled producer outcomes remain non-publishable cache outcomes.
+pub(crate) fn build_java_file_cache_evidence(
+    relational_session: &crate::analyzer::relational_frontier::RelationalFrontierSession<'_>,
+    analyzer: &dyn IAnalyzer,
+    java: &JavaAnalyzer,
+    token: QueryToken<'_>,
+    file: &ProjectFile,
+    spec: &TargetSpec,
+    cancellation: &crate::CancellationToken,
+) -> crate::analyzer::usages::java_usage_evidence_cache::JavaUsageEvidenceBuildOutcome {
+    match build_java_file_usage_evidence(
+        relational_session,
+        analyzer,
+        java,
+        token,
+        file,
+        spec,
+        cancellation,
+    ) {
+        JavaFileEvidenceBuildOutcome::Complete(evidence) => {
+            crate::analyzer::usages::java_usage_evidence_cache::JavaUsageEvidenceBuildOutcome::Complete(
+                crate::analyzer::usages::java_usage_evidence_cache::JavaFileUsageEvidence::new(
+                    evidence.hits,
+                    evidence.unproven_hits,
+                    evidence.raw_match_count,
+                ),
+            )
+        }
+        JavaFileEvidenceBuildOutcome::Omitted(reason) => {
+            crate::analyzer::usages::java_usage_evidence_cache::JavaUsageEvidenceBuildOutcome::Omitted(
+                match reason {
+                    JavaFileEvidenceOmission::SourceRead => {
+                        crate::analyzer::usages::java_usage_evidence_cache::JavaUsageEvidenceOmission::SourceRead
+                    }
+                    JavaFileEvidenceOmission::ParserSetup => {
+                        crate::analyzer::usages::java_usage_evidence_cache::JavaUsageEvidenceOmission::ParserSetup
+                    }
+                    JavaFileEvidenceOmission::Parse => {
+                        crate::analyzer::usages::java_usage_evidence_cache::JavaUsageEvidenceOmission::Parse
+                    }
+                    JavaFileEvidenceOmission::StoreProvider => {
+                        crate::analyzer::usages::java_usage_evidence_cache::JavaUsageEvidenceOmission::StoreProvider
+                    }
+                    JavaFileEvidenceOmission::ClassRange => {
+                        crate::analyzer::usages::java_usage_evidence_cache::JavaUsageEvidenceOmission::ClassRange
+                    }
+                    JavaFileEvidenceOmission::RelationalFrontier => {
+                        crate::analyzer::usages::java_usage_evidence_cache::JavaUsageEvidenceOmission::RelationalFrontier
+                    }
+                    JavaFileEvidenceOmission::UnavailableCapability => {
+                        crate::analyzer::usages::java_usage_evidence_cache::JavaUsageEvidenceOmission::UnavailableCapability
+                    }
+                    JavaFileEvidenceOmission::InternalSafetyCap => {
+                        crate::analyzer::usages::java_usage_evidence_cache::JavaUsageEvidenceOmission::InternalSafetyCap
+                    }
+                },
+            )
+        }
+        JavaFileEvidenceBuildOutcome::Cancelled => {
+            crate::analyzer::usages::java_usage_evidence_cache::JavaUsageEvidenceBuildOutcome::Cancelled
+        }
+    }
+}
+
+pub(crate) fn merge_java_cached_file_evidence(
+    evidence: &crate::analyzer::usages::java_usage_evidence_cache::JavaFileUsageEvidence,
+    state: &mut ScanState<'_>,
+) {
+    state.hits.extend(evidence.hits.iter().cloned());
+    state
+        .unproven_hits
+        .extend(evidence.unproven_hits.iter().cloned());
+    *state.raw_match_count += evidence.raw_match_count;
+    *state.limit_exceeded =
+        crate::analyzer::usages::common::external_usage_hit_count(state.hits) > state.max_usages;
 }
 
 pub(crate) fn build_java_usage_edges<F>(
@@ -235,19 +299,25 @@ pub(crate) fn scan_jvm_files_for_foreign_type(
         .collect();
     java_files.sort();
     for file in &java_files {
-        if !matches!(
-            scan_java_file_replayable(
-                &relational_session,
-                analyzer,
-                java,
-                token,
-                file,
-                &spec,
-                &mut state,
-            ),
-            crate::analyzer::RelationalFrontierOutcome::Complete(())
+        match build_java_file_usage_evidence(
+            &relational_session,
+            analyzer,
+            java,
+            token,
+            file,
+            &spec,
+            &cancellation,
         ) {
-            return;
+            JavaFileEvidenceBuildOutcome::Complete(evidence) => {
+                merge_java_file_evidence(evidence, &mut state);
+            }
+            JavaFileEvidenceBuildOutcome::Omitted(reason) => {
+                crate::profiling::note_with(|| {
+                    format!("Java file evidence omitted for {:?}: {reason:?}", file)
+                });
+                return;
+            }
+            JavaFileEvidenceBuildOutcome::Cancelled => return,
         }
         if *state.limit_exceeded {
             return;

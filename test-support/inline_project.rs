@@ -99,7 +99,7 @@ impl BuiltInlineTestProject {
     }
 
     pub fn workspace_analyzer(&self, config: AnalyzerConfig) -> WorkspaceAnalyzer {
-        WorkspaceAnalyzer::build_ephemeral(self.project_dyn(), config)
+        WorkspaceAnalyzer::build_ephemeral_footgun(self.project_dyn(), config)
             .expect("ephemeral inline workspace should build")
     }
 }

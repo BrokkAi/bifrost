@@ -1,3 +1,13 @@
+//! Scoped MCP sessions: a service over an explicitly named subset of a
+//! workspace's files, optionally read at a git revision.
+//!
+//! Every service built here takes the ephemeral analyzer deliberately, which is
+//! why the footgun name appears four times below. A scoped session sees a
+//! partial file set, and a partial view must not become the workspace's
+//! persisted picture of itself: the files it never listed would read as absent
+//! to the next consumer of that cache. Surfacing the incompleteness to callers,
+//! rather than paying for it with a throwaway store, is tracked in #2770.
+
 use crate::analyzer::{
     AnalyzerConfig, FileSetProject, OverlayProject, Project, SourceIngestionKind,
     ingest_source_bytes,
@@ -21,7 +31,8 @@ pub fn create_scoped_service(
     let Some(revision) = revision.map(str::trim).filter(|rev| !rev.is_empty()) else {
         let rel_paths = resolve_sources(&root, sources)?;
         let project = Arc::new(FileSetProject::new(root, rel_paths));
-        return SearchToolsService::new_manual_ephemeral_for_project(
+        // Ephemeral on purpose: partial file set, see the module doc.
+        return SearchToolsService::new_manual_ephemeral_footgun_for_project(
             project,
             AnalyzerConfig::default(),
         );
@@ -77,7 +88,8 @@ pub fn create_scoped_service(
         }
     }
     let project: Arc<dyn Project> = overlay_project;
-    SearchToolsService::new_manual_ephemeral_for_project(project, AnalyzerConfig::default())
+    // Ephemeral on purpose: partial file set, see the module doc.
+    SearchToolsService::new_manual_ephemeral_footgun_for_project(project, AnalyzerConfig::default())
 }
 
 pub fn create_cli_tool_service(
@@ -89,15 +101,17 @@ pub fn create_cli_tool_service(
     let root = root
         .canonicalize()
         .map_err(|err| format!("Failed to resolve project root {}: {err}", root.display()))?;
-    // A workspace-independent tool (`analyze_diff`) never reads the live
-    // workspace or semantic index; it builds its own ephemeral per-endpoint
-    // analyzers. Serve it from a lazy service so the one-shot CLI does not boot
-    // -- and then persist -- a whole-repo analyzer it will never touch, which
-    // otherwise dwarfs the analysis itself on a large repo. `--sources` and
-    // git-history overlays do not apply to such tools, so they are irrelevant
-    // here.
+    // A workspace-independent tool (`analyze_diff`, `blast_radius`) never reads
+    // the live workspace or semantic index; it builds its own per-endpoint
+    // analyzers over revision images. Serve it from a lazy service so the
+    // one-shot CLI does not boot a whole-repo analyzer it will never touch,
+    // which otherwise dwarfs the analysis itself on a large repo. An immutable
+    // endpoint's own build does share the repository's content-addressed cache,
+    // so what this avoids is the whole-repo parse, not every write. `--sources`
+    // and git-history overlays do not apply to such tools, so they are
+    // irrelevant here.
     if SearchToolsService::tool_is_workspace_independent(tool_name) {
-        return SearchToolsService::new_workspace_independent(root);
+        return SearchToolsService::new_one_shot_workspace_independent(root);
     }
     if overlays.is_empty() && sources.is_empty() {
         // A one-shot `--tool` call over the whole root. Every other branch here
@@ -108,7 +122,8 @@ pub fn create_cli_tool_service(
     if overlays.is_empty() {
         let rel_paths = resolve_sources(&root, sources)?;
         let project = Arc::new(FileSetProject::new(root, rel_paths));
-        return SearchToolsService::new_manual_ephemeral_for_project(
+        // Ephemeral on purpose: partial file set, see the module doc.
+        return SearchToolsService::new_manual_ephemeral_footgun_for_project(
             project,
             AnalyzerConfig::default(),
         );
@@ -135,7 +150,8 @@ pub fn create_cli_tool_service(
     let overlay_project = Arc::new(OverlayProject::new(project));
     install_git_history_overlays(&root, &overlay_project, overlays)?;
     let project: Arc<dyn Project> = overlay_project;
-    SearchToolsService::new_manual_ephemeral_for_project(project, AnalyzerConfig::default())
+    // Ephemeral on purpose: partial file set, see the module doc.
+    SearchToolsService::new_manual_ephemeral_footgun_for_project(project, AnalyzerConfig::default())
 }
 
 pub fn resolve_sources(root: &Path, inputs: &[String]) -> Result<Vec<PathBuf>, String> {

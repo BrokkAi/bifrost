@@ -90,7 +90,12 @@ jobs:
               fi
             done
 
-          for required in "bifrost-agent-${RELEASE_TAG}.tar.gz" "brokk-bifrost-agent-${RELEASE_VERSION}.tgz" "bifrost-vscode-${RELEASE_TAG}.vsix"; do
+          for required in \
+            "bifrost-agent-${RELEASE_TAG}.tar.gz" \
+            "brokk-bifrost-agent-${RELEASE_VERSION}.tgz" \
+            "bifrost-vscode-${RELEASE_TAG}.vsix" \
+            "bifrost-semantic-packs-${RELEASE_TAG}.tar.gz" \
+            "bifrost-semantic-packs-${RELEASE_TAG}.tar.gz.sha256"; do
             test -s "$asset_dir/$required"
           done
           tar -xOf "$asset_dir/bifrost-agent-${RELEASE_TAG}.tar.gz" bifrost-agent/package.json |
@@ -250,7 +255,6 @@ jobs:
         @brokkai/bifrost
         @brokkai/bifrost-darwin-universal
         @brokkai/bifrost-linux-x64-gnu
-        @brokkai/bifrost-linux-x64-musl
         @brokkai/bifrost-linux-arm64-gnu
         @brokkai/bifrost-android-arm64
         @brokkai/bifrost-win32-x64

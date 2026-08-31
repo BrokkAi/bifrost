@@ -4,8 +4,12 @@
 mod common;
 
 use brokk_bifrost_analysis::Language;
+use brokk_bifrost_mcp::benchmark_api::{
+    BENCHMARK_MCP_REQUEST_BUDGET_SECS, MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV,
+};
 use brokk_bifrost_policy::{PolicyEvaluationOptions, PolicyFailOn, evaluate_policy_files};
 use common::InlineTestProject;
+use git2::{IndexAddOption, Repository, Signature};
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
@@ -536,6 +540,11 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "refresh",
             "activate_workspace",
             "get_active_workspace",
+            "analyze_diff",
+            "blast_radius",
+            "cyclomatic_complexity",
+            "missing_tests",
+            "score_diff",
             "query_code",
             "list_policies",
             "run_policy",
@@ -557,7 +566,6 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
             "report_long_method_and_god_object_smells",
             "report_dead_code_and_unused_abstraction_smells",
             "report_secret_like_code",
-            "analyze_diff",
             "classify_test_files",
         ];
         expected
@@ -570,9 +578,41 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     assert_definition_lookup_schema_limits_and_requires_location(tools);
     assert_declaration_lookup_schema_limits_and_requires_location(tools);
     assert_tool_schema_contains_property(tools, "scan_usages_by_location", "targets");
+    assert_tool_schema_omits_property(tools, "scan_usages_by_location", "max_duration_secs");
     assert_scan_usages_location_schema(tools);
     assert_type_lookup_schema_limits_and_requires_location(tools);
     assert_rename_symbol_schema_requires_location_and_new_name(tools);
+    let blast_radius = tools
+        .iter()
+        .find(|tool| tool["name"] == "blast_radius")
+        .expect("blast_radius descriptor");
+    assert_eq!(
+        blast_radius["inputSchema"]["properties"]["max_scopes"]["default"],
+        100
+    );
+    assert_eq!(
+        blast_radius["inputSchema"]["properties"]["max_scopes"]["minimum"],
+        1
+    );
+    assert_eq!(
+        blast_radius["inputSchema"]["properties"]["max_scopes"]["maximum"],
+        1000
+    );
+    assert!(blast_radius["outputSchema"].is_object());
+    let cyclomatic_complexity = tools
+        .iter()
+        .find(|tool| tool["name"] == "cyclomatic_complexity")
+        .expect("cyclomatic_complexity descriptor");
+    assert_eq!(
+        cyclomatic_complexity["inputSchema"]["properties"]["include_tests"]["default"],
+        false
+    );
+    assert!(cyclomatic_complexity["outputSchema"].is_object());
+    let missing_tests = tools
+        .iter()
+        .find(|tool| tool["name"] == "missing_tests")
+        .expect("missing_tests descriptor");
+    assert!(missing_tests["outputSchema"].is_object());
 
     let list_resources = round_trip(
         &mut stdin,
@@ -1669,7 +1709,7 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
         listed["result"]["structuredContent"]["policies"]
             .as_array()
             .map(Vec::len),
-        Some(13)
+        Some(14)
     );
 
     let run = round_trip(
@@ -1730,6 +1770,7 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
         category_ids,
         vec![
             "bifrost.correctness.dynamic-evaluation",
+            "bifrost.correctness.go-result-used-before-success-check",
             "bifrost.correctness.rayon-in-blocking-lazy-init",
             "bifrost.correctness.unsafe-deserialization"
         ],
@@ -1765,6 +1806,7 @@ fn bifrost_mcp_lists_and_runs_built_in_policies() {
         pack_ids,
         vec![
             "bifrost.correctness.dynamic-evaluation",
+            "bifrost.correctness.go-result-used-before-success-check",
             "bifrost.correctness.rayon-in-blocking-lazy-init",
             "bifrost.correctness.unsafe-deserialization",
             "bifrost.performance.database-call-in-loop",
@@ -3561,9 +3603,12 @@ fn legacy_clients_never_see_a_result_type() {
     assert!(child.wait().expect("wait bifrost").success());
 }
 
-/// The four tools of the first `outputSchema` slice (issue #2321). Every other
+/// The tools whose `structuredContent` shapes are published as contracts.
 /// published tool answers with a shape that is not yet a declared contract.
-const OUTPUT_SCHEMA_TOOLS: [&str; 4] = [
+const OUTPUT_SCHEMA_TOOLS: [&str; 7] = [
+    "blast_radius",
+    "cyclomatic_complexity",
+    "missing_tests",
     "get_active_workspace",
     "list_policies",
     "search_symbols",
@@ -3652,6 +3697,23 @@ fn output_schema_describes_real_workspace_and_policy_results() {
     let workspace = InlineTestProject::new()
         .file("Described.java", "class Described {}\n")
         .build();
+    let repo = Repository::init(workspace.root()).expect("initialize schema fixture repository");
+    let mut index = repo.index().expect("schema fixture index");
+    index
+        .add_all(["*"], IndexAddOption::DEFAULT, None)
+        .expect("stage schema fixture");
+    index.write().expect("write schema fixture index");
+    let tree = repo
+        .find_tree(index.write_tree().expect("schema fixture tree id"))
+        .expect("schema fixture tree");
+    let signature = Signature::now("Tester", "tester@example.com").expect("signature");
+    repo.commit(Some("HEAD"), &signature, &signature, "base", &tree, &[])
+        .expect("commit schema fixture");
+    fs::write(
+        workspace.root().join("Described.java"),
+        "class Described { void changed() {} }\n",
+    )
+    .expect("edit schema fixture");
     let mut child = spawn_server(workspace.root(), "searchtools", &[]);
     let mut stdin = child.stdin.take().expect("stdin");
     let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
@@ -3706,6 +3768,53 @@ fn output_schema_describes_real_workspace_and_policy_results() {
         "{policies}"
     );
     assert_structured_content_matches_advertised_schema(&tools, "list_policies", &policies);
+
+    let blast_radius = call_tool(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        4,
+        "blast_radius",
+        json!({}),
+    );
+    assert_eq!(
+        blast_radius["result"]["structuredContent"]["analysis"]["mode"], "file_imports",
+        "{blast_radius}"
+    );
+    assert_structured_content_matches_advertised_schema(&tools, "blast_radius", &blast_radius);
+
+    let cyclomatic_complexity = call_tool(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        5,
+        "cyclomatic_complexity",
+        json!({}),
+    );
+    assert_eq!(
+        cyclomatic_complexity["result"]["structuredContent"]["summary"]["introduced"], 1,
+        "{cyclomatic_complexity}"
+    );
+    assert_structured_content_matches_advertised_schema(
+        &tools,
+        "cyclomatic_complexity",
+        &cyclomatic_complexity,
+    );
+
+    let missing_tests = call_tool(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        6,
+        "missing_tests",
+        json!({}),
+    );
+    assert_eq!(
+        missing_tests["result"]["structuredContent"]["analysis"]["mode"],
+        "file_imports_then_exact_usages",
+        "{missing_tests}"
+    );
+    assert_structured_content_matches_advertised_schema(&tools, "missing_tests", &missing_tests);
 
     drop(stdin);
     assert!(child.wait().expect("wait bifrost").success());
@@ -5139,6 +5248,85 @@ fn spawn_server(root: &std::path::Path, mode: &str, extra_args: &[&str]) -> std:
         .expect("spawn bifrost")
 }
 
+/// A server left at the production request budget.
+///
+/// Deliberately not built from `mcp_server_command`, which installs the
+/// 60-second test budget that the cold-start guard must not have. A separate
+/// function rather than a parameter on the shared helper, so no caller can
+/// select the wrong budget by passing the wrong argument.
+fn spawn_server_at_production_budget(root: &std::path::Path, mode: &str) -> std::process::Child {
+    Command::new(mcp_server_binary())
+        .arg("--root")
+        .arg(root)
+        .arg("--mcp")
+        .arg(mode)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn cold-start guard bifrost")
+}
+
+/// Cold-start latency guard (1 of 2; the other is
+/// `mcp_repository_corpus::cold_first_call_stays_within_the_production_budget`).
+///
+/// Every other server in this file runs with the 60-second test budget from
+/// `apply_test_request_budget`, so none of them can still prove that a cold
+/// workspace answers its first request inside the budget a real client gets.
+/// This test makes that claim on purpose and is the only place in this file
+/// that does: it spawns cold at the production default and requires the first
+/// analyzer-backed call to succeed within `COLD_WORKSPACE_REQUEST_BUDGET`
+/// (4.5s, `crates/bifrost-mcp/src/mcp_common.rs`). The server enforces the
+/// bound itself -- past it the call returns a "not ready within the
+/// request-wide time budget" error instead of a result -- so asserting success
+/// is asserting the latency.
+///
+/// `get_symbol_sources` is the request under test because
+/// `default_cold_workspace_budget_applies` exempts `search_symbols`, which
+/// would make the assertion vacuous.
+///
+/// `.config/nextest.toml` reserves the machine for this test: a wall-clock
+/// bound measured on a saturated box measures the box.
+#[test]
+fn cold_first_call_stays_within_the_production_cold_workspace_budget() {
+    let workspace = InlineTestProject::new()
+        .file(
+            "Cold.java",
+            "public class Cold {\n  public void run() {}\n}\n",
+        )
+        .build();
+
+    let mut child = spawn_server_at_production_budget(workspace.root(), "searchtools");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut stderr = child.stderr.take().expect("stderr");
+    initialize_session(&mut stdin, &mut reader, &mut stderr);
+
+    let first = round_trip(
+        &mut stdin,
+        &mut reader,
+        &mut stderr,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "get_symbol_sources",
+                "arguments": { "symbols": ["Cold.java"] }
+            }
+        }),
+    );
+    assert_eq!(
+        first["result"]["isError"], false,
+        "a cold workspace must answer its first request inside the production \
+         cold-workspace budget: {first}"
+    );
+
+    drop(stdin);
+    let status = child.wait().expect("wait bifrost");
+    assert!(status.success(), "bifrost exited unsuccessfully: {status}");
+}
+
 const PROFILED_STDERR_TAIL_BYTES: usize = 64 * 1024;
 const PROFILED_PHASES: [&str; 4] = [
     "queue_wait",
@@ -5309,11 +5497,34 @@ fn mcp_server_command(root: &std::path::Path, mode: &str, extra_args: &[&str]) -
     for arg in extra_args {
         command.arg(arg);
     }
+    apply_test_request_budget(&mut command);
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     command
+}
+
+/// Give a spawned server a budget that absorbs box load.
+///
+/// A functional wire test must not incidentally assert the cold-start budget.
+/// Left at the production default, a first call made while the workspace is
+/// still building is held to `COLD_WORKSPACE_REQUEST_BUDGET` (4.5s), so
+/// whole-suite CPU saturation converts a protocol assertion into a latency
+/// failure: on 2026-08-29 five tests in this file failed 3/3 in one
+/// 13,692-test run, and a disjoint six in `mcp_repository_corpus` failed 3/3
+/// in the next, out of a pool of 156 server-spawning tests. Sixty seconds
+/// never trips on load and still catches a genuine hang.
+///
+/// The cold-start claim is proven deliberately instead, by
+/// `cold_first_call_stays_within_the_production_cold_workspace_budget` here
+/// and its repository-corpus twin. Those two keep the production default and
+/// are reserved a quiet machine in `.config/nextest.toml`.
+fn apply_test_request_budget(command: &mut Command) {
+    command.env(
+        MCP_ANALYZER_REQUEST_BUDGET_SECS_ENV,
+        BENCHMARK_MCP_REQUEST_BUDGET_SECS.to_string(),
+    );
 }
 
 /// Issue #1491: the benchmark's transport-phase profile contract in
@@ -5476,7 +5687,11 @@ fn light_lookup_overtakes_long_usage_scan() {
 }
 
 fn spawn_rootless_server(cwd: &std::path::Path, mode: &str) -> std::process::Child {
-    Command::new(mcp_server_binary())
+    let mut command = Command::new(mcp_server_binary());
+    // See `apply_test_request_budget`: a wire test asserts protocol behavior,
+    // not cold-start latency.
+    apply_test_request_budget(&mut command);
+    command
         .arg("--mcp")
         .arg(mode)
         .current_dir(cwd)
@@ -5490,7 +5705,11 @@ fn spawn_rootless_server(cwd: &std::path::Path, mode: &str) -> std::process::Chi
 fn spawn_server_no_args(cwd: &std::path::Path) -> std::process::Child {
     // No mode: the compatibility contract is MCP searchtools. No --root: the
     // server must default its root to the working directory.
-    Command::new(mcp_server_binary())
+    let mut command = Command::new(mcp_server_binary());
+    // See `apply_test_request_budget`: a wire test asserts protocol behavior,
+    // not cold-start latency.
+    apply_test_request_budget(&mut command);
+    command
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

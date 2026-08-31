@@ -23,6 +23,7 @@ use sha2::{Digest, Sha256};
 use brokk_bifrost_analysis::CancellationToken;
 use brokk_bifrost_analysis::analyzer::Range as AnalyzerRange;
 use brokk_bifrost_analysis::analyzer::semantic::WorkspaceRelativePath;
+use brokk_bifrost_analysis::analyzer::semantic_model::ActiveSemanticModelSnapshot;
 use brokk_bifrost_analysis::analyzer::usages::{UsageHitSurface, UsageProof};
 use brokk_bifrost_analysis::analyzer::{CodeUnit, IAnalyzer, ProjectFile, WorkspaceAnalyzer};
 use brokk_bifrost_flow::flow_state::{
@@ -419,6 +420,9 @@ pub(crate) trait TypestatePolicyEvaluator:
 pub struct DefaultPolicyEvaluator<'a> {
     taint: Option<&'a dyn TaintPolicyEvaluator>,
     typestate: Option<&'a dyn TypestatePolicyEvaluator>,
+    /// Request-selected activation shared by assertion flow derivation and
+    /// the installed production adapters.
+    active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
 }
 
 impl<'a> DefaultPolicyEvaluator<'a> {
@@ -433,6 +437,7 @@ impl<'a> DefaultPolicyEvaluator<'a> {
         let evaluator = Self {
             taint: None,
             typestate: None,
+            active_semantic_model_snapshot: None,
         };
         let evaluator = match taint {
             Some(adapter) => evaluator.with_taint(adapter),
@@ -460,6 +465,15 @@ impl<'a> DefaultPolicyEvaluator<'a> {
         self.typestate = Some(typestate);
         self
     }
+
+    /// Pin assertion flow derivation to the host's request-level activation.
+    pub(crate) fn with_active_semantic_model_snapshot(
+        mut self,
+        snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
+    ) -> Self {
+        self.active_semantic_model_snapshot = snapshot;
+        self
+    }
 }
 
 impl Default for DefaultPolicyEvaluator<'_> {
@@ -478,9 +492,13 @@ impl PolicyEvaluator for DefaultPolicyEvaluator<'_> {
         let host_budget = *budget;
         match &policy.definition().analysis {
             PolicyAnalysis::Match { .. } => evaluate_match_policy(policy, context, &host_budget),
-            PolicyAnalysis::Assertion { spec } => {
-                evaluate_assertion_policy(policy, spec, context, &host_budget)
-            }
+            PolicyAnalysis::Assertion { spec } => evaluate_assertion_policy(
+                policy,
+                spec,
+                context,
+                &host_budget,
+                self.active_semantic_model_snapshot.clone(),
+            ),
             // Flow executes the production taint pipeline over the same
             // resolved model with one internal label (#2436); only the run's
             // analysis type and the finding evidence variant differ.
@@ -1310,10 +1328,9 @@ fn failed_policy_run_with_reason(
     budget: &PolicyBudget,
 ) -> Result<PolicyRun, PolicyRunError> {
     retain_unique_strong_findings(&mut findings);
-    let diagnostic = internal_failure_diagnostic(message).ok();
-    let retain_diagnostic = budget.max_diagnostics() > 0 && diagnostic.is_some();
+    let retain_diagnostic = budget.max_diagnostics() > 0;
     let diagnostics = if retain_diagnostic {
-        diagnostic.into_iter().collect()
+        vec![internal_failure_diagnostic(message)]
     } else {
         Vec::new()
     };
@@ -2262,10 +2279,14 @@ fn evaluate_match_query_candidates(
             | QueryValueKind::ReceiverOutcome
             | QueryValueKind::ReceiverEvidence
             | QueryValueKind::CallShape
+            | QueryValueKind::CallResult
             | QueryValueKind::CallArgumentGroup
             | QueryValueKind::CallArgument
             | QueryValueKind::CallBinding
             | QueryValueKind::CallEffect
+            | QueryValueKind::CallResultContract
+            | QueryValueKind::ResultContractUse
+            | QueryValueKind::ResultContractFailureUse
             | QueryValueKind::ProcedureEffect
             | QueryValueKind::CallableSignature
             | QueryValueKind::SignatureParameter
@@ -2428,13 +2449,9 @@ fn evaluate_match_query_candidates(
     if adapted_candidates.conversion_failed {
         failure_reasons.push(PolicyFailureReason::InternalInvariant);
         if diagnostics.len() < budget.max_diagnostics() {
-            if let Ok(diagnostic) = internal_failure_diagnostic(
+            diagnostics.push(internal_failure_diagnostic(
                 "a detailed query row could not be projected into validated policy evidence",
-            ) {
-                diagnostics.push(diagnostic);
-            } else {
-                diagnostics_truncated = true;
-            }
+            ));
         } else {
             diagnostics_truncated = true;
         }
@@ -2861,6 +2878,9 @@ fn terminal_presentation(
         // procedure, so a finding anchors at the call-shape or declaration row
         // it names rather than at the effect row itself (#2437).
         | CodeQueryResultValue::CallEffect { .. }
+        | CodeQueryResultValue::CallResultContract { .. }
+        | CodeQueryResultValue::ResultContractUse { .. }
+        | CodeQueryResultValue::ResultContractFailureUse { .. }
         | CodeQueryResultValue::ProcedureEffect { .. }
         // A callable-signature row describes a declaration's declared shape. It
         // is an analysis projection anchored at the declaration, not a
@@ -2985,6 +3005,18 @@ fn terminal_presentation(
             Some(value.range),
             Vec::new(),
             ProofState::Proven,
+            ProofReason::DirectStructuralMatch,
+        ),
+        CodeQueryResultValue::CallResult { value } => (
+            DetailedCodeQueryDomain::CallResult,
+            value.path.as_str(),
+            Some(value.range),
+            Vec::new(),
+            if value.proof == "proven" {
+                ProofState::Proven
+            } else {
+                ProofState::Unproven
+            },
             ProofReason::DirectStructuralMatch,
         ),
         // A topology row is an exact record of what a build file declares. Its
@@ -3737,10 +3769,14 @@ fn public_provenance_kind(value: &CodeQueryResultRef) -> &'static str {
         CodeQueryResultRef::MemberFamilyEdge { .. } => "member_family_edge",
         CodeQueryResultRef::ReceiverEvidence { .. } => "receiver_evidence",
         CodeQueryResultRef::CallShape { .. } => "call_shape",
+        CodeQueryResultRef::CallResult { .. } => "call_result",
         CodeQueryResultRef::CallArgumentGroup { .. } => "call_argument_group",
         CodeQueryResultRef::CallArgument { .. } => "call_argument",
         CodeQueryResultRef::CallBinding { .. } => "call_binding",
         CodeQueryResultRef::CallEffect { .. } => "call_effect",
+        CodeQueryResultRef::CallResultContract { .. } => "call_result_contract",
+        CodeQueryResultRef::ResultContractUse { .. } => "result_contract_use",
+        CodeQueryResultRef::ResultContractFailureUse { .. } => "result_contract_failure_use",
         CodeQueryResultRef::ProcedureEffect { .. } => "procedure_effect",
         CodeQueryResultRef::CallableSignature { .. } => "callable_signature",
         CodeQueryResultRef::SignatureParameter { .. } => "signature_parameter",
@@ -3789,10 +3825,14 @@ fn public_provenance_path(value: &CodeQueryResultRef) -> &str {
         | CodeQueryResultRef::ReceiverOutcome { path, .. }
         | CodeQueryResultRef::ReceiverEvidence { path, .. }
         | CodeQueryResultRef::CallShape { path, .. }
+        | CodeQueryResultRef::CallResult { path, .. }
         | CodeQueryResultRef::CallArgumentGroup { path, .. }
         | CodeQueryResultRef::CallArgument { path, .. }
         | CodeQueryResultRef::CallBinding { path, .. }
         | CodeQueryResultRef::CallEffect { path, .. }
+        | CodeQueryResultRef::CallResultContract { path, .. }
+        | CodeQueryResultRef::ResultContractUse { path, .. }
+        | CodeQueryResultRef::ResultContractFailureUse { path, .. }
         | CodeQueryResultRef::ProcedureEffect { path, .. }
         | CodeQueryResultRef::CallableSignature { path, .. }
         | CodeQueryResultRef::SignatureParameter { path, .. }
@@ -3886,10 +3926,14 @@ fn match_domain(domain: DetailedCodeQueryDomain) -> Option<MatchResultDomain> {
         | DetailedCodeQueryDomain::ReceiverOutcome
         | DetailedCodeQueryDomain::ReceiverEvidence
         | DetailedCodeQueryDomain::CallShape
+        | DetailedCodeQueryDomain::CallResult
         | DetailedCodeQueryDomain::CallArgumentGroup
         | DetailedCodeQueryDomain::CallArgument
         | DetailedCodeQueryDomain::CallBinding
         | DetailedCodeQueryDomain::CallEffect
+        | DetailedCodeQueryDomain::CallResultContract
+        | DetailedCodeQueryDomain::ResultContractUse
+        | DetailedCodeQueryDomain::ResultContractFailureUse
         | DetailedCodeQueryDomain::ProcedureEffect
         | DetailedCodeQueryDomain::CallableSignature
         | DetailedCodeQueryDomain::SignatureParameter
@@ -4146,11 +4190,18 @@ fn weak_finding_key(evidence: &DetailedCodeQueryEvidence) -> OpaqueFindingKey {
         DetailedCodeQueryKey::ReceiverOutcome { id, site_id }
         | DetailedCodeQueryKey::ReceiverEvidence { id, site_id }
         | DetailedCodeQueryKey::CallShape { id, site_id }
+        | DetailedCodeQueryKey::CallResult { id, site_id }
         | DetailedCodeQueryKey::CallArgumentGroup { id, site_id }
         | DetailedCodeQueryKey::CallBinding { id, site_id }
-        | DetailedCodeQueryKey::CallEffect { id, site_id } => {
+        | DetailedCodeQueryKey::CallEffect { id, site_id }
+        | DetailedCodeQueryKey::CallResultContract { id, site_id } => {
             update_hash(&mut hasher, id.as_bytes());
             update_hash(&mut hasher, site_id.as_bytes());
+        }
+        DetailedCodeQueryKey::ResultContractUse { id, acquisition_id }
+        | DetailedCodeQueryKey::ResultContractFailureUse { id, acquisition_id } => {
+            update_hash(&mut hasher, id.as_bytes());
+            update_hash(&mut hasher, acquisition_id.as_bytes());
         }
         DetailedCodeQueryKey::ProcedureEffect { id, procedure_id } => {
             update_hash(&mut hasher, id.as_bytes());
@@ -4344,7 +4395,8 @@ pub(super) fn incomplete_reason_for_code(code: &CodeQueryDiagnosticCode) -> Poli
         // An effect derivation that could not establish every callee is a
         // capability gap, not a budget one: the missing fact is a model or a
         // resolution, and no larger bound would recover it (#2437).
-        | CodeQueryDiagnosticCode::EffectDerivationIncomplete => {
+        | CodeQueryDiagnosticCode::EffectDerivationIncomplete
+        | CodeQueryDiagnosticCode::ResultContractDerivationIncomplete => {
             PolicyIncompleteReason::CapabilityIncomplete
         }
         CodeQueryDiagnosticCode::OccurrenceRowBudgetExhausted
@@ -4376,6 +4428,7 @@ pub(super) fn incomplete_reason_for_code(code: &CodeQueryDiagnosticCode) -> Poli
         CodeQueryDiagnosticCode::ResultLimitReached => PolicyIncompleteReason::QueryResultLimit,
         CodeQueryDiagnosticCode::SemanticResultsOmitted
         | CodeQueryDiagnosticCode::SemanticAnalysisPartial
+        | CodeQueryDiagnosticCode::CallBindingDispatchPartial
         | CodeQueryDiagnosticCode::SemanticBudgetExhausted
         | CodeQueryDiagnosticCode::SemanticProviderFailed
         | CodeQueryDiagnosticCode::UnresolvedProtocolReference
@@ -4455,16 +4508,15 @@ fn adapt_query_diagnostic(
     )
 }
 
-fn internal_failure_diagnostic(message: &str) -> Result<PolicyDiagnostic, ()> {
-    PolicyDiagnostic::try_new(
+fn internal_failure_diagnostic(message: &str) -> PolicyDiagnostic {
+    // Bounded, not validated: an internal-failure explanation must never be
+    // dropped for being too long (#2779).
+    PolicyDiagnostic::new_bounded(
         PolicyDiagnosticCode::EvaluationFailure,
         PolicyDiagnosticSeverity::Error,
         PolicyDiagnosticImpact::RunFailed,
         message,
-        None,
-        Vec::new(),
     )
-    .map_err(|_| ())
 }
 
 fn failed_before_execution(
@@ -4472,10 +4524,9 @@ fn failed_before_execution(
     message: &str,
     budget: &PolicyBudget,
 ) -> EvaluatedMatchPolicy {
-    let diagnostic = internal_failure_diagnostic(message).ok();
-    let retain_diagnostic = budget.max_diagnostics() > 0 && diagnostic.is_some();
+    let retain_diagnostic = budget.max_diagnostics() > 0;
     let diagnostics = if retain_diagnostic {
-        diagnostic.into_iter().collect()
+        vec![internal_failure_diagnostic(message)]
     } else {
         Vec::new()
     };

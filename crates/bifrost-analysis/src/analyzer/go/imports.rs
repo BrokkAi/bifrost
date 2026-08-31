@@ -11,9 +11,9 @@ use crate::analyzer::{CodeUnit, ImportAnalysisProvider, ImportInfo, ProjectFile}
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_go::imports::{
-    GoImportTables, build_go_dir_parent_files, build_go_dir_parent_suffix_files,
-    build_go_package_files, dir_suffix_matches, go_directory_sibling_import_files, go_import_path,
-    go_imported_code_units_of, go_matching_import_files, go_package_of, go_relevant_imports_for,
+    GoImportTables, dir_suffix_matches, go_directory_sibling_import_files, go_import_path,
+    go_imported_code_units_of, go_matching_import_files, go_relevant_imports_for, parent_path_key,
+    path_suffixes,
 };
 use std::sync::Arc;
 
@@ -21,6 +21,13 @@ use super::GoAnalyzer;
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 
 impl ImportAnalysisProvider for GoAnalyzer {
+    fn file_dependency_facts_for_files(
+        &self,
+        files: &[ProjectFile],
+    ) -> Option<crate::hash::HashMap<ProjectFile, crate::analyzer::FileDependencyFacts>> {
+        Some(self.inner.bulk_file_dependency_facts(files.iter().cloned()))
+    }
+
     fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();
@@ -140,9 +147,14 @@ impl GoAnalyzer {
     }
 
     /// Canonical package identity (import path) of a file, taken from any of
-    /// its declarations. `None` for files with no top-level declarations.
+    /// its persisted package-clause fact. This remains available in the
+    /// file-dependency build, which intentionally omits declarations.
     pub(super) fn go_package_of(&self, file: &ProjectFile) -> Option<String> {
-        go_package_of(&self.inner, file)
+        let declared = self.inner.content_qualifier_of(file)?;
+        (!declared.is_empty()).then(|| {
+            self.workspace_path_index()
+                .canonical_package_name(file, &declared)
+        })
     }
 
     fn import_tables(&self) -> GoImportTables<'_> {
@@ -154,20 +166,57 @@ impl GoAnalyzer {
     }
 
     fn package_files(&self) -> &HashMap<String, Arc<Vec<ProjectFile>>> {
-        self.memo_caches
-            .package_files
-            .get_or_init(|| build_go_package_files(&self.inner, &self.inner.all_files()))
+        self.memo_caches.package_files.get_or_init(|| {
+            let mut grouped: HashMap<String, Vec<ProjectFile>> = HashMap::default();
+            for file in self.inner.all_files() {
+                if let Some(package) = self.go_package_of(&file) {
+                    grouped.entry(package).or_default().push(file);
+                }
+            }
+            grouped
+                .into_iter()
+                .map(|(package, files)| (package, Arc::new(files)))
+                .collect()
+        })
     }
 
     fn dir_parent_files(&self) -> &HashMap<String, Arc<Vec<ProjectFile>>> {
-        self.memo_caches
-            .dir_parent_files
-            .get_or_init(|| build_go_dir_parent_files(&self.inner, &self.inner.all_files()))
+        self.memo_caches.dir_parent_files.get_or_init(|| {
+            let mut grouped: HashMap<String, Vec<ProjectFile>> = HashMap::default();
+            for file in self.inner.all_files() {
+                if self.go_package_of(&file).is_some() {
+                    grouped
+                        .entry(parent_path_key(&file))
+                        .or_default()
+                        .push(file);
+                }
+            }
+            grouped
+                .into_iter()
+                .map(|(parent, files)| (parent, Arc::new(files)))
+                .collect()
+        })
     }
 
     fn dir_parent_suffix_files(&self) -> &HashMap<String, Arc<Vec<ProjectFile>>> {
-        self.memo_caches
-            .dir_parent_suffix_files
-            .get_or_init(|| build_go_dir_parent_suffix_files(&self.inner, &self.inner.all_files()))
+        self.memo_caches.dir_parent_suffix_files.get_or_init(|| {
+            let mut grouped: HashMap<String, Vec<ProjectFile>> = HashMap::default();
+            for file in self.inner.all_files() {
+                if self.go_package_of(&file).is_none() {
+                    continue;
+                }
+                let parent = parent_path_key(&file);
+                for suffix in path_suffixes(&parent) {
+                    grouped
+                        .entry(suffix.to_string())
+                        .or_default()
+                        .push(file.clone());
+                }
+            }
+            grouped
+                .into_iter()
+                .map(|(suffix, files)| (suffix, Arc::new(files)))
+                .collect()
+        })
     }
 }

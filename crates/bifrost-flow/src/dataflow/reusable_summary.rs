@@ -13,10 +13,12 @@ use crate::analyzer::invalidation::{
     ArtifactVerdict, DerivedArtifactId, InvalidationReason, RetentionReason,
 };
 use crate::analyzer::semantic::{
-    DeclarationLocator, DependencyFingerprint, EvidenceCompleteness, ProofStatus,
-    SemanticArtifactKey, SemanticLocator, SemanticRole, StableDigest, WorkspaceMountId,
-    WorkspaceRelativePath,
+    DeclarationLocator, DeclarationSegment, DeclarationSegmentKind, DependencyFingerprint,
+    EvidenceCompleteness, ProofStatus, SemanticArtifactKey, SemanticLocator, SemanticRole,
+    StableDigest, WorkspaceMountId, WorkspaceRelativePath,
+    is_unmaterialized_external_artifact_locator,
 };
+use crate::analyzer::semantic_model::UnmaterializedExternalSummaryCallShapeBinding;
 use crate::hash::{HashMap, HashSet, map_with_capacity, set_with_capacity};
 
 use super::{PathQuality, PathQualityFrontier, SummaryCallCycle, UnmodeledCallBehavior};
@@ -670,6 +672,7 @@ pub enum SummaryPort {
     Receiver,
     Parameter(u32),
     NormalReturn,
+    IndexedNormalReturn(u32),
     ExceptionalReturn,
     Capture(SummaryLocationKey),
     Heap(SummaryLocationKey),
@@ -696,7 +699,10 @@ impl SummaryExit {
         if matches!(
             (kind, &port),
             (SummaryExitKind::Normal, SummaryPort::ExceptionalReturn)
-                | (SummaryExitKind::Exceptional, SummaryPort::NormalReturn)
+                | (
+                    SummaryExitKind::Exceptional,
+                    SummaryPort::NormalReturn | SummaryPort::IndexedNormalReturn(_)
+                )
         ) {
             return Err(SummaryValidationError::IncompatibleExitPort);
         }
@@ -857,7 +863,9 @@ impl SummaryTransfer {
     ) -> Result<Self, SummaryValidationError> {
         if matches!(
             input,
-            SummaryPort::NormalReturn | SummaryPort::ExceptionalReturn
+            SummaryPort::NormalReturn
+                | SummaryPort::IndexedNormalReturn(_)
+                | SummaryPort::ExceptionalReturn
         ) {
             return Err(SummaryValidationError::InvalidTransferInputPort);
         }
@@ -1418,6 +1426,8 @@ pub struct ExternalSummaryTarget {
 }
 
 impl ExternalSummaryTarget {
+    const INTERNAL_SUMMARY_SEGMENT_PREFIX: &'static str = "bifrost.semantic-summary.";
+
     pub fn from_summary(summary: &SemanticProcedureSummary) -> Self {
         Self {
             mount: summary.key().artifact().mount(),
@@ -1425,6 +1435,54 @@ impl ExternalSummaryTarget {
             language: summary.key().artifact().language(),
             declaration: summary.key().declaration().clone(),
         }
+    }
+
+    /// Build an exact source-independent target from a resolver-owned
+    /// procedure locator. Synthetic unmaterialized-external targets can then
+    /// index one semantic summary under each exact call shape selected for a
+    /// variadic declaration.
+    pub fn from_locator(locator: &SemanticLocator) -> Option<Self> {
+        (locator.role() == SemanticRole::Procedure).then(|| Self {
+            mount: locator.mount(),
+            path: locator.path().clone(),
+            language: locator.language(),
+            declaration: locator.declaration().clone(),
+        })
+    }
+
+    /// Build a flow-internal procedure identity beneath one formal external
+    /// declaration. This distinguishes overlapping authored records while
+    /// exact resolver call shapes remain aliases rather than summary keys.
+    /// The external model id is later checked against the bound summary's
+    /// origin before an alias set accepts the mapping.
+    pub fn internal_summary_locator(
+        formal: &SemanticLocator,
+        external_model_id: &str,
+    ) -> Option<SemanticLocator> {
+        if !is_unmaterialized_external_artifact_locator(formal) || external_model_id.is_empty() {
+            return None;
+        }
+        let mut segments = formal.declaration().segments().to_vec();
+        segments.push(
+            DeclarationSegment::named(
+                DeclarationSegmentKind::LocalFunction,
+                format!(
+                    "{}{external_model_id}",
+                    Self::INTERNAL_SUMMARY_SEGMENT_PREFIX
+                ),
+                formal.anchor(),
+                0,
+            )
+            .ok()?,
+        );
+        Some(SemanticLocator::new(
+            formal.mount(),
+            formal.path().clone(),
+            formal.language(),
+            DeclarationLocator::new(segments).ok()?,
+            SemanticRole::Procedure,
+            formal.anchor(),
+        ))
     }
 
     pub fn matches(&self, locator: &SemanticLocator) -> bool {
@@ -1457,6 +1515,48 @@ impl ExternalSummaryTarget {
 
     pub fn declaration(&self) -> &DeclarationLocator {
         &self.declaration
+    }
+
+    fn stable_fingerprint(&self) -> StableDigest {
+        let mut bytes = Vec::new();
+        push_digest_part(&mut bytes, b"bifrost-external-summary-target-v1");
+        // Keep target aliases portable for the same reason external procedure
+        // identities omit the workspace-derived mount and source anchors.
+        push_digest_part(&mut bytes, self.path.as_str().as_bytes());
+        push_digest_part(&mut bytes, self.language.stable_label().as_bytes());
+        for segment in self.declaration.segments() {
+            push_digest_part(&mut bytes, segment.kind().stable_label().as_bytes());
+            match segment.name() {
+                Some(name) => {
+                    push_digest_part(&mut bytes, b"named");
+                    push_digest_part(&mut bytes, name.as_bytes());
+                }
+                None => push_digest_part(&mut bytes, b"anonymous"),
+            }
+            push_digest_part(&mut bytes, &segment.sibling_ordinal().to_le_bytes());
+        }
+        StableDigest::sha256(bytes)
+    }
+
+    fn is_call_shape_alias_of(&self, formal: &Self) -> bool {
+        if self.mount != formal.mount
+            || self.path != formal.path
+            || self.language != formal.language
+        {
+            return false;
+        }
+        let actual = self.declaration.segments();
+        let formal = formal.declaration.segments();
+        let Some((actual_last, actual_prefix)) = actual.split_last() else {
+            return false;
+        };
+        let Some((formal_last, formal_prefix)) = formal.split_last() else {
+            return false;
+        };
+        actual_prefix == formal_prefix
+            && actual_last.kind() == formal_last.kind()
+            && actual_last.name() == formal_last.name()
+            && actual_last.anchor() == formal_last.anchor()
     }
 }
 
@@ -1517,15 +1617,93 @@ impl ExternalSemanticSummarySet {
     ) -> Result<Self, ExternalSummarySetError> {
         let summaries = canonicalize_semantic_summary_items(summaries, |summary| summary, false)
             .map_err(|_| ExternalSummarySetError::AmbiguousTarget)?;
-        let mut entries = Vec::with_capacity(summaries.len());
-        for summary in summaries.into_vec() {
+        let entries = summaries
+            .into_vec()
+            .into_iter()
+            .map(|summary| (ExternalSummaryTarget::from_summary(&summary), summary))
+            .collect();
+        Self::try_new_entries(entries, compatibility)
+    }
+
+    /// Build a query-scoped set from analyzer-proven exact call-shape bindings.
+    ///
+    /// The opaque binding proves that an activated authored target applies to
+    /// one resolver-owned unmaterialized-external actual arity. Flow derives
+    /// the internal summary locator itself, then checks that the lowered
+    /// summary carries the proven external model id at exactly that locator.
+    /// No caller can supply raw sibling ordinals and relabel a fixed summary.
+    ///
+    /// Several actual targets may map to identical clones of one semantic
+    /// summary. A target still has at most one summary, and one summary key
+    /// cannot carry differing bodies across aliases.
+    pub fn try_new_with_unmaterialized_call_shape_bindings(
+        summaries: Vec<SemanticProcedureSummary>,
+        bindings: Vec<(
+            UnmaterializedExternalSummaryCallShapeBinding,
+            SemanticProcedureSummary,
+        )>,
+        compatibility: ExternalSummaryCompatibilityKey,
+    ) -> Result<Self, ExternalSummarySetError> {
+        let mut entries = Vec::with_capacity(summaries.len().saturating_add(bindings.len()));
+        entries.extend(
+            summaries
+                .into_iter()
+                .map(|summary| (ExternalSummaryTarget::from_summary(&summary), summary)),
+        );
+        for (binding, summary) in bindings {
+            let Some(actual) = ExternalSummaryTarget::from_locator(binding.actual_locator()) else {
+                return Err(ExternalSummarySetError::InvalidTargetAlias);
+            };
+            let Some(formal) = ExternalSummaryTarget::from_locator(binding.formal_locator()) else {
+                return Err(ExternalSummarySetError::InvalidTargetAlias);
+            };
+            let SummaryOrigin::External(origin) = summary.origin() else {
+                return Err(ExternalSummarySetError::InvalidTargetAlias);
+            };
+            let Some(internal_locator) = ExternalSummaryTarget::internal_summary_locator(
+                binding.formal_locator(),
+                binding.model_id(),
+            ) else {
+                return Err(ExternalSummarySetError::InvalidTargetAlias);
+            };
+            let Some(internal) = ExternalSummaryTarget::from_locator(&internal_locator) else {
+                return Err(ExternalSummarySetError::InvalidTargetAlias);
+            };
+            if !actual.is_call_shape_alias_of(&formal)
+                || origin.model().as_str() != binding.model_id()
+                || origin.content().digest() != binding.content()
+                || origin.contract_version() != binding.contract_version()
+                || origin.covers_overrides() != binding.covers_overrides()
+                || internal != ExternalSummaryTarget::from_summary(&summary)
+            {
+                return Err(ExternalSummarySetError::InvalidTargetAlias);
+            }
+            entries.push((actual, summary));
+        }
+        Self::try_new_entries(entries, compatibility)
+    }
+
+    fn try_new_entries(
+        mut entries: Vec<(ExternalSummaryTarget, SemanticProcedureSummary)>,
+        compatibility: ExternalSummaryCompatibilityKey,
+    ) -> Result<Self, ExternalSummarySetError> {
+        for (_, summary) in &entries {
             if !matches!(summary.origin(), SummaryOrigin::External(_)) {
                 return Err(ExternalSummarySetError::InferredSummary);
             }
-            if !compatibility.matches(&summary) {
+            if !compatibility.matches(summary) {
                 return Err(ExternalSummarySetError::IncompatibleSummary);
             }
-            entries.push((ExternalSummaryTarget::from_summary(&summary), summary));
+        }
+        {
+            let mut by_key = entries.iter().collect::<Vec<_>>();
+            by_key.sort_unstable_by(|left, right| left.1.key().cmp(right.1.key()));
+            if by_key
+                .windows(2)
+                .any(|pair| pair[0].1.key() == pair[1].1.key() && pair[0].1 != pair[1].1)
+            {
+                return Err(ExternalSummarySetError::InconsistentSummaryKey);
+            }
         }
         entries.sort_unstable_by(|left, right| {
             left.0
@@ -1536,10 +1714,23 @@ impl ExternalSemanticSummarySet {
             return Err(ExternalSummarySetError::AmbiguousTarget);
         }
 
-        let mut bytes = Vec::with_capacity(48usize.saturating_add(entries.len() * 32));
-        bytes.extend_from_slice(b"bifrost-external-summary-set/v1\0");
-        for (_, summary) in &entries {
-            bytes.extend_from_slice(summary.key().fingerprint().as_bytes());
+        let has_aliases = entries
+            .iter()
+            .any(|(target, summary)| *target != ExternalSummaryTarget::from_summary(summary));
+        let mut bytes = Vec::with_capacity(48usize.saturating_add(entries.len() * 64));
+        if has_aliases {
+            bytes.extend_from_slice(b"bifrost-external-summary-set/target-bound-v1\0");
+            for (target, summary) in &entries {
+                bytes.extend_from_slice(target.stable_fingerprint().as_bytes());
+                bytes.extend_from_slice(summary.key().fingerprint().as_bytes());
+            }
+        } else {
+            // Preserve the established fingerprint of ordinary one-target-per-
+            // summary sets. Only an actual alias mapping rotates the domain.
+            bytes.extend_from_slice(b"bifrost-external-summary-set/v1\0");
+            for (_, summary) in &entries {
+                bytes.extend_from_slice(summary.key().fingerprint().as_bytes());
+            }
         }
         Ok(Self {
             entries: entries.into_boxed_slice(),
@@ -1684,6 +1875,8 @@ impl CuratedCallModel {
 pub enum ExternalSummarySetError {
     InferredSummary,
     IncompatibleSummary,
+    InvalidTargetAlias,
+    InconsistentSummaryKey,
     AmbiguousTarget,
 }
 
@@ -1693,6 +1886,12 @@ impl fmt::Display for ExternalSummarySetError {
             Self::InferredSummary => "external summary sets cannot contain inferred summaries",
             Self::IncompatibleSummary => {
                 "external summary sets require one compatible summary family"
+            }
+            Self::InvalidTargetAlias => {
+                "external summary aliases require one synthetic unmaterialized call shape"
+            }
+            Self::InconsistentSummaryKey => {
+                "one external summary key cannot carry different summary bodies"
             }
             Self::AmbiguousTarget => {
                 "external summary sets require exactly one summary per structured target"
@@ -1720,7 +1919,9 @@ impl SummaryBoundaryBinding {
         }
         if matches!(
             input,
-            SummaryPort::NormalReturn | SummaryPort::ExceptionalReturn
+            SummaryPort::NormalReturn
+                | SummaryPort::IndexedNormalReturn(_)
+                | SummaryPort::ExceptionalReturn
         ) {
             return Err(SummaryValidationError::InvalidBoundaryInputPort);
         }

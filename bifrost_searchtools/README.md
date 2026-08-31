@@ -75,6 +75,10 @@ exposes:
 | `rename_symbol(path, *, line=..., column=..., new_name=...)` | Return a non-mutating edit plan for a symbol rename. |
 | `usage_graph(*, include_tests=False, paths=None)` | Whole-workspace caller/callee graph; each edge carries its `{path, line}` call sites. |
 | `most_relevant_files(seed_files, *, limit=20, ...)` | Rank files related to seed files. Each result carries a `test` verdict (`test`, `test_support`, `production`, `ambiguous`); filter locally to drop tests, and raise `limit` to cover what you drop. |
+| `analyze_diff(target=None, *, base=None, include_tests=True)` | Semantic effects between Git endpoints. |
+| `blast_radius(target=None, *, base=None, max_scopes=None)` | Suggested test scopes from structured file dependencies. |
+| `cyclomatic_complexity(target=None, *, base=None, include_tests=False)` | Complexity scores for introduced and patch-edited functions, with signed deltas for edits. |
+| `missing_tests(target=None, *, base=None)` | Changed functions with no complete structured call path from test context; incomplete negatives are reported separately. |
 | `refresh()` | Force a full re-index (recovery escape hatch). |
 | `update_paths(paths)` | Incrementally re-analyze specific paths (with `manual=True`). |
 | `activate_workspace(path)` / `get_active_workspace()` | Switch / read the active workspace root. |

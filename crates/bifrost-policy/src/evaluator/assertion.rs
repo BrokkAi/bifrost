@@ -67,6 +67,7 @@ pub(super) fn evaluate_assertion_policy(
     spec: &AssertionPolicySpec,
     context: &PolicyEvaluationContext<'_>,
     budget: &PolicyBudget,
+    active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
 ) -> Result<PolicyRun, PolicyRunError> {
     if let Some(plan) = &spec.relational {
         return evaluate_relational_assertion_policy(policy, plan, context, budget);
@@ -265,8 +266,11 @@ pub(super) fn evaluate_assertion_policy(
     let mut identity_support =
         needs_identity_producers.then(|| IdentityAssertSupport::new(context.analyzer));
     let mut edge_assert_context = EdgeAssertContext::new(context.analyzer, context.cancellation);
-    let mut flow_assert_context =
-        FlowStateAssertContext::new(context.workspace, context.cancellation);
+    let mut flow_assert_context = FlowStateAssertContext::new(
+        context.workspace,
+        context.cancellation,
+        active_semantic_model_snapshot,
+    );
     let mut rewrite_assert_context =
         RewriteAssertContext::new(context.analyzer, context.cancellation);
 
@@ -2957,17 +2961,33 @@ struct FlowStateAssertContext<'context> {
     /// there is no second one.
     workspace: Option<&'context WorkspaceAnalyzer>,
     cancellation: Option<&'context CancellationToken>,
-    files: HashMap<ProjectFile, Arc<FileFlowState>>,
+    /// Retained so every asserted file sees one activation snapshot even if a
+    /// host publishes another set while this policy run is in progress.
+    active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
+    active_model_set_hash: Option<Arc<str>>,
+    files: HashMap<FlowStateAssertCacheKey, Arc<FileFlowState>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FlowStateAssertCacheKey {
+    file: ProjectFile,
+    active_model_set_hash: Option<Arc<str>>,
 }
 
 impl<'context> FlowStateAssertContext<'context> {
     fn new(
         workspace: Option<&'context WorkspaceAnalyzer>,
         cancellation: Option<&'context CancellationToken>,
+        active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
     ) -> Self {
+        let active_model_set_hash = active_semantic_model_snapshot
+            .as_ref()
+            .map(|snapshot| Arc::<str>::from(snapshot.active_models().active_model_set_hash()));
         Self {
             workspace,
             cancellation,
+            active_semantic_model_snapshot,
+            active_model_set_hash,
             files: HashMap::new(),
         }
     }
@@ -2981,16 +3001,18 @@ impl<'context> FlowStateAssertContext<'context> {
             workspace.analyzer().project().root().to_path_buf(),
             path.to_string(),
         );
-        if let Some(cached) = self.files.get(&file) {
+        let key = FlowStateAssertCacheKey {
+            file: file.clone(),
+            active_model_set_hash: self.active_model_set_hash.clone(),
+        };
+        if let Some(cached) = self.files.get(&key) {
             return Some(Arc::clone(cached));
         }
         let token = self.cancellation.cloned().unwrap_or_default();
-        let derived = Arc::new(flow_state_for_file(
-            workspace,
-            &file,
-            &mut FlowStateRequest::new(&token),
-        ));
-        self.files.insert(file, Arc::clone(&derived));
+        let mut request = FlowStateRequest::new(&token)
+            .with_active_semantic_model_snapshot(self.active_semantic_model_snapshot.clone());
+        let derived = Arc::new(flow_state_for_file(workspace, &file, &mut request));
+        self.files.insert(key, Arc::clone(&derived));
         Some(derived)
     }
 }

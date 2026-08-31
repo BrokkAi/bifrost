@@ -1,8 +1,10 @@
 use super::super::ids::{
-    SemanticArtifactKey, SemanticLanguage, SemanticLocator, SemanticRole, WorkspaceMountId,
-    WorkspaceRelativePath,
+    DeclarationLocator, DeclarationSegment, SemanticArtifactKey, SemanticLanguage, SemanticLocator,
+    SemanticRole, WorkspaceMountId, WorkspaceRelativePath,
 };
-use super::super::ir::{CallSiteHandle, EvidenceCompleteness, ProcedureHandle, ProofStatus};
+use super::super::ir::{
+    CallSiteHandle, EvidenceCompleteness, ProcedureHandle, ProcedureKind, ProofStatus,
+};
 use super::error::OracleContractError;
 use super::limits::OracleLimits;
 use super::model::DispatchBoundaryKind;
@@ -137,6 +139,36 @@ impl DispatchBoundary {
         self.unmaterialized_external_target.as_ref()
     }
 
+    /// Return the receiver shape proved independently of an external body.
+    ///
+    /// Boundary completeness describes whether the callee body is available.
+    /// Receiver shape has separate authority and qualifies only when the
+    /// resolver supplied it from an exact declaration owner or explicitly on
+    /// an unmaterialized target. Ordinary synthetic targets prove no shape.
+    pub fn proven_external_receiver_shape(&self) -> Option<bool> {
+        if !matches!(self.proof, ProofStatus::Proven) {
+            return None;
+        }
+        match (
+            &self.kind,
+            &self.exact_external_target,
+            &self.unmaterialized_external_target,
+        ) {
+            (DispatchBoundaryKind::Unmaterialized(locator), Some(target), None)
+                if locator == target.procedure()
+                    && target.artifact().language() == SemanticLanguage::Standard(Language::Go) =>
+            {
+                Some(target.has_receiver())
+            }
+            (DispatchBoundaryKind::External(Some(locator)), None, Some(target))
+                if locator == target.locator() && target.has_resolver_owned_call_shape() =>
+            {
+                Some(target.has_receiver())
+            }
+            _ => None,
+        }
+    }
+
     /// Validate one retained boundary independently of the dispatch result
     /// that originally sealed it.
     ///
@@ -169,7 +201,21 @@ impl DispatchBoundary {
                         .procedure()
                         .semantics()
                         .call_site(call.id())
-                        .is_some_and(|row| row.receiver.is_some() == target.has_receiver())
+                        .is_some_and(|row| {
+                            // Resolver-owned call shape is authoritative. For
+                            // Go, syntax-only lowering can retain a package
+                            // qualifier as a receiver; for JS/TS, a direct named
+                            // import proves that the package owner is not a
+                            // receiver written at the call. Ordinary synthetic
+                            // targets still have to match the lowered shape.
+                            target.has_resolver_owned_call_shape()
+                                || normalized_external_has_receiver(
+                                    row.receiver.is_some(),
+                                    target.language(),
+                                    target.owner_fqn(),
+                                    target.normalized_static_owner(),
+                                ) == target.has_receiver()
+                        })
             }
             (_, None, None) => true,
             _ => false,
@@ -205,8 +251,10 @@ impl DispatchBoundary {
 
 /// Structured resolver output for one exact external procedure target.
 ///
-/// The symbol and boundary shape are retained from analyzer metadata. Clients
-/// must not reconstruct them from the locator or source text.
+/// The symbol and boundary shape are retained from analyzer metadata. Receiver
+/// shape is derived from the exact declaration owner's structured scope and is
+/// corroborated against the lowered call before construction. Clients must not
+/// reconstruct either fact from the locator or source text.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ExactExternalProcedureTarget {
     artifact: SemanticArtifactKey,
@@ -360,13 +408,17 @@ impl ExactExternalFormalParameter {
 /// synthetic `locator` -- and the provenance artifact key derived from it -- is
 /// not a real source location; it only anchors the bound summary so the boundary
 /// and the summary compare equal. The owner FQN and member are stored verbatim
-/// so the summary lookup never has to re-parse the locator.
+/// so the summary lookup never has to re-parse the locator. Private call-shape
+/// authority is validation evidence; authored summary lookup still uses only
+/// the documented match identity.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct UnmaterializedExternalTarget {
     owner_fqn: Box<str>,
     member: Box<str>,
     arity: u32,
     has_receiver: bool,
+    resolver_owned_call_shape: bool,
+    normalized_static_owner: Option<Box<str>>,
     locator: SemanticLocator,
 }
 
@@ -378,15 +430,55 @@ impl UnmaterializedExternalTarget {
         has_receiver: bool,
         locator: SemanticLocator,
     ) -> Self {
+        Self::new_with_normalized_static_owner(
+            owner_fqn,
+            member,
+            arity,
+            has_receiver,
+            None,
+            locator,
+        )
+    }
+
+    pub(crate) fn new_with_normalized_static_owner(
+        owner_fqn: impl Into<Box<str>>,
+        member: impl Into<Box<str>>,
+        arity: u32,
+        has_receiver: bool,
+        normalized_static_owner: Option<Box<str>>,
+        locator: SemanticLocator,
+    ) -> Self {
         debug_assert_eq!(locator.role(), SemanticRole::Procedure);
         debug_assert!(is_unmaterialized_external_artifact_locator(&locator));
+        let owner_fqn = owner_fqn.into();
+        debug_assert!(
+            normalized_static_owner
+                .as_deref()
+                .is_none_or(|owner| owner == owner_fqn.as_ref())
+        );
         Self {
-            owner_fqn: owner_fqn.into(),
+            owner_fqn,
             member: member.into(),
             arity,
             has_receiver,
+            resolver_owned_call_shape: false,
+            normalized_static_owner,
             locator,
         }
+    }
+
+    /// Construct a target whose receiver and arity came from the exact source
+    /// resolver rather than syntax-only semantic lowering.
+    pub(in crate::analyzer::semantic) fn new_for_resolver_owned_call(
+        owner_fqn: impl Into<Box<str>>,
+        member: impl Into<Box<str>>,
+        arity: u32,
+        has_receiver: bool,
+        locator: SemanticLocator,
+    ) -> Self {
+        let mut target = Self::new(owner_fqn, member, arity, has_receiver, locator);
+        target.resolver_owned_call_shape = true;
+        target
     }
 
     pub fn owner_fqn(&self) -> &str {
@@ -405,6 +497,29 @@ impl UnmaterializedExternalTarget {
         self.has_receiver
     }
 
+    /// Whether structured language resolution proved that this receiverless
+    /// external call is statically selected.
+    pub fn resolver_proves_static_call(&self) -> bool {
+        if self.has_receiver {
+            return false;
+        }
+        match self.language() {
+            SemanticLanguage::Standard(Language::Java) => self
+                .normalized_static_owner
+                .as_deref()
+                .is_some_and(|owner| owner == self.owner_fqn.as_ref()),
+            _ => false,
+        }
+    }
+
+    const fn has_resolver_owned_call_shape(&self) -> bool {
+        self.resolver_owned_call_shape
+    }
+
+    pub(crate) fn normalized_static_owner(&self) -> Option<&str> {
+        self.normalized_static_owner.as_deref()
+    }
+
     pub fn language(&self) -> SemanticLanguage {
         self.locator.language()
     }
@@ -413,6 +528,31 @@ impl UnmaterializedExternalTarget {
     /// the bound summary (at discovery time) name, so the two compare equal.
     pub fn locator(&self) -> &SemanticLocator {
         &self.locator
+    }
+
+    /// Rebuild this canonical external declaration locator with a different
+    /// structured arity. Variadic semantic targets use their total formal
+    /// count for the summary's stable declaration identity while retaining the
+    /// resolver's actual-arity locators as exact lookup aliases.
+    pub fn locator_for_arity(&self, arity: u32) -> SemanticLocator {
+        let mut segments = self.locator.declaration().segments().to_vec();
+        let last = segments
+            .pop()
+            .expect("unmaterialized external locator has a member segment");
+        debug_assert_eq!(last.name(), Some(self.member()));
+        segments.push(
+            DeclarationSegment::named(last.kind(), self.member(), last.anchor(), arity)
+                .expect("unmaterialized external member name remains non-empty"),
+        );
+        SemanticLocator::new(
+            self.locator.mount(),
+            self.locator.path().clone(),
+            self.locator.language(),
+            DeclarationLocator::new(segments)
+                .expect("unmaterialized external declaration remains non-empty"),
+            SemanticRole::Procedure,
+            self.locator.anchor(),
+        )
     }
 
     /// Build the provenance artifact key that anchors the bound summary. It
@@ -434,6 +574,25 @@ impl UnmaterializedExternalTarget {
     }
 }
 
+/// Normalize the raw IR receiver shape at the external-summary identity
+/// boundary.
+///
+/// Java intentionally retains a value row for every method-invocation object,
+/// including a type qualifier. A qualifier is not a semantic receiver, so the
+/// exact resolver may prove its canonical owner here. The equality guard keeps
+/// that proof target-specific; every other language and every Java value
+/// receiver preserves the raw IR shape.
+pub(crate) fn normalized_external_has_receiver(
+    raw_has_receiver: bool,
+    language: SemanticLanguage,
+    owner_fqn: &str,
+    normalized_static_owner: Option<&str>,
+) -> bool {
+    raw_has_receiver
+        && !(language.language() == Language::Java
+            && normalized_static_owner.is_some_and(|owner| owner == owner_fqn))
+}
+
 /// Stable sentinel mount for synthetic unmaterialized-external identities. The
 /// mount and path are provenance only; both the boundary locator and the bound
 /// summary artifact key use them, so the two compare equal (#1978).
@@ -450,12 +609,21 @@ pub(crate) fn unmaterialized_external_path() -> WorkspaceRelativePath {
 /// Whether `key` is the synthetic provenance artifact of an unmaterialized
 /// external target rather than a real materialized artifact (#1978).
 pub fn is_unmaterialized_external_artifact(key: &SemanticArtifactKey) -> bool {
-    key.mount() == unmaterialized_external_mount()
+    is_unmaterialized_external_identity(key.mount(), key.path())
 }
 
-fn is_unmaterialized_external_artifact_locator(locator: &SemanticLocator) -> bool {
-    locator.mount() == unmaterialized_external_mount()
-        && *locator.path() == unmaterialized_external_path()
+/// Whether `locator` is one of the structured synthetic procedure identities
+/// emitted for an unmaterialized external target (#1978).
+pub fn is_unmaterialized_external_artifact_locator(locator: &SemanticLocator) -> bool {
+    locator.role() == SemanticRole::Procedure
+        && is_unmaterialized_external_identity(locator.mount(), locator.path())
+}
+
+fn is_unmaterialized_external_identity(
+    mount: WorkspaceMountId,
+    path: &WorkspaceRelativePath,
+) -> bool {
+    mount == unmaterialized_external_mount() && *path == unmaterialized_external_path()
 }
 
 /// Split a resolved or authored qualified callee symbol into `(owner FQN,
@@ -590,6 +758,52 @@ impl DispatchResult {
 
     pub const fn coverage(&self) -> CandidateCoverage {
         self.coverage
+    }
+
+    /// Return the receiver shape proved by one exhaustive dispatch result.
+    ///
+    /// A materialized Go target's procedure kind is declaration-owned: Go has
+    /// methods and free functions but no static methods, so a complete proven
+    /// candidate identifies receiver shape even when the receiver declaration
+    /// itself is unnamed and therefore has no formal binding row. A modeled
+    /// external target qualifies only when its boundary carries the equivalent
+    /// resolver-owned shape. Mixed, partial, non-Go, or open target sets prove
+    /// no shape.
+    pub fn proven_receiver_shape(&self) -> Option<bool> {
+        if self.coverage != CandidateCoverage::Exhaustive {
+            return None;
+        }
+        if self.candidates.is_empty() {
+            return match self.boundaries.as_ref() {
+                [boundary] => boundary.proven_external_receiver_shape(),
+                _ => None,
+            };
+        }
+        if !self.boundaries.is_empty() {
+            return None;
+        }
+
+        let shape = |candidate: &DispatchCandidate| {
+            if !matches!(candidate.proof(), ProofStatus::Proven)
+                || !matches!(candidate.completeness(), EvidenceCompleteness::Complete)
+                || candidate.target().artifact().key().language()
+                    != SemanticLanguage::Standard(Language::Go)
+            {
+                return None;
+            }
+            match candidate.target().semantics().kind() {
+                ProcedureKind::Method => Some(true),
+                ProcedureKind::Function | ProcedureKind::LocalFunction | ProcedureKind::Lambda => {
+                    Some(false)
+                }
+                _ => None,
+            }
+        };
+        let first = shape(self.candidates.first()?)?;
+        self.candidates
+            .iter()
+            .all(|candidate| shape(candidate) == Some(first))
+            .then_some(first)
     }
 
     pub(crate) fn into_parts(

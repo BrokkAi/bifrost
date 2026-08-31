@@ -35,10 +35,11 @@ pub enum ExtensionPersistenceMode {
 
 /// Evidence of the persistence decision one open actually made.
 ///
-/// `engaged` reports what the built store is, not what the caller asked for:
-/// the engine degrades a persisted request to an in-memory store when the
-/// project offers no persistence root, and that degradation must be visible
-/// as data rather than inferred from timing.
+/// `engaged` reports what the built store is, not what the caller asked for, so
+/// a host reads the decision as data instead of inferring it from timing. The
+/// engine no longer degrades: a persisted request over a project with no
+/// persistence root fails the open with a guided error, so a successful
+/// persisted open always reports `Persisted` and a `cache_db`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtensionStoreReport {
     pub requested: ExtensionPersistenceMode,
@@ -48,7 +49,9 @@ pub struct ExtensionStoreReport {
     /// worktree this is the primary checkout's shared database.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_db: Option<Box<str>>,
-    /// Degradation record; empty whenever `engaged` matches `requested`.
+    /// Degradation record. Retained for wire stability and always empty now
+    /// that the engine fails a persisted request it cannot honor instead of
+    /// quietly serving an in-memory store.
     pub diagnostics: Box<[ExtensionDiagnostic]>,
 }
 
@@ -235,7 +238,7 @@ impl ExtensionWorkspace {
         let project: Arc<dyn Project> = Arc::new(frozen.snapshot());
         let (analyzer, build_tier_access) = match options.persistence {
             ExtensionPersistenceMode::Ephemeral => {
-                WorkspaceAnalyzer::build_ephemeral_with_tier_access(
+                WorkspaceAnalyzer::build_ephemeral_with_tier_access_footgun(
                     Arc::clone(&project),
                     options.analyzer_config.clone(),
                 )
@@ -254,29 +257,24 @@ impl ExtensionWorkspace {
             }
         };
         // Report the store the build actually produced rather than echoing the
-        // request: a persisted request against a project with no persistence
-        // root degrades to the in-memory store inside the engine, and that
-        // decision must surface here as data.
-        let store = match (options.persistence, analyzer.persisted_store_path()) {
-            (requested, Some(path)) => ExtensionStoreReport {
-                requested,
-                engaged: ExtensionPersistenceMode::Persisted,
-                cache_db: Some(path.to_string_lossy().into_owned().into_boxed_str()),
-                diagnostics: Box::new([]),
-            },
-            (ExtensionPersistenceMode::Persisted, None) => ExtensionStoreReport {
-                requested: ExtensionPersistenceMode::Persisted,
-                engaged: ExtensionPersistenceMode::Ephemeral,
-                cache_db: None,
-                diagnostics: Box::new([ExtensionDiagnostic {
-                    code: "store.persistence_unavailable".into(),
-                    message: "workspace offers no persistence root; \
-                              the engine degraded to an in-memory store"
-                        .into(),
-                    source: None,
-                }]),
-            },
-            (ExtensionPersistenceMode::Ephemeral, None) => ExtensionStoreReport {
+        // request, so the persistence decision surfaces as data. The engine is
+        // strict: a persisted build that cannot find a persistence root errors
+        // out above rather than returning an in-memory store, so a persisted
+        // request that got here has a store path.
+        let store = match options.persistence {
+            ExtensionPersistenceMode::Persisted => {
+                let path = analyzer.persisted_store_path().expect(
+                    "a persisted build reaching here has a store path: the engine rejects a \
+                     persisted request over a project with no persistence root",
+                );
+                ExtensionStoreReport {
+                    requested: ExtensionPersistenceMode::Persisted,
+                    engaged: ExtensionPersistenceMode::Persisted,
+                    cache_db: Some(path.to_string_lossy().into_owned().into_boxed_str()),
+                    diagnostics: Box::new([]),
+                }
+            }
+            ExtensionPersistenceMode::Ephemeral => ExtensionStoreReport {
                 requested: ExtensionPersistenceMode::Ephemeral,
                 engaged: ExtensionPersistenceMode::Ephemeral,
                 cache_db: None,

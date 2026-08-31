@@ -1312,6 +1312,7 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
         let flow_relation_step = op_label == Some("flow_relations_of");
         let rewrite_path_step = op_label == Some("rewrite_paths_of");
         let control_relation_step = op_label == Some("control_relations");
+        let failure_use_step = op_label == Some("result_contract_failure_uses");
         let mut seen_op = false;
         let mut seen_depth = false;
         let mut seen_transitive = false;
@@ -1733,6 +1734,10 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
                         inner @ (QueryStepField::ControlRelations
                         | QueryStepField::ControlExitPartitions),
                     ) if control_relation_step => Some(inner),
+                    Some(
+                        inner @ (QueryStepField::FailureUseProvenances
+                        | QueryStepField::FailureUseConsumers),
+                    ) if failure_use_step => Some(inner),
                     _ => None,
                 };
             if let Some(constrained_field) = constrained_field {
@@ -1902,6 +1907,12 @@ fn validate_json_steps(value: &spanned::Value, path: &str, analysis: &mut Analys
                                     candidate,
                                     QueryStepField::ControlRelations
                                         | QueryStepField::ControlExitPartitions
+                                ))
+                            || (failure_use_step
+                                && matches!(
+                                    candidate,
+                                    QueryStepField::FailureUseProvenances
+                                        | QueryStepField::FailureUseConsumers
                                 ))
                     })
                     .map(|candidate| (candidate.label().to_string(), candidate.label().to_string()))

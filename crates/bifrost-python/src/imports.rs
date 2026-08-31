@@ -638,6 +638,59 @@ pub fn resolve_imports_batched(
         .collect()
 }
 
+/// Resolve Python imports to the workspace files whose modules they execute.
+///
+/// A file dependency graph does not need declaration binding: for
+/// `from pkg import member`, the dependency on `pkg` exists whether `member`
+/// is a local declaration, a re-export, or an optional external name. When
+/// `member` is itself the workspace submodule `pkg.member`, that file is a
+/// dependency too. Resolve both module spellings from the path-backed module
+/// index in one batch and deliberately avoid the exact-definition fallbacks
+/// used by [`resolve_imports_batched`].
+pub fn resolve_import_files_batched(
+    python: &dyn PythonSource,
+    file: &ProjectFile,
+    imports: &[ImportInfo],
+) -> HashSet<ProjectFile> {
+    let mut module_fqns = Vec::new();
+    for import in imports {
+        match python_import_details(import) {
+            Some(PythonImportDetails::Import { module, .. }) => module_fqns.push(module),
+            Some(PythonImportDetails::FromImport {
+                module,
+                name,
+                wildcard,
+                ..
+            }) => {
+                let resolved_module = if module.starts_with('.') {
+                    resolve_python_relative_module(file, &module)
+                } else {
+                    Some(module)
+                };
+                let Some(resolved_module) = resolved_module else {
+                    continue;
+                };
+                if !wildcard {
+                    module_fqns.push(format!("{resolved_module}.{name}"));
+                }
+                module_fqns.push(resolved_module);
+            }
+            None => {}
+        }
+    }
+    module_fqns.sort();
+    module_fqns.dedup();
+
+    python
+        .path_module_fqns_batch(&module_fqns)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(CodeUnit::is_module)
+        .map(|unit| unit.source().clone())
+        .collect()
+}
+
 /// The module FQN `resolve_import`'s fast path checks first, if any -- must stay in sync with the
 /// two `resolve_module_code_unit` call sites in `resolve_import_with_hint` below, since it's what
 /// lets `resolve_import_target_files` batch-resolve them ahead of the serial fallback logic.

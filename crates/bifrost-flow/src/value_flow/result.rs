@@ -133,9 +133,10 @@ impl ValueFlowSummaryResult {
         // accepting authored-complete external summaries closes it.
         let proven_by_authored_summaries = !discovery_complete
             && plan.execution_result_complete_accepting_authored_summaries(&result);
-        // Record what proved a residual-arm closure only when such a closure
-        // decided the run (#2342). A derived-complete run closed nothing this
-        // way, and a run that stayed inconclusive concluded nothing to explain.
+        // Record what proved an authored boundary closure only when such a
+        // closure decided the run (#2342). A derived-complete run closed nothing
+        // this way, and a run that stayed inconclusive concluded nothing to
+        // explain.
         let authored_arm_closures = if proven_by_authored_summaries {
             plan.authored_arm_closures(&result).into_boxed_slice()
         } else {
@@ -170,8 +171,8 @@ impl ValueFlowSummaryResult {
         self.proven_by_authored_summaries
     }
 
-    /// The authored external summaries that closed a residual dispatch arm in
-    /// this run (#2342), so a consumer can state what proved the closure.
+    /// The authored external summaries that closed a dispatch boundary in this
+    /// run (#2342), so a consumer can state what proved the closure.
     /// Empty unless `is_proven_by_authored_summaries` holds.
     pub fn authored_arm_closures(&self) -> &[AuthoredArmClosure] {
         &self.authored_arm_closures
@@ -208,6 +209,6 @@ impl ValueFlowSummaryResult {
             return Err(SummaryWitnessError::TargetNotInResult);
         }
         self.result
-            .witness_for_reached_index(meeting.reached_index, quality, limits)
+            .witness_for_reached_index(meeting.reached_index, quality, 0, limits)
     }
 }

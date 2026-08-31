@@ -7,7 +7,9 @@ use crate::analyzer::semantic_model::{
     ResolvedDependencyArtifact, SemanticModelActivationEvidence,
 };
 use crate::analyzer::topology::DependencyScope;
-use crate::analyzer::{GoAnalyzerConfig, GoDependencyDiscoveryConfig, Project};
+use crate::analyzer::{
+    GoAnalyzerConfig, GoDependencyDiscoveryConfig, GoDependencyDiscoveryMode, Project,
+};
 use crate::process::{BoundedProcessRequest, run_bounded_process};
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -169,7 +171,7 @@ fn resolve_with_runner(
     runner: &dyn GoCommandRunner,
 ) -> DependencyDiscoveryOutcome {
     let discovery = &config.dependency_discovery;
-    if !discovery.enabled {
+    if discovery.mode == GoDependencyDiscoveryMode::Disabled {
         return DependencyDiscoveryOutcome::complete(Vec::new());
     }
     if let Err(error) = validate_config(discovery) {
@@ -237,6 +239,7 @@ fn resolve_with_runner(
     let mut list_args = vec![
         OsString::from("list"),
         OsString::from("-deps"),
+        OsString::from("-test"),
         OsString::from("-json"),
         OsString::from("-e"),
         OsString::from(if vendor {
@@ -277,6 +280,18 @@ fn resolve_with_runner(
             return failed_outcome("go.list_invalid_json", error, cancellation, limits);
         }
     };
+    if discovery.mode == GoDependencyDiscoveryMode::CuratedPackEvidence {
+        return build_curated_pack_evidence_outcome(
+            packages,
+            &environment,
+            goos,
+            goarch,
+            discovery,
+            vendor,
+            limits,
+        );
+    }
+    debug_assert_eq!(discovery.mode, GoDependencyDiscoveryMode::FullProduction);
     if packages.iter().any(|package| {
         package.cgo_files.is_empty()
             && package.ignored_go_files.iter().any(|path| {
@@ -330,14 +345,128 @@ fn resolve_with_runner(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+fn build_curated_pack_evidence_outcome(
+    packages: Vec<GoPackage>,
+    environment: &GoEnvironment,
+    goos: &str,
+    goarch: &str,
+    config: &GoDependencyDiscoveryConfig,
+    vendor: bool,
+    limits: &DependencyPackLimits,
+) -> DependencyDiscoveryOutcome {
+    let mut modules = BTreeMap::new();
+    let mut diagnostics = Vec::new();
+    for package in packages {
+        if let Some(error) = &package.error {
+            diagnostics.push(error_diagnostic(
+                "go.package_incomplete",
+                Some(package.import_path.clone()),
+                format!(
+                    "Go package {} is incomplete: {}",
+                    package.import_path, error.err
+                ),
+                limits,
+            ));
+        } else if package.incomplete {
+            diagnostics.push(error_diagnostic(
+                "go.package_incomplete",
+                Some(package.import_path.clone()),
+                format!("Go package {} is incomplete", package.import_path),
+                limits,
+            ));
+        }
+        if package.module.as_ref().is_some_and(|module| module.main) {
+            continue;
+        }
+        if package.standard {
+            continue;
+        }
+        let Some(module) = package.module else {
+            diagnostics.push(error_diagnostic(
+                "go.module_missing",
+                Some(package.import_path.clone()),
+                format!("Go package {} has no module metadata", package.import_path),
+                limits,
+            ));
+            continue;
+        };
+        modules.entry(module_id(&module)).or_insert(module);
+    }
+
+    let target = format!(
+        "go-{}-{}",
+        goos.to_ascii_lowercase(),
+        goarch.to_ascii_lowercase()
+    );
+    let configuration = configuration_identity(config, vendor);
+    let toolchain = CatalogCoordinate {
+        name: "go".to_owned(),
+        version: go_version(&environment.goversion),
+    };
+    let mut dependencies = modules
+        .into_iter()
+        .map(|(module_id, module)| ResolvedDependency {
+            id: format!("go:curated:{module_id}"),
+            evidence: SemanticModelActivationEvidence {
+                language: "go".to_owned(),
+                ecosystem: "go-module".to_owned(),
+                package: None,
+                module: Some(CatalogCoordinate {
+                    name: module.path.clone(),
+                    version: module_version(&module.version),
+                }),
+                toolchain: Some(toolchain.clone()),
+                target: Some(target.clone()),
+                configuration: Some(configuration.clone()),
+                artifact_sha256: None,
+            },
+            provenance: module_provenance(&module),
+            artifacts: Vec::new(),
+            scope: DependencyScope::Unknown,
+            declared_by: None,
+        })
+        .collect::<Vec<_>>();
+
+    let mut suppressed_diagnostics = 0;
+    if dependencies.len() > limits.max_dependencies {
+        suppressed_diagnostics += dependencies.len() - limits.max_dependencies;
+        dependencies.truncate(limits.max_dependencies);
+        diagnostics.push(error_diagnostic(
+            "limit.dependencies",
+            None,
+            format!(
+                "Go dependency discovery exceeded the configured limit {}",
+                limits.max_dependencies
+            ),
+            limits,
+        ));
+    }
+    if diagnostics.len() > limits.max_diagnostics {
+        suppressed_diagnostics += diagnostics.len() - limits.max_diagnostics;
+        diagnostics.truncate(limits.max_diagnostics);
+    }
+    DependencyDiscoveryOutcome {
+        profile: DependencyDiscoveryProfile {
+            metadata_inputs_considered: 2,
+            dependencies_resolved: dependencies.len(),
+        },
+        dependencies,
+        complete: diagnostics.is_empty() && suppressed_diagnostics == 0,
+        diagnostics,
+        suppressed_diagnostics,
+        cancelled: false,
+    }
+}
+
 fn hardened_environment(config: &GoDependencyDiscoveryConfig) -> Vec<(OsString, OsString)> {
-    let mut env = reviewed_host_environment();
+    let mut env = reviewed_host_environment(|name| std::env::var_os(name));
     env.extend([
         os_env("GOTOOLCHAIN", "local"),
         os_env("GOPROXY", "off"),
         os_env("GOSUMDB", "off"),
         os_env("GOENV", "off"),
-        os_env("GOFLAGS", ""),
+        os_env("GOFLAGS", "-buildvcs=false"),
         os_env("CGO_ENABLED", "0"),
     ]);
     if let Some(path) = &config.gopath {
@@ -407,11 +536,15 @@ fn target_environment(
     env
 }
 
-fn reviewed_host_environment() -> Vec<(OsString, OsString)> {
+fn reviewed_host_environment(
+    mut value: impl FnMut(&str) -> Option<OsString>,
+) -> Vec<(OsString, OsString)> {
     [
         "PATH",
         "HOME",
         "USERPROFILE",
+        "LOCALAPPDATA",
+        "GOCACHE",
         "TMPDIR",
         "TEMP",
         "TMP",
@@ -419,7 +552,7 @@ fn reviewed_host_environment() -> Vec<(OsString, OsString)> {
         "WINDIR",
     ]
     .into_iter()
-    .filter_map(|name| std::env::var_os(name).map(|value| (OsString::from(name), value)))
+    .filter_map(|name| value(name).map(|value| (OsString::from(name), value)))
     .collect()
 }
 
@@ -1065,7 +1198,9 @@ fn cancelled_outcome() -> DependencyDiscoveryOutcome {
 mod tests {
     use super::*;
     use crate::analyzer::semantic_model::ResolvedDependencyArtifactInput;
-    use crate::analyzer::{GoAnalyzerConfig, GoDependencyDiscoveryConfig};
+    use crate::analyzer::{
+        GoAnalyzerConfig, GoDependencyDiscoveryConfig, GoDependencyDiscoveryMode,
+    };
     use crate::analyzer::{Language, TestProject};
     use std::cell::RefCell;
     use std::collections::VecDeque;
@@ -1104,7 +1239,7 @@ mod tests {
     fn config() -> GoAnalyzerConfig {
         GoAnalyzerConfig {
             dependency_discovery: GoDependencyDiscoveryConfig {
-                enabled: true,
+                mode: GoDependencyDiscoveryMode::FullProduction,
                 go_executable: Some(PathBuf::from("configured-go")),
                 workspace_patterns: vec!["./cmd/...".to_owned()],
                 gopath: None,
@@ -1148,6 +1283,8 @@ mod tests {
         assert_eq!(invocations.len(), 2);
         assert_eq!(invocations[0].args[0], "env");
         assert_eq!(invocations[1].args[0], "list");
+        assert!(invocations[1].args.iter().any(|arg| arg == "-deps"));
+        assert!(invocations[1].args.iter().any(|arg| arg == "-test"));
         assert!(invocations[1].args.iter().any(|arg| arg == "-mod=readonly"));
         assert!(
             invocations[1]
@@ -1160,9 +1297,130 @@ mod tests {
         assert_eq!(env.get(OsStr::new("GOPROXY")).unwrap(), "off");
         assert_eq!(env.get(OsStr::new("GOSUMDB")).unwrap(), "off");
         assert_eq!(env.get(OsStr::new("GOENV")).unwrap(), "off");
+        assert_eq!(env.get(OsStr::new("GOFLAGS")).unwrap(), "-buildvcs=false");
         assert_eq!(env.get(OsStr::new("CGO_ENABLED")).unwrap(), "0");
         assert_eq!(env.get(OsStr::new("GOOS")).unwrap(), "linux");
         assert_eq!(env.get(OsStr::new("GOARCH")).unwrap(), "arm64");
+    }
+
+    #[test]
+    fn hardened_environment_preserves_host_go_cache_locations() {
+        let env = reviewed_host_environment(|name| match name {
+            "LOCALAPPDATA" => Some(OsString::from(r"C:\Users\runner\AppData\Local")),
+            "GOCACHE" => Some(OsString::from(r"D:\go-build")),
+            "UNREVIEWED_SECRET" => Some(OsString::from("must-not-pass")),
+            _ => None,
+        })
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(
+            env.get(OsStr::new("LOCALAPPDATA")),
+            Some(&OsString::from(r"C:\Users\runner\AppData\Local"))
+        );
+        assert_eq!(
+            env.get(OsStr::new("GOCACHE")),
+            Some(&OsString::from(r"D:\go-build"))
+        );
+        assert!(!env.contains_key(OsStr::new("UNREVIEWED_SECRET")));
+    }
+
+    #[test]
+    fn curated_evidence_keeps_only_exact_reachable_modules_without_sources() {
+        let temporary = tempfile::tempdir().unwrap();
+        let project = TestProject::new(temporary.path(), Language::Go);
+        let package_stream = format!(
+            "{}\n{}\n{}\n{}\n",
+            serde_json::json!({
+                "ImportPath": "net",
+                "Standard": true,
+                "IgnoredGoFiles": ["cgo_linux.go"]
+            }),
+            serde_json::json!({
+                "ImportPath": "example.com/main",
+                "Module": { "Path": "example.com/main", "Main": true }
+            }),
+            serde_json::json!({
+                "ImportPath": "github.com/stretchr/testify/require",
+                "Module": {
+                    "Path": "github.com/stretchr/testify",
+                    "Version": "v1.11.1",
+                    "Sum": "h1:reviewed"
+                }
+            }),
+            serde_json::json!({
+                "ImportPath": "github.com/stretchr/testify/assert",
+                "Module": {
+                    "Path": "github.com/stretchr/testify",
+                    "Version": "v1.11.1",
+                    "Sum": "h1:reviewed"
+                }
+            })
+        )
+        .into_bytes();
+        let runner = FakeRunner::with_outputs([environment(temporary.path()), package_stream]);
+        let mut config = config();
+        config.dependency_discovery.mode = GoDependencyDiscoveryMode::CuratedPackEvidence;
+        let outcome = resolve_with_runner(
+            &config,
+            &project,
+            &DependencyPackLimits::default(),
+            None,
+            &runner,
+        );
+
+        assert!(outcome.complete, "{:?}", outcome.diagnostics);
+        assert_eq!(runner.invocations.borrow().len(), 2);
+        assert_eq!(outcome.dependencies.len(), 1);
+        let dependency = &outcome.dependencies[0];
+        assert_eq!(
+            dependency.id,
+            "go:curated:github.com/stretchr/testify@v1.11.1"
+        );
+        assert!(dependency.artifacts.is_empty());
+        assert_eq!(
+            dependency.evidence.module,
+            Some(CatalogCoordinate {
+                name: "github.com/stretchr/testify".to_owned(),
+                version: Some(Version::new(1, 11, 1)),
+            })
+        );
+        assert!(
+            dependency
+                .provenance
+                .iter()
+                .any(|fact| { fact.key == "module.sum" && fact.value == "h1:reviewed" })
+        );
+    }
+
+    #[test]
+    fn curated_evidence_reports_incomplete_workspace_packages() {
+        let temporary = tempfile::tempdir().unwrap();
+        let project = TestProject::new(temporary.path(), Language::Go);
+        let package_stream = serde_json::to_vec(&serde_json::json!({
+            "ImportPath": "example.com/main",
+            "Incomplete": true,
+            "Error": { "Err": "cannot find module providing package example.com/missing" },
+            "Module": { "Path": "example.com/main", "Main": true }
+        }))
+        .unwrap();
+        let runner = FakeRunner::with_outputs([environment(temporary.path()), package_stream]);
+        let mut config = config();
+        config.dependency_discovery.mode = GoDependencyDiscoveryMode::CuratedPackEvidence;
+        let outcome = resolve_with_runner(
+            &config,
+            &project,
+            &DependencyPackLimits::default(),
+            None,
+            &runner,
+        );
+
+        assert!(!outcome.complete);
+        assert!(outcome.dependencies.is_empty());
+        assert!(outcome.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "go.package_incomplete"
+                && diagnostic.message.contains("example.com/missing")
+        }));
     }
 
     #[test]

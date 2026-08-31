@@ -291,6 +291,19 @@ impl LanguageDialect {
         }
     }
 
+    /// Language identity used to select semantic-pack content.
+    ///
+    /// TSX needs its own durable dialect identity for parsing and indexed
+    /// artifacts, but TypeScript procedure summaries describe the same runtime
+    /// APIs in `.ts` and `.tsx` files. Keep the dialect label everywhere else
+    /// and fold it only at the semantic-pack boundary.
+    pub fn semantic_pack_label(self) -> &'static str {
+        match self {
+            Self::TypeScriptTsx => Language::TypeScript.config_label(),
+            Self::Standard(_) | Self::CppC => self.stable_label(),
+        }
+    }
+
     /// Short user-facing configuration label retained by Rune IR and the CLI.
     pub fn config_label(self) -> &'static str {
         match self {
@@ -319,6 +332,28 @@ impl From<Language> for LanguageDialect {
 impl fmt::Display for LanguageDialect {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.stable_label())
+    }
+}
+
+#[cfg(test)]
+mod language_dialect_tests {
+    use super::*;
+
+    #[test]
+    fn semantic_pack_identity_folds_only_typescript_tsx() {
+        assert_eq!(
+            LanguageDialect::TypeScriptTsx.stable_label(),
+            "typescript-tsx"
+        );
+        assert_eq!(
+            LanguageDialect::TypeScriptTsx.semantic_pack_label(),
+            "typescript"
+        );
+        assert_eq!(
+            LanguageDialect::Standard(Language::TypeScript).semantic_pack_label(),
+            "typescript"
+        );
+        assert_eq!(LanguageDialect::CppC.semantic_pack_label(), "cpp-c");
     }
 }
 
@@ -416,7 +451,7 @@ pub struct CallableArity {
 }
 
 impl CallableArity {
-    pub fn new(required: usize, total: usize, repeated: bool) -> Self {
+    pub const fn new(required: usize, total: usize, repeated: bool) -> Self {
         Self {
             required,
             total,
@@ -428,7 +463,7 @@ impl CallableArity {
         Self::new(arity, arity, false)
     }
 
-    pub fn accepts(self, arity: usize) -> bool {
+    pub const fn accepts(self, arity: usize) -> bool {
         arity >= self.required && (self.repeated || arity <= self.total)
     }
 
@@ -2529,6 +2564,23 @@ impl ProjectFile {
 
     pub fn rel_path(&self) -> &Path {
         &self.0.rel_path
+    }
+
+    /// Conservative retained allocation for one owned file identity.
+    ///
+    /// This includes the handle, both `Arc` allocation headers, the private
+    /// identity payload, and the owned path buffers. The interned root is
+    /// deliberately counted for every file: callers may deduplicate it when
+    /// they retain a whole workspace set, but repeated accounting is safe and
+    /// avoids undercounting when this handle is the last non-interner owner.
+    pub fn retained_bytes(&self) -> usize {
+        const ARC_HEADER_BYTES: usize = 2 * std::mem::size_of::<usize>();
+        std::mem::size_of::<Self>()
+            .saturating_add(ARC_HEADER_BYTES)
+            .saturating_add(std::mem::size_of::<ProjectFileInner>())
+            .saturating_add(self.0.rel_path.capacity())
+            .saturating_add(ARC_HEADER_BYTES)
+            .saturating_add(self.0.root.as_os_str().len())
     }
 
     pub fn abs_path(&self) -> PathBuf {
@@ -4737,6 +4789,25 @@ mod project_file_identity_tests {
         assert!(std::ptr::eq(file.root(), sibling.root()));
         assert_eq!(sibling, ProjectFile::new(root, "src/a/mod.rs"));
         assert_eq!(sibling.rel_path(), Path::new("src/a/mod.rs"));
+    }
+
+    #[test]
+    fn retained_bytes_accounts_for_owned_path_storage() {
+        let root = absolute_root("identity-retained-bytes");
+        let short = ProjectFile::new(root.clone(), "a.go");
+        let long_rel = format!("src/{}/subject.go", "nested".repeat(128));
+        let long = ProjectFile::new(root, &long_rel);
+
+        assert!(
+            short.retained_bytes()
+                >= std::mem::size_of::<ProjectFile>()
+                    .saturating_add(short.root().as_os_str().len())
+                    .saturating_add(short.rel_path().as_os_str().len())
+        );
+        assert!(
+            long.retained_bytes() >= short.retained_bytes().saturating_add(long_rel.len() / 2),
+            "long owned paths must materially increase retained accounting"
+        );
     }
 
     /// Files from two workspaces meet in one process -- a multi-root MCP

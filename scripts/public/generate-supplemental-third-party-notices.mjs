@@ -23,6 +23,7 @@ const auditedLinksPackages = new Set([
   "pyo3",
   "pyo3-ffi",
   "rayon-core",
+  "ring",
   "tree-sitter",
   "tree-sitter-language",
   "wasm-bindgen-shared",

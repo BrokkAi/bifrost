@@ -26,7 +26,12 @@ rayon = "1.10.0"
 # `backup` carries a cache store forward across schema versions: it copies a
 # live source through SQLite rather than the filesystem, so committed pages
 # sitting in the source's `-wal` sidecar come along (issue #1589).
-rusqlite = { version = "0.32.1", features = ["bundled", "backup"] }
+rusqlite = { version = "0.40.2", default-features = false, features = [
+    "backup",
+    "bundled",
+    "cache",
+    "fallible_uint",
+] }
 rustc-hash = "2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"

@@ -15,11 +15,19 @@ use brokk_bifrost_python::declarations::python_module_name;
 use brokk_bifrost_python::graph_support::extract_type_identifiers;
 use brokk_bifrost_python::imports::{
     PythonImportDetails, extract_package_from_python_wildcard, python_import_details,
-    resolve_import_bindings, resolve_imports_batched, resolve_python_relative_module,
+    resolve_import_bindings, resolve_import_files_batched, resolve_imports_batched,
+    resolve_python_relative_module,
 };
 use std::sync::Arc;
 
 impl ImportAnalysisProvider for PythonAnalyzer {
+    fn file_dependency_facts_for_files(
+        &self,
+        files: &[ProjectFile],
+    ) -> Option<crate::hash::HashMap<ProjectFile, crate::analyzer::FileDependencyFacts>> {
+        Some(self.inner.bulk_file_dependency_facts(files.iter().cloned()))
+    }
+
     fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();
@@ -75,6 +83,14 @@ impl ImportAnalysisProvider for PythonAnalyzer {
                 .map(|(_, code_unit)| code_unit)
                 .collect(),
         ))
+    }
+
+    fn imported_files_from_infos(
+        &self,
+        file: &ProjectFile,
+        imports: &[ImportInfo],
+    ) -> Option<HashSet<ProjectFile>> {
+        Some(resolve_import_files_batched(self, file, imports))
     }
 
     /// Without this, `scan_usages` falls back to `import_info_of` one file at

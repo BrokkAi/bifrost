@@ -51,6 +51,7 @@ pub fn declared_names(node: Node<'_>, source: &str) -> Vec<String> {
         }
         "var_spec" => var_spec_names(node, source),
         "short_var_declaration" => lhs_identifiers(node, source),
+        "range_clause" => range_clause_binding_names(node, source),
         _ => Vec::new(),
     }
 }
@@ -149,6 +150,17 @@ pub fn identifiers_in_node(node: Node<'_>, source: &str) -> Vec<String> {
     }
     out
 }
+/// Whether `node` is one of the clause forms whose `statement_list` owns an
+/// implicit Go lexical scope. Keeping this grammar predicate shared prevents
+/// the forward, inverted, and reference scans from assigning different scope
+/// to expression-switch, type-switch, or select bodies.
+pub fn is_clause(node: Node<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "expression_case" | "type_case" | "communication_case" | "default_case"
+    )
+}
+
 /// Names introduced for one Go switch/select clause. The caller is responsible
 /// for limiting their scope to the clause's `statement_list`.
 pub fn clause_binding_names(node: Node<'_>, source: &str) -> Vec<String> {
@@ -181,9 +193,28 @@ pub fn clause_binding_names(node: Node<'_>, source: &str) -> Vec<String> {
 }
 
 pub fn receive_statement_is_short_declaration(node: Node<'_>) -> bool {
-    node.kind() == "receive_statement"
-        && (0..node.child_count())
-            .any(|index| node.child(index).is_some_and(|child| child.kind() == ":="))
+    node.kind() == "receive_statement" && has_short_declaration_token(node)
+}
+
+pub fn range_clause_is_short_declaration(node: Node<'_>) -> bool {
+    node.kind() == "range_clause" && has_short_declaration_token(node)
+}
+
+pub fn range_clause_binding_names(node: Node<'_>, source: &str) -> Vec<String> {
+    if !range_clause_is_short_declaration(node) {
+        return Vec::new();
+    }
+    let Some(left) = node.child_by_field_name("left") else {
+        return Vec::new();
+    };
+    identifiers_in_node(left, source)
+        .into_iter()
+        .filter(|name| name != "_")
+        .collect()
+}
+
+fn has_short_declaration_token(node: Node<'_>) -> bool {
+    (0..node.child_count()).any(|index| node.child(index).is_some_and(|child| child.kind() == ":="))
 }
 
 pub fn is_clause_binding_identifier(node: Node<'_>) -> bool {

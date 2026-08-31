@@ -501,6 +501,7 @@ pub struct CodeQueryReceiverEvidence {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub site_ast_id: Option<String>,
     pub path: String,
+    pub range: CodeQueryRange,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_evidence_id: Option<String>,
     pub ordinal: usize,
@@ -512,6 +513,10 @@ pub struct CodeQueryReceiverEvidence {
     pub declaration_fq_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub declaration_kind: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pack_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub factory_id: Option<String>,
     pub proof: &'static str,
@@ -531,9 +536,12 @@ pub struct CodeQueryCallShape {
     pub range: CodeQueryRange,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub callee_range: Option<CodeQueryRange>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callee_name: Option<String>,
     pub call_kind: &'static str,
     pub coverage: &'static str,
     pub group_count: usize,
+    pub argument_count: usize,
 }
 
 /// One ordered argument-list group of a call shape.
@@ -611,6 +619,10 @@ pub struct CodeQueryCallBinding {
     /// unset rather than inventing or comparing names.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub semantic_target_id: Option<String>,
+    /// Whether the declared target came from an indexed source declaration or
+    /// an activated semantic-model overlay.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_origin: Option<&'static str>,
     /// The dispatch oracle's outcome for this call range.
     pub dispatch_outcome: &'static str,
     /// The dispatch oracle's candidate-set coverage.
@@ -623,6 +635,36 @@ pub struct CodeQueryCallBinding {
     /// Retained dispatch arms and whether the oracle hit its target bound.
     pub dispatch_target_count: usize,
     pub dispatch_targets_truncated: bool,
+    /// Exact endpoint-selection proof, deliberately separate from the runtime
+    /// dispatch fields above. Authored-summary exactness preserves its summary
+    /// record and active-pack provenance on the fields below.
+    pub selector_exact: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selector_proof: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selector_summary_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selector_summary_model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selector_summary_pack_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selector_summary_active_set_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selector_summary_pack_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selector_summary_pack_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selector_summary_record_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selector_summary_origin: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selector_summary_model_proof: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selector_summary_completeness: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selector_summary_producer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selector_summary_producer_version: Option<String>,
     /// The `callable_signature` row this binding selects: the target's only
     /// published entry, or the entry of a multi-entry set whose declared arity
     /// accepts this call. Absent when entries with different parameter lists
@@ -633,9 +675,46 @@ pub struct CodeQueryCallBinding {
     /// when this row is model-backed rather than source-materialized.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
+    /// Stable identity of the type that owns an established receiver. An
+    /// exact model owner takes precedence; otherwise this is the source
+    /// declaration identity. This is absent for static, unestablished, and
+    /// terminal rows; it is never a qualified or display name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receiver_type_id: Option<String>,
     /// Activated semantic-pack provenance for a model-backed target.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pack_id: Option<String>,
+    /// Scalar provenance copied from the activated semantic-model record. The
+    /// fields stay separate so policies can inspect evidence without parsing
+    /// an opaque JSON object.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_active_set_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_pack_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_pack_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_record_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_activation_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_activation_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_activation_source_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_activation_source_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_origin: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_proof: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_completeness: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_ambiguous: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_producer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_producer_version: Option<String>,
     /// The actual's position inside its own argument-list group.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub actual_index: Option<usize>,
@@ -748,6 +827,193 @@ pub struct CodeQueryCallEffect {
     /// Arms a unique activated summary modeled.
     pub modeled_arm_count: usize,
     pub terminal: bool,
+}
+
+/// One reviewed condition that must be established before a normal call result
+/// is valid to consume. A condition may be carried by another result or stated
+/// directly by `result_success_predicate`. At least one row exists per call
+/// shape; terminal rows carry no ordinals or predicates and state why no
+/// contract was established.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryCallResultContract {
+    pub id: String,
+    pub site_id: String,
+    pub site_ast_id: String,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callee: Option<CodeQueryDeclaration>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callee_symbol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_ordinal: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub condition_result_ordinal: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub predicate: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_success_predicate: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proof: Option<&'static str>,
+    pub coverage: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pack_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary_id: Option<String>,
+    pub arm_count: usize,
+    pub modeled_arm_count: usize,
+    pub terminal: bool,
+    /// Exact when `use_validation_coverage` is `exhaustive`; under `open`
+    /// coverage this is a lower bound over structured observations retained in
+    /// the snapshot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_use_count: Option<usize>,
+    /// Exact when `use_validation_coverage` is `exhaustive`; under `open`
+    /// coverage this is a lower bound over observed uses proved unguarded in
+    /// the retained control-flow graph.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unguarded_result_use_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub use_validation: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub use_validation_coverage: Option<&'static str>,
+    /// Exact normalized guard edges that establish the reviewed result
+    /// predicate. This excludes model-backed normal-return refinements, whose
+    /// activation is a call boundary rather than an intraprocedural edge.
+    pub success_guard_count: usize,
+    /// Whether every modeled dispatch arm declares a fresh allocation at the
+    /// validated result ordinal.
+    pub fresh_allocation: bool,
+    /// Reviewed members carried by this result. Public JSON reports the count;
+    /// the typed records remain snapshot-local policy composition evidence.
+    pub member_contract_count: usize,
+    #[serde(skip)]
+    pub member_contracts: Vec<crate::analyzer::semantic_model::CompiledResultMemberContract>,
+    /// Coverage of the exact success-guard relation. This is typed,
+    /// snapshot-local policy evidence rather than public query vocabulary.
+    #[serde(skip)]
+    pub success_guard_coverage: Option<crate::analyzer::usages::effects::EffectCoverage>,
+    /// Non-retaining, lifetime-independent semantic locators for policy
+    /// composition. They are bound to exact frozen artifact contents, so an
+    /// independently allocated equivalent artifact can resolve them.
+    /// Public query JSON exposes only `success_guard_count`; policy consumers
+    /// resolve these locators against the matching immutable workspace
+    /// snapshot before using the dense edge IDs.
+    #[serde(skip)]
+    pub success_guard_edges: Vec<crate::analyzer::semantic::ControlEdgeLocator>,
+    /// Positioned partial-positive guard evidence. Exact edges remain in
+    /// `success_guard_edges` because result-use validation depends on that
+    /// exact relation; policy composition may consult these locators when the
+    /// guard relation's coverage is open.
+    #[serde(skip)]
+    pub possible_success_guard_edges: Vec<crate::analyzer::semantic::ControlEdgeLocator>,
+}
+
+/// One exact operation on a protected result, anchored at the operation rather
+/// than at the call that acquired the result.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryResultContractUse {
+    pub id: String,
+    pub acquisition_id: String,
+    pub acquisition_site_id: String,
+    pub acquisition_site_ast_id: String,
+    pub operation_point_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation_site_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation_site_ast_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ast_id: Option<String>,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub result_ordinal: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub condition_result_ordinal: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acquisition_predicate: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_success_predicate: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required_predicate: Option<&'static str>,
+    pub use_kind: &'static str,
+    pub timing: &'static str,
+    pub applicability: &'static str,
+    pub guard: &'static str,
+    pub coverage: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub member: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameter_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameter_ordinal: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pack_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary_id: Option<String>,
+}
+
+/// One structured value consumed inside an exact reviewed failure arm.
+#[derive(Debug, Clone, Serialize)]
+pub struct CodeQueryResultContractFailureUse {
+    pub id: String,
+    pub acquisition_id: String,
+    pub acquisition_site_id: String,
+    pub acquisition_site_ast_id: String,
+    pub procedure_id: String,
+    pub condition_result_ordinal: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub condition_value_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_edge_id: Option<String>,
+    pub consumer_point_id: String,
+    /// Semantic, procedure-specialized identity of the retained call. This is
+    /// deliberately distinct from the structural call-shape site identity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consumer_call_id: Option<String>,
+    /// Exact structural call occurrence; joins `call_shape.site_id`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consumer_site_id: Option<String>,
+    /// Content-scoped structural occurrence identity; joins call-shape,
+    /// occurrence, and dispatch rows that retain the same AST node.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consumer_site_ast_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ast_id: Option<String>,
+    pub path: String,
+    pub language: &'static str,
+    pub range: CodeQueryRange,
+    pub operand_value_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binding_value_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub establishment_point_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub establishment_value_id: Option<u64>,
+    /// Failure-origin classification. The `failure_` prefix avoids colliding
+    /// with `CodeQueryResultItem::provenance`, which carries query trace paths
+    /// in the flattened JSON row. The query filter remains `:provenance`.
+    pub failure_provenance: &'static str,
+    pub consumer: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub argument_ordinal: Option<u32>,
+    pub proof: &'static str,
+    pub coverage: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pack_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary_id: Option<String>,
 }
 
 /// One effect attributed to one procedure, direct or transitive (#2437).
@@ -928,6 +1194,8 @@ pub struct CodeQueryDecoratedParameter {
     pub owner_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub procedure_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parameter_ordinal: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]

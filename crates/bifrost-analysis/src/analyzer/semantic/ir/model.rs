@@ -4,7 +4,7 @@ use super::super::capabilities::SemanticCapability;
 use super::super::ids::{
     AllocationId, BlockId, CallSiteId, CaptureId, EvidenceId, GuardId, MemoryLocationId,
     ProcedureId, ProgramPointId, SemanticGapId, SemanticLocator, SourceMappingId, StableDigest,
-    ValueId,
+    StructuralNodeIdentity, ValueId,
 };
 use super::super::provider::SemanticBudgetExceeded;
 pub use crate::analyzer::DispatchExtensibility;
@@ -265,6 +265,11 @@ pub enum SemanticValueKind {
     },
     Return,
     Temporary,
+    /// A language-level address or reference value derived from another
+    /// semantic value. The structured assignment into this value records the
+    /// referenced source without conflating ordinary value propagation with
+    /// address creation.
+    Address,
     Constant,
     Exception,
     Callable,
@@ -341,6 +346,7 @@ impl SemanticValueKind {
             Self::Receiver { .. } => "receiver",
             Self::Return => "return",
             Self::Temporary => "temporary",
+            Self::Address => "address",
             Self::Constant => "constant",
             Self::Exception => "exception",
             Self::Callable => "callable",
@@ -430,6 +436,17 @@ impl MemoryLocationKind {
             Self::Index { .. } => "index",
             Self::LexicalCell { .. } => "lexical_cell",
             Self::Capture { .. } => "capture",
+        }
+    }
+
+    /// Whether this location's structured identity consumes `value` as its
+    /// base, index, or lexical binding.
+    pub fn uses_value(&self, value: ValueId) -> bool {
+        match self {
+            Self::Field { base, .. } => *base == value,
+            Self::Index { base, index } => *base == value || *index == Some(value),
+            Self::LexicalCell { binding } => *binding == value,
+            Self::Static { .. } | Self::Capture { .. } => false,
         }
     }
 }
@@ -596,6 +613,18 @@ pub struct CallableValue {
     pub environment: Option<AllocationId>,
 }
 
+/// A caller-side receiver fact established at one call site.
+///
+/// This describes evaluation of the callable value, not whether a resolved
+/// target declares a receiver-like formal. In particular, an unbound method or
+/// constructor can require target-specific binding even though the caller did
+/// not evaluate a bound receiver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CallerReceiverBinding {
+    Absent,
+    Bound(ValueId),
+}
+
 /// The intraprocedural destination of one normal, exceptional, or async arm.
 ///
 /// `Absent` is a proven semantic absence, such as the normal arm of a
@@ -642,6 +671,11 @@ pub struct SemanticCallSite {
     pub callee: ValueId,
     pub receiver: Option<ValueId>,
     pub arguments: Box<[SemanticCallArgument]>,
+    /// Ordered normal results for a language call that returns more than one
+    /// independent value. This is mutually exclusive with `result` and must
+    /// contain at least two values when non-empty.
+    pub normal_results: Box<[ValueId]>,
+    /// The normal result for a call with exactly one result.
     pub result: Option<ValueId>,
     pub thrown: Option<ValueId>,
     /// Targets named or established by local syntax/declaration semantics.
@@ -655,6 +689,31 @@ pub struct SemanticCallSite {
     pub exceptional_continuation: ControlContinuation,
     pub source: SourceMappingId,
     pub evidence: EvidenceId,
+}
+
+impl SemanticCallSite {
+    /// Return one normal result by its zero-based language ordinal.
+    pub fn normal_result(&self, index: usize) -> Option<ValueId> {
+        if self.normal_results.is_empty() {
+            (index == 0).then_some(self.result).flatten()
+        } else {
+            self.normal_results.get(index).copied()
+        }
+    }
+
+    pub fn normal_result_values(&self) -> impl Iterator<Item = ValueId> + '_ {
+        self.normal_results.iter().copied().chain(self.result)
+    }
+
+    /// Returns whether `target` consumes one of this call's ordinary results.
+    ///
+    /// This relation establishes evaluation order without depending on source
+    /// ranges: this producer must complete before the consuming call begins.
+    pub fn normal_result_is_argument_to(&self, target: &Self) -> bool {
+        target.arguments.iter().any(|argument| {
+            self.result == Some(argument.value) || self.normal_results.contains(&argument.value)
+        })
+    }
 }
 
 /// The relation represented by a portable source mapping.
@@ -680,6 +739,10 @@ pub struct SourceMapping {
     pub id: SourceMappingId,
     pub locator: SemanticLocator,
     pub kind: SourceMappingKind,
+    /// Exact normalized structural fact identity when this mapping was
+    /// produced from a supported structural node. Ordinary mappings retain
+    /// `None` rather than inferring identity from their source range.
+    pub ast_identity: Option<StructuralNodeIdentity>,
 }
 
 /// Whether the evidence actually establishes the attached fact.
@@ -982,13 +1045,71 @@ impl SemanticGapImpacts {
 /// workspace resolution and binding of that call answers -- for example
 /// Scala argument-evaluation strictness, which the resolved signature proves
 /// because a deferring callee carries its own procedure-level gap that keeps
-/// every binding to it open. A gap without a declared discharge (`None`)
-/// stands until the adapter itself lowers the construct.
+/// every binding to it open. `RetainedEvaluationOrder` marks a point-scoped
+/// gap where the adapter retained every evaluation but chose one deterministic
+/// order for evaluations whose relative order the language leaves open. A
+/// consumer may discharge that gap only when its answer depends on the set of
+/// evaluations rather than their order. `RetainedControlTopology` marks a
+/// point-scoped control gap where every source-local parent normal successor is
+/// retained, but feasibility, blocking, termination, or concurrent child
+/// execution remains unresolved. A consumer may discharge it only for a
+/// positive proof that depends on the retained parent successor topology, not
+/// on liveness, evaluation effects, or spawned work.
+/// `CanonicalIndexIdentity` marks a memory-location-scoped index gap where the
+/// producer retained one exact value for every occurrence of the same literal
+/// index. Consumers such as value flow may discharge the identity question
+/// after verifying that structured location and constant value. The marker
+/// does not claim that flow state projects indexed properties, so the raw gap
+/// remains available to consumers that need that separate capability.
+/// `NonRejoiningExceptionalExit` marks an omitted exceptional transfer that
+/// cannot resume this procedure's normal evaluation after the gap point and
+/// whose exact lowering scope has no already-active handler or cleanup user
+/// code. An adapter must leave the discharge as `None` when an omitted abort
+/// route can enter such user code. A result-specific selective-dominance proof
+/// may ignore the marker only when retained dominance places the gap strictly
+/// before every establishment of the exact result being checked, so the
+/// omitted route exits before that result exists. An exact normal-continuation
+/// proof may also ignore a point- or value-scoped marker that strictly precedes
+/// that continuation: reaching the continuation proves the non-rejoining exit
+/// was not taken. After proving that one exact guard edge dominates a queried
+/// use, a positive result-specific proof may ignore a point- or value-scoped
+/// marker when retained reachability proves the marker cannot reach that use;
+/// this admits both a strictly later marker and one confined to a sibling arm.
+/// The corresponding negative-evidence proof may use the same target-relative
+/// fact only to prove control confinement; its caller must supply the arm's
+/// reviewed negative meaning. Procedure-scoped markers, predecessors, and
+/// cycles remain blocking. Global exceptional flow remains incomplete, and
+/// consumers must not treat the marker as a model of the omitted route.
+/// `ExitOnlyProcedureCompletion` marks omitted work that can begin only after
+/// this procedure has selected an exit and cannot resume its normal body. It
+/// covers point-scoped deferred-execution or cleanup-control work whose
+/// registration-time evaluations and ordinary successor are retained. It also
+/// covers a point- or value-scoped exceptional transfer that can run active Go
+/// cleanup code before the panicking function returns, including when that
+/// cleanup recovers the panic. A result-specific control proof may discharge
+/// the marker only relative to an ordinary-body target: either the retained
+/// point is in the strict acyclic history of every exact result establishment,
+/// or an exact guard projection proves that the point cannot reach that target.
+/// In both cases the target must be normal-entry-reachable and outside every
+/// retained cleanup, exceptional, or asynchronous region; a shared completion
+/// target is not eligible merely because a normal path also reaches it.
+/// Procedure-scoped markers, predecessors, and cycles remain blocking. The
+/// marker does not enumerate work performed during completion:
+/// result-observation and generic control proofs must keep it open. For
+/// observation enumeration its point/value subject scopes the triggering
+/// transfer only; active completion may observe any captured result.
+/// A gap without a declared discharge (`None`) stands until the adapter itself
+/// lowers the construct.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SemanticGapDischarge {
     #[default]
     None,
     CallResolution,
+    RetainedEvaluationOrder,
+    RetainedControlTopology,
+    CanonicalIndexIdentity,
+    NonRejoiningExceptionalExit,
+    ExitOnlyProcedureCompletion,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1001,11 +1122,66 @@ pub struct SemanticGap {
     pub kind: SemanticGapKind,
     /// Required exactly when `kind` is `ExceededBudget`.
     pub budget: Option<SemanticBudgetExceeded>,
-    /// Must be `None` unless `subject` is a call site.
+    /// The declared structured proof obligation, when this gap is
+    /// dischargeable by a downstream consumer.
     pub discharge: SemanticGapDischarge,
     pub detail: Box<str>,
     pub source: SourceMappingId,
     pub evidence: EvidenceId,
+}
+
+/// Whether a producer-authored gap certifies one exact index identity across
+/// source occurrences.
+///
+/// The discharge marker is the producer's cross-occurrence guarantee. The
+/// structural checks keep that guarantee scoped to an indexed memory location
+/// whose retained index is a constant value and whose exact access remains at
+/// the gap point. A dynamic, rebound, missing, or retargeted access therefore
+/// cannot acquire the proof merely by carrying the marker.
+pub(crate) fn gap_certifies_canonical_index_identity(
+    gap: &SemanticGap,
+    points: &[ProgramPoint],
+    memory_locations: &[MemoryLocation],
+    values: &[SemanticValue],
+) -> bool {
+    if gap.discharge != SemanticGapDischarge::CanonicalIndexIdentity
+        || gap.capability != SemanticCapability::IndexMemory
+        || gap.kind != SemanticGapKind::Unsupported
+    {
+        return false;
+    }
+    let SemanticGapSubject::MemoryLocation(location) = gap.subject else {
+        return false;
+    };
+    let Some(MemoryLocation {
+        kind: MemoryLocationKind::Index {
+            index: Some(index), ..
+        },
+        ..
+    }) = memory_locations.get(location.index())
+    else {
+        return false;
+    };
+    let constant_index = values
+        .get(index.index())
+        .is_some_and(|value| matches!(value.kind, SemanticValueKind::Constant));
+    constant_index
+        && points.get(gap.point.index()).is_some_and(|point| {
+            point.events.iter().any(|event| {
+                matches!(
+                    &event.effect,
+                    SemanticEffect::MemoryLoad {
+                        kind: MemoryAccessKind::Index,
+                        location: accessed,
+                        ..
+                    } | SemanticEffect::MemoryStore {
+                        kind: MemoryAccessKind::Index,
+                        location: accessed,
+                        ..
+                    } if *accessed == location
+                )
+            })
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1014,6 +1190,7 @@ pub enum ValueFlowKind {
     Parameter,
     Receiver,
     Return,
+    IndexedReturn { ordinal: u32 },
     LanguageDefined,
 }
 
@@ -1024,7 +1201,27 @@ impl ValueFlowKind {
             Self::Parameter => "parameter",
             Self::Receiver => "receiver",
             Self::Return => "return",
+            Self::IndexedReturn { .. } => "indexed_return",
             Self::LanguageDefined => "language_defined",
+        }
+    }
+}
+
+/// A structured operation that consumes a value without claiming that the
+/// consumed value flows into the operation's result.
+///
+/// This is deliberately separate from [`ValueFlowKind`]. For example, an
+/// address value is required to dereference memory, but the address itself is
+/// not the value loaded from that memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ValueUseKind {
+    Dereference,
+}
+
+impl ValueUseKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Dereference => "dereference",
         }
     }
 }
@@ -1096,6 +1293,10 @@ pub enum SemanticEffect {
         source: ValueId,
         target: ValueId,
     },
+    ValueUse {
+        kind: ValueUseKind,
+        value: ValueId,
+    },
     Allocation {
         allocation: AllocationId,
     },
@@ -1156,6 +1357,7 @@ impl SemanticEffect {
             Self::ExceptionalExit => "exceptional_exit",
             Self::Assignment { .. } => "assignment",
             Self::ValueFlow { .. } => "value_flow",
+            Self::ValueUse { .. } => "value_use",
             Self::Allocation { .. } => "allocation",
             Self::MemoryLoad { .. } => "memory_load",
             Self::MemoryStore { .. } => "memory_store",

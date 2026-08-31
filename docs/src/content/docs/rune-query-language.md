@@ -360,6 +360,65 @@ Four things are absences that are answers rather than gaps, and each says so. A 
 
 There is no lexical, textual, or source-order fallback anywhere on this surface, by construction: the derivation has no other evidence source to fall back to.
 
+## Reviewed Result Contracts and Operation Uses
+
+The result-contract pipeline joins exact call identity, indexed normal results,
+success guards, and operation-sensitive use evidence from activated semantic
+packs. A paired contract says that one result is valid when a predicate holds
+for a separate condition result, such as `(resource, error)` being successful
+when the error is null. A direct contract instead states a predicate on the
+protected result itself, such as a nullable pointer being non-null. Return
+shape alone establishes neither contract. `result-contract-calls` is the
+lightweight positive-discovery filter: it retains a call shape only when every
+canonical dispatch arm selects a reviewed result contract.
+`call-result-contracts` then projects the contract rows, and
+`result-contract-operation-uses` projects one `result_contract_use` row per
+structured operation on the protected result.
+
+```lisp
+(result-contract-operation-uses
+  (call-result-contracts
+    (result-contract-calls
+      (call-shape
+        (call :callee (name "Open"))))))
+```
+
+The raw `call_result_contract` fields preserve the authored shape.
+`result_ordinal` identifies the protected result. For a paired contract,
+`condition_result_ordinal` identifies the separate condition result and
+`predicate` is the predicate required of it; these two fields are always
+present or absent together. `result_success_predicate` records a reviewed
+predicate on the protected result: it is required for a direct contract and
+may also record an independently reviewed correlation for a paired contract.
+A positive direct row therefore has `result_ordinal` and
+`result_success_predicate`, but omits `condition_result_ordinal` and
+`predicate`. A terminal row has `terminal = true`, omits all result ordinals
+and predicates, and carries the reason no contract was established.
+
+Each `result_contract_use` row keeps the acquisition identity and repeats
+`result_ordinal`. Its optional `condition_result_ordinal` and
+`acquisition_predicate` preserve the paired condition; both are absent for a
+direct contract. `result_success_predicate` preserves the protected-result
+predicate in either shape. `required_predicate` is different: when present, it
+is the predicate required by this particular operation. The row also carries
+the operation's source range and program point, its `dereference`, `field`,
+`index`, `receiver_call`, or `call_argument` kind, and its `direct`, `deferred`,
+or `captured` timing. A call-argument row also carries the zero-based
+`parameter_ordinal`; its applicability comes from the procedure-entry
+preconditions on every exact possible target. `applicability` is `required`,
+`not_required`, or `unknown` according to the exact complete operation
+contract. `guard` is independently `guarded`,
+`unguarded`, `not_applicable`, or `unknown`; the originating pack, model, and
+summary identities are present when known.
+
+An authored policy can therefore select `applicability = required` and
+`guard = unguarded` without treating every method call as a dereference.
+Omitted, ambiguous, or incomplete operation knowledge stays open. The older
+`result-contract-uses` wrapper remains available for clients that need one
+aggregate row per acquisition, but its counts are not a substitute for the
+typed per-operation relation when a finding claims that one particular use was
+unsafe.
+
 ## Bounded Rewrite Paths
 
 An analyzer that chases a chain of rewrites -- import-alias substitution, specifier rewriting, type-inference delegation -- is supposed to converge, and a cyclic input is what makes it loop forever. Three things make such a chase analysable rather than merely terminating: a *semantic state key* per step, a *declared finite bound*, and an *explicit terminal outcome*. `(rewrite-paths-of ...)` exposes all three as rows.

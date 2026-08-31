@@ -16,9 +16,11 @@ use super::{
     SemanticProcedureValue,
 };
 use crate::analyzer::semantic::{
-    DispatchBoundaryKind, LengthDelimitedDigest, ProcedureHandle, ProgramPointHandle,
-    ReturnTransferKind, SemanticBudget, SemanticLocator,
+    DispatchBoundaryKind, IcfgProvider, IcfgProviderBehaviorIdentity, LengthDelimitedDigest,
+    ProcedureHandle, ProgramPointHandle, ReturnTransferKind, SemanticBudget, SemanticLocator,
+    WorkspaceIcfgProvider,
 };
+use crate::analyzer::semantic_model::ActiveSemanticModelSnapshot;
 use crate::analyzer::{ProjectFile, WorkspaceAnalyzer};
 use crate::cancellation::CancellationToken;
 use crate::hash::HashMap;
@@ -40,6 +42,8 @@ use brokk_bifrost_rql::WitnessTraversal;
 struct ValueFlowCacheKey {
     root: ProcedureHandle,
     plan_allocation: usize,
+    /// Separates results if this cache is ever reused across provider builds.
+    provider_behavior: IcfgProviderBehaviorIdentity,
 }
 
 #[derive(Debug)]
@@ -94,6 +98,7 @@ impl ValueFlowQueryState {
         limits: CodeQueryValueFlowLimits,
         max_endpoints: usize,
         cancellation: &CancellationToken,
+        active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
     ) -> Vec<SemanticFlowEndpointValue> {
         let Some(analysis_context) = analysis_context else {
             self.push_diagnostic(
@@ -122,9 +127,14 @@ impl ValueFlowQueryState {
         };
         let plan = Arc::clone(registration.plan());
         let root = plan.root().clone();
+        let provider = WorkspaceIcfgProvider::with_active_semantic_model_snapshot(
+            workspace,
+            active_semantic_model_snapshot,
+        );
         let cache_key = ValueFlowCacheKey {
             root: root.clone(),
             plan_allocation: Arc::as_ptr(&plan) as usize,
+            provider_behavior: provider.behavior_identity(),
         };
         let analysis = match self.cache.get(&cache_key).cloned() {
             Some(CachedValueFlowAnalysis::Complete(analysis)) => {
@@ -145,7 +155,6 @@ impl ValueFlowQueryState {
                 .expect("validated CodeQuery value-flow retention limits are positive");
                 let mut solver_budget = SolverBudget::new(limits.solver_work);
                 let mut request = DataflowRequest::new(&mut solver_budget, cancellation);
-                let provider = workspace.icfg_provider();
                 let solved = match solve_value_flow_with_witnesses(
                     &root,
                     &provider,
@@ -862,6 +871,10 @@ fn hash_public_carrier_key(digest: &mut LengthDelimitedDigest, root: &ValueFlowC
                         digest.push(&ordinal.to_le_bytes());
                     }
                     ValueFlowPortKey::NormalReturn => digest.push(b"normal_return"),
+                    ValueFlowPortKey::IndexedNormalReturn { ordinal } => {
+                        digest.push(b"indexed_normal_return");
+                        digest.push(&ordinal.to_le_bytes());
+                    }
                     ValueFlowPortKey::ExceptionalReturn => digest.push(b"exceptional_return"),
                     ValueFlowPortKey::Capture { slot } => {
                         digest.push(b"capture");
@@ -1109,6 +1122,9 @@ pub(super) fn public_carrier_symbol(
                     CodeQueryFlowPortSymbol::Parameter { ordinal: *ordinal }
                 }
                 ValueFlowPortKey::NormalReturn => CodeQueryFlowPortSymbol::NormalReturn,
+                ValueFlowPortKey::IndexedNormalReturn { ordinal } => {
+                    CodeQueryFlowPortSymbol::IndexedNormalReturn { ordinal: *ordinal }
+                }
                 ValueFlowPortKey::ExceptionalReturn => CodeQueryFlowPortSymbol::ExceptionalReturn,
                 ValueFlowPortKey::Capture { slot } => {
                     CodeQueryFlowPortSymbol::Capture { slot: *slot }

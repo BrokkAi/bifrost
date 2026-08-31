@@ -1,8 +1,8 @@
 //! The analyzer-owned shim over [`brokk_bifrost_csharp`].
 //!
 //! What lives here is everything the language crate cannot name: the
-//! [`CSharpAnalyzer`] newtype and its six moka caches, six `OnceLock`s and two
-//! `PoolSafeMemo`s; the accessors that implement
+//! [`CSharpAnalyzer`] newtype and its generation-owned bounded caches and lazy
+//! cells; the accessors that implement
 //! [`graph_support::CSharpSource`] out of them; the `CSharpAdapter`
 //! forwarding shell; the `IAnalyzer`/`CodeUnitIndex` impls; and the
 //! `LanguageSupport` SPI block.
@@ -10,6 +10,7 @@
 mod adapter;
 mod cache;
 mod clones;
+mod compilation;
 mod dependency_discovery;
 pub(crate) mod diagnostics;
 pub mod external;
@@ -17,6 +18,7 @@ mod hierarchy_provider;
 mod imports;
 mod semantic;
 mod structural;
+mod test_classification;
 use crate::analyzer::Range;
 use crate::analyzer::structural::BoundaryStatus;
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
@@ -52,13 +54,14 @@ use crate::analyzer::languages::{
 };
 use crate::analyzer::store::LimitedQueryRows;
 use crate::analyzer::usages::csharp_graph::{
-    CSharpUsageGraphStrategy, build_csharp_usage_edge_weights, build_inbound_csharp_usage_edges,
-    build_rooted_csharp_usage_edges,
+    CSharpUsageGraphStrategy, build_csharp_usage_edge_weights,
+    build_inbound_csharp_usage_edges_with_completeness, build_rooted_csharp_usage_edges,
 };
 use crate::analyzer::usages::get_definition::{
     BoundedResolution, DefinitionLookupOutcome, resolve_csharp_bounded,
 };
 use crate::analyzer::usages::get_type::{TypeLookupOutcome, resolve_csharp_type_bounded};
+use crate::analyzer::usages::inverted_edges::cached_dead_code_usage_edges;
 use crate::analyzer::usages::workspace_graph::UsageEcosystem;
 use crate::analyzer::{
     AnalyzerConfig, AnalyzerDefinitionLookup, AnalyzerStoreContext, BoundedDefinitionLookup,
@@ -78,7 +81,7 @@ use brokk_bifrost_csharp::dead_code::{
     csharp_constructor_candidate, csharp_unsafe_using_member_forms_present,
 };
 use brokk_bifrost_csharp::test_detection::detect_csharp_test_assertion_smells;
-use cache::CSharpMemoCaches;
+use cache::{CSharpMemoCaches, PersistedFqnLookup};
 use clones::build_csharp_clone_candidate_data;
 use external::{CSharpExternalDeclarationIndex, CSharpExternalMember, CSharpExternalType};
 use graph_support::CSharpSource;
@@ -100,7 +103,9 @@ fn limited_known_values<T>(
     }
 }
 
-pub(crate) use dependency_discovery::is_csharp_dependency_input;
+pub(crate) use dependency_discovery::{
+    is_csharp_dependency_input, is_csharp_dependency_input_path,
+};
 
 #[derive(Clone)]
 pub struct CSharpAnalyzer {
@@ -116,6 +121,7 @@ impl CSharpAnalyzer {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
         let mut clone = self.clone();
         clone.inner = clone.inner.clone_with_project(project);
+        clone.memo_caches = Arc::new(CSharpMemoCaches::new(self.memo_caches.budget_bytes()));
         clone.external_index = Arc::new(std::sync::OnceLock::new());
         clone
     }
@@ -212,14 +218,71 @@ impl CSharpAnalyzer {
     }
 
     pub(crate) fn workspace_namespace_exists(&self, namespace: &str) -> bool {
-        if let Some(known) = self.memo_caches.namespace_exists.get(namespace) {
-            return known;
-        }
-        let exists = self.inner.persisted_package_exists(namespace);
+        let key = namespace.to_string();
         self.memo_caches
             .namespace_exists
-            .insert(namespace.to_string(), exists);
-        exists
+            .get_or_try_build(&key, || {
+                #[cfg(any(test, feature = "test-support"))]
+                self.memo_caches
+                    .namespace_exists_build_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.inner.try_persisted_package_may_exist(namespace)
+            })
+            .is_none_or(|exists| *exists)
+    }
+
+    fn persisted_declaration_candidates_by_fqn_cached(
+        &self,
+        fqn: &str,
+        normalized: bool,
+    ) -> BTreeSet<CodeUnit> {
+        let key = PersistedFqnLookup {
+            name: if normalized {
+                csharp_normalize_full_name(fqn)
+            } else {
+                fqn.to_string()
+            },
+            normalized,
+        };
+        self.memo_caches
+            .persisted_fqn_candidates
+            .get_or_try_build(&key, || {
+                #[cfg(any(test, feature = "test-support"))]
+                self.memo_caches
+                    .persisted_fqn_candidate_build_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.inner
+                    .try_lookup_declarations_by_persisted_fqn(&key.name, key.normalized)
+            })
+            .map_or_else(BTreeSet::new, |candidates| (*candidates).clone())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn reset_visible_type_store_build_counts_for_test(&self) {
+        use std::sync::atomic::Ordering;
+
+        self.memo_caches
+            .namespace_exists_build_count
+            .store(0, Ordering::Relaxed);
+        self.memo_caches
+            .persisted_fqn_candidate_build_count
+            .store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn visible_type_store_build_counts_for_test(&self) -> (usize, usize) {
+        use std::sync::atomic::Ordering;
+
+        (
+            self.memo_caches
+                .namespace_exists_build_count
+                .load(Ordering::Relaxed),
+            self.memo_caches
+                .persisted_fqn_candidate_build_count
+                .load(Ordering::Relaxed),
+        )
     }
 
     pub fn namespace_of_file(&self, file: &ProjectFile) -> String {
@@ -522,8 +585,7 @@ impl CSharpSource for CSharpAnalyzer {
         fqn: &str,
         normalized: bool,
     ) -> BTreeSet<CodeUnit> {
-        self.inner
-            .lookup_declarations_by_persisted_fqn(fqn, normalized)
+        self.persisted_declaration_candidates_by_fqn_cached(fqn, normalized)
     }
 
     fn persisted_declaration_candidates_by_fqn_limited(
@@ -1066,7 +1128,18 @@ impl IAnalyzer for CSharpAnalyzer {
     fn workspace_content_identities(
         &self,
     ) -> Option<crate::analyzer::content_identity::WorkspaceContentIdentities> {
-        self.inner.workspace_content_identities()
+        let compilation_digest = self.compilation_index().config_digest()?;
+        let mut hasher = crate::analyzer::canonical_hash::CanonicalHasher::new(
+            b"bifrost-csharp-content-with-compilation-config:v1",
+        );
+        hasher.field("sources", self.inner.language_content_identity().as_bytes());
+        hasher.field("compilation_config", compilation_digest.as_bytes());
+        Some(
+            crate::analyzer::content_identity::WorkspaceContentIdentities::new([(
+                Language::CSharp,
+                crate::analyzer::semantic::ids::StableDigest::from_array(hasher.finish()),
+            )]),
+        )
     }
 
     fn import_statements(&self, file: &ProjectFile) -> Vec<String> {
@@ -1135,7 +1208,7 @@ impl IAnalyzer for CSharpAnalyzer {
     }
 
     fn contains_tests(&self, file: &ProjectFile) -> bool {
-        self.inner.contains_tests(file)
+        self.inner.contains_tests(file) || self.hierarchy_test_files().contains(file)
     }
 
     fn in_test_region(&self, code_unit: &crate::analyzer::CodeUnit) -> bool {
@@ -1482,10 +1555,151 @@ impl DeadCodeBulkProof for CSharpDeadCodeBulk {
         analyzer: &dyn IAnalyzer,
         candidates: &[CodeUnit],
     ) -> Option<DeadCodeBulkEdges> {
-        let scope = AnalyzerQueryScope::new(analyzer);
-        let token = scope.token();
+        let csharp = resolve_analyzer::<CSharpAnalyzer>(analyzer)?;
         let callees = candidate_fqns(candidates);
-        build_inbound_csharp_usage_edges(analyzer, token, &callees)
-            .map(|edges| DeadCodeBulkEdges::Fqn(Arc::new(edges)))
+        cached_dead_code_usage_edges(
+            analyzer,
+            &csharp.memo_caches.dead_code_usage_edges,
+            &callees,
+            |token| build_inbound_csharp_usage_edges_with_completeness(analyzer, token, &callees),
+        )
+        .map(DeadCodeBulkEdges::Fqn)
+    }
+}
+
+#[cfg(test)]
+mod dead_code_cache_tests {
+    use super::*;
+    use crate::analyzer::usages::inverted_edges::UsageEdges;
+    use crate::inline_project::InlineTestProject;
+
+    #[test]
+    fn update_all_update_and_overlay_clone_start_with_empty_dead_code_caches() {
+        let fixture = InlineTestProject::with_language(Language::CSharp)
+            .file("A.cs", "class A {}")
+            .build();
+        let analyzer = CSharpAnalyzer::from_project(fixture.project().clone());
+        let key: Arc<[String]> = vec!["A".to_string()].into();
+        analyzer
+            .memo_caches
+            .dead_code_usage_edges
+            .insert(key.clone(), Arc::new(UsageEdges::default()));
+
+        let updated = analyzer.update(&std::collections::BTreeSet::new());
+        assert!(
+            updated
+                .memo_caches
+                .dead_code_usage_edges
+                .get(&key)
+                .is_none()
+        );
+        let rebuilt = analyzer.update_all();
+        assert!(
+            rebuilt
+                .memo_caches
+                .dead_code_usage_edges
+                .get(&key)
+                .is_none()
+        );
+        let overlay = analyzer.clone_with_project(fixture.project_dyn());
+        assert!(
+            overlay
+                .memo_caches
+                .dead_code_usage_edges
+                .get(&key)
+                .is_none()
+        );
+    }
+}
+
+#[cfg(test)]
+mod package_inventory_gate_tests {
+    use super::*;
+    use crate::analyzer::OverlayProject;
+    use crate::inline_project::InlineTestProject;
+
+    #[test]
+    fn incomplete_package_inventory_cannot_suppress_an_exact_csharp_fqn() {
+        let fixture = InlineTestProject::with_language(Language::CSharp)
+            .file(
+                "Shared/Widget.cs",
+                "namespace Shared { public class Widget { } }",
+            )
+            .file(
+                "Consumer.cs",
+                "using Shared; public class Consumer { private Widget value; }",
+            )
+            .file(
+                "Other/Marker.cs",
+                "namespace Other { public class Marker { } }",
+            )
+            .build();
+        let analyzer = CSharpAnalyzer::from_project(fixture.project().clone());
+
+        assert!(analyzer.inner.workspace_package_inventory_complete());
+        assert_eq!(
+            analyzer.inner.try_persisted_package_may_exist("Shared"),
+            Some(true),
+            "a persisted package witness remains immediately authoritative"
+        );
+
+        analyzer
+            .inner
+            .delete_workspace_package_membership_for_test("Shared");
+        assert_eq!(
+            analyzer.inner.try_persisted_package_may_exist("Shared"),
+            Some(false),
+            "a complete package inventory may publish an exact negative"
+        );
+
+        let overlay = Arc::new(OverlayProject::new(fixture.project_dyn()));
+        let marker = fixture.file("Other/Marker.cs");
+        assert!(overlay.set(
+            marker.abs_path(),
+            "namespace Other { public class EditedMarker { } }".to_string(),
+        ));
+        let overlay_project: Arc<dyn Project> = Arc::new(overlay.snapshot());
+        let request = analyzer.clone_with_project(overlay_project);
+        assert!(!request.inner.workspace_package_inventory_complete());
+        assert_eq!(
+            request.inner.try_persisted_package_may_exist("Shared"),
+            Some(true),
+            "an absent partial package projection must conservatively preserve the exact probe"
+        );
+
+        request.reset_visible_type_store_build_counts_for_test();
+        let consumer = fixture.file("Consumer.cs");
+        let resolve = || {
+            let scope = AnalyzerQueryScope::new(&request);
+            graph_support::visible_type_candidates(&request, scope.token(), &consumer, "Widget")
+        };
+        let candidates = resolve();
+        assert_eq!(
+            candidates.iter().map(CodeUnit::fq_name).collect::<Vec<_>>(),
+            vec!["Shared.Widget"],
+            "C# must perform the exact structured FQN probe when package absence is uncertain"
+        );
+        assert_eq!(
+            resolve(),
+            candidates,
+            "a warm repeat must preserve the exact C# answer"
+        );
+        assert_eq!(
+            request.visible_type_store_build_counts_for_test(),
+            (1, 1),
+            "the conservative package answer and exact FQN result must each cache after one computation"
+        );
+
+        assert!(overlay.set(
+            marker.abs_path(),
+            "namespace Shared { public class DirtyMarker { } }".to_string(),
+        ));
+        let dirty_project: Arc<dyn Project> = Arc::new(overlay.snapshot());
+        let dirty = analyzer.clone_with_project(dirty_project);
+        assert_eq!(
+            dirty.inner.try_persisted_package_may_exist("Shared"),
+            Some(true),
+            "a dirty structured declaration is positive evidence even when persistence misses"
+        );
     }
 }

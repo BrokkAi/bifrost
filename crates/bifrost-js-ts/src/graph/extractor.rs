@@ -846,19 +846,23 @@ fn this_alias_owner_binding(
 
 fn enclosing_function_node(mut node: Node<'_>) -> Option<Node<'_>> {
     loop {
-        if matches!(
-            node.kind(),
-            "arrow_function"
-                | "function_declaration"
-                | "function_expression"
-                | "generator_function"
-                | "generator_function_declaration"
-                | "method_definition"
-        ) {
+        if is_function_like(node.kind()) {
             return Some(node);
         }
         node = node.parent()?;
     }
+}
+
+fn is_function_like(kind: &str) -> bool {
+    matches!(
+        kind,
+        "arrow_function"
+            | "function_declaration"
+            | "function_expression"
+            | "generator_function"
+            | "generator_function_declaration"
+            | "method_definition"
+    )
 }
 
 fn object_assign_prototype_owner(function: Node<'_>, source: &str) -> Option<String> {
@@ -2117,7 +2121,11 @@ fn register_parameter_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         "required_parameter" | "optional_parameter" => {
             if let Some(pattern) = node.child_by_field_name("pattern") {
                 let binding = if has_target_type_annotation(node, ctx) {
-                    LocalBinding::TargetReceiver
+                    if pattern_binders_are_reassigned(pattern, ctx) {
+                        LocalBinding::Conflicted
+                    } else {
+                        LocalBinding::TargetReceiver
+                    }
                 } else {
                     LocalBinding::Other
                 };
@@ -2142,6 +2150,39 @@ fn register_parameter_binding(node: Node<'_>, ctx: &mut ScanCtx<'_>) {
         }
         _ => {}
     }
+}
+
+/// Whether any simple binder in an annotated parameter is assigned inside its
+/// function body. TypeScript annotations are structural and survive writes,
+/// so the annotation alone cannot prove the runtime owner after a write to a
+/// structurally compatible unrelated class. The graph scan is flow-insensitive;
+/// retaining explicit conflicting evidence is the only sound answer (#2495).
+fn pattern_binders_are_reassigned(pattern: Node<'_>, ctx: &ScanCtx<'_>) -> bool {
+    let names = pattern_binder_identifiers(pattern)
+        .into_iter()
+        .filter_map(|binder| simple_identifier_text(binder, ctx.source))
+        .collect::<HashSet<_>>();
+    if names.is_empty() {
+        return false;
+    }
+    let Some(function) = enclosing_function_node(pattern) else {
+        return false;
+    };
+    let mut stack = vec![function];
+    while let Some(node) = stack.pop() {
+        if node.id() != function.id() && is_function_like(node.kind()) {
+            continue;
+        }
+        if node.kind() == "assignment_expression"
+            && let Some(left) = node.child_by_field_name("left")
+            && simple_identifier_text(left, ctx.source).is_some_and(|name| names.contains(name))
+        {
+            return true;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    false
 }
 
 /// Declares one shadow per binder of a `let`/`const`/`var` declarator's
@@ -2945,15 +2986,21 @@ pub fn simple_identifier_text<'a>(node: Node<'_>, source: &'a str) -> Option<&'a
 
 fn infer_receiver_binding(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<LocalBinding> {
     let value = node.child_by_field_name("value")?;
-    // A declared type survives reassignment -- the compiler holds every later
-    // write to it -- so annotation evidence needs no reassignment check.
+    let (reassigned_target, reassigned_other) = reassignment_class_evidence(node, ctx);
+    // A TypeScript annotation constrains structure, not nominal runtime
+    // identity. A later write may therefore satisfy the annotation while
+    // naming an unrelated class with the same members; never let the original
+    // annotation bypass conflicting write evidence (#2495).
     if has_target_type_annotation(node, ctx) {
-        return Some(LocalBinding::TargetReceiver);
+        return Some(if reassigned_other {
+            LocalBinding::Conflicted
+        } else {
+            LocalBinding::TargetReceiver
+        });
     }
     let value_names_target = expression_is_target_constructor(value, ctx)
         || expression_resolves_to_target_owner(value, ctx);
-    if value_names_target || value.kind() == "new_expression" {
-        let (reassigned_target, reassigned_other) = reassignment_class_evidence(node, ctx);
+    if value_names_target || reassigned_target || value.kind() == "new_expression" {
         let names_target = value_names_target || reassigned_target;
         let names_other = !value_names_target || reassigned_other;
         if names_target && names_other {
@@ -2985,17 +3032,16 @@ fn infer_receiver_binding(node: Node<'_>, ctx: &ScanCtx<'_>) -> Option<LocalBind
 }
 
 /// Whether other visible assignments to this declarator's symbol name the
-/// target class (`.0`) or a different class (`.1`).
+/// target class (`.0`) or anything that cannot prove that class (`.1`).
 ///
 /// The walk covers the binding's own scope subtree -- the nearest enclosing
 /// scope node for a lexical declaration, the nearest function or program node
 /// for a `var` -- so it sees a write inside a nested block or closure. A write
 /// in a nested scope that redeclares the name is counted anyway: the cost of
 /// that imprecision is a proven row degrading to unproven, never the reverse.
-/// An assignment whose right side carries no class evidence (a call, a
-/// parameter, an arbitrary expression) contributes nothing: absence of
-/// evidence is not conflicting evidence, the same rule the Python inference
-/// applies (#2495).
+/// An assignment whose right side carries no exact target evidence is a
+/// conflicting write. Otherwise an unresolved/dynamic write followed by a
+/// target constructor could erase uncertainty and manufacture proof.
 fn reassignment_class_evidence(declarator: Node<'_>, ctx: &ScanCtx<'_>) -> (bool, bool) {
     let Some(name) = declarator
         .child_by_field_name("name")
@@ -3038,7 +3084,7 @@ fn reassignment_class_evidence(declarator: Node<'_>, ctx: &ScanCtx<'_>) -> (bool
                 || expression_resolves_to_target_owner(right, ctx)
             {
                 saw_target = true;
-            } else if right.kind() == "new_expression" {
+            } else {
                 saw_other = true;
             }
             if saw_target && saw_other {

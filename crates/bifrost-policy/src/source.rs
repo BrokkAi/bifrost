@@ -2813,17 +2813,17 @@ impl Decoder {
             subject_expr.range.clone(),
         )?;
         let phase = decode_observation_phase(fields.required("phase"))?;
-        if matches!(subject, TypestateCallBinding::ReturnValue)
-            && matches!(
-                phase,
-                EndpointObservationPhase::BeforeCall
-                    | EndpointObservationPhase::AfterExceptionalReturn
-            )
-        {
+        if matches!(
+            subject,
+            TypestateCallBinding::ReturnValue | TypestateCallBinding::ResultIndex { .. }
+        ) && matches!(
+            phase,
+            EndpointObservationPhase::BeforeCall | EndpointObservationPhase::AfterExceptionalReturn
+        ) {
             return Err(source_error(
                 "invalid-call-binding-phase",
                 fields.required("phase").range.clone(),
-                "return-value can be observed only after a normal return",
+                "normal results can be observed only after a normal return",
             ));
         }
         if phase == EndpointObservationPhase::AtMatch {
@@ -3774,6 +3774,7 @@ impl Decoder {
             DecodedBinding::MatchedValue => Ok(PolicyEndpointBinding::MatchedValue),
             DecodedBinding::Receiver => Ok(PolicyEndpointBinding::Receiver),
             DecodedBinding::ReturnValue => Ok(PolicyEndpointBinding::ReturnValue),
+            DecodedBinding::ResultIndex(index) => Ok(PolicyEndpointBinding::ResultIndex { index }),
             DecodedBinding::ArgumentIndex(index) => {
                 Ok(PolicyEndpointBinding::ArgumentIndex { index })
             }
@@ -4630,6 +4631,7 @@ enum DecodedBinding {
     MatchedValue,
     Receiver,
     ReturnValue,
+    ResultIndex(u32),
     ArgumentIndex(u32),
     ArgumentName(String),
 }
@@ -4673,7 +4675,19 @@ fn decode_binding(
             value => unreachable!("binding registry returned {value:?}"),
         };
     }
-    let fields = RecordCursor::parse(expr, PolicyRecord::Argument, context)?;
+    let record = select_record(
+        expr,
+        &[PolicyRecord::Argument, PolicyRecord::Result],
+        "binding",
+    )?;
+    let fields = RecordCursor::parse(expr, record, context)?;
+    if record == PolicyRecord::Result {
+        return Ok(DecodedBinding::ResultIndex(expect_u32(
+            fields.required("index"),
+            "result index",
+            true,
+        )?));
+    }
     match (fields.get("index"), fields.get("name")) {
         (Some(index), None) => Ok(DecodedBinding::ArgumentIndex(expect_u32(
             index,
@@ -4703,6 +4717,7 @@ fn decoded_binding_to_port(binding: DecodedBinding) -> PolicyPort {
         DecodedBinding::MatchedValue => PolicyPort::MatchedValue,
         DecodedBinding::Receiver => PolicyPort::Receiver,
         DecodedBinding::ReturnValue => PolicyPort::ReturnValue,
+        DecodedBinding::ResultIndex(index) => PolicyPort::ResultIndex { index },
         DecodedBinding::ArgumentIndex(index) => PolicyPort::ArgumentIndex { index },
         DecodedBinding::ArgumentName(name) => PolicyPort::ArgumentName { name },
     }
@@ -4713,6 +4728,7 @@ fn decoded_binding_to_seed(binding: DecodedBinding) -> TypestateSeedBinding {
         DecodedBinding::MatchedValue => TypestateSeedBinding::MatchedValue,
         DecodedBinding::Receiver => TypestateSeedBinding::Receiver,
         DecodedBinding::ReturnValue => TypestateSeedBinding::ReturnValue,
+        DecodedBinding::ResultIndex(index) => TypestateSeedBinding::ResultIndex { index },
         DecodedBinding::ArgumentIndex(index) => TypestateSeedBinding::ArgumentIndex { index },
         DecodedBinding::ArgumentName(name) => TypestateSeedBinding::ArgumentName { name },
     }
@@ -4730,6 +4746,7 @@ fn decoded_binding_to_call(
         )),
         DecodedBinding::Receiver => Ok(TypestateCallBinding::Receiver),
         DecodedBinding::ReturnValue => Ok(TypestateCallBinding::ReturnValue),
+        DecodedBinding::ResultIndex(index) => Ok(TypestateCallBinding::ResultIndex { index }),
         DecodedBinding::ArgumentIndex(index) => Ok(TypestateCallBinding::ArgumentIndex { index }),
         DecodedBinding::ArgumentName(name) => Ok(TypestateCallBinding::ArgumentName { name }),
     }
@@ -4963,7 +4980,13 @@ fn decode_row_filter(expr: &Expr) -> Result<RowFilter, PolicySourceError> {
             "a filter must state at least one predicate",
         ));
     }
-    Ok(RowFilter { over, predicates })
+    Ok(RowFilter {
+        over,
+        predicates,
+        evidence: None,
+        call_locator: None,
+        resolved_locators: Vec::new(),
+    })
 }
 
 /// Lower `(call-argument ...)` into the ordinary in-place row filter it
@@ -5049,14 +5072,21 @@ fn decode_call_argument(expr: &Expr) -> Result<RowFilter, PolicySourceError> {
                 operand: RowPredicateOperand::None,
             },
         ],
+        evidence: None,
+        call_locator: None,
+        resolved_locators: Vec::new(),
     })
 }
 
-/// Lower `(call :over NAME :resolves-to MODEL_ID :proof exact)` into one
-/// ordinary in-place filter. `MODEL_ID` is compared with the row's stable
-/// semantic-model symbol identity; it is deliberately not a qualified name,
-/// display name, or source spelling. The proof keyword is authoring syntax,
-/// while the concrete dispatch predicates below are the executable contract.
+/// Lower `(call :over NAME :resolves-to MODEL_ID|QUALIFIED_NAME :proof PROOF)`
+/// into one ordinary in-place filter. An unquoted value is an existing stable
+/// semantic-model identity. A quoted value is retained as a qualified locator
+/// until the loaded-policy boundary can resolve it against typed workspace or
+/// active-model identities. `exact` consumes the analyzer's typed
+/// selector proof, which may be derived or backed by one exact authored
+/// summary. `declared` proves one complete semantic-model declaration,
+/// signature, and actual-to-formal mapping while leaving runtime dispatch as
+/// an independent axis for the taint solver and summaries.
 fn decode_call(expr: &Expr) -> Result<RowFilter, PolicySourceError> {
     let fields = RecordCursor::parse(
         expr,
@@ -5065,7 +5095,7 @@ fn decode_call(expr: &Expr) -> Result<RowFilter, PolicySourceError> {
     )?;
     let over: RowBindingName = parse_identifier(fields.required("over"), "call row binding name")?;
     let model_id_expr = fields.required("resolves-to");
-    let model_id = match &model_id_expr.kind {
+    let (model_id, target_locator) = match &model_id_expr.kind {
         ExprKind::String(value) => {
             if value.is_empty() || value.len() > MAX_HUMAN_NAME_BYTES {
                 return Err(source_error(
@@ -5076,25 +5106,67 @@ fn decode_call(expr: &Expr) -> Result<RowFilter, PolicySourceError> {
                     ),
                 ));
             }
-            value.clone()
+            (
+                value.clone(),
+                Some(PolicyLocator {
+                    value: value.clone(),
+                    range: model_id_expr.range.clone(),
+                }),
+            )
         }
         ExprKind::Symbol(value) if !value.is_empty() && value.len() <= MAX_HUMAN_NAME_BYTES => {
-            value.clone()
+            (value.clone(), None)
         }
         _ => {
             return Err(source_error(
                 "invalid-call-model-id",
                 model_id_expr.range.clone(),
-                "call :resolves-to requires a stable semantic-model symbol identity",
+                "call :resolves-to requires a stable identity or quoted qualified locator",
             ));
         }
     };
+    let (receiver_type_id, receiver_locator) = fields.get("receiver-type").map_or(
+        Ok((None, None)),
+        |receiver_type_expr| {
+        match &receiver_type_expr.kind {
+            ExprKind::String(value) => {
+                if value.is_empty() || value.len() > MAX_HUMAN_NAME_BYTES {
+                    return Err(source_error(
+                        "invalid-call-receiver-type-id",
+                        receiver_type_expr.range.clone(),
+                        format!(
+                            "call receiver semantic-model type identity must contain from 1 through {MAX_HUMAN_NAME_BYTES} bytes"
+                        ),
+                    ));
+                }
+                Ok((
+                    Some(value.clone()),
+                    Some(PolicyLocator {
+                        value: value.clone(),
+                        range: receiver_type_expr.range.clone(),
+                    }),
+                ))
+            }
+            ExprKind::Symbol(value)
+                if !value.is_empty() && value.len() <= MAX_HUMAN_NAME_BYTES =>
+            {
+                Ok((Some(value.clone()), None))
+            }
+            _ => Err(source_error(
+                "invalid-call-receiver-type-id",
+                receiver_type_expr.range.clone(),
+                "call :receiver-type requires a stable identity or quoted qualified locator",
+            )),
+        }
+    },
+    )?;
     let proof_expr = fields.required("proof");
-    if expect_token(proof_expr, "call proof")? != "exact" {
+    let proof = expect_token(proof_expr, "call proof")?;
+    if !matches!(proof, "exact" | "declared") {
         return Err(source_error(
             "unsupported-call-proof",
             proof_expr.range.clone(),
-            "call currently accepts only :proof exact",
+            "call :proof must be exact or declared",
         ));
     }
 
@@ -5102,41 +5174,73 @@ fn decode_call(expr: &Expr) -> Result<RowFilter, PolicySourceError> {
         binding: over.clone(),
         field: name.to_string(),
     };
-    let constrained = |name: &str, value: &str| RowPredicate {
-        field: field(name),
-        op: RowPredicateOp::Eq,
-        operand: RowPredicateOperand::Literal(RowLiteral::ConstrainedEnum(value.to_string())),
-    };
     let not_null = |name: &str| RowPredicate {
         field: field(name),
         op: RowPredicateOp::IsNotNull,
         operand: RowPredicateOperand::None,
     };
-    Ok(RowFilter {
-        over: over.clone(),
-        predicates: vec![
+    let constrained = |name: &str, value: &str| RowPredicate {
+        field: field(name),
+        op: RowPredicateOp::Eq,
+        operand: RowPredicateOperand::Literal(RowLiteral::ConstrainedEnum(value.to_owned())),
+    };
+    let mut predicates = vec![
+        RowPredicate {
+            field: field("model_id"),
+            op: RowPredicateOp::Eq,
+            operand: RowPredicateOperand::Literal(RowLiteral::String(model_id)),
+        },
+        not_null("semantic_target_id"),
+        not_null("signature_id"),
+    ];
+    let evidence = if proof == "exact" {
+        predicates.push(RowPredicate {
+            field: field("selector_exact"),
+            op: RowPredicateOp::Eq,
+            operand: RowPredicateOperand::Literal(RowLiteral::Boolean(true)),
+        });
+        None
+    } else {
+        predicates.extend([
+            not_null("pack_id"),
+            not_null("model_record_id"),
+            not_null("model_proof"),
+            constrained("model_completeness", "complete"),
             RowPredicate {
-                field: field("model_id"),
-                op: RowPredicateOp::Eq,
-                operand: RowPredicateOperand::Literal(RowLiteral::String(model_id)),
-            },
-            not_null("semantic_target_id"),
-            not_null("signature_id"),
-            constrained("dispatch_outcome", "resolved"),
-            constrained("dispatch_coverage", "exhaustive"),
-            constrained("dispatch_proof", "proven"),
-            constrained("dispatch_completeness", "complete"),
-            RowPredicate {
-                field: field("dispatch_target_count"),
-                op: RowPredicateOp::Eq,
-                operand: RowPredicateOperand::Literal(RowLiteral::Integer(1)),
-            },
-            RowPredicate {
-                field: field("dispatch_targets_truncated"),
+                field: field("model_ambiguous"),
                 op: RowPredicateOp::Eq,
                 operand: RowPredicateOperand::Literal(RowLiteral::Boolean(false)),
             },
-        ],
+            constrained("mapping", "exact"),
+            constrained("coverage", "exhaustive"),
+            RowPredicate {
+                field: field("terminal"),
+                op: RowPredicateOp::Eq,
+                operand: RowPredicateOperand::Literal(RowLiteral::Boolean(false)),
+            },
+            not_null("argument_id"),
+        ]);
+        Some(RowFilterEvidence::DeclaredCall)
+    };
+    if let Some(receiver_type_id) = receiver_type_id {
+        predicates.push(RowPredicate {
+            field: field("receiver_type_id"),
+            op: RowPredicateOp::Eq,
+            operand: RowPredicateOperand::Literal(RowLiteral::String(receiver_type_id)),
+        });
+        predicates.push(not_null("receiver_type_id"));
+    }
+    Ok(RowFilter {
+        over: over.clone(),
+        predicates,
+        evidence,
+        call_locator: (target_locator.is_some() || receiver_locator.is_some()).then_some({
+            CallLocator {
+                target: target_locator,
+                receiver_type: receiver_locator,
+            }
+        }),
+        resolved_locators: Vec::new(),
     })
 }
 
@@ -7150,12 +7254,7 @@ mod tests {
               ((calls.model_id eq "member.widget.create")
                (calls.semantic_target_id is-not-null)
                (calls.signature_id is-not-null)
-               (calls.dispatch_outcome eq resolved)
-               (calls.dispatch_coverage eq exhaustive)
-               (calls.dispatch_proof eq proven)
-               (calls.dispatch_completeness eq complete)
-               (calls.dispatch_target_count eq 1)
-               (calls.dispatch_targets_truncated eq false)))"#,
+               (calls.selector_exact eq true)))"#,
         ))
         .unwrap();
 
@@ -7191,7 +7290,7 @@ mod tests {
             panic!("call must lower to a filter")
         };
         assert_eq!(filter.over.as_str(), "calls");
-        assert_eq!(filter.predicates.len(), 9);
+        assert_eq!(filter.predicates.len(), 4);
         let fields: Vec<_> = filter
             .predicates
             .iter()
@@ -7203,12 +7302,7 @@ mod tests {
                 "model_id",
                 "semantic_target_id",
                 "signature_id",
-                "dispatch_outcome",
-                "dispatch_coverage",
-                "dispatch_proof",
-                "dispatch_completeness",
-                "dispatch_target_count",
-                "dispatch_targets_truncated",
+                "selector_exact",
             ]
         );
         assert!(matches!(
@@ -7216,6 +7310,92 @@ mod tests {
             RowPredicateOperand::Literal(RowLiteral::String(value))
                 if value == "member.widget.create"
         ));
+    }
+
+    #[test]
+    fn exact_call_receiver_type_lowers_to_an_equivalent_typed_filter() {
+        let sugar = parse(&exact_call_policy(
+            r#"(call :over calls :resolves-to member.widget.create :proof exact
+                 :receiver-type type.widget)"#,
+        ))
+        .unwrap();
+        let hand_written = parse(&exact_call_policy(
+            r#"(filter :over calls :where
+              ((calls.model_id eq "member.widget.create")
+               (calls.semantic_target_id is-not-null)
+               (calls.signature_id is-not-null)
+               (calls.selector_exact eq true)
+               (calls.receiver_type_id eq "type.widget")
+               (calls.receiver_type_id is-not-null)))"#,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            serde_json::to_vec(&sugar.document.to_normalized_authored_json()).unwrap(),
+            serde_json::to_vec(&hand_written.document.to_normalized_authored_json()).unwrap(),
+        );
+        assert_eq!(
+            serde_json::to_vec(
+                &sugar
+                    .document
+                    .to_inline_local_canonical_semantic_json()
+                    .unwrap(),
+            )
+            .unwrap(),
+            serde_json::to_vec(
+                &hand_written
+                    .document
+                    .to_inline_local_canonical_semantic_json()
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
+
+        let RqlpDocument::Policy { definition } = sugar.document else {
+            panic!("expected policy")
+        };
+        let PolicyAnalysis::Assertion { spec } = definition.analysis else {
+            panic!("expected assertion policy")
+        };
+        let plan = spec.relational.expect("relational plan");
+        let RowDerivation::Filter(filter) = &plan.derivations[0] else {
+            panic!("call must lower to a filter")
+        };
+        assert_eq!(filter.predicates.len(), 6);
+        assert_eq!(filter.predicates[4].field.field, "receiver_type_id");
+        assert!(matches!(
+            &filter.predicates[4].operand,
+            RowPredicateOperand::Literal(RowLiteral::String(value)) if value == "type.widget"
+        ));
+        assert_eq!(filter.predicates[5].field.field, "receiver_type_id");
+        assert_eq!(filter.predicates[5].op, RowPredicateOp::IsNotNull);
+    }
+
+    #[test]
+    fn qualified_call_locators_are_retained_until_loaded_policy_resolution() {
+        let source = exact_call_policy(
+            r#"(call :over calls :resolves-to "Widget.create" :proof exact
+                 :receiver-type "Widget")"#,
+        );
+        let parsed = parse(&source).unwrap();
+        let RqlpDocument::Policy { definition } = parsed.document else {
+            panic!("expected policy")
+        };
+        let PolicyAnalysis::Assertion { spec } = definition.analysis else {
+            panic!("expected assertion policy")
+        };
+        let plan = spec.relational.expect("relational plan");
+        let RowDerivation::Filter(filter) = &plan.derivations[0] else {
+            panic!("call must lower to a filter")
+        };
+        let locator = filter.call_locator.as_ref().expect("pending locators");
+        let target = locator.target.as_ref().expect("call locator");
+        assert_eq!(target.value, "Widget.create");
+        assert_eq!(&source[target.range.clone()], "\"Widget.create\"");
+        let receiver = locator.receiver_type.as_ref().expect("receiver locator");
+        assert_eq!(receiver.value, "Widget");
+        assert_eq!(&source[receiver.range.clone()], "\"Widget\"");
+        assert!(filter.resolved_locators.is_empty());
     }
 
     #[test]
@@ -7228,6 +7408,53 @@ mod tests {
     }
 
     #[test]
+    fn declared_call_requires_complete_model_signature_and_binding_evidence() {
+        let parsed = parse(&exact_call_policy(
+            r#"(call :over calls :resolves-to member.widget.create :proof declared)"#,
+        ))
+        .unwrap();
+        let canonical = parsed.document.to_normalized_authored_json();
+        assert_eq!(
+            canonical["analysis"]["plan"]["derivations"][0]["evidence"],
+            "declared_call"
+        );
+
+        let RqlpDocument::Policy { definition } = parsed.document else {
+            panic!("expected policy")
+        };
+        let PolicyAnalysis::Assertion { spec } = definition.analysis else {
+            panic!("expected assertion policy")
+        };
+        let plan = spec.relational.expect("relational plan");
+        let RowDerivation::Filter(filter) = &plan.derivations[0] else {
+            panic!("call must lower to a filter")
+        };
+        assert_eq!(filter.evidence, Some(RowFilterEvidence::DeclaredCall));
+        assert_eq!(filter.predicates.len(), 12);
+        assert_eq!(
+            filter
+                .predicates
+                .iter()
+                .map(|predicate| predicate.field.field.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "model_id",
+                "semantic_target_id",
+                "signature_id",
+                "pack_id",
+                "model_record_id",
+                "model_proof",
+                "model_completeness",
+                "model_ambiguous",
+                "mapping",
+                "coverage",
+                "terminal",
+                "argument_id",
+            ]
+        );
+    }
+
+    #[test]
     fn exact_call_vocabulary_is_registered_for_hover() {
         let source = exact_call_policy(
             r#"(call :over calls :resolves-to member.widget.create :proof exact)"#,
@@ -7236,17 +7463,43 @@ mod tests {
             .expect("registered call record has hover help");
         assert_eq!(
             record_help.signature,
-            "(call :over NAME :resolves-to MODEL_ID :proof exact)"
+            "(call :over NAME :resolves-to MODEL_ID|QUALIFIED_NAME :proof exact|declared [:receiver-type MODEL_TYPE_ID|QUALIFIED_TYPE])"
         );
         let field_help = rqlp_source_help_at(&source, source.find(":resolves-to").unwrap() + 3)
             .expect("registered resolves-to field has hover help");
-        assert_eq!(field_help.signature, ":resolves-to MODEL_ID");
+        assert_eq!(field_help.signature, ":resolves-to MODEL_ID|QUALIFIED_NAME");
+
+        let receiver_source = exact_call_policy(
+            r#"(call :over calls :resolves-to member.widget.create :proof exact
+                 :receiver-type type.widget)"#,
+        );
+        let receiver_type_help = rqlp_source_help_at(
+            &receiver_source,
+            receiver_source.find(":receiver-type").unwrap() + 3,
+        )
+        .expect("registered receiver-type field has hover help");
+        assert_eq!(
+            receiver_type_help.signature,
+            ":receiver-type MODEL_TYPE_ID|QUALIFIED_TYPE"
+        );
+    }
+
+    #[test]
+    fn exact_call_rejects_an_invalid_receiver_type_identity() {
+        let source = exact_call_policy(
+            r#"(call :over calls :resolves-to member.widget.create :proof exact
+                 :receiver-type ())"#,
+        );
+        let error = parse(&source).unwrap_err().diagnostic;
+        assert_eq!(error.code, "invalid-call-receiver-type-id");
+        assert_eq!(&source[error.range], "()");
     }
 
     #[test]
     fn row_selector_call_sugar_is_the_typed_relational_plan() {
         let sugar = parse(&row_selector_endpoint(
-            r#"(call :over calls :resolves-to java.sql.Statement.execute :proof exact)
+            r#"(call :over calls :resolves-to java.sql.Statement.execute :proof exact
+                 :receiver-type type.java-sql-statement)
                (call-argument :over calls :formal-name "sql")"#,
         ))
         .unwrap();
@@ -7255,12 +7508,9 @@ mod tests {
                  ((calls.model_id eq "java.sql.Statement.execute")
                   (calls.semantic_target_id is-not-null)
                   (calls.signature_id is-not-null)
-                  (calls.dispatch_outcome eq resolved)
-                  (calls.dispatch_coverage eq exhaustive)
-                  (calls.dispatch_proof eq proven)
-                  (calls.dispatch_completeness eq complete)
-                  (calls.dispatch_target_count eq 1)
-                  (calls.dispatch_targets_truncated eq false)))
+                  (calls.selector_exact eq true)
+                  (calls.receiver_type_id eq "type.java-sql-statement")
+                  (calls.receiver_type_id is-not-null)))
                (filter :over calls :where
                  ((calls.formal_name eq "sql")
                   (calls.mapping eq exact)
@@ -7353,12 +7603,7 @@ mod tests {
                  ((calls.model_id eq "java.sql.Statement.execute")
                   (calls.semantic_target_id is-not-null)
                   (calls.signature_id is-not-null)
-                  (calls.dispatch_outcome eq resolved)
-                  (calls.dispatch_coverage eq exhaustive)
-                  (calls.dispatch_proof eq proven)
-                  (calls.dispatch_completeness eq complete)
-                  (calls.dispatch_target_count eq 1)
-                  (calls.dispatch_targets_truncated eq false)))
+                  (calls.selector_exact eq true)))
                (filter :over calls :where
                  ((calls.formal_index eq 0)
                   (calls.mapping eq exact)
@@ -7733,6 +7978,33 @@ mod tests {
             definition.taint,
             Some(EndpointTaintSemantics::Source { .. })
         ));
+    }
+
+    #[test]
+    fn decodes_and_documents_indexed_normal_result_bindings() {
+        let source = r#"(endpoint
+          :schema-version 1
+          :id "bifrost.sources.go-resource"
+          :name "Go resource"
+          :display-name "acquired resource"
+          :role source
+          :categories [resource.acquire]
+          :selector (rql :schema-version 1 (language go (call)))
+          :binding (result :index 0)
+          :supersedes [])"#;
+        let parsed = parse(source).unwrap();
+        let RqlpDocument::Endpoint { definition } = parsed.document else {
+            panic!("expected endpoint")
+        };
+        assert_eq!(
+            definition.binding,
+            PolicyEndpointBinding::ResultIndex { index: 0 }
+        );
+
+        let result_offset = source.find("result").unwrap() + 2;
+        let help = rqlp_source_help_at(source, result_offset).expect("result record hover help");
+        assert_eq!(help.signature, "(result :index N)");
+        assert!(help.description.contains("zero-based normal call result"));
     }
 
     #[test]

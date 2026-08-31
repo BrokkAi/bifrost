@@ -24,10 +24,14 @@ impl CodeQueryResult {
                 | CodeQueryResultValue::ReceiverOutcome { .. }
                 | CodeQueryResultValue::ReceiverEvidence { .. }
                 | CodeQueryResultValue::CallShape { .. }
+                | CodeQueryResultValue::CallResult { .. }
                 | CodeQueryResultValue::CallArgumentGroup { .. }
                 | CodeQueryResultValue::CallArgument { .. }
                 | CodeQueryResultValue::CallBinding { .. }
                 | CodeQueryResultValue::CallEffect { .. }
+                | CodeQueryResultValue::CallResultContract { .. }
+                | CodeQueryResultValue::ResultContractUse { .. }
+                | CodeQueryResultValue::ResultContractFailureUse { .. }
                 | CodeQueryResultValue::ProcedureEffect { .. }
                 | CodeQueryResultValue::CallableSignature { .. }
                 | CodeQueryResultValue::SignatureParameter { .. }
@@ -384,6 +388,20 @@ impl CodeQueryResult {
                             value.site_id
                         ));
                     }
+                    CodeQueryResultValue::CallResult { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [call result #{}; {}; {}] value={}; call={}; site={}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.ordinal,
+                            value.proof,
+                            value.completeness,
+                            value.value_id,
+                            value.call_id,
+                            value.site_id,
+                        ));
+                    }
                     CodeQueryResultValue::CallArgumentGroup { value } => {
                         out.push_str(&format!(
                             "{}:{}:{} [argument group {}; {}] arguments={}; site={}\n",
@@ -462,6 +480,68 @@ impl CodeQueryResult {
                                     .map(|reason| format!(" ({reason})"))
                                     .unwrap_or_default()),
                             value.site_id,
+                        ));
+                    }
+                    CodeQueryResultValue::CallResultContract { value } => {
+                        let contract = match (
+                            value.result_ordinal,
+                            value.condition_result_ordinal,
+                            value.predicate,
+                            value.result_success_predicate,
+                        ) {
+                            (Some(result), Some(condition), Some(predicate), _) => {
+                                format!("result {result} requires result {condition} {predicate}")
+                            }
+                            (Some(result), None, None, Some(predicate)) => {
+                                format!("result {result} is valid when {predicate}")
+                            }
+                            _ => value
+                                .reason
+                                .unwrap_or("no reviewed result contract")
+                                .to_owned(),
+                        };
+                        out.push_str(&format!(
+                            "{}:{}:{} [call result contract; {}] {}; site={}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.coverage,
+                            contract,
+                            value.site_id,
+                        ));
+                    }
+                    CodeQueryResultValue::ResultContractUse { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [result contract use; {}; {}; {}; {}] {}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.use_kind,
+                            value.applicability,
+                            value.guard,
+                            value.coverage,
+                            match (value.member.as_deref(), value.parameter_ordinal) {
+                                (Some(member), Some(ordinal)) => {
+                                    format!("{member} parameter {ordinal}")
+                                }
+                                (Some(member), None) => member.to_owned(),
+                                (None, Some(ordinal)) => format!("call parameter {ordinal}"),
+                                (None, None) => "intrinsic operation".to_owned(),
+                            },
+                        ));
+                    }
+                    CodeQueryResultValue::ResultContractFailureUse { value } => {
+                        out.push_str(&format!(
+                            "{}:{}:{} [result contract failure use; {}; {}; {}; {}] operand={} edge={}\n",
+                            value.path,
+                            value.range.start_line,
+                            value.range.start_column,
+                            value.consumer,
+                            value.failure_provenance,
+                            value.proof,
+                            value.coverage,
+                            value.operand_value_id,
+                            value.failure_edge_id.as_deref().unwrap_or("open"),
                         ));
                     }
                     CodeQueryResultValue::ProcedureEffect { value } => {

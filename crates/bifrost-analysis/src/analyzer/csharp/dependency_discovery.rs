@@ -43,18 +43,46 @@ pub(super) fn project_assets_files(root: &Path) -> Vec<PathBuf> {
 }
 
 pub(crate) fn is_csharp_dependency_input(file: &ProjectFile) -> bool {
-    let path = file.rel_path();
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("");
-    name == "project.assets.json"
-        || name == "packages.lock.json"
-        || name == "Directory.Packages.props"
-        || name == "NuGet.config"
-        || name.ends_with(".csproj")
-        || name.ends_with(".props")
-        || name.ends_with(".targets")
-        || name.ends_with(".dll")
-        || name.ends_with(".exe")
+    is_csharp_dependency_input_path(file.rel_path())
+}
+
+pub(crate) fn is_csharp_dependency_input_path(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    name.eq_ignore_ascii_case("project.assets.json")
+        || name.eq_ignore_ascii_case("packages.lock.json")
+        || name.eq_ignore_ascii_case("Directory.Packages.props")
+        || name.eq_ignore_ascii_case("NuGet.config")
+        || path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                ["csproj", "props", "targets", "dll", "exe"]
+                    .iter()
+                    .any(|expected| extension.eq_ignore_ascii_case(expected))
+            })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_csharp_dependency_input_path;
+    use std::path::Path;
+
+    #[test]
+    fn dependency_inputs_are_case_insensitive() {
+        for path in [
+            "App.CSPROJ",
+            "Directory.Build.PROPS",
+            "Custom.TARGETS",
+            "PROJECT.ASSETS.JSON",
+            "PACKAGES.LOCK.JSON",
+            "NUGET.CONFIG",
+            "Library.DLL",
+            "Tool.EXE",
+        ] {
+            assert!(is_csharp_dependency_input_path(Path::new(path)), "{path}");
+        }
+        assert!(!is_csharp_dependency_input_path(Path::new("App.cs")));
+    }
 }

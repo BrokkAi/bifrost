@@ -19,7 +19,7 @@
 use super::results::{CodeQueryGuard, CodeQueryResultRef, DetailedCodeQueryKey};
 use super::semantic::SemanticProcedureValue;
 use crate::analyzer::semantic::{
-    EvidenceCompleteness, GuardFact, GuardId, LengthDelimitedDigest, ProofStatus,
+    EvidenceCompleteness, GuardFact, GuardId, GuardPredicate, LengthDelimitedDigest, ProofStatus,
 };
 use crate::analyzer::{ProjectFile, Range};
 
@@ -85,16 +85,22 @@ pub(super) fn public_guard(value: &GuardValue) -> CodeQueryGuard {
         .point_value(fact.point)
         .expect("a validated procedure owns the point its own guard names")
         .point_ref();
-    let edge_id = |edge| {
-        value
+    let edge_projection = |edge| {
+        let edge = value
             .procedure
             .edge_value(edge)
             .expect("a validated procedure owns the edge its own guard names")
-            .public()
-            .id
+            .public();
+        (edge.id, edge.target.id)
     };
-    let true_edge_id = fact.true_edge.map(edge_id);
-    let false_edge_id = fact.false_edge.map(edge_id);
+    let (true_edge_id, true_target_id) = fact
+        .true_edge
+        .map(edge_projection)
+        .map_or((None, None), |(edge, target)| (Some(edge), Some(target)));
+    let (false_edge_id, false_target_id) = fact
+        .false_edge
+        .map(edge_projection)
+        .map_or((None, None), |(edge, target)| (Some(edge), Some(target)));
     let evidence = value
         .procedure
         .handle
@@ -111,6 +117,29 @@ pub(super) fn public_guard(value: &GuardValue) -> CodeQueryGuard {
     // discriminator that makes the public digest injective, exactly as the
     // program-point wire id does.
     digest.push(&fact.id.get().to_le_bytes());
+    let (null_on_true, null_target_id, equality_negated, constant_value, opaque_digest) =
+        match fact.predicate {
+            GuardPredicate::NullComparison { null_on_true } => (
+                Some(null_on_true),
+                if null_on_true {
+                    true_target_id.clone()
+                } else {
+                    false_target_id.clone()
+                },
+                None,
+                None,
+                None,
+            ),
+            GuardPredicate::ConstantEquality { negated, constant } => (
+                None,
+                None,
+                Some(negated),
+                Some(u64::from(constant.get())),
+                None,
+            ),
+            GuardPredicate::Opaque { digest } => (None, None, None, None, Some(digest.get())),
+            GuardPredicate::ConstantBoolean { .. } => (None, None, None, None, None),
+        };
     CodeQueryGuard {
         id: digest.finish().to_string(),
         procedure_id: procedure.id,
@@ -120,9 +149,16 @@ pub(super) fn public_guard(value: &GuardValue) -> CodeQueryGuard {
         point,
         predicate: fact.predicate.label(),
         constant: fact.predicate.constant_value(),
+        null_on_true,
+        null_target_id,
+        equality_negated,
+        constant_value,
+        opaque_digest,
         subject_value: fact.subject.map(|subject| u64::from(subject.get())),
         true_edge_id,
+        true_target_id,
         false_edge_id,
+        false_target_id,
         proof: proof_label(&evidence.proof),
         completeness: completeness_label(&evidence.completeness),
     }

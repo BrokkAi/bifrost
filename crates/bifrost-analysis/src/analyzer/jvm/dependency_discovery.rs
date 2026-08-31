@@ -296,7 +296,10 @@ fn discover_build_tools_with_executor(
 }
 
 pub(crate) fn is_jvm_dependency_input(file: &ProjectFile) -> bool {
-    let path = file.rel_path();
+    is_jvm_dependency_input_path(file.rel_path())
+}
+
+pub(crate) fn is_jvm_dependency_input_path(path: &Path) -> bool {
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())

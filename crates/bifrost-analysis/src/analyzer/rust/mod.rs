@@ -1241,6 +1241,10 @@ impl IAnalyzer for RustAnalyzer {
         Some(self)
     }
 
+    fn member_family_provider(&self) -> Option<&dyn crate::analyzer::usages::MemberFamilyProvider> {
+        Some(self)
+    }
+
     fn structural_fact_providers(
         &self,
     ) -> Vec<&dyn crate::analyzer::structural::StructuralFactProvider> {
@@ -1525,8 +1529,8 @@ impl LanguageSupport for RustSupport {
 
     /// Pre-build persisted Rust usage facts and the Cargo route index.
     /// These are otherwise charged to whichever request first touches the Rust
-    /// usage graph, which can push a single interactive `scan_usages` call
-    /// past its wall-clock budget on a large workspace (issue #1416). A no-op
+    /// usage graph, which can make a single interactive frontend request slow
+    /// on a large workspace (issue #1416). A no-op
     /// for workspaces without Rust.
     fn warm_usage_analysis(&self, analyzer: &dyn IAnalyzer) {
         let Some(rust) = resolve_analyzer::<RustAnalyzer>(analyzer) else {

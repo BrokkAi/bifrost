@@ -238,6 +238,18 @@ test("release readiness qualifies and assembles attributable semantic-pack parti
   assert.match(assembler, /bifrost-semantic-packs-\$\{RELEASE_TAG\}\.tar\.gz/u);
 });
 
+readinessTest("semantic-pack measurements stay in the tarball and are published separately", () => {
+  const assembler = jobBlock(readiness, "semantic-pack-bundle");
+  const packaging = stepBlocks(assembler).find((step) => /Package semantic-pack bundle/u.test(step));
+  assert.ok(packaging, "expected semantic-pack packaging step");
+  assert.match(
+    packaging,
+    /cp "\$\{RUNNER_TEMP\}\/bifrost-semantic-packs\/measurements\.json" "dist\/bifrost-semantic-packs-\$\{RELEASE_TAG\}-measurements\.json"/u,
+  );
+  assert.doesNotMatch(packaging, /\bmv\b[^\n]*measurements\.json/u);
+  assert.match(packaging, /-C "\$\{RUNNER_TEMP\}" -cf - bifrost-semantic-packs/u);
+});
+
 test("promotion is byte-only and does not rebuild, package, or repack", () => {
   for (const workflow of [release, cratePublisher]) {
     for (const forbidden of [
@@ -539,20 +551,53 @@ readinessTest("release readiness is read-only and contains no publishing boundar
   }
 });
 
-readinessTest("release readiness caps matrix concurrency", () => {
+readinessTest("release readiness starts every release binary while capping wheel matrices", () => {
   const caps = [...readiness.matchAll(/^\s+max-parallel:\s*(\d+)\s*$/gmu)].map((match) => Number(match[1]));
-  assert.ok(caps.length > 0, "expected at least one bounded matrix");
-  assert.ok(caps.every((cap) => cap >= 1 && cap <= 4), `unexpected max-parallel caps: ${caps.join(", ")}`);
+  assert.deepEqual(caps, [6, 4, 4]);
 });
 
-readinessTest("release readiness uses bash for the portable binary build", () => {
+readinessTest("release binaries use the restricted larger-runner pools", () => {
+  const build = jobBlock(readiness, "build");
+  assert.match(
+    build,
+    /target: universal-apple-darwin[\s\S]{0,160}?runner: bifrost-macos-arm64-5core/u,
+  );
+  for (const target of ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"]) {
+    assert.match(
+      build,
+      new RegExp(`target: ${target}[\\s\\S]{0,160}?runner: bifrost-release-windows-x64-8core`, "u"),
+    );
+  }
+});
+
+readinessTest("release readiness separates pinned GNU builds from portable binary builds", () => {
   const build = jobBlock(readiness, "build");
   const binaryBuild = build.match(
-    /^      - name: Build binary\n[\s\S]*?(?=^      - name: Build macOS universal binary)/mu,
+    /^      - name: Build binary\n[\s\S]*?(?=^      - name: Build GNU\/Linux binary)/mu,
   )?.[0];
   assert.ok(binaryBuild, "expected the cross-platform binary build step");
   assert.match(binaryBuild, /^        shell: bash$/mu);
   assert.match(binaryBuild, /run: cargo build --release --locked --bin "\$BIN_NAME"/u);
+
+  const linkerSetup = build.match(
+    /^      - name: Install pinned GNU\/Linux linker toolchain\n[\s\S]*?(?=^      - name: Set up Android NDK)/mu,
+  )?.[0];
+  assert.ok(linkerSetup, "expected the pinned GNU/Linux linker setup step");
+  assert.match(linkerSetup, /cargo-zigbuild --version '=0\.23\.3'/u);
+  assert.match(linkerSetup, /ziglang==0\.15\.2/u);
+
+  const gnuBuild = build.match(
+    /^      - name: Build GNU\/Linux binary with glibc 2\.28 floor\n[\s\S]*?(?=^      - name: Verify GNU\/Linux ELF contract)/mu,
+  )?.[0];
+  assert.ok(gnuBuild, "expected the constrained GNU/Linux build step");
+  assert.match(gnuBuild, /LIBZ_SYS_STATIC: '1'/u);
+  assert.match(gnuBuild, /cargo zigbuild --release --locked/u);
+  assert.match(gnuBuild, /--target "\$\{\{ matrix\.target \}\}\.2\.28"/u);
+
+  const verifier = build.indexOf("bash scripts/public/verify-linux-release-elf.sh");
+  const staging = build.indexOf("- name: Stage Unix archive");
+  assert.ok(verifier >= 0 && verifier < staging, "ELF verification must precede archive staging");
+  assert.doesNotMatch(build, /x86_64-unknown-linux-musl/u);
 });
 
 readinessTest("npm release packaging resolves assets from the workspace root", () => {

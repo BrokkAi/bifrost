@@ -587,10 +587,12 @@ fn entry_fact_is_zero(
 
 /// Attribute every source that generates taint along `steps` to `witness`.
 ///
-/// A step whose input is the zero fact and whose source point carries a
-/// selected source is the exact program point that introduced the value the
-/// rest of the path carries. Nothing else is consulted: the origin is the
-/// solver's own generation step, never a name or a spelling.
+/// `source_contribution` replays each selected source from the zero value at
+/// its own observation point and checks the resulting output fact against the
+/// witness step. This also attributes a source that regenerates a taint class
+/// on a path whose input fact already carries taint. Nothing else is
+/// consulted: the origin is the solver's own generation step, never a name or
+/// a spelling.
 #[allow(clippy::too_many_arguments)]
 fn collect_step_origins(
     plan: &TaintAnalysisPlan,
@@ -605,14 +607,10 @@ fn collect_step_origins(
     origin_truncated: &mut bool,
 ) -> Result<(), TaintFindingError> {
     for step in steps {
-        let input = result
+        result
             .fact_result()
             .fact(step.input_fact())
-            .copied()
             .ok_or(TaintFindingError::InvalidResult)?;
-        if !input.is_zero() {
-            continue;
-        }
         let output = result
             .fact_result()
             .fact(step.output_fact())
@@ -686,94 +684,107 @@ fn reconstruct_origins(
     let mut pending_callers = Vec::<PendingCallerContext>::new();
     let problem = super::TaintFlowProblem::new(plan);
     for quality in point_value.path_qualities().iter() {
-        let remaining_steps = budget
-            .limits
-            .max_witness_steps
-            .saturating_sub(budget.witness_steps);
-        let remaining_expansions = budget
-            .limits
-            .max_witness_expansions
-            .saturating_sub(budget.witness_expansions);
-        if budget.witnesses == budget.limits.max_witnesses
-            || remaining_steps == 0
-            || remaining_expansions == 0
-        {
-            witness_truncated = true;
-            witness_truncation_cause =
-                witness_truncation_cause.or(Some(TaintWitnessTruncationCause::CollectionBudget));
-            budget.truncated = true;
-            continue;
-        }
-        let bounded_limits = WitnessReconstructionLimits::new(
-            witness_limits.max_steps().min(remaining_steps),
-            witness_limits.max_expansions().min(remaining_expansions),
-        )
-        .expect("positive remaining witness limits were checked");
-        match result
-            .fact_result()
-            .witness_for_reached(reached, quality, bounded_limits)
-        {
-            Ok(witness) => {
-                let retained_bytes = witness.retained_bytes();
-                if retained_bytes
-                    > budget
-                        .limits
-                        .max_retained_witness_bytes
-                        .saturating_sub(budget.retained_witness_bytes)
-                {
-                    witness_truncated = true;
-                    witness_truncation_cause = witness_truncation_cause
-                        .or(Some(TaintWitnessTruncationCause::CollectionBudget));
-                    budget.truncated = true;
-                    continue;
-                }
-                budget.witnesses = budget.witnesses.saturating_add(1);
-                budget.witness_steps = budget
-                    .witness_steps
-                    .saturating_add(witness.work().emitted_steps());
-                budget.witness_expansions = budget
-                    .witness_expansions
-                    .saturating_add(witness.work().evidence_expansions());
-                budget.retained_witness_bytes =
-                    budget.retained_witness_bytes.saturating_add(retained_bytes);
-                let witness = Arc::new(witness);
-                // Unretained sibling alternatives are deliberately not folded
-                // in: the retained witness's own steps are complete without
-                // them, and the production retention limit of one alternative
-                // per quality would otherwise mark nearly every witness.
-                witness_truncated |= witness.truncated();
-                witness_truncation_cause = witness_truncation_cause.or(witness
-                    .truncation_cause()
-                    .map(TaintWitnessTruncationCause::Reconstruction));
-                budget.truncated |= witness.truncated();
-                collect_step_origins(
-                    plan,
-                    result,
-                    &problem,
-                    classes,
-                    limit,
-                    witness.steps(),
-                    &witness,
-                    &mut origins,
-                    &mut evidence,
-                    &mut origin_truncated,
-                )?;
-                // A path edge is relative to its entry, so a witness whose entry
-                // fact is not the distinguished zero fact begins mid-flow: the
-                // value was already tainted when the procedure was entered, and
-                // the step that generated it belongs to a caller (#2546).
-                if !entry_fact_is_zero(result, reached.entry())? {
-                    pending_callers
-                        .push(PendingCallerContext::new(reached.entry().clone(), &witness));
-                }
-            }
-            Err(SummaryWitnessError::RetentionDisabled) => witness_unavailable = true,
-            Err(SummaryWitnessError::QualityNotRetained(_)) => {
+        // One reached fact is routinely derived along several paths, and two
+        // paths can generate it from different sources, so the origin set is
+        // the union over every retained derivation rather than a property of
+        // whichever one the solver retained first (#2734). Asking for
+        // derivation zero when none was retained is what reports whether
+        // retention was disabled or the quality was dropped, so an empty
+        // retention still runs exactly one pass.
+        let derivations = reached.retained_derivations(quality).max(1);
+        for derivation in 0..derivations {
+            let remaining_steps = budget
+                .limits
+                .max_witness_steps
+                .saturating_sub(budget.witness_steps);
+            let remaining_expansions = budget
+                .limits
+                .max_witness_expansions
+                .saturating_sub(budget.witness_expansions);
+            if budget.witnesses == budget.limits.max_witnesses
+                || remaining_steps == 0
+                || remaining_expansions == 0
+            {
                 witness_truncated = true;
                 witness_truncation_cause = witness_truncation_cause
-                    .or(Some(TaintWitnessTruncationCause::QualityNotRetained));
+                    .or(Some(TaintWitnessTruncationCause::CollectionBudget));
+                budget.truncated = true;
+                continue;
             }
-            Err(error) => return Err(TaintFindingError::Witness(error)),
+            let bounded_limits = WitnessReconstructionLimits::new(
+                witness_limits.max_steps().min(remaining_steps),
+                witness_limits.max_expansions().min(remaining_expansions),
+            )
+            .expect("positive remaining witness limits were checked");
+            match result.fact_result().witness_for_reached_derivation(
+                reached,
+                quality,
+                derivation,
+                bounded_limits,
+            ) {
+                Ok(witness) => {
+                    let retained_bytes = witness.retained_bytes();
+                    if retained_bytes
+                        > budget
+                            .limits
+                            .max_retained_witness_bytes
+                            .saturating_sub(budget.retained_witness_bytes)
+                    {
+                        witness_truncated = true;
+                        witness_truncation_cause = witness_truncation_cause
+                            .or(Some(TaintWitnessTruncationCause::CollectionBudget));
+                        budget.truncated = true;
+                        continue;
+                    }
+                    budget.witnesses = budget.witnesses.saturating_add(1);
+                    budget.witness_steps = budget
+                        .witness_steps
+                        .saturating_add(witness.work().emitted_steps());
+                    budget.witness_expansions = budget
+                        .witness_expansions
+                        .saturating_add(witness.work().evidence_expansions());
+                    budget.retained_witness_bytes =
+                        budget.retained_witness_bytes.saturating_add(retained_bytes);
+                    let witness = Arc::new(witness);
+                    // Sibling derivations the retention limit dropped are still not
+                    // marked truncated: this witness's own steps are complete
+                    // without them, and the production retention limit of one
+                    // alternative per quality would otherwise mark nearly every
+                    // witness.
+                    witness_truncated |= witness.truncated();
+                    witness_truncation_cause = witness_truncation_cause.or(witness
+                        .truncation_cause()
+                        .map(TaintWitnessTruncationCause::Reconstruction));
+                    budget.truncated |= witness.truncated();
+                    collect_step_origins(
+                        plan,
+                        result,
+                        &problem,
+                        classes,
+                        limit,
+                        witness.steps(),
+                        &witness,
+                        &mut origins,
+                        &mut evidence,
+                        &mut origin_truncated,
+                    )?;
+                    // A path edge is relative to its entry, so a witness whose entry
+                    // fact is not the distinguished zero fact begins mid-flow: the
+                    // value was already tainted when the procedure was entered, and
+                    // the step that generated it belongs to a caller (#2546).
+                    if !entry_fact_is_zero(result, reached.entry())? {
+                        pending_callers
+                            .push(PendingCallerContext::new(reached.entry().clone(), &witness));
+                    }
+                }
+                Err(SummaryWitnessError::RetentionDisabled) => witness_unavailable = true,
+                Err(SummaryWitnessError::QualityNotRetained(_)) => {
+                    witness_truncated = true;
+                    witness_truncation_cause = witness_truncation_cause
+                        .or(Some(TaintWitnessTruncationCause::QualityNotRetained));
+                }
+                Err(error) => return Err(TaintFindingError::Witness(error)),
+            }
         }
     }
     // Walk back through the published incoming-call relations until the chain
@@ -791,112 +802,119 @@ fn reconstruct_origins(
                 continue;
             }
             for quality in incoming.path_qualities().iter() {
-                if caller_expansions == MAX_ORIGIN_CALLER_EXPANSIONS {
-                    origin_truncated = true;
-                    break 'callers;
-                }
-                let remaining_steps = budget
-                    .limits
-                    .max_witness_steps
-                    .saturating_sub(budget.witness_steps);
-                let remaining_expansions = budget
-                    .limits
-                    .max_witness_expansions
-                    .saturating_sub(budget.witness_expansions);
-                if budget.witnesses == budget.limits.max_witnesses
-                    || remaining_steps == 0
-                    || remaining_expansions == 0
-                {
-                    witness_truncated = true;
-                    witness_truncation_cause = witness_truncation_cause
-                        .or(Some(TaintWitnessTruncationCause::CollectionBudget));
-                    budget.truncated = true;
-                    break 'callers;
-                }
-                let bounded_limits = WitnessReconstructionLimits::new(
-                    witness_limits.max_steps().min(remaining_steps),
-                    witness_limits.max_expansions().min(remaining_expansions),
-                )
-                .expect("positive remaining witness limits were checked");
-                let call_witness = match result.fact_result().witness_for_incoming_call(
-                    incoming,
-                    quality,
-                    bounded_limits,
-                ) {
-                    Ok(call_witness) => call_witness,
-                    Err(SummaryWitnessError::RetentionDisabled) => {
-                        witness_unavailable = true;
-                        continue;
+                // The same union-over-derivations rule as the reached walk
+                // above: one call can be reached along several caller-relative
+                // paths, each of which can carry its own sources (#2734).
+                for derivation in 0..incoming.retained_derivations(quality).max(1) {
+                    if caller_expansions == MAX_ORIGIN_CALLER_EXPANSIONS {
+                        origin_truncated = true;
+                        break 'callers;
                     }
-                    Err(SummaryWitnessError::QualityNotRetained(_)) => {
+                    let remaining_steps = budget
+                        .limits
+                        .max_witness_steps
+                        .saturating_sub(budget.witness_steps);
+                    let remaining_expansions = budget
+                        .limits
+                        .max_witness_expansions
+                        .saturating_sub(budget.witness_expansions);
+                    if budget.witnesses == budget.limits.max_witnesses
+                        || remaining_steps == 0
+                        || remaining_expansions == 0
+                    {
                         witness_truncated = true;
                         witness_truncation_cause = witness_truncation_cause
-                            .or(Some(TaintWitnessTruncationCause::QualityNotRetained));
+                            .or(Some(TaintWitnessTruncationCause::CollectionBudget));
+                        budget.truncated = true;
+                        break 'callers;
+                    }
+                    let bounded_limits = WitnessReconstructionLimits::new(
+                        witness_limits.max_steps().min(remaining_steps),
+                        witness_limits.max_expansions().min(remaining_expansions),
+                    )
+                    .expect("positive remaining witness limits were checked");
+                    let call_witness =
+                        match result.fact_result().witness_for_incoming_call_derivation(
+                            incoming,
+                            quality,
+                            derivation,
+                            bounded_limits,
+                        ) {
+                            Ok(call_witness) => call_witness,
+                            Err(SummaryWitnessError::RetentionDisabled) => {
+                                witness_unavailable = true;
+                                continue;
+                            }
+                            Err(SummaryWitnessError::QualityNotRetained(_)) => {
+                                witness_truncated = true;
+                                witness_truncation_cause = witness_truncation_cause
+                                    .or(Some(TaintWitnessTruncationCause::QualityNotRetained));
+                                continue;
+                            }
+                            Err(error) => return Err(TaintFindingError::Witness(error)),
+                        };
+                    caller_expansions = caller_expansions.saturating_add(1);
+                    let call_steps = call_witness.steps().len();
+                    let Some(composed) =
+                        call_witness.joined_at_call(&context.witness, witness_limits.max_steps())
+                    else {
+                        // A retention marker carries no steps, so there is nothing
+                        // to compose and nothing the caller could witness.
+                        witness_truncated = true;
+                        witness_truncation_cause = witness_truncation_cause
+                            .or(Some(TaintWitnessTruncationCause::CollectionBudget));
+                        continue;
+                    };
+                    if composed.retained_bytes()
+                        > budget
+                            .limits
+                            .max_retained_witness_bytes
+                            .saturating_sub(budget.retained_witness_bytes)
+                    {
+                        witness_truncated = true;
+                        witness_truncation_cause = witness_truncation_cause
+                            .or(Some(TaintWitnessTruncationCause::CollectionBudget));
+                        budget.truncated = true;
                         continue;
                     }
-                    Err(error) => return Err(TaintFindingError::Witness(error)),
-                };
-                caller_expansions = caller_expansions.saturating_add(1);
-                let call_steps = call_witness.steps().len();
-                let Some(composed) =
-                    call_witness.joined_at_call(&context.witness, witness_limits.max_steps())
-                else {
-                    // A retention marker carries no steps, so there is nothing
-                    // to compose and nothing the caller could witness.
-                    witness_truncated = true;
-                    witness_truncation_cause = witness_truncation_cause
-                        .or(Some(TaintWitnessTruncationCause::CollectionBudget));
-                    continue;
-                };
-                if composed.retained_bytes()
-                    > budget
-                        .limits
-                        .max_retained_witness_bytes
-                        .saturating_sub(budget.retained_witness_bytes)
-                {
-                    witness_truncated = true;
-                    witness_truncation_cause = witness_truncation_cause
-                        .or(Some(TaintWitnessTruncationCause::CollectionBudget));
-                    budget.truncated = true;
-                    continue;
-                }
-                budget.witnesses = budget.witnesses.saturating_add(1);
-                budget.witness_steps = budget
-                    .witness_steps
-                    .saturating_add(call_witness.work().emitted_steps());
-                budget.witness_expansions = budget
-                    .witness_expansions
-                    .saturating_add(call_witness.work().evidence_expansions());
-                budget.retained_witness_bytes = budget
-                    .retained_witness_bytes
-                    .saturating_add(composed.retained_bytes());
-                witness_truncated |= composed.truncated();
-                witness_truncation_cause = witness_truncation_cause.or(composed
-                    .truncation_cause()
-                    .map(TaintWitnessTruncationCause::Reconstruction));
-                budget.truncated |= composed.truncated();
-                let composed = Arc::new(composed);
-                // Only the replayed call's own steps are scanned: the suffix's
-                // generating steps were already attributed to the witness that
-                // contains them.
-                collect_step_origins(
-                    plan,
-                    result,
-                    &problem,
-                    classes,
-                    limit,
-                    &composed.steps()[..call_steps.min(composed.steps().len())],
-                    &composed,
-                    &mut origins,
-                    &mut evidence,
-                    &mut origin_truncated,
-                )?;
-                if !entry_fact_is_zero(result, incoming.caller())? {
-                    pending_callers.push(PendingCallerContext::extended(
-                        &context,
-                        incoming.caller().clone(),
+                    budget.witnesses = budget.witnesses.saturating_add(1);
+                    budget.witness_steps = budget
+                        .witness_steps
+                        .saturating_add(call_witness.work().emitted_steps());
+                    budget.witness_expansions = budget
+                        .witness_expansions
+                        .saturating_add(call_witness.work().evidence_expansions());
+                    budget.retained_witness_bytes = budget
+                        .retained_witness_bytes
+                        .saturating_add(composed.retained_bytes());
+                    witness_truncated |= composed.truncated();
+                    witness_truncation_cause = witness_truncation_cause.or(composed
+                        .truncation_cause()
+                        .map(TaintWitnessTruncationCause::Reconstruction));
+                    budget.truncated |= composed.truncated();
+                    let composed = Arc::new(composed);
+                    // Only the replayed call's own steps are scanned: the suffix's
+                    // generating steps were already attributed to the witness that
+                    // contains them.
+                    collect_step_origins(
+                        plan,
+                        result,
+                        &problem,
+                        classes,
+                        limit,
+                        &composed.steps()[..call_steps.min(composed.steps().len())],
                         &composed,
-                    ));
+                        &mut origins,
+                        &mut evidence,
+                        &mut origin_truncated,
+                    )?;
+                    if !entry_fact_is_zero(result, incoming.caller())? {
+                        pending_callers.push(PendingCallerContext::extended(
+                            &context,
+                            incoming.caller().clone(),
+                            &composed,
+                        ));
+                    }
                 }
             }
         }

@@ -22,7 +22,7 @@ use crate::analyzer::tree_walk::named_children;
 use crate::analyzer::{Language, ProjectFile, RubyAnalyzer};
 use crate::hash::HashMap;
 
-const ADAPTER_VERSION: &[u8] = b"ruby-value-semantics-v3";
+const ADAPTER_VERSION: &[u8] = b"ruby-value-semantics-v4";
 
 impl_program_semantics_provider!(RubyAnalyzer, RubySemanticLowerer);
 
@@ -181,6 +181,25 @@ fn first_runtime_named_child(node: Node<'_>) -> Option<Node<'_>> {
     named_children(node)
         .into_iter()
         .find(|child| is_runtime_node(child.kind()))
+}
+
+/// The boolean value of a Ruby condition that is a literal, optionally wrapped
+/// in one parenthesized statement list. A multi-statement parenthesized body is
+/// intentionally not folded because its value depends on evaluation order.
+fn ruby_folded_boolean_constant(node: Node<'_>) -> Option<bool> {
+    let mut current = node;
+    while current.kind() == "parenthesized_statements" {
+        let children = runtime_expression_children(current);
+        if children.len() != 1 {
+            return None;
+        }
+        current = children[0];
+    }
+    match current.kind() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
 }
 
 fn required_field<'tree>(node: Node<'tree>, field: &str) -> Result<Node<'tree>, RubyLoweringError> {
@@ -525,13 +544,10 @@ fn ruby_capabilities() -> SemanticCapabilities {
         SemanticCapability::ConcurrentSpawn,
         SemanticCapability::NonLocalControl,
         SemanticCapability::ResourceManagement,
+        SemanticCapability::GuardFacts,
     ] {
         builder = builder.partial(capability);
     }
-    // Explicitly unsupported: this adapter normalizes no branch conditions, so
-    // an empty `guard_facts` table means "this language publishes no guard
-    // facts" rather than "this procedure has no decision" (#2443).
-    builder = builder.unsupported(SemanticCapability::GuardFacts);
     builder.build()
 }
 
@@ -1624,6 +1640,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), RubyLoweringError> {
+        if let Some(value) = ruby_folded_boolean_constant(node) {
+            let taken = if value { when_true } else { when_false };
+            self.edge(builder, entry, taken)?;
+            return self.record_guard(
+                builder,
+                entry,
+                GuardPredicate::ConstantBoolean { value },
+                None,
+                value.then_some(when_true),
+                (!value).then_some(when_false),
+            );
+        }
         if node.kind() == "binary" {
             let operator = node
                 .child_by_field_name("operator")
@@ -1686,6 +1714,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             self.negation_gaps(builder, decision)?;
             self.edge(builder, decision, when_true)?;
             self.edge(builder, decision, when_false)?;
+            let subject = self.expression_value(builder, node, expression_value_kind(node))?;
+            self.record_guard(
+                builder,
+                decision,
+                GuardPredicate::Opaque {
+                    digest: GuardConditionDigest::from_syntax_kind(node.kind()),
+                },
+                Some(subject),
+                Some(when_true),
+                Some(when_false),
+            )?;
             stack.push(Work::Expression {
                 node: operand,
                 entry,
@@ -1698,12 +1737,55 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let decision = self.point(builder, node, Vec::new())?;
         self.edge(builder, decision, when_true)?;
         self.edge(builder, decision, when_false)?;
+        let subject = self.expression_value(builder, node, expression_value_kind(node))?;
+        self.record_guard(
+            builder,
+            decision,
+            GuardPredicate::Opaque {
+                digest: GuardConditionDigest::from_syntax_kind(node.kind()),
+            },
+            Some(subject),
+            Some(when_true),
+            Some(when_false),
+        )?;
         stack.push(Work::Expression {
             node,
             entry,
             next: EdgeTarget::normal(decision),
             scope,
         });
+        Ok(())
+    }
+
+    /// Publish one guard fact for a decision this lowerer just made.
+    ///
+    /// Arms must already have been added as edges; the IR validator enforces
+    /// that. Ruby's general truthiness and overloadable operators remain
+    /// opaque.
+    #[allow(clippy::too_many_arguments)]
+    fn record_guard(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        predicate: GuardPredicate,
+        subject: Option<ValueId>,
+        when_true: Option<EdgeTarget>,
+        when_false: Option<EdgeTarget>,
+    ) -> Result<(), RubyLoweringError> {
+        let arm = |target: Option<EdgeTarget>| {
+            target.map(|target| GuardArm {
+                target_point: target.point,
+                kind: target.kind,
+            })
+        };
+        self.session.add_guard_fact(
+            builder,
+            point,
+            predicate,
+            subject,
+            arm(when_true),
+            arm(when_false),
+        )?;
         Ok(())
     }
 
@@ -2746,6 +2828,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 callee,
                 receiver,
                 arguments: arguments.into_boxed_slice(),
+                normal_results: Box::new([]),
                 result: Some(result),
                 thrown: Some(thrown),
                 declared_targets: resolution.clone(),
@@ -3608,6 +3691,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 callee,
                 receiver: None,
                 arguments: Box::new([]),
+                normal_results: Box::new([]),
                 result: Some(result),
                 thrown: Some(thrown),
                 declared_targets: resolution.clone(),

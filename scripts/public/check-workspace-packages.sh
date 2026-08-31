@@ -127,6 +127,15 @@ require_archive_file brokk-bifrost-policy policy-packs/bifrost.code-smells/manif
 require_archive_file brokk-bifrost-semantic-packs src/lib.rs
 require_archive_file brokk-bifrost-semantic-packs src/release_bundle.rs
 require_archive_file brokk-bifrost-semantic-packs src/bin/bifrost-semantic-pack.rs
+require_archive_file brokk-bifrost-semantic-packs models/go-stdlib-bytes-declarations.json
+require_archive_file brokk-bifrost-semantic-packs embedded/go-stdlib-bytes-declarations/manifest.json
+require_archive_file brokk-bifrost-semantic-packs embedded/go-stdlib-bytes-declarations/shards/go.stdlib.bytes.declarations.json
+require_archive_file brokk-bifrost-semantic-packs models/go-stdlib-crypto-x509.json
+require_archive_file brokk-bifrost-semantic-packs models/go-stdlib-crypto-x509-declarations.json
+require_archive_file brokk-bifrost-semantic-packs embedded/go-stdlib-crypto-x509/manifest.json
+require_archive_file brokk-bifrost-semantic-packs embedded/go-stdlib-crypto-x509/shards/go.stdlib.crypto-x509.parameter-preconditions.json
+require_archive_file brokk-bifrost-semantic-packs embedded/go-stdlib-crypto-x509-declarations/manifest.json
+require_archive_file brokk-bifrost-semantic-packs embedded/go-stdlib-crypto-x509-declarations/shards/go.stdlib.crypto-x509.declarations.json
 require_archive_file brokk-bifrost-runtime src/extension/mod.rs
 require_archive_file brokk-bifrost-runtime src/extension/workspace.rs
 

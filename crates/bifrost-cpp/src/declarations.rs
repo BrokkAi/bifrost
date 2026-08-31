@@ -2440,9 +2440,162 @@ pub struct CppVisitor<'a> {
     /// `Widget$Inner`). Regions are rare (one per fragmented recovery), so a
     /// linear scan at visit time is fine.
     pub consumed_fragment_regions: Vec<(usize, usize)>,
+    /// The namespace forward declarations already folded out of each tree this
+    /// walk has asked [`CppVisitor::unique_earlier_namespace_forward`] about.
+    /// Empty until the first question, which the overwhelming majority of files
+    /// never ask.
+    pub namespace_forward_scans: HashMap<CppTreeIdentity, CppNamespaceForwardScan>,
+    /// Which owners already have field declarations in the parse product, as
+    /// [`CppVisitor::has_enum_enumerator_units`] needs to know. `None` until
+    /// the first enum asks, which most files never do (#2786).
+    pub field_owners: Option<CppFieldOwnerIndex>,
+    /// What each open [`CppVisitor::record_recovered_declarations`] has watched
+    /// happen to the declaration set, innermost last. Empty outside a recovery
+    /// reparse, which is almost always (#2787).
+    pub recovery_captures: Vec<CppRecoveryCapture>,
 }
 
 impl<'a> CppVisitor<'a> {
+    /// Records `code_unit` with the answers the walk carries forward, then adds
+    /// it to the parse product.
+    ///
+    /// Every declaration this walk publishes goes through this family, so the
+    /// carried-forward answers see each one exactly once: the field ownership
+    /// index behind [`Self::has_enum_enumerator_units`] (#2786) and the minted
+    /// set every open [`Self::record_recovered_declarations`] reports (#2787).
+    fn add_declaration(
+        &mut self,
+        code_unit: CodeUnit,
+        node: Node<'_>,
+        parent: Option<CodeUnit>,
+        top_level: Option<CodeUnit>,
+    ) {
+        self.note_declaration(&code_unit);
+        let source = self.source;
+        self.parsed
+            .add_code_unit(code_unit, node, source, parent, top_level);
+    }
+
+    /// Range-based form of [`Self::add_declaration`].
+    fn add_declaration_with_range(
+        &mut self,
+        code_unit: CodeUnit,
+        range: Range,
+        parent: Option<CodeUnit>,
+        top_level: Option<CodeUnit>,
+    ) {
+        self.note_declaration(&code_unit);
+        self.parsed
+            .add_code_unit_with_range(code_unit, range, parent, top_level);
+    }
+
+    /// Deferred-replacement form of [`Self::add_declaration`].
+    fn replace_declaration_deferred(
+        &mut self,
+        code_unit: CodeUnit,
+        node: Node<'_>,
+        parent: Option<CodeUnit>,
+        top_level: Option<CodeUnit>,
+    ) {
+        self.note_replaced_declaration(&code_unit);
+        let source = self.source;
+        self.parsed
+            .replace_code_unit_deferred(code_unit, node, source, parent, top_level);
+    }
+
+    /// Range-based form of [`Self::replace_declaration_deferred`].
+    fn replace_declaration_with_range_deferred(
+        &mut self,
+        code_unit: CodeUnit,
+        range: Range,
+        parent: Option<CodeUnit>,
+        top_level: Option<CodeUnit>,
+    ) {
+        self.note_replaced_declaration(&code_unit);
+        self.parsed
+            .replace_code_unit_with_range_deferred(code_unit, range, parent, top_level);
+    }
+
+    /// Notes one declaration about to enter the parse product.
+    ///
+    /// A declaration the product already holds is not a creation, so an open
+    /// recovery capture ignores it -- which is the membership test the set
+    /// difference it replaces performed. A creation inside a nested recovery
+    /// belongs to the recoveries around it too, so every open capture takes it.
+    fn note_declaration(&mut self, code_unit: &CodeUnit) {
+        if !self.recovery_captures.is_empty() && !self.parsed.contains_declaration(code_unit) {
+            for capture in &mut self.recovery_captures {
+                if capture.removed_pre_existing.contains(code_unit) {
+                    continue;
+                }
+                if capture.created_units.insert(code_unit.clone()) {
+                    capture.created.push(code_unit.clone());
+                }
+            }
+        }
+        if let Some(field_owners) = self.field_owners.as_mut() {
+            field_owners.record(code_unit, self.file);
+        }
+    }
+
+    /// Notes one declaration about to replace an existing one.
+    ///
+    /// A deferred replacement of a declaration that already owns children
+    /// removes those children (`ParsedFile::prepare_deferred_replacement`), and
+    /// a removal is the one thing the field index cannot absorb by addition.
+    /// Drop it; the next question rebuilds it from the declarations that
+    /// survive. A replacement of a unit with no children, and a "replacement"
+    /// of a unit that is not there at all, remove nothing.
+    fn note_replaced_declaration(&mut self, code_unit: &CodeUnit) {
+        let removes_children = self.parsed.contains_declaration(code_unit)
+            && self
+                .parsed
+                .children
+                .get(code_unit)
+                .is_some_and(|children| !children.is_empty());
+        if removes_children {
+            if !self.recovery_captures.is_empty() {
+                let removed = self.declarations_a_replacement_removes(code_unit);
+                for capture in &mut self.recovery_captures {
+                    for unit in &removed {
+                        // A declaration this capture watched being created is
+                        // its own; one it did not is a declaration that was
+                        // already there when the capture opened, so creating it
+                        // again is a restoration and not a mint.
+                        if !capture.created_units.contains(unit) {
+                            capture.removed_pre_existing.insert(unit.clone());
+                        }
+                    }
+                }
+            }
+            self.field_owners = None;
+        }
+        self.note_declaration(code_unit);
+    }
+
+    /// The declarations `ParsedFile::prepare_deferred_replacement` will remove
+    /// when `code_unit` is replaced: its children, transitively.
+    fn declarations_a_replacement_removes(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
+        let mut removed = Vec::new();
+        let mut seen = HashSet::default();
+        let mut pending: Vec<CodeUnit> = self
+            .parsed
+            .children
+            .get(code_unit)
+            .cloned()
+            .unwrap_or_default();
+        while let Some(unit) = pending.pop() {
+            if !seen.insert(unit.clone()) {
+                continue;
+            }
+            if let Some(children) = self.parsed.children.get(&unit) {
+                pending.extend(children.iter().cloned());
+            }
+            removed.push(unit);
+        }
+        removed
+    }
+
     fn visit_function_like_export_class_pair<'tree>(
         &mut self,
         node: Node<'tree>,
@@ -2564,10 +2717,18 @@ impl<'a> CppVisitor<'a> {
         found
     }
 
+    /// Walk `node`'s container, answering every ancestor question from
+    /// `ancestry`.
+    ///
+    /// `ancestry` must index the tree `node` belongs to. The caller owns it
+    /// because one tree can be walked more than once -- a header's C and C++
+    /// readings are the same tree under different tag semantics -- and the
+    /// parent relation is a property of the tree, not of the reading.
     #[allow(clippy::too_many_arguments)]
-    pub fn visit_container(
+    pub fn visit_container<'tree>(
         &mut self,
-        node: Node<'_>,
+        node: Node<'tree>,
+        ancestry: &ParentIndex<'tree>,
         package_name: &str,
         module: Option<CodeUnit>,
         class_unit: Option<CodeUnit>,
@@ -2584,7 +2745,7 @@ impl<'a> CppVisitor<'a> {
             recovered_specialization_member_scope: false,
             visible_using_namespaces,
         };
-        self.run_container_work(node, scope);
+        self.run_container_work(node, scope, ancestry);
     }
 
     /// Whether a work node lies entirely inside a byte region consumed by a
@@ -2599,19 +2760,20 @@ impl<'a> CppVisitor<'a> {
     /// Drive the container work loop from an explicit seed scope to completion. The
     /// loop is self-contained so a locally-owned reparsed tree (issue #938/#941)
     /// stays alive for the whole traversal.
-    fn run_container_work<'tree>(&mut self, node: Node<'tree>, scope: ScopeInfo) {
-        // Every ancestor question this walk asks is answered from one index
-        // built here. Asking tree-sitter itself costs the node's position in
-        // the tree, which made a generated header with thousands of top-level
-        // declarations quadratic (#2361). `node` is the root of its own tree in
-        // every caller -- the file's tree, or a region reparse's -- and the
-        // ascent below costs nothing in that case while keeping the index
-        // correct if a caller ever seeds the walk lower down.
-        let mut root = node;
-        while let Some(parent) = root.parent() {
-            root = parent;
-        }
-        let ancestry = ParentIndex::new(root);
+    ///
+    /// Every ancestor question this walk asks is answered from `ancestry`, which
+    /// must index the tree `node` belongs to. Asking tree-sitter itself costs the
+    /// node's position in the tree, which made a generated header with thousands
+    /// of top-level declarations quadratic (#2361). The index is the caller's
+    /// because it outlives any one walk: the file's tree is walked twice when a
+    /// header has both a C and a C++ reading, and a region reparse (#938/#941)
+    /// builds its own index for its own tree.
+    fn run_container_work<'tree>(
+        &mut self,
+        node: Node<'tree>,
+        scope: ScopeInfo,
+        ancestry: &ParentIndex<'tree>,
+    ) {
         let mut stack = vec![CppWork::Container(CppContainer { node, scope })];
         while let Some(work) = stack.pop() {
             match work {
@@ -2625,7 +2787,7 @@ impl<'a> CppVisitor<'a> {
                     if self.node_is_inside_consumed_fragment(work.node) {
                         continue;
                     }
-                    self.visit_node(work.node, &work.scope, &mut stack, &ancestry);
+                    self.visit_node(work.node, &work.scope, &mut stack, ancestry);
                 }
             }
         }
@@ -2724,7 +2886,8 @@ impl<'a> CppVisitor<'a> {
             }
             return false;
         }
-        self.run_container_work(root, member_scope);
+        // The reparsed region is its own tree, so this walk indexes it itself.
+        self.run_container_work(root, member_scope, &ParentIndex::new(root));
         true
     }
 
@@ -2764,7 +2927,7 @@ impl<'a> CppVisitor<'a> {
         };
         debug_assert_eq!(function.name, class_unit.identifier());
         let code_unit = function.code_unit(self.file.clone());
-        self.parsed.add_code_unit_with_range(
+        self.add_declaration_with_range(
             code_unit.clone(),
             Range {
                 start_byte: function_declarator.start_byte(),
@@ -3132,7 +3295,12 @@ impl<'a> CppVisitor<'a> {
                 self.visit_type_declaration(node, scope, stack, ancestry)
             }
             "preproc_def" | "preproc_function_def" => self.visit_macro(node),
-            "preproc_include" => self.visit_include(node),
+            // `#include` is collected by `collect_cpp_includes` before the
+            // walk, so a directive the container walk never reaches -- inside
+            // a class body (Eigen's `EIGEN_DENSEBASE_PLUGIN`) or a switch
+            // statement (llama.cpp's `sycl/info/aspects.def`) -- is still an
+            // include claim.
+            "preproc_include" => {}
             kind if preserves_declaration_scope_through_wrapper(
                 kind,
                 scope.class_unit.is_some(),
@@ -3245,8 +3413,10 @@ impl<'a> CppVisitor<'a> {
             return false;
         }
         let recovery = cpp_recovery_window(self.source, start, end);
+        // The reparsed region is its own tree, so this walk indexes it itself.
+        let reparsed_ancestry = ParentIndex::new(root);
         self.record_recovered_declarations(recovery, |visitor| {
-            visitor.run_container_work(root, scope.clone());
+            visitor.run_container_work(root, scope.clone(), &reparsed_ancestry);
         });
         true
     }
@@ -3306,8 +3476,7 @@ impl<'a> CppVisitor<'a> {
                 cpp_namespace_fq(&full_name),
             );
             if !self.parsed.contains_declaration(&level) {
-                self.parsed
-                    .add_code_unit(level.clone(), node, self.source, None, None);
+                self.add_declaration(level.clone(), node, None, None);
             }
             package_name = full_name;
             module = Some(level);
@@ -3533,24 +3702,12 @@ impl<'a> CppVisitor<'a> {
         }
         if has_body {
             if let Some(range) = explicit_range {
-                self.parsed.replace_code_unit_with_range_deferred(
-                    code_unit.clone(),
-                    range,
-                    None,
-                    None,
-                );
+                self.replace_declaration_with_range_deferred(code_unit.clone(), range, None, None);
             } else {
-                self.parsed.replace_code_unit_deferred(
-                    code_unit.clone(),
-                    declaration_node,
-                    self.source,
-                    None,
-                    None,
-                );
+                self.replace_declaration_deferred(code_unit.clone(), declaration_node, None, None);
             }
         } else {
-            self.parsed
-                .add_code_unit(code_unit.clone(), declaration_node, self.source, None, None);
+            self.add_declaration(code_unit.clone(), declaration_node, None, None);
         }
         if let Some(raw_supertypes) = raw_supertypes {
             self.parsed
@@ -3638,22 +3795,46 @@ impl<'a> CppVisitor<'a> {
         code_unit
     }
 
-    fn has_enum_enumerator_units(&self, parent: &CodeUnit) -> bool {
-        let prefix = format!("{}.", parent.short_name());
-        let parent_short = parent.short_name();
-        self.parsed.declarations().iter().any(|unit| {
-            unit.kind() == CodeUnitType::Field
-                && unit.source() == parent.source()
-                && unit.package_name() == parent.package_name()
-                && if parent_short.is_empty() {
-                    // Anonymous enum/union parent: its enumerators carry bare
-                    // short names (#2140), so presence means any ownerless
-                    // field in this file.
-                    !unit.short_name().contains(['.', '$'])
-                } else {
-                    unit.short_name().starts_with(&prefix)
-                }
-        })
+    /// Whether the parse product already holds enumerator fields for `parent`,
+    /// answered from the walk's carried-forward field ownership index.
+    ///
+    /// Built on the first enum's question and advanced by every declaration
+    /// recorded after it, so a file that declares no enum -- most files -- pays
+    /// nothing, and one that declares thousands pays a single pass instead of
+    /// one per enum (#2786).
+    fn has_enum_enumerator_units(&mut self, parent: &CodeUnit) -> bool {
+        if self.field_owners.is_none() {
+            self.field_owners = Some(CppFieldOwnerIndex::of(
+                self.parsed.declarations().iter(),
+                self.file,
+            ));
+        }
+        debug_assert_eq!(
+            parent.source(),
+            self.file,
+            "the walk's declarations are declarations of the file it is walking"
+        );
+        let carried = self
+            .field_owners
+            .as_ref()
+            .expect("the index was just ensured")
+            .owns_fields(parent.package_name(), parent.short_name());
+
+        #[cfg(debug_assertions)]
+        assert_eq!(
+            carried,
+            cpp_declarations_hold_owned_fields(
+                self.parsed.declarations(),
+                self.file,
+                parent.package_name(),
+                parent.short_name()
+            ),
+            "the carried-forward field index must answer what a fresh declaration scan \
+             answers for {}",
+            parent.fq_name()
+        );
+
+        carried
     }
 
     fn visit_enum_enumerators(&mut self, node: Node<'_>, scope: &ScopeInfo, parent: &CodeUnit) {
@@ -3681,13 +3862,7 @@ impl<'a> CppVisitor<'a> {
             if self.parsed.contains_declaration(&code_unit) {
                 return WalkControl::Continue;
             }
-            self.parsed.add_code_unit(
-                code_unit.clone(),
-                child,
-                self.source,
-                Some(parent.clone()),
-                None,
-            );
+            self.add_declaration(code_unit.clone(), child, Some(parent.clone()), None);
             self.parsed.add_signature(
                 code_unit,
                 normalize_cpp_whitespace(node_text(child, self.source)),
@@ -3734,13 +3909,7 @@ impl<'a> CppVisitor<'a> {
             if self.parsed.contains_declaration(&code_unit) {
                 continue;
             }
-            self.parsed.add_code_unit(
-                code_unit.clone(),
-                node,
-                self.source,
-                Some(parent.clone()),
-                None,
-            );
+            self.add_declaration(code_unit.clone(), node, Some(parent.clone()), None);
             self.parsed.add_signature(code_unit, trimmed.to_string());
         }
     }
@@ -4014,8 +4183,7 @@ impl<'a> CppVisitor<'a> {
         // of this callable. `CodeUnit` already identifies the role-neutral
         // overload, while ranges and signature metadata describe its
         // declaration/definition occurrences.
-        self.parsed
-            .add_code_unit(code_unit.clone(), node, self.source, None, None);
+        self.add_declaration(code_unit.clone(), node, None, None);
         let signature = if recovered_constraint_constructor.is_some() {
             normalize_cpp_whitespace(node_text(function_declarator, self.source))
         } else {
@@ -4045,7 +4213,7 @@ impl<'a> CppVisitor<'a> {
     /// body-bearing, top-level recovery may borrow a namespace, and only when
     /// one earlier namespace-scope forward declaration proves the identity.
     fn scope_for_recovered_exported_class<'tree>(
-        &self,
+        &mut self,
         node: Node<'tree>,
         name: &str,
         definition_body_present: bool,
@@ -4078,10 +4246,9 @@ impl<'a> CppVisitor<'a> {
         {
             return scope.clone();
         }
-        let Some(package_name) =
-            unique_earlier_cpp_namespace_forward(node, name, self.source, ancestry).or_else(|| {
-                lifted_function_like_export_class_namespace(node, self.source, ancestry)
-            })
+        let borrowed_namespace = self.unique_earlier_namespace_forward(node, name, ancestry);
+        let Some(package_name) = borrowed_namespace
+            .or_else(|| lifted_function_like_export_class_namespace(node, self.source, ancestry))
         else {
             return scope.clone();
         };
@@ -4097,6 +4264,44 @@ impl<'a> CppVisitor<'a> {
         recovered.package_name = package_name;
         recovered.module = Some(module);
         recovered
+    }
+
+    /// The unique namespace-scope forward declaration of `name` that precedes
+    /// `recovered_node`, answered from the walk's carried-forward scan of the
+    /// tree `recovered_node` belongs to.
+    ///
+    /// The scan is built on the first question and advanced by each later one,
+    /// so a file that never reaches this path -- almost every file -- pays
+    /// nothing, and one that reaches it thousands of times pays a single pass
+    /// (#2754).
+    fn unique_earlier_namespace_forward<'tree>(
+        &mut self,
+        recovered_node: Node<'tree>,
+        name: &str,
+        ancestry: &ParentIndex<'tree>,
+    ) -> Option<String> {
+        let mut root = recovered_node;
+        while let Some(parent) = ancestry.parent(root) {
+            root = parent;
+        }
+        let source = self.source;
+        let scan = self
+            .namespace_forward_scans
+            .entry(CppTreeIdentity::of(root))
+            .or_default();
+        scan.advance_to(root, recovered_node.start_byte(), source, ancestry);
+        let borrowed = scan.unique_earlier_forward(name, recovered_node);
+
+        #[cfg(debug_assertions)]
+        assert_eq!(
+            borrowed,
+            unique_earlier_cpp_namespace_forward(recovered_node, name, source, ancestry),
+            "the carried-forward namespace scan must answer what a fresh prefix scan answers \
+             for {name} at byte {}",
+            recovered_node.start_byte()
+        );
+
+        borrowed
     }
 
     fn visit_malformed_function_definition_container<'tree>(
@@ -4139,24 +4344,47 @@ impl<'a> CppVisitor<'a> {
         recovery: Range,
         reparse_walk: impl FnOnce(&mut Self),
     ) {
+        // The set difference this used to be, kept as the oracle every answer
+        // is asserted against (#2787).
+        #[cfg(any(debug_assertions, test))]
         let before = self.parsed.declarations().clone();
+
+        self.recovery_captures.push(CppRecoveryCapture::default());
         reparse_walk(self);
-        let mut minted: Vec<CodeUnit> = self
-            .parsed
-            .declarations()
-            .iter()
-            .filter(|unit| !before.contains(*unit))
-            .cloned()
+        let captured = self
+            .recovery_captures
+            .pop()
+            .expect("the capture this call pushed is the one it pops");
+
+        // The capture holds every declaration created while it was open, once
+        // each and in creation order, so the recovered set costs what the
+        // recovery made rather than everything the file has declared so far.
+        // One filter is left to apply: a created declaration that a later
+        // deferred replacement removed is not in the parse product to report.
+        let mut minted: Vec<CodeUnit> = captured
+            .created
+            .into_iter()
+            .filter(|unit| self.parsed.contains_declaration(unit))
             .collect();
-        minted.sort_by_cached_key(|unit| {
-            let start = self
+        minted.sort_by_cached_key(|unit| self.recovered_declaration_order(unit));
+
+        #[cfg(any(debug_assertions, test))]
+        {
+            let mut rediscovered: Vec<CodeUnit> = self
                 .parsed
-                .declaration_ranges(unit)
-                .first()
-                .map(|range| range.start_byte)
-                .unwrap_or(usize::MAX);
-            (start, unit.fq_name().to_string())
-        });
+                .declarations()
+                .iter()
+                .filter(|unit| !before.contains(*unit))
+                .cloned()
+                .collect();
+            rediscovered.sort_by_cached_key(|unit| self.recovered_declaration_order(unit));
+            assert_eq!(
+                minted, rediscovered,
+                "the captured recovered set must be the declaration delta of the reparse \
+                 walk over {recovery:?}"
+            );
+        }
+
         for unit in minted {
             self.parsed
                 .record_materialization(MaterializationRecord::RecoveredDeclaration {
@@ -4164,6 +4392,18 @@ impl<'a> CppVisitor<'a> {
                     unit,
                 });
         }
+    }
+
+    /// Where one recovered declaration sorts: by start byte, then by name, so
+    /// the parse product stays deterministic.
+    fn recovered_declaration_order(&self, unit: &CodeUnit) -> (usize, String) {
+        let start = self
+            .parsed
+            .declaration_ranges(unit)
+            .first()
+            .map(|range| range.start_byte)
+            .unwrap_or(usize::MAX);
+        (start, unit.fq_name().to_string())
     }
 
     fn visit_sentinel_macro_region<'tree>(
@@ -4257,7 +4497,9 @@ impl<'a> CppVisitor<'a> {
                 recovered_specialization_member_scope: false,
                 visible_using_namespaces: class_scope.visible_using_namespaces.clone(),
             };
-            self.run_container_work(body_tree.root_node(), member_scope);
+            // The padded body reparse is its own tree, so it indexes itself.
+            let body_root = body_tree.root_node();
+            self.run_container_work(body_root, member_scope, &ParentIndex::new(body_root));
             // Register only after the padded body reparse: its nodes deliberately
             // retain offsets inside the consumed region and must be visited first.
             self.consumed_fragment_regions
@@ -4287,9 +4529,12 @@ impl<'a> CppVisitor<'a> {
             return false;
         }
         let recovery = cpp_recovery_window(self.source, start, end);
+        // The reparsed region is its own tree, so this walk indexes it itself.
+        let reparsed_ancestry = ParentIndex::new(root);
         self.record_recovered_declarations(recovery, |visitor| {
             visitor.visit_container(
                 root,
+                &reparsed_ancestry,
                 &scope.package_name,
                 scope.module.clone(),
                 scope.class_unit.clone(),
@@ -4348,13 +4593,7 @@ impl<'a> CppVisitor<'a> {
                 cpp_namespace_fq(&package_name),
             );
             if !self.parsed.contains_declaration(&namespace_module) {
-                self.parsed.add_code_unit(
-                    namespace_module.clone(),
-                    recovered.function,
-                    self.source,
-                    None,
-                    None,
-                );
+                self.add_declaration(namespace_module.clone(), recovered.function, None, None);
             }
             module = Some(namespace_module);
         }
@@ -4416,8 +4655,9 @@ impl<'a> CppVisitor<'a> {
         }
         // The class requirement above is the admission gate; once admitted,
         // traverse the whole proven inner namespace body so sibling aliases,
-        // functions, and variables are not silently discarded.
-        self.run_container_work(recovered.body, recovered_scope);
+        // functions, and variables are not silently discarded. The body is a
+        // node of the tree being walked, so it reuses that tree's index.
+        self.run_container_work(recovered.body, recovered_scope, ancestry);
         true
     }
 
@@ -4721,8 +4961,7 @@ impl<'a> CppVisitor<'a> {
                 .record_navigation_range(code_unit, cpp_declaration_range(declaration_node));
             return;
         }
-        self.parsed
-            .add_code_unit(code_unit.clone(), declaration_node, self.source, None, None);
+        self.add_declaration(code_unit.clone(), declaration_node, None, None);
         let signature = render_cpp_function_display_signature_from_node(
             declaration_node,
             self.source,
@@ -4784,8 +5023,7 @@ impl<'a> CppVisitor<'a> {
                 .record_navigation_range(code_unit, cpp_declaration_range(declaration_node));
             return;
         }
-        self.parsed
-            .add_code_unit(code_unit.clone(), declaration_node, self.source, None, None);
+        self.add_declaration(code_unit.clone(), declaration_node, None, None);
         let signature_label = render_cpp_function_display_signature_from_node(
             declaration_node,
             self.source,
@@ -4835,8 +5073,7 @@ impl<'a> CppVisitor<'a> {
             signature,
         };
         let code_unit = function.code_unit_with_synthetic(self.file.clone(), true);
-        self.parsed
-            .add_code_unit(code_unit.clone(), declaration_node, self.source, None, None);
+        self.add_declaration(code_unit.clone(), declaration_node, None, None);
         let signature_label = normalize_cpp_whitespace(node_text(declaration_node, self.source));
         let metadata = SignatureMetadata::with_parameter_labels(signature_label, parameter_labels)
             .with_declaration_only(false)
@@ -4891,8 +5128,7 @@ impl<'a> CppVisitor<'a> {
         if self.parsed.contains_declaration(&code_unit) {
             return;
         }
-        self.parsed
-            .add_code_unit(code_unit.clone(), declaration_node, self.source, None, None);
+        self.add_declaration(code_unit.clone(), declaration_node, None, None);
         self.parsed.add_signature_with_metadata(
             code_unit.clone(),
             SignatureMetadata::new(
@@ -4962,19 +5198,6 @@ impl<'a> CppVisitor<'a> {
                 self.visit_variable_declaration(node, child, scope, false, ancestry);
             }
         }
-    }
-
-    fn visit_include(&mut self, node: Node<'_>) {
-        let raw = normalize_cpp_whitespace(node_text(node, self.source));
-        self.parsed.imports.push(ImportInfo {
-            raw_snippet: raw,
-            is_wildcard: false,
-            is_global: false,
-            identifier: None,
-            alias: None,
-            path: None,
-            binder_span: None,
-        });
     }
 
     fn visit_type_declaration<'tree>(
@@ -5082,8 +5305,7 @@ impl<'a> CppVisitor<'a> {
             let code_unit = self.type_alias_unit(scope, alias_name, signature.clone());
             // Declaration identity does not include the alias signature. Keep
             // each physical range so conditional aliases retain their guards.
-            self.parsed
-                .add_code_unit_with_range(code_unit.clone(), range, None, None);
+            self.add_declaration_with_range(code_unit.clone(), range, None, None);
             self.parsed
                 .add_signature(code_unit.clone(), signature.clone());
             if let Some(metadata) = &scope.template_metadata {
@@ -5157,8 +5379,7 @@ impl<'a> CppVisitor<'a> {
         if self.parsed.contains_declaration(&code_unit) {
             return;
         }
-        self.parsed
-            .add_code_unit(code_unit.clone(), node, self.source, None, None);
+        self.add_declaration(code_unit.clone(), node, None, None);
         let name_range = node
             .child_by_field_name("name")
             .map(cpp_declaration_range)
@@ -5271,6 +5492,33 @@ fn cpp_recovery_window(source: &str, start_byte: usize, end_byte: usize) -> Rang
         start_line: line_at(start_byte),
         end_line: line_at(end_byte),
     }
+}
+
+/// Every `#include` directive the tree holds, in source order.
+///
+/// A preorder sweep rather than a step of the declaration walk: the container
+/// walk descends only through declaration scopes, so an include written inside
+/// a class body or a function body would otherwise never be seen, and an
+/// include is an include wherever it is written.
+pub fn collect_cpp_includes(root: Node<'_>, source: &str, parsed: &mut ParsedFile) {
+    walk_named_tree_preorder(root, true, |node| {
+        if node.kind() == "preproc_include" {
+            let raw = normalize_cpp_whitespace(node_text(node, source));
+            if !raw.is_empty() {
+                parsed.imports.push(ImportInfo {
+                    raw_snippet: raw,
+                    is_wildcard: false,
+                    is_global: false,
+                    identifier: None,
+                    alias: None,
+                    path: None,
+                    binder_span: None,
+                });
+            }
+            return WalkControl::SkipChildren;
+        }
+        WalkControl::Continue
+    });
 }
 
 pub fn recover_quoted_includes(source: &str, parsed: &mut ParsedFile) {
@@ -5798,17 +6046,319 @@ fn has_direct_cpp_declarator(node: Node<'_>) -> bool {
     })
 }
 
-/// Find the unique namespace-scope forward declaration that precedes a
-/// recovered export-macro class definition.  Tree-sitter can close a malformed
-/// class at the enclosing namespace's closing brace, leaving the later class
-/// definitions as root-level recovered `function_definition` nodes.  A
+/// One namespace-scope forward class declaration that a recovered export-macro
+/// class definition may borrow its identity from.  Tree-sitter can close a
+/// malformed class at the enclosing namespace's closing brace, leaving the later
+/// class definitions as root-level recovered `function_definition` nodes.  A
 /// preceding `class Name;` in the same namespace is the only structured identity
 /// signal available in that shape.
 ///
-/// The search is deliberately conservative: it only accepts a body-less class
-/// specifier whose declaration has no declarator and is not nested in a function
-/// or class body.  More than one matching namespace forward declaration is
-/// ambiguous and returns `None` rather than guessing.
+/// Everything recorded here is a property of the forward declaration alone.
+/// What depends on the node doing the asking -- that the forward and its
+/// namespace both close before it, with nothing but recovery trivia between --
+/// stays in [`cpp_namespace_forward_matches_recovery`], so one fold over the
+/// tree answers every later question about it.
+struct CppNamespaceForward {
+    name: String,
+    start_byte: usize,
+    /// Where the malformed namespace that held the forward ended.  No query
+    /// asks anything else about that node.
+    namespace_end_byte: usize,
+    package_name: String,
+}
+
+/// Read `node` as a borrowable namespace forward declaration.
+///
+/// The admission is deliberately conservative: only a body-less class specifier
+/// whose declaration has no declarator, at namespace scope rather than inside a
+/// function or class body, in a namespace that itself failed to parse.
+fn cpp_namespace_forward_entry<'tree>(
+    node: Node<'tree>,
+    source: &str,
+    ancestry: &ParentIndex<'tree>,
+) -> Option<CppNamespaceForward> {
+    if !matches!(
+        node.kind(),
+        "class_specifier" | "struct_specifier" | "union_specifier"
+    ) || cpp_body_node(node).is_some()
+    {
+        return None;
+    }
+    let parent = node.parent()?;
+    if !(parent.kind() == "declaration_list"
+        || parent.kind() == "declaration" && !has_direct_cpp_declarator(parent))
+    {
+        return None;
+    }
+    let namespace = cpp_namespace_definition_for_forward(node, ancestry)?;
+    // Borrowing is only justified by the parser-recovery shape we are
+    // repairing: the namespace that held the forward must itself contain a
+    // syntax error. A clean, unrelated namespace forward is not an identity
+    // proof.
+    if !namespace.has_error() {
+        return None;
+    }
+    Some(CppNamespaceForward {
+        name: class_like_name(node, source, ancestry)?,
+        start_byte: node.start_byte(),
+        namespace_end_byte: namespace.end_byte(),
+        package_name: cpp_namespace_name_for_forward(node, source, ancestry)?,
+    })
+}
+
+/// Whether `forward` stands in the recovery relation to the node asking about
+/// it: it and its malformed namespace both closed before the recovered class,
+/// and nothing but recovery trivia separates the two.
+fn cpp_namespace_forward_matches_recovery(
+    forward: &CppNamespaceForward,
+    recovered_node: Node<'_>,
+) -> bool {
+    forward.start_byte < recovered_node.start_byte()
+        && forward.namespace_end_byte < recovered_node.start_byte()
+        && malformed_namespace_is_nearest_recovery_region(
+            forward.namespace_end_byte,
+            recovered_node,
+        )
+}
+
+/// What one open [`CppVisitor::record_recovered_declarations`] has watched
+/// happen to the declaration set.
+///
+/// The recovered set used to be a difference against a clone of the whole
+/// declaration set, taken once per recovery: O(recoveries x declarations) on
+/// exactly the error-recovered files that already walk slowest (#2787). The
+/// walk knows which declarations it creates, so the capture collects them as
+/// they are made and the difference is never needed.
+///
+/// `removed_pre_existing` is what makes that equal to the difference. A
+/// deferred replacement removes the replaced declaration's children
+/// (`ParsedFile::prepare_deferred_replacement`), and the reparse walk then
+/// re-creates them. Creation alone cannot tell that apart from a first mint, so
+/// a removal of a declaration this capture did not create records that it was
+/// already there when the capture opened.
+#[derive(Debug, Default)]
+pub struct CppRecoveryCapture {
+    /// Declarations created while this capture was open, in creation order.
+    created: Vec<CodeUnit>,
+    /// Membership for `created`.
+    created_units: HashSet<CodeUnit>,
+    /// Declarations that predate this capture and have been removed during it.
+    removed_pre_existing: HashSet<CodeUnit>,
+}
+
+/// Which owners the parse product already holds field declarations for, folded
+/// in as the walk records them.
+///
+/// [`CppVisitor::has_enum_enumerator_units`] asks that question once per enum
+/// and used to answer it by scanning every declaration accumulated so far:
+/// O(enums x declarations) on exactly the generated headers that declare many
+/// of both (#2786). The answer only grows by declaration, so the walk carries
+/// it. A field's short name names its owner chain, `Owner.member`, so one field
+/// answers for every dotted prefix of its own short name; an anonymous enum's
+/// or union's enumerators carry bare short names instead (#2140), which is what
+/// an empty owner short name asks about.
+#[derive(Debug, Default)]
+pub struct CppFieldOwnerIndex {
+    /// Package name -> the owner short names its fields name.
+    owners: HashMap<String, HashSet<String>>,
+    /// Packages holding at least one field that names no owner.
+    ownerless_packages: HashSet<String>,
+}
+
+impl CppFieldOwnerIndex {
+    /// The index of the declarations recorded so far, built when the first
+    /// question arrives.
+    fn of<'unit>(
+        declarations: impl IntoIterator<Item = &'unit CodeUnit>,
+        file: &ProjectFile,
+    ) -> Self {
+        let mut index = Self::default();
+        for declaration in declarations {
+            index.record(declaration, file);
+        }
+        index
+    }
+
+    fn record(&mut self, code_unit: &CodeUnit, file: &ProjectFile) {
+        if code_unit.kind() != CodeUnitType::Field || code_unit.source() != file {
+            return;
+        }
+        let short_name = code_unit.short_name();
+        let package_name = code_unit.package_name();
+        if !short_name.contains(['.', '$']) && !self.ownerless_packages.contains(package_name) {
+            self.ownerless_packages.insert(package_name.to_string());
+        }
+        if !short_name.contains('.') {
+            return;
+        }
+        if !self.owners.contains_key(package_name) {
+            self.owners
+                .insert(package_name.to_string(), HashSet::default());
+        }
+        let owners = self
+            .owners
+            .get_mut(package_name)
+            .expect("the package entry was just ensured");
+        for (offset, _) in short_name.match_indices('.') {
+            let owner = &short_name[..offset];
+            if !owners.contains(owner) {
+                owners.insert(owner.to_string());
+            }
+        }
+    }
+
+    /// Whether a field declaration in `package_name` names `owner_short_name`
+    /// as its owner. An empty owner asks about ownerless fields instead.
+    fn owns_fields(&self, package_name: &str, owner_short_name: &str) -> bool {
+        if owner_short_name.is_empty() {
+            self.ownerless_packages.contains(package_name)
+        } else {
+            self.owners
+                .get(package_name)
+                .is_some_and(|owners| owners.contains(owner_short_name))
+        }
+    }
+}
+
+/// The declaration scan [`CppFieldOwnerIndex`] replaces, kept as the oracle a
+/// debug build asserts every carried answer against and as the release-mode
+/// parity tests' reference (#2786).
+#[cfg(any(debug_assertions, test))]
+fn cpp_declarations_hold_owned_fields<'unit>(
+    declarations: impl IntoIterator<Item = &'unit CodeUnit>,
+    file: &ProjectFile,
+    package_name: &str,
+    owner_short_name: &str,
+) -> bool {
+    let prefix = format!("{owner_short_name}.");
+    declarations.into_iter().any(|unit| {
+        unit.kind() == CodeUnitType::Field
+            && unit.source() == file
+            && unit.package_name() == package_name
+            && if owner_short_name.is_empty() {
+                // Anonymous enum/union parent: its enumerators carry bare
+                // short names (#2140), so presence means any ownerless
+                // field in this file.
+                !unit.short_name().contains(['.', '$'])
+            } else {
+                unit.short_name().starts_with(&prefix)
+            }
+    })
+}
+
+/// Which tree a [`CppNamespaceForwardScan`] was folded out of.
+///
+/// A region reparse is its own tree and is dropped while the walk that made it
+/// continues, so a later parse can be allocated at the same address and hand out
+/// the same node ids.  The root's span and shape pin the identity its address
+/// alone does not: two roots agreeing on all of this are the same parse of the
+/// same bytes, and a scan of one is a scan of the other.
+#[derive(PartialEq, Eq, Hash)]
+pub struct CppTreeIdentity {
+    root_id: usize,
+    start_byte: usize,
+    end_byte: usize,
+    kind_id: u16,
+    child_count: usize,
+}
+
+impl CppTreeIdentity {
+    fn of(root: Node<'_>) -> Self {
+        Self {
+            root_id: root.id(),
+            start_byte: root.start_byte(),
+            end_byte: root.end_byte(),
+            kind_id: root.kind_id(),
+            child_count: root.child_count(),
+        }
+    }
+}
+
+/// The namespace forward declarations one tree's prefix holds, folded in as the
+/// walk asks about them.
+///
+/// `scope_for_recovered_exported_class` asks the same question once per
+/// recovered class, and the answer depends only on the part of the tree that
+/// starts before the asking node.  Rescanning that prefix per question is
+/// quadratic in the file, and a generated header whose parse recovery leaves
+/// thousands of class-like declarations at file scope pays all of it: 1,904
+/// questions over 1.13 billion node visits on one 7.25 MB Vulkan header
+/// (#2754).  This carries the scan forward instead.  Each question advances the
+/// traversal from wherever the last one stopped to the asking node's start byte,
+/// so a whole walk pays at most one pass over the prefix its furthest question
+/// reaches, and each question then costs a name lookup.
+#[derive(Default)]
+pub struct CppNamespaceForwardScan {
+    /// Every named node starting before this byte has been folded in.
+    scanned_through: usize,
+    forwards: HashMap<String, Vec<CppNamespaceForward>>,
+}
+
+impl CppNamespaceForwardScan {
+    /// Fold in every named node of `root` that starts at or after the fold
+    /// watermark and before `cutoff`.
+    ///
+    /// Preorder over a tree is nondecreasing in start byte, so the nodes this
+    /// pass owes are exactly the ones no earlier pass reached, and a question
+    /// about an earlier byte than one already answered costs nothing.
+    fn advance_to<'tree>(
+        &mut self,
+        root: Node<'tree>,
+        cutoff: usize,
+        source: &str,
+        ancestry: &ParentIndex<'tree>,
+    ) {
+        if cutoff <= self.scanned_through {
+            return;
+        }
+        let folded_through = self.scanned_through;
+        let mut cursor = root.walk();
+        let mut stack = vec![root];
+        while let Some(current) = stack.pop() {
+            if (folded_through..cutoff).contains(&current.start_byte())
+                && let Some(forward) = cpp_namespace_forward_entry(current, source, ancestry)
+            {
+                self.forwards
+                    .entry(forward.name.clone())
+                    .or_default()
+                    .push(forward);
+            }
+            // A subtree ending before the watermark holds only nodes an earlier
+            // pass already folded, and one starting at or after the cutoff is
+            // outside the prefix being asked about. Skipping both is what keeps
+            // the total traversal to one pass.
+            for child in current.named_children(&mut cursor) {
+                if child.start_byte() < cutoff && child.end_byte() >= folded_through {
+                    stack.push(child);
+                }
+            }
+        }
+        self.scanned_through = cutoff;
+    }
+
+    /// The one namespace `name` was forward declared in before `recovered_node`.
+    /// More than one matching forward declaration is ambiguous and answers
+    /// nothing rather than guessing.
+    fn unique_earlier_forward(&self, name: &str, recovered_node: Node<'_>) -> Option<String> {
+        let mut matching = self
+            .forwards
+            .get(name)
+            .into_iter()
+            .flatten()
+            .filter(|forward| cpp_namespace_forward_matches_recovery(forward, recovered_node));
+        let first = matching.next()?;
+        matching
+            .next()
+            .is_none()
+            .then(|| first.package_name.clone())
+    }
+}
+
+/// The prefix scan [`CppNamespaceForwardScan`] replaces, kept as the oracle a
+/// debug build checks every answer against (and the one the parity tests drive
+/// directly).  It walks the whole prefix per question, which is exactly the cost
+/// #2754 removed from the release path.
+#[cfg(any(debug_assertions, test))]
 fn unique_earlier_cpp_namespace_forward<'tree>(
     recovered_node: Node<'tree>,
     name: &str,
@@ -5824,29 +6374,11 @@ fn unique_earlier_cpp_namespace_forward<'tree>(
     let mut stack = vec![root];
     while let Some(current) = stack.pop() {
         if current.start_byte() < recovered_node.start_byte()
-            && matches!(
-                current.kind(),
-                "class_specifier" | "struct_specifier" | "union_specifier"
-            )
-            && cpp_body_node(current).is_none()
-            && current.parent().is_some_and(|parent| {
-                parent.kind() == "declaration_list"
-                    || parent.kind() == "declaration" && !has_direct_cpp_declarator(parent)
-            })
-            && class_like_name(current, source, ancestry).as_deref() == Some(name)
-            && cpp_namespace_definition_for_forward(current, ancestry).is_some_and(|namespace| {
-                // Borrowing is only justified by the parser-recovery shape we
-                // are repairing: the namespace that held the forward must
-                // itself contain a syntax error and must have closed before
-                // the root-level recovered class. A clean, unrelated
-                // namespace forward is not an identity proof.
-                namespace.has_error()
-                    && namespace.end_byte() < recovered_node.start_byte()
-                    && malformed_namespace_is_nearest_recovery_region(namespace, recovered_node)
-            })
-            && let Some(package_name) = cpp_namespace_name_for_forward(current, source, ancestry)
+            && let Some(forward) = cpp_namespace_forward_entry(current, source, ancestry)
+            && forward.name == name
+            && cpp_namespace_forward_matches_recovery(&forward, recovered_node)
         {
-            candidates.push(package_name);
+            candidates.push(forward.package_name);
         }
 
         let mut cursor = current.walk();
@@ -5865,7 +6397,7 @@ fn unique_earlier_cpp_namespace_forward<'tree>(
 }
 
 fn malformed_namespace_is_nearest_recovery_region(
-    namespace: Node<'_>,
+    namespace_end_byte: usize,
     recovered_node: Node<'_>,
 ) -> bool {
     let mut root = recovered_node;
@@ -5875,7 +6407,7 @@ fn malformed_namespace_is_nearest_recovery_region(
     let mut cursor = root.walk();
     root.named_children(&mut cursor)
         .filter(|sibling| {
-            namespace.end_byte() <= sibling.start_byte()
+            namespace_end_byte <= sibling.start_byte()
                 && sibling.end_byte() <= recovered_node.start_byte()
         })
         .all(is_malformed_namespace_recovery_trivia)
@@ -11495,10 +12027,44 @@ fn cpp_macro_swallowed_declaration_envelope(node: Node<'_>, source: &str) -> boo
 }
 
 /// Reparse a fragmented class-body interior while preserving its original byte
-/// and line offsets. Unlike an included-range translation-unit parse, a padded
-/// prefix keeps C++ preprocessor directives after an access label in the same
-/// recovery shape tree-sitter produces for a complete class body.
+/// and line offsets, confined to the region by tree-sitter included ranges.
+///
+/// This used to materialize the region's whole file prefix as whitespace and
+/// make the lexer walk it, the technique #1309 replaced on the other reparse
+/// path: O(file) per fragmented-class recovery, on files that are already
+/// error-recovered and already slow (#2788). Included ranges give the parser
+/// the same view -- the region's bytes, at their original offsets and
+/// line/column positions -- without materializing or lexing anything before it.
+///
+/// The equality of the two views is the claim, so a debug build parses both and
+/// asserts the trees agree node for node.
 fn cpp_reparse_fragmented_class_body(source: &str, start: usize, end: usize) -> Option<Tree> {
+    let region = cpp_reparse_region_items(source, start, end);
+
+    #[cfg(debug_assertions)]
+    assert_eq!(
+        region.as_ref().map(cpp_tree_shape),
+        cpp_reparse_padded_class_body(source, start, end)
+            .as_ref()
+            .map(cpp_tree_shape),
+        "the region reparse of [{start}, {end}) must be the parse a whitespace-padded \
+         prefix produces"
+    );
+
+    region
+}
+
+/// The whitespace-padded reparse [`cpp_reparse_fragmented_class_body`]
+/// replaces, kept as the oracle a debug build asserts every region reparse
+/// against and as the release-mode parity tests' reference (#2788).
+#[cfg(any(debug_assertions, test))]
+fn cpp_reparse_padded_class_body(source: &str, start: usize, end: usize) -> Option<Tree> {
+    if start >= end {
+        // The included-range parser refuses an empty region; the padded one
+        // returned a tree holding nothing, which every caller read as "no
+        // members here".
+        return None;
+    }
     let bytes = source.as_bytes();
     let prefix = bytes.get(..start)?;
     let interior = bytes.get(start..end)?;
@@ -11515,6 +12081,30 @@ fn cpp_reparse_fragmented_class_body(source: &str, start: usize, end: usize) -> 
         .set_language(&tree_sitter_cpp::LANGUAGE.into())
         .ok()?;
     parser.parse(&padded, None)
+}
+
+/// Every node of `tree` in preorder, by kind, span and position, which is what
+/// two reparses of one region have to agree on for their callers to read the
+/// same declarations out of either (#2788).
+#[cfg(any(debug_assertions, test))]
+fn cpp_tree_shape(tree: &Tree) -> Vec<(&'static str, usize, usize, usize, usize, bool, bool)> {
+    let mut shape = Vec::new();
+    let mut cursor = tree.root_node().walk();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        shape.push((
+            node.kind(),
+            node.start_byte(),
+            node.end_byte(),
+            node.start_position().row,
+            node.start_position().column,
+            node.is_named(),
+            node.is_missing(),
+        ));
+        let children: Vec<Node<'_>> = node.children(&mut cursor).collect();
+        stack.extend(children.into_iter().rev());
+    }
+    shape
 }
 
 /// Robustness gate adapting #1015's `rust_reparsed_items_are_indexable`: the
@@ -15917,5 +16507,589 @@ struct Widget {
                 .map(|unit| unit.fq_name())
                 .collect::<std::collections::BTreeSet<_>>()
         );
+    }
+
+    /// Drive [`CppNamespaceForwardScan`] and the prefix scan it replaced over
+    /// every (node, class-like name) pair a tree offers, and require the same
+    /// answer from both.
+    ///
+    /// The release build has no `debug_assertions` agreement check, so this is
+    /// what pins the two together there.  Both query orders are exercised:
+    /// document order is what the walk does, and reverse order proves that a
+    /// question about an earlier byte than one already answered is still
+    /// filtered back to its own prefix rather than answered from the wider
+    /// fold.
+    ///
+    /// Returns how many questions were answered with a namespace, so a fixture
+    /// can assert it actually reached the path (#2754).
+    fn namespace_forward_scan_agreement(source: &str) -> usize {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let root = tree.root_node();
+        let ancestry = ParentIndex::new(root);
+
+        let mut nodes = Vec::new();
+        let mut names = std::collections::BTreeSet::new();
+        let mut cursor = root.walk();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if matches!(
+                node.kind(),
+                "class_specifier" | "struct_specifier" | "union_specifier"
+            ) && let Some(name) = class_like_name(node, source, &ancestry)
+            {
+                names.insert(name);
+            }
+            nodes.push(node);
+            stack.extend(node.named_children(&mut cursor));
+        }
+        nodes.sort_by_key(|node| (node.start_byte(), node.end_byte()));
+        assert!(!names.is_empty(), "fixture declares no class-like name");
+
+        let mut answered = 0usize;
+        for reversed in [false, true] {
+            let mut scan = CppNamespaceForwardScan::default();
+            let ordered: Vec<_> = if reversed {
+                nodes.iter().rev().copied().collect()
+            } else {
+                nodes.clone()
+            };
+            answered = 0;
+            for node in ordered {
+                for name in &names {
+                    scan.advance_to(root, node.start_byte(), source, &ancestry);
+                    let carried = scan.unique_earlier_forward(name, node);
+                    assert_eq!(
+                        carried,
+                        unique_earlier_cpp_namespace_forward(node, name, source, &ancestry),
+                        "carried-forward scan and prefix scan disagree about {name} at \
+                         {} node starting at byte {} (reversed order: {reversed})",
+                        node.kind(),
+                        node.start_byte()
+                    );
+                    answered += usize::from(carried.is_some());
+                }
+            }
+        }
+        answered
+    }
+
+    /// A malformed namespace whose forward declarations are the only identity
+    /// signal left for the class definitions tree-sitter pushed out to file
+    /// scope.  Both recovered classes open the guard; only the first one is
+    /// separated from the namespace by nothing but recovery trivia, so only the
+    /// first one borrows.  The carried-forward scan has to reproduce both
+    /// answers.
+    const MALFORMED_NAMESPACE_WITH_TWO_RECOVERED_CLASSES: &str = r#"#define API
+namespace ns {
+class Widget;
+class Gadget;
+int x = ;
+}
+class API Widget {
+public:
+    void first();
+};
+class API Gadget {
+public:
+    void second();
+};
+"#;
+
+    #[test]
+    fn carried_forward_namespace_scan_answers_what_the_prefix_scan_answers() {
+        assert!(
+            namespace_forward_scan_agreement(MALFORMED_NAMESPACE_WITH_TWO_RECOVERED_CLASSES) > 0,
+            "the fixture must actually reach the namespace-borrow path"
+        );
+
+        // Nothing here may be answered, and the two paths have to agree about
+        // that too: a clean namespace is not an identity proof, two forwards of
+        // one name are ambiguous rather than a guess, and a forward inside a
+        // function body is not at namespace scope.
+        for source in [
+            "namespace clean {\nclass Widget;\n}\nclass API Widget {\npublic:\n    void method();\n};\n",
+            r#"#define API
+namespace ns {
+class Widget;
+class Widget;
+int x = ;
+}
+class API Widget {
+public:
+    void method();
+};
+"#,
+            r#"#define API
+namespace ns {
+void host() {
+    class Widget;
+}
+int x = ;
+}
+class API Widget {
+public:
+    void method();
+};
+"#,
+        ] {
+            assert_eq!(
+                namespace_forward_scan_agreement(source),
+                0,
+                "no borrow is justified here: {source}"
+            );
+        }
+    }
+
+    /// The fold is incremental, so a walk that asks about steadily later bytes
+    /// must never re-fold a node an earlier question already folded, and must
+    /// never skip one that lies between two questions.
+    #[test]
+    fn carried_forward_namespace_scan_folds_each_node_once() {
+        let source = MALFORMED_NAMESPACE_WITH_TWO_RECOVERED_CLASSES;
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let root = tree.root_node();
+        let ancestry = ParentIndex::new(root);
+
+        let mut incremental = CppNamespaceForwardScan::default();
+        for cutoff in 0..=source.len() {
+            incremental.advance_to(root, cutoff, source, &ancestry);
+        }
+        let mut whole = CppNamespaceForwardScan::default();
+        whole.advance_to(root, source.len(), source, &ancestry);
+
+        let mut incremental_shape: Vec<_> = incremental
+            .forwards
+            .iter()
+            .map(|(name, forwards)| {
+                (
+                    name.clone(),
+                    forwards
+                        .iter()
+                        .map(|forward| (forward.start_byte, forward.package_name.clone()))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        let mut whole_shape: Vec<_> = whole
+            .forwards
+            .iter()
+            .map(|(name, forwards)| {
+                (
+                    name.clone(),
+                    forwards
+                        .iter()
+                        .map(|forward| (forward.start_byte, forward.package_name.clone()))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        incremental_shape.sort();
+        whole_shape.sort();
+        for (_, forwards) in &mut incremental_shape {
+            forwards.sort();
+        }
+        for (_, forwards) in &mut whole_shape {
+            forwards.sort();
+        }
+
+        assert!(!whole_shape.is_empty(), "fixture folds no forward");
+        assert_eq!(
+            incremental_shape, whole_shape,
+            "one byte at a time must fold exactly what one whole pass folds"
+        );
+    }
+
+    /// Drive the region reparse and the whitespace-padded reparse it replaced
+    /// over the same region and require identical trees.
+    ///
+    /// The release build has no `debug_assertions` agreement check, so this is
+    /// what pins the two together there. Each body is reparsed at its own
+    /// offset and again after a long prefix, because the prefix is the whole
+    /// difference between the two techniques: the padded parse lexes it as
+    /// whitespace, the included-range parse never sees it, and the tree has to
+    /// come out the same either way (#2788).
+    fn fragmented_class_reparse_agreement(body: &str) {
+        for prefix in [
+            String::new(),
+            "// leading comment\n".to_string(),
+            // A body starts just after its class head's `{`, which is normally
+            // mid-line: the padded parse then has spaces before the region on
+            // the region's own line, and the included-range parse has nothing
+            // at all before it.
+            "class Widget : public Base { ".to_string(),
+            "namespace filler {\n".to_string()
+                + &"struct Filler { int member; };\n".repeat(200)
+                + "}\n",
+            "namespace filler {\n".to_string()
+                + &"struct Filler { int member; };\n".repeat(200)
+                + "}\nclass Widget : public Base { ",
+        ] {
+            let source = format!("{prefix}{body}");
+            let start = prefix.len();
+            let end = source.len();
+            let region = cpp_reparse_fragmented_class_body(&source, start, end)
+                .expect("the region reparse must produce a tree");
+            let padded = cpp_reparse_padded_class_body(&source, start, end)
+                .expect("the padded reparse must produce a tree");
+            assert_eq!(
+                cpp_tree_shape(&region),
+                cpp_tree_shape(&padded),
+                "region and padded reparse disagree at offset {start} of {end} bytes"
+            );
+            assert_eq!(
+                region.root_node().start_byte(),
+                start,
+                "the reparsed region keeps its original offsets"
+            );
+        }
+    }
+
+    #[test]
+    fn the_region_reparse_of_a_fragmented_class_body_is_the_padded_reparse() {
+        // A conditional immediately after an access label: the shape the padded
+        // technique was kept for, because the directive and its macro name
+        // become an ERROR plus the following declaration's apparent type.
+        fragmented_class_reparse_agreement(
+            "public:\n#ifdef HAS_FEATURE\n   Widget(int value);\n#endif\n   void method();\n",
+        );
+        fragmented_class_reparse_agreement(
+            "public:\n#if defined(A) || defined(B)\n   Widget();\n#else\n   Widget(int);\n#endif\n",
+        );
+        // The merged inline constructor and the nested fragmented bodies the
+        // #938 recovery reads out of a reparse.
+        fragmented_class_reparse_agreement(
+            "public:\n   explicit Lookup_Error(std::string_view err) : Exception(err) {}\n\n                Lookup_Error(std::string_view type, std::string_view algo);\n",
+        );
+        fragmented_class_reparse_agreement(
+            "public:\n   void first();\nclass Action {\npublic:\n   void second();\n",
+        );
+        // A body that is not member-shaped at all still has to reparse the same
+        // way, because the admission gate reads the tree to reject it.
+        fragmented_class_reparse_agreement("public:\n   value + other;\n   return value;\n");
+    }
+
+    /// A header shaped like the generated ones this walk is slow on: many
+    /// enums, classes whose members share the enums' names, nested enums, an
+    /// ownerless enumerator, and namespaced repeats of all of it.
+    fn many_enums_and_mixed_declarations() -> String {
+        let mut source = String::from("#define API\nenum Empty {};\nenum API Loose { KEPT, };\n");
+        for index in 0..40 {
+            let _ = write!(
+                source,
+                "enum Color{index} {{ RED{index}, GREEN{index} }};\n\
+                 struct Holder{index} {{ int Color{index}; enum Inner{index} {{ A{index} }}; }};\n\
+                 class Color{index}Like {{ public: int member{index}; }};\n"
+            );
+        }
+        source.push_str("namespace outer {\n");
+        for index in 0..20 {
+            let _ = write!(
+                source,
+                "enum Shade{index} {{ DARK{index} }};\n\
+                 struct Shade{index}Holder {{ int field{index}; }};\n"
+            );
+        }
+        source.push_str("}\n");
+        source
+    }
+
+    /// Drive [`CppFieldOwnerIndex`] and the declaration scan it replaced over
+    /// every question a fixture's declarations can ask, and require the same
+    /// answer from both.
+    ///
+    /// The release build has no `debug_assertions` agreement check, so this is
+    /// what pins the two together there. The index is fed one declaration at a
+    /// time and every question is re-asked after each one, which is what proves
+    /// the incremental record agrees -- a whole-set rebuild would pass a weaker
+    /// test. Each of the fixture's own fields is also fed in restated as a
+    /// declaration of another file: the scan ignores those because it asks
+    /// about the asking unit's own source, and the index has to ignore them for
+    /// the same reason.
+    ///
+    /// Returns how many questions the fixture answered `true`, so a caller can
+    /// assert that it actually reached the path (#2786).
+    fn field_owner_index_agreement(source: &str, name: &str) -> usize {
+        let parsed = parse_cpp_declarations(source, name);
+        let file = ProjectFile::new(std::env::temp_dir(), name);
+        let elsewhere = ProjectFile::new(std::env::temp_dir(), "elsewhere.hpp");
+
+        let mut declarations: Vec<CodeUnit> = parsed.declarations().iter().cloned().collect();
+        declarations.sort_by_key(|unit| (unit.fq_name(), unit.kind()));
+
+        let foreign: Vec<CodeUnit> = declarations
+            .iter()
+            .filter(|unit| unit.kind() == CodeUnitType::Field)
+            .map(|unit| {
+                CodeUnit::new_fq(
+                    elsewhere.clone(),
+                    unit.kind(),
+                    unit.package_name().to_string(),
+                    unit.short_name().to_string(),
+                    unit.fq().clone(),
+                )
+            })
+            .collect();
+
+        // One owner chain deeper than any C++ short name reaches today
+        // (`cpp_member_fq`: at most one `.`, separating the owner chain from
+        // the member). The scan asks `starts_with("owner.")`, so a field like
+        // this answers for every owner in its chain, and the index has to
+        // record every one of them rather than only the innermost.
+        let mut packages: Vec<String> = declarations
+            .iter()
+            .map(|unit| unit.package_name().to_string())
+            .collect();
+        packages.push(String::new());
+        packages.sort();
+        packages.dedup();
+        let deeper: Vec<CodeUnit> = packages
+            .iter()
+            .map(|package_name| {
+                CodeUnit::new_fq(
+                    file.clone(),
+                    CodeUnitType::Field,
+                    package_name.clone(),
+                    "SynthOwner.middle.leaf".to_string(),
+                    cpp_member_fq(package_name, "SynthOwner.middle.leaf"),
+                )
+            })
+            .collect();
+
+        // Every (package, owner) pair anything could ask about: each unit's own
+        // short name, each dotted prefix of it, and the empty owner an
+        // anonymous enum asks with (#2140).
+        let mut questions: Vec<(String, String)> = Vec::new();
+        for unit in declarations.iter().chain(deeper.iter()) {
+            let package_name = unit.package_name().to_string();
+            let short_name = unit.short_name();
+            questions.push((package_name.clone(), short_name.to_string()));
+            questions.push((package_name.clone(), String::new()));
+            for (offset, _) in short_name.match_indices('.') {
+                questions.push((package_name.clone(), short_name[..offset].to_string()));
+            }
+        }
+        questions.sort();
+        questions.dedup();
+
+        let mut index = CppFieldOwnerIndex::default();
+        let mut recorded: Vec<&CodeUnit> = Vec::new();
+        let mut answered = 0usize;
+        for unit in foreign
+            .iter()
+            .chain(declarations.iter())
+            .chain(deeper.iter())
+        {
+            index.record(unit, &file);
+            recorded.push(unit);
+            for (package_name, owner_short_name) in &questions {
+                let carried = index.owns_fields(package_name, owner_short_name);
+                assert_eq!(
+                    carried,
+                    cpp_declarations_hold_owned_fields(
+                        recorded.iter().copied(),
+                        &file,
+                        package_name,
+                        owner_short_name
+                    ),
+                    "the carried field index and the declaration scan disagree about \
+                     {package_name:?}/{owner_short_name:?} after recording {}",
+                    unit.fq_name()
+                );
+                answered += usize::from(carried);
+            }
+        }
+
+        // The whole-set build the first question performs must land on the same
+        // index the incremental record built.
+        let rebuilt = CppFieldOwnerIndex::of(
+            foreign
+                .iter()
+                .chain(declarations.iter())
+                .chain(deeper.iter()),
+            &file,
+        );
+        for (package_name, owner_short_name) in &questions {
+            assert_eq!(
+                rebuilt.owns_fields(package_name, owner_short_name),
+                index.owns_fields(package_name, owner_short_name),
+                "a rebuilt index must answer what the incremental one answers for \
+                 {package_name:?}/{owner_short_name:?}"
+            );
+        }
+        answered
+    }
+
+    /// The one thing the field index cannot absorb by addition: a deferred
+    /// replacement of a declaration that owns children removes those children.
+    ///
+    /// The first enum builds the index, the struct records `Color.RED` into it,
+    /// the body-less second `Color` replaces the first and takes `Color.RED`
+    /// with it, and the last enum then asks about owner `Color`. An index that
+    /// survived that removal answers `true` where the declarations say `false`,
+    /// which is exactly what the in-walk agreement assertion catches (#2786).
+    #[test]
+    fn a_replacement_that_removes_children_drops_the_field_index() {
+        let source =
+            "enum First { A };\nstruct Color { int RED; };\nstruct Color {};\nenum Color {};\n";
+        let parsed = parse_cpp_declarations(source, "replaced-owner.hpp");
+        let mut names: Vec<_> = parsed
+            .declarations()
+            .iter()
+            .map(|unit| unit.fq_name())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "Color".to_string(),
+                "First".to_string(),
+                "First.A".to_string()
+            ],
+            "the replaced Color owns no field any more"
+        );
+    }
+
+    /// A recovery that re-declares what the file already declared mints
+    /// nothing.
+    ///
+    /// The reparse walk replaces the outer `Widget`, which removes its method,
+    /// and then re-creates that method from the region. Creation alone would
+    /// call the method recovered; it was there before the recovery opened, so
+    /// the recovered set is empty and only the region's own reparse window is
+    /// recorded (#2787).
+    #[test]
+    fn a_recovery_that_restores_an_existing_declaration_mints_nothing() {
+        let source = "namespace demo { struct Widget { void doWork(); }; }\n\
+                      BEGIN_NS\n\
+                      namespace demo { struct Widget { void doWork(); }; }\n\
+                      END_NS\n";
+        let parsed = parse_cpp_declarations(source, "restored.cpp");
+        let recovered: Vec<String> = parsed
+            .materialization_records
+            .iter()
+            .filter_map(|record| match record {
+                MaterializationRecord::RecoveredDeclaration { unit, .. } => Some(unit.fq_name()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            recovered.is_empty(),
+            "the region declares nothing the file did not already declare: {recovered:?}"
+        );
+        let mut names: Vec<String> = parsed
+            .declarations()
+            .iter()
+            .map(|unit| unit.fq_name())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "demo".to_string(),
+                "demo.Widget".to_string(),
+                "demo.Widget.doWork".to_string(),
+            ]
+        );
+    }
+
+    /// Four macro-sentinel recoveries in one file (#941). Each one must record
+    /// exactly the declarations it minted -- not the ones an earlier recovery
+    /// minted, and not the file's other declarations -- in start-byte order,
+    /// and each record must carry its own reparse window (#2787).
+    #[test]
+    fn repeated_sentinel_recoveries_record_only_what_each_one_minted() {
+        let mut source = String::new();
+        for index in 0..4 {
+            let _ = write!(
+                source,
+                "BEGIN_NS\nnamespace demo{index} {{ struct Widget{index}                  {{ void doWork{index}(); }}; }}\nEND_NS\n"
+            );
+        }
+        source.push_str("void outside() {}\n");
+        let parsed = parse_cpp_declarations(&source, "repeated-sentinels.cpp");
+
+        let recovered: Vec<(String, (usize, usize))> = parsed
+            .materialization_records
+            .iter()
+            .filter_map(|record| match record {
+                MaterializationRecord::RecoveredDeclaration { recovery, unit } => {
+                    Some((unit.fq_name(), (recovery.start_byte, recovery.end_byte)))
+                }
+                _ => None,
+            })
+            .collect();
+
+        let mut expected: Vec<(String, (usize, usize))> = Vec::new();
+        for index in 0..4 {
+            // The window the reparse covers: everything after the opening
+            // sentinel token up to the newline before the closing one.
+            let region = format!("namespace demo{index}");
+            let region_start = source.find(&region).expect("each region is in the source");
+            let start = source[..region_start]
+                .rfind("BEGIN_NS")
+                .expect("each region opens with a sentinel")
+                + "BEGIN_NS".len();
+            let end = start
+                + source[start..]
+                    .find("END_NS")
+                    .expect("each region closes with a sentinel")
+                - 1;
+            let window = (start, end);
+            for name in [
+                format!("demo{index}"),
+                format!("demo{index}.Widget{index}"),
+                format!("demo{index}.Widget{index}.doWork{index}"),
+            ] {
+                expected.push((name, window));
+            }
+        }
+        assert_eq!(
+            recovered, expected,
+            "each recovery records its own minted declarations, in order"
+        );
+        assert!(
+            parsed
+                .declarations()
+                .iter()
+                .any(|unit| unit.fq_name() == "outside"),
+            "the declaration outside every region stays parsed and unrecovered"
+        );
+    }
+
+    #[test]
+    fn carried_forward_field_index_answers_what_the_declaration_scan_answers() {
+        assert!(
+            field_owner_index_agreement(&many_enums_and_mixed_declarations(), "many-enums.hpp") > 0,
+            "the fixture must actually own fields"
+        );
+
+        // The shapes that make the two implementations diverge if the index
+        // records the wrong keys: a nested enum's owner is its whole dotted
+        // chain, a class named like an enum owns fields under that same name, a
+        // `$` in a short name is an owner separator the dotted prefix rule must
+        // not split on, and the same enum name in two namespaces is two owners.
+        for (source, name) in [
+            ("struct S { enum E { V }; };\n", "nested.hpp"),
+            (
+                "enum Color { RED };\nstruct Color { int RED; };\n",
+                "class-like.c",
+            ),
+            ("struct Outer { struct Inner { int V; }; };\n", "sigil.hpp"),
+            (
+                "enum E { V };\nnamespace ns { enum E { V }; }\n",
+                "repeated.hpp",
+            ),
+            ("#define API\nenum API Loose { KEPT, };\n", "ownerless.hpp"),
+        ] {
+            field_owner_index_agreement(source, name);
+        }
     }
 }

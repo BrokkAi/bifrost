@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "pack_id": "bifrost.jdk-framework-decls",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "producer": {
     "name": "bifrost-framework-foundry",
     "version": "0.9.0"
@@ -1474,6 +1474,7 @@
             "is_static": false,
             "is_abstract": true,
             "is_virtual": true,
+            "callable_family_complete": true,
             "signature": {
               "type_parameters": [],
               "parameters": [

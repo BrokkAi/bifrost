@@ -18,7 +18,17 @@ use tree_sitter::{Language as TsLanguage, Node, ParseOptions, Parser};
 #[derive(Debug)]
 pub(crate) enum LimitedFileFacts {
     Complete(FileFacts),
-    Exceeded { minimum_fact_nodes: usize },
+    /// Complete facts plus the exact tree-sitter-node to normalized-fact
+    /// mapping from the tree that was passed to the extraction pass. The
+    /// index is intentionally returned only for callers that retain that
+    /// exact tree, such as semantic lowering of a prepared syntax snapshot.
+    CompleteWithNodeIndex {
+        facts: FileFacts,
+        node_ids: HashMap<usize, u32>,
+    },
+    Exceeded {
+        minimum_fact_nodes: usize,
+    },
     Cancelled,
     Unavailable,
 }
@@ -43,6 +53,7 @@ pub fn extract_file_facts(
 ) -> Option<FileFacts> {
     match extract_file_facts_limited(spec, grammar, source, usize::MAX, None) {
         LimitedFileFacts::Complete(facts) => Some(facts),
+        LimitedFileFacts::CompleteWithNodeIndex { facts, .. } => Some(facts),
         LimitedFileFacts::Exceeded { .. }
         | LimitedFileFacts::Cancelled
         | LimitedFileFacts::Unavailable => None,
@@ -61,6 +72,50 @@ pub(crate) fn extract_file_facts_limited(
     max_fact_nodes: usize,
     cancellation: Option<&CancellationToken>,
 ) -> LimitedFileFacts {
+    extract_file_facts_limited_with_tree(
+        spec,
+        grammar,
+        source,
+        None,
+        max_fact_nodes,
+        cancellation,
+        false,
+    )
+}
+
+/// Extract normalized facts from an already-prepared tree and retain the
+/// exact mapping from tree-sitter node ids to normalized fact ids. This is the
+/// same extraction pass used by [`extract_file_facts_limited`]; accepting the
+/// prepared tree is what makes the returned ids directly joinable to a
+/// semantic producer without ranges, names, or a second parser tree.
+pub(crate) fn extract_file_facts_from_tree_limited(
+    spec: &dyn StructuralSpec,
+    grammar: &TsLanguage,
+    tree: &tree_sitter::Tree,
+    source: &str,
+    max_fact_nodes: usize,
+    cancellation: Option<&CancellationToken>,
+) -> LimitedFileFacts {
+    extract_file_facts_limited_with_tree(
+        spec,
+        grammar,
+        source,
+        Some(tree),
+        max_fact_nodes,
+        cancellation,
+        true,
+    )
+}
+
+fn extract_file_facts_limited_with_tree(
+    spec: &dyn StructuralSpec,
+    grammar: &TsLanguage,
+    source: &str,
+    prepared_tree: Option<&tree_sitter::Tree>,
+    max_fact_nodes: usize,
+    cancellation: Option<&CancellationToken>,
+    include_node_index: bool,
+) -> LimitedFileFacts {
     // An empty source is a legitimate file with zero facts (empty __init__.py
     // and placeholder .ts fixtures are real workspace members). Rejecting it
     // as Unavailable made one empty file abort the whole provider index and
@@ -74,29 +129,34 @@ pub(crate) fn extract_file_facts_limited(
             minimum_fact_nodes: 1,
         };
     }
-    let mut parser = Parser::new();
-    if parser.set_language(grammar).is_err() {
-        return LimitedFileFacts::Unavailable;
-    }
-    // C# hides preprocessor directive lines and inactive conditional branches
-    // from the parser; every other language parses the whole file.
-    if let Some(ranges) = spec.parser_included_ranges(source)
-        && parser.set_included_ranges(&ranges).is_err()
-    {
-        return LimitedFileFacts::Unavailable;
-    }
-    let tree = if let Some(cancellation) = cancellation {
-        let mut read = |offset: usize, _| &source.as_bytes()[offset..];
-        let mut progress = |_: &tree_sitter::ParseState| cancellation.is_cancelled();
-        parser.parse_with_options(
-            &mut read,
-            None,
-            Some(ParseOptions::new().progress_callback(&mut progress)),
-        )
+    let parsed_tree = if prepared_tree.is_none() {
+        let mut parser = Parser::new();
+        if parser.set_language(grammar).is_err() {
+            return LimitedFileFacts::Unavailable;
+        }
+        // C# hides preprocessor directive lines and inactive conditional
+        // branches from the parser; every other language parses the whole
+        // file.
+        if let Some(ranges) = spec.parser_included_ranges(source)
+            && parser.set_included_ranges(&ranges).is_err()
+        {
+            return LimitedFileFacts::Unavailable;
+        }
+        if let Some(cancellation) = cancellation {
+            let mut read = |offset: usize, _| &source.as_bytes()[offset..];
+            let mut progress = |_: &tree_sitter::ParseState| cancellation.is_cancelled();
+            parser.parse_with_options(
+                &mut read,
+                None,
+                Some(ParseOptions::new().progress_callback(&mut progress)),
+            )
+        } else {
+            parser.parse(source, None)
+        }
     } else {
-        parser.parse(source, None)
+        None
     };
-    let Some(tree) = tree else {
+    let Some(tree) = prepared_tree.or(parsed_tree.as_ref()) else {
         return if cancellation.is_some_and(CancellationToken::is_cancelled) {
             LimitedFileFacts::Cancelled
         } else {
@@ -309,13 +369,21 @@ pub(crate) fn extract_file_facts_limited(
     debug_assert_eq!(next, occurrence_roles.len());
 
     let line_starts = compute_line_starts(source);
-    LimitedFileFacts::Complete(FileFacts::new(
+    let facts = FileFacts::new(
         source.to_string(),
         line_starts,
         nodes,
         roles.finish(),
         occurrence_rows.finish(),
-    ))
+    );
+    if include_node_index {
+        LimitedFileFacts::CompleteWithNodeIndex {
+            facts,
+            node_ids: fact_by_ts_node,
+        }
+    } else {
+        LimitedFileFacts::Complete(facts)
+    }
 }
 
 #[cfg(test)]
@@ -333,11 +401,11 @@ mod tests {
         let facts = extract_file_facts(spec, &grammar, "").expect("empty source yields facts");
         assert_eq!(facts.work_item_count(), 0);
         assert_eq!(facts.source(), "");
-        let payload = facts
-            .encode_snapshot()
-            .expect("empty facts round-trip through the snapshot codec");
-        let decoded =
-            FileFacts::decode_snapshot(String::new(), &payload).expect("empty snapshot decodes");
+        let rows = facts
+            .persisted_rows()
+            .expect("empty facts convert to relational rows");
+        let decoded = FileFacts::from_persisted_rows(String::new(), rows)
+            .expect("empty relational facts hydrate");
         assert_eq!(decoded.work_item_count(), 0);
     }
 
@@ -357,7 +425,7 @@ mod tests {
         assert_eq!(facts.occurrence_role_count(), 0);
     }
 
-    /// Occurrence roles survive the snapshot codec with their node addressing
+    /// Occurrence roles survive relational persistence with their node addressing
     /// intact, which is the property the `(content identity, fact id)` join in
     /// later milestones depends on.
     #[test]
@@ -368,9 +436,11 @@ mod tests {
         let facts = extract_file_facts(spec, &grammar, source).expect("python fixture extracts");
         assert!(facts.occurrence_role_count() > 0);
 
-        let payload = facts.encode_snapshot().expect("facts encode");
-        let decoded =
-            FileFacts::decode_snapshot(source.to_owned(), &payload).expect("facts decode");
+        let rows = facts
+            .persisted_rows()
+            .expect("facts become relational rows");
+        let decoded = FileFacts::from_persisted_rows(source.to_owned(), rows)
+            .expect("relational facts hydrate");
         for id in 0..facts.nodes().len() as u32 {
             assert_eq!(decoded.occurrence_roles(id), facts.occurrence_roles(id));
         }
@@ -418,9 +488,11 @@ mod tests {
             facts.occurrence_roles(embedded_id)
         );
 
-        let payload = facts.encode_snapshot().expect("facts encode");
-        let decoded =
-            FileFacts::decode_snapshot(source.to_owned(), &payload).expect("facts decode");
+        let rows = facts
+            .persisted_rows()
+            .expect("facts become relational rows");
+        let decoded = FileFacts::from_persisted_rows(source.to_owned(), rows)
+            .expect("relational facts hydrate");
         assert_eq!(
             decoded.node(embedded_id).range,
             facts.node(embedded_id).range

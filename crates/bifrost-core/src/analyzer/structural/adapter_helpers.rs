@@ -93,6 +93,7 @@ pub fn is_spread_argument_node(node: Node<'_>) -> bool {
             | "list_splat"
             | "dictionary_splat"
             | "spread_argument"
+            | "variadic_argument"
             | "variadic_unpacking"
     ) || (node.kind() == "argument"
         && (0..node.named_child_count())

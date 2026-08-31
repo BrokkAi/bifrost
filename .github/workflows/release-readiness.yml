@@ -387,7 +387,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          mv "${RUNNER_TEMP}/bifrost-semantic-packs/measurements.json" "dist/bifrost-semantic-packs-${RELEASE_TAG}-measurements.json"
+          cp "${RUNNER_TEMP}/bifrost-semantic-packs/measurements.json" "dist/bifrost-semantic-packs-${RELEASE_TAG}-measurements.json"
           tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
             -C "${RUNNER_TEMP}" -cf - bifrost-semantic-packs | gzip -n > "dist/bifrost-semantic-packs-${RELEASE_TAG}.tar.gz"
           (cd dist && sha256sum "bifrost-semantic-packs-${RELEASE_TAG}.tar.gz" > "bifrost-semantic-packs-${RELEASE_TAG}.tar.gz.sha256")
@@ -409,15 +409,13 @@ jobs:
     timeout-minutes: 60
     strategy:
       fail-fast: false
-      max-parallel: 4
+      # Start every target immediately. The paid macOS and Windows pools have
+      # their own lower capacity limits in the release-readiness runner group.
+      max-parallel: 6
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
             rust_targets: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
-            archive: tar.gz
-          - target: x86_64-unknown-linux-musl
-            rust_targets: x86_64-unknown-linux-musl
             runner: ubuntu-latest
             archive: tar.gz
           - target: aarch64-unknown-linux-gnu
@@ -430,15 +428,15 @@ jobs:
             archive: tar.gz
           - target: universal-apple-darwin
             rust_targets: x86_64-apple-darwin aarch64-apple-darwin
-            runner: macos-latest
+            runner: bifrost-macos-arm64-5core
             archive: tar.gz
           - target: x86_64-pc-windows-msvc
             rust_targets: x86_64-pc-windows-msvc
-            runner: windows-latest
+            runner: bifrost-release-windows-x64-8core
             archive: zip
           - target: aarch64-pc-windows-msvc
             rust_targets: aarch64-pc-windows-msvc
-            runner: windows-latest
+            runner: bifrost-release-windows-x64-8core
             archive: zip
     steps:
       - name: Checkout qualified source
@@ -464,10 +462,14 @@ jobs:
       - name: Install Rust targets
         shell: bash
         run: rustup target add ${{ matrix.rust_targets }}
-      - name: Install musl toolchain
-        if: matrix.target == 'x86_64-unknown-linux-musl'
+      - name: Install pinned GNU/Linux linker toolchain
+        if: endsWith(matrix.target, '-unknown-linux-gnu')
         shell: bash
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y musl-tools
+        run: |
+          cargo install --locked cargo-zigbuild --version '=0.23.3'
+          python3 -m venv "$RUNNER_TEMP/ziglang"
+          "$RUNNER_TEMP/ziglang/bin/pip" install --disable-pip-version-check 'ziglang==0.15.2'
+          echo "CARGO_ZIGBUILD_ZIG_PATH=$RUNNER_TEMP/ziglang/bin/python-zig" >> "$GITHUB_ENV"
       - name: Set up Android NDK
         if: matrix.target == 'aarch64-linux-android'
         id: setup-ndk
@@ -489,11 +491,22 @@ jobs:
             echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${toolchain_bin}/aarch64-linux-android${api}-clang"
           } >> "$GITHUB_ENV"
       - name: Build binary
-        if: matrix.target != 'universal-apple-darwin'
+        if: matrix.target != 'universal-apple-darwin' && !endsWith(matrix.target, '-unknown-linux-gnu')
         shell: bash
         env:
           BIFROST_BUILD_IDENTITY_OVERRIDE: ${{ needs.preflight.outputs.build_identity }}
         run: cargo build --release --locked --bin "$BIN_NAME" --target "${{ matrix.target }}"
+      - name: Build GNU/Linux binary with glibc 2.28 floor
+        if: endsWith(matrix.target, '-unknown-linux-gnu')
+        shell: bash
+        env:
+          BIFROST_BUILD_IDENTITY_OVERRIDE: ${{ needs.preflight.outputs.build_identity }}
+          LIBZ_SYS_STATIC: '1'
+        run: cargo zigbuild --release --locked --bin "$BIN_NAME" --target "${{ matrix.target }}.2.28"
+      - name: Verify GNU/Linux ELF contract
+        if: endsWith(matrix.target, '-unknown-linux-gnu')
+        shell: bash
+        run: bash scripts/public/verify-linux-release-elf.sh "target/${{ matrix.target }}/release/${BIN_NAME}" "${{ matrix.target }}"
       - name: Build macOS universal binary
         if: matrix.target == 'universal-apple-darwin'
         shell: bash

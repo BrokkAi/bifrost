@@ -5,6 +5,237 @@ analysis behavior, integrations, and release artifacts. It is curated from the
 complete private release range because the public open-core repository is a
 projection and its commit history does not contain every source commit.
 
+## [0.10.8] - 2026-08-31
+
+### Added
+
+- Partial semantic-model declaration packs can now establish the exact callable
+  scope they cover, allowing complete modeled call bindings without treating
+  unlisted declarations as absent.
+- Exact modeled call binding now covers Java static imports and JavaScript/
+  TypeScript named imports, so external summaries can bind without source-text
+  fallbacks.
+- Rust trait resolution now follows workspace-crate exports and inline-module
+  imports, enabling exact trait-method dispatch for supported workspace
+  implementations.
+- Rust trait-method dispatch now resolves exact workspace implementations
+  through trait-implementation families, while unresolved, blanket, and
+  macro-derived families remain explicitly incomplete.
+- Added a core `diff` MCP toolset containing `analyze_diff`, `blast_radius`,
+  endpoint-oriented `cyclomatic_complexity`, and `missing_tests`. Complexity
+  reports introduced and patch-edited functions with before/after scores and
+  signed deltas. Missing-test analysis uses the file graph to bound exact
+  reverse usage traversal, and separates incomplete evidence from confident
+  negative results. Both tools are available through the typed Python client.
+- Added `score_diff` to the `diff` toolset. It returns a deterministic vector of
+  raw named features describing how hard a revision range makes future
+  maintenance -- change geometry, review coordination load, symbol-level test
+  verification, and cognitive-complexity baselines -- and publishes no weights
+  and no single score, because no validated weighting exists yet. Unmeasurable
+  and unresolved inputs are named rather than dropped, so a consumer can tell a
+  zero from an absence.
+- Semantic-model-pack hosts can download and verify exact release-hosted
+  dependency packs, reusing a compatible prebuilt output while safely falling
+  back to local production when no matching asset is available.
+- Added typed RQL projections for indexed call results and normalized Go guard
+  conditions, enabling policies to correlate paired returns with the exact
+  success branch that dominates a later use.
+- Added three-state operation preconditions to reviewed result-member
+  contracts and the typed `result-contract-operation-uses` RQL relation. A
+  policy can now distinguish an unreviewed operation, a reviewed operation
+  with no input requirement, and an operation that requires an exact receiver
+  or parameter predicate, while retaining the operation's own source location.
+- Added reviewed Go standard-library result contracts and a built-in
+  correctness policy for dereferencing selected `os` results before their
+  paired error establishes success. The same typed RQL relations can validate
+  opt-in reviewed contracts such as URL parsers without expanding the default
+  rule.
+- Added partial exact declaration companion packs for the reviewed Go `os`,
+  `net/url`, `errors`, `log`, and Testify `require` behavior packs, plus a
+  declarations-only `path/filepath` pack for the exact variadic
+  `Join(...string) string` signature. Modeled calls can select these functions,
+  concrete result types, and single-result nested arguments without treating
+  unlisted package members as absent or changing the behavior packs' own
+  completeness claims.
+- Added an explicit no-normal-continuation claim to reviewed procedure
+  summaries. The Go standard-library `os` pack now models `os.Exit`, and the
+  new `log` pack models the receiverless `log.Fatal`, `log.Fatalf`, and
+  `log.Fatalln` functions. Exact external error paths that terminate the
+  process can participate in ICFG, dominance, and reaching-definition analysis
+  without name-based exceptions.
+- Added authored variadic procedure targets to semantic-model packs. They match
+  every applicable actual arity while keeping semantic claims on the fixed
+  parameter prefix until packed-tail flow ports are available. The shallow Go
+  Testify model now uses this support so normal return from `require.NoError`,
+  including calls with optional message arguments, establishes the exact error
+  argument as nil without treating nonfatal assertions as guards.
+- Added reviewed boolean-outcome predicate refinements to procedure summaries,
+  with bounded composition through exact identity-preserving workspace
+  wrappers. The Go standard-library `errors` pack now models the false result
+  of `errors.Is` as insufficient to establish that its first argument is nil,
+  without inferring the opposite predicate or trusting same-named functions.
+- Reviewed result contracts can now express a direct result's own success
+  predicate. The Go `encoding/pem` packs use it so unguarded operations on
+  nullable decode results are reported without inventing a second condition
+  port.
+- Procedure summaries can now publish reviewed receiver and parameter entry
+  preconditions, and result-contract queries expose exact positional argument
+  uses with their formal parameter ordinal. The Go correctness policy uses
+  this with `crypto/x509.IsEncryptedPEMBlock`; a declarations-only `bytes`
+  pack preserves the exact single-result arity of nested `bytes.TrimSpace`
+  calls, so unchecked `pem.Decode` blocks report at the x509 argument without
+  admitting same-named or uncertain targets.
+
+### Changed
+
+- Upgraded `bifrost.code-smells` to 2.5.0. The Go result-contract rule now
+  includes exact `net.Listen` acquisitions and reports required operations on
+  the returned listener when its paired error has not established success.
+- A persisted analyzer build over a project with no persistence identity is now
+  a hard error instead of a silent downgrade to a throwaway store. A caller that
+  asked for reuse across runs no longer receives a database deleted on drop and
+  pays a full re-parse every run with nothing said about it. The error names its
+  exits: analyze through a rooted project, put a whole immutable revision on the
+  shared revision cache, state a deliberately session-only or partial view with
+  the ephemeral footgun constructor, or set `BIFROST_CACHE_ROOT` for a multi-root
+  host with no resolvable machine cache directory.
+- Diff tools now report a shared revision cache that cannot open instead of
+  falling back to an ephemeral store and re-parsing every blob. For a read-only
+  checkout, `BIFROST_CACHE_ROOT` relocates the cache to a writable local root.
+- LSP sessions with several workspace folders now persist their analyzer facts
+  to a machine-local cache keyed by the root set, so reopening the same
+  multi-root session reuses what the previous one parsed.
+- `policy --diff-base` now evaluates the base revision through the primary
+  repository's content-addressed cache rather than a per-run throwaway store, so
+  a warm base run costs only the delta.
+- Policy runs now reuse the persisted analyzer cache. A run that builds its own
+  workspace -- the policy CLI, the MCP workspace-less arm, and policy
+  explanations -- reads the content-addressed facts an earlier run parsed
+  instead of rebuilding the whole workspace into a throwaway database, so warm
+  runs are substantially faster. The policy CLI now writes the same `.bifrost`
+  cache every other one-shot tool already writes.
+- Official GNU/Linux binaries now target glibc 2.28 or newer and statically
+  link zlib. The x86-64 musl archive and npm package are no longer published;
+  musl source builds are untested and unsupported.
+- Usage scans no longer create or clamp wall-clock deadlines in the analysis
+  layer. The MCP and Python scan APIs no longer accept `max_duration_secs`;
+  frontends own latency policy and pass cooperative cancellation into analysis.
+- Upgraded `bifrost.code-smells` to 2.4.0. The Go result-contract rule now
+  includes exact `net.Dial` and `net.DialTimeout` acquisitions, so a required
+  operation on their connection result can report when its paired error has
+  not established success.
+- Upgraded `bifrost.code-smells` to 2.3.0. Its Go result-contract rule now
+  selects exact required, unguarded operation rows: ignoring a paired error can
+  still report when a success-gated operation uses the result, while reviewed
+  nil-tolerant operations such as `(*os.File).Close`, `Read`, `Seek`, and
+  `Stat` no longer produce a nil-dereference finding.
+
+### Fixed
+
+- Go result-contract analysis now follows direct modeled results through
+  assignments, conversions, conditional switches, deferred cleanup, and early
+  exits while retaining explicit boundaries for unsupported paths.
+- C# persisted visible-type lookup now shares race-safe in-flight work, and
+  large file-graph hydration avoids repeatedly building transient indexes.
+- C++ declaration recovery no longer reparses each fragmented class body with
+  a whole-file padded prefix, keeping recovery work scoped to the affected
+  region.
+- Go result-contract analysis now proves success guards relative to each
+  acquired result, so unrelated early exits no longer leave locally guarded
+  `encoding/pem.Decode` values inconclusive.
+- Go result-contract analysis now distinguishes an ignored conditional result
+  from real consumers even when later statements, nested field loads, or
+  conservative operand-order gaps make the surrounding procedure incomplete.
+  This preserves definite unguarded operation findings without treating an
+  assigned, guarded, captured, or passed boolean as discarded.
+- Let Go value-flow combine canonical literal-index identity with an
+  independently proven singleton allocation and no secondary local storage
+  owner, so an exact later store can kill an overwritten element while
+  dynamic, rebound, copied, or alias-open indexing and the unsupported
+  flow-state projection boundary remain explicit.
+- Included strong-update behavior in value-flow propagation compatibility
+  hashes, preventing semantically distinct policy plans from colliding in one
+  batch before the exact compatibility check.
+- Definition lookup keeps anchored package searches selective, avoiding severe
+  latency on ambiguous Ruby references in large workspaces.
+- Kotlin and JavaScript/TypeScript definition navigation now selects the true
+  declaration name for positional declarations, including Kotlin function
+  headers and anonymous default exports.
+- Distinguished Go package-function calls from bound receivers and method
+  expressions during modeled-result discovery, preserving aliases and unique
+  dot imports while respecting predeclared and package-local names plus
+  receiver arity.
+- Scoped Go range short-declaration bindings to their containing loops in exact
+  reference resolution and semantic diagnostics, so the range expression and
+  post-loop references retain their outer bindings while `=` range clauses
+  declare none.
+- Proved all-path success guards with exact conditional-edge dominance,
+  preventing a fall-through error arm that rejoins at a result use from
+  falsely certifying that use as safe.
+- Kept semantic-model requests and reusable flow caches coherent across model,
+  source, configuration, and dependency changes. Active summaries and
+  declaration overlays are frozen atomically per request; dispatch-sensitive
+  cache identities now include effective matcher behavior, whole-workspace and
+  hierarchy behavior, and path-independent JVM external declaration surfaces.
+- Preserved caller-owned semantic-model publications when policy batches use a
+  supplied analyzer, instead of freezing absent document activation and
+  silently hiding reviewed contracts.
+- Counted retained external dispatch identities and formal contracts against
+  semantic work budgets, so configured entry and byte limits cover modeled
+  workspace-boundary results.
+- Preserved exact reusable summaries for call-free procedures across unrelated
+  workspace edits while keeping solved results and call-bearing summaries keyed
+  by complete workspace dispatch behavior.
+- Kept composed interprocedural witnesses root-relative by omitting validated
+  callee-entry join seeds while retaining every call, body, and return step.
+- Kept success-conditioned typestate acquisitions inside their owning analysis
+  root while preserving reusable callee summaries, preventing unrelated
+  procedures from contaminating lifecycle findings.
+- Bounded conditional-result validation by candidate file and switched guard
+  checks to the exact dominator tree already derived by flow state, allowing Go
+  correctness policies to finish on medium-sized repositories without
+  retaining every semantic artifact or enumerating unrelated control
+  relations, while preserving honest capability diagnostics.
+- Preserved distinct Go multi-result values through explicit callee returns,
+  including swapped return expressions and interface-call result identities.
+- Preserved Go multi-result assignments into fields and named result bindings,
+  allowing guarded resource uses to remain clean without conflating reads that
+  occur before or after an assignment.
+- Modeled acyclic path-scoped Go defers, including conditional registration,
+  registration-time operand capture, LIFO cleanup on return and panic paths,
+  and typed unsupported evidence for loop-contained registration.
+- Counted direct Go defer receiver invocations in conditional-result checks, so
+  registering cleanup before the paired success check is reported while a
+  checked registration remains clean.
+- Preserved exact immutable Go values across direct function-literal captures,
+  allowing deferred resource uses to participate in result-contract checks
+  without misclassifying bindings that nested closures mutate.
+- Scoped a nested Go procedure's capture uncertainty to values that actually
+  cross the procedure boundary, substantially reducing open callback results
+  without closing entry-origin, mutable, or indirect captures.
+- Retained exact Go result uses that occur before every possible success-guard
+  input as violations even when later identity or validator evidence remains
+  open; the policy still reports incomplete coverage for the unresolved uses.
+- Treated opaque Go scalar call reassignment as a definite overwrite even when
+  exact result type identity is unavailable, preventing an earlier result
+  definition from incorrectly reaching later guards while preserving ordinary
+  data dependence through a non-identity conversion boundary.
+- Reused exact source-dispatch answers across result-validation consumers
+  within one request, avoiding duplicate bounded semantic work while retaining
+  the existing materialization and work-ledger accounting.
+- Made result-contract policy discovery follow canonical modeled call identity,
+  including import aliases, without claiming unrelated same-named methods.
+- Preserved event-local resource identity for direct receiver operations while
+  keeping universal identity closure for deferred, captured, and intrinsic
+  uses, so one operation cannot borrow another operation's proof.
+- Distinguished exact modeled single-result calls used as Go arguments from
+  possible multi-result expansion, allowing nested calls such as
+  `os.Create(filepath.Join(...))` without weakening tuple, spread, shadowing,
+  or ambiguous-call barriers.
+- Kept intrinsic semantic-pack activation separate from workspace configuration
+  reviews and skipped declaration-wide review evidence when no configured
+  review can consume it.
+
 ## [0.10.7] - 2026-08-27
 
 ### Changed
@@ -42,6 +273,25 @@ projection and its commit history does not contain every source commit.
   `bifrost-model://` identity instead of an unopenable external path. The field
   is additive, so existing packs keep their bytes and digests; packs published
   before it exist fall back to the model URI for out-of-workspace sources.
+- Clarified `blast_radius` output as file-graph reachability evidence: graph
+  completion and reached-test counts no longer imply exhaustive test impact,
+  changed paths outside analyzer coverage are reported explicitly, and Rust
+  external-module declarations now connect private implementation files to
+  tests importing their enclosing modules. Changed callables now label
+  test-tree or structural attribution as `in_test_context`, avoiding any
+  implication that they are individually runnable tests. Results also expose
+  analyzer-classified changed test files explicitly, so distance-zero evidence
+  remains inspectable after directory-scope compaction.
+- Removed exact method-call analysis from `blast_radius` callable discovery;
+  historical immutable revisions that previously stalled now stop after symbol
+  pairing and use exact call graphs only when running `analyze_diff` itself.
+- Scoped immutable `blast_radius` graph builds to the changed language
+  ecosystems, parallelized complete revision export, and added compact
+  graph-only JVM parsing, eliminating cold timeouts on very large source trees
+  without dropping graph files or structured dependency facts.
+- `analyze_diff` and `blast_radius` now default zero-argument worktree analysis
+  to the merge base of `HEAD` and the default branch, so one-shot CLI calls
+  include committed feature-branch changes as well as uncommitted edits.
 - Scala value-flow and taint analysis now decides the object, field, alias, and
   array strata. Member and element assignments lower into real heap stores and
   loads with resolved member identities, a class's primary constructor
@@ -79,6 +329,19 @@ projection and its commit history does not contain every source commit.
 
 ### Fixed
 
+- Policy-local taint sanitizers now lower their exact selected call identity,
+  input operand, output carrier, and removed labels through the shipped CLI.
+  Same-named owners, unrelated operands, non-reaching calls, and unresolved or
+  ambiguous selections no longer produce false clean conclusions.
+- JavaScript and TypeScript taint-policy runs now finish with explicit
+  summary-backed completion when a shipped complete semantic summary binds an
+  otherwise unavailable external procedure. Missing, partial, unrelated, or
+  ambiguous external models remain inconclusive.
+- Rust require-model taint runs now complete for resolved same-file flows whose
+  sinks discard a value with `let _ = value`, and for values returned through
+  reference-typed functions. Wildcard lets no longer masquerade as unsupported
+  destructuring or create lexical cleanup obligations; genuinely droppable
+  discarded temporaries retain an immediate cleanup frontier.
 - C and C++ procedure value-flow snapshots now complete for ordinary scalar
   code instead of reporting a blanket unknown. The C-family adapter treats
   by-value transfers as exact wherever the language guarantees it (all of C,
@@ -130,6 +393,17 @@ projection and its commit history does not contain every source commit.
 - Bound persisted workspace queries to immutable worktree revisions, preserving
   retained-analyzer results across concurrent worktree publication and avoiding
   large temporary candidate tables during Java reverse-reference analysis.
+- Recognized structured JavaScript and TypeScript test declarations, ESLint
+  `RuleTester` suites, and Node-style `test-*.js` runners without classifying
+  ordinary production calls such as `emit(...)` as tests. `blast_radius` now
+  includes those changed and importing tests without fabricating production
+  file scopes from test-like source substrings.
+- Included Java same-package dependencies and framework-specific `*TestCase`
+  subclasses in file-level blast-radius evidence, including type names used as
+  structured static/value qualifiers.
+- Replaced Scala file-graph definition prefetch with bulk structured import,
+  export, and same-package resolution, avoiding cold historical timeouts
+  without treating every file in one package as a dependency.
 - Python call binding now handles a method invoked on a call result when the
   receiver's return type proves the target, so calls such as
   `make_store().put(key)` bind receiver, positional, and defaulted formals
@@ -140,6 +414,9 @@ projection and its commit history does not contain every source commit.
 
 ### Added
 
+- Added the `blast_radius` slopcop MCP/CLI and Python-client tool, which maps
+  diff endpoints to changed callables and compact affected-test scopes using
+  structured file-import evidence with explicit partial-result states.
 - Shipped standard-library procedure-summary packs for three new languages:
   Rust (`bifrost.rust-std-golden-summaries`), JavaScript, and TypeScript
   (`bifrost.javascript-golden-summaries`, `bifrost.typescript-golden-summaries`),

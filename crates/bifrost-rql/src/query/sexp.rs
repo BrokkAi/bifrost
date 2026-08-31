@@ -796,10 +796,15 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
         | RqlForm::MemberFamily
         | RqlForm::FamilyEdges
         | RqlForm::CallShape
+        | RqlForm::CallResults
         | RqlForm::CallArgumentGroups
         | RqlForm::CallArguments
         | RqlForm::CallBindings
         | RqlForm::CallEffects
+        | RqlForm::ResultContractCalls
+        | RqlForm::CallResultContracts
+        | RqlForm::ResultContractUses
+        | RqlForm::ResultContractOperationUses
         | RqlForm::ProcedureEffects
         | RqlForm::CallableSignature
         | RqlForm::SignatureParameters
@@ -811,10 +816,15 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
                 RqlForm::ReceiverOutcome => "receiver_outcome",
                 RqlForm::ReceiverEvidence => "receiver_evidence",
                 RqlForm::CallShape => "call_shape",
+                RqlForm::CallResults => "call_results",
                 RqlForm::CallArgumentGroups => "call_argument_groups",
                 RqlForm::CallArguments => "call_arguments",
                 RqlForm::CallBindings => "call_bindings",
                 RqlForm::CallEffects => "call_effects",
+                RqlForm::ResultContractCalls => "result_contract_calls",
+                RqlForm::CallResultContracts => "call_result_contracts",
+                RqlForm::ResultContractUses => "result_contract_uses",
+                RqlForm::ResultContractOperationUses => "result_contract_operation_uses",
                 RqlForm::ProcedureEffects => "procedure_effects",
                 RqlForm::CallableSignature => "callable_signature",
                 RqlForm::SignatureParameters => "signature_parameters",
@@ -1174,7 +1184,8 @@ fn wrapper_query_to_json(expr: &Expr) -> LowerResult<Option<Value>> {
             step.insert("op".to_string(), Value::String(op.label().to_string()));
             append_step(expr, &items[1], step)
         }
-        RqlForm::StateEventsOf
+        RqlForm::ResultContractFailureUses
+        | RqlForm::StateEventsOf
         | RqlForm::FlowRelationsOf
         | RqlForm::ControlRelations
         | RqlForm::RewritePathsOf => {
@@ -1736,10 +1747,16 @@ fn pattern_to_json(expr: &Expr) -> LowerResult<Value> {
         | RqlForm::ReceiverOutcome
         | RqlForm::ReceiverEvidence
         | RqlForm::CallShape
+        | RqlForm::CallResults
         | RqlForm::CallArgumentGroups
         | RqlForm::CallArguments
         | RqlForm::CallBindings
         | RqlForm::CallEffects
+        | RqlForm::ResultContractCalls
+        | RqlForm::CallResultContracts
+        | RqlForm::ResultContractUses
+        | RqlForm::ResultContractOperationUses
+        | RqlForm::ResultContractFailureUses
         | RqlForm::ProcedureEffects
         | RqlForm::CallableSignature
         | RqlForm::SignatureParameters

@@ -16,6 +16,9 @@ pub enum OracleContractError {
     InvalidParameterOrdinal {
         ordinal: u32,
     },
+    InvalidReturnOrdinal {
+        ordinal: u32,
+    },
     InvalidCaptureSlot {
         slot: MemoryLocationId,
     },
@@ -56,6 +59,12 @@ impl fmt::Display for OracleContractError {
                 write!(
                     formatter,
                     "procedure does not publish parameter ordinal {ordinal}"
+                )
+            }
+            Self::InvalidReturnOrdinal { ordinal } => {
+                write!(
+                    formatter,
+                    "procedure does not publish normal return ordinal {ordinal}"
                 )
             }
             Self::InvalidCaptureSlot { slot } => {

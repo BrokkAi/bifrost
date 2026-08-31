@@ -264,6 +264,50 @@ pub fn collect_type_identifiers(node: Node<'_>, source: &str, identifiers: &mut 
     });
 }
 
+/// The `type_identifiers` fact family persisted for one Java blob: every name
+/// the file spells that could bind a type declared in another workspace file.
+///
+/// Two readings share this one set, so it must be a superset of both. The
+/// reverse-reference prefilter needs written type names and qualified type
+/// paths (`java.util.List`). The file dependency graph's same-package tier
+/// needs the terminal names Java binds implicitly, and a class used as a
+/// static or value qualifier (`Owner.INSTANCE`) spells `Owner` as a plain
+/// `identifier`, not a `type_identifier` -- so capitalized identifiers are
+/// retained as structured type-like evidence too.
+///
+/// Both readings are conservative: an extra name costs a candidate that a
+/// later exact check discards, while a missing name silently loses an edge.
+///
+/// A declaration's own name is excluded. It is a definition, not a reference,
+/// and the same-package reading has no later check that would discard it: a
+/// file that recorded the classes it declares would report itself as one of
+/// its own referencing files.
+fn collect_persisted_type_identifiers(
+    node: Node<'_>,
+    source: &str,
+    identifiers: &mut HashSet<String>,
+) {
+    walk_named_tree_preorder(node, true, |node| {
+        let text = node_text(node, source).trim();
+        if !text.is_empty()
+            && (matches!(node.kind(), "type_identifier" | "scoped_type_identifier")
+                || (node.kind() == "identifier"
+                    && looks_like_pascal_identifier(text)
+                    && !is_declared_name(node)))
+        {
+            identifiers.insert(text.to_string());
+        }
+        WalkControl::Continue
+    });
+}
+
+/// Whether `node` is the `name` field of the declaration that encloses it.
+fn is_declared_name(node: Node<'_>) -> bool {
+    node.parent()
+        .and_then(|parent| parent.child_by_field_name("name"))
+        == Some(node)
+}
+
 /// One class-like scope waiting on the extraction stack.
 ///
 /// A written declaration and an anonymous `new Base(...) { ... }` body differ
@@ -459,22 +503,21 @@ pub fn visit_class_like<'tree>(
     first
 }
 
-/// The scope a written `class`/`interface`/`enum`/`record`/`@interface`
-/// declaration introduces, wherever it is written: a top-level type, a nested
-/// member type, or a class local to one method body.
-fn declared_class_scope<'tree>(
+/// Build the stable identity for a written class-like declaration without
+/// walking its members. The dependency-only parser uses this to retain the
+/// type names needed by Java import resolution.
+pub fn class_like_code_unit(
     file: &ProjectFile,
     source: &str,
-    node: Node<'tree>,
+    node: Node<'_>,
     package_name: &str,
     parent: Option<&CodeUnit>,
-) -> Option<JavaClassScopeFacts<'tree>> {
+) -> Option<CodeUnit> {
     let name_node = node.child_by_field_name("name")?;
     let simple_name = node_text(name_node, source).trim();
     if simple_name.is_empty() {
         return None;
     }
-
     let local_coordinate = parent.filter(|parent| parent.is_function()).map(|_| {
         format!(
             "local${}:{}",
@@ -488,12 +531,6 @@ fn declared_class_scope<'tree>(
             None => format!("{}.{}", parent.short_name(), simple_name),
         })
         .unwrap_or_else(|| simple_name.to_string());
-    // A member class joins its parent with an ordinary `.` in Java's legacy
-    // convention, so it is a plain `Type` segment hanging off the parent's
-    // chain. A method-local class first adds a `$local$line:column` nested
-    // segment. Method signatures are not rendered in descendant FQNs, so the
-    // coordinate keeps same-named locals in overloads distinct while the
-    // terminal `Type` segment preserves the identifier written in source.
     let fq = match parent {
         Some(parent) => {
             let mut fq = parent.fq().clone();
@@ -506,15 +543,29 @@ fn declared_class_scope<'tree>(
             java_package_fq(package_name).with_pushed(java_segment(simple_name, SegmentKind::Type))
         }
     };
+    Some(CodeUnit::new_fq(
+        file.clone(),
+        brokk_bifrost_core::analyzer::model::CodeUnitType::Class,
+        package_name.to_string(),
+        short_name,
+        fq,
+    ))
+}
+
+/// The scope a written `class`/`interface`/`enum`/`record`/`@interface`
+/// declaration introduces, wherever it is written: a top-level type, a nested
+/// member type, or a class local to one method body.
+fn declared_class_scope<'tree>(
+    file: &ProjectFile,
+    source: &str,
+    node: Node<'tree>,
+    package_name: &str,
+    parent: Option<&CodeUnit>,
+) -> Option<JavaClassScopeFacts<'tree>> {
+    let unit = class_like_code_unit(file, source, node, package_name, parent)?;
 
     Some(JavaClassScopeFacts {
-        unit: CodeUnit::new_fq(
-            file.clone(),
-            brokk_bifrost_core::analyzer::model::CodeUnitType::Class,
-            package_name.to_string(),
-            short_name,
-            fq,
-        ),
+        unit,
         anchor: node,
         body: node.child_by_field_name("body"),
         raw_supertypes: extract_raw_supertypes(node, source),
@@ -1776,7 +1827,7 @@ pub fn parse_java_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedF
     let root = tree.root_node();
     let package_name = determine_package_name(root, source);
     let mut parsed = ParsedFile::new(package_name.clone());
-    collect_type_identifiers(root, source, &mut parsed.type_identifiers);
+    collect_persisted_type_identifiers(root, source, &mut parsed.type_identifiers);
     let package_module_code_unit =
         (!package_name.is_empty()).then(|| module_code_unit(file, &package_name));
 
@@ -1832,5 +1883,52 @@ mod relational_name_tests {
         let structured = normalize_java_fq_name(&name).display_native(Language::Java, interner);
         assert_eq!(structured, normalize_java_full_name(&exact));
         assert_eq!(structured, "com.Outer.Inner");
+    }
+}
+
+#[cfg(test)]
+mod same_package_identifier_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn parse(source: &str) -> Tree {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .expect("java grammar");
+        parser.parse(source, None).expect("java tree")
+    }
+
+    /// The `type_identifiers` family the coarse file graph reads for Java's
+    /// same-package tier. A class named only as a static or value qualifier
+    /// (`SamePackageOwner.INSTANCE`) is spelled as a plain `identifier`, not a
+    /// `type_identifier`, so the walk has to keep capitalized identifiers --
+    /// but not a declaration's own name, which is a definition rather than a
+    /// reference.
+    #[test]
+    fn type_identifiers_keep_referenced_names_and_drop_declared_ones() {
+        let source = r#"package sample;
+import sample.explicit.Target;
+class Outer {
+    class Inner { void nestedMethod() {} }
+    Target field;
+    void method(Target value) {
+        NotAType local = null;
+        SamePackageOwner.INSTANCE.use();
+    }
+}
+"#;
+        let file = ProjectFile::new("/tmp/project", "src/Outer.java");
+        let tree = parse(source);
+        let parsed = parse_java_file(&file, source, &tree);
+
+        assert!(parsed.type_identifiers.contains("Target"));
+        assert!(parsed.type_identifiers.contains("NotAType"));
+        assert!(parsed.type_identifiers.contains("SamePackageOwner"));
+        assert!(
+            !parsed.type_identifiers.contains("Outer"),
+            "a declaration's own name is a definition, not a reference: {:?}",
+            parsed.type_identifiers
+        );
     }
 }

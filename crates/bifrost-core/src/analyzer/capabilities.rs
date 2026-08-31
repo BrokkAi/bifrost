@@ -15,6 +15,47 @@ pub trait CapabilityProvider: Any {
     fn as_any(&self) -> &dyn Any;
 }
 
+/// File-local facts consumed together while constructing the coarse direct
+/// dependency graph.
+///
+/// `contains_tests` is optional so providers without a bulk test-classification
+/// projection can retain their existing per-file fallback. Tree-sitter-backed
+/// providers populate it from the same persisted blob metadata read that
+/// supplies their import facts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileDependencyFacts {
+    pub imports: Vec<ImportInfo>,
+    pub contains_tests: Option<bool>,
+}
+
+/// Structured direct file dependencies contributed outside ordinary imports.
+///
+/// `complete` belongs to the relation set rather than to cancellation. A
+/// provider may know useful edges while lacking enough build-model evidence to
+/// prove that it found every edge; callers must preserve those edges without
+/// publishing the result as a complete cached graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdditionalFileDependencies {
+    pub dependencies: HashMap<ProjectFile, HashSet<ProjectFile>>,
+    pub complete: bool,
+}
+
+impl AdditionalFileDependencies {
+    pub fn complete(dependencies: HashMap<ProjectFile, HashSet<ProjectFile>>) -> Self {
+        Self {
+            dependencies,
+            complete: true,
+        }
+    }
+
+    pub fn incomplete(dependencies: HashMap<ProjectFile, HashSet<ProjectFile>>) -> Self {
+        Self {
+            dependencies,
+            complete: false,
+        }
+    }
+}
+
 impl<T: Any> CapabilityProvider for T {
     fn as_any(&self) -> &dyn Any {
         self
@@ -60,6 +101,48 @@ pub trait ImportAnalysisProvider: CapabilityProvider + Send + Sync {
         _files: &[ProjectFile],
     ) -> Option<HashMap<ProjectFile, Vec<ImportInfo>>> {
         None
+    }
+
+    /// Return the file-local facts needed by coarse dependency-graph
+    /// construction in one batch.
+    ///
+    /// The default preserves providers that only expose bulk imports. A
+    /// provider with persisted test classification should override this so a
+    /// reverse walk does not rehydrate one file state per reached graph node.
+    fn file_dependency_facts_for_files(
+        &self,
+        files: &[ProjectFile],
+    ) -> Option<HashMap<ProjectFile, FileDependencyFacts>> {
+        self.import_infos_for_files(files).map(|infos| {
+            infos
+                .into_iter()
+                .map(|(file, imports)| {
+                    (
+                        file,
+                        FileDependencyFacts {
+                            imports,
+                            contains_tests: None,
+                        },
+                    )
+                })
+                .collect()
+        })
+    }
+
+    /// Return structured direct file dependencies that are not represented by
+    /// ordinary import facts.
+    ///
+    /// Rust external-module declarations are the motivating case: `mod x;`
+    /// makes the declaring file depend on `x.rs`, but it is neither a `use`
+    /// declaration nor an `extern crate` declaration. Providers should return
+    /// `None` when cancellation prevents a complete answer; callers must not
+    /// cache that prefix as a complete graph.
+    fn additional_direct_file_dependencies(
+        &self,
+        _files: &[ProjectFile],
+        _cancellation: &CancellationToken,
+    ) -> Option<AdditionalFileDependencies> {
+        Some(AdditionalFileDependencies::complete(HashMap::default()))
     }
 
     /// The file's import facts, which fall through to the import-tier store
@@ -126,6 +209,21 @@ pub trait ImportAnalysisProvider: CapabilityProvider + Send + Sync {
     /// per-candidate answer is already file-local (Python, JS/TS, Go, C++)
     /// keep the default.
     fn prefetch_import_targets(
+        &self,
+        _files: &[ProjectFile],
+        _import_infos: Option<&HashMap<ProjectFile, Vec<ImportInfo>>>,
+        _cancellation: &crate::cancellation::CancellationToken,
+    ) {
+    }
+
+    /// Batch the definition identities that file-dependency resolution will
+    /// consult after import facts have been loaded for a whole workspace.
+    ///
+    /// This is separate from [`Self::prefetch_import_targets`]: exact usage
+    /// candidate discovery and coarse file-edge construction do not
+    /// necessarily resolve the same names. Providers whose file resolver is
+    /// already path-local keep the no-op default.
+    fn prefetch_file_dependency_targets(
         &self,
         _files: &[ProjectFile],
         _import_infos: Option<&HashMap<ProjectFile, Vec<ImportInfo>>>,

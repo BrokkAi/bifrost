@@ -73,7 +73,7 @@ mod tests {
         let root = temp.path().canonicalize().expect("canonical temp dir");
         let file = ProjectFile::new(root.clone(), PathBuf::from("Receiver.php"));
         file.write(source).expect("write PHP fixture");
-        let workspace = WorkspaceAnalyzer::build_ephemeral(
+        let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
             Arc::new(TestProject::new(root, Language::Php)),
             AnalyzerConfig::default(),
         )
@@ -143,7 +143,7 @@ class Service {
         let root = temp.path().canonicalize().expect("canonical temp dir");
         let file = ProjectFile::new(root.clone(), PathBuf::from("Receiver.php"));
         file.write(source).expect("write PHP fixture");
-        let workspace = WorkspaceAnalyzer::build_ephemeral(
+        let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
             Arc::new(TestProject::new(root, Language::Php)),
             AnalyzerConfig::default(),
         )

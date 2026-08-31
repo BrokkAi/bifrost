@@ -376,6 +376,38 @@ impl Validator {
                     self.stable_id(&format!("{fact_path}.id"), &fact.id);
                     self.language_identifier(&format!("{fact_path}.name"), &fact.name);
                     self.locator(&format!("{fact_path}.locator"), &fact.locator);
+                    if fact.callable_family_complete {
+                        if !matches!(
+                            fact.member_kind,
+                            MemberKind::Constructor | MemberKind::Method | MemberKind::Function
+                        ) {
+                            self.error(
+                                "declaration.callable_family_complete_on_non_callable",
+                                format!("{fact_path}.callable_family_complete"),
+                                "callable_family_complete requires a constructor, method, or function",
+                            );
+                        }
+                        match &fact.signature {
+                            None => self.error(
+                                "declaration.callable_family_complete_without_signature",
+                                format!("{fact_path}.callable_family_complete"),
+                                "callable_family_complete requires a structured signature",
+                            ),
+                            Some(signature)
+                                if signature
+                                    .parameters
+                                    .last()
+                                    .is_some_and(|parameter| parameter.variadic) =>
+                            {
+                                self.error(
+                                    "declaration.callable_family_complete_on_variadic",
+                                    format!("{fact_path}.callable_family_complete"),
+                                    "callable_family_complete does not yet support variadic declarations",
+                                );
+                            }
+                            Some(_) => {}
+                        }
+                    }
                     if let Some(signature) = &fact.signature {
                         let owner_parameters = self
                             .type_parameters_by_id
@@ -463,6 +495,13 @@ impl Validator {
                 ),
             );
         }
+        if summary.target.variadic && summary.target.parameter_count == 0 {
+            self.error(
+                "summary.invalid_variadic_parameter_count",
+                format!("{path}.target.parameter_count"),
+                "a variadic target must declare its variadic final formal parameter",
+            );
+        }
         let target = (summary.target.path.clone(), summary.target.symbol.clone());
         if let Some(first_path) = self.procedure_targets.insert(target, path.to_owned()) {
             self.error(
@@ -502,6 +541,19 @@ impl Validator {
                     "covers_overrides requires a receiver target: a receiverless callee has no overrides to cover",
                 );
             }
+        }
+
+        if let Some(normal_result_count) = summary.normal_result_count
+            && normal_result_count > MAX_PROCEDURE_SUMMARY_ORDINAL.saturating_add(1)
+        {
+            self.error(
+                "summary.invalid_normal_result_count",
+                format!("{path}.normal_result_count"),
+                format!(
+                    "normal result count exceeds {}",
+                    MAX_PROCEDURE_SUMMARY_ORDINAL.saturating_add(1)
+                ),
+            );
         }
 
         if summary.locations.len() > MAX_PROCEDURE_SUMMARY_LOCATIONS {
@@ -546,17 +598,98 @@ impl Validator {
             );
         }
         // A declared effect (#2437) is metadata about the procedure, not a
-        // modeled port, so it deliberately does not satisfy this rule: a summary
-        // still has to say how values move through the procedure.
-        if summary.transfers.is_empty() && summary.effects.is_empty() {
+        // modeled port, so it deliberately does not satisfy this rule. Result
+        // contracts and conditional-result refinements do: they are
+        // substantive relations among modeled ports even when the summary
+        // moves no values.
+        if summary.transfers.is_empty()
+            && summary.effects.is_empty()
+            && summary.preconditions.is_none()
+            && summary.result_contracts.is_empty()
+            && summary.conditional_result_refinements.is_empty()
+            && summary.normal_return_refinements.is_empty()
+            && !summary.normal_continuation_absent
+        {
             self.error(
                 "summary.empty",
                 path,
-                "a procedure summary must declare at least one transfer or effect",
+                "a procedure summary must declare at least one transfer, effect, operation precondition review, result contract, conditional-result refinement, normal-return refinement, or absent normal continuation",
             );
         }
 
+        if summary.normal_continuation_absent {
+            for (index, transfer) in summary.transfers.iter().enumerate() {
+                if matches!(transfer.exit_kind, AuthoredSummaryExitKind::Normal) {
+                    self.error(
+                        "summary.normal_continuation_conflict",
+                        format!("{path}.transfers[{index}].exit_kind"),
+                        "normal_continuation_absent conflicts with a normal transfer",
+                    );
+                }
+            }
+            for (index, effect) in summary.effects.iter().enumerate() {
+                if matches!(
+                    effect,
+                    AuthoredSummaryEffect::Allocation {
+                        output: AuthoredSummaryOutput::NormalReturn {}
+                            | AuthoredSummaryOutput::IndexedNormalReturn { .. },
+                        ..
+                    } | AuthoredSummaryEffect::Sanitize {
+                        output: AuthoredSummaryOutput::NormalReturn {}
+                            | AuthoredSummaryOutput::IndexedNormalReturn { .. },
+                        ..
+                    }
+                ) {
+                    self.error(
+                        "summary.normal_continuation_conflict",
+                        format!("{path}.effects[{index}].output"),
+                        "normal_continuation_absent conflicts with a normal-return effect output",
+                    );
+                }
+            }
+            if !summary.result_contracts.is_empty() {
+                self.error(
+                    "summary.normal_continuation_conflict",
+                    format!("{path}.result_contracts"),
+                    "normal_continuation_absent conflicts with result contracts on a normal return",
+                );
+            }
+            if !summary.conditional_result_refinements.is_empty() {
+                self.error(
+                    "summary.normal_continuation_conflict",
+                    format!("{path}.conditional_result_refinements"),
+                    "normal_continuation_absent conflicts with conditional-result refinements",
+                );
+            }
+            if !summary.normal_return_refinements.is_empty() {
+                self.error(
+                    "summary.normal_continuation_conflict",
+                    format!("{path}.normal_return_refinements"),
+                    "normal_continuation_absent conflicts with normal-return refinements",
+                );
+            }
+        }
+
         self.declared_effects(path, &summary.declared_effects);
+        self.operation_preconditions(path, &summary.preconditions, &summary.target);
+        if summary.normal_result_count.is_none()
+            && (!summary.result_contracts.is_empty()
+                || !summary.conditional_result_refinements.is_empty())
+        {
+            self.error(
+                "summary.result_count_required",
+                format!("{path}.normal_result_count"),
+                "normal_result_count is required when result contracts or conditional-result refinements are non-empty",
+            );
+        }
+        self.result_contracts(path, summary.normal_result_count, &summary.result_contracts);
+        self.conditional_result_refinements(
+            path,
+            &summary.target,
+            summary.normal_result_count,
+            &summary.conditional_result_refinements,
+        );
+        self.normal_return_refinements(path, &summary.target, &summary.normal_return_refinements);
 
         let mut locations = HashMap::new();
         for (index, location) in summary.locations.iter().enumerate() {
@@ -589,6 +722,7 @@ impl Validator {
                 &transfer.output,
                 &locations,
                 &summary.target,
+                summary.normal_result_count,
             );
             if matches!(
                 (&transfer.exit_kind, &transfer.output),
@@ -598,6 +732,7 @@ impl Validator {
                 ) | (
                     AuthoredSummaryExitKind::Exceptional,
                     AuthoredSummaryOutput::NormalReturn {}
+                        | AuthoredSummaryOutput::IndexedNormalReturn { .. }
                 )
             ) {
                 self.error(
@@ -614,6 +749,7 @@ impl Validator {
                 &locations,
                 &summary.target,
                 &summary.transfers,
+                summary.normal_result_count,
             );
         }
     }
@@ -643,6 +779,15 @@ impl Validator {
                     ),
                 );
             }
+            AuthoredSummaryInput::Parameter { ordinal }
+                if target.variadic && target.parameter_count.checked_sub(1) == Some(*ordinal) =>
+            {
+                self.error(
+                    "summary.unsupported_variadic_tail_reference",
+                    format!("{path}.ordinal"),
+                    "semantic claims cannot yet reference a variadic tail formal",
+                );
+            }
             AuthoredSummaryInput::Receiver {} | AuthoredSummaryInput::Parameter { .. } => {}
         }
     }
@@ -653,6 +798,7 @@ impl Validator {
         output: &AuthoredSummaryOutput,
         locations: &HashMap<&str, (AuthoredSummaryLocationKind, String)>,
         target: &AuthoredProcedureTarget,
+        normal_result_count: Option<u32>,
     ) {
         let (location, expected_kind) = match output {
             AuthoredSummaryOutput::Capture { location } => {
@@ -667,6 +813,24 @@ impl Validator {
                     path,
                     "procedure target does not declare a receiver",
                 );
+                (None, None)
+            }
+            AuthoredSummaryOutput::IndexedNormalReturn { ordinal } => {
+                if normal_result_count.is_none() {
+                    self.error(
+                        "summary.result_count_required",
+                        path,
+                        "normal_result_count is required for an indexed normal return",
+                    );
+                } else if let Some(count) = normal_result_count
+                    && *ordinal >= count
+                {
+                    self.error(
+                        "summary.result_ordinal_out_of_range",
+                        format!("{path}.ordinal"),
+                        format!("result ordinal {ordinal} is outside normal_result_count {count}"),
+                    );
+                }
                 (None, None)
             }
             AuthoredSummaryOutput::NormalReturn {}
@@ -702,6 +866,7 @@ impl Validator {
         locations: &HashMap<&str, (AuthoredSummaryLocationKind, String)>,
         target: &AuthoredProcedureTarget,
         transfers: &[AuthoredSummaryTransfer],
+        normal_result_count: Option<u32>,
     ) {
         // A sanitize effect names ports and labels, not an event, so it is
         // validated separately from the event-bearing effects below.
@@ -712,7 +877,13 @@ impl Validator {
         } = effect
         {
             self.summary_input(&format!("{path}.input"), input, target);
-            self.summary_output(&format!("{path}.output"), output, locations, target);
+            self.summary_output(
+                &format!("{path}.output"),
+                output,
+                locations,
+                target,
+                normal_result_count,
+            );
             self.sanitize_removes(&format!("{path}.removes"), removes);
             if !transfers
                 .iter()
@@ -729,7 +900,13 @@ impl Validator {
         let event = match effect {
             AuthoredSummaryEffect::Sanitize { .. } => unreachable!("sanitize handled above"),
             AuthoredSummaryEffect::Allocation { event, output } => {
-                self.summary_output(&format!("{path}.output"), output, locations, target);
+                self.summary_output(
+                    &format!("{path}.output"),
+                    output,
+                    locations,
+                    target,
+                    normal_result_count,
+                );
                 event
             }
             AuthoredSummaryEffect::Call { event, callee } => {
@@ -856,6 +1033,371 @@ impl Validator {
                     "summary.duplicate_declared_effect",
                     format!("{effect_path}.id"),
                     format!("duplicate declared effect `{}`", effect.id),
+                );
+            }
+        }
+    }
+
+    fn operation_preconditions(
+        &mut self,
+        path: &str,
+        preconditions: &Option<Vec<AuthoredOperationPrecondition>>,
+        target: &AuthoredProcedureTarget,
+    ) {
+        let Some(preconditions) = preconditions else {
+            return;
+        };
+        let mut seen = HashMap::new();
+        for (index, precondition) in preconditions.iter().enumerate() {
+            let precondition_path = format!("{path}.preconditions[{index}]");
+            self.summary_input(
+                &format!("{precondition_path}.input"),
+                &precondition.input,
+                target,
+            );
+            if let Some((first_predicate, first_index)) = seen.get(&precondition.input) {
+                let first_path = format!("{path}.preconditions[{first_index}]");
+                if *first_predicate == precondition.predicate {
+                    self.error(
+                        "summary.duplicate_operation_precondition",
+                        format!("{precondition_path}.input"),
+                        format!("operation precondition duplicates {first_path}"),
+                    );
+                } else {
+                    self.error(
+                        "summary.conflicting_operation_precondition",
+                        format!("{precondition_path}.predicate"),
+                        format!(
+                            "operation predicate conflicts with {first_path}.predicate for the same input"
+                        ),
+                    );
+                }
+            } else {
+                seen.insert(&precondition.input, (precondition.predicate, index));
+            }
+        }
+    }
+
+    fn result_contracts(
+        &mut self,
+        path: &str,
+        normal_result_count: Option<u32>,
+        contracts: &[AuthoredResultContract],
+    ) {
+        if contracts.len() > MAX_PROCEDURE_SUMMARY_RESULT_CONTRACTS {
+            self.error(
+                "limit.summary_result_contracts",
+                format!("{path}.result_contracts"),
+                format!(
+                    "summary declares more than {MAX_PROCEDURE_SUMMARY_RESULT_CONTRACTS} result contracts"
+                ),
+            );
+        }
+        let mut seen_results = HashSet::new();
+        for (index, contract) in contracts.iter().enumerate() {
+            let contract_path = format!("{path}.result_contracts[{index}]");
+            for (field, ordinal) in [
+                ("result_ordinal", Some(contract.result_ordinal)),
+                (
+                    "condition_result_ordinal",
+                    contract.condition_result_ordinal,
+                ),
+            ]
+            .into_iter()
+            .filter_map(|(field, ordinal)| ordinal.map(|ordinal| (field, ordinal)))
+            {
+                if ordinal > MAX_PROCEDURE_SUMMARY_ORDINAL {
+                    self.error(
+                        "summary.invalid_result_ordinal",
+                        format!("{contract_path}.{field}"),
+                        format!("result ordinal exceeds {MAX_PROCEDURE_SUMMARY_ORDINAL}"),
+                    );
+                }
+                if normal_result_count.is_some_and(|count| ordinal >= count) {
+                    self.error(
+                        "summary.result_ordinal_out_of_range",
+                        format!("{contract_path}.{field}"),
+                        format!(
+                            "result ordinal {ordinal} is outside normal_result_count {}",
+                            normal_result_count.expect("checked as some")
+                        ),
+                    );
+                }
+            }
+            match (contract.condition_result_ordinal, contract.predicate) {
+                (Some(_), None) | (None, Some(_)) => self.error(
+                    "summary.incomplete_result_condition",
+                    contract_path.clone(),
+                    "condition_result_ordinal and predicate must be present or absent together",
+                ),
+                (None, None) if contract.result_success_predicate.is_none() => self.error(
+                    "summary.direct_result_predicate_required",
+                    format!("{contract_path}.result_success_predicate"),
+                    "a direct result contract requires result_success_predicate",
+                ),
+                _ => {}
+            }
+            if contract.condition_result_ordinal == Some(contract.result_ordinal) {
+                self.error(
+                    "summary.self_conditioned_result",
+                    contract_path.clone(),
+                    "use a direct result contract instead of conditioning a result on itself",
+                );
+            }
+            if !seen_results.insert(contract.result_ordinal) {
+                self.error(
+                    "summary.duplicate_result_contract",
+                    format!("{contract_path}.result_ordinal"),
+                    format!(
+                        "result ordinal {} already has a validity contract",
+                        contract.result_ordinal
+                    ),
+                );
+            }
+            if contract.member_contracts.len() > MAX_RESULT_CONTRACT_MEMBER_CONTRACTS {
+                self.error(
+                    "limit.result_member_contracts",
+                    format!("{contract_path}.member_contracts"),
+                    format!(
+                        "result contract declares more than {MAX_RESULT_CONTRACT_MEMBER_CONTRACTS} member contracts"
+                    ),
+                );
+            }
+            let mut seen_members = HashSet::new();
+            for (member_index, member) in contract.member_contracts.iter().enumerate() {
+                let member_path = format!("{contract_path}.member_contracts[{member_index}]");
+                self.language_identifier(&format!("{member_path}.member"), &member.member);
+                if member.parameter_count > MAX_PROCEDURE_SUMMARY_ORDINAL {
+                    self.error(
+                        "summary.invalid_member_parameter_count",
+                        format!("{member_path}.parameter_count"),
+                        format!("member parameter count exceeds {MAX_PROCEDURE_SUMMARY_ORDINAL}"),
+                    );
+                }
+                if !seen_members.insert((member.member.as_str(), member.parameter_count)) {
+                    self.error(
+                        "summary.duplicate_result_member_contract",
+                        member_path.clone(),
+                        format!(
+                            "duplicate result member contract `{}` with arity {}",
+                            member.member, member.parameter_count
+                        ),
+                    );
+                }
+                if let Some(preconditions) = &member.preconditions {
+                    let mut seen_inputs = HashSet::new();
+                    for (precondition_index, precondition) in preconditions.iter().enumerate() {
+                        let precondition_path =
+                            format!("{member_path}.preconditions[{precondition_index}]");
+                        if let AuthoredSummaryInput::Parameter { ordinal } = &precondition.input {
+                            if *ordinal > MAX_PROCEDURE_SUMMARY_ORDINAL {
+                                self.error(
+                                    "summary.invalid_parameter_ordinal",
+                                    format!("{precondition_path}.input.ordinal"),
+                                    format!(
+                                        "parameter ordinal exceeds {MAX_PROCEDURE_SUMMARY_ORDINAL}"
+                                    ),
+                                );
+                            }
+                            if *ordinal >= member.parameter_count {
+                                self.error(
+                                    "summary.parameter_ordinal_out_of_range",
+                                    format!("{precondition_path}.input.ordinal"),
+                                    format!(
+                                        "parameter ordinal {ordinal} is outside member parameter_count {}",
+                                        member.parameter_count
+                                    ),
+                                );
+                            }
+                        }
+                        if !seen_inputs.insert(&precondition.input) {
+                            self.error(
+                                "summary.duplicate_operation_precondition_input",
+                                format!("{precondition_path}.input"),
+                                "an operation input can have at most one precondition",
+                            );
+                        }
+                    }
+                }
+                self.declared_effects(&member_path, &member.declared_effects);
+            }
+        }
+    }
+
+    fn conditional_result_refinements(
+        &mut self,
+        path: &str,
+        target: &AuthoredProcedureTarget,
+        normal_result_count: Option<u32>,
+        refinements: &[AuthoredConditionalResultRefinement],
+    ) {
+        if refinements.len() > MAX_PROCEDURE_SUMMARY_CONDITIONAL_RESULT_REFINEMENTS {
+            self.error(
+                "limit.summary_conditional_result_refinements",
+                format!("{path}.conditional_result_refinements"),
+                format!(
+                    "summary declares more than {MAX_PROCEDURE_SUMMARY_CONDITIONAL_RESULT_REFINEMENTS} conditional-result refinements"
+                ),
+            );
+        }
+
+        let mut seen = HashMap::new();
+        let mut established = HashMap::new();
+        for (index, refinement) in refinements.iter().enumerate() {
+            let refinement_path = format!("{path}.conditional_result_refinements[{index}]");
+            if refinement.result_ordinal > MAX_PROCEDURE_SUMMARY_ORDINAL {
+                self.error(
+                    "summary.invalid_result_ordinal",
+                    format!("{refinement_path}.result_ordinal"),
+                    format!("result ordinal exceeds {MAX_PROCEDURE_SUMMARY_ORDINAL}"),
+                );
+            }
+            if normal_result_count.is_some_and(|count| refinement.result_ordinal >= count) {
+                self.error(
+                    "summary.result_ordinal_out_of_range",
+                    format!("{refinement_path}.result_ordinal"),
+                    format!(
+                        "result ordinal {} is outside normal_result_count {}",
+                        refinement.result_ordinal,
+                        normal_result_count.expect("checked as some")
+                    ),
+                );
+            }
+            if refinement.parameter_ordinal > MAX_PROCEDURE_SUMMARY_ORDINAL {
+                self.error(
+                    "summary.invalid_parameter_ordinal",
+                    format!("{refinement_path}.parameter_ordinal"),
+                    format!("parameter ordinal exceeds {MAX_PROCEDURE_SUMMARY_ORDINAL}"),
+                );
+            }
+            if refinement.parameter_ordinal >= target.parameter_count {
+                self.error(
+                    "summary.parameter_ordinal_out_of_range",
+                    format!("{refinement_path}.parameter_ordinal"),
+                    format!(
+                        "parameter ordinal {} is outside parameter_count {}",
+                        refinement.parameter_ordinal, target.parameter_count
+                    ),
+                );
+            } else if target.variadic
+                && target.parameter_count.checked_sub(1) == Some(refinement.parameter_ordinal)
+            {
+                self.error(
+                    "summary.unsupported_variadic_tail_reference",
+                    format!("{refinement_path}.parameter_ordinal"),
+                    format!(
+                        "conditional-result refinement cannot reference variadic tail ordinal {}",
+                        refinement.parameter_ordinal
+                    ),
+                );
+            }
+
+            let claim_key = (
+                refinement.result_ordinal,
+                refinement.outcome,
+                refinement.parameter_ordinal,
+                refinement.predicate,
+            );
+            if let Some((first_effect, first_path)) = seen.insert(
+                claim_key,
+                (refinement.proof_effect, refinement_path.clone()),
+            ) {
+                if first_effect == refinement.proof_effect {
+                    self.error(
+                        "summary.duplicate_conditional_result_refinement",
+                        refinement_path.clone(),
+                        format!("conditional-result refinement duplicates {first_path}"),
+                    );
+                } else {
+                    self.error(
+                        "summary.conflicting_conditional_result_refinement",
+                        format!("{refinement_path}.proof_effect"),
+                        format!(
+                            "conditional-result proof effect conflicts with {first_path}.proof_effect"
+                        ),
+                    );
+                }
+            }
+
+            if matches!(
+                refinement.proof_effect,
+                AuthoredPredicateProofEffect::Establishes
+            ) {
+                let outcome_key = (
+                    refinement.result_ordinal,
+                    refinement.outcome,
+                    refinement.parameter_ordinal,
+                );
+                if let Some((first_predicate, first_path)) =
+                    established.insert(outcome_key, (refinement.predicate, refinement_path.clone()))
+                    && first_predicate != refinement.predicate
+                {
+                    self.error(
+                        "summary.conflicting_conditional_result_refinement",
+                        format!("{refinement_path}.predicate"),
+                        format!(
+                            "established predicate conflicts with {first_path}.predicate for the same result outcome and parameter"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    fn normal_return_refinements(
+        &mut self,
+        path: &str,
+        target: &AuthoredProcedureTarget,
+        refinements: &[AuthoredNormalReturnRefinement],
+    ) {
+        if refinements.len() > MAX_PROCEDURE_SUMMARY_NORMAL_RETURN_REFINEMENTS {
+            self.error(
+                "limit.summary_normal_return_refinements",
+                format!("{path}.normal_return_refinements"),
+                format!(
+                    "summary declares more than {MAX_PROCEDURE_SUMMARY_NORMAL_RETURN_REFINEMENTS} normal-return refinements"
+                ),
+            );
+        }
+        let mut seen = HashSet::new();
+        for (index, refinement) in refinements.iter().enumerate() {
+            let refinement_path = format!("{path}.normal_return_refinements[{index}]");
+            if refinement.parameter_ordinal > MAX_PROCEDURE_SUMMARY_ORDINAL {
+                self.error(
+                    "summary.invalid_parameter_ordinal",
+                    format!("{refinement_path}.parameter_ordinal"),
+                    format!("parameter ordinal exceeds {MAX_PROCEDURE_SUMMARY_ORDINAL}"),
+                );
+            }
+            if refinement.parameter_ordinal >= target.parameter_count {
+                self.error(
+                    "summary.parameter_ordinal_out_of_range",
+                    format!("{refinement_path}.parameter_ordinal"),
+                    format!(
+                        "parameter ordinal {} is outside parameter_count {}",
+                        refinement.parameter_ordinal, target.parameter_count
+                    ),
+                );
+            } else if target.variadic
+                && target.parameter_count.checked_sub(1) == Some(refinement.parameter_ordinal)
+            {
+                self.error(
+                    "summary.unsupported_variadic_tail_reference",
+                    format!("{refinement_path}.parameter_ordinal"),
+                    format!(
+                        "normal-return refinement cannot reference variadic tail ordinal {}",
+                        refinement.parameter_ordinal
+                    ),
+                );
+            }
+            if !seen.insert(refinement.parameter_ordinal) {
+                self.error(
+                    "summary.duplicate_normal_return_refinement",
+                    format!("{refinement_path}.parameter_ordinal"),
+                    format!(
+                        "parameter ordinal {} already has a normal-return refinement",
+                        refinement.parameter_ordinal
+                    ),
                 );
             }
         }

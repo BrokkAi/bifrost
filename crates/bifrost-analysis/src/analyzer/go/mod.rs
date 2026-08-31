@@ -7,6 +7,7 @@ pub(crate) mod diagnostics;
 mod imports;
 pub(crate) mod package_identity;
 mod semantic;
+mod type_identity_proof;
 use crate::analyzer::Range;
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
@@ -57,6 +58,12 @@ use brokk_bifrost_go::test_detection::detect_go_test_assertion_smells;
 use cache::GoMemoCaches;
 use clones::build_go_clone_candidate_data;
 pub use dependency_discovery::resolve_go_semantic_pack_dependencies;
+pub use type_identity_proof::{
+    GO_MODELED_RESULT_BINDING_TYPE_PROOF_MAX_SOURCE_BYTES,
+    GO_MODELED_RESULT_BINDING_TYPE_PROOF_MAX_STEPS,
+    go_modeled_result_binding_type_identity_is_exact,
+    go_modeled_result_binding_type_identity_proof_work,
+};
 
 #[derive(Clone)]
 pub struct GoAnalyzer {
@@ -68,9 +75,10 @@ crate::analyzer::impl_forward_query_provider!(GoAnalyzer);
 
 impl GoAnalyzer {
     pub(crate) fn clone_with_project(&self, project: Arc<dyn Project>) -> Self {
-        let mut clone = self.clone();
-        clone.inner = clone.inner.clone_with_project(project);
-        clone
+        Self {
+            inner: self.inner.clone_with_project(project),
+            memo_caches: GoMemoCaches::new(self.memo_caches.budget_bytes()),
+        }
     }
 
     pub fn new(project: Arc<dyn Project>) -> Self {
@@ -79,6 +87,7 @@ impl GoAnalyzer {
 
     pub fn new_with_config(project: Arc<dyn Project>, config: AnalyzerConfig) -> Self {
         let memo_budget = config.memo_cache_budget_bytes();
+        invalidate_nearest_go_module_cache();
         Self {
             inner: TreeSitterAnalyzer::new_with_config(project, GoAdapter, config),
             memo_caches: GoMemoCaches::new(memo_budget),
@@ -92,6 +101,7 @@ impl GoAnalyzer {
         progress: Option<BuildProgress>,
     ) -> Result<Self, crate::analyzer::store::StoreError> {
         let memo_budget = config.memo_cache_budget_bytes();
+        invalidate_nearest_go_module_cache();
         let inner = TreeSitterAnalyzer::new_with_config_storage_context_and_progress(
             project,
             GoAdapter,
@@ -241,8 +251,18 @@ impl GoAnalyzer {
             self.memo_caches
                 .workspace_path_index_build_count
                 .fetch_add(1, Ordering::Relaxed);
-            packages::GoWorkspacePathIndex::build(self.project())
+            packages::GoWorkspacePathIndex::build(self.project(), |file| {
+                self.package_clause_of(file)
+            })
         })
+    }
+
+    pub(crate) fn workspace_package_inventory_complete(&self) -> bool {
+        self.inner.workspace_package_inventory_complete()
+    }
+
+    pub(crate) fn workspace_declaration_identities_authoritative(&self) -> bool {
+        self.inner.workspace_declaration_identities_authoritative()
     }
 
     #[doc(hidden)]
@@ -332,35 +352,172 @@ impl TypeAliasProvider for GoAnalyzer {
     }
 }
 
+impl GoAnalyzer {
+    /// The workspace's Go type and member relations, built at most once per
+    /// analyzer snapshot.
+    fn hierarchy_index(&self) -> &GoHierarchyIndex {
+        self.memo_caches.hierarchy_index.get_or_init(|| {
+            let scope = AnalyzerQueryScope::new(self);
+            GoHierarchyIndex::build(scope.token(), &self.inner, self)
+        })
+    }
+}
+
 impl TypeHierarchyProvider for GoAnalyzer {
     fn get_direct_ancestors(&self, code_unit: &CodeUnit) -> Vec<CodeUnit> {
-        self.memo_caches
-            .hierarchy_index
-            .get_or_init(|| {
-                let scope = AnalyzerQueryScope::new(self);
-                GoHierarchyIndex::build(scope.token(), &self.inner, self)
-            })
-            .direct_ancestors(code_unit)
+        self.hierarchy_index().direct_ancestors(code_unit)
     }
 
     fn get_direct_descendants(&self, code_unit: &CodeUnit) -> crate::hash::HashSet<CodeUnit> {
-        self.memo_caches
-            .hierarchy_index
-            .get_or_init(|| {
-                let scope = AnalyzerQueryScope::new(self);
-                GoHierarchyIndex::build(scope.token(), &self.inner, self)
-            })
-            .direct_descendants(code_unit)
+        self.hierarchy_index().direct_descendants(code_unit)
     }
 
     fn supports_type_hierarchy(&self, code_unit: &CodeUnit) -> bool {
-        self.memo_caches
-            .hierarchy_index
-            .get_or_init(|| {
-                let scope = AnalyzerQueryScope::new(self);
-                GoHierarchyIndex::build(scope.token(), &self.inner, self)
-            })
-            .supports(code_unit)
+        self.hierarchy_index().supports(code_unit)
+    }
+}
+
+/// Go's method family: structural interface satisfaction (#1721, and the CHA
+/// lever ICFG dispatch consumes at
+/// `workspace_oracle::dispatch::virtual_dispatch_implementor_targets`).
+///
+/// Go has no override chains and writes nothing at either declaration site: a
+/// type satisfies an interface exactly when its method set covers the
+/// interface's. So `Overrides`/`OverriddenBy` never appear here, and the only
+/// edges are `Implements` and its bounded inversion `ImplementedBy`, both read
+/// out of the one satisfaction pass `GoHierarchyIndex` already runs. That pass
+/// compares whole method keys -- each method's name, qualified by package when
+/// the name is unexported, plus its parameter and result type tokens resolved
+/// through the file's imports and type aliases -- so an edge exists only where
+/// two declarations agree on structure, never where two names merely agree.
+///
+/// Only a method with a body joins a family as an implementor. An interface
+/// method whose signature happens to match another interface's declares no
+/// body, so it supplies nothing to implement and gets no `Implements` edge --
+/// which is also why an interface method's own family is exactly its
+/// implementors. Go's one real interface-to-interface relation is embedding,
+/// and a promoted method has no declaration of its own to relate: the edge
+/// lands on the interface that declares it.
+///
+/// `proven` therefore means "exhaustive over the indexed workspace": every Go
+/// file parsed, the satisfaction pass ran within its pair cap, and neither end
+/// of the answer touches an interface the pass skips. Anything else is
+/// `incomplete`, and dispatch treats an unproven family as contributing no
+/// target at all.
+impl crate::analyzer::usages::MemberFamilyProvider for GoAnalyzer {
+    fn member_family_capability(
+        &self,
+        member: &CodeUnit,
+    ) -> crate::analyzer::structural::resolution::MemberFamilyCapability {
+        go_member_family_capability(member)
+    }
+
+    fn member_family(
+        &self,
+        member: &CodeUnit,
+        cancellation: Option<&crate::cancellation::CancellationToken>,
+    ) -> crate::analyzer::usages::MemberFamilyAnswer {
+        go_member_family(self, self.hierarchy_index(), member, cancellation)
+    }
+}
+
+/// What a Go declaration's own recorded structure can discriminate.
+///
+/// `ParameterTypeSpellings` is the measured level: the satisfaction pass reads
+/// each parameter's and result's declared type node and resolves it through
+/// the file's imports and aliases where it can, falling back to the written
+/// token where it cannot. That is a strictly stronger discriminator than a
+/// bare spelling but is not proof of type identity, so it must not claim
+/// erasure.
+pub fn go_member_family_capability(
+    member: &CodeUnit,
+) -> crate::analyzer::structural::resolution::MemberFamilyCapability {
+    use crate::analyzer::structural::resolution::MemberFamilyCapability;
+    if file_language(member.source()) != Language::Go {
+        return MemberFamilyCapability::Unsupported;
+    }
+    MemberFamilyCapability::ParameterTypeSpellings
+}
+
+/// One Go member's family, read out of the workspace satisfaction index.
+pub fn go_member_family(
+    analyzer: &dyn IAnalyzer,
+    index: &GoHierarchyIndex,
+    member: &CodeUnit,
+    cancellation: Option<&crate::cancellation::CancellationToken>,
+) -> crate::analyzer::usages::MemberFamilyAnswer {
+    use crate::analyzer::structural::resolution::{
+        MemberFamilyCapability, MemberFamilyOutcome, MemberFamilyReason, MethodFamilyRelation,
+    };
+    use crate::analyzer::usages::{MemberFamilyAnswer, MemberFamilyEdge};
+    use brokk_bifrost_go::hierarchy::{GoMemberFamily, GoMemberFamilyEdge};
+
+    let capability = go_member_family_capability(member);
+    if capability == MemberFamilyCapability::Unsupported {
+        return MemberFamilyAnswer::unsupported_answer();
+    }
+    if cancellation.is_some_and(crate::cancellation::CancellationToken::is_cancelled) {
+        return MemberFamilyAnswer::incomplete(capability, MemberFamilyReason::HierarchyTruncated);
+    }
+    if !member.is_function() {
+        return MemberFamilyAnswer::no_family(capability, MemberFamilyReason::NotAMethod);
+    }
+    let (implements, implemented_by) = match index.member_family(member) {
+        GoMemberFamily::Proven {
+            implements,
+            implemented_by,
+        } => (implements, implemented_by),
+        GoMemberFamily::NotEnumerable => {
+            return MemberFamilyAnswer::incomplete(
+                capability,
+                MemberFamilyReason::HierarchyTruncated,
+            );
+        }
+        // A top-level Go function owns no type and joins no method family;
+        // that is a complete answer. A function the index did not record while
+        // its owner is a type is a fact the index is missing, not an exclusion.
+        GoMemberFamily::NotTracked => {
+            return match analyzer.parent_of(member) {
+                Some(parent) if parent.is_class() => {
+                    MemberFamilyAnswer::incomplete(capability, MemberFamilyReason::OwnerUnknown)
+                }
+                _ => MemberFamilyAnswer::no_family(capability, MemberFamilyReason::NotAMethod),
+            };
+        }
+    };
+
+    // Go promotion and satisfaction match whole method keys, and Go has no
+    // overloading, so a member is singled out by structure alone.
+    let edge = |edge: GoMemberFamilyEdge, relation: MethodFamilyRelation| MemberFamilyEdge {
+        target: edge.member,
+        owner: edge.owner,
+        relation,
+        depth: 1,
+        arity_unique: true,
+    };
+    let roots = if implements.is_empty() {
+        vec![member.clone()]
+    } else {
+        let mut roots: Vec<CodeUnit> = implements.iter().map(|edge| edge.member.clone()).collect();
+        roots.sort();
+        roots.dedup();
+        roots
+    };
+    let edges = implements
+        .into_iter()
+        .map(|value| edge(value, MethodFamilyRelation::Implements))
+        .chain(
+            implemented_by
+                .into_iter()
+                .map(|value| edge(value, MethodFamilyRelation::ImplementedBy)),
+        )
+        .collect();
+    MemberFamilyAnswer {
+        capability,
+        outcome: MemberFamilyOutcome::Proven,
+        reason: None,
+        edges,
+        roots,
     }
 }
 
@@ -637,15 +794,32 @@ impl IAnalyzer for GoAnalyzer {
     }
 
     fn update(&self, changed_files: &BTreeSet<ProjectFile>) -> Self {
+        let module_identity_changed = changed_files.iter().any(|file| {
+            file.rel_path()
+                .file_name()
+                .is_some_and(|name| name == "go.mod")
+        });
+        invalidate_nearest_go_module_cache();
+        let inner = if module_identity_changed {
+            // Package facts are keyed by import path. A module-path change
+            // therefore rekeys every Go file below this manifest, including
+            // files absent from `changed_files`. Invalidate before rebuilding
+            // so the projection cannot reuse the old nearest-module answer.
+            self.inner.update_all()
+        } else {
+            self.inner.update(changed_files)
+        };
         Self {
-            inner: self.inner.update(changed_files),
+            inner,
             memo_caches: GoMemoCaches::new(self.memo_caches.budget_bytes()),
         }
     }
 
     fn update_all(&self) -> Self {
+        invalidate_nearest_go_module_cache();
+        let inner = self.inner.update_all();
         Self {
-            inner: self.inner.update_all(),
+            inner,
             memo_caches: GoMemoCaches::new(self.memo_caches.budget_bytes()),
         }
     }
@@ -703,6 +877,10 @@ impl IAnalyzer for GoAnalyzer {
     }
 
     fn type_hierarchy_provider(&self) -> Option<&dyn TypeHierarchyProvider> {
+        Some(self)
+    }
+
+    fn member_family_provider(&self) -> Option<&dyn crate::analyzer::usages::MemberFamilyProvider> {
         Some(self)
     }
 
@@ -773,6 +951,42 @@ impl IAnalyzer for GoAnalyzer {
 
 #[cfg(any(test, feature = "test-support"))]
 impl crate::analyzer::AnalyzerTestHooks for GoAnalyzer {
+    fn arm_selector_continuation_semantic_cache_invalidation_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .arm_selector_continuation_semantic_cache_invalidation_for_test();
+    }
+
+    fn invalidate_selector_continuation_semantic_cache_if_armed_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .invalidate_selector_continuation_semantic_cache_if_armed_for_test();
+    }
+
+    fn selector_continuation_semantic_cache_revivals_for_test(&self) -> u64 {
+        self.inner
+            .test_hooks()
+            .selector_continuation_semantic_cache_revivals_for_test()
+    }
+
+    fn arm_evaluation_root_continuation_semantic_cache_invalidation_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .arm_evaluation_root_continuation_semantic_cache_invalidation_for_test();
+    }
+
+    fn invalidate_evaluation_root_continuation_semantic_cache_if_armed_for_test(&self) {
+        self.inner
+            .test_hooks()
+            .invalidate_evaluation_root_continuation_semantic_cache_if_armed_for_test();
+    }
+
+    fn evaluation_root_continuation_semantic_cache_revivals_for_test(&self) -> u64 {
+        self.inner
+            .test_hooks()
+            .evaluation_root_continuation_semantic_cache_revivals_for_test()
+    }
+
     fn reset_full_declaration_scan_count_for_test(&self) {
         self.inner
             .test_hooks()
@@ -1016,5 +1230,233 @@ mod hierarchy_tests {
                 && relation.from.identifier() == "Worker"
                 && relation.to.identifier() == "Runner"
         }));
+    }
+
+    /// The member of `owner` named `identifier`, by exact declaration identity.
+    fn member(analyzer: &GoAnalyzer, owner: &str, identifier: &str) -> CodeUnit {
+        analyzer
+            .get_all_declarations()
+            .into_iter()
+            .find(|unit| {
+                unit.is_function()
+                    && unit.identifier() == identifier
+                    && unit.owner_identifier() == Some(owner)
+            })
+            .unwrap_or_else(|| panic!("no declaration {owner}.{identifier}"))
+    }
+
+    /// The members the family answer says implement `member`, by short name.
+    fn implementors(analyzer: &GoAnalyzer, member: &CodeUnit) -> Vec<String> {
+        use crate::analyzer::structural::resolution::MethodFamilyRelation;
+        use crate::analyzer::usages::MemberFamilyProvider;
+        let answer = analyzer.member_family(member, None);
+        assert!(
+            answer.is_proven(),
+            "family for {} is not proven: {:?} {:?}",
+            member.fq_name(),
+            answer.outcome,
+            answer.reason
+        );
+        let mut names: Vec<_> = answer
+            .edges
+            .iter()
+            .filter(|edge| edge.relation == MethodFamilyRelation::ImplementedBy)
+            .map(|edge| edge.target.short_name().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn interface_method_resolves_to_its_implementors() {
+        let analyzer = analyzer(&[(
+            "service.go",
+            "package app\n\
+             type Runner interface { Run(id int) error }\n\
+             type Worker struct{}\n\
+             func (Worker) Run(id int) error { return nil }\n\
+             type Pointer struct{}\n\
+             func (*Pointer) Run(id int) error { return nil }\n",
+        )]);
+        let declaration = member(&analyzer, "Runner", "Run");
+        assert_eq!(
+            implementors(&analyzer, &declaration),
+            vec!["Pointer.Run".to_string(), "Worker.Run".to_string()],
+            "a pointer receiver implements the interface for *Pointer, and its \
+             body is still the code that runs"
+        );
+    }
+
+    #[test]
+    fn a_method_of_the_same_name_and_a_different_signature_is_not_an_implementor() {
+        let analyzer = analyzer(&[(
+            "service.go",
+            "package app\n\
+             type Runner interface { Run(id int) error }\n\
+             type Worker struct{}\n\
+             func (Worker) Run(id int) error { return nil }\n\
+             type NearMiss struct{}\n\
+             func (NearMiss) Run(name string) error { return nil }\n\
+             type WrongResult struct{}\n\
+             func (WrongResult) Run(id int) {}\n",
+        )]);
+        let declaration = member(&analyzer, "Runner", "Run");
+        assert_eq!(
+            implementors(&analyzer, &declaration),
+            vec!["Worker.Run".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_type_that_satisfies_an_interface_by_embedding_reports_the_embedded_method() {
+        let analyzer = analyzer(&[(
+            "service.go",
+            "package app\n\
+             type Runner interface { Run(id int) error }\n\
+             type Base struct{}\n\
+             func (Base) Run(id int) error { return nil }\n\
+             type Derived struct{ Base }\n",
+        )]);
+        let declaration = member(&analyzer, "Runner", "Run");
+        assert_eq!(
+            implementors(&analyzer, &declaration),
+            vec!["Base.Run".to_string()],
+            "Derived satisfies Runner through promotion, and the declaration \
+             that runs is Base's"
+        );
+    }
+
+    #[test]
+    fn an_embedded_interfaces_method_keeps_its_own_declaration_as_the_family_root() {
+        let analyzer = analyzer(&[(
+            "service.go",
+            "package app\n\
+             type Starter interface { Start() error }\n\
+             type Runner interface { Starter; Run() error }\n\
+             type Worker struct{}\n\
+             func (Worker) Start() error { return nil }\n\
+             func (Worker) Run() error { return nil }\n",
+        )]);
+        assert_eq!(
+            implementors(&analyzer, &member(&analyzer, "Starter", "Start")),
+            vec!["Worker.Start".to_string()]
+        );
+        assert_eq!(
+            implementors(&analyzer, &member(&analyzer, "Runner", "Run")),
+            vec!["Worker.Run".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_method_in_another_file_of_the_same_package_still_implements() {
+        let analyzer = analyzer(&[
+            (
+                "api/service.go",
+                "package api\ntype Runner interface { Run() error }\ntype Worker struct{}\n",
+            ),
+            (
+                "api/worker.go",
+                "package api\nfunc (Worker) Run() error { return nil }\n",
+            ),
+        ]);
+        assert_eq!(
+            implementors(&analyzer, &member(&analyzer, "Runner", "Run")),
+            vec!["Worker.Run".to_string()],
+            "a Go method lives in a file of its own, so the family join must \
+             not be per-file"
+        );
+    }
+
+    #[test]
+    fn a_top_level_function_states_a_complete_answer_with_no_family() {
+        use crate::analyzer::structural::resolution::{MemberFamilyOutcome, MemberFamilyReason};
+        use crate::analyzer::usages::MemberFamilyProvider;
+        let analyzer = analyzer(&[(
+            "service.go",
+            "package app\ntype Runner interface { Run() error }\nfunc Run() error { return nil }\n",
+        )]);
+        let function = analyzer
+            .get_all_declarations()
+            .into_iter()
+            .find(|unit| unit.is_function() && analyzer.parent_of(unit).is_none())
+            .expect("a top-level function");
+        let answer = analyzer.member_family(&function, None);
+        assert_eq!(answer.outcome, MemberFamilyOutcome::NoFamily);
+        assert_eq!(answer.reason, Some(MemberFamilyReason::NotAMethod));
+        assert!(answer.edges.is_empty());
+    }
+
+    #[test]
+    fn the_forward_and_inverse_directions_name_the_same_pair() {
+        use crate::analyzer::structural::resolution::MethodFamilyRelation;
+        use crate::analyzer::usages::MemberFamilyProvider;
+        let analyzer = analyzer(&[(
+            "service.go",
+            "package app\n\
+             type Runner interface { Run() error }\n\
+             type Worker struct{}\n\
+             func (Worker) Run() error { return nil }\n",
+        )]);
+        let declaration = member(&analyzer, "Runner", "Run");
+        let implementor = member(&analyzer, "Worker", "Run");
+        let forward = analyzer.member_family(&implementor, None);
+        assert!(forward.is_proven());
+        assert_eq!(
+            forward
+                .edges
+                .iter()
+                .filter(|edge| edge.relation == MethodFamilyRelation::Implements)
+                .map(|edge| edge.target.clone())
+                .collect::<Vec<_>>(),
+            vec![declaration.clone()]
+        );
+        assert_eq!(forward.roots, vec![declaration.clone()]);
+        let inverse = analyzer.member_family(&declaration, None);
+        assert_eq!(
+            inverse
+                .edges
+                .iter()
+                .filter(|edge| edge.relation == MethodFamilyRelation::ImplementedBy)
+                .map(|edge| edge.target.clone())
+                .collect::<Vec<_>>(),
+            vec![implementor]
+        );
+        assert_eq!(inverse.roots, vec![declaration]);
+    }
+
+    #[test]
+    fn an_interface_with_type_terms_leaves_both_ends_of_its_family_incomplete() {
+        use crate::analyzer::structural::resolution::{MemberFamilyOutcome, MemberFamilyReason};
+        use crate::analyzer::usages::MemberFamilyProvider;
+        let analyzer = analyzer(&[(
+            "service.go",
+            "package app\n\
+             type Labelled interface { ~int | ~int64; Label() string }\n\
+             type Counter struct{}\n\
+             func (Counter) Label() string { return \"counter\" }\n\
+             type Plain interface { Run() error }\n\
+             type Worker struct{}\n\
+             func (Worker) Run() error { return nil }\n",
+        )]);
+        for unit in [
+            member(&analyzer, "Labelled", "Label"),
+            member(&analyzer, "Counter", "Label"),
+        ] {
+            let answer = analyzer.member_family(&unit, None);
+            assert_eq!(
+                answer.outcome,
+                MemberFamilyOutcome::Incomplete,
+                "the satisfaction pass skips an interface carrying type terms, \
+                 so neither end of {} may claim an exhaustive family",
+                unit.fq_name()
+            );
+            assert_eq!(answer.reason, Some(MemberFamilyReason::HierarchyTruncated));
+            assert!(answer.edges.is_empty());
+        }
+        assert_eq!(
+            implementors(&analyzer, &member(&analyzer, "Plain", "Run")),
+            vec!["Worker.Run".to_string()],
+            "an unrelated interface in the same workspace still answers"
+        );
     }
 }

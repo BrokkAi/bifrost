@@ -15,18 +15,16 @@ use crate::analyzer::Range;
 use crate::analyzer::semantic::ContentIdentity;
 use crate::compact_graph::CompactRows;
 use crate::text_utils::compute_line_starts;
-use bincode::Options;
 use brokk_bifrost_core::analyzer::structural::callable::{
     CallKind, CallShapeCoverage, CallSiteFacts,
 };
-use serde::{Deserialize, Serialize};
 use std::fmt;
 
-/// Semantic and binary contract for persisted structural facts.
+/// Semantic contract for persisted structural facts.
 ///
-/// Increment this whenever normalization semantics or the snapshot DTO changes,
-/// even when older bytes would still deserialize. The version is part of the
-/// SQLite row key so incompatible facts are treated as ordinary cache misses.
+/// Increment this whenever normalization semantics or the persisted row shape changes,
+/// even when older rows would still hydrate. The version is stored in the
+/// SQLite manifest so incompatible facts are treated as ordinary cache misses.
 /// Version 2 was claimed twice on divergent branches (loop-kind refinement and
 /// the #1473 per-node occurrence-role rows), so their merge is version 3.
 /// Version 4 was also claimed twice (the #1474 `Block` kind, which makes
@@ -50,310 +48,103 @@ use std::fmt;
 /// `declaration` subtype) and parameter decorator role edges (#2644).
 /// Version 12 adds JSX element/attribute facts, object-property facts, and
 /// structured tag, attribute, child, key, and value role edges (#2645).
-pub(crate) const STRUCTURAL_FACTS_SNAPSHOT_VERSION: i64 = 12;
+pub(crate) const STRUCTURAL_FACTS_VERSION: i64 = 12;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StructuralSnapshotError(String);
+pub(crate) struct StructuralFactsPersistenceError(String);
 
-impl StructuralSnapshotError {
+impl StructuralFactsPersistenceError {
     fn invalid(message: impl Into<String>) -> Self {
         Self(message.into())
     }
 }
 
-impl fmt::Display for StructuralSnapshotError {
+impl fmt::Display for StructuralFactsPersistenceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
     }
 }
 
-impl std::error::Error for StructuralSnapshotError {}
+impl std::error::Error for StructuralFactsPersistenceError {}
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-struct SnapshotSpan {
-    start: u32,
-    end: u32,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PersistedSpan {
+    pub(crate) start: u32,
+    pub(crate) end: u32,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct SnapshotNode {
-    kind: u8,
-    boolean_value: Option<bool>,
-    construct: Option<String>,
-    span: SnapshotSpan,
-    parent: Option<u32>,
-    name: Option<SnapshotSpan>,
-    subtree_end: u32,
-    call_site: Option<SnapshotCallSite>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PersistedStructuralNode {
+    pub(crate) node_id: u32,
+    pub(crate) kind: String,
+    pub(crate) boolean_value: Option<bool>,
+    pub(crate) construct: Option<String>,
+    pub(crate) span: PersistedSpan,
+    pub(crate) parent: Option<u32>,
+    pub(crate) name: Option<PersistedSpan>,
+    pub(crate) subtree_end: u32,
+    pub(crate) call_site: Option<PersistedCallSite>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-struct SnapshotCallSite {
-    call_kind: Option<u8>,
-    coverage: u8,
-    continues_callee_groups: bool,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PersistedCallSite {
+    pub(crate) call_kind: Option<String>,
+    pub(crate) coverage: String,
+    pub(crate) continues_callee_groups: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct SnapshotRoleTarget {
-    role: u8,
-    spread: bool,
-    keyword: Option<SnapshotSpan>,
-    node: Option<u32>,
-    span: SnapshotSpan,
-    name: Option<SnapshotSpan>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PersistedStructuralRole {
+    pub(crate) source_node_id: u32,
+    pub(crate) ordinal: u32,
+    pub(crate) role: String,
+    pub(crate) spread: bool,
+    pub(crate) keyword: Option<PersistedSpan>,
+    pub(crate) node: Option<u32>,
+    pub(crate) span: PersistedSpan,
+    pub(crate) name: Option<PersistedSpan>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct StructuralFactsSnapshot {
-    nodes: Vec<SnapshotNode>,
-    role_offsets: Vec<u32>,
-    roles: Vec<SnapshotRoleTarget>,
-    occurrence_role_offsets: Vec<u32>,
-    occurrence_roles: Vec<u8>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PersistedOccurrenceRole {
+    pub(crate) node_id: u32,
+    pub(crate) ordinal: u32,
+    pub(crate) role: String,
 }
 
-fn kind_code(kind: NormalizedKind) -> u8 {
-    use NormalizedKind::*;
-    match kind {
-        Declaration => 0,
-        Callable => 1,
-        Function => 2,
-        Method => 3,
-        Constructor => 4,
-        Lambda => 5,
-        Class => 6,
-        Import => 7,
-        Call => 8,
-        Assignment => 9,
-        FieldAccess => 10,
-        Identifier => 11,
-        Literal => 12,
-        StringLiteral => 13,
-        NumericLiteral => 14,
-        BooleanLiteral => 15,
-        NullLiteral => 16,
-        Return => 17,
-        Throw => 18,
-        Catch => 19,
-        If => 20,
-        Loop => 21,
-        Decorator => 22,
-        ForLoop => 23,
-        WhileLoop => 24,
-        Block => 25,
-        CollectionLiteral => 26,
-        Parameter => 27,
-        JsxElement => 28,
-        JsxAttribute => 29,
-        JsxSpreadAttribute => 30,
-        ObjectProperty => 31,
-        ComputedProperty => 32,
-        SpreadElement => 33,
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PersistedStructuralFacts {
+    pub(crate) source_bytes: u32,
+    pub(crate) nodes: Vec<PersistedStructuralNode>,
+    pub(crate) roles: Vec<PersistedStructuralRole>,
+    pub(crate) occurrence_roles: Vec<PersistedOccurrenceRole>,
 }
 
-fn decode_kind(code: u8) -> Result<NormalizedKind, StructuralSnapshotError> {
-    use NormalizedKind::*;
-    match code {
-        0 => Ok(Declaration),
-        1 => Ok(Callable),
-        2 => Ok(Function),
-        3 => Ok(Method),
-        4 => Ok(Constructor),
-        5 => Ok(Lambda),
-        6 => Ok(Class),
-        7 => Ok(Import),
-        8 => Ok(Call),
-        9 => Ok(Assignment),
-        10 => Ok(FieldAccess),
-        11 => Ok(Identifier),
-        12 => Ok(Literal),
-        13 => Ok(StringLiteral),
-        14 => Ok(NumericLiteral),
-        15 => Ok(BooleanLiteral),
-        16 => Ok(NullLiteral),
-        17 => Ok(Return),
-        18 => Ok(Throw),
-        19 => Ok(Catch),
-        20 => Ok(If),
-        21 => Ok(Loop),
-        22 => Ok(Decorator),
-        23 => Ok(ForLoop),
-        24 => Ok(WhileLoop),
-        25 => Ok(Block),
-        26 => Ok(CollectionLiteral),
-        27 => Ok(Parameter),
-        28 => Ok(JsxElement),
-        29 => Ok(JsxAttribute),
-        30 => Ok(JsxSpreadAttribute),
-        31 => Ok(ObjectProperty),
-        32 => Ok(ComputedProperty),
-        33 => Ok(SpreadElement),
-        _ => Err(StructuralSnapshotError::invalid(format!(
-            "unknown structural kind code {code}"
-        ))),
-    }
-}
-
-fn role_code(role: Role) -> u8 {
-    match role {
-        Role::Callee => 0,
-        Role::Receiver => 1,
-        Role::Arg => 2,
-        Role::Kwarg => 3,
-        Role::Left => 4,
-        Role::Right => 5,
-        Role::Module => 6,
-        Role::Decorator => 7,
-        Role::Object => 8,
-        Role::Field => 9,
-        Role::Iterable => 10,
-        Role::Element => 11,
-        Role::Tag => 12,
-        Role::Attributes => 13,
-        Role::Children => 14,
-        Role::Value => 15,
-        Role::Key => 16,
-    }
-}
-
-fn decode_role(code: u8) -> Result<Role, StructuralSnapshotError> {
-    match code {
-        0 => Ok(Role::Callee),
-        1 => Ok(Role::Receiver),
-        2 => Ok(Role::Arg),
-        3 => Ok(Role::Kwarg),
-        4 => Ok(Role::Left),
-        5 => Ok(Role::Right),
-        6 => Ok(Role::Module),
-        7 => Ok(Role::Decorator),
-        8 => Ok(Role::Object),
-        9 => Ok(Role::Field),
-        10 => Ok(Role::Iterable),
-        11 => Ok(Role::Element),
-        12 => Ok(Role::Tag),
-        13 => Ok(Role::Attributes),
-        14 => Ok(Role::Children),
-        15 => Ok(Role::Value),
-        16 => Ok(Role::Key),
-        _ => Err(StructuralSnapshotError::invalid(format!(
-            "unknown structural role code {code}"
-        ))),
-    }
-}
-
-fn call_kind_code(kind: CallKind) -> u8 {
-    use CallKind::*;
-    match kind {
-        Function => 0,
-        Method => 1,
-        Constructor => 2,
-        Extractor => 3,
-        Infix => 4,
-        Operator => 5,
-        MethodValue => 6,
-    }
-}
-
-fn decode_call_kind(code: u8) -> Result<CallKind, StructuralSnapshotError> {
-    use CallKind::*;
-    match code {
-        0 => Ok(Function),
-        1 => Ok(Method),
-        2 => Ok(Constructor),
-        3 => Ok(Extractor),
-        4 => Ok(Infix),
-        5 => Ok(Operator),
-        6 => Ok(MethodValue),
-        _ => Err(StructuralSnapshotError::invalid(format!(
-            "unknown call kind code {code}"
-        ))),
-    }
-}
-
-fn call_coverage_code(coverage: CallShapeCoverage) -> u8 {
-    use CallShapeCoverage::*;
-    match coverage {
-        Exact => 0,
-        Partial => 1,
-        UnknownMacroDerived => 2,
-        UnknownDynamic => 3,
-    }
-}
-
-fn decode_call_coverage(code: u8) -> Result<CallShapeCoverage, StructuralSnapshotError> {
-    use CallShapeCoverage::*;
-    match code {
-        0 => Ok(Exact),
-        1 => Ok(Partial),
-        2 => Ok(UnknownMacroDerived),
-        3 => Ok(UnknownDynamic),
-        _ => Err(StructuralSnapshotError::invalid(format!(
-            "unknown call shape coverage code {code}"
-        ))),
-    }
-}
-
-fn occurrence_role_code(role: OccurrenceRole) -> u8 {
-    use OccurrenceRole::*;
-    match role {
-        DeclarationName => 0,
-        Binder => 1,
-        LabelOrKey => 2,
-        TypeOperand => 3,
-        PathSegment => 4,
-        ImportAlias => 5,
-        ImportTarget => 6,
-        ReceiverPosition => 7,
-        MemberPosition => 8,
-        PatternPosition => 9,
-        GeneratedSource => 10,
-        ValueReference => 11,
-    }
-}
-
-fn decode_occurrence_role(code: u8) -> Result<OccurrenceRole, StructuralSnapshotError> {
-    use OccurrenceRole::*;
-    match code {
-        0 => Ok(DeclarationName),
-        1 => Ok(Binder),
-        2 => Ok(LabelOrKey),
-        3 => Ok(TypeOperand),
-        4 => Ok(PathSegment),
-        5 => Ok(ImportAlias),
-        6 => Ok(ImportTarget),
-        7 => Ok(ReceiverPosition),
-        8 => Ok(MemberPosition),
-        9 => Ok(PatternPosition),
-        10 => Ok(GeneratedSource),
-        11 => Ok(ValueReference),
-        _ => Err(StructuralSnapshotError::invalid(format!(
-            "unknown structural occurrence role code {code}"
-        ))),
-    }
-}
-
-fn encode_span(span: Span) -> Result<SnapshotSpan, StructuralSnapshotError> {
-    Ok(SnapshotSpan {
-        start: u32::try_from(span.start_byte)
-            .map_err(|_| StructuralSnapshotError::invalid("structural span start exceeds u32"))?,
-        end: u32::try_from(span.end_byte)
-            .map_err(|_| StructuralSnapshotError::invalid("structural span end exceeds u32"))?,
+fn persist_span(span: Span) -> Result<PersistedSpan, StructuralFactsPersistenceError> {
+    Ok(PersistedSpan {
+        start: u32::try_from(span.start_byte).map_err(|_| {
+            StructuralFactsPersistenceError::invalid("structural span start exceeds u32")
+        })?,
+        end: u32::try_from(span.end_byte).map_err(|_| {
+            StructuralFactsPersistenceError::invalid("structural span end exceeds u32")
+        })?,
     })
 }
 
-fn decode_span(span: SnapshotSpan, source: &str) -> Result<Span, StructuralSnapshotError> {
+fn hydrate_span(
+    span: PersistedSpan,
+    source: &str,
+) -> Result<Span, StructuralFactsPersistenceError> {
     let start_byte = span.start as usize;
     let end_byte = span.end as usize;
     if start_byte > end_byte || end_byte > source.len() {
-        return Err(StructuralSnapshotError::invalid(format!(
+        return Err(StructuralFactsPersistenceError::invalid(format!(
             "structural span {start_byte}..{end_byte} is outside source length {}",
             source.len()
         )));
     }
     if !source.is_char_boundary(start_byte) || !source.is_char_boundary(end_byte) {
-        return Err(StructuralSnapshotError::invalid(format!(
+        return Err(StructuralFactsPersistenceError::invalid(format!(
             "structural span {start_byte}..{end_byte} is not on UTF-8 boundaries"
         )));
     }
@@ -458,144 +249,167 @@ impl FileFacts {
         self.source_identity
     }
 
-    pub(crate) fn encode_snapshot(&self) -> Result<Vec<u8>, StructuralSnapshotError> {
-        u32::try_from(self.source.len()).map_err(|_| {
-            StructuralSnapshotError::invalid("structural source length exceeds u32")
+    pub(crate) fn persisted_rows(
+        &self,
+    ) -> Result<PersistedStructuralFacts, StructuralFactsPersistenceError> {
+        let source_bytes = u32::try_from(self.source.len()).map_err(|_| {
+            StructuralFactsPersistenceError::invalid("structural source length exceeds u32")
         })?;
         let nodes = self
             .nodes
             .iter()
-            .map(|node| {
-                Ok(SnapshotNode {
-                    kind: kind_code(node.kind),
+            .enumerate()
+            .map(|(node_id, node)| {
+                Ok(PersistedStructuralNode {
+                    node_id: u32::try_from(node_id).map_err(|_| {
+                        StructuralFactsPersistenceError::invalid(
+                            "structural node count exceeds u32",
+                        )
+                    })?,
+                    kind: node.kind.label().to_string(),
                     boolean_value: node.boolean_value,
                     construct: node.construct.clone(),
-                    span: encode_span(node.span())?,
+                    span: persist_span(node.span())?,
                     parent: node.parent,
-                    name: node.name.map(encode_span).transpose()?,
+                    name: node.name.map(persist_span).transpose()?,
                     subtree_end: node.subtree_end,
-                    call_site: node.call_site.map(|facts| SnapshotCallSite {
-                        call_kind: facts.call_kind.map(call_kind_code),
-                        coverage: call_coverage_code(facts.coverage),
+                    call_site: node.call_site.map(|facts| PersistedCallSite {
+                        call_kind: facts.call_kind.map(|kind| kind.label().to_string()),
+                        coverage: facts.coverage.label().to_string(),
                         continues_callee_groups: facts.continues_callee_groups,
                     }),
                 })
             })
-            .collect::<Result<Vec<_>, StructuralSnapshotError>>()?;
-        let roles = self
-            .roles
-            .values()
-            .iter()
-            .map(|target| {
-                Ok(SnapshotRoleTarget {
-                    role: role_code(target.role),
+            .collect::<Result<Vec<_>, StructuralFactsPersistenceError>>()?;
+        let mut roles = Vec::with_capacity(self.roles.len());
+        for source_node_id in 0..self.nodes.len() {
+            let source_node_id = u32::try_from(source_node_id).map_err(|_| {
+                StructuralFactsPersistenceError::invalid("structural node count exceeds u32")
+            })?;
+            for (ordinal, target) in self.roles(source_node_id).iter().enumerate() {
+                roles.push(PersistedStructuralRole {
+                    source_node_id,
+                    ordinal: u32::try_from(ordinal).map_err(|_| {
+                        StructuralFactsPersistenceError::invalid("structural role row exceeds u32")
+                    })?,
+                    role: target.role.label().to_string(),
                     spread: target.spread,
-                    keyword: target.keyword.map(encode_span).transpose()?,
+                    keyword: target.keyword.map(persist_span).transpose()?,
                     node: target.node,
-                    span: encode_span(target.span)?,
-                    name: target.name.map(encode_span).transpose()?,
-                })
-            })
-            .collect::<Result<Vec<_>, StructuralSnapshotError>>()?;
-        let snapshot = StructuralFactsSnapshot {
+                    span: persist_span(target.span)?,
+                    name: target.name.map(persist_span).transpose()?,
+                });
+            }
+        }
+        let mut occurrence_roles = Vec::with_capacity(self.occurrence_roles.len());
+        for node_id in 0..self.nodes.len() {
+            let node_id = u32::try_from(node_id).map_err(|_| {
+                StructuralFactsPersistenceError::invalid("structural node count exceeds u32")
+            })?;
+            for (ordinal, role) in self.occurrence_roles(node_id).iter().enumerate() {
+                occurrence_roles.push(PersistedOccurrenceRole {
+                    node_id,
+                    ordinal: u32::try_from(ordinal).map_err(|_| {
+                        StructuralFactsPersistenceError::invalid(
+                            "structural occurrence-role row exceeds u32",
+                        )
+                    })?,
+                    role: role.label().to_string(),
+                });
+            }
+        }
+        Ok(PersistedStructuralFacts {
+            source_bytes,
             nodes,
-            role_offsets: self.roles.offsets().to_vec(),
             roles,
-            occurrence_role_offsets: self.occurrence_roles.offsets().to_vec(),
-            occurrence_roles: self
-                .occurrence_roles
-                .values()
-                .iter()
-                .copied()
-                .map(occurrence_role_code)
-                .collect(),
-        };
-        bincode::DefaultOptions::new()
-            .with_varint_encoding()
-            .reject_trailing_bytes()
-            .serialize(&snapshot)
-            .map_err(|error| {
-                StructuralSnapshotError::invalid(format!(
-                    "serialize structural facts snapshot: {error}"
-                ))
-            })
+            occurrence_roles,
+        })
     }
 
-    pub(crate) fn decode_snapshot(
+    pub(crate) fn from_persisted_rows(
         source: String,
-        payload: &[u8],
-    ) -> Result<Self, StructuralSnapshotError> {
-        u32::try_from(source.len()).map_err(|_| {
-            StructuralSnapshotError::invalid("structural source length exceeds u32")
+        persisted: PersistedStructuralFacts,
+    ) -> Result<Self, StructuralFactsPersistenceError> {
+        let source_bytes = u32::try_from(source.len()).map_err(|_| {
+            StructuralFactsPersistenceError::invalid("structural source length exceeds u32")
         })?;
-        let snapshot: StructuralFactsSnapshot = bincode::DefaultOptions::new()
-            .with_varint_encoding()
-            .with_limit(payload.len() as u64)
-            .reject_trailing_bytes()
-            .deserialize(payload)
-            .map_err(|error| {
-                StructuralSnapshotError::invalid(format!(
-                    "deserialize structural facts snapshot: {error}"
-                ))
-            })?;
-        if snapshot.role_offsets.len() != snapshot.nodes.len().saturating_add(1) {
-            return Err(StructuralSnapshotError::invalid(format!(
-                "structural role row count {} does not match node count {}",
-                snapshot.role_offsets.len().saturating_sub(1),
-                snapshot.nodes.len()
+        if persisted.source_bytes != source_bytes {
+            return Err(StructuralFactsPersistenceError::invalid(format!(
+                "persisted structural source length {} does not match source length {source_bytes}",
+                persisted.source_bytes
             )));
         }
-        if snapshot.occurrence_role_offsets.len() != snapshot.nodes.len().saturating_add(1) {
-            return Err(StructuralSnapshotError::invalid(format!(
-                "structural occurrence-role row count {} does not match node count {}",
-                snapshot.occurrence_role_offsets.len().saturating_sub(1),
-                snapshot.nodes.len()
-            )));
-        }
-        let node_count = u32::try_from(snapshot.nodes.len()).map_err(|_| {
-            StructuralSnapshotError::invalid("structural snapshot node count exceeds u32")
+        let node_count = u32::try_from(persisted.nodes.len()).map_err(|_| {
+            StructuralFactsPersistenceError::invalid("structural facts node count exceeds u32")
         })?;
         let line_starts = compute_line_starts(&source);
-        let mut nodes = Vec::with_capacity(snapshot.nodes.len());
-        for (id, node) in snapshot.nodes.into_iter().enumerate() {
+        let mut nodes = Vec::with_capacity(persisted.nodes.len());
+        for (id, node) in persisted.nodes.into_iter().enumerate() {
             let id = id as u32;
+            if node.node_id != id {
+                return Err(StructuralFactsPersistenceError::invalid(format!(
+                    "persisted structural node id {} is out of order at {id}",
+                    node.node_id
+                )));
+            }
             if node.parent.is_some_and(|parent| parent >= id) {
-                return Err(StructuralSnapshotError::invalid(format!(
+                return Err(StructuralFactsPersistenceError::invalid(format!(
                     "structural node {id} has invalid parent {:?}",
                     node.parent
                 )));
             }
             if node.subtree_end <= id || node.subtree_end > node_count {
-                return Err(StructuralSnapshotError::invalid(format!(
+                return Err(StructuralFactsPersistenceError::invalid(format!(
                     "structural node {id} has invalid subtree end {} for {node_count} nodes",
                     node.subtree_end
                 )));
             }
-            let span = decode_span(node.span, &source)?;
+            let span = hydrate_span(node.span, &source)?;
             let name = node
                 .name
-                .map(|name| decode_span(name, &source))
+                .map(|name| hydrate_span(name, &source))
                 .transpose()?;
             if name.is_some_and(|name| {
                 name.start_byte < span.start_byte || name.end_byte > span.end_byte
             }) {
-                return Err(StructuralSnapshotError::invalid(format!(
+                return Err(StructuralFactsPersistenceError::invalid(format!(
                     "structural node {id} name is outside its node span"
                 )));
             }
             let call_site = node
                 .call_site
                 .map(|facts| {
-                    Ok::<_, StructuralSnapshotError>(CallSiteFacts {
-                        call_kind: facts.call_kind.map(decode_call_kind).transpose()?,
-                        coverage: decode_call_coverage(facts.coverage)?,
+                    Ok::<_, StructuralFactsPersistenceError>(CallSiteFacts {
+                        call_kind: facts
+                            .call_kind
+                            .map(|kind| {
+                                CallKind::from_label(&kind).ok_or_else(|| {
+                                    StructuralFactsPersistenceError::invalid(format!(
+                                        "unknown structural call kind {kind}"
+                                    ))
+                                })
+                            })
+                            .transpose()?,
+                        coverage: CallShapeCoverage::from_label(&facts.coverage).ok_or_else(
+                            || {
+                                StructuralFactsPersistenceError::invalid(format!(
+                                    "unknown structural call coverage {}",
+                                    facts.coverage
+                                ))
+                            },
+                        )?,
                         continues_callee_groups: facts.continues_callee_groups,
                     })
                 })
                 .transpose()?;
-            let kind = decode_kind(node.kind)?;
+            let kind = NormalizedKind::from_label(&node.kind).ok_or_else(|| {
+                StructuralFactsPersistenceError::invalid(format!(
+                    "unknown structural kind {}",
+                    node.kind
+                ))
+            })?;
             if node.boolean_value.is_some() && kind != NormalizedKind::BooleanLiteral {
-                return Err(StructuralSnapshotError::invalid(format!(
+                return Err(StructuralFactsPersistenceError::invalid(format!(
                     "structural node {id} carries a boolean value for non-boolean kind {}",
                     kind.label()
                 )));
@@ -620,46 +434,111 @@ impl FileFacts {
             if let Some(parent) = node.parent
                 && id as u32 >= nodes[parent as usize].subtree_end
             {
-                return Err(StructuralSnapshotError::invalid(format!(
+                return Err(StructuralFactsPersistenceError::invalid(format!(
                     "structural node {id} lies outside parent {parent}'s subtree"
                 )));
             }
         }
 
-        let mut roles = Vec::with_capacity(snapshot.roles.len());
-        for target in snapshot.roles {
-            if target.node.is_some_and(|node| node >= node_count) {
-                return Err(StructuralSnapshotError::invalid(format!(
-                    "structural role target node {:?} is outside {node_count} nodes",
-                    target.node
-                )));
+        let mut role_offsets = Vec::with_capacity(nodes.len().saturating_add(1));
+        let mut roles = Vec::with_capacity(persisted.roles.len());
+        let mut persisted_roles = persisted.roles.into_iter().peekable();
+        role_offsets.push(0);
+        for source_node_id in 0..node_count {
+            let mut ordinal = 0u32;
+            while persisted_roles
+                .peek()
+                .is_some_and(|row| row.source_node_id == source_node_id)
+            {
+                let target = persisted_roles.next().expect("peeked structural role");
+                if target.ordinal != ordinal {
+                    return Err(StructuralFactsPersistenceError::invalid(format!(
+                        "structural role ordinal {} is out of order for node {source_node_id}",
+                        target.ordinal
+                    )));
+                }
+                ordinal += 1;
+                if target.node.is_some_and(|node| node >= node_count) {
+                    return Err(StructuralFactsPersistenceError::invalid(format!(
+                        "structural role target node {:?} is outside {node_count} nodes",
+                        target.node
+                    )));
+                }
+                roles.push(RoleTarget {
+                    role: Role::from_label(&target.role).ok_or_else(|| {
+                        StructuralFactsPersistenceError::invalid(format!(
+                            "unknown structural role {}",
+                            target.role
+                        ))
+                    })?,
+                    spread: target.spread,
+                    keyword: target
+                        .keyword
+                        .map(|span| hydrate_span(span, &source))
+                        .transpose()?,
+                    node: target.node,
+                    span: hydrate_span(target.span, &source)?,
+                    name: target
+                        .name
+                        .map(|span| hydrate_span(span, &source))
+                        .transpose()?,
+                });
             }
-            roles.push(RoleTarget {
-                role: decode_role(target.role)?,
-                spread: target.spread,
-                keyword: target
-                    .keyword
-                    .map(|span| decode_span(span, &source))
-                    .transpose()?,
-                node: target.node,
-                span: decode_span(target.span, &source)?,
-                name: target
-                    .name
-                    .map(|span| decode_span(span, &source))
-                    .transpose()?,
-            });
+            role_offsets.push(u32::try_from(roles.len()).map_err(|_| {
+                StructuralFactsPersistenceError::invalid("structural role count exceeds u32")
+            })?);
         }
-        let roles = CompactRows::try_from_parts(snapshot.role_offsets, roles)
-            .map_err(StructuralSnapshotError::invalid)?;
+        if let Some(role) = persisted_roles.next() {
+            return Err(StructuralFactsPersistenceError::invalid(format!(
+                "structural role references out-of-order source node {}",
+                role.source_node_id
+            )));
+        }
+        let roles = CompactRows::try_from_parts(role_offsets, roles)
+            .map_err(StructuralFactsPersistenceError::invalid)?;
 
-        let occurrence_roles = snapshot
-            .occurrence_roles
-            .into_iter()
-            .map(decode_occurrence_role)
-            .collect::<Result<Vec<_>, StructuralSnapshotError>>()?;
+        let mut occurrence_role_offsets = Vec::with_capacity(nodes.len().saturating_add(1));
+        let mut occurrence_roles = Vec::with_capacity(persisted.occurrence_roles.len());
+        let mut persisted_occurrence_roles = persisted.occurrence_roles.into_iter().peekable();
+        occurrence_role_offsets.push(0);
+        for node_id in 0..node_count {
+            let mut ordinal = 0u32;
+            while persisted_occurrence_roles
+                .peek()
+                .is_some_and(|row| row.node_id == node_id)
+            {
+                let row = persisted_occurrence_roles
+                    .next()
+                    .expect("peeked structural occurrence role");
+                if row.ordinal != ordinal {
+                    return Err(StructuralFactsPersistenceError::invalid(format!(
+                        "structural occurrence-role ordinal {} is out of order for node {node_id}",
+                        row.ordinal
+                    )));
+                }
+                ordinal += 1;
+                occurrence_roles.push(OccurrenceRole::from_label(&row.role).ok_or_else(|| {
+                    StructuralFactsPersistenceError::invalid(format!(
+                        "unknown structural occurrence role {}",
+                        row.role
+                    ))
+                })?);
+            }
+            occurrence_role_offsets.push(u32::try_from(occurrence_roles.len()).map_err(|_| {
+                StructuralFactsPersistenceError::invalid(
+                    "structural occurrence-role count exceeds u32",
+                )
+            })?);
+        }
+        if let Some(row) = persisted_occurrence_roles.next() {
+            return Err(StructuralFactsPersistenceError::invalid(format!(
+                "structural occurrence role references out-of-order node {}",
+                row.node_id
+            )));
+        }
         let occurrence_roles =
-            CompactRows::try_from_parts(snapshot.occurrence_role_offsets, occurrence_roles)
-                .map_err(StructuralSnapshotError::invalid)?;
+            CompactRows::try_from_parts(occurrence_role_offsets, occurrence_roles)
+                .map_err(StructuralFactsPersistenceError::invalid)?;
 
         Ok(Self::new(
             source,
@@ -761,17 +640,14 @@ impl FileFacts {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        FileFacts, NormalizedNode, RoleTarget, STRUCTURAL_FACTS_SNAPSHOT_VERSION, SnapshotNode,
-        SnapshotRoleTarget, SnapshotSpan, Span, StructuralFactsSnapshot, decode_kind,
-        decode_occurrence_role, decode_role, kind_code, occurrence_role_code, role_code,
-    };
+    use super::{FileFacts, NormalizedNode, RoleTarget, STRUCTURAL_FACTS_VERSION, Span};
     use crate::analyzer::Range;
-    use crate::analyzer::structural::kinds::{ALL_KINDS, ALL_ROLES, NormalizedKind, Role};
-    use crate::analyzer::structural::occurrences::{ALL_OCCURRENCE_ROLES, OccurrenceRole};
+    use crate::analyzer::structural::kinds::{NormalizedKind, Role};
+    use crate::analyzer::structural::occurrences::OccurrenceRole;
     use crate::compact_graph::{CompactRows, CompactRowsBuilder};
-    use bincode::Options;
-    use serde::Serialize;
+    use brokk_bifrost_core::analyzer::structural::callable::{
+        CallKind, CallShapeCoverage, CallSiteFacts,
+    };
 
     fn role_target(role: Role, start_byte: usize) -> RoleTarget {
         RoleTarget {
@@ -809,7 +685,7 @@ mod tests {
         }
     }
 
-    fn snapshot_fixture() -> FileFacts {
+    fn relational_fixture() -> FileFacts {
         let source = "f(é)\n".to_owned();
         let nodes = vec![
             NormalizedNode {
@@ -828,11 +704,15 @@ mod tests {
                     end_byte: 1,
                 }),
                 subtree_end: 2,
-                call_site: None,
+                call_site: Some(CallSiteFacts {
+                    call_kind: Some(CallKind::Method),
+                    coverage: CallShapeCoverage::Partial,
+                    continues_callee_groups: true,
+                }),
             },
             NormalizedNode {
-                kind: NormalizedKind::Identifier,
-                boolean_value: None,
+                kind: NormalizedKind::BooleanLiteral,
+                boolean_value: Some(true),
                 construct: None,
                 range: Range {
                     start_byte: 2,
@@ -866,9 +746,12 @@ mod tests {
                 }),
             },
             RoleTarget {
-                role: Role::Arg,
+                role: Role::Kwarg,
                 spread: true,
-                keyword: None,
+                keyword: Some(Span {
+                    start_byte: 0,
+                    end_byte: 1,
+                }),
                 node: Some(1),
                 span: Span {
                     start_byte: 2,
@@ -891,14 +774,6 @@ mod tests {
             roles.finish(),
             occurrence_roles.finish(),
         )
-    }
-
-    fn serialize_wire(snapshot: &StructuralFactsSnapshot) -> Vec<u8> {
-        bincode::DefaultOptions::new()
-            .with_varint_encoding()
-            .reject_trailing_bytes()
-            .serialize(snapshot)
-            .unwrap()
     }
 
     #[test]
@@ -971,57 +846,28 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_codes_cover_the_complete_structural_vocabulary() {
-        for &kind in ALL_KINDS {
-            assert_eq!(decode_kind(kind_code(kind)).unwrap(), kind);
-        }
-        for &role in ALL_ROLES {
-            assert_eq!(decode_role(role_code(role)).unwrap(), role);
-        }
-        for &role in ALL_OCCURRENCE_ROLES {
-            assert_eq!(
-                decode_occurrence_role(occurrence_role_code(role)).unwrap(),
-                role
-            );
-        }
-        let unknown = u8::try_from(ALL_OCCURRENCE_ROLES.len()).expect("occurrence role count fits");
-        assert!(decode_occurrence_role(unknown).is_err());
-    }
+    fn relational_round_trip_reconstructs_identical_hot_facts() {
+        assert_eq!(STRUCTURAL_FACTS_VERSION, 12);
+        let original = relational_fixture();
+        let rows = original.persisted_rows().unwrap();
+        assert_eq!(rows.source_bytes, original.source().len() as u32);
+        assert_eq!(rows.nodes[0].kind, "call");
+        assert_eq!(rows.roles[1].role, "kwargs");
+        assert_eq!(rows.occurrence_roles[0].role, "value_reference");
 
-    #[test]
-    fn jsx_snapshot_codes_append_after_parameter_vocabulary() {
-        assert_eq!(STRUCTURAL_FACTS_SNAPSHOT_VERSION, 12);
-        assert_eq!(kind_code(NormalizedKind::Parameter), 27);
-        assert_eq!(kind_code(NormalizedKind::JsxElement), 28);
-        assert_eq!(kind_code(NormalizedKind::JsxAttribute), 29);
-        assert_eq!(kind_code(NormalizedKind::JsxSpreadAttribute), 30);
-        assert_eq!(kind_code(NormalizedKind::ObjectProperty), 31);
-        assert_eq!(kind_code(NormalizedKind::ComputedProperty), 32);
-        assert_eq!(kind_code(NormalizedKind::SpreadElement), 33);
-        assert_eq!(role_code(Role::Tag), 12);
-        assert_eq!(role_code(Role::Attributes), 13);
-        assert_eq!(role_code(Role::Children), 14);
-        assert_eq!(role_code(Role::Value), 15);
-        assert_eq!(role_code(Role::Key), 16);
-    }
-
-    #[test]
-    fn snapshot_round_trip_reconstructs_identical_hot_facts() {
-        let mut original = snapshot_fixture();
-        original.nodes[1].kind = NormalizedKind::BooleanLiteral;
-        original.nodes[1].boolean_value = Some(true);
-        let payload = original.encode_snapshot().unwrap();
-        let decoded = FileFacts::decode_snapshot(original.source().to_owned(), &payload).unwrap();
+        let decoded = FileFacts::from_persisted_rows(original.source().to_owned(), rows).unwrap();
 
         assert_eq!(decoded.source(), original.source());
         assert_eq!(decoded.nodes().len(), original.nodes().len());
         for (actual, expected) in decoded.nodes().iter().zip(original.nodes()) {
             assert_eq!(actual.kind, expected.kind);
             assert_eq!(actual.boolean_value, expected.boolean_value);
+            assert_eq!(actual.construct, expected.construct);
             assert_eq!(actual.range, expected.range);
             assert_eq!(actual.parent, expected.parent);
             assert_eq!(actual.name, expected.name);
             assert_eq!(actual.subtree_end, expected.subtree_end);
+            assert_eq!(actual.call_site, expected.call_site);
         }
         assert_eq!(decoded.role_count(), original.role_count());
         for node in 0..original.nodes().len() as u32 {
@@ -1033,12 +879,6 @@ mod tests {
                 assert_eq!(actual.span, expected.span);
                 assert_eq!(actual.name, expected.name);
             }
-        }
-        assert_eq!(
-            decoded.occurrence_role_count(),
-            original.occurrence_role_count()
-        );
-        for node in 0..original.nodes().len() as u32 {
             assert_eq!(
                 decoded.occurrence_roles(node),
                 original.occurrence_roles(node)
@@ -1049,175 +889,52 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_decode_rejects_unknown_codes_and_corrupt_rows() {
-        let unknown_kind = StructuralFactsSnapshot {
-            nodes: vec![SnapshotNode {
-                kind: u8::MAX,
-                boolean_value: None,
-                construct: None,
-                span: SnapshotSpan { start: 0, end: 1 },
-                parent: None,
-                name: None,
-                subtree_end: 1,
-                call_site: None,
-            }],
-            role_offsets: vec![0, 0],
-            roles: vec![],
-            occurrence_role_offsets: vec![0, 0],
-            occurrence_roles: vec![],
-        };
-        let error =
-            FileFacts::decode_snapshot("x".to_owned(), &serialize_wire(&unknown_kind)).unwrap_err();
-        assert!(error.to_string().contains("unknown structural kind code"));
+    fn relational_hydration_rejects_inconsistent_rows() {
+        let fixture = relational_fixture();
 
-        let boolean_value_on_call = StructuralFactsSnapshot {
-            nodes: vec![SnapshotNode {
-                kind: kind_code(NormalizedKind::Call),
-                boolean_value: Some(true),
-                construct: None,
-                span: SnapshotSpan { start: 0, end: 1 },
-                parent: None,
-                name: None,
-                subtree_end: 1,
-                call_site: None,
-            }],
-            role_offsets: vec![0, 0],
-            roles: vec![],
-            occurrence_role_offsets: vec![0, 0],
-            occurrence_roles: vec![],
-        };
-        let error =
-            FileFacts::decode_snapshot("x".to_owned(), &serialize_wire(&boolean_value_on_call))
-                .unwrap_err();
-        assert!(error.to_string().contains("non-boolean kind call"));
-
-        let corrupt_rows = StructuralFactsSnapshot {
-            nodes: vec![SnapshotNode {
-                kind: kind_code(NormalizedKind::Call),
-                boolean_value: None,
-                construct: None,
-                span: SnapshotSpan { start: 0, end: 1 },
-                parent: None,
-                name: None,
-                subtree_end: 1,
-                call_site: None,
-            }],
-            role_offsets: vec![0, 2],
-            roles: vec![SnapshotRoleTarget {
-                role: role_code(Role::Callee),
-                spread: false,
-                keyword: None,
-                node: None,
-                span: SnapshotSpan { start: 0, end: 1 },
-                name: None,
-            }],
-            occurrence_role_offsets: vec![0, 0],
-            occurrence_roles: vec![],
-        };
-        let error =
-            FileFacts::decode_snapshot("x".to_owned(), &serialize_wire(&corrupt_rows)).unwrap_err();
-        assert!(error.to_string().contains("offsets must end"));
-    }
-
-    /// The occurrence-role rows changed the snapshot's binary shape, which is
-    /// exactly why `STRUCTURAL_FACTS_SNAPSHOT_VERSION` moved past 1: a payload
-    /// written by the version-1 encoder no longer decodes, so a stale cache row
-    /// that somehow reached this decoder fails loudly instead of misdecoding.
-    /// The version key means the cache treats it as an ordinary miss and the
-    /// file is re-extracted.
-    #[test]
-    fn version_one_payloads_do_not_decode_under_the_current_shape() {
-        #[derive(Serialize)]
-        struct VersionOneSnapshot {
-            nodes: Vec<SnapshotNode>,
-            role_offsets: Vec<u32>,
-            roles: Vec<SnapshotRoleTarget>,
-        }
-
-        let legacy = VersionOneSnapshot {
-            nodes: vec![SnapshotNode {
-                kind: kind_code(NormalizedKind::Identifier),
-                boolean_value: None,
-                construct: None,
-                span: SnapshotSpan { start: 0, end: 1 },
-                parent: None,
-                name: None,
-                subtree_end: 1,
-                call_site: None,
-            }],
-            role_offsets: vec![0, 0],
-            roles: vec![],
-        };
-        let payload = bincode::DefaultOptions::new()
-            .with_varint_encoding()
-            .reject_trailing_bytes()
-            .serialize(&legacy)
-            .expect("version-one payload serializes");
-
-        let error = FileFacts::decode_snapshot("x".to_owned(), &payload)
-            .expect_err("version-one payload must not decode as version two");
+        let mut rows = fixture.persisted_rows().unwrap();
+        rows.source_bytes -= 1;
         assert!(
-            error
+            FileFacts::from_persisted_rows(fixture.source().to_owned(), rows)
+                .unwrap_err()
                 .to_string()
-                .contains("deserialize structural facts snapshot"),
-            "unexpected error: {error}"
+                .contains("source length")
         );
-    }
 
-    /// The `Block` kind (#1474) changes what extraction *produces* without
-    /// changing the snapshot's binary shape, so a payload written before it
-    /// still decodes: it simply describes an arena in which no statement list
-    /// is a node, and every scope query over it would answer from a file that
-    /// appears to have no scopes. Nothing in the bytes can detect that, which
-    /// is why `STRUCTURAL_FACTS_SNAPSHOT_VERSION` advanced: the version is part
-    /// of the cache row key, so those bytes are a plain miss and the file is
-    /// re-extracted with its blocks.
-    #[test]
-    fn pre_block_payloads_decode_and_are_therefore_gated_by_the_version_key() {
-        let source = "fn demo() { }\n".to_owned();
-        let pre_block = StructuralFactsSnapshot {
-            nodes: vec![SnapshotNode {
-                kind: kind_code(NormalizedKind::Function),
-                boolean_value: None,
-                construct: None,
-                span: SnapshotSpan { start: 0, end: 13 },
-                parent: None,
-                name: Some(SnapshotSpan { start: 3, end: 7 }),
-                subtree_end: 1,
-                call_site: None,
-            }],
-            role_offsets: vec![0, 0],
-            roles: vec![],
-            occurrence_role_offsets: vec![0, 0],
-            occurrence_roles: vec![],
-        };
-
-        let decoded = FileFacts::decode_snapshot(source, &serialize_wire(&pre_block))
-            .expect("a pre-block payload still satisfies the current wire shape");
+        let mut rows = fixture.persisted_rows().unwrap();
+        rows.nodes[0].kind = "not_a_kind".to_owned();
         assert!(
-            decoded
-                .nodes()
-                .iter()
-                .all(|node| node.kind != NormalizedKind::Block),
-            "a pre-block arena cannot answer scope queries: {:?}",
-            decoded.nodes()
-        );
-    }
-
-    #[test]
-    fn snapshot_decode_rejects_source_mismatch_and_trailing_bytes() {
-        let facts = snapshot_fixture();
-        let mut payload = facts.encode_snapshot().unwrap();
-        let source_error = FileFacts::decode_snapshot("f".to_owned(), &payload).unwrap_err();
-        assert!(source_error.to_string().contains("outside source length"));
-
-        payload.push(0);
-        let trailing_error = FileFacts::decode_snapshot(facts.source().to_owned(), &payload)
-            .expect_err("snapshot decoder must reject trailing bytes");
-        assert!(
-            trailing_error
+            FileFacts::from_persisted_rows(fixture.source().to_owned(), rows)
+                .unwrap_err()
                 .to_string()
-                .contains("deserialize structural facts snapshot")
+                .contains("unknown structural kind")
+        );
+
+        let mut rows = fixture.persisted_rows().unwrap();
+        rows.nodes[1].node_id = 7;
+        assert!(
+            FileFacts::from_persisted_rows(fixture.source().to_owned(), rows)
+                .unwrap_err()
+                .to_string()
+                .contains("out of order")
+        );
+
+        let mut rows = fixture.persisted_rows().unwrap();
+        rows.roles[1].ordinal = 9;
+        assert!(
+            FileFacts::from_persisted_rows(fixture.source().to_owned(), rows)
+                .unwrap_err()
+                .to_string()
+                .contains("role ordinal")
+        );
+
+        let mut rows = fixture.persisted_rows().unwrap();
+        rows.nodes[0].boolean_value = Some(true);
+        assert!(
+            FileFacts::from_persisted_rows(fixture.source().to_owned(), rows)
+                .unwrap_err()
+                .to_string()
+                .contains("non-boolean kind call")
         );
     }
 }

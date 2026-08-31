@@ -37,10 +37,13 @@ use crate::analyzer::tree_sitter_analyzer::FileState;
 use crate::analyzer::usages::parsed_tree::{
     ParseSpec, ParsedTreeFile, parse_tree_sitter_file, parse_tree_sitter_source,
 };
-use crate::analyzer::{CodeUnit, IAnalyzer, ProjectFile, Range};
+use crate::analyzer::{AnalyzerQueryScope, CodeUnit, IAnalyzer, ProjectFile, QueryScope, Range};
 use crate::hash::{HashMap, HashSet};
+use moka::sync::Cache;
 use rayon::prelude::*;
 use std::collections::BTreeMap;
+use std::mem::size_of;
+use std::sync::Arc;
 
 /// [`ClassRangeIndex`] over a persisted file state, for scans that already
 /// hydrated one and would otherwise pay the declaration/range queries twice.
@@ -106,6 +109,141 @@ impl<'a, K> EdgeNodeDomain<'a, K> {
 /// request either site-bearing API edges or compact weights for graph algorithms.
 pub(crate) trait UsageEdgeBuildOutput<K: NodeKey>: Sized {
     fn merge(per_file: Vec<PerFileEdges<K>>) -> Self;
+}
+
+/// The result of a whole-workspace edge build that also records whether every
+/// selected file produced a per-file result.
+///
+/// The ordinary usage-graph callers retain their historical best-effort
+/// behaviour and may consume the output from an omitted file. Dead-code bulk
+/// proofs use this status to avoid retaining such a graph: a missing parse,
+/// file state, or provider result is evidence that the graph is incomplete.
+pub(crate) enum UsageEdgeBuildResult<Output> {
+    Complete(Output),
+    Uncacheable {
+        output: Output,
+        omitted_files: Vec<ProjectFile>,
+    },
+}
+
+impl<Output> UsageEdgeBuildResult<Output> {
+    pub(crate) fn mark_uncacheable(self) -> Self {
+        match self {
+            Self::Complete(output) => Self::Uncacheable {
+                output,
+                omitted_files: Vec::new(),
+            },
+            uncacheable @ Self::Uncacheable { .. } => uncacheable,
+        }
+    }
+}
+
+/// Cache shape used by dead-code bulk proofs. The owner is one language
+/// analyzer instance, so the key only needs the canonical target FQNs; the
+/// analyzer instance supplies the generation and language domain.
+pub(crate) type UsageEdgesCache = Cache<Arc<[String]>, Arc<UsageEdges>>;
+
+pub(crate) fn sorted_usage_edge_targets(targets: &HashSet<String>) -> Arc<[String]> {
+    let mut targets = targets.iter().cloned().collect::<Vec<_>>();
+    targets.sort_unstable();
+    targets.into()
+}
+
+pub(crate) fn weight_usage_edges(key: &Arc<[String]>, edges: &Arc<UsageEdges>) -> u32 {
+    let key_bytes = size_of::<Arc<[String]>>()
+        + key
+            .iter()
+            .map(|target| size_of::<String>() + target.len())
+            .sum::<usize>();
+    let edge_bytes = edges
+        .edges
+        .iter()
+        .map(|((caller, callee), sites)| {
+            caller.len()
+                + callee.len()
+                + sites
+                    .iter()
+                    .map(|site| size_of::<CallSite>() + site.path.len())
+                    .sum::<usize>()
+        })
+        .sum::<usize>();
+    let summary_bytes = edges
+        .truncated
+        .keys()
+        .chain(edges.unproven_inbound.keys())
+        .map(|name| size_of::<String>() + name.len() + size_of::<usize>())
+        .sum::<usize>();
+    (key_bytes + edge_bytes + summary_bytes).clamp(1, u32::MAX as usize) as u32
+}
+
+/// Cache a dead-code bulk graph only when its builder explicitly reports that
+/// every selected input was processed. A best-effort graph from an omitted
+/// input remains available to the current report, but is never published into
+/// the generation-local cache.
+pub(crate) fn cached_dead_code_usage_edges(
+    analyzer: &dyn IAnalyzer,
+    cache: &UsageEdgesCache,
+    targets: &HashSet<String>,
+    build: impl FnOnce(
+        brokk_bifrost_core::analyzer::query_token::QueryToken<'_>,
+    ) -> Option<UsageEdgeBuildResult<UsageEdges>>,
+) -> Option<Arc<UsageEdges>> {
+    let cancellation = analyzer.active_query_cancellation();
+    if cancellation
+        .as_ref()
+        .is_some_and(crate::CancellationToken::is_cancelled)
+    {
+        return None;
+    }
+    let scope = match cancellation.as_ref() {
+        Some(cancellation) => AnalyzerQueryScope::with_cancellation(analyzer, cancellation),
+        None => AnalyzerQueryScope::new(analyzer),
+    };
+    let result = cache_complete_usage_edges(cache, targets, || {
+        let result = build(scope.token())?;
+        if cancellation
+            .as_ref()
+            .is_some_and(crate::CancellationToken::is_cancelled)
+            || scope.store_error().is_some()
+        {
+            Some(result.mark_uncacheable())
+        } else {
+            Some(result)
+        }
+    });
+    if cancellation
+        .as_ref()
+        .is_some_and(crate::CancellationToken::is_cancelled)
+    {
+        None
+    } else {
+        result
+    }
+}
+
+fn cache_complete_usage_edges(
+    cache: &UsageEdgesCache,
+    targets: &HashSet<String>,
+    build: impl FnOnce() -> Option<UsageEdgeBuildResult<UsageEdges>>,
+) -> Option<Arc<UsageEdges>> {
+    let key = sorted_usage_edge_targets(targets);
+    if let Some(cached) = cache.get(&key) {
+        return Some(cached);
+    }
+    match build()? {
+        UsageEdgeBuildResult::Complete(edges) => {
+            let edges = Arc::new(edges);
+            cache.insert(key, Arc::clone(&edges));
+            Some(edges)
+        }
+        UsageEdgeBuildResult::Uncacheable {
+            output,
+            omitted_files,
+        } => {
+            debug_assert!(omitted_files.windows(2).all(|files| files[0] < files[1]));
+            Some(Arc::new(output))
+        }
+    }
 }
 
 impl<K: NodeKey> UsageEdgeBuildOutput<K> for UsageEdges<K> {
@@ -277,6 +415,49 @@ where
     ScanFn: Fn(&ProjectFile) -> Option<PerFileEdges<K>> + Sync,
 {
     Output::merge(collect_per_file_edges(files, keep_file, scan))
+}
+
+/// Drive a whole-workspace edge build while retaining the identities of files
+/// whose scan could not produce a per-file result.
+///
+/// This is deliberately an opt-in sibling of [`build_edge_output`]. Existing
+/// usage paths continue to receive their best-effort graph, while callers that
+/// publish a graph beyond the current request can fail closed on omitted input.
+pub(crate) fn build_edge_output_with_completeness<K, Output, KeepFn, ScanFn>(
+    files: &[ProjectFile],
+    keep_file: KeepFn,
+    scan: ScanFn,
+) -> UsageEdgeBuildResult<Output>
+where
+    K: NodeKey + Send,
+    Output: UsageEdgeBuildOutput<K>,
+    KeepFn: Fn(&ProjectFile) -> bool + Sync,
+    ScanFn: Fn(&ProjectFile) -> Option<PerFileEdges<K>> + Sync,
+{
+    let (per_file, omitted_files) = files
+        .par_iter()
+        .filter(|file| keep_file(file))
+        .map(|file| scan(file).map_or_else(|| Err(file.clone()), Ok))
+        .partition::<Vec<_>, Vec<_>, _>(Result::is_ok);
+    let mut omitted_files = omitted_files
+        .into_iter()
+        .map(|result| match result {
+            Ok(_) => unreachable!("partitioned successful file result into omissions"),
+            Err(file) => file,
+        })
+        .collect::<Vec<_>>();
+    omitted_files.sort_unstable();
+    omitted_files.dedup();
+    let per_file = per_file.into_iter().map(Result::unwrap).collect::<Vec<_>>();
+    let output = Output::merge(per_file);
+    if omitted_files.is_empty() {
+        UsageEdgeBuildResult::Complete(output)
+    } else {
+        UsageEdgeBuildResult::Uncacheable {
+            output,
+            omitted_files,
+        }
+    }
 }
 
 #[allow(clippy::redundant_closure)] // the closure borrows `scan`; see the note below
@@ -945,5 +1126,158 @@ mod tests {
         );
         assert_eq!(file.unproven_inbound[&callee].len(), 1);
         assert!(!file.unproven_inbound.contains_key("app.other"));
+    }
+
+    fn usage_edges_cache() -> UsageEdgesCache {
+        Cache::builder()
+            .max_capacity(1024 * 1024)
+            .weigher(weight_usage_edges)
+            .build()
+    }
+
+    fn cached_edges_fixture() -> UsageEdges {
+        UsageEdges {
+            edges: BTreeMap::from([(
+                ("caller".to_string(), "target".to_string()),
+                vec![CallSite {
+                    path: "src/caller.rs".to_string(),
+                    line: 7,
+                    spans: vec![(41, 47)],
+                    exact_targets: Vec::new(),
+                }],
+            )]),
+            truncated: BTreeMap::from([("busy".to_string(), 12)]),
+            unproven_inbound: BTreeMap::from([("uncertain".to_string(), 2)]),
+        }
+    }
+
+    #[test]
+    fn dead_code_cache_keys_are_order_insensitive_and_preserve_evidence_on_hit() {
+        let cache = usage_edges_cache();
+        let first_targets = HashSet::from_iter(["z.target".to_string(), "a.target".to_string()]);
+        let second_targets = HashSet::from_iter(["a.target".to_string(), "z.target".to_string()]);
+        let builds = std::sync::atomic::AtomicUsize::new(0);
+
+        let first = cache_complete_usage_edges(&cache, &first_targets, || {
+            builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some(UsageEdgeBuildResult::Complete(cached_edges_fixture()))
+        })
+        .expect("complete graph should be returned");
+        let second = cache_complete_usage_edges(&cache, &second_targets, || {
+            builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some(UsageEdgeBuildResult::Complete(UsageEdges::default()))
+        })
+        .expect("canonical key should hit");
+
+        assert_eq!(builds.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert_eq!(second.edges, first.edges);
+        assert_eq!(second.truncated, BTreeMap::from([("busy".to_string(), 12)]));
+        assert_eq!(
+            second.unproven_inbound,
+            BTreeMap::from([("uncertain".to_string(), 2)])
+        );
+    }
+
+    #[test]
+    fn incomplete_file_results_are_observable_and_never_published() {
+        let root = std::env::temp_dir();
+        let missing = ProjectFile::new(root.clone(), "missing.rs");
+        let present = ProjectFile::new(root, "present.rs");
+        let files = vec![missing.clone(), present.clone(), missing.clone()];
+        let result = build_edge_output_with_completeness::<String, UsageEdges, _, _>(
+            &files,
+            |_| true,
+            |file| {
+                (file == &present).then(|| per_file_with_edge("present.rs", "caller", "target", 3))
+            },
+        );
+
+        let UsageEdgeBuildResult::Uncacheable {
+            output,
+            omitted_files,
+        } = result
+        else {
+            panic!("an omitted file must make the result uncacheable");
+        };
+        assert_eq!(omitted_files, vec![missing]);
+        assert_eq!(output.edges.len(), 1);
+
+        let cache = usage_edges_cache();
+        let targets = HashSet::from_iter(["target".to_string()]);
+        let builds = std::sync::atomic::AtomicUsize::new(0);
+        let first = cache_complete_usage_edges(&cache, &targets, || {
+            builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some(UsageEdgeBuildResult::Uncacheable {
+                output: cached_edges_fixture(),
+                omitted_files: vec![ProjectFile::new(std::env::temp_dir(), "unreadable.rs")],
+            })
+        })
+        .expect("current incomplete request still receives its graph");
+        let second = cache_complete_usage_edges(&cache, &targets, || {
+            builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some(UsageEdgeBuildResult::Complete(cached_edges_fixture()))
+        })
+        .expect("a later complete request should rebuild");
+
+        assert_eq!(builds.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert!(!std::sync::Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn none_results_are_not_published_and_ordinary_output_is_unchanged() {
+        let cache = usage_edges_cache();
+        let targets = HashSet::from_iter(["target".to_string()]);
+        let builds = std::sync::atomic::AtomicUsize::new(0);
+        assert!(
+            cache_complete_usage_edges(&cache, &targets, || {
+                builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                None
+            })
+            .is_none()
+        );
+        assert!(
+            cache_complete_usage_edges(&cache, &targets, || {
+                builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Some(UsageEdgeBuildResult::Complete(cached_edges_fixture()))
+            })
+            .is_some()
+        );
+        assert_eq!(builds.load(std::sync::atomic::Ordering::Relaxed), 2);
+
+        let files = vec![
+            ProjectFile::new(std::env::temp_dir(), "one.rs"),
+            ProjectFile::new(std::env::temp_dir(), "two.rs"),
+        ];
+        let ordinary: UsageEdges = build_edge_output(
+            &files,
+            |_| true,
+            |file| {
+                Some(per_file_with_edge(
+                    &file.rel_path().to_string_lossy(),
+                    "caller",
+                    "target",
+                    3,
+                ))
+            },
+        );
+        let checked: UsageEdgeBuildResult<UsageEdges> = build_edge_output_with_completeness(
+            &files,
+            |_| true,
+            |file| {
+                Some(per_file_with_edge(
+                    &file.rel_path().to_string_lossy(),
+                    "caller",
+                    "target",
+                    3,
+                ))
+            },
+        );
+        let UsageEdgeBuildResult::Complete(checked) = checked else {
+            panic!("all successful files should be complete");
+        };
+        assert_eq!(ordinary.edges, checked.edges);
+        assert_eq!(ordinary.truncated, checked.truncated);
+        assert_eq!(ordinary.unproven_inbound, checked.unproven_inbound);
     }
 }

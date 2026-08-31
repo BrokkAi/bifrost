@@ -56,6 +56,9 @@ pub struct CallShapeOutcome {
     /// The span of the token that names the callee, where the lowering
     /// recorded one. A callable-object call (`proc.(x)`) has none.
     pub callee_range: Option<Range>,
+    /// The callee token recorded by the language lowering. This is decoded
+    /// from the facts arena, not reparsed from the call's source text.
+    pub callee_name: Option<String>,
     /// The span of the receiver expression the call is written against, where
     /// the lowering recorded one. A curried sequence names it on its innermost
     /// application, which is where the receiver is written. This is the actual
@@ -138,6 +141,7 @@ pub fn call_shape_for_call(
     let callee_range = call
         .name
         .map(|span| range_for_bytes(facts, span.start_byte, span.end_byte));
+    let callee_name = call.name.map(|span| span.text(facts.source()).to_owned());
     // The receiver is written on the innermost application: `a.f(x)(y)` reads
     // its receiver at `a`, and the outer application has none of its own.
     let receiver_range = applications
@@ -206,6 +210,7 @@ pub fn call_shape_for_call(
             file: file.clone(),
             range: call.range,
             callee_range,
+            callee_name,
             receiver_range,
             call_kind,
             coverage,
@@ -225,6 +230,7 @@ pub fn call_shapes_in_file(
     file: &ProjectFile,
     limit: usize,
 ) -> Vec<CallShapeReport> {
+    let _scope = crate::profiling::scope("call_shapes_in_file");
     let mut reports = Vec::new();
     for (id, node) in facts.nodes().iter().enumerate() {
         if reports.len() >= limit {

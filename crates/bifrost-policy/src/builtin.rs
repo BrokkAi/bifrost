@@ -24,6 +24,12 @@ const EMBEDDED_POLICY_SOURCES: &[(&str, &str)] = &[
         include_str!("../policy-packs/bifrost.code-smells/policies/unsafe-deserialization.rqlp"),
     ),
     (
+        "policies/go-result-used-before-success-check.rqlp",
+        include_str!(
+            "../policy-packs/bifrost.code-smells/policies/go-result-used-before-success-check.rqlp"
+        ),
+    ),
+    (
         "policies/loop-invariant-sort.rqlp",
         include_str!("../policy-packs/bifrost.code-smells/policies/loop-invariant-sort.rqlp"),
     ),
@@ -411,7 +417,7 @@ mod tests {
     #[test]
     fn checked_in_catalog_is_internally_consistent() {
         let catalog = built_in_policy_catalog().expect("valid built-in catalog");
-        assert_eq!(catalog.manifest().policies.len(), 13);
+        assert_eq!(catalog.manifest().policies.len(), 14);
         assert_eq!(
             catalog
                 .select(&BuiltInPolicySelection {
@@ -420,7 +426,7 @@ mod tests {
                 })
                 .expect("select pack")
                 .len(),
-            13
+            14
         );
     }
 }

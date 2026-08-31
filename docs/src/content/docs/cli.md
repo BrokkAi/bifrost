@@ -15,13 +15,13 @@ bifrost --root /path/to/project --tool search_symbols --args '{"patterns":["MyCl
 
 ## Immutable Git Snapshot Diffs
 
-`analyze_diff` can compare exact Git commits or tree objects. For snapshot trees
+The diff tools can compare exact Git commits or tree objects. For snapshot trees
 that exist only in a separate Git object store, launch Bifrost with
 `--diff-snapshot-object-dir`. The value is a trusted path to a Git `objects`
 directory, given as either an absolute path or one relative to the launch working
 directory; Bifrost resolves it to an absolute path and rejects a missing or
 non-directory path before serving requests. It is launch
-configuration, never an `analyze_diff` argument, so callers cannot select an
+configuration, never a diff-tool argument, so callers cannot select an
 arbitrary filesystem object store.
 
 The flag is valid only with `--tool` and MCP server modes. For example, a review
@@ -106,8 +106,12 @@ registries. A workspace semantic-pack policy uses the shared
 dependency packs for languages present in the workspace, a configured document
 selects its named ecosystems, and an empty `ecosystems` array explicitly
 disables that route. A configured catalog is workspace-relative; without one,
-activation is ephemeral. Activation never downloads packs or dependencies, and
-compatibility and `review_required` gates remain authoritative. A catalog-backed
+activation is ephemeral. The catalog and activation contract do not download
+packs or dependencies, and compatibility and `review_required` gates remain
+authoritative. The released `brokk-bifrost` facade separately opts into fetching
+the immutable matching public release bundle only for an exact generated
+production miss; set `BIFROST_SEMANTIC_PACK_DOWNLOAD=off` to disable that path.
+A catalog-backed
 policy requires a library embedding which explicitly populated
 `TaintCatalogRegistry`. A policy that uses only
 `(match-endpoints :ids [...])` also requires an embedding to pre-register those

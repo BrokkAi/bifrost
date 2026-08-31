@@ -1,4 +1,5 @@
 use super::syntax::*;
+use super::values::stable_member_key;
 use super::*;
 
 #[allow(clippy::too_many_arguments)]
@@ -6,8 +7,10 @@ pub(super) fn lower_procedure<'tree, 'targets>(
     prepared: &'tree PreparedSyntaxTree,
     spec: &ProcedureSpec<'tree>,
     procedure_targets: &'targets HashMap<usize, NestedProcedureTarget>,
+    callable_bindings: &'targets HashMap<Range, LexicalCallableTarget>,
     imports: &'targets JsTsImportBinder,
     lexical_bindings: &'targets JsTsLexicalBindingIndex,
+    structural_node_index: Option<&'targets StructuralNodeIndex>,
     capture_binding_expected: bool,
     budget: &SemanticBudget,
     cancellation: &'targets CancellationToken,
@@ -33,6 +36,7 @@ pub(super) fn lower_procedure<'tree, 'targets>(
         prepared,
         imports,
         lexical_bindings,
+        structural_node_index,
         session,
         expression_values: HashMap::default(),
         constant_index_values: HashMap::default(),
@@ -40,7 +44,9 @@ pub(super) fn lower_procedure<'tree, 'targets>(
         locals: HashMap::default(),
         receiver: None,
         captured_receiver: None,
+        captured_bindings: HashMap::default(),
         procedure_targets,
+        callable_bindings,
         abruptness: HashMap::default(),
         cleanups: Vec::new(),
         catch_binders: HashMap::default(),
@@ -48,9 +54,10 @@ pub(super) fn lower_procedure<'tree, 'targets>(
         plain_object_locals: HashMap::default(),
         plain_object_fields: HashMap::default(),
         array_locals: HashMap::default(),
+        array_element_fields: HashMap::default(),
     };
     context.emit_procedure_inputs(&mut builder, spec)?;
-    context.emit_captured_receiver(&mut builder, entry, spec, capture_binding_expected)?;
+    context.emit_capture_inputs(&mut builder, entry, spec, capture_binding_expected)?;
     context.emit_local_bindings(&mut builder, spec.body)?;
     context.collect_plain_object_locals(&mut builder, spec.body)?;
     context.collect_array_locals(&mut builder, spec.body)?;
@@ -282,7 +289,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             let object = required_field(left, "object")?;
             let property = required_field(left, "property")?;
             let base = self.expression_value(builder, object, expression_value_kind(object))?;
-            let member = self.plain_object_member_locator(object, property)?;
+            let element_member = self.array_element_member_locator(left, object, property);
+            let established_array_element_field = element_member.is_some();
+            let member = if let Some(member) = element_member {
+                member
+            } else {
+                self.plain_object_member_locator(object, property)?
+            };
             let location = self.session.add_memory_location(
                 builder,
                 terminal,
@@ -291,7 +304,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             // A field store on an established plain object local creates or
             // rewrites a data property of the local literal; its identity
             // needs no further resolution.
-            if !self.established_plain_object_base(left, object) {
+            if !self.established_plain_object_base(left, object) && !established_array_element_field
+            {
                 self.add_field_identity_gap(builder, terminal, location)?;
             }
             self.append_effect(
@@ -1345,9 +1359,15 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .transpose()?;
         let established_plain_base =
             node.kind() == "member_expression" && self.established_plain_object_base(node, object);
+        let established_array_element = node.kind() == "member_expression"
+            && self.established_array_element_object(node, object)
+            && node
+                .child_by_field_name("property")
+                .and_then(|property| stable_member_key(self.prepared.source(), property))
+                .is_some_and(|field| field.as_ref() != "property_identifier:__proto__");
         let established_array_base =
             index.is_some_and(|index| self.established_array_base(node, object, index));
-        if !established_plain_base && !established_array_base {
+        if !established_plain_base && !established_array_base && !established_array_element {
             self.implicit_exception_gap(builder, access, node)?;
         }
         if node.kind() == "subscript_expression" {
@@ -1379,7 +1399,13 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             let property = required_field(node, "property")?;
             let base = self.expression_value(builder, object, expression_value_kind(object))?;
             let result = self.expression_value(builder, node, expression_value_kind(node))?;
-            let member = self.plain_object_member_locator(object, property)?;
+            let element_member = self.array_element_member_locator(node, object, property);
+            let established_array_element_field = element_member.is_some();
+            let member = if let Some(member) = element_member {
+                member
+            } else {
+                self.plain_object_member_locator(object, property)?
+            };
             let location = self.session.add_memory_location(
                 builder,
                 access,
@@ -1396,7 +1422,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 parent.kind() == "call_expression"
                     && parent.child_by_field_name("function") == Some(node)
             });
-            if !established_plain_base && !callee_position {
+            if !established_plain_base && !established_array_element_field && !callee_position {
                 self.add_field_identity_gap(builder, access, location)?;
             }
             self.append_effect(
@@ -2078,11 +2104,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let binding_ranges = self
             .lexical_bindings
             .binding_identifier_ranges_at(name, parameter.start_byte());
-        if !binding_ranges.iter().any(|range| {
+        let Some(binding) = binding_ranges.into_iter().find(|range| {
             range.start_byte == parameter.start_byte() && range.end_byte == parameter.end_byte()
-        }) {
+        }) else {
             return Ok(None);
-        }
+        };
         let metadata = self.mapping(builder, parameter)?;
         let value =
             self.session
@@ -2091,6 +2117,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .entry(name.into())
             .or_default()
             .push(LocalBinding {
+                binding,
                 scope_start: handler.start_byte(),
                 scope_end: handler.end_byte(),
                 value,
@@ -2132,10 +2159,30 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         } else {
             (CallableReferenceKind::Function, None)
         };
-        // Local name matching is not a sound dispatch proof in JavaScript or TypeScript:
-        // lexical shadowing, imports, hoisting, and declaration merging can all change the
-        // target.  The location-first DispatchOracle owns refinement in the ICFG layer.
-        let resolution = CallableTargetResolution::Unknown;
+        let direct_function = ts_unwrap_expression(function).unwrap_or(function);
+        let local_target = self
+            .procedure_targets
+            .get(&direct_function.id())
+            .filter(|target| target.direct_invocation_supported)
+            .map(|target| target.id)
+            .or_else(|| {
+                (direct_function.kind() == "identifier")
+                    .then(|| node_text(self.prepared.source(), direct_function))
+                    .flatten()
+                    .and_then(|name| {
+                        let bindings = self
+                            .lexical_bindings
+                            .binding_identifier_ranges_at(name, direct_function.start_byte());
+                        (bindings.len() == 1)
+                            .then(|| self.callable_bindings.get(&bindings[0]))
+                            .flatten()
+                            .filter(|target| target.available_after <= direct_function.start_byte())
+                            .map(|target| target.id)
+                    })
+            });
+        let resolution = local_target
+            .map(|target| CallableTargetResolution::Proven(CallableTarget::Local(target)))
+            .unwrap_or(CallableTargetResolution::Unknown);
         let metadata = self.metadata(invoke)?;
         self.append_effect(
             builder,
@@ -2177,6 +2224,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 callee,
                 receiver,
                 arguments: arguments.into_boxed_slice(),
+                normal_results: Box::new([]),
                 result: Some(result),
                 thrown: Some(thrown),
                 declared_targets: resolution.clone(),
@@ -2216,34 +2264,38 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         // A program-level callee name with competing direct imports or a
         // program-scope reassignment has more than one plausible target, so
         // the dispatch gap is ambiguous and stays undischargeable.
-        let ambiguous_target = function.kind() == "identifier"
-            && node_text(self.prepared.source(), function).is_some_and(|name| {
+        let ambiguous_target = direct_function.kind() == "identifier"
+            && node_text(self.prepared.source(), direct_function).is_some_and(|name| {
                 let root = self.prepared.tree().root_node();
-                self.lexical_bindings
-                    .is_program_binding_at(name, function.start_byte(), root)
-                    && (self.imports.has_competing_direct_imports(name)
-                        || self
-                            .lexical_bindings
-                            .is_program_binding_reassigned(name, root))
+                self.lexical_bindings.is_program_binding_at(
+                    name,
+                    direct_function.start_byte(),
+                    root,
+                ) && (self.imports.has_competing_direct_imports(name)
+                    || self
+                        .lexical_bindings
+                        .is_program_binding_reassigned(name, root))
             });
         self.resolution_gaps(builder, invoke, callee, call_site, &resolution)?;
 
-        self.add_gap(
-            builder,
-            invoke,
-            SemanticGapSubject::CallSite(call_site),
-            SemanticCapability::DynamicDispatch,
-            if ambiguous_target {
-                SemanticGapKind::Ambiguous
-            } else {
-                SemanticGapKind::Unknown
-            },
-            if receiver.is_some() {
-                "property dispatch may resolve through a prototype, accessor, proxy, or runtime mutation; complete target coverage requires value and type refinement"
-            } else {
-                "callable bindings and imports may be rebound or replaced at runtime; complete target coverage requires lexical and value-flow refinement"
-            },
-        )?;
+        if resolution == CallableTargetResolution::Unknown {
+            self.add_gap(
+                builder,
+                invoke,
+                SemanticGapSubject::CallSite(call_site),
+                SemanticCapability::DynamicDispatch,
+                if ambiguous_target {
+                    SemanticGapKind::Ambiguous
+                } else {
+                    SemanticGapKind::Unknown
+                },
+                if receiver.is_some() {
+                    "property dispatch may resolve through a prototype, accessor, proxy, or runtime mutation; complete target coverage requires value and type refinement"
+                } else {
+                    "callable bindings and imports may be rebound or replaced at runtime; complete target coverage requires lexical and value-flow refinement"
+                },
+            )?;
+        }
 
         if has_child_kind(node, "?.") {
             let decision = self.point(builder, node, Vec::new())?;
@@ -2425,8 +2477,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         next: EdgeTarget,
     ) -> Result<(), TsLoweringError> {
         let result = self.expression_value(builder, node, SemanticValueKind::Callable)?;
-        let target = self.procedure_targets.get(&node.id()).copied();
+        let target = self.procedure_targets.get(&node.id()).cloned();
         let resolution = target
+            .as_ref()
             .map(|target| CallableTargetResolution::Proven(CallableTarget::Local(target.id)))
             .unwrap_or(CallableTargetResolution::Unknown);
         let metadata = self.metadata(entry)?;
@@ -2435,17 +2488,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         } else {
             CallableReferenceKind::Function
         };
-        let environment =
-            if target.is_some_and(|target| target.receiver_capture_destination.is_some()) {
-                Some(self.session.add_allocation(
-                    builder,
-                    entry,
-                    result,
-                    AllocationKind::ClosureEnvironment,
-                )?)
-            } else {
-                None
-            };
+        let environment = if target.as_ref().is_some_and(|target| {
+            target.receiver_capture_destination.is_some() || !target.captures.is_empty()
+        }) {
+            Some(self.session.add_allocation(
+                builder,
+                entry,
+                result,
+                AllocationKind::ClosureEnvironment,
+            )?)
+        } else {
+            None
+        };
         let effect = SemanticEffect::CallableCreation {
             result,
             callable: CallableValue {
@@ -2458,10 +2512,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         };
         self.append_effect(builder, entry, effect)?;
         if let (Some(target), Some(environment), Some(captured), Some(destination)) = (
-            target,
+            target.as_ref(),
             environment,
             self.receiver.or(self.captured_receiver),
-            target.and_then(|target| target.receiver_capture_destination),
+            target
+                .as_ref()
+                .and_then(|target| target.receiver_capture_destination),
         ) {
             self.session.add_capture(
                 builder,
@@ -2473,6 +2529,29 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 destination,
                 CaptureMode::Value,
             )?;
+        }
+        if let (Some(target), Some(environment)) = (target.as_ref(), environment) {
+            for (index, binding) in target.captures.iter().enumerate() {
+                let source = self.stable_binding_value(binding).ok_or_else(|| {
+                    TsLoweringError::Invalid(format!(
+                        "precomputed JS/TS capture {binding:?} has no parent binding"
+                    ))
+                })?;
+                let destination = lexical_capture_destination(
+                    target.receiver_capture_destination.is_some(),
+                    index,
+                )?;
+                self.session.add_capture(
+                    builder,
+                    entry,
+                    result,
+                    target.id,
+                    environment,
+                    CaptureSource::Value(source),
+                    destination,
+                    CaptureMode::Value,
+                )?;
+            }
         }
         if resolution == CallableTargetResolution::Unknown {
             self.add_gap(

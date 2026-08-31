@@ -1401,6 +1401,18 @@ impl IAnalyzer for CppAnalyzer {
         self.inner.active_query_cancellation()
     }
 
+    fn active_query_semantic_model_overlay(
+        &self,
+    ) -> Option<Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>> {
+        self.inner.active_query_semantic_model_overlay()
+    }
+
+    fn active_query_semantic_model_snapshot(
+        &self,
+    ) -> Option<Option<Arc<crate::analyzer::semantic_model::ActiveSemanticModelSnapshot>>> {
+        self.inner.active_query_semantic_model_snapshot()
+    }
+
     fn begin_streaming_file_read(&self, file: &ProjectFile) {
         self.inner.begin_streaming_file_read(file);
     }

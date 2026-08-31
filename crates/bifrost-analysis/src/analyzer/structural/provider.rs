@@ -9,7 +9,7 @@
 
 use super::edges::EdgeAxis;
 use super::extract::{LimitedFileFacts, extract_file_facts, extract_file_facts_limited};
-use super::facts::{FileFacts, STRUCTURAL_FACTS_SNAPSHOT_VERSION};
+use super::facts::{FileFacts, STRUCTURAL_FACTS_VERSION};
 use super::kinds::{NormalizedKind, Role};
 use super::materialization::MaterializationAxis;
 use super::occurrences::OccurrenceRole;
@@ -155,8 +155,8 @@ pub trait StructuralFactProvider: Send + Sync {
     /// pruning skipped a file and that repeated queries hit the cache.
     fn structural_extraction_count(&self) -> u64;
 
-    /// How many facts-cache misses were satisfied by a persisted compact
-    /// snapshot rather than a tree-sitter parse and normalization pass.
+    /// How many facts-cache misses were satisfied by persisted relational rows
+    /// rather than a tree-sitter parse and normalization pass.
     fn structural_hydration_count(&self) -> u64;
 
     fn structural_supports_kind(&self, kind: NormalizedKind) -> bool;
@@ -452,22 +452,18 @@ impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
             &source,
             || {
                 let key = snapshot_key.as_ref()?;
-                let payload = self
-                    .load_structural_facts_snapshot(key, STRUCTURAL_FACTS_SNAPSHOT_VERSION)
+                let rows = self
+                    .load_structural_facts_rows(key, STRUCTURAL_FACTS_VERSION)
                     .ok()??;
-                FileFacts::decode_snapshot(source.clone(), &payload).ok()
+                FileFacts::from_persisted_rows(source.clone(), rows).ok()
             },
             || {
                 let grammar = self.adapter().parser_language_for_file(file);
                 let facts = extract_file_facts(spec, &grammar, &source)?;
                 if let Some(key) = snapshot_key.as_ref()
-                    && let Ok(payload) = facts.encode_snapshot()
+                    && let Ok(rows) = facts.persisted_rows()
                 {
-                    let _ = self.persist_structural_facts_snapshot(
-                        key,
-                        STRUCTURAL_FACTS_SNAPSHOT_VERSION,
-                        &payload,
-                    );
+                    let _ = self.persist_structural_facts_rows(key, STRUCTURAL_FACTS_VERSION, rows);
                 }
                 Some(facts)
             },
@@ -519,6 +515,7 @@ impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
             cancellation,
         ) {
             LimitedFileFacts::Complete(facts) => facts,
+            LimitedFileFacts::CompleteWithNodeIndex { facts, .. } => facts,
             LimitedFileFacts::Exceeded { minimum_fact_nodes } => {
                 return StructuralFactsLimitedOutcome::Exceeded { minimum_fact_nodes };
             }
@@ -534,10 +531,10 @@ impl<A: LanguageAdapter> StructuralFactProvider for TreeSitterAnalyzer<A> {
         }
 
         let facts = Arc::new(facts);
-        // The bounded query path must remain promptly cancellable. Durable snapshot encoding
-        // clones every normalized node and role edge before serialization, so leave that
-        // optional optimization to the ordinary materialization path rather than performing
-        // an unmetered post-extraction traversal here.
+        // The bounded query path must remain promptly cancellable. Durable row conversion
+        // clones every normalized node and role edge before insertion, so leave that optional
+        // optimization to the ordinary materialization path rather than performing an
+        // unmetered post-extraction traversal here.
         self.structural_cache()
             .insert_complete(file, source, Arc::clone(&facts));
         StructuralFactsLimitedOutcome::Available {

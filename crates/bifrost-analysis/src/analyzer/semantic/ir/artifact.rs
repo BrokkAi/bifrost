@@ -9,8 +9,8 @@ use crate::hash::{HashMap, HashSet};
 use super::super::capabilities::SemanticCapabilities;
 use super::super::ids::{
     AllocationId, BlockId, CallSiteId, CaptureId, ControlEdgeId, EvidenceId, GuardId,
-    MemoryLocationId, ProcedureId, ProgramPointId, SemanticArtifactKey, SemanticGapId,
-    SemanticLocator, SourceMappingId, ValueId,
+    LengthDelimitedDigest, MemoryLocationId, ProcedureId, ProgramPointId, SemanticArtifactKey,
+    SemanticGapId, SemanticLocator, SourceMappingId, StableDigest, ValueId,
 };
 use super::super::provider::{SemanticBudget, SemanticBudgetExceeded, SemanticWork};
 use super::model::*;
@@ -475,10 +475,113 @@ impl GuardFact {
     }
 }
 
+const PROCEDURE_MATERIALIZATION_ID_DOMAIN: &[u8] = b"bifrost-semantic-procedure-materialization-v1";
+const ARTIFACT_MATERIALIZATION_ID_DOMAIN: &[u8] = b"bifrost-semantic-artifact-materialization-v1";
+
+/// Process-stable identity for one exact frozen procedure row set.
+///
+/// This includes the owning procedure's artifact-local ID and all frozen row
+/// fields, including cross-procedure references. It deliberately fails closed
+/// when a partial artifact shifts dense IDs instead of claiming that those
+/// references have been canonicalized. Derived indexes are excluded because
+/// their complete inputs are included and their construction is deterministic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct ProcedureMaterializationId(StableDigest);
+
+/// Identity for the complete proof-relevant contents of one semantic artifact.
+///
+/// [`SemanticArtifactKey`] identifies the source and lowering inputs, but one
+/// key can still have multiple partial materializations. This digest adds the
+/// exact capability table and ordered frozen procedure identities, so a dense
+/// procedure-local row ID is used only after the complete materialization that
+/// assigned it has been reconstructed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SemanticArtifactMaterializationId(StableDigest);
+
+impl fmt::Display for SemanticArtifactMaterializationId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+struct MaterializationFingerprintHasher(LengthDelimitedDigest);
+
+impl MaterializationFingerprintHasher {
+    fn new(domain: &[u8]) -> Self {
+        Self(LengthDelimitedDigest::new(domain))
+    }
+
+    fn finish_digest(self) -> StableDigest {
+        self.0.finish()
+    }
+}
+
+impl Hasher for MaterializationFingerprintHasher {
+    fn finish(&self) -> u64 {
+        let digest = self.0.clone().finish();
+        let mut head = [0_u8; 8];
+        head.copy_from_slice(&digest.as_bytes()[..8]);
+        u64::from_le_bytes(head)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.push(bytes);
+    }
+
+    fn write_u8(&mut self, value: u8) {
+        self.0.push(&value.to_le_bytes());
+    }
+
+    fn write_u16(&mut self, value: u16) {
+        self.0.push(&value.to_le_bytes());
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.0.push(&value.to_le_bytes());
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0.push(&value.to_le_bytes());
+    }
+
+    fn write_u128(&mut self, value: u128) {
+        self.0.push(&value.to_le_bytes());
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.write_u64(u64::try_from(value).expect("usize fits u64 on supported targets"));
+    }
+
+    fn write_i8(&mut self, value: i8) {
+        self.0.push(&value.to_le_bytes());
+    }
+
+    fn write_i16(&mut self, value: i16) {
+        self.0.push(&value.to_le_bytes());
+    }
+
+    fn write_i32(&mut self, value: i32) {
+        self.0.push(&value.to_le_bytes());
+    }
+
+    fn write_i64(&mut self, value: i64) {
+        self.0.push(&value.to_le_bytes());
+    }
+
+    fn write_i128(&mut self, value: i128) {
+        self.0.push(&value.to_le_bytes());
+    }
+
+    fn write_isize(&mut self, value: isize) {
+        self.write_i64(i64::try_from(value).expect("isize fits i64 on supported targets"));
+    }
+}
+
 /// One validated executable body.
 #[derive(Debug, Clone)]
 pub struct ProcedureSemantics {
     id: ProcedureId,
+    materialization_id: ProcedureMaterializationId,
     locator: SemanticLocator,
     lexical_parent: Option<ProcedureId>,
     kind: ProcedureKind,
@@ -521,8 +624,9 @@ impl ProcedureSemantics {
         let (call_phase_points, call_result_sites) = index_call_phases(&parts.call_sites);
         let value_identity_ordinals =
             duplicate_value_ordinals(&parts.values, &parts.source_mappings);
-        Ok(Self {
+        let mut semantics = Self {
             id: parts.id,
+            materialization_id: ProcedureMaterializationId(StableDigest::from_array([0; 32])),
             locator: parts.locator,
             lexical_parent: parts.lexical_parent,
             kind: parts.kind,
@@ -547,11 +651,45 @@ impl ProcedureSemantics {
             entry_point,
             normal_exit_point,
             exceptional_exit_point,
-        })
+        };
+        semantics.materialization_id = semantics.compute_materialization_id();
+        Ok(semantics)
+    }
+
+    fn compute_materialization_id(&self) -> ProcedureMaterializationId {
+        let mut digest = MaterializationFingerprintHasher::new(PROCEDURE_MATERIALIZATION_ID_DOMAIN);
+        self.id.hash(&mut digest);
+        self.locator.hash(&mut digest);
+        self.lexical_parent.hash(&mut digest);
+        self.kind.hash(&mut digest);
+        self.properties.hash(&mut digest);
+        self.source.hash(&mut digest);
+        self.evidence.hash(&mut digest);
+        self.values.hash(&mut digest);
+        self.value_identity_ordinals.hash(&mut digest);
+        self.allocations.hash(&mut digest);
+        self.memory_locations.hash(&mut digest);
+        self.captures.hash(&mut digest);
+        self.call_sites.hash(&mut digest);
+        self.source_mappings.hash(&mut digest);
+        self.evidence_rows.hash(&mut digest);
+        self.gaps.hash(&mut digest);
+        self.blocks.hash(&mut digest);
+        self.points.hash(&mut digest);
+        self.guard_facts.hash(&mut digest);
+        self.cfg.edges.hash(&mut digest);
+        self.entry_point.hash(&mut digest);
+        self.normal_exit_point.hash(&mut digest);
+        self.exceptional_exit_point.hash(&mut digest);
+        ProcedureMaterializationId(digest.finish_digest())
     }
 
     pub const fn id(&self) -> ProcedureId {
         self.id
+    }
+
+    const fn materialization_id(&self) -> ProcedureMaterializationId {
+        self.materialization_id
     }
 
     pub fn locator(&self) -> &SemanticLocator {
@@ -758,6 +896,53 @@ impl ProcedureSemantics {
         self.call_sites.get(id.index())
     }
 
+    /// Return a receiver fact proved by the callable evaluation at this call.
+    ///
+    /// Target resolution is deliberately irrelevant: a language adapter can
+    /// prove from local syntax that `package.Function(...)` evaluates a free
+    /// function even when the external target remains open. Missing,
+    /// incomplete, duplicate, or contradictory callable-reference evidence
+    /// returns `None` instead of turning absent semantic support into a fact.
+    pub fn proven_caller_receiver_binding(&self, id: CallSiteId) -> Option<CallerReceiverBinding> {
+        let call = self.call_site(id)?;
+        let call_evidence = self.evidence_row(call.evidence)?;
+        if !matches!(call_evidence.proof, ProofStatus::Proven)
+            || !matches!(call_evidence.completeness, EvidenceCompleteness::Complete)
+        {
+            return None;
+        }
+
+        let point = self.point(call.point)?;
+        let mut references = point.events.iter().filter_map(|event| {
+            let SemanticEffect::CallableReference { result, callable } = &event.effect else {
+                return None;
+            };
+            (*result == call.callee).then_some((event, callable))
+        });
+        let (event, callable) = references.next()?;
+        if references.next().is_some() {
+            return None;
+        }
+        let event_evidence = self.evidence_row(event.evidence)?;
+        if !matches!(event_evidence.proof, ProofStatus::Proven)
+            || !matches!(event_evidence.completeness, EvidenceCompleteness::Complete)
+        {
+            return None;
+        }
+
+        match (call.receiver, callable.kind, callable.bound_receiver) {
+            (Some(receiver), CallableReferenceKind::BoundMethod, Some(bound_receiver))
+                if receiver == bound_receiver =>
+            {
+                Some(CallerReceiverBinding::Bound(receiver))
+            }
+            (None, CallableReferenceKind::Function | CallableReferenceKind::StaticMethod, None) => {
+                Some(CallerReceiverBinding::Absent)
+            }
+            _ => None,
+        }
+    }
+
     pub fn source_mapping(&self, id: SourceMappingId) -> Option<&SourceMapping> {
         self.source_mappings.get(id.index())
     }
@@ -912,12 +1097,14 @@ fn index_call_phases(
     };
     for call in call_sites {
         push(call.callee, call.point);
-        if let (Some(result), Some(point)) = (call.result, call.normal_continuation.target()) {
-            push(result, point);
-            result_sites
-                .entry((result, point))
-                .or_default()
-                .push(call.id);
+        if let Some(point) = call.normal_continuation.target() {
+            for result in call.normal_result_values() {
+                push(result, point);
+                result_sites
+                    .entry((result, point))
+                    .or_default()
+                    .push(call.id);
+            }
         }
         if let (Some(thrown), Some(point)) = (call.thrown, call.exceptional_continuation.target()) {
             push(thrown, point);
@@ -958,6 +1145,7 @@ fn boxed_slice_index_retained_bytes<K, V>(index: &HashMap<K, Box<[V]>>) -> u64 {
 #[derive(Debug)]
 pub struct SemanticArtifact {
     key: SemanticArtifactKey,
+    materialization_id: SemanticArtifactMaterializationId,
     capabilities: SemanticCapabilities,
     work: SemanticWork,
     procedures: Box<[ProcedureSemantics]>,
@@ -1010,11 +1198,15 @@ impl SemanticArtifact {
             )?);
         }
 
+        let procedures = procedures.into_boxed_slice();
+        let materialization_id =
+            compute_artifact_materialization_id(&key, &capabilities, &procedures);
         let artifact = Self {
             key,
+            materialization_id,
             capabilities,
             work,
-            procedures: procedures.into_boxed_slice(),
+            procedures,
             procedures_by_locator,
         };
         *budget = charged_budget;
@@ -1023,6 +1215,10 @@ impl SemanticArtifact {
 
     pub fn key(&self) -> &SemanticArtifactKey {
         &self.key
+    }
+
+    pub const fn materialization_id(&self) -> SemanticArtifactMaterializationId {
+        self.materialization_id
     }
 
     pub fn capabilities(&self) -> &SemanticCapabilities {
@@ -1058,6 +1254,25 @@ impl SemanticArtifact {
     }
 }
 
+fn compute_artifact_materialization_id(
+    key: &SemanticArtifactKey,
+    capabilities: &SemanticCapabilities,
+    procedures: &[ProcedureSemantics],
+) -> SemanticArtifactMaterializationId {
+    let mut digest = MaterializationFingerprintHasher::new(ARTIFACT_MATERIALIZATION_ID_DOMAIN);
+    key.fingerprint().hash(&mut digest);
+    capabilities.iter().for_each(|(capability, support)| {
+        capability.hash(&mut digest);
+        support.hash(&mut digest);
+    });
+    procedures.len().hash(&mut digest);
+    for procedure in procedures {
+        procedure.id().hash(&mut digest);
+        procedure.materialization_id().hash(&mut digest);
+    }
+    SemanticArtifactMaterializationId(digest.finish_digest())
+}
+
 /// An artifact-instance-scoped procedure identity safe for provider/oracle
 /// boundaries.  Two materializations may share a durable artifact key while
 /// retaining different partial rows, so equality includes `Arc` identity.
@@ -1081,11 +1296,11 @@ impl ProcedureHandle {
     ///
     /// Handle equality is materialization-scoped, so a handle minted from a
     /// second materialization of one immutable artifact is unequal to the
-    /// first even though both name the same procedure. A caller that holds
-    /// both -- a closure walk whose byte-bounded artifact cache evicted and
-    /// re-materialized a file mid-walk -- keys on this instead, because
-    /// `SemanticArtifactKey` pins the revision, adapter, IR version,
-    /// configuration, and dependencies, and the dense ID is stable beneath it.
+    /// first even when both contain the same procedure rows. This compact key
+    /// is suitable for deduplication within a materialization shape already
+    /// established by the caller. It is not sufficient to reconstruct a row
+    /// across arbitrary same-key partial artifacts; use
+    /// [`ProcedureLocalLocator`] for that boundary.
     ///
     /// This is the owned, hashable form of the comparison
     /// `value_flow::model` uses for carriers.
@@ -1186,6 +1401,83 @@ impl Hash for ProcedureHandle {
     }
 }
 
+/// A durable procedure-local row identity that does not retain a semantic
+/// artifact materialization.
+///
+/// The artifact validity key, exact artifact materialization identity, and
+/// stable procedure locator make the dense row ID meaningful after the
+/// materialization that produced it has been released. A consumer must resolve
+/// the locator against the same exact frozen artifact contents before using the
+/// dense ID. An independently allocated artifact with identical capabilities
+/// and rows is compatible; a same-key artifact whose contents differ fails
+/// closed even when its dense IDs collide.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ProcedureLocalLocator<I> {
+    artifact_key: SemanticArtifactKey,
+    artifact_materialization_id: SemanticArtifactMaterializationId,
+    procedure_locator: SemanticLocator,
+    id: I,
+}
+
+impl<I: Copy> ProcedureLocalLocator<I> {
+    pub fn artifact_key(&self) -> &SemanticArtifactKey {
+        &self.artifact_key
+    }
+
+    pub fn procedure_locator(&self) -> &SemanticLocator {
+        &self.procedure_locator
+    }
+
+    pub const fn artifact_materialization_id(&self) -> SemanticArtifactMaterializationId {
+        self.artifact_materialization_id
+    }
+
+    pub const fn id(&self) -> I {
+        self.id
+    }
+
+    pub fn validate_owner(
+        &self,
+        procedure: &ProcedureHandle,
+    ) -> Result<(), ProcedureLocalLocatorError> {
+        if &self.artifact_key != procedure.artifact().key() {
+            return Err(ProcedureLocalLocatorError::ArtifactKeyMismatch);
+        }
+        if self.artifact_materialization_id != procedure.artifact().materialization_id() {
+            return Err(ProcedureLocalLocatorError::ArtifactMaterializationMismatch);
+        }
+        if &self.procedure_locator != procedure.semantics().locator() {
+            return Err(ProcedureLocalLocatorError::ProcedureLocatorMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// Why a durable procedure-local row could not be reconstructed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ProcedureLocalLocatorError {
+    ArtifactKeyMismatch,
+    ArtifactMaterializationMismatch,
+    ProcedureLocatorMismatch,
+    RowMissing,
+}
+
+impl fmt::Display for ProcedureLocalLocatorError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::ArtifactKeyMismatch => "semantic artifact validity key changed",
+            Self::ArtifactMaterializationMismatch => {
+                "semantic artifact capabilities or frozen rows changed beneath their validity key"
+            }
+            Self::ProcedureLocatorMismatch => "stable semantic procedure identity changed",
+            Self::RowMissing => "semantic procedure no longer contains the located row",
+        })
+    }
+}
+
+impl std::error::Error for ProcedureLocalLocatorError {}
+
 /// A local ID paired with its owning artifact and procedure.  Type aliases
 /// below keep APIs readable without duplicating wrapper implementations.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -1211,18 +1503,28 @@ impl<I: Copy> ProcedureLocalHandle<I> {
     /// `ProcedureSemantics::values`, and so on -- so the owning procedure's
     /// durable key is the scope that makes the pair unique.
     ///
-    /// This mirrors [`ProcedureHandle::durable_key`] and exists for the same
-    /// reason: handle equality compares the owning `Arc<SemanticArtifact>` by
-    /// pointer, so a caller that must recognize one row across two
-    /// materializations of one immutable artifact cannot use it.
+    /// This mirrors [`ProcedureHandle::durable_key`] and shares its
+    /// materialization-shape precondition. Use [`Self::durable_locator`] when a
+    /// row must survive release and exact re-materialization of its artifact.
     pub fn durable_key(&self) -> ((SemanticArtifactKey, ProcedureId), I) {
         (self.procedure.durable_key(), self.id)
+    }
+
+    /// Convert this artifact-retaining handle into a durable locator.
+    pub fn durable_locator(&self) -> ProcedureLocalLocator<I> {
+        ProcedureLocalLocator {
+            artifact_key: self.procedure.artifact().key().clone(),
+            artifact_materialization_id: self.procedure.artifact().materialization_id(),
+            procedure_locator: self.procedure.semantics().locator().clone(),
+            id: self.id,
+        }
     }
 }
 
 pub type BlockHandle = ProcedureLocalHandle<BlockId>;
 pub type ProgramPointHandle = ProcedureLocalHandle<ProgramPointId>;
 pub type ControlEdgeHandle = ProcedureLocalHandle<ControlEdgeId>;
+pub type ControlEdgeLocator = ProcedureLocalLocator<ControlEdgeId>;
 pub type ValueHandle = ProcedureLocalHandle<ValueId>;
 pub type AllocationHandle = ProcedureLocalHandle<AllocationId>;
 pub type CallSiteHandle = ProcedureLocalHandle<CallSiteId>;
@@ -1231,6 +1533,22 @@ pub type CaptureHandle = ProcedureLocalHandle<CaptureId>;
 pub type SourceMappingHandle = ProcedureLocalHandle<SourceMappingId>;
 pub type EvidenceHandle = ProcedureLocalHandle<EvidenceId>;
 pub type SemanticGapHandle = ProcedureLocalHandle<SemanticGapId>;
+
+impl ProcedureLocalLocator<ControlEdgeId> {
+    /// Resolve this durable edge identity within a matching materialized
+    /// procedure. A different artifact key, exact materialization contents, or
+    /// stable procedure is not a compatible owner, even if it contains the same
+    /// dense edge ID.
+    pub fn resolve(
+        &self,
+        procedure: &ProcedureHandle,
+    ) -> Result<ControlEdgeHandle, ProcedureLocalLocatorError> {
+        self.validate_owner(procedure)?;
+        procedure
+            .control_edge_handle(self.id)
+            .ok_or(ProcedureLocalLocatorError::RowMissing)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1243,6 +1561,7 @@ mod tests {
             callee: ValueId::new(id),
             receiver: None,
             arguments: Box::new([]),
+            normal_results: Box::new([]),
             result: Some(ValueId::new(7)),
             thrown: None,
             declared_targets: CallableTargetResolution::Unknown,

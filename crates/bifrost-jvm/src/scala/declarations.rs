@@ -85,7 +85,42 @@ pub fn parse_scala_file(
     visitor.visit_compilation_unit(tree.root_node(), "");
     visitor.visit_anonymous_classes(tree.root_node());
     collect_scala_imports(tree.root_node(), source, &mut parsed);
+    collect_scala_same_package_identifiers(tree.root_node(), source, &mut parsed.type_identifiers);
     parsed
+}
+
+/// The `type_identifiers` fact family persisted for one Scala blob: every leaf
+/// name the file spells, which is what Scala's implicit same-package tier can
+/// bind. Both the ordinary walk and the file-graph walk record it, so a file
+/// parsed by either produces the same same-package edges.
+fn collect_scala_same_package_identifiers(
+    root: Node<'_>,
+    source: &str,
+    identifiers: &mut brokk_bifrost_core::hash::HashSet<String>,
+) {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.named_child_count() == 0
+            && matches!(
+                node.kind(),
+                "identifier"
+                    | "operator_identifier"
+                    | "stable_identifier"
+                    | "type_identifier"
+                    | "stable_type_identifier"
+            )
+        {
+            let text = scala_node_text(node, source).trim();
+            if !text.is_empty() {
+                identifiers.insert(text.to_string());
+            }
+        }
+        for index in (0..node.named_child_count()).rev() {
+            if let Some(child) = node.named_child(index) {
+                stack.push(child);
+            }
+        }
+    }
 }
 
 fn scala_compilation_children(node: Node<'_>) -> Vec<Node<'_>> {
@@ -493,6 +528,16 @@ impl<'a> ScalaVisitor<'a> {
                 "type_definition" => {
                     self.visit_type_alias(child, &current_package, recovery_parent.clone())
                 }
+                // Scala 3 puts most `extension` groups at the top level of a
+                // file, where they declare package-level methods. Without this
+                // arm they were invisible to every declaration consumer.
+                "extension_definition" => self.visit_extension_definition(
+                    child,
+                    &current_package,
+                    &package_prefixes,
+                    recovery_parent.as_ref(),
+                    stack,
+                ),
                 "ERROR" => {
                     // Tree-sitter can recover a malformed type header as either a definition
                     // inside ERROR or keyword/name/colon children, then emit indented members as
@@ -817,7 +862,7 @@ impl<'a> ScalaVisitor<'a> {
                     child,
                     package_name,
                     package_prefixes,
-                    parent,
+                    Some(parent),
                     stack,
                 ),
                 "export_declaration" => {
@@ -853,12 +898,18 @@ impl<'a> ScalaVisitor<'a> {
         }
     }
 
+    /// An `extension` group's members.
+    ///
+    /// `parent` is `None` for a group written at the top level of a
+    /// compilation unit, which is where Scala 3 code usually puts one; its
+    /// methods are then package-level declarations, exactly as the file-graph
+    /// walk has always recorded them.
     fn visit_extension_definition<'tree>(
         &mut self,
         node: Node<'tree>,
         package_name: &str,
         package_prefixes: &[String],
-        parent: &CodeUnit,
+        parent: Option<&CodeUnit>,
         stack: &mut Vec<ScalaWork<'tree>>,
     ) {
         let receiver_parameters = node.child_by_field_name("parameters");
@@ -869,21 +920,19 @@ impl<'a> ScalaVisitor<'a> {
                     child,
                     receiver_parameters,
                     package_name,
-                    Some(parent.clone()),
+                    parent.cloned(),
                 ),
                 "val_definition" | "var_definition" | "val_declaration" | "var_declaration" => {
-                    self.visit_field_declaration(child, package_name, Some(parent.clone()))
+                    self.visit_field_declaration(child, package_name, parent.cloned())
                 }
-                "type_definition" => {
-                    self.visit_type_alias(child, package_name, Some(parent.clone()))
-                }
+                "type_definition" => self.visit_type_alias(child, package_name, parent.cloned()),
                 "class_definition" | "object_definition" | "trait_definition"
                 | "enum_definition" => {
                     self.visit_type_declaration(
                         child,
                         package_name,
                         package_prefixes,
-                        Some(parent.clone()),
+                        parent.cloned(),
                         stack,
                     );
                 }
@@ -906,7 +955,7 @@ impl<'a> ScalaVisitor<'a> {
         receiver_parameters: Option<Node<'tree>>,
         package_name: &str,
         package_prefixes: &[String],
-        parent: &CodeUnit,
+        parent: Option<&CodeUnit>,
         stack: &mut Vec<ScalaWork<'tree>>,
     ) {
         let mut cursor = node.walk();
@@ -916,21 +965,19 @@ impl<'a> ScalaVisitor<'a> {
                     child,
                     receiver_parameters,
                     package_name,
-                    Some(parent.clone()),
+                    parent.cloned(),
                 ),
                 "val_definition" | "var_definition" | "val_declaration" | "var_declaration" => {
-                    self.visit_field_declaration(child, package_name, Some(parent.clone()))
+                    self.visit_field_declaration(child, package_name, parent.cloned())
                 }
-                "type_definition" => {
-                    self.visit_type_alias(child, package_name, Some(parent.clone()))
-                }
+                "type_definition" => self.visit_type_alias(child, package_name, parent.cloned()),
                 "class_definition" | "object_definition" | "trait_definition"
                 | "enum_definition" => {
                     self.visit_type_declaration(
                         child,
                         package_name,
                         package_prefixes,
-                        Some(parent.clone()),
+                        parent.cloned(),
                         stack,
                     );
                 }
@@ -1932,4 +1979,84 @@ fn strip_declaration_indent(text: &str, declaration_indent: usize) -> String {
         normalized.push(trimmed);
     }
     normalized.join("\n")
+}
+
+#[cfg(test)]
+mod same_package_and_extension_tests {
+    use super::*;
+    use brokk_bifrost_core::analyzer::parsed_file::ParsedFile;
+    use std::path::PathBuf;
+    use tree_sitter::Parser;
+
+    fn parse(source: &str) -> ParsedFile {
+        let file = ProjectFile::new(PathBuf::from("/workspace"), "src/Graph.scala");
+        let mut parser = Parser::new();
+        parser
+            .set_language(&crate::scala::language::LANGUAGE.into())
+            .expect("Scala parser");
+        let tree = parser.parse(source, None).expect("Scala syntax tree");
+        parse_scala_file(&file, source, &tree)
+    }
+
+    /// The leaf-identifier `type_identifiers` family the coarse file graph
+    /// reads for Scala's same-package tier, and the export owners the file
+    /// graph follows.
+    #[test]
+    fn walk_records_leaf_identifiers_and_export_owners() {
+        let source = r#"
+package app
+
+import lib.Widget
+
+def packageHelper: Int = 1
+
+object Facade {
+  export Core.{kept, original as renamed}
+  object Nested {
+    class Member
+  }
+}
+
+class Consumer {
+  def use: Int = Facade.value + packageHelper
+}
+"#;
+        let parsed = parse(source);
+
+        assert_eq!(parsed.package_name, "app");
+        assert!(parsed.type_identifiers.contains("packageHelper"));
+        assert!(parsed.type_identifiers.contains("Facade"));
+        assert!(
+            parsed
+                .declarations()
+                .iter()
+                .any(|unit| unit.short_name() == "Facade$.Nested$.Member" && unit.is_class())
+        );
+        assert!(
+            parsed
+                .scala_exports
+                .iter()
+                .any(|(owner, infos)| owner.short_name() == "Facade$" && !infos.is_empty()),
+            "the export owner must be recorded: {:?}",
+            parsed.scala_exports
+        );
+    }
+
+    /// Scala 3 writes most `extension` groups at the top level of a file, where
+    /// their members are package-level declarations. The walk used to handle
+    /// `extension` only inside a template body, so such a file declared nothing.
+    #[test]
+    fn top_level_extension_members_are_package_level_declarations() {
+        let parsed =
+            parse("package example\n\nextension (s: String)\n  def asInt: Int = s.toInt\n");
+
+        assert!(
+            parsed
+                .declarations()
+                .iter()
+                .any(|unit| unit.fq_name() == "example.asInt" && unit.is_function()),
+            "top-level extension methods must be declared: {:?}",
+            parsed.declarations()
+        );
+    }
 }

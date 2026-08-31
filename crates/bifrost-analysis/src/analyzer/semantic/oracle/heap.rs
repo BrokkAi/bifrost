@@ -4,8 +4,8 @@ use super::super::ir::ProofStatus;
 use super::error::OracleContractError;
 use super::limits::OracleLimits;
 use super::model::{
-    AbstractLocation, AbstractObject, AccessPathAtPoint, AliasQuery, ObjectCardinality,
-    StoreAtPoint, ValueAtPoint,
+    AbstractLocation, AbstractObject, AccessPathAtPoint, AliasQuery, FreshObjectPublication,
+    FreshObjectPublicationQuery, ObjectCardinality, StoreAtPoint, ValueAtPoint,
 };
 use super::relation::{
     CandidateCoverage, EvidenceBacked, OracleCandidate, OracleRelationHandle, OracleRelationKind,
@@ -61,6 +61,57 @@ impl PointsToResult {
 
     pub fn objects(&self) -> &OracleSet<AbstractObject> {
         &self.objects
+    }
+}
+
+/// Every structured publication of a fresh object on a bounded
+/// ownership-to-observation slice.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FreshObjectPublicationResult {
+    query: FreshObjectPublicationQuery,
+    publications: OracleSet<FreshObjectPublication>,
+}
+
+impl FreshObjectPublicationResult {
+    pub fn new<I>(
+        query: FreshObjectPublicationQuery,
+        candidates: I,
+        coverage: CandidateCoverage,
+        limits: OracleLimits,
+    ) -> Result<Self, OracleContractError>
+    where
+        I: IntoIterator<Item = OracleCandidate<FreshObjectPublication>>,
+    {
+        let publications = OracleSet::bounded_publications(candidates, coverage, limits);
+        validate_candidate_provenance(
+            publications.candidates(),
+            &OracleRelationOwner::FreshObjectPublications(Box::new(query.clone())),
+            OracleRelationKind::Publication,
+        )?;
+        for candidate in publications.candidates() {
+            if candidate.value().point().procedure() != query.observation().procedure() {
+                return Err(OracleContractError::CrossProcedure);
+            }
+        }
+        validate_retained_relation_arenas(
+            publications
+                .candidates()
+                .iter()
+                .flat_map(OracleCandidate::provenance),
+            limits,
+        )?;
+        Ok(Self {
+            query,
+            publications,
+        })
+    }
+
+    pub fn query(&self) -> &FreshObjectPublicationQuery {
+        &self.query
+    }
+
+    pub fn publications(&self) -> &OracleSet<FreshObjectPublication> {
+        &self.publications
     }
 }
 

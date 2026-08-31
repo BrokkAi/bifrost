@@ -10,18 +10,106 @@
 //! wholesale.
 
 use crate::analyzer::common::language_for_file as file_language;
+use crate::analyzer::tree_sitter_analyzer::BulkFileStateSource;
 use crate::analyzer::{CodeUnit, ImportAnalysisProvider, ImportInfo, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_core::analyzer::query_token::QueryToken;
 use brokk_bifrost_jvm::kotlin::imports::{
-    compute_kotlin_same_package_reference_index, kotlin_could_import_file,
-    resolve_kotlin_import_infos,
+    compute_kotlin_same_package_reference_index, is_kotlin_importable_top_level,
+    kotlin_could_import_file, kotlin_import_path, resolve_kotlin_import_infos,
 };
 use brokk_bifrost_jvm::realm::JvmSourceRealm;
 use std::sync::Arc;
 
 use super::KotlinAnalyzer;
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
+
+#[derive(Default)]
+pub(super) struct KotlinFileDependencyIndex {
+    declaration_files: HashMap<String, HashSet<ProjectFile>>,
+    importable_files_by_package: HashMap<String, HashSet<ProjectFile>>,
+    direct_member_files: HashMap<String, HashSet<ProjectFile>>,
+}
+
+impl KotlinFileDependencyIndex {
+    fn build(
+        analyzer: &KotlinAnalyzer,
+        files: &[ProjectFile],
+        cancellation: &crate::cancellation::CancellationToken,
+    ) -> Option<Self> {
+        let states = analyzer.bulk_file_states(files.iter().cloned(), BulkFileStateSource::Omit);
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        let kotlin_file_count = files
+            .iter()
+            .filter(|file| file_language(file) == Language::Kotlin)
+            .count();
+        if states.len() != kotlin_file_count {
+            return None;
+        }
+
+        let mut index = Self::default();
+        for (file, state) in states {
+            if cancellation.is_cancelled() {
+                return None;
+            }
+            for declaration in &state.declarations {
+                if declaration.is_synthetic() {
+                    continue;
+                }
+                index
+                    .declaration_files
+                    .entry(declaration.fq_name())
+                    .or_default()
+                    .insert(file.clone());
+                if is_kotlin_importable_top_level(declaration) {
+                    index
+                        .importable_files_by_package
+                        .entry(declaration.package_name().to_string())
+                        .or_default()
+                        .insert(file.clone());
+                }
+            }
+            for (owner, children) in &state.children {
+                if !owner.is_class() {
+                    continue;
+                }
+                let targets = index
+                    .direct_member_files
+                    .entry(owner.fq_name())
+                    .or_default();
+                targets.extend(
+                    children
+                        .iter()
+                        .filter(|child| !child.is_synthetic())
+                        .map(|child| child.source().clone()),
+                );
+            }
+        }
+        Some(index)
+    }
+
+    fn resolve_imports(&self, file: &ProjectFile, imports: &[ImportInfo]) -> HashSet<ProjectFile> {
+        let mut imported = HashSet::default();
+        for import in imports {
+            let Some(path) = kotlin_import_path(import) else {
+                continue;
+            };
+            if import.is_wildcard {
+                if let Some(files) = self.importable_files_by_package.get(&path) {
+                    imported.extend(files.iter().cloned());
+                } else if let Some(files) = self.direct_member_files.get(&path) {
+                    imported.extend(files.iter().cloned());
+                }
+            } else if let Some(files) = self.declaration_files.get(&path) {
+                imported.extend(files.iter().cloned());
+            }
+        }
+        imported.remove(file);
+        imported
+    }
+}
 
 impl KotlinAnalyzer {
     /// The declarations a Kotlin file imports, widened to the whole JVM source
@@ -63,6 +151,13 @@ impl KotlinAnalyzer {
 }
 
 impl ImportAnalysisProvider for KotlinAnalyzer {
+    fn file_dependency_facts_for_files(
+        &self,
+        files: &[ProjectFile],
+    ) -> Option<crate::hash::HashMap<ProjectFile, crate::analyzer::FileDependencyFacts>> {
+        Some(self.inner.bulk_file_dependency_facts(files.iter().cloned()))
+    }
+
     fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();
@@ -85,6 +180,29 @@ impl ImportAnalysisProvider for KotlinAnalyzer {
             imports,
             None,
         )))
+    }
+
+    fn imported_files_from_infos(
+        &self,
+        file: &ProjectFile,
+        imports: &[ImportInfo],
+    ) -> Option<HashSet<ProjectFile>> {
+        self.file_dependency_index
+            .get()
+            .map(|index| index.resolve_imports(file, imports))
+    }
+
+    fn prefetch_file_dependency_targets(
+        &self,
+        files: &[ProjectFile],
+        _import_infos: Option<&HashMap<ProjectFile, Vec<ImportInfo>>>,
+        cancellation: &crate::cancellation::CancellationToken,
+    ) {
+        if self.file_dependency_index.get().is_none()
+            && let Some(index) = KotlinFileDependencyIndex::build(self, files, cancellation)
+        {
+            let _ = self.file_dependency_index.set(index);
+        }
     }
 
     /// Kotlin files that reference `file`.

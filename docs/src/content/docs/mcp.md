@@ -9,7 +9,7 @@ Bifrost can run as a stdio MCP server. For a manual configuration, pass an expli
 bifrost --root /path/to/project --mcp "symbol|extended"
 ```
 
-Use `--mcp core` only for a navigation-focused setup that should not expose `query_code`. The chosen toolset controls whether an agent can query code.
+Use `--mcp core` for the standard navigation, workspace, and diff-review surface without `query_code`. The chosen toolset controls whether an agent can query code.
 
 ## Tool Discovery Metadata
 
@@ -40,9 +40,12 @@ selects compatible packs from every ecosystem serving a language present in the
 workspace. A configured document selects its named `ecosystems`; an empty
 array explicitly disables dependency-pack activation. An omitted `catalog` is
 ephemeral, while a configured catalog must be workspace-relative. Activation
-never downloads packs or dependencies. Compatibility and `review_required`
-gates remain authoritative, and `enable` names the reviewed packs permitted by
-the workspace.
+through the generic catalog contract does not download packs or dependencies.
+Compatibility and `review_required` gates remain authoritative, and `enable`
+names the reviewed packs permitted by the workspace. The released
+`brokk-bifrost` facade separately opts into fetching the immutable matching
+public release bundle only for an exact generated production miss; set
+`BIFROST_SEMANTIC_PACK_DOWNLOAD=off` to disable that path.
 
 Activation is owned by the bound workspace generation and is reused by
 `run_policy`; the policy result retains the shared activation review. Reports
@@ -122,13 +125,106 @@ filesystem path.
 `analyze_diff` accepts commit-ish or tree-ish values for explicit `base` and
 `target` endpoints, preferring a commit when a spelling can resolve to either.
 Its response labels commits by full hash and trees as `tree:<oid>`. Omitting
-both endpoints retains the HEAD-to-live-worktree comparison. A commit supplied
-as `target` alone compares against its first parent, while a tree-only target
-is rejected because trees have no parents and therefore needs an explicit
-`base`. When both endpoints are immutable commits or trees, Bifrost compares
-only those snapshots and ignores the live worktree, index, and `.gitattributes`.
+both endpoints compares the merge base of `HEAD` and the repository's default
+branch against the live working tree, so committed and uncommitted feature-branch
+changes are included. Bifrost reads the default branch from the local symbolic
+`refs/remotes/origin/HEAD`; when that record is unavailable, it falls back to
+`HEAD`. A commit supplied as `target` alone compares against its first parent,
+while a tree-only target is rejected because trees have no parents and therefore
+needs an explicit `base`. When both endpoints are immutable commits or trees,
+Bifrost compares only those snapshots and ignores the live worktree, index, and
+`.gitattributes`.
 Objects available only in the snapshot store resolve only when the server was
 launched with the flag.
+
+`blast_radius` uses the same endpoint rules and trusted snapshot-object
+configuration. It identifies callables changed by the diff, seeds every
+analyzer-visible changed target file, and follows incoming edges in Bifrost's
+structured direct file-dependency graph to suggest reached test files. The
+graph includes ordinary imports and language-owned file relations such as Rust
+external `mod` declarations. A changed file that contains tests is evidence at
+dependency distance zero. Deleted and renamed-away preimages trigger
+conditional base-graph recovery; ordinary edits use target state only, so a
+removed import edge is not restored from the base.
+
+`analysis.analyzer_changed_test_paths` lists the changed target files that the
+target analyzer structurally classified as containing test code. Each listed
+path is seeded at dependency distance zero even when presentation compaction
+returns a containing directory instead of the exact file. These are file paths,
+not runner-specific test identifiers.
+
+Changed callable symbols expose `in_test_context` when a declaration is nested
+in structurally attributed test code or lives under a recognized test-tree
+path. This contextual flag does not mean the declaration is an individually
+runnable test and does not make its file a distance-zero `TestScope`. Test-data
+fixtures driven through generated runners or resource metadata require evidence
+outside the file-import graph.
+
+From a feature-branch checkout, the useful default CLI invocation is simply:
+
+```bash
+bifrost --tool blast_radius
+```
+
+The result is file-dependency evidence, not an exhaustive test-impact claim,
+individual method-call graph, test-runner identifier map, or runtime coverage
+report. `analysis.graph_completion` states only whether Bifrost completed the
+selected file graphs; it does not claim that every way a test can depend on a
+change is modeled. `analysis.paths_outside_file_graph` lists changed build,
+data, documentation, and other non-analyzer paths whose validation the graph
+cannot infer. In particular, zero reached tests is not proof that no repository
+validation applies when this list is nonempty.
+
+`max_scopes` defaults to 100 and accepts 1 through 1000. When exact reached
+files exceed that limit, Bifrost returns deterministic directory scopes
+selected to minimize additional analyzer-visible coverage.
+`analysis.reached_test_file_count` remains the exact reached-file count, and
+directory records include coverage, distance bounds, and up to five sample
+reached files. Inspect `analysis.graph_completion`, `paths_outside_file_graph`,
+`analyzer_changed_test_paths`, and typed `incomplete_reasons` when interpreting
+an empty result. For example,
+`compilation_scope_unresolved` means Bifrost preserved proven file-dependency
+evidence but could not fully establish a language compilation boundary.
+
+`cyclomatic_complexity` uses the same endpoints and the same heuristic scorer
+as the file-oriented `compute_cyclomatic_complexity` tool. It returns functions
+introduced or patch-edited by the diff. Introduced functions have a postimage
+score; edited functions have preimage and postimage scores plus a signed delta,
+including zero-delta edits. Deleted functions and pure moves are omitted.
+Structurally detected test code is excluded unless `include_tests` is true.
+Changed non-analyzer paths and unresolved analyzer paths are retained in the
+result's `analysis` metadata.
+
+`missing_tests` also shares those endpoint rules. It first reverse-walks the
+cheap file-dependency graph to obtain the bounded importer closure for each
+changed file. It then batches exact declaration-location usage scans inside
+that closure and follows enclosing callers back toward test-context code. This
+distinguishes an uncalled changed function from a called sibling in the same
+file without constructing the bulk whole-workspace usage graph. A fully
+exhausted search appears in `missing_functions`; cancelled, incomplete,
+unresolved, ambiguous, and unproven searches appear in
+`indeterminate_functions`. The result is static reachability evidence, not
+runtime coverage.
+
+`score_diff` shares those endpoint rules and returns a deterministic vector of
+raw named features describing how hard a revision range makes future
+maintenance. It publishes no weights and no single score, because no validated
+weighting exists; a consumer combines the features itself. `geometry` counts
+changed symbols, files, directories, insertions, deletions, edit clusters, and
+pairwise directory distance. `coordination` counts external caller sites per
+signature change, added and removed call-edge weight,
+`unattributed_call_edge_changes`, and edited symbols that publish
+`dispatch_extensibility: open`. `verification` lists changed production symbols
+with no direct test reference; this is a symbol-level, non-transitive signal,
+not coverage, so a symbol that a test reaches only through an intermediate is
+still listed. `baseline` reports cognitive complexity before and after the
+edited symbol pairs. `excluded` names the binary and unparseable changed files
+no feature could measure, and `verification.unresolved_symbols` names symbols
+whose reference scan did not complete, so nothing is dropped silently. Test
+symbols and edges are always in scope because verification needs them. The tool
+builds an analyzer over the whole target revision rather than the changed files
+alone, because the diff's own files cannot answer who calls a changed symbol;
+expect the cost of a cold whole-repository analysis.
 
 When standard roots or sandbox-state metadata controls a rootless connection, `activate_workspace` is unavailable even if the selected toolset exposes it. Change the workspace through the MCP host instead. This prevents a tool call from widening the client-approved scope; explicit-root integrations retain the normal workspace activation behavior.
 
@@ -138,12 +234,13 @@ When standard roots or sandbox-state metadata controls a rootless connection, `a
 | --- | --- |
 | `symbol` | `search_symbols`, `get_symbol_sources`, `get_summaries`, mode-specific usage and definition lookup tools, `get_type_by_location`, `rename_symbol`, `usage_graph` |
 | `workspace` | `refresh`, `activate_workspace`, `get_active_workspace` |
+| `diff` | `analyze_diff`, `blast_radius`, `cyclomatic_complexity`, `missing_tests`, `score_diff` |
 | `extended` | `query_code`, `list_policies`, `run_policy`, `explain_policy`, `get_symbol_locations`, `get_symbol_ancestors`, `most_relevant_files` |
 | `text` | `get_file_contents`, `search_file_contents`, `find_files_containing` |
-| `slopcop` | `compute_cyclomatic_complexity`, `compute_cognitive_complexity`, `report_comment_density_for_code_unit`, `report_exception_handling_smells`, `report_comment_density_for_files`, `analyze_git_hotspots`, `report_test_assertion_smells`, `report_structural_clone_smells`, `report_long_method_and_god_object_smells`, `report_dead_code_and_unused_abstraction_smells`, `report_secret_like_code`, `analyze_diff` |
+| `slopcop` | `compute_cyclomatic_complexity`, `compute_cognitive_complexity`, `report_comment_density_for_code_unit`, `report_exception_handling_smells`, `report_comment_density_for_files`, `analyze_git_hotspots`, `report_test_assertion_smells`, `report_structural_clone_smells`, `report_long_method_and_god_object_smells`, `report_dead_code_and_unused_abstraction_smells`, `report_secret_like_code` |
 | `cli` | `classify_test_files` |
 
-`core` expands to `symbol|workspace`. `searchtools` expands to every toolset above in registry order: `symbol|workspace|extended|text|slopcop|cli`.
+`core` expands to `symbol|workspace|diff`. `searchtools` expands to every toolset above in registry order: `symbol|workspace|diff|extended|text|slopcop|cli`.
 
 With line numbers enabled, `symbol` advertises `scan_usages_by_location`, `get_declarations_by_location`, and `get_definitions_by_location`. With `--no-line-numbers`, it instead advertises `scan_usages_by_reference` and `get_definitions_by_reference`; there is no declaration-by-reference tool.
 

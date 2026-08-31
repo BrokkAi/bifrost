@@ -1095,6 +1095,7 @@ pub(super) fn append_diagnostic_terminations(
             }
             CodeQueryDiagnosticCode::SemanticResultsOmitted
             | CodeQueryDiagnosticCode::SemanticAnalysisPartial
+            | CodeQueryDiagnosticCode::CallBindingDispatchPartial
             | CodeQueryDiagnosticCode::SemanticProviderFailed
             | CodeQueryDiagnosticCode::UnresolvedProtocolReference
             | CodeQueryDiagnosticCode::TypestateRegistrationStale
@@ -1136,6 +1137,7 @@ pub(super) fn append_diagnostic_terminations(
             | CodeQueryDiagnosticCode::TopologyOwnershipAmbiguous
             | CodeQueryDiagnosticCode::PathDerivationIncomplete
             | CodeQueryDiagnosticCode::EffectDerivationIncomplete
+            | CodeQueryDiagnosticCode::ResultContractDerivationIncomplete
             | CodeQueryDiagnosticCode::JsxProjectionIncomplete => {
                 Some(QueryOperatorTermination::AnalysisIncomplete)
             }

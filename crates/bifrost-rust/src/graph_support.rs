@@ -1529,13 +1529,15 @@ pub fn resolve_module_files(
     // rather than a physical child of that crate. `crate::api` in a facade
     // that says `pub use engine::api` is one namespace with the physical
     // `engine::api`; treating the path-derived `facade.api` spelling as final
-    // reports an indexed workspace target as an external boundary. Follow the
-    // crate root's structured export graph only after the ordinary physical
-    // route misses, so a real local module keeps Rust's normal precedence.
-    if rooted
-        && files.is_empty()
+    // reports an indexed workspace target as an external boundary. The same
+    // holds for a path rooted at another workspace crate -- `rig::tool` is
+    // `rig_core::tool` when the `rig` facade writes `pub use rig_core::*`
+    // (issue #2775). Follow the crate root's structured export graph only
+    // after the ordinary physical route misses, so a real local module keeps
+    // Rust's normal precedence.
+    if files.is_empty()
         && let Some(exported_module) =
-            resolve_rooted_exported_module_package(rust, token, importing_file, module_specifier)
+            resolve_exported_module_package(rust, token, importing_file, module_specifier)
     {
         resolved_module = exported_module;
         files = resolved_module_files(rust, token, importing_file, &resolved_module);
@@ -1593,7 +1595,24 @@ fn resolved_module_files(
     files
 }
 
-fn resolve_rooted_exported_module_package(
+/// A module path's segments followed through the structured export graph of
+/// the crate root the path is anchored at.
+///
+/// Two spellings anchor at a crate root. `crate::api` names the importing
+/// file's own crate root, which may be a facade whose `pub use engine::api`
+/// puts the physical `engine::api` module in that namespace. `rig::tool` names
+/// *another* Cargo workspace member's root, and the same re-export can stand
+/// between that root and the module the path names: `rig::tool` is
+/// `rig_core::tool` because the `rig` facade writes `pub use rig_core::*`
+/// (issue #2775). Both are one walk over one export index; only the seed
+/// differs, so this states the seed and shares the walk.
+///
+/// A head segment that names no crate of the analyzed workspace answers
+/// `None`. That is the honest external boundary: a registry dependency's
+/// modules are in no index, and a same-named workspace module must not answer
+/// for one. `self::` and `super::` are module-relative rather than
+/// crate-rooted, so they are the path arithmetic's business, not this walk's.
+fn resolve_exported_module_package(
     rust: &dyn RustSource,
     token: QueryToken<'_>,
     importing_file: &ProjectFile,
@@ -1601,20 +1620,38 @@ fn resolve_rooted_exported_module_package(
 ) -> Option<String> {
     let segments = parse_symbol_path(Language::Rust, module_specifier);
     let (root, nested) = segments.split_first()?;
-    if root != "crate" || nested.is_empty() {
+    if nested.is_empty() || matches!(root.as_str(), "self" | "super") {
         return None;
     }
 
-    let mut files = rust.cargo_routes().target_roots_for_file(importing_file);
-    if files.is_empty()
-        && rust.is_analyzed(importing_file)
-        && rust_package_name(importing_file) == rust_crate_root_package(importing_file)
-    {
-        files.push(importing_file.clone());
-    }
+    let mut files = if root == "crate" {
+        let mut roots = rust.cargo_routes().target_roots_for_file(importing_file);
+        if roots.is_empty()
+            && rust.is_analyzed(importing_file)
+            && rust_package_name(importing_file) == rust_crate_root_package(importing_file)
+        {
+            roots.push(importing_file.clone());
+        }
+        roots
+    } else {
+        // Not this file's crate: only a crate the importing file's manifest
+        // actually routes to, which is what keeps an external crate external.
+        vec![
+            rust.cargo_routes()
+                .resolve_crate_root_file(importing_file, root)?,
+        ]
+    };
     files.retain(|file| rust.is_analyzed(file));
     files.sort();
     files.dedup();
+
+    // A `pub use` in the walked root can name a path that lands back here, so
+    // the walk re-enters through `resolve_module_files`. Cargo's dependency
+    // graph is a DAG, but a crate re-exporting through its own name
+    // (`pub use self_crate::part::*` at its root) closes a cycle inside one
+    // crate. Refuse the request already on this thread's stack rather than
+    // recursing; a chain of distinct facades still resolves hop by hop.
+    let _guard = ExportedModuleWalkGuard::enter(importing_file, module_specifier)?;
 
     let mut package = None;
     for segment in nested {
@@ -1626,6 +1663,39 @@ fn resolve_rooted_exported_module_package(
         package = Some(resolved);
     }
     package
+}
+
+thread_local! {
+    /// The (importing file, module specifier) pairs whose crate-root export
+    /// walk is in progress on this thread. Thread-local because the walk is
+    /// one call stack, and the walks run on rayon workers in parallel.
+    static EXPORTED_MODULE_WALKS: RefCell<HashSet<(ProjectFile, String)>> =
+        RefCell::new(HashSet::default());
+}
+
+/// Marks one crate-root export walk as in progress for as long as it is on the
+/// stack. [`ExportedModuleWalkGuard::enter`] answers `None` when the same walk
+/// is already running, which is the cycle.
+struct ExportedModuleWalkGuard {
+    key: (ProjectFile, String),
+}
+
+impl ExportedModuleWalkGuard {
+    fn enter(importing_file: &ProjectFile, module_specifier: &str) -> Option<Self> {
+        let key = (importing_file.clone(), module_specifier.to_string());
+        EXPORTED_MODULE_WALKS
+            .with(|walks| walks.borrow_mut().insert(key.clone()))
+            .then_some(Self { key })
+    }
+}
+
+impl Drop for ExportedModuleWalkGuard {
+    fn drop(&mut self) {
+        EXPORTED_MODULE_WALKS.with(|walks| {
+            let removed = walks.borrow_mut().remove(&self.key);
+            debug_assert!(removed, "an entered export walk must still be recorded");
+        });
+    }
 }
 
 /// Re-spell one rooted module prefix under a Cargo target's shared kind root.

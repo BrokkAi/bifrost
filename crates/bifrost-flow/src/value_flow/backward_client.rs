@@ -551,6 +551,14 @@ impl BackwardDistributiveDataflowProblem for BackwardValueFlowProblem<'_> {
         BackwardValueFlowFact::Zero
     }
 
+    /// The forward client takes the caller-side continuation of a resolved
+    /// call, so the preimage relation must take it too, or a carrier the
+    /// callee neither receives nor returns has no backward path past the call
+    /// and the two directions disagree on every pair that spans one (#2782).
+    fn resolved_call_to_return(&self) -> bool {
+        true
+    }
+
     fn normal_predecessor_flow(
         &self,
         edge: DataflowEdge<'_, Self::Fact>,

@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "pack_id": "bifrost.go.stdlib.crypto-x509",
+  "version": "1.0.0",
+  "producer": {
+    "name": "bifrost",
+    "version": "0.10.7"
+  },
+  "language": "go",
+  "ecosystem": "go",
+  "compatibility": {
+    "bifrost": ">=0.10.7, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "https://pkg.go.dev/crypto/x509",
+    "revision": "go1.26.0"
+  },
+  "license": "BSD-3-Clause",
+  "completeness": "complete",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "go.stdlib.crypto-x509.parameter-preconditions",
+      "activation": [{}],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "crypto-x509.is-encrypted-pem-block",
+            "target": {
+              "path": "src/crypto/x509/pem_decrypt.go",
+              "symbol": "crypto/x509.IsEncryptedPEMBlock(b *pem.Block)",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "normal_result_count": 1,
+            "transfers": [],
+            "preconditions": [
+              {
+                "input": {
+                  "kind": "parameter",
+                  "ordinal": 0
+                },
+                "predicate": "non_null"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

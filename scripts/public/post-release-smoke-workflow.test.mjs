@@ -33,7 +33,6 @@ const NPM_PACKAGES = [
   "@brokkai/bifrost",
   "@brokkai/bifrost-darwin-universal",
   "@brokkai/bifrost-linux-x64-gnu",
-  "@brokkai/bifrost-linux-x64-musl",
   "@brokkai/bifrost-linux-arm64-gnu",
   "@brokkai/bifrost-android-arm64",
   "@brokkai/bifrost-win32-x64",
@@ -115,6 +114,16 @@ test("checks every GitHub asset and published SHA-256 sidecar", () => {
   assert.match(workflow, /bifrost-agent-\$\{RELEASE_TAG\}\.tar\.gz/u);
   assert.match(workflow, /brokk-bifrost-agent-\$\{RELEASE_VERSION\}\.tgz/u);
   assert.match(workflow, /bifrost-vscode-\$\{RELEASE_TAG\}\.vsix/u);
+  const requiredStart = workflow.indexOf("          for required in");
+  const requiredEnd = workflow.indexOf("\n          done", requiredStart);
+  assert.ok(requiredStart >= 0 && requiredEnd > requiredStart, "required asset loop must be present");
+  const requiredAssets = workflow.slice(requiredStart, requiredEnd);
+  for (const asset of [
+    "bifrost-semantic-packs-${RELEASE_TAG}.tar.gz",
+    "bifrost-semantic-packs-${RELEASE_TAG}.tar.gz.sha256",
+  ]) {
+    assert.ok(requiredAssets.includes(asset), `missing required semantic-pack asset ${asset}`);
+  }
   assert.ok(workflow.includes('.digest // ""'));
   assert.match(workflow, /\^sha256:\[0-9a-f\]\{64\}\$/u);
   assert.ok(workflow.includes('expected="${digest#sha256:}"'));
@@ -131,6 +140,8 @@ test("checks every GitHub asset and published SHA-256 sidecar", () => {
   assert.match(workflow, /unzip -p .*bifrost-vscode-\$\{RELEASE_TAG\}\.vsix/u);
   assert.match(workflow, /sha256sum -c/u);
   assert.match(workflow, /checksums=\("\$asset_dir"\/\*\.sha256\)/u);
+  const checksumStart = workflow.indexOf('checksums=("$asset_dir"/*.sha256)');
+  assert.match(workflow.slice(checksumStart), /sha256sum -c/u, "downloaded checksum sidecars must be checked");
   assert.match(
     workflow,
     /raw\.githubusercontent\.com\/BrokkAi\/bifrost\/master\/plugins\/bifrost-agent\/bifrost-release\.json/u,

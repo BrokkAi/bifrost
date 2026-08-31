@@ -16,8 +16,9 @@ use brokk_bifrost_rql::structural::search::DetailedCodeQueryDomain;
 
 use crate::definition::{
     PolicySelector, RelationalAssertionPlan, RowAggregate, RowAggregateOp, RowBinding,
-    RowBindingName, RowBindingSource, RowDerivation, RowFieldRef, RowFilter, RowJoin, RowJoinKind,
-    RowPredicate, RowPredicateOp, RowPredicateOperand, RowProjection, RowSelectorPlan,
+    RowBindingName, RowBindingSource, RowDerivation, RowFieldRef, RowFilter, RowFilterEvidence,
+    RowJoin, RowJoinKind, RowLiteral, RowPredicate, RowPredicateOp, RowPredicateOperand,
+    RowProjection, RowSelectorPlan,
 };
 
 use super::ir::{
@@ -56,6 +57,8 @@ pub struct LoweredRowSelector {
     pub upstream: IrRelationId,
     pub output_binding: RowBindingName,
     pub upstream_binding: RowBindingName,
+    pub declared_call_binding: Option<RowBindingName>,
+    pub declared_call_model_id: Option<String>,
 }
 
 fn lower_bindings_and_derivations(
@@ -157,6 +160,25 @@ fn lower_bindings_and_derivations(
 pub fn lower_row_selector_plan(
     selector: &RowSelectorPlan,
 ) -> Result<LoweredRowSelector, RelationalAssertionPlanError> {
+    let declared_call = selector.derivations.iter().find_map(|derivation| {
+        let RowDerivation::Filter(filter) = derivation else {
+            return None;
+        };
+        if !matches!(filter.evidence, Some(RowFilterEvidence::DeclaredCall)) {
+            return None;
+        }
+        let model_id = filter.predicates.iter().find_map(|predicate| {
+            if predicate.field.field != "model_id" || !matches!(predicate.op, RowPredicateOp::Eq) {
+                return None;
+            }
+            let RowPredicateOperand::Literal(RowLiteral::String(model_id)) = &predicate.operand
+            else {
+                return None;
+            };
+            Some(model_id.clone())
+        });
+        Some((filter.over.clone(), model_id))
+    });
     let (mut relations, slots) =
         lower_bindings_and_derivations(&selector.bindings, &selector.derivations)?;
     let Some(output_relation) = slots
@@ -206,6 +228,8 @@ pub fn lower_row_selector_plan(
         upstream,
         output_binding: selector.output.clone(),
         upstream_binding,
+        declared_call_binding: declared_call.as_ref().map(|(binding, _)| binding.clone()),
+        declared_call_model_id: declared_call.and_then(|(_, model_id)| model_id),
     })
 }
 

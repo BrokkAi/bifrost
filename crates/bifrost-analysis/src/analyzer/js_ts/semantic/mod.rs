@@ -2,24 +2,30 @@
 
 use tree_sitter::Node;
 
-use crate::analyzer::lexical_definitions::formal_parameter_slots;
+use crate::analyzer::lexical_definitions::formal_parameter_slots_for_owner_with_nodes;
 use crate::analyzer::semantic::cfg::{
     CleanupRegionId, CompletionKind, CompletionRequest, CompletionRoute, ProcedureCfgBuilder,
     ScopeBinding, ScopeFrameId,
 };
 use crate::analyzer::semantic::service::{ProgramSemanticsLowerer, SemanticAdapterIdentity};
 use crate::analyzer::semantic::*;
+use crate::analyzer::structural::extract::{
+    LimitedFileFacts, extract_file_facts_from_tree_limited,
+};
+use crate::analyzer::structural::facts::STRUCTURAL_FACTS_VERSION;
 use crate::analyzer::tree_sitter_analyzer::{
     PreparedSyntaxTree, WalkControl, try_walk_named_tree_preorder,
 };
-use crate::analyzer::{Language, ProjectFile, Range};
+use crate::analyzer::{Language, ProjectFile, Range, parser_language_for_dialect};
 use crate::hash::{HashMap, HashSet};
+use brokk_bifrost_js_ts::structural::TYPESCRIPT_STRUCTURAL_SPEC;
 use brokk_bifrost_js_ts::syntax::{
-    JsTsImportBinder, JsTsLexicalBindingIndex, compute_import_binder,
+    JsTsImportBinder, JsTsLexicalBindingIndex, compute_import_binder, is_declaration_identifier,
 };
+use brokk_bifrost_js_ts::ts_owners::ts_unwrap_expression;
 
-const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-value-semantics-v13";
-const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v16";
+const JAVASCRIPT_ADAPTER_VERSION: &[u8] = b"javascript-value-semantics-v15";
+const TYPESCRIPT_ADAPTER_VERSION: &[u8] = b"typescript-value-semantics-v18";
 
 #[derive(Debug, Clone, Copy)]
 enum JsTsSemanticFlavor {
@@ -61,6 +67,85 @@ pub(crate) struct JsTsSemanticLowerer {
     flavor: JsTsSemanticFlavor,
 }
 
+/// Exact joins from a prepared syntax tree to the normalized structural facts
+/// extracted from that same tree. The map is built once per prepared source,
+/// then each parameter mapping performs only a tree-node-id lookup.
+#[derive(Debug)]
+struct StructuralNodeIndex {
+    content: ContentIdentity,
+    node_ids: HashMap<usize, u32>,
+}
+
+enum StructuralNodeIndexOutcome {
+    Complete {
+        index: StructuralNodeIndex,
+        work_items: usize,
+    },
+    Exceeded {
+        minimum_work_items: usize,
+    },
+    Cancelled,
+}
+
+impl StructuralNodeIndex {
+    fn for_typescript(
+        prepared: &PreparedSyntaxTree,
+        max_work_items: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<StructuralNodeIndexOutcome, SemanticProviderError> {
+        let grammar = parser_language_for_dialect(prepared.dialect()).ok_or_else(|| {
+            SemanticProviderError::internal(
+                "TypeScript semantic lowering has no structural parser language",
+            )
+        })?;
+        let extracted = extract_file_facts_from_tree_limited(
+            &TYPESCRIPT_STRUCTURAL_SPEC,
+            &grammar,
+            prepared.tree(),
+            prepared.source(),
+            max_work_items,
+            Some(cancellation),
+        );
+        let (facts, node_ids) = match extracted {
+            LimitedFileFacts::CompleteWithNodeIndex { facts, node_ids } => (facts, node_ids),
+            LimitedFileFacts::Exceeded { minimum_fact_nodes } => {
+                return Ok(StructuralNodeIndexOutcome::Exceeded {
+                    minimum_work_items: minimum_fact_nodes,
+                });
+            }
+            LimitedFileFacts::Cancelled => return Ok(StructuralNodeIndexOutcome::Cancelled),
+            LimitedFileFacts::Unavailable => {
+                return Err(SemanticProviderError::internal(
+                    "TypeScript structural identity extraction is unavailable",
+                ));
+            }
+            LimitedFileFacts::Complete(_) => {
+                return Err(SemanticProviderError::internal(
+                    "prepared-tree structural extraction omitted its node index",
+                ));
+            }
+        };
+        let work_items = facts.work_item_count();
+        let content = facts.source_identity();
+        assert_eq!(
+            content,
+            ContentIdentity::hash_bytes(prepared.source().as_bytes()),
+            "structural facts must be extracted from the semantic artifact source"
+        );
+        Ok(StructuralNodeIndexOutcome::Complete {
+            index: Self { content, node_ids },
+            work_items,
+        })
+    }
+
+    fn identity(&self, node: Node<'_>) -> Option<StructuralNodeIdentity> {
+        self.node_ids
+            .get(&node.id())
+            .copied()
+            .map(|node_id| StructuralNodeIdentity::new(self.content, node_id))
+    }
+}
+
 impl JsTsSemanticLowerer {
     pub(crate) const fn javascript() -> Self {
         Self {
@@ -77,6 +162,18 @@ impl JsTsSemanticLowerer {
 
 impl ProgramSemanticsLowerer for JsTsSemanticLowerer {
     fn identity(&self) -> SemanticAdapterIdentity {
+        let dependencies = match self.flavor {
+            JsTsSemanticFlavor::JavaScript => {
+                DependencyFingerprint::hash_bytes(b"no-intrafile-dependencies")
+            }
+            JsTsSemanticFlavor::TypeScript => {
+                let mut digest = LengthDelimitedDigest::new(
+                    b"bifrost.typescript-semantic.structural-facts-dependency.v1",
+                );
+                digest.push(&STRUCTURAL_FACTS_VERSION.to_le_bytes());
+                DependencyFingerprint::from_digest(digest.finish())
+            }
+        };
         SemanticAdapterIdentity {
             adapter: AdapterSemanticsVersion::hash_bytes(
                 self.flavor.adapter_name(),
@@ -84,7 +181,7 @@ impl ProgramSemanticsLowerer for JsTsSemanticLowerer {
             )
             .expect("adapter name is non-empty"),
             configuration: ConfigurationFingerprint::hash_bytes(self.flavor.configuration()),
-            dependencies: DependencyFingerprint::hash_bytes(b"no-intrafile-dependencies"),
+            dependencies,
         }
     }
 
@@ -106,7 +203,7 @@ impl ProgramSemanticsLowerer for JsTsSemanticLowerer {
                 prepared.dialect()
             )));
         }
-        let (mut specs, initial_work, inventory_work) =
+        let (procedure_inventory, mut initial_work, mut inventory_work) =
             match enumerate_procedures(file, prepared, budget, cancellation)? {
                 ProcedureEnumeration::Complete {
                     value,
@@ -127,6 +224,11 @@ impl ProgramSemanticsLowerer for JsTsSemanticLowerer {
                     });
                 }
             };
+        let JsTsProcedureInventory {
+            mut specs,
+            lexical_bindings,
+            callable_bindings,
+        } = procedure_inventory;
         if relay_receiver_capture_demand(&mut specs, cancellation).is_err() {
             return Ok(SemanticOutcome::Cancelled {
                 partial: None,
@@ -178,16 +280,70 @@ impl ProgramSemanticsLowerer for JsTsSemanticLowerer {
                     spec.callable.id(),
                     NestedProcedureTarget {
                         id: spec.id,
+                        direct_invocation_supported: !spec.properties.is_async
+                            && !spec.properties.is_generator
+                            && spec.omitted_captures.is_empty(),
                         receiver_capture_destination: spec
                             .captures_receiver
                             .then_some(RECEIVER_CAPTURE_DESTINATION),
+                        captures: spec
+                            .captures
+                            .iter()
+                            .map(|capture| capture.binding)
+                            .collect(),
                     },
                 )
             })
             .collect::<HashMap<_, _>>();
         let imports = compute_import_binder(prepared.source(), prepared.tree());
-        let lexical_bindings =
-            JsTsLexicalBindingIndex::build(prepared.tree().root_node(), prepared.source());
+        let structural_node_index = if matches!(self.flavor, JsTsSemanticFlavor::TypeScript) {
+            let max_work_items = budget
+                .limits()
+                .nested_entries
+                .saturating_sub(inventory_work.nested_entries);
+            match StructuralNodeIndex::for_typescript(prepared, max_work_items, cancellation)? {
+                StructuralNodeIndexOutcome::Complete { index, work_items } => {
+                    let work = SemanticWork {
+                        nested_entries: work_items,
+                        ..SemanticWork::default()
+                    };
+                    initial_work = sum_lowering_work(initial_work, work);
+                    inventory_work = sum_lowering_work(inventory_work, work);
+                    Some(index)
+                }
+                StructuralNodeIndexOutcome::Exceeded { minimum_work_items } => {
+                    let work = sum_lowering_work(
+                        inventory_work,
+                        SemanticWork {
+                            nested_entries: minimum_work_items,
+                            ..SemanticWork::default()
+                        },
+                    );
+                    let exceeded = budget
+                        .check(work)
+                        .expect_err("structural minimum exceeds its remaining semantic budget");
+                    return Ok(SemanticOutcome::ExceededBudget {
+                        partial: None,
+                        exceeded,
+                        work,
+                    });
+                }
+                StructuralNodeIndexOutcome::Cancelled => {
+                    return Ok(SemanticOutcome::Cancelled {
+                        partial: None,
+                        work: inventory_work,
+                    });
+                }
+            }
+        } else {
+            None
+        };
+        if cancellation.is_cancelled() {
+            return Ok(SemanticOutcome::Cancelled {
+                partial: None,
+                work: inventory_work,
+            });
+        }
         let mut bound_capture_targets = HashSet::default();
         lower_procedure_batch(
             &specs,
@@ -200,8 +356,10 @@ impl ProgramSemanticsLowerer for JsTsSemanticLowerer {
                     prepared,
                     spec,
                     &procedure_targets,
+                    &callable_bindings,
                     &imports,
                     &lexical_bindings,
+                    structural_node_index.as_ref(),
                     capture_binding_expected,
                     staged_budget,
                     cancellation,
@@ -277,7 +435,10 @@ mod tests;
 mod values;
 
 use control::lower_procedure;
-use inventory::{NestedProcedureTarget, ProcedureEnumeration, ProcedureSpec, enumerate_procedures};
+use inventory::{
+    JsTsProcedureInventory, LexicalCallableTarget, NestedProcedureTarget, ProcedureEnumeration,
+    ProcedureSpec, enumerate_procedures,
+};
 
 type TsLoweringError = ProcedureLoweringError;
 
@@ -345,10 +506,14 @@ struct CleanupRegion<'tree> {
     outer_scope: ScopeFrameId,
 }
 
+type ElementFieldLocators = HashMap<Box<str>, SemanticLocator>;
+type ArrayElementFields = HashMap<u64, ElementFieldLocators>;
+
 struct LoweringContext<'tree, 'targets> {
     prepared: &'tree PreparedSyntaxTree,
     imports: &'targets JsTsImportBinder,
     lexical_bindings: &'targets JsTsLexicalBindingIndex,
+    structural_node_index: Option<&'targets StructuralNodeIndex>,
     session: ProcedureLoweringSession<'targets>,
     expression_values: HashMap<usize, ValueId>,
     constant_index_values: HashMap<u64, ValueId>,
@@ -356,7 +521,9 @@ struct LoweringContext<'tree, 'targets> {
     locals: HashMap<Box<str>, Vec<LocalBinding>>,
     receiver: Option<ValueId>,
     captured_receiver: Option<ValueId>,
+    captured_bindings: HashMap<Range, ValueId>,
     procedure_targets: &'targets HashMap<usize, NestedProcedureTarget>,
+    callable_bindings: &'targets HashMap<Range, LexicalCallableTarget>,
     abruptness: HashMap<usize, bool>,
     cleanups: Vec<CleanupRegion<'tree>>,
     catch_binders: HashMap<ProgramPointId, ValueId>,
@@ -364,12 +531,29 @@ struct LoweringContext<'tree, 'targets> {
     plain_object_locals: HashMap<ValueId, PlainObjectLocal>,
     plain_object_fields: HashMap<ValueId, HashMap<Box<str>, SemanticLocator>>,
     array_locals: HashMap<ValueId, ArrayLocal>,
+    /// Stable field locators for each element of a proven, non-escaping array
+    /// literal. The outer key is the allocation root so declaration aliases
+    /// retain the same element identity.
+    array_element_fields: HashMap<ValueId, ArrayElementFields>,
 }
 
 struct LocalBinding {
+    binding: Range,
     scope_start: usize,
     scope_end: usize,
     value: ValueId,
+}
+
+fn lexical_capture_destination(
+    captures_receiver: bool,
+    capture_index: usize,
+) -> Result<MemoryLocationId, TsLoweringError> {
+    let index = capture_index
+        .checked_add(usize::from(captures_receiver))
+        .ok_or_else(|| TsLoweringError::Invalid("too many JS/TS captures".into()))?;
+    let index = u32::try_from(index)
+        .map_err(|_| TsLoweringError::Invalid("too many JS/TS captures".into()))?;
+    Ok(MemoryLocationId::new(index))
 }
 
 /// A local whose value is a proven allocation for the binding's whole extent:
@@ -403,6 +587,8 @@ struct PlainObjectLocal {
 /// accesses through those aliases retain one identity only while the root is
 /// proven not to be rebound, captured, or used through another operation.
 struct ArrayLocal {
+    /// The allocation root shared by direct declaration aliases.
+    root: ValueId,
     declaration_parent: usize,
     available_after: usize,
     /// Start byte of the first whole-value consumption of this allocation

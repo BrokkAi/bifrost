@@ -121,7 +121,10 @@ use callable_signature::{CallableSignatureValue, SignatureParameterValue};
 use control_relations::{ControlRelationKey, ControlRelationTraversalCache, ControlRelationValue};
 use decorator_binding::DecoratedParameterValue;
 use dispatch::{DispatchSiteValue, DispatchTargetValue};
-use effects::{CallEffectValue, EffectTraversalCache, ProcedureEffectValue};
+use effects::{
+    CallEffectValue, CallResultContractValue, EffectTraversalCache, ProcedureEffectValue,
+    ResultContractFailureUseValue, ResultContractUseValue,
+};
 use environment::{
     BindingKey, BindingValue, CandidateHopKey, CandidateHopValue, CandidateKey, CandidateValue,
     EnvironmentTraversalCache, ScopeKey, ScopeValue,
@@ -168,8 +171,8 @@ use render::*;
 use row_relations::*;
 use seeds::*;
 use semantic::{
-    SemanticControlEdgeValue, SemanticProcedureValue, SemanticProgramPointValue,
-    SemanticQueryContext,
+    SemanticCallResultValue, SemanticControlEdgeValue, SemanticProcedureValue,
+    SemanticProgramPointValue, SemanticQueryContext,
 };
 use taint::SemanticTaintFindingValue;
 use typestate::{SemanticTypestateFindingValue, SemanticTypestateWitnessValue};
@@ -193,7 +196,11 @@ use expansions::{
 use super::lexical_environment::BindingOfOutcome;
 use super::occurrence_rows::{OccurrenceRow, OccurrenceTarget};
 use super::occurrences::{OccurrenceClass, OccurrenceRole};
-use crate::analyzer::semantic::{ContentIdentity, LengthDelimitedDigest};
+use crate::analyzer::semantic::{
+    ContentIdentity, LengthDelimitedDigest, SemanticArtifactLeaseSnapshot, SemanticBudget,
+    SemanticBudgetCharge, SemanticBudgetScopeSnapshot, SemanticExecutionBudget,
+    SemanticExecutionBudgetCharge, SemanticExecutionBudgetSnapshot,
+};
 use crate::analyzer::usages::get_definition::TraceCandidateRef;
 use brokk_bifrost_rql::{
     BindingFilter, CandidateFilter, ControlRelationFilter, EdgeFilter, FlowRelationFilter,
@@ -205,6 +212,8 @@ pub use results::CodeQueryCallArgument;
 pub use results::CodeQueryCallArgumentGroup;
 pub use results::CodeQueryCallBinding;
 pub use results::CodeQueryCallEffect;
+pub use results::CodeQueryCallResult;
+pub use results::CodeQueryCallResultContract;
 pub use results::CodeQueryCallShape;
 pub use results::CodeQueryCallShapeArgument;
 pub use results::CodeQueryCallSite;
@@ -275,6 +284,8 @@ pub use results::CodeQueryReferenceSite;
 pub use results::CodeQueryResolutionCandidate;
 pub use results::CodeQueryResponse;
 pub use results::CodeQueryResult;
+pub use results::CodeQueryResultContractFailureUse;
+pub use results::CodeQueryResultContractUse;
 pub use results::CodeQueryResultItem;
 pub use results::CodeQueryResultRef;
 pub use results::CodeQueryResultValue;
@@ -287,6 +298,7 @@ pub use results::CodeQuerySemanticCompleteness;
 pub use results::CodeQuerySemanticEvidence;
 pub use results::CodeQuerySemanticLimits;
 pub use results::CodeQuerySemanticProof;
+pub use results::CodeQuerySemanticReceipt;
 pub use results::CodeQuerySemanticRowLimits;
 pub use results::CodeQuerySemanticWork;
 pub use results::CodeQuerySignatureParameter;
@@ -310,6 +322,7 @@ pub use results::CodeQueryTypestateWitnessStepKind;
 pub use results::CodeQueryTypestateWork;
 pub use results::CodeQueryValueFlowLimits;
 pub use results::CodeQueryValueFlowWork;
+pub use results::DetailedCodeQueryDecoratedParameterEvidence;
 pub use results::DetailedCodeQueryDomain;
 pub use results::DetailedCodeQueryEvidence;
 pub use results::DetailedCodeQueryIdentityCandidate;
@@ -728,6 +741,9 @@ enum PipelineValue {
     CallArgument(CallArgumentValue),
     CallBinding(Box<CallBindingValue>),
     CallEffect(Box<CallEffectValue>),
+    CallResultContract(Box<CallResultContractValue>),
+    ResultContractUse(Box<ResultContractUseValue>),
+    ResultContractFailureUse(Box<ResultContractFailureUseValue>),
     ProcedureEffect(Box<ProcedureEffectValue>),
     CallableSignature(Box<CallableSignatureValue>),
     SignatureParameter(Box<SignatureParameterValue>),
@@ -786,6 +802,7 @@ enum SemanticPipelineValue {
     Procedure(SemanticProcedureValue),
     ProgramPoint(SemanticProgramPointValue),
     ControlEdge(SemanticControlEdgeValue),
+    CallResult(SemanticCallResultValue),
     TypestateFinding(SemanticTypestateFindingValue),
     TypestateWitness(SemanticTypestateWitnessValue),
     FlowEndpoint(Box<SemanticFlowEndpointValue>),
@@ -821,6 +838,9 @@ enum PipelineKey {
     CallArgument(String),
     CallBinding(String),
     CallEffect(String),
+    CallResultContract(String),
+    ResultContractUse(String),
+    ResultContractFailureUse(String),
     ProcedureEffect(String),
     CallableSignature(String),
     SignatureParameter(String),
@@ -858,6 +878,7 @@ enum SemanticPipelineKey {
     Procedure(crate::analyzer::semantic::ProcedureHandle),
     ProgramPoint(crate::analyzer::semantic::ProgramPointHandle),
     ControlEdge(crate::analyzer::semantic::ControlEdgeHandle),
+    CallResult(String),
     TypestateFinding(String),
     TypestateWitness(String),
     FlowEndpoint(String),
@@ -896,6 +917,11 @@ impl PipelineValue {
             ),
             Self::CallBinding(value) => PipelineKey::CallBinding(value.row().id.clone()),
             Self::CallEffect(value) => PipelineKey::CallEffect(value.row().id.clone()),
+            Self::CallResultContract(value) => PipelineKey::CallResultContract(value.id.clone()),
+            Self::ResultContractUse(value) => PipelineKey::ResultContractUse(value.id.clone()),
+            Self::ResultContractFailureUse(value) => {
+                PipelineKey::ResultContractFailureUse(value.id.clone())
+            }
             Self::ProcedureEffect(value) => PipelineKey::ProcedureEffect(value.row().id.clone()),
             Self::CallableSignature(value) => {
                 PipelineKey::CallableSignature(value.report.signature.id.clone())
@@ -946,6 +972,7 @@ impl SemanticPipelineValue {
             Self::Procedure(procedure) => SemanticPipelineKey::Procedure(procedure.handle.clone()),
             Self::ProgramPoint(point) => SemanticPipelineKey::ProgramPoint(point.handle.clone()),
             Self::ControlEdge(edge) => SemanticPipelineKey::ControlEdge(edge.handle.clone()),
+            Self::CallResult(result) => SemanticPipelineKey::CallResult(result.public().id),
             Self::TypestateFinding(finding) => {
                 SemanticPipelineKey::TypestateFinding(finding.key().to_string())
             }
@@ -969,6 +996,7 @@ impl SemanticPipelineValue {
             Self::Procedure(value) => value.file(),
             Self::ProgramPoint(value) => value.file(),
             Self::ControlEdge(value) => value.file(),
+            Self::CallResult(value) => value.file(),
             Self::TypestateFinding(value) => value.file(),
             Self::TypestateWitness(value) => value.file(),
             Self::FlowEndpoint(value) => value.file(),
@@ -986,6 +1014,9 @@ impl SemanticPipelineValue {
                 value: value.public(),
             },
             Self::ControlEdge(value) => CodeQueryResultValue::ControlEdge {
+                value: Box::new(value.public()),
+            },
+            Self::CallResult(value) => CodeQueryResultValue::CallResult {
                 value: Box::new(value.public()),
             },
             Self::TypestateFinding(value) => CodeQueryResultValue::TypestateFinding {
@@ -1011,6 +1042,7 @@ impl SemanticPipelineValue {
             Self::Procedure(value) => value.public_ref(),
             Self::ProgramPoint(value) => value.public_ref(),
             Self::ControlEdge(value) => value.public_ref(),
+            Self::CallResult(value) => value.public_ref(),
             Self::TypestateFinding(value) => value.public_ref(),
             Self::TypestateWitness(value) => value.public_ref(),
             Self::FlowEndpoint(value) => value.public_ref(),
@@ -1057,6 +1089,21 @@ impl SemanticPipelineValue {
                     key: DetailedCodeQueryKey::ControlEdge {
                         id: public.id.clone(),
                         procedure_id: public.procedure_id,
+                    },
+                    file: value.file(),
+                    byte_span: value.byte_span(),
+                    display_range: public.range,
+                    language: public.language,
+                    stable_id: public.id,
+                }
+            }
+            Self::CallResult(value) => {
+                let public = value.public();
+                DetailedSemanticProjection {
+                    domain: DetailedCodeQueryDomain::CallResult,
+                    key: DetailedCodeQueryKey::CallResult {
+                        id: public.id.clone(),
+                        site_id: public.site_id,
                     },
                     file: value.file(),
                     byte_span: value.byte_span(),
@@ -1157,6 +1204,9 @@ enum PipelineTraceValue {
     CallArgument(CallArgumentValue),
     CallBinding(Box<CallBindingValue>),
     CallEffect(Box<CallEffectValue>),
+    CallResultContract(Box<CallResultContractValue>),
+    ResultContractUse(Box<ResultContractUseValue>),
+    ResultContractFailureUse(Box<ResultContractFailureUseValue>),
     ProcedureEffect(Box<ProcedureEffectValue>),
     CallableSignature(Box<CallableSignatureValue>),
     SignatureParameter(Box<SignatureParameterValue>),
@@ -1214,6 +1264,17 @@ struct CallTraversalCache {
     reported_outgoing: HashSet<CodeUnit>,
     bindings: CallBindingCache,
     effects: EffectTraversalCache,
+}
+
+impl CallTraversalCache {
+    fn with_active_semantic_models(
+        active_models: Option<Arc<crate::analyzer::semantic_model::ResolvedActiveSemanticModels>>,
+    ) -> Self {
+        Self {
+            effects: EffectTraversalCache::with_active_semantic_models(active_models),
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2034,6 +2095,9 @@ pub fn execute_with_limits(
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
 ) -> CodeQueryResult {
+    let snapshot = analyzer.active_semantic_model_snapshot();
+    let _semantic_model_scope =
+        AnalyzerQueryScope::with_active_semantic_model_snapshot(analyzer, snapshot);
     let mut result = execute_code_query_detailed(analyzer, query, limits, None).result;
     augment_public_result_with_semantic_overlay(analyzer, query, &mut result);
     result
@@ -2046,7 +2110,9 @@ pub fn execute_workspace_with_limits(
     query: &CodeQuery,
     limits: CodeQueryExecutionLimits,
 ) -> CodeQueryResult {
-    let scope = AnalyzerQueryScope::new(workspace.analyzer());
+    let snapshot = workspace.analyzer().active_semantic_model_snapshot();
+    let scope =
+        AnalyzerQueryScope::with_active_semantic_model_snapshot(workspace.analyzer(), snapshot);
     let token = scope.token();
     let mut result = execute_internal_with_analysis(
         workspace.analyzer(),
@@ -2250,6 +2316,11 @@ fn execute_request_internal(
         &TaintResultRegistrationSet,
     )>,
 ) -> CodeQueryResponse {
+    let active_semantic_model_snapshot = analyzer.active_semantic_model_snapshot();
+    let _semantic_model_scope = AnalyzerQueryScope::with_active_semantic_model_snapshot(
+        analyzer,
+        active_semantic_model_snapshot,
+    );
     if query_plan_requires_typestate(&query.plan) && !limits.typestate.is_valid() {
         return CodeQueryResponse::Results(invalid_plan_result(
             "typestate execution limits must be positive and no greater than their hard maxima",
@@ -2423,6 +2494,7 @@ pub fn execute_code_query_detailed_eager_index(
         access_mode,
         OccurrenceDerivationOptions::ROWS_ONLY,
         None,
+        None,
     )
 }
 
@@ -2464,6 +2536,7 @@ pub fn execute_code_query_detailed_eager_index_without_targets(
         access_mode,
         OccurrenceDerivationOptions::IDENTITY_ONLY,
         None,
+        None,
     )
 }
 
@@ -2502,7 +2575,77 @@ pub fn execute_code_query_detailed_eager_index_workspace(
         access_mode,
         OccurrenceDerivationOptions::ROWS_ONLY,
         None,
+        None,
     )
+}
+
+/// Workspace-backed detailed execution for a coordinator that continues
+/// semantic analysis after consuming the query rows.
+///
+/// The ordinary detailed entry point intentionally releases windowed
+/// artifacts. This opt-in form snapshots the parent semantic and execution
+/// ledgers, then runs independently bounded children in the same logical
+/// scope. The semantic child's exact additive limits come from the
+/// coordinator's parent ledger; `limits.semantic.max_retained_bytes` remains
+/// the separate physical cap over the deduplicated union of parent leases,
+/// active source windows, and successful result-contract dependencies. A
+/// nested query can therefore charge only repeat lookup work for an artifact
+/// or file the parent already paid, and returns a one-shot charge plus the
+/// exact complete allocations behind policy-relevant rows. The coordinator
+/// must import performed work before atomically promoting or dropping those
+/// allocations.
+pub fn execute_code_query_detailed_eager_index_workspace_with_semantic_receipt(
+    workspace: &WorkspaceAnalyzer,
+    query: &CodeQuery,
+    limits: CodeQueryExecutionLimits,
+    cancellation: Option<&CancellationToken>,
+    parent_semantic: &SemanticBudget,
+    parent_execution: &SemanticExecutionBudget,
+    artifact_leases: SemanticArtifactLeaseSnapshot,
+) -> DetailedCodeQueryResult {
+    let parent_scope = parent_semantic.scope_snapshot();
+    let (execution_before, execution_child) = parent_execution.fork_with_additional_limits(
+        limits.semantic.max_materialized_files,
+        limits.semantic.max_traversal_steps,
+    );
+    let scope = AnalyzerQueryScope::new(workspace.analyzer());
+    let token = scope.token();
+    let access_mode = match benchmark_structural_access_mode() {
+        StructuralAccessMode::ScanOnly => StructuralAccessMode::ScanOnly,
+        _ => StructuralAccessMode::EagerAuto,
+    };
+    execute_internal_with_analysis_strategy(
+        workspace.analyzer(),
+        token,
+        Some(workspace),
+        None,
+        0,
+        query,
+        limits,
+        cancellation,
+        None,
+        false,
+        UnionExecutionStrategy::Auto,
+        CODE_QUERY_SCHEDULER_WORKERS,
+        access_mode,
+        OccurrenceDerivationOptions::ROWS_ONLY,
+        Some(SemanticQueryContinuation {
+            parent_scope,
+            child_semantic_limits: parent_semantic.remaining(),
+            execution_before,
+            execution_child,
+            artifact_leases,
+        }),
+        None,
+    )
+}
+
+struct SemanticQueryContinuation {
+    parent_scope: SemanticBudgetScopeSnapshot,
+    child_semantic_limits: crate::analyzer::semantic::SemanticWork,
+    execution_before: SemanticExecutionBudgetSnapshot,
+    execution_child: SemanticExecutionBudget,
+    artifact_leases: SemanticArtifactLeaseSnapshot,
 }
 
 /// Internal opt-in profile entry point used by the M2 measurement harness.
@@ -2548,6 +2691,7 @@ pub(crate) fn execute_code_query_with_union_strategy(
         StructuralAccessMode::Auto,
         OccurrenceDerivationOptions::ROWS_ONLY,
         None,
+        None,
     )
 }
 
@@ -2577,6 +2721,7 @@ pub(crate) fn execute_code_query_with_access_mode(
         CODE_QUERY_SCHEDULER_WORKERS,
         mode,
         OccurrenceDerivationOptions::ROWS_ONLY,
+        None,
         Some(&mut failure),
     );
     match failure {
@@ -2663,6 +2808,7 @@ fn execute_internal_with_analysis(
         benchmark_structural_access_mode(),
         OccurrenceDerivationOptions::ROWS_ONLY,
         None,
+        None,
     )
 }
 
@@ -2705,6 +2851,7 @@ fn execute_internal_with_strategy(
         scheduler_workers,
         access_mode,
         OccurrenceDerivationOptions::ROWS_ONLY,
+        None,
         access_failure_out,
     )
 }
@@ -2725,12 +2872,17 @@ fn execute_internal_with_analysis_strategy(
     scheduler_workers: usize,
     access_mode: StructuralAccessMode,
     occurrence_options: OccurrenceDerivationOptions,
+    semantic_continuation: Option<SemanticQueryContinuation>,
     access_failure_out: Option<&mut Option<String>>,
 ) -> DetailedCodeQueryResult {
-    // Keep repeated analyzer reads coherent and reusable even for direct API
-    // callers that do not already own a wider request scope. Nested scopes are
-    // supported and preserve an outer caller's store-error observation.
-    let _query_scope = crate::analyzer::AnalyzerQueryScope::new(analyzer);
+    let active_semantic_model_snapshot = analyzer.active_semantic_model_snapshot();
+    // Keep every resolver read in this query on the same semantic-model
+    // publication. Passing `None` deliberately freezes the absence so a pack
+    // activated midway through the query cannot change later row families.
+    let _query_scope = crate::analyzer::AnalyzerQueryScope::with_active_semantic_model_snapshot(
+        analyzer,
+        active_semantic_model_snapshot.clone(),
+    );
     let request_started = capture_profile.then(Instant::now);
     let planning_started = capture_profile.then(Instant::now);
     if !capture_profile && cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -2749,7 +2901,7 @@ fn execute_internal_with_analysis_strategy(
         }
     };
     let requires_semantic = query_plan_requires_semantic(&query.plan);
-    if requires_semantic && !limits.semantic.all_positive() {
+    if requires_semantic && semantic_continuation.is_none() && !limits.semantic.all_positive() {
         return detailed_result_without_evidence(
             invalid_plan_result(
                 "semantic execution limits must all be positive for a semantic query",
@@ -2774,6 +2926,9 @@ fn execute_internal_with_analysis_strategy(
         );
     }
     let planning_ns = planning_started.map(elapsed_ns).unwrap_or(0);
+    let active_models = active_semantic_model_snapshot
+        .as_ref()
+        .map(|snapshot| Arc::clone(snapshot.active_models()));
     let mut diagnostics = Vec::new();
     let mut state = QueryExecutionState {
         analyzer,
@@ -2789,24 +2944,43 @@ fn execute_internal_with_analysis_strategy(
         environment_cache: EnvironmentTraversalCache::default(),
         materialization_cache: materialization::MaterializationTraversalCache::default(),
         edge_cache: EdgeTraversalCache::default(),
-        flow_state_cache: FlowStateTraversalCache::default(),
+        flow_state_cache: FlowStateTraversalCache::new(active_semantic_model_snapshot.clone()),
         control_relation_cache: ControlRelationTraversalCache::default(),
         topology_cache: TopologyTraversalCache::default(),
         rewrite_path_cache: RewritePathTraversalCache::default(),
         path_cache: PathTraversalCache::default(),
-        call_cache: CallTraversalCache::default(),
+        call_cache: CallTraversalCache::with_active_semantic_models(active_models.clone()),
         receiver_facts: HashMap::default(),
         semantic: workspace.filter(|_| requires_semantic).map(|workspace| {
-            SemanticQueryContext::new_with_analysis(
-                workspace,
-                cancellation,
-                limits.semantic,
-                limits.typestate,
-                limits.value_flow,
-                limits.taint,
-                workspace_generation,
-                analysis_context,
-            )
+            match semantic_continuation {
+                Some(continuation) => SemanticQueryContext::new_with_parent_scope(
+                    workspace,
+                    cancellation,
+                    limits.semantic,
+                    limits.typestate,
+                    limits.value_flow,
+                    limits.taint,
+                    workspace_generation,
+                    analysis_context,
+                    active_semantic_model_snapshot,
+                    &continuation.parent_scope,
+                    continuation.child_semantic_limits,
+                    continuation.execution_before,
+                    continuation.execution_child,
+                    continuation.artifact_leases,
+                ),
+                None => SemanticQueryContext::new_with_analysis(
+                    workspace,
+                    cancellation,
+                    limits.semantic,
+                    limits.typestate,
+                    limits.value_flow,
+                    limits.taint,
+                    workspace_generation,
+                    analysis_context,
+                    active_semantic_model_snapshot,
+                ),
+            }
         }),
         import_graph: None,
         import_graph_content: None,
@@ -2835,6 +3009,25 @@ fn execute_internal_with_analysis_strategy(
         &mut diagnostics,
         &mut profile_branch,
     );
+    // The root `Limit` operator (query.limit, e.g. a policy's
+    // `budget.max_findings()` override) is the only node in the plan that is
+    // ever handed a terminal row cap: it names its own truncation via
+    // `push_truncation_diagnostic` whenever it cuts its child's rows down to
+    // `count`. Nothing else in the plan is guaranteed to explain a cap it did
+    // not itself enforce -- issue #2779 is exactly that gap, discovered as a
+    // policy selector that truncated with `truncated=true` and zero
+    // diagnostics, which downstream collapsed to a bare, unexplained
+    // `PartialDiscovery`. This is a defense-in-depth backstop, not the
+    // primary reporting path: see `needs_root_terminal_cap_diagnostic`.
+    if needs_root_terminal_cap_diagnostic(
+        execution.truncated,
+        execution.cancelled,
+        execution.rows.len(),
+        query.limit,
+        &diagnostics,
+    ) {
+        push_truncation_diagnostic(&mut diagnostics, &state.budget, query.limit);
+    }
     if !state
         .structural_index_session
         .selections_are_current(|content| state.analyzer.workspace_content_matches(content))
@@ -2959,6 +3152,10 @@ fn execute_internal_with_analysis_strategy(
     if let Some(out) = access_failure_out {
         *out = state.access_failure.take();
     }
+    let semantic_receipt = state
+        .semantic
+        .take()
+        .and_then(SemanticQueryContext::into_receipt);
     let mut result = CodeQueryResult {
         results,
         truncated: truncated || cancelled,
@@ -2970,9 +3167,49 @@ fn execute_internal_with_analysis_strategy(
         work,
         evidence,
         profile,
+        semantic_receipt,
     };
     detailed.assert_invariants();
     detailed
+}
+
+/// Whether the root terminal-cap backstop (issue #2779) must push its own
+/// truncation diagnostic for one `execute_plan` result.
+///
+/// The outermost `Limit` operator is the only node ever handed a terminal row
+/// cap, and it already names its own truncation via
+/// `push_truncation_diagnostic` whenever it enforces `query.limit`. This
+/// check only fires when nothing already explains the truncation:
+///
+/// - `truncated` must be set (nothing to explain otherwise).
+/// - `cancelled` must be clear: a cancellation names itself with its own
+///   `Cancelled` diagnostic and can leave any row count, so it must never be
+///   relabeled as a cap truncation.
+/// - `query_limit` must be positive: a zero limit makes `row_count == 0` a
+///   trivial match for "no results" rather than evidence of a cut.
+/// - `row_count` must equal `query_limit` exactly: that is the fingerprint a
+///   correctly-truncating `Limit` leaves behind (it truncates its child's
+///   rows down to exactly `count`). A row count below the limit means some
+///   other, unrelated mechanism (a budget lane, a stale-content retry, ...)
+///   stopped the query short, and that mechanism must name itself instead.
+/// - No diagnostic already carries `Incomplete` impact: if one does, it
+///   already explains the truncation (whether or not it is literally
+///   `ResultLimitReached`), and adding this one would double- or
+///   mis-attribute the cause.
+fn needs_root_terminal_cap_diagnostic(
+    truncated: bool,
+    cancelled: bool,
+    row_count: usize,
+    query_limit: usize,
+    diagnostics: &[CodeQueryDiagnostic],
+) -> bool {
+    truncated
+        && !cancelled
+        && query_limit > 0
+        && row_count == query_limit
+        && !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.impact == CodeQueryDiagnosticImpact::Incomplete)
 }
 
 fn select_physical_plan(
@@ -3042,6 +3279,7 @@ fn detailed_result_without_evidence(
         )),
         evidence: Vec::new(),
         profile: None,
+        semantic_receipt: None,
     };
     detailed.assert_invariants();
     detailed
@@ -3122,6 +3360,7 @@ fn detailed_evidence_for_pipeline_value(
                 ),
                 stable_owner_candidate,
                 provenance: Vec::new(),
+                decorated_parameter: None,
             }
         }
         PipelineValue::Declaration(declaration) => {
@@ -3152,6 +3391,7 @@ fn detailed_evidence_for_pipeline_value(
                 ),
                 stable_owner_candidate: stable_owner_candidate_for_unit(&file, &declaration.unit),
                 provenance: Vec::new(),
+                decorated_parameter: None,
             }
         }
         PipelineValue::Semantic(value) => {
@@ -3177,6 +3417,7 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             source_slice_sha256: None,
             provenance: Vec::new(),
+            decorated_parameter: None,
         },
         PipelineValue::ReferenceSite(site) => {
             let target_path = rel_path_string(site.target.unit.source());
@@ -3205,6 +3446,7 @@ fn detailed_evidence_for_pipeline_value(
                     stable_owner_candidate_for_unit(&site.file, &declaration.unit)
                 }),
                 provenance: Vec::new(),
+                decorated_parameter: None,
             }
         }
         PipelineValue::CallSite(site) => {
@@ -3227,6 +3469,7 @@ fn detailed_evidence_for_pipeline_value(
                 },
                 stable_owner_candidate: stable_owner_candidate_for_unit(file, &site.0.caller),
                 provenance: Vec::new(),
+                decorated_parameter: None,
             }
         }
         PipelineValue::ExpressionSite(site) => {
@@ -3253,6 +3496,7 @@ fn detailed_evidence_for_pipeline_value(
                     &site.call_site.0.caller,
                 ),
                 provenance: Vec::new(),
+                decorated_parameter: None,
             }
         }
         PipelineValue::JsxAttributeValue(value) => {
@@ -3279,6 +3523,7 @@ fn detailed_evidence_for_pipeline_value(
                 )),
                 stable_owner_candidate: candidate,
                 provenance: Vec::new(),
+                decorated_parameter: None,
             }
         }
         PipelineValue::ReceiverAnalysis(value) => {
@@ -3298,6 +3543,7 @@ fn detailed_evidence_for_pipeline_value(
                 identities: DetailedCodeQueryProvenanceIdentities::None,
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
+                decorated_parameter: None,
             }
         }
         PipelineValue::ReceiverOutcome(value) => {
@@ -3315,6 +3561,7 @@ fn detailed_evidence_for_pipeline_value(
                 identities: DetailedCodeQueryProvenanceIdentities::None,
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
+                decorated_parameter: None,
             }
         }
         PipelineValue::ReceiverEvidence(value) => {
@@ -3332,6 +3579,7 @@ fn detailed_evidence_for_pipeline_value(
                 identities: DetailedCodeQueryProvenanceIdentities::None,
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
+                decorated_parameter: None,
             }
         }
         PipelineValue::CallShape(value) => {
@@ -3349,6 +3597,7 @@ fn detailed_evidence_for_pipeline_value(
                 identities: DetailedCodeQueryProvenanceIdentities::None,
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
+                decorated_parameter: None,
             }
         }
         PipelineValue::CallArgumentGroup(value) => {
@@ -3367,6 +3616,7 @@ fn detailed_evidence_for_pipeline_value(
                 identities: DetailedCodeQueryProvenanceIdentities::None,
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
+                decorated_parameter: None,
             }
         }
         PipelineValue::CallArgument(value) => {
@@ -3385,6 +3635,7 @@ fn detailed_evidence_for_pipeline_value(
                 identities: DetailedCodeQueryProvenanceIdentities::None,
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
+                decorated_parameter: None,
             }
         }
         PipelineValue::CallBinding(value) => {
@@ -3402,6 +3653,7 @@ fn detailed_evidence_for_pipeline_value(
                 identities: DetailedCodeQueryProvenanceIdentities::None,
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
+                decorated_parameter: None,
             }
         }
         PipelineValue::CallEffect(value) => {
@@ -3419,8 +3671,54 @@ fn detailed_evidence_for_pipeline_value(
                 identities: DetailedCodeQueryProvenanceIdentities::None,
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
+                decorated_parameter: None,
             }
         }
+        PipelineValue::CallResultContract(value) => DetailedCodeQueryEvidence {
+            result_index,
+            domain: DetailedCodeQueryDomain::CallResultContract,
+            key: DetailedCodeQueryKey::CallResultContract {
+                id: value.id.clone(),
+                site_id: value.site_id.clone(),
+            },
+            file: value.file.clone(),
+            source_slice_sha256: None,
+            byte_span: Some(range_byte_span(value.range)),
+            identities: DetailedCodeQueryProvenanceIdentities::None,
+            stable_owner_candidate: None,
+            provenance: Vec::new(),
+            decorated_parameter: None,
+        },
+        PipelineValue::ResultContractUse(value) => DetailedCodeQueryEvidence {
+            result_index,
+            domain: DetailedCodeQueryDomain::ResultContractUse,
+            key: DetailedCodeQueryKey::ResultContractUse {
+                id: value.id.clone(),
+                acquisition_id: value.acquisition_id.clone(),
+            },
+            file: value.file.clone(),
+            source_slice_sha256: None,
+            byte_span: Some(range_byte_span(value.range)),
+            identities: DetailedCodeQueryProvenanceIdentities::None,
+            stable_owner_candidate: None,
+            provenance: Vec::new(),
+            decorated_parameter: None,
+        },
+        PipelineValue::ResultContractFailureUse(value) => DetailedCodeQueryEvidence {
+            result_index,
+            domain: DetailedCodeQueryDomain::ResultContractFailureUse,
+            key: DetailedCodeQueryKey::ResultContractFailureUse {
+                id: value.id.clone(),
+                acquisition_id: value.acquisition_id.clone(),
+            },
+            file: value.file.clone(),
+            source_slice_sha256: None,
+            byte_span: Some(range_byte_span(value.range)),
+            identities: DetailedCodeQueryProvenanceIdentities::None,
+            stable_owner_candidate: None,
+            provenance: Vec::new(),
+            decorated_parameter: None,
+        },
         PipelineValue::ProcedureEffect(value) => {
             let row = value.row();
             DetailedCodeQueryEvidence {
@@ -3436,6 +3734,7 @@ fn detailed_evidence_for_pipeline_value(
                 identities: DetailedCodeQueryProvenanceIdentities::None,
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
+                decorated_parameter: None,
             }
         }
         PipelineValue::CallableSignature(value) => DetailedCodeQueryEvidence {
@@ -3451,6 +3750,7 @@ fn detailed_evidence_for_pipeline_value(
             identities: DetailedCodeQueryProvenanceIdentities::None,
             stable_owner_candidate: None,
             provenance: Vec::new(),
+            decorated_parameter: None,
         },
         PipelineValue::SignatureParameter(value) => DetailedCodeQueryEvidence {
             result_index,
@@ -3465,6 +3765,7 @@ fn detailed_evidence_for_pipeline_value(
             identities: DetailedCodeQueryProvenanceIdentities::None,
             stable_owner_candidate: None,
             provenance: Vec::new(),
+            decorated_parameter: None,
         },
         PipelineValue::DecoratedParameter(value) => DetailedCodeQueryEvidence {
             result_index,
@@ -3480,6 +3781,7 @@ fn detailed_evidence_for_pipeline_value(
             identities: DetailedCodeQueryProvenanceIdentities::None,
             stable_owner_candidate: None,
             provenance: Vec::new(),
+            decorated_parameter: value.semantic.as_deref().cloned(),
         },
         PipelineValue::CallableApplicability(value) => DetailedCodeQueryEvidence {
             result_index,
@@ -3494,6 +3796,7 @@ fn detailed_evidence_for_pipeline_value(
             identities: DetailedCodeQueryProvenanceIdentities::None,
             stable_owner_candidate: None,
             provenance: Vec::new(),
+            decorated_parameter: None,
         },
         PipelineValue::OverloadSelection(value) => DetailedCodeQueryEvidence {
             result_index,
@@ -3508,6 +3811,7 @@ fn detailed_evidence_for_pipeline_value(
             identities: DetailedCodeQueryProvenanceIdentities::None,
             stable_owner_candidate: None,
             provenance: Vec::new(),
+            decorated_parameter: None,
         },
         PipelineValue::MemberSelection(value) => {
             let row = &value.occurrence;
@@ -3524,6 +3828,7 @@ fn detailed_evidence_for_pipeline_value(
                 identities: DetailedCodeQueryProvenanceIdentities::None,
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
+                decorated_parameter: None,
             }
         }
         PipelineValue::Occurrence(value) => {
@@ -3547,6 +3852,7 @@ fn detailed_evidence_for_pipeline_value(
                     .as_ref()
                     .and_then(|unit| stable_owner_candidate_for_unit(&row.file, unit)),
                 provenance: Vec::new(),
+                decorated_parameter: None,
             }
         }
         PipelineValue::LexicalScope(value) => {
@@ -3567,6 +3873,7 @@ fn detailed_evidence_for_pipeline_value(
                 identities: DetailedCodeQueryProvenanceIdentities::None,
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
+                decorated_parameter: None,
             }
         }
         PipelineValue::Binding(value) => {
@@ -3587,6 +3894,7 @@ fn detailed_evidence_for_pipeline_value(
                 identities: DetailedCodeQueryProvenanceIdentities::None,
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
+                decorated_parameter: None,
             }
         }
         PipelineValue::GenerationSite(value) => {
@@ -3607,6 +3915,7 @@ fn detailed_evidence_for_pipeline_value(
                 identities: DetailedCodeQueryProvenanceIdentities::None,
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
+                decorated_parameter: None,
             }
         }
         PipelineValue::Export(value) => {
@@ -3627,6 +3936,7 @@ fn detailed_evidence_for_pipeline_value(
                 identities: DetailedCodeQueryProvenanceIdentities::None,
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
+                decorated_parameter: None,
             }
         }
         PipelineValue::DeclarationState(value) => {
@@ -3650,6 +3960,7 @@ fn detailed_evidence_for_pipeline_value(
                 identities: DetailedCodeQueryProvenanceIdentities::None,
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
+                decorated_parameter: None,
             }
         }
         PipelineValue::StateEvent(value) => {
@@ -3671,6 +3982,7 @@ fn detailed_evidence_for_pipeline_value(
                 identities: DetailedCodeQueryProvenanceIdentities::None,
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
+                decorated_parameter: None,
             }
         }
         // A topology row's location is the build file that declares it: the
@@ -3687,6 +3999,7 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             source_slice_sha256: None,
             provenance: Vec::new(),
+            decorated_parameter: None,
         },
         PipelineValue::BuildTarget(value) => DetailedCodeQueryEvidence {
             result_index,
@@ -3698,6 +4011,7 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             source_slice_sha256: None,
             provenance: Vec::new(),
+            decorated_parameter: None,
         },
         PipelineValue::TopologyEdge(value) => DetailedCodeQueryEvidence {
             result_index,
@@ -3709,6 +4023,7 @@ fn detailed_evidence_for_pipeline_value(
             stable_owner_candidate: None,
             source_slice_sha256: None,
             provenance: Vec::new(),
+            decorated_parameter: None,
         },
         PipelineValue::ControlRelation(value) => {
             let (file, range) = control_relations::anchor(value);
@@ -3724,6 +4039,7 @@ fn detailed_evidence_for_pipeline_value(
                 identities: DetailedCodeQueryProvenanceIdentities::None,
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
+                decorated_parameter: None,
             }
         }
         PipelineValue::Guard(value) => {
@@ -3740,6 +4056,7 @@ fn detailed_evidence_for_pipeline_value(
                 identities: DetailedCodeQueryProvenanceIdentities::None,
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
+                decorated_parameter: None,
             }
         }
         PipelineValue::RewritePath(value) => {
@@ -3761,6 +4078,7 @@ fn detailed_evidence_for_pipeline_value(
                 identities: DetailedCodeQueryProvenanceIdentities::None,
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
+                decorated_parameter: None,
             }
         }
         PipelineValue::FlowRelation(value) => {
@@ -3782,6 +4100,7 @@ fn detailed_evidence_for_pipeline_value(
                 identities: DetailedCodeQueryProvenanceIdentities::None,
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
+                decorated_parameter: None,
             }
         }
         PipelineValue::ReferenceEdge(value) => {
@@ -3807,6 +4126,7 @@ fn detailed_evidence_for_pipeline_value(
                     .as_ref()
                     .and_then(|unit| stable_owner_candidate_for_unit(&row.site.file, unit)),
                 provenance: Vec::new(),
+                decorated_parameter: None,
             }
         }
         PipelineValue::DispatchOutcome(value) => DetailedCodeQueryEvidence {
@@ -3822,6 +4142,7 @@ fn detailed_evidence_for_pipeline_value(
             identities: DetailedCodeQueryProvenanceIdentities::None,
             stable_owner_candidate: None,
             provenance: Vec::new(),
+            decorated_parameter: None,
         },
         PipelineValue::DispatchTarget(value) => DetailedCodeQueryEvidence {
             result_index,
@@ -3837,6 +4158,7 @@ fn detailed_evidence_for_pipeline_value(
             identities: DetailedCodeQueryProvenanceIdentities::None,
             stable_owner_candidate: None,
             provenance: Vec::new(),
+            decorated_parameter: None,
         },
         PipelineValue::MemberFamily(value) => DetailedCodeQueryEvidence {
             result_index,
@@ -3851,6 +4173,7 @@ fn detailed_evidence_for_pipeline_value(
             identities: DetailedCodeQueryProvenanceIdentities::None,
             stable_owner_candidate: None,
             provenance: Vec::new(),
+            decorated_parameter: None,
         },
         PipelineValue::MemberFamilyEdge(value) => DetailedCodeQueryEvidence {
             result_index,
@@ -3866,6 +4189,7 @@ fn detailed_evidence_for_pipeline_value(
             identities: DetailedCodeQueryProvenanceIdentities::None,
             stable_owner_candidate: None,
             provenance: Vec::new(),
+            decorated_parameter: None,
         },
         PipelineValue::CandidateHop(value) => {
             let row = &value.occurrence;
@@ -3888,6 +4212,7 @@ fn detailed_evidence_for_pipeline_value(
                     .as_ref()
                     .and_then(|unit| stable_owner_candidate_for_unit(&row.file, unit)),
                 provenance: Vec::new(),
+                decorated_parameter: None,
             }
         }
         PipelineValue::ResolutionCandidate(value) => {
@@ -3911,6 +4236,7 @@ fn detailed_evidence_for_pipeline_value(
                     .as_ref()
                     .and_then(|unit| stable_owner_candidate_for_unit(&row.file, unit)),
                 provenance: Vec::new(),
+                decorated_parameter: None,
             }
         }
         PipelineValue::QualifiedPath(value) => {
@@ -3930,6 +4256,7 @@ fn detailed_evidence_for_pipeline_value(
                 identities: DetailedCodeQueryProvenanceIdentities::None,
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
+                decorated_parameter: None,
             }
         }
         PipelineValue::PathSegment(value) => {
@@ -3950,6 +4277,7 @@ fn detailed_evidence_for_pipeline_value(
                 identities: DetailedCodeQueryProvenanceIdentities::None,
                 stable_owner_candidate: None,
                 provenance: Vec::new(),
+                decorated_parameter: None,
             }
         }
     }
@@ -3987,6 +4315,7 @@ fn detailed_semantic_evidence(
         )),
         stable_owner_candidate: Some(candidate),
         provenance: Vec::new(),
+        decorated_parameter: None,
     }
 }
 
@@ -4020,6 +4349,9 @@ fn terminal_source_file(value: &PipelineValue) -> Option<&ProjectFile> {
         PipelineValue::CallArgument(value) => Some(&value.shape.report.outcome.file),
         PipelineValue::CallBinding(value) => Some(value.file()),
         PipelineValue::CallEffect(value) => Some(value.file()),
+        PipelineValue::CallResultContract(value) => Some(value.file()),
+        PipelineValue::ResultContractUse(value) => Some(value.file()),
+        PipelineValue::ResultContractFailureUse(value) => Some(value.file()),
         PipelineValue::ProcedureEffect(value) => Some(value.file()),
         PipelineValue::Occurrence(value) => Some(value.file()),
         PipelineValue::MemberSelection(value) => Some(&value.occurrence.file),
@@ -4165,6 +4497,15 @@ fn collect_pipeline_value_source_files(value: &PipelineValue, files: &mut BTreeS
         PipelineValue::CallEffect(value) => {
             files.insert(value.file().clone());
         }
+        PipelineValue::CallResultContract(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineValue::ResultContractUse(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineValue::ResultContractFailureUse(value) => {
+            files.insert(value.file().clone());
+        }
         PipelineValue::ProcedureEffect(value) => {
             files.insert(value.file().clone());
         }
@@ -4292,6 +4633,15 @@ fn collect_trace_value_source_files(value: &PipelineTraceValue, files: &mut BTre
             }
         }
         PipelineTraceValue::CallEffect(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineTraceValue::CallResultContract(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineTraceValue::ResultContractUse(value) => {
+            files.insert(value.file().clone());
+        }
+        PipelineTraceValue::ResultContractFailureUse(value) => {
             files.insert(value.file().clone());
         }
         PipelineTraceValue::ProcedureEffect(value) => {
@@ -4641,6 +4991,36 @@ fn detailed_trace_provenance_ref(
                 cache,
             )
         }
+        PipelineTraceValue::CallResultContract(value) => detailed_call_shape_provenance_ref(
+            DetailedCodeQueryDomain::CallResultContract,
+            DetailedCodeQueryKey::CallResultContract {
+                id: value.id.clone(),
+                site_id: value.site_id.clone(),
+            },
+            value.file(),
+            value.range,
+            cache,
+        ),
+        PipelineTraceValue::ResultContractUse(value) => detailed_call_shape_provenance_ref(
+            DetailedCodeQueryDomain::ResultContractUse,
+            DetailedCodeQueryKey::ResultContractUse {
+                id: value.id.clone(),
+                acquisition_id: value.acquisition_id.clone(),
+            },
+            value.file(),
+            value.range,
+            cache,
+        ),
+        PipelineTraceValue::ResultContractFailureUse(value) => detailed_call_shape_provenance_ref(
+            DetailedCodeQueryDomain::ResultContractFailureUse,
+            DetailedCodeQueryKey::ResultContractFailureUse {
+                id: value.id.clone(),
+                acquisition_id: value.acquisition_id.clone(),
+            },
+            value.file(),
+            value.range,
+            cache,
+        ),
         PipelineTraceValue::ProcedureEffect(value) => {
             let row = value.row();
             detailed_call_shape_provenance_ref(
@@ -5485,6 +5865,15 @@ fn pipeline_trace_value(value: &PipelineValue) -> Option<PipelineTraceValue> {
         PipelineValue::CallArgument(value) => Some(PipelineTraceValue::CallArgument(value.clone())),
         PipelineValue::CallBinding(value) => Some(PipelineTraceValue::CallBinding(value.clone())),
         PipelineValue::CallEffect(value) => Some(PipelineTraceValue::CallEffect(value.clone())),
+        PipelineValue::CallResultContract(value) => {
+            Some(PipelineTraceValue::CallResultContract(value.clone()))
+        }
+        PipelineValue::ResultContractUse(value) => {
+            Some(PipelineTraceValue::ResultContractUse(value.clone()))
+        }
+        PipelineValue::ResultContractFailureUse(value) => {
+            Some(PipelineTraceValue::ResultContractFailureUse(value.clone()))
+        }
         PipelineValue::ProcedureEffect(value) => {
             Some(PipelineTraceValue::ProcedureEffect(value.clone()))
         }

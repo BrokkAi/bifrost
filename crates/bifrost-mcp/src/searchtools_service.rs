@@ -1,4 +1,6 @@
 #[cfg(test)]
+use crate::analyzer::Language;
+#[cfg(test)]
 use crate::policy::{
     PolicyExecutionStage, PolicyExecutionTermination, PolicyReportDiagnosticCode,
     PolicySuppressionDocumentState,
@@ -8,10 +10,14 @@ use crate::searchtools::get_symbol_sources;
 use crate::{
     AnalyzerConfig, CancellationToken, FilesystemProject, Project, ProjectChangeWatcher,
     ProjectFile, WorkspaceAnalyzer, WorkspaceFileListingCache,
+    analyzer::IndexWarmer,
     analyzer::packs_document::{
         WORKSPACE_PACKS_DOCUMENT_PATH, WorkspaceActivationSources, WorkspacePacksActivation,
         WorkspacePacksConfig, activate_workspace_semantic_sources_in_catalog,
-        load_workspace_packs_config_at, workspace_pack_ecosystems,
+        bootstrap_semantic_model_catalog,
+        install_semantic_model_catalog_bootstrap as install_shared_semantic_model_catalog_bootstrap,
+        intrinsic_language_evidence, load_workspace_packs_config_at,
+        open_ambient_semantic_pack_catalog, workspace_pack_ecosystems,
     },
     analyzer::semantic::WorkspaceRelativePath,
     analyzer::semantic_model::{
@@ -20,7 +26,9 @@ use crate::{
         SemanticPackCatalog, WorkspaceSemanticModelOptions, acquire_active_semantic_models,
         register_workspace_semantic_models, workspace_semantic_models_not_active,
     },
-    analyzer::{IndexWarmer, Language},
+    blast_radius::{
+        BlastRadiusParams, MissingTestsParams, blast_radius_at_root, missing_tests_at_root,
+    },
     code_intelligence::CodeIntelligenceRuntime,
     code_quality::{
         analyze_git_hotspots, compute_cognitive_complexity, compute_cyclomatic_complexity,
@@ -29,7 +37,9 @@ use crate::{
         report_long_method_and_god_object_smells, report_secret_like_code,
         report_structural_clone_smells, report_test_assertion_smells,
     },
+    cyclomatic_complexity_diff::{CyclomaticComplexityParams, cyclomatic_complexity_at_root},
     diff_analysis::{AnalyzeDiffParams, DiffAnalysisOptions, analyze_diff_at_root},
+    diff_scoring::{ScoreDiffParams, score_diff_at_root},
     file_tools::{find_files_containing, get_file_contents, search_file_contents},
     path_normalization::NormalizePath,
     policy::{
@@ -68,7 +78,7 @@ use std::io;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -86,18 +96,11 @@ pub(crate) struct TransportTimings {
     pub(crate) analyzer_admission_wait: Duration,
 }
 
-/// Facade-owned registration hook for reviewed shipped semantic packs.
-pub type SemanticModelCatalogBootstrap = fn(&SemanticPackCatalog) -> Result<(), String>;
-
-static SEMANTIC_MODEL_CATALOG_BOOTSTRAP: OnceLock<SemanticModelCatalogBootstrap> = OnceLock::new();
-
 /// Configure the downstream shipped-pack provider once for this process.
 pub fn install_semantic_model_catalog_bootstrap(
-    bootstrap: SemanticModelCatalogBootstrap,
+    bootstrap: crate::analyzer::packs_document::SemanticModelCatalogBootstrap,
 ) -> Result<(), &'static str> {
-    SEMANTIC_MODEL_CATALOG_BOOTSTRAP
-        .set(bootstrap)
-        .map_err(|_| "semantic-model catalog bootstrap is already configured")
+    install_shared_semantic_model_catalog_bootstrap(bootstrap)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -242,7 +245,6 @@ fn activate_configured_semantic_models(
     let packs_config = load_workspace_packs_config_at(workspace_root)
         .map_err(|error| format!("failed to load workspace packs document: {error}"))?
         .map(Arc::new);
-    let bootstrap = SEMANTIC_MODEL_CATALOG_BOOTSTRAP.get().copied();
     let explicit_legacy = configured.as_ref().is_some_and(|configured| {
         configured.catalog_root.is_some() || !configured.evidence.is_empty()
     });
@@ -254,20 +256,9 @@ fn activate_configured_semantic_models(
             .as_ref()
             .is_some_and(|configured| configured.workspace_models);
         let ecosystems = workspace_pack_ecosystems(workspace, packs_config.as_deref());
-        let workspace_models_present = workspace_models
-            && std::fs::symlink_metadata(
-                workspace_root
-                    .join(crate::analyzer::semantic_model::WORKSPACE_SEMANTIC_MODEL_DIRECTORY),
-            )
-            .is_ok();
-        if ecosystems.is_empty() && !workspace_models_present {
-            return Ok(WorkspacePackActivationState {
-                config: packs_config,
-                activation: None,
-                ecosystems,
-                failure: None,
-            });
-        }
+        // Intrinsic shipped packs are independent of the dependency and
+        // workspace-local routes, so even an explicit empty ecosystem list
+        // must reach the shared bootstrap below.
         let catalog = {
             let _scope = profiling::scope("semantic_pack.open_catalog");
             match packs_config.as_ref().and_then(|config| config.catalog()) {
@@ -288,7 +279,8 @@ fn activate_configured_semantic_models(
                         });
                     }
                 },
-                None => match crate::analyzer::semantic_model::open_default_semantic_pack_catalog(
+                None => match open_ambient_semantic_pack_catalog(
+                    workspace,
                     workspace_root,
                     CatalogOptions::default(),
                 ) {
@@ -307,8 +299,10 @@ fn activate_configured_semantic_models(
             }
         };
         let mut additional_evidence = Vec::new();
-        if let Some(bootstrap) = bootstrap {
-            if let Err(error) = bootstrap(&catalog) {
+        match bootstrap_semantic_model_catalog(&catalog) {
+            Ok(true) => additional_evidence.extend(intrinsic_language_evidence(workspace)),
+            Ok(false) => {}
+            Err(error) => {
                 return Ok(WorkspacePackActivationState {
                     config: packs_config,
                     activation: None,
@@ -318,7 +312,6 @@ fn activate_configured_semantic_models(
                     )),
                 });
             }
-            additional_evidence.extend(intrinsic_language_evidence(workspace));
         }
         let activation = match activate_workspace_semantic_sources_in_catalog(
             workspace,
@@ -328,6 +321,7 @@ fn activate_configured_semantic_models(
                 catalog_root: workspace_root,
                 workspace_model_root: workspace_models.then_some(workspace_root),
                 config: packs_config.as_deref(),
+                intrinsic_shipped_models: false,
             },
             &additional_evidence,
             &CancellationToken::default(),
@@ -382,7 +376,8 @@ fn activate_configured_semantic_models(
                     catalog_root.display()
                 )
             })?,
-            None => crate::analyzer::semantic_model::open_default_semantic_pack_catalog(
+            None => open_ambient_semantic_pack_catalog(
+                workspace,
                 workspace_root,
                 CatalogOptions::default(),
             )
@@ -394,11 +389,7 @@ fn activate_configured_semantic_models(
         .into_iter()
         .map(ConfiguredSemanticModelEvidence::parse)
         .collect::<Result<Vec<_>, _>>()?;
-    if let Some(bootstrap) = bootstrap {
-        {
-            let _scope = profiling::scope("semantic_pack.bootstrap_catalog");
-            bootstrap(&catalog)?;
-        }
+    if bootstrap_semantic_model_catalog(&catalog)? {
         {
             let _scope = profiling::scope("semantic_pack.intrinsic_evidence");
             evidence.extend(intrinsic_language_evidence(workspace));
@@ -504,39 +495,6 @@ pub fn prewarm_configured_semantic_models(
     }
 }
 
-fn intrinsic_language_evidence(
-    workspace: &WorkspaceAnalyzer,
-) -> Vec<SemanticModelActivationEvidence> {
-    workspace
-        .analyzer()
-        .languages()
-        .into_iter()
-        .map(|language| SemanticModelActivationEvidence {
-            language: language.config_label().to_owned(),
-            ecosystem: intrinsic_ecosystem(language).to_owned(),
-            package: None,
-            module: None,
-            toolchain: None,
-            target: None,
-            configuration: None,
-            artifact_sha256: None,
-        })
-        .collect()
-}
-
-fn intrinsic_ecosystem(language: Language) -> &'static str {
-    match language {
-        Language::Java | Language::Scala | Language::Kotlin => "maven",
-        Language::Rust => "cargo",
-        Language::Go => "go",
-        Language::Python => "pypi",
-        Language::Ruby => "rubygems",
-        Language::JavaScript | Language::TypeScript => "npm",
-        Language::CSharp => "nuget",
-        Language::Cpp | Language::Php | Language::None => "language",
-    }
-}
-
 #[cfg(test)]
 mod workspace_semantic_model_configuration_tests {
     use super::*;
@@ -590,8 +548,9 @@ mod workspace_semantic_model_configuration_tests {
         std::fs::write(model_root.join("job-maker.json"), source).unwrap();
         let root = temp.path().canonicalize().unwrap().normalize();
         let project: Arc<dyn Project> = Arc::new(FilesystemProject::new(root).unwrap());
-        let analyzer = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
-            .expect("ephemeral test workspace should build");
+        let analyzer =
+            WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
+                .expect("ephemeral test workspace should build");
         (temp, analyzer)
     }
 
@@ -616,8 +575,9 @@ mod workspace_semantic_model_configuration_tests {
         .unwrap();
         let root = temp.path().canonicalize().unwrap().normalize();
         let project: Arc<dyn Project> = Arc::new(FilesystemProject::new(root.clone()).unwrap());
-        let analyzer = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
-            .expect("ephemeral test workspace should build");
+        let analyzer =
+            WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
+                .expect("ephemeral test workspace should build");
 
         // No environment variables, no host options: the document alone is
         // the opt-in, so a bound MCP session activates the same packs the LSP
@@ -642,8 +602,9 @@ mod workspace_semantic_model_configuration_tests {
         std::fs::write(temp.path().join("src/lib.rs"), "pub struct Local;\n").unwrap();
         let root = temp.path().canonicalize().unwrap().normalize();
         let project: Arc<dyn Project> = Arc::new(FilesystemProject::new(root.clone()).unwrap());
-        let analyzer = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
-            .expect("ephemeral test workspace should build");
+        let analyzer =
+            WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
+                .expect("ephemeral test workspace should build");
 
         let state = activate_configured_semantic_models(&root, &analyzer, None).unwrap();
         assert!(state.config.is_none());
@@ -2268,8 +2229,19 @@ impl SearchToolsService {
         Self::new_lazy_with_strategy(root, UpdateStrategy::WatchFiles)
     }
 
-    /// Construct with no file watcher. This is useful for immutable,
-    /// short-lived workspaces such as inline test fixtures.
+    /// Construct with no file watcher and ephemeral analyzer and semantic-pack
+    /// caches, for immutable short-lived workspaces such as inline fixtures.
+    /// An explicit catalog or cache environment override still opts into
+    /// persistence outside this constructor's default.
+    ///
+    /// Test-only, and gated so it cannot become production API by accident: it
+    /// had no production caller, and a service over a live root should build the
+    /// persisted cache that [`Self::new_manual_persisted`] gives it. A
+    /// `cfg(test)` item is invisible across a crate boundary and the integration
+    /// suites under the workspace root need this one, so they reach it through
+    /// this crate's `test-support` feature, the same gate `brokk-bifrost-core`
+    /// uses for `gitblob::test_repo`.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new_manual_ephemeral(root: PathBuf) -> Result<Self, String> {
         Self::new_ephemeral_with_strategy(root, UpdateStrategy::Manual)
     }
@@ -2280,42 +2252,107 @@ impl SearchToolsService {
         Self::new_with_strategy(root, UpdateStrategy::Manual)
     }
 
-    /// Whether a tool is a pure function of its Git endpoints and never reads
-    /// the live workspace analyzer.
+    /// Whether a tool's answer is a pure function of its Git endpoints and
+    /// never reads the live workspace analyzer.
     ///
-    /// `analyze_diff` is such a tool: it builds its own ephemeral per-endpoint
-    /// analyzers (see `diff_analysis::build_analyzer`) and is dispatched before
-    /// `snapshot_for_query` is ever consulted. Booting a persisted whole-repo
-    /// workspace to serve it is pure waste.
+    /// The diff tools are such tools: each builds its own per-endpoint analyzers
+    /// over revision images and is dispatched before `snapshot_for_query` is
+    /// ever consulted, so booting a persisted whole-repo workspace to serve one
+    /// is pure waste. `score_diff` derives from the same endpoint analyzers and
+    /// adds one over the whole target revision, so it reads the live workspace
+    /// no more than its siblings do.
+    ///
+    /// Independent means "does not read the live workspace", not "writes
+    /// nothing". An immutable endpoint's revision image publishes the blobs it
+    /// parses into the repository's shared content-addressed analyzer cache,
+    /// which is the point: the next consumer of those blobs, revision or
+    /// worktree, reads them instead of parsing them. What the image does not
+    /// leave behind is any workspace projection row naming its temporary export
+    /// directory; a request-scoped lease removes those when the request ends.
     pub fn tool_is_workspace_independent(name: &str) -> bool {
-        name == "analyze_diff"
+        matches!(
+            name,
+            "analyze_diff"
+                | "blast_radius"
+                | "cyclomatic_complexity"
+                | "missing_tests"
+                | "score_diff"
+        )
     }
 
-    /// Lazy, watcher-less service whose workspace is never built
-    /// unless a query forces it. The one-shot CLI uses this for
-    /// [workspace-independent tools](Self::tool_is_workspace_independent): the
-    /// deferred `session` (`None`) is never materialized, so no whole-repo
-    /// analyzer is built and nothing is persisted to the cache database.
-    pub fn new_workspace_independent(root: PathBuf) -> Result<Self, String> {
-        Self::new_lazy_with_strategy(root, UpdateStrategy::Manual)
+    /// Lazy, watcher-less service for a one-shot `--tool` process whose tool is
+    /// [workspace-independent](Self::tool_is_workspace_independent): the
+    /// deferred `session` (`None`) is never materialized unless a query forces
+    /// it, so no whole-repo analyzer is built. What this saves is parsing the
+    /// whole repository to answer a question scoped to one diff; the tool's own
+    /// revision-image analyzers may still warm the shared cache with the blobs
+    /// they parse.
+    ///
+    /// It carries a listing cache for the same reason
+    /// [`Self::new_one_shot`] does, and only because it is one-shot: a process
+    /// that exits cannot observe a change it would need to invalidate for, so
+    /// one walk serves every consumer. That reasoning does not extend to a
+    /// long-lived `Manual` service (the stdio server under
+    /// `BIFROST_MCP_FILE_WATCHER=off`), which has no watcher to invalidate a
+    /// cache and must keep answering listing-backed tools from a fresh walk --
+    /// hence [`listing_cache_for`] still refuses one there.
+    ///
+    /// The cache is not academic on this path. A worktree endpoint forces the
+    /// lazy build after all, and with no cache `FilesystemProject::all_files`
+    /// re-walks the tree per call: on Godot the C++ claim round's ignore probe
+    /// alone re-walked 129 times and cost 9.3 seconds.
+    pub fn new_one_shot_workspace_independent(root: PathBuf) -> Result<Self, String> {
+        Self::new_one_shot_workspace_independent_with_watcher_starter(
+            root,
+            production_watcher_starter(),
+        )
     }
 
-    /// Construct a manual service over `project` with an
-    /// ephemeral (non-persisted) analyzer cache and a caller-supplied analyzer
-    /// config. One-shot audit drivers (the MCP property fuzzer) use this:
-    /// nothing is written into the target checkout, and because every file is
-    /// parsed fresh, session-only evidence such as tree-sitter ERROR nodes
-    /// (`IAnalyzer::parse_errors`) is available for the whole workspace.
-    pub fn new_manual_ephemeral_for_project(
+    fn new_one_shot_workspace_independent_with_watcher_starter(
+        root: PathBuf,
+        watcher_starter: WatcherStarter,
+    ) -> Result<Self, String> {
+        let canonical = canonical_service_root(root)?;
+        let file_listing = Some(Arc::new(WorkspaceFileListingCache::new(canonical.clone())));
+        Ok(Self::lazy(
+            canonical,
+            file_listing,
+            UpdateStrategy::Manual,
+            watcher_starter,
+        ))
+    }
+
+    /// Construct a manual service over `project` with an ephemeral
+    /// (non-persisted) analyzer cache and a caller-supplied analyzer config.
+    ///
+    /// Named a footgun because it usually is one: an ephemeral cache is deleted
+    /// when the service drops, so every run re-parses and re-persists the whole
+    /// workspace from nothing.
+    /// [`Self::new_manual_persisted_for_project`] instead reuses
+    /// content-addressed blobs across runs, and over a project with no
+    /// persistence root it errors rather than quietly opening the store this
+    /// constructor opens, so an ephemeral cache is always an explicit choice.
+    /// See [`WorkspaceAnalyzer::build_ephemeral_footgun`] for the full rule.
+    ///
+    /// Two callers legitimately want it. One-shot audit drivers (the MCP
+    /// property fuzzer) get two things at once: absent an explicit catalog or
+    /// cache override, nothing is written into the target checkout, which
+    /// matters when the operator does not own it, and
+    /// because every file is parsed fresh, session-only evidence such as
+    /// tree-sitter ERROR nodes (`IAnalyzer::parse_errors`) is available for the
+    /// whole workspace rather than only for the blobs that missed the cache.
+    /// Scoped sessions ([`crate::scoped_project`]) want it because their partial
+    /// file set must not become the workspace's persisted picture of itself.
+    pub fn new_manual_ephemeral_footgun_for_project(
         project: Arc<dyn Project>,
         config: AnalyzerConfig,
     ) -> Result<Self, String> {
-        let workspace = WorkspaceAnalyzer::build_ephemeral(Arc::clone(&project), config)
+        let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(Arc::clone(&project), config)
             .map_err(|error| format!("Failed to build ephemeral workspace: {error}"))?;
         Self::new_manual_from_workspace(project, workspace)
     }
 
-    /// Persisted-cache sibling of [`Self::new_manual_ephemeral_for_project`]
+    /// Persisted-cache sibling of [`Self::new_manual_ephemeral_footgun_for_project`]
     /// for warmed, resumable campaigns. Session-only evidence (tree-sitter
     /// ERROR nodes) is unavailable for files served from the warm cache.
     pub fn new_manual_persisted_for_project(
@@ -2725,6 +2762,98 @@ impl SearchToolsService {
                 .map_err(SearchToolsServiceError::internal)?,
             );
         }
+        if name == "cyclomatic_complexity" {
+            let params =
+                serde_json::from_value::<CyclomaticComplexityParams>(arguments).map_err(|err| {
+                    SearchToolsServiceError::invalid_params(format!(
+                        "Invalid tool arguments: {err}"
+                    ))
+                })?;
+            let root = self.service_root()?;
+            let result = cyclomatic_complexity_at_root(
+                &root,
+                params,
+                &DiffAnalysisOptions {
+                    snapshot_object_dir: self.diff_snapshot_object_dir.clone(),
+                },
+            )
+            .map_err(SearchToolsServiceError::internal)?;
+            return Self::rendered_structured(result, render_options);
+        }
+        if name == "blast_radius"
+            && arguments
+                .get("target")
+                .and_then(Value::as_str)
+                .is_some_and(|target| !target.trim().is_empty())
+        {
+            let params = serde_json::from_value::<BlastRadiusParams>(arguments).map_err(|err| {
+                SearchToolsServiceError::invalid_params(format!("Invalid tool arguments: {err}"))
+            })?;
+            params
+                .validate()
+                .map_err(SearchToolsServiceError::invalid_params)?;
+            let root = self.service_root()?;
+            let uncancelled = CancellationToken::default();
+            let result = blast_radius_at_root(
+                &root,
+                None,
+                params,
+                &DiffAnalysisOptions {
+                    snapshot_object_dir: self.diff_snapshot_object_dir.clone(),
+                },
+                cancellation.unwrap_or(&uncancelled),
+            )
+            .map_err(SearchToolsServiceError::internal)?;
+            return Self::rendered_structured(result, render_options);
+        }
+        if name == "missing_tests"
+            && arguments
+                .get("target")
+                .and_then(Value::as_str)
+                .is_some_and(|target| !target.trim().is_empty())
+        {
+            let params =
+                serde_json::from_value::<MissingTestsParams>(arguments).map_err(|err| {
+                    SearchToolsServiceError::invalid_params(format!(
+                        "Invalid tool arguments: {err}"
+                    ))
+                })?;
+            let root = self.service_root()?;
+            let uncancelled = CancellationToken::default();
+            let result = missing_tests_at_root(
+                &root,
+                None,
+                params,
+                &DiffAnalysisOptions {
+                    snapshot_object_dir: self.diff_snapshot_object_dir.clone(),
+                },
+                cancellation.unwrap_or(&uncancelled),
+            )
+            .map_err(SearchToolsServiceError::internal)?;
+            return Self::rendered_structured(result, render_options);
+        }
+        if name == "score_diff" {
+            let params = serde_json::from_value::<ScoreDiffParams>(arguments).map_err(|err| {
+                SearchToolsServiceError::invalid_params(format!("Invalid tool arguments: {err}"))
+            })?;
+            let root = self.service_root()?;
+            let uncancelled = CancellationToken::default();
+            return Self::structured_only(
+                score_diff_at_root(
+                    &root,
+                    params,
+                    &DiffAnalysisOptions {
+                        snapshot_object_dir: self.diff_snapshot_object_dir.clone(),
+                    },
+                    // The whole-target-revision reference scan is the long pole
+                    // of this tool, so it runs under the caller's token rather
+                    // than a fresh one: a client that cancelled the tool call
+                    // must be able to stop the scan.
+                    cancellation.unwrap_or(&uncancelled),
+                )
+                .map_err(SearchToolsServiceError::internal)?,
+            );
+        }
         if name == "query_code" {
             let prepared = self.prepare_query_code(arguments, cancellation)?;
             return self.execute_prepared_query_code_with_transport_timings(
@@ -2781,6 +2910,8 @@ impl SearchToolsService {
                 name,
                 "search_symbols"
                     | "most_relevant_files"
+                    | "blast_radius"
+                    | "missing_tests"
                     | "scan_usages_by_reference"
                     | "scan_usages_by_location"
             )
@@ -2857,6 +2988,41 @@ impl SearchToolsService {
                     error
                 }
             }),
+            "blast_radius" => Self::decode_render_and_try_run(
+                &snapshot,
+                arguments,
+                render_options,
+                |workspace, params: BlastRadiusParams| {
+                    params.validate()?;
+                    let uncancelled = CancellationToken::default();
+                    blast_radius_at_root(
+                        workspace.analyzer().project().root(),
+                        Some(workspace.analyzer()),
+                        params,
+                        &DiffAnalysisOptions {
+                            snapshot_object_dir: self.diff_snapshot_object_dir.clone(),
+                        },
+                        cancellation.unwrap_or(&uncancelled),
+                    )
+                },
+            ),
+            "missing_tests" => Self::decode_render_and_try_run(
+                &snapshot,
+                arguments,
+                render_options,
+                |workspace, params: MissingTestsParams| {
+                    let uncancelled = CancellationToken::default();
+                    missing_tests_at_root(
+                        workspace.analyzer().project().root(),
+                        Some(workspace.analyzer()),
+                        params,
+                        &DiffAnalysisOptions {
+                            snapshot_object_dir: self.diff_snapshot_object_dir.clone(),
+                        },
+                        cancellation.unwrap_or(&uncancelled),
+                    )
+                },
+            ),
             "scan_usages_by_reference" => {
                 Self::validate_scan_usages_by_reference_arguments(&arguments)?;
                 Self::decode_render_and_run(
@@ -3493,6 +3659,7 @@ impl SearchToolsService {
         })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn new_ephemeral_with_strategy(
         root: PathBuf,
         update_strategy: UpdateStrategy,
@@ -3504,6 +3671,7 @@ impl SearchToolsService {
         )
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn new_ephemeral_with_strategy_and_watcher_starter(
         root: PathBuf,
         update_strategy: UpdateStrategy,
@@ -3556,7 +3724,26 @@ impl SearchToolsService {
     ) -> Result<Self, String> {
         let canonical = canonical_service_root(root)?;
         let file_listing = listing_cache_for(update_strategy, &canonical);
-        Ok(Self {
+        Ok(Self::lazy(
+            canonical,
+            file_listing,
+            update_strategy,
+            watcher_starter,
+        ))
+    }
+
+    /// A service with no session yet, whose listing cache is a parameter rather
+    /// than a function of `update_strategy` -- the same split
+    /// [`Self::new_synchronous`] makes, and for the same reason: a one-shot
+    /// process wants the cache without the watcher that normally invalidates
+    /// it.
+    fn lazy(
+        canonical: PathBuf,
+        file_listing: Option<Arc<WorkspaceFileListingCache>>,
+        update_strategy: UpdateStrategy,
+        watcher_starter: WatcherStarter,
+    ) -> Self {
+        Self {
             root: RwLock::new(Some(canonical)),
             session: RwLock::new(None),
             workspace_generation: AtomicU64::new(1),
@@ -3571,7 +3758,7 @@ impl SearchToolsService {
             startup_index_warm: StartupIndexWarm::OnDemand,
             watcher_starter,
             diff_snapshot_object_dir: None,
-        })
+        }
     }
 
     /// Construct the searchtools service without blocking on the initial
@@ -4627,6 +4814,11 @@ impl SearchToolsService {
         arguments: &Value,
         tool_name: &str,
     ) -> Result<(), SearchToolsServiceError> {
+        if arguments.get("max_duration_secs").is_some() {
+            return Err(SearchToolsServiceError::invalid_params(format!(
+                "{tool_name} does not accept `max_duration_secs`; deadline policy belongs to the frontend"
+            )));
+        }
         if arguments
             .get("include_tests")
             .is_some_and(|value| !value.is_boolean())
@@ -4650,14 +4842,6 @@ impl SearchToolsService {
         }) {
             return Err(SearchToolsServiceError::invalid_params(format!(
                 "{tool_name} requires `paths` to be an array of strings"
-            )));
-        }
-        if arguments
-            .get("max_duration_secs")
-            .is_some_and(|value| !value.is_u64())
-        {
-            return Err(SearchToolsServiceError::invalid_params(format!(
-                "{tool_name} requires `max_duration_secs` to be a non-negative integer"
             )));
         }
         Ok(())
@@ -5058,6 +5242,20 @@ impl SearchToolsService {
         })
     }
 
+    fn rendered_structured<R: Serialize + RenderText>(
+        result: R,
+        render_options: RenderOptions,
+    ) -> Result<ToolOutput, SearchToolsServiceError> {
+        let rendered_text = result.render_text(render_options);
+        let structured = serde_json::to_value(result).map_err(|err| {
+            SearchToolsServiceError::internal(format!("Failed to serialize tool result: {err}"))
+        })?;
+        Ok(ToolOutput::Structured {
+            structured,
+            rendered_text: Some(rendered_text),
+        })
+    }
+
     fn read_session(
         &self,
     ) -> Result<std::sync::RwLockReadGuard<'_, Option<WorkspaceSession>>, SearchToolsServiceError>
@@ -5158,6 +5356,11 @@ fn strip_legacy_kind_filter(mut arguments: Value) -> Value {
 /// The shared workspace file listing cache for a root about to be bound, or
 /// `None` under `Manual`: manual sessions have no watcher to invalidate a
 /// cache, so they keep answering listing-backed tools from a fresh walk.
+///
+/// A one-shot process is the exception and does not come through here: it
+/// constructs its own cache ([`SearchToolsService::new_one_shot`],
+/// [`SearchToolsService::new_one_shot_workspace_independent`]) because it
+/// exits before any change could need invalidating.
 fn listing_cache_for(
     update_strategy: UpdateStrategy,
     root: &Path,
@@ -5231,13 +5434,16 @@ fn build_persisted_analyzer(
     }
 }
 
+/// Test-only, with [`SearchToolsService::new_manual_ephemeral`]: the only chain
+/// that reaches it is gated the same way.
+#[cfg(any(test, feature = "test-support"))]
 fn build_ephemeral_workspace(
     root: PathBuf,
     listing: Option<Arc<WorkspaceFileListingCache>>,
 ) -> Result<(Arc<dyn Project>, WorkspaceAnalyzer), String> {
     let project = build_project(root, listing)?;
     let workspace =
-        WorkspaceAnalyzer::build_ephemeral(Arc::clone(&project), AnalyzerConfig::default())
+        WorkspaceAnalyzer::build_ephemeral_footgun(Arc::clone(&project), AnalyzerConfig::default())
             .map_err(|error| format!("Failed to build ephemeral workspace: {error}"))?;
     Ok((project, workspace))
 }
@@ -5386,6 +5592,14 @@ mod watcher_startup_tests {
     fn workspace(file: &str, source: &str) -> (tempfile::TempDir, PathBuf) {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join(file), source).unwrap();
+        // Watcher/session tests do not exercise dependency-pack activation.
+        // Keep their persisted workspace build independent of the host JDK.
+        std::fs::create_dir_all(temp.path().join(".bifrost")).unwrap();
+        std::fs::write(
+            temp.path().join(".bifrost/packs.json"),
+            r#"{ "schema_version": 1, "ecosystems": [] }"#,
+        )
+        .unwrap();
         let root = temp.path().canonicalize().unwrap().normalize();
         (temp, root)
     }
@@ -5479,6 +5693,77 @@ mod watcher_startup_tests {
             1,
             listing.walk_count(),
             "the workspace must be walked once for the whole process"
+        );
+    }
+
+    /// A workspace-independent one-shot tool is lazy, but "lazy" is not "never
+    /// built": a worktree endpoint forces the build after all, and every
+    /// ignore probe inside it then re-walked the whole tree. On Godot one
+    /// claim round's `claim.bifrostignore_probe[124 files]` span cost 9.3
+    /// seconds in 129 walks. The walk count is the observable form of that
+    /// defect, so it is what this pins.
+    #[test]
+    fn a_workspace_independent_one_shot_service_walks_the_workspace_once() {
+        let (_temp, root) = workspace("Independent.java", "class Independent {}\n");
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let service = SearchToolsService::new_one_shot_workspace_independent_with_watcher_starter(
+            root,
+            failing_starter(Arc::clone(&calls)),
+        )
+        .unwrap();
+        assert!(
+            service.session.read().unwrap().is_none(),
+            "the workspace-independent service must not build a session eagerly"
+        );
+
+        // A worktree endpoint forces the lazy build; `get_active_workspace` is
+        // the cheapest thing that does.
+        service
+            .call_tool_value("get_active_workspace", json!({}))
+            .expect("the lazy workspace should build");
+        {
+            let guard = service.session.read().unwrap();
+            let project = guard
+                .as_ref()
+                .expect("the forced build installs a session")
+                .snapshot
+                .analyzer()
+                .project();
+            for _ in 0..8 {
+                project.is_bifrostignored(Path::new("Independent.java"));
+            }
+        }
+
+        assert_eq!(
+            0,
+            calls.load(Ordering::SeqCst),
+            "a one-shot process must not install a file watcher"
+        );
+        let listing = service
+            .file_listing
+            .read()
+            .unwrap()
+            .clone()
+            .expect("a one-shot workspace-independent service shares one listing cache");
+        assert_eq!(
+            1,
+            listing.walk_count(),
+            "the workspace must be walked once for the whole process"
+        );
+    }
+
+    /// The other side of the distinction above: a long-lived `Manual` service
+    /// (the stdio server under `BIFROST_MCP_FILE_WATCHER=off`) has no watcher
+    /// to invalidate a listing cache, so it must not carry one -- a stale
+    /// listing there is user-visible across requests.
+    #[test]
+    fn a_long_lived_manual_service_carries_no_listing_cache() {
+        let (_temp, root) = workspace("Manual.java", "class Manual {}\n");
+        let service = SearchToolsService::new_deferred_manual(root).unwrap();
+        assert!(
+            service.file_listing.read().unwrap().is_none(),
+            "a long-lived manual service must keep re-walking; it cannot invalidate a cache"
         );
     }
 
@@ -6973,7 +7258,7 @@ public partial class MudDialogContainer
     fn stale_analyzer_and_manual_service_keep_generation_consistent_source() {
         let (_temp, root) = write_project();
         let (project, workspace) = build_ephemeral_workspace(root.clone(), None).unwrap();
-        let manual = SearchToolsService::new_manual_ephemeral_for_project(
+        let manual = SearchToolsService::new_manual_ephemeral_footgun_for_project(
             project,
             AnalyzerConfig::default(),
         )
@@ -7230,6 +7515,10 @@ mod client_roots_tests {
 
         assert_eq!(result["total_files"], 1, "{result:#}");
         assert!(!cache_db_for(&root).exists());
+        assert!(
+            !root.join(crate::gitblob::PROJECT_DIR_NAME).exists(),
+            "an ephemeral service must not create any generated checkout state"
+        );
     }
 
     /// A client-bound linked worktree resolves its cache the way every other

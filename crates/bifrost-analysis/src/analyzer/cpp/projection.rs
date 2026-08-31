@@ -5,7 +5,7 @@
 //! of a header blob when they disagree -- the `cpp` row-set and, under the
 //! `cpp:c` storage language key, the C row-set where a tag declared inside an
 //! aggregate member list has file scope (C17 6.2.1). See
-//! [`crate::analyzer::cpp::adapter::CppAdapter::additional_projections`].
+//! [`crate::analyzer::cpp::adapter::CppAdapter::parse_file_with_projections`].
 //!
 //! What lives here is the *reading selector*: which of the two a given
 //! reference sees, which extra identities the workspace index therefore
@@ -138,21 +138,7 @@ impl CppAnalyzer {
     /// branch or a Rust-side workspace index.
     pub(crate) fn sync_published_c_reading_workspace(&self) {
         let scope = AnalyzerQueryScope::new(self);
-        let token = scope.token();
-        let analyzed_files = self.inner.analyzed_files();
-        let has_c_translation_unit = analyzed_files.iter().any(is_c_source_file);
-        let files = analyzed_files
-            .into_iter()
-            .filter(|file| {
-                is_c_source_file(file)
-                    || (has_c_translation_unit
-                        && !imports::is_cpp_translation_unit(file)
-                        && matches!(
-                            self.header_language_attribution(token, file),
-                            HeaderLanguageAttribution::C | HeaderLanguageAttribution::Mixed
-                        ))
-            })
-            .collect::<Vec<_>>();
+        let files = self.c_reading_workspace_files(scope.token());
         if let Err(error) = self
             .inner
             .sync_content_reading_workspace_files(CPP_C_STORAGE_LANGUAGE_KEY, &files)
@@ -161,6 +147,37 @@ impl CppAnalyzer {
                 error.context("publishing C header readings in the workspace snapshot"),
             );
         }
+    }
+
+    /// Exactly the files the `cpp:c` mount publishes: every C translation unit,
+    /// plus -- when the workspace has one at all -- every header some
+    /// translation unit provably compiles as C.
+    ///
+    /// The second half is one boolean per file, so it asks
+    /// [`CppAnalyzer::files_compiled_as_c`] for the boolean.
+    /// `header_language_attribution` answers the same question, but through the
+    /// per-file reaching-translation-unit sets, and materializing those cost
+    /// 1,887,205 memberships and 10.2 seconds on every warm Godot startup to
+    /// produce 8,356 booleans. The two must agree file for file; that is what
+    /// `predicate_agrees_with_the_transitive_index_over_a_mixed_workspace` and
+    /// `the_mount_publishes_the_same_files_the_attribution_would` check.
+    pub(super) fn c_reading_workspace_files(&self, token: QueryToken<'_>) -> Vec<ProjectFile> {
+        let analyzed_files = self.inner.analyzed_files();
+        let has_c_translation_unit = analyzed_files.iter().any(is_c_source_file);
+        let candidates = if has_c_translation_unit {
+            analyzed_files
+                .iter()
+                .filter(|file| !is_c_source_file(file) && !imports::is_cpp_translation_unit(file))
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let compiled_as_c = self.files_compiled_as_c(token, &candidates);
+        analyzed_files
+            .into_iter()
+            .filter(|file| is_c_source_file(file) || compiled_as_c.contains(file))
+            .collect()
     }
 
     /// The C reading of `file`'s blob, or `None` when the two readings agree

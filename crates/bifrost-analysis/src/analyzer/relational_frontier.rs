@@ -754,6 +754,26 @@ mod tests {
     }
 
     #[test]
+    fn failed_item_batch_never_returns_the_provisional_result() {
+        use crate::analyzer::RelationalBatchError;
+
+        let question = package_question("failed");
+        let frontier = Arc::new(RecordingRelationalFrontier::default());
+        let outcome = resolve_relational_items_with_barriers(
+            &frontier,
+            &CancellationToken::new(),
+            &["failed"],
+            |_requests| RelationalBatchOutcome::Failed(RelationalBatchError::new("injected")),
+            |_item, answers| exists(answers.as_ref(), &question),
+        );
+
+        assert!(matches!(
+            outcome,
+            RelationalItemFrontierOutcome::Failed(error) if error.message() == "injected"
+        ));
+    }
+
+    #[test]
     fn one_request_session_reuses_installed_answers_across_computations() {
         let first = package_question("first");
         let second = package_question("second");

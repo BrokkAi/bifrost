@@ -1136,7 +1136,6 @@ fn issue_1228_source_budget_never_reports_verified_absence() {
             include_tests: true,
             paths: None,
             include_same_owner: true,
-            max_duration_secs: None,
         },
         &context,
     );
@@ -1190,7 +1189,6 @@ fn issue_1228_time_budget_is_explicit_and_never_reports_verified_absence() {
             include_tests: true,
             paths: None,
             include_same_owner: true,
-            max_duration_secs: None,
         },
         &context,
     );

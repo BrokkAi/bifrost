@@ -13,16 +13,190 @@ use crate::hash::HashMap;
 
 use super::{
     WorkspaceSemanticOracle, common::Interruption, common::WorkStager,
-    heap::points_to_capability_surface_is_incomplete,
+    dispatch::PreparedWorkspaceDispatchSession, heap::points_to_capability_surface_is_incomplete,
 };
 use crate::analyzer::semantic::{
-    AbstractObject, CallSiteHandle, CandidateCoverage, DispatchCandidate, DispatchOracle,
-    DispatchResult, HeapOracle, ObservationPhase, OracleCallContext, OracleCandidate,
-    PointsToResult, SemanticArtifact, SemanticBudgetExceeded, SemanticCapability, SemanticOutcome,
-    SemanticProviderError, SemanticRequest, SemanticWork, SourceSpan, ValueAtPoint, ValueHandle,
+    AbstractObject, CallSiteHandle, CandidateCoverage, DispatchCandidate, DispatchResult,
+    HeapOracle, ObservationPhase, OracleCallContext, OracleCandidate, PointsToResult,
+    SemanticArtifact, SemanticBudgetExceeded, SemanticBudgetScopeIdentity, SemanticCapability,
+    SemanticOutcome, SemanticProviderError, SemanticRequest, SemanticWork, SourceSpan,
+    ValueAtPoint, ValueHandle,
 };
 
-impl WorkspaceSemanticOracle<'_> {
+/// A lazy file-window dispatch session over one immutable semantic artifact.
+///
+/// Source ranges need not be known up front. Each range is projected only when
+/// requested, and each resulting call is dispatched serially. The first real
+/// call initializes the exact-source parse session; skipped rows perform no
+/// low-level work and cannot desynchronize later rows. That first demand also
+/// freezes the caller source for the rest of this query-scoped file window;
+/// later demands deliberately reuse it even if a live editor overlay changes.
+/// Reuse is valid only inside one logical [`crate::analyzer::semantic::SemanticBudget`]
+/// scope, so a fresh independent request cannot inherit work paid elsewhere.
+#[doc(hidden)]
+pub struct PreparedSourceDispatchSession<'a> {
+    oracle: WorkspaceSemanticOracle<'a>,
+    materialized: SemanticOutcome<Arc<SemanticArtifact>>,
+    pending_materialization_work: SemanticWork,
+    budget_scope: Option<SemanticBudgetScopeIdentity>,
+    calls: Option<PreparedWorkspaceDispatchSession<'a>>,
+}
+
+impl PreparedSourceDispatchSession<'_> {
+    /// Conservative physical footprint retained only for this prepared file
+    /// window. The artifact itself is accounted by its lease owner.
+    #[doc(hidden)]
+    pub fn retained_bytes(&self) -> usize {
+        self.calls
+            .as_ref()
+            .map_or(0, PreparedWorkspaceDispatchSession::retained_bytes)
+    }
+
+    #[doc(hidden)]
+    pub fn resolve_at_source(
+        &mut self,
+        range: Range,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<SourceDispatchResult>, SemanticProviderError> {
+        if !request.cancellation.is_cancelled() {
+            match &self.budget_scope {
+                Some(scope) if !request.budget.shares_scope_with(scope) => {
+                    return Err(SemanticProviderError::invalid_identity(
+                        "prepared source dispatch cannot cross semantic budget scopes",
+                    ));
+                }
+                Some(_) => {}
+                None => self.budget_scope = Some(request.budget.scope_identity()),
+            }
+        }
+        let mut quality = SourceOutcomeQuality::from_outcome(&self.materialized);
+        // Materialization happened once before this file session opened. Its
+        // outcome quality applies to every projection, but its physical work
+        // is reported only by the first projection that consumes the session.
+        let mut work = std::mem::take(&mut self.pending_materialization_work);
+        let Some(artifact) = self.materialized.available_value().cloned() else {
+            return Ok(quality.publish(None, work));
+        };
+
+        let mut staged = WorkStager::new(request);
+        let projection = source_call_sites(
+            &artifact,
+            range,
+            self.oracle.limits.source_observations(),
+            &mut staged,
+            request.cancellation,
+        );
+        work = work.conservative_add(staged.work);
+        let (calls, calls_truncated) = match projection {
+            Ok(_) if request.cancellation.is_cancelled() => {
+                return Ok(SemanticOutcome::Cancelled {
+                    partial: None,
+                    work,
+                });
+            }
+            Ok(projection) => projection,
+            Err(Interruption::Budget(exceeded)) => {
+                return Ok(SemanticOutcome::ExceededBudget {
+                    partial: None,
+                    exceeded,
+                    work,
+                });
+            }
+            Err(Interruption::Cancelled) => {
+                return Ok(SemanticOutcome::Cancelled {
+                    partial: None,
+                    work,
+                });
+            }
+        };
+        *request.budget = staged.budget;
+        if calls.is_empty() {
+            quality.absorb(SourceOutcomeQuality::Unknown);
+            return Ok(quality.publish(None, work));
+        }
+        if calls_truncated {
+            quality.absorb(SourceOutcomeQuality::Unproven);
+        }
+
+        let mut observations = Vec::with_capacity(calls.len());
+        let mut all_results_exhaustive = true;
+        let mut any_result_truncated = false;
+        let call_count = calls.len();
+        for (index, call) in calls.into_iter().enumerate() {
+            let outcome = self
+                .calls
+                .as_mut()
+                .expect("an available artifact owns a dispatch session")
+                .resolve_call(&call, request)?;
+            work = work.conservative_add(outcome.work());
+            quality.absorb(SourceOutcomeQuality::from_outcome(&outcome));
+            if let Some(result) = outcome.available_value() {
+                all_results_exhaustive &= result.coverage().is_exhaustive();
+                any_result_truncated |= result.coverage().is_truncated();
+                observations.push(SourceDispatchObservation {
+                    call,
+                    dispatch: result.clone(),
+                });
+            } else {
+                all_results_exhaustive = false;
+            }
+            if matches!(
+                outcome,
+                SemanticOutcome::Cancelled { .. } | SemanticOutcome::ExceededBudget { .. }
+            ) {
+                all_results_exhaustive &= index + 1 == call_count;
+                break;
+            }
+        }
+
+        let coverage = if calls_truncated || any_result_truncated {
+            CandidateCoverage::Truncated
+        } else if all_results_exhaustive
+            && !matches!(
+                quality,
+                SourceOutcomeQuality::Unknown
+                    | SourceOutcomeQuality::Unsupported(_)
+                    | SourceOutcomeQuality::ExceededBudget(_)
+                    | SourceOutcomeQuality::Cancelled
+            )
+        {
+            CandidateCoverage::Exhaustive
+        } else {
+            CandidateCoverage::Open
+        };
+        // Aggregate coverage does not feed back into quality. Each delegated
+        // call already classified its own open or truncated answer; only
+        // source-observation omission introduced by this seam is absorbed
+        // above.
+        let result = (!observations.is_empty()).then(|| SourceDispatchResult {
+            observations: observations.into_boxed_slice(),
+            coverage,
+        });
+        Ok(quality.publish(result, work))
+    }
+}
+
+impl<'a> WorkspaceSemanticOracle<'a> {
+    /// Open a source dispatch session without reading or parsing source.
+    #[doc(hidden)]
+    pub fn prepare_source_dispatch_session_in_artifact(
+        &self,
+        materialized: SemanticOutcome<Arc<SemanticArtifact>>,
+    ) -> PreparedSourceDispatchSession<'a> {
+        let pending_materialization_work = materialized.work();
+        let calls = materialized
+            .available_value()
+            .cloned()
+            .map(|artifact| self.prepare_call_dispatch_session(artifact));
+        PreparedSourceDispatchSession {
+            oracle: self.clone(),
+            materialized,
+            pending_materialization_work,
+            budget_scope: None,
+            calls,
+        }
+    }
+
     /// Resolve every retained point-sensitive value observation for the
     /// narrowest semantic source mapping that contains `range`.
     ///
@@ -153,7 +327,8 @@ impl WorkspaceSemanticOracle<'_> {
     /// a source position and delegates each one to the handle-keyed dispatch
     /// oracle. Per-candidate proof, completeness, provenance, typed boundaries,
     /// and each call site's own [`CandidateCoverage`] are retained exactly as
-    /// [`DispatchOracle::resolve_call`] reports them.
+    /// [`crate::analyzer::semantic::DispatchOracle::resolve_call`] reports
+    /// them.
     ///
     /// One source range can address several call sites when a procedure is
     /// path-specialized or when equally narrow mappings coincide, so each
@@ -179,108 +354,27 @@ impl WorkspaceSemanticOracle<'_> {
         let materialized = self
             .workspace
             .materialize_program_semantics(file, request)?;
-        let mut quality = SourceOutcomeQuality::from_outcome(&materialized);
-        let mut work = materialized.work();
-        let Some(artifact) = materialized.available_value().cloned() else {
-            return Ok(source_outcome_without_value(materialized));
-        };
+        self.dispatch_at_source_in_artifact(materialized, range, request)
+    }
 
-        let mut staged = WorkStager::new(request);
-        let projection = source_call_sites(
-            &artifact,
-            range,
-            self.limits.source_observations(),
-            &mut staged,
-            request.cancellation,
-        );
-        work = work.conservative_add(staged.work);
-        let (calls, calls_truncated) = match projection {
-            Ok(_) if request.cancellation.is_cancelled() => {
-                return Ok(SemanticOutcome::Cancelled {
-                    partial: None,
-                    work,
-                });
-            }
-            Ok(projection) => projection,
-            Err(Interruption::Budget(exceeded)) => {
-                return Ok(SemanticOutcome::ExceededBudget {
-                    partial: None,
-                    exceeded,
-                    work,
-                });
-            }
-            Err(Interruption::Cancelled) => {
-                return Ok(SemanticOutcome::Cancelled {
-                    partial: None,
-                    work,
-                });
-            }
-        };
-        *request.budget = staged.budget;
-        if calls.is_empty() {
-            // An unsupported or otherwise degraded materialization keeps its
-            // own quality; an otherwise healthy artifact with no call site at
-            // this position is unknown, not an exhaustive empty answer.
-            quality.absorb(SourceOutcomeQuality::Unknown);
-            return Ok(quality.publish(None, work));
-        }
-        if calls_truncated {
-            quality.absorb(SourceOutcomeQuality::Unproven);
-        }
-
-        let mut observations = Vec::with_capacity(calls.len());
-        let mut all_results_exhaustive = true;
-        let mut any_result_truncated = false;
-        let call_count = calls.len();
-        for (index, call) in calls.into_iter().enumerate() {
-            let outcome = self.resolve_call(&call, request)?;
-            work = work.conservative_add(outcome.work());
-            quality.absorb(SourceOutcomeQuality::from_outcome(&outcome));
-            if let Some(result) = outcome.available_value() {
-                all_results_exhaustive &= result.coverage().is_exhaustive();
-                any_result_truncated |= result.coverage().is_truncated();
-                observations.push(SourceDispatchObservation {
-                    call,
-                    dispatch: result.clone(),
-                });
-            } else {
-                all_results_exhaustive = false;
-            }
-            if matches!(
-                outcome,
-                SemanticOutcome::Cancelled { .. } | SemanticOutcome::ExceededBudget { .. }
-            ) {
-                all_results_exhaustive &= index + 1 == call_count;
-                break;
-            }
-        }
-
-        let coverage = if calls_truncated || any_result_truncated {
-            CandidateCoverage::Truncated
-        } else if all_results_exhaustive
-            && !matches!(
-                quality,
-                SourceOutcomeQuality::Unknown
-                    | SourceOutcomeQuality::Unsupported(_)
-                    | SourceOutcomeQuality::ExceededBudget(_)
-                    | SourceOutcomeQuality::Cancelled
-            )
-        {
-            CandidateCoverage::Exhaustive
-        } else {
-            CandidateCoverage::Open
-        };
-        // Unlike the points-to seam, the aggregate coverage is not fed back
-        // into the quality. Each delegated `resolve_call` already classified
-        // its own open or truncated coverage (an unresolved boundary makes it
-        // at least unproven), so re-absorbing would report a source position
-        // as less certain than the exact call-site query it forwards to. Only
-        // omission this seam caused itself is added, above.
-        let result = (!observations.is_empty()).then(|| SourceDispatchResult {
-            observations: observations.into_boxed_slice(),
-            coverage,
-        });
-        Ok(quality.publish(result, work))
+    /// Resolve source dispatch from an artifact materialization the caller
+    /// already charged to `request`.
+    ///
+    /// The complete materialization outcome is accepted, rather than only its
+    /// artifact, so an ambiguous, unproven, unknown, unsupported, budgeted, or
+    /// cancelled partial retains exactly the quality it would have had through
+    /// [`Self::dispatch_at_source`]. Source-observation limits and every
+    /// call-site dispatch budget remain active; this entry point only avoids
+    /// paying for the same artifact a second time when a query context already
+    /// owns its exact materialization.
+    pub fn dispatch_at_source_in_artifact(
+        &self,
+        materialized: SemanticOutcome<Arc<SemanticArtifact>>,
+        range: Range,
+        request: &mut SemanticRequest<'_>,
+    ) -> Result<SemanticOutcome<SourceDispatchResult>, SemanticProviderError> {
+        self.prepare_source_dispatch_session_in_artifact(materialized)
+            .resolve_at_source(range, request)
     }
 }
 
@@ -870,12 +964,14 @@ fn span_contains_range(span: SourceSpan, range: Range) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::semantic::SemanticBudget;
+    use crate::analyzer::semantic::{DispatchOracle, SemanticBudget, SemanticBudgetDimension};
     use crate::analyzer::{Language, ProjectFile};
     use crate::cancellation::CancellationToken;
     use crate::test_support::AnalyzerFixture;
 
     const CALL_SOURCE: &str = "function target() {}\nexport function caller() { target(); }\n";
+    const BATCH_CALL_SOURCE: &str = "import { open } from \"third-party\";\nexport function caller() { open(\"a\"); open(\"b\"); }\n";
+    const DISTINCT_CALL_SOURCE: &str = "function first() {}\nfunction second() {}\nexport function caller() { first(); second(); }\n";
 
     /// The durable, arena-independent shape of one dispatch answer. Relation
     /// provenance handles are query-local (they compare by arena identity), so
@@ -974,6 +1070,445 @@ mod tests {
                 end_line: span.end().line() as usize,
             },
         )
+    }
+
+    fn all_call_sites(
+        artifact: &Arc<crate::analyzer::semantic::SemanticArtifact>,
+    ) -> Vec<(CallSiteHandle, Range)> {
+        artifact
+            .procedures()
+            .iter()
+            .flat_map(|procedure| {
+                procedure.call_sites().iter().map(|call| {
+                    let span = procedure
+                        .source_mapping(call.source)
+                        .expect("call source mapping")
+                        .locator
+                        .anchor()
+                        .span();
+                    let handle = artifact
+                        .procedure_handle(procedure.id())
+                        .and_then(|procedure| procedure.call_site_handle(call.id))
+                        .expect("scoped call handle");
+                    (
+                        handle,
+                        Range {
+                            start_byte: span.start_byte() as usize,
+                            end_byte: span.end_byte() as usize,
+                            start_line: span.start().line() as usize,
+                            end_line: span.end().line() as usize,
+                        },
+                    )
+                })
+            })
+            .collect()
+    }
+
+    fn complete_materialization(
+        artifact: &Arc<crate::analyzer::semantic::SemanticArtifact>,
+    ) -> SemanticOutcome<Arc<crate::analyzer::semantic::SemanticArtifact>> {
+        complete_materialization_with_work(artifact, SemanticWork::default())
+    }
+
+    fn complete_materialization_with_work(
+        artifact: &Arc<crate::analyzer::semantic::SemanticArtifact>,
+        work: SemanticWork,
+    ) -> SemanticOutcome<Arc<crate::analyzer::semantic::SemanticArtifact>> {
+        SemanticOutcome::Complete {
+            value: Arc::clone(artifact),
+            work,
+        }
+    }
+
+    #[test]
+    fn prepared_source_dispatch_session_shares_one_parse_and_matches_serial_results() {
+        let fixture = typescript_fixture(&[("batch.ts", BATCH_CALL_SOURCE)]);
+        let file = ProjectFile::new(fixture.project_root(), "batch.ts");
+        let artifact = artifact_for(&fixture, &file);
+        let calls = all_call_sites(&artifact);
+        assert_eq!(calls.len(), 2, "the fixture has two external calls");
+        let oracle = fixture.analyzer.semantic_oracle_provider();
+        let cancellation = CancellationToken::default();
+        let mut session_budget = SemanticBudget::default();
+        let mut session_request = SemanticRequest::new(&mut session_budget, &cancellation);
+        let mut session =
+            oracle.prepare_source_dispatch_session_in_artifact(complete_materialization(&artifact));
+
+        let mut session_outcomes = Vec::new();
+        for (call, range) in &calls {
+            let outcome = session
+                .resolve_at_source(*range, &mut session_request)
+                .expect("prepared source dispatch");
+            let result = outcome
+                .available_value()
+                .expect("external call retains a dispatch result");
+            assert_eq!(result.observations().len(), 1);
+            assert_eq!(result.observations()[0].call(), call);
+            session_outcomes.push(outcome);
+        }
+        assert_eq!(
+            session_outcomes[0].work().source_bytes,
+            BATCH_CALL_SOURCE.len()
+        );
+        assert_eq!(session_outcomes[1].work().source_bytes, 0);
+        assert_eq!(
+            session_request.budget.used().source_bytes,
+            BATCH_CALL_SOURCE.len()
+        );
+
+        for ((_, range), session_outcome) in calls.iter().zip(&session_outcomes) {
+            let mut serial_budget = SemanticBudget::default();
+            let serial = oracle
+                .dispatch_at_source_in_artifact(
+                    complete_materialization(&artifact),
+                    *range,
+                    &mut SemanticRequest::new(&mut serial_budget, &cancellation),
+                )
+                .expect("serial source dispatch");
+            assert_eq!(outcome_label(session_outcome), outcome_label(&serial));
+            let session_result = session_outcome
+                .available_value()
+                .expect("session dispatch result");
+            let serial_result = serial.available_value().expect("serial dispatch result");
+            assert_eq!(session_result.coverage(), serial_result.coverage());
+            assert_eq!(session_result.observations().len(), 1);
+            assert_eq!(serial_result.observations().len(), 1);
+            assert_eq!(
+                dispatch_shape(session_result.observations()[0].dispatch()),
+                dispatch_shape(serial_result.observations()[0].dispatch())
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_source_dispatch_session_uses_one_source_budget_for_two_calls() {
+        let fixture = typescript_fixture(&[("batch.ts", BATCH_CALL_SOURCE)]);
+        let file = ProjectFile::new(fixture.project_root(), "batch.ts");
+        let artifact = artifact_for(&fixture, &file);
+        let calls = all_call_sites(&artifact);
+        assert_eq!(calls.len(), 2, "the fixture has two external calls");
+        let oracle = fixture.analyzer.semantic_oracle_provider();
+        let cancellation = CancellationToken::default();
+        let mut limits = SemanticBudget::default().limits();
+        limits.source_bytes = BATCH_CALL_SOURCE.len();
+
+        let mut session_budget = SemanticBudget::new(limits).expect("positive source budget");
+        let mut session_request = SemanticRequest::new(&mut session_budget, &cancellation);
+        let mut session =
+            oracle.prepare_source_dispatch_session_in_artifact(complete_materialization(&artifact));
+        for (_, range) in &calls {
+            let outcome = session
+                .resolve_at_source(*range, &mut session_request)
+                .expect("prepared source dispatch");
+            assert!(
+                outcome.available_value().is_some(),
+                "the shared parse keeps both calls inside one source budget: {outcome:?}"
+            );
+        }
+        assert_eq!(
+            session_request.budget.used().source_bytes,
+            BATCH_CALL_SOURCE.len()
+        );
+
+        let mut serial_budget = SemanticBudget::new(limits).expect("positive source budget");
+        let first = oracle
+            .dispatch_at_source_in_artifact(
+                complete_materialization(&artifact),
+                calls[0].1,
+                &mut SemanticRequest::new(&mut serial_budget, &cancellation),
+            )
+            .expect("first serial source dispatch");
+        assert!(first.available_value().is_some(), "{first:?}");
+        let second = oracle
+            .dispatch_at_source_in_artifact(
+                complete_materialization(&artifact),
+                calls[1].1,
+                &mut SemanticRequest::new(&mut serial_budget, &cancellation),
+            )
+            .expect("second serial source dispatch");
+        assert!(
+            matches!(second, SemanticOutcome::ExceededBudget { .. }),
+            "a second independent parse exceeds the one-source budget: {second:?}"
+        );
+    }
+
+    #[test]
+    fn prepared_source_dispatch_drops_a_parse_whose_source_charge_rolled_back() {
+        let fixture = typescript_fixture(&[("batch.ts", BATCH_CALL_SOURCE)]);
+        let file = ProjectFile::new(fixture.project_root(), "batch.ts");
+        let artifact = artifact_for(&fixture, &file);
+        let calls = all_call_sites(&artifact);
+        assert_eq!(calls.len(), 2, "the fixture has two external calls");
+        let oracle = fixture.analyzer.semantic_oracle_provider();
+        let cancellation = CancellationToken::default();
+        let mut first_budget = SemanticBudget::default();
+        let nested_limit = first_budget.limits().nested_entries;
+        first_budget
+            .charge(SemanticWork {
+                nested_entries: nested_limit - 1,
+                ..SemanticWork::default()
+            })
+            .expect("the first source projection retains one nested entry of headroom");
+        let mut session =
+            oracle.prepare_source_dispatch_session_in_artifact(complete_materialization(&artifact));
+
+        let first = session
+            .resolve_at_source(
+                calls[0].1,
+                &mut SemanticRequest::new(&mut first_budget, &cancellation),
+            )
+            .expect("post-parse budget refusal remains a typed source outcome");
+        let SemanticOutcome::ExceededBudget { exceeded, work, .. } = first else {
+            panic!("the low-level nested entry must exceed the remaining budget: {first:?}");
+        };
+        assert_eq!(exceeded.dimension(), SemanticBudgetDimension::NestedEntries);
+        assert_eq!(work.source_bytes, BATCH_CALL_SOURCE.len());
+        assert_eq!(first_budget.used().source_bytes, 0);
+        assert_eq!(
+            session.retained_bytes(),
+            0,
+            "rolled-back source work cannot leave reusable parsed syntax"
+        );
+
+        let first_scope = first_budget.scope_snapshot();
+        let mut retry_budget =
+            SemanticBudget::new_child(SemanticBudget::default().limits(), &first_scope);
+        let second = session
+            .resolve_at_source(
+                calls[1].1,
+                &mut SemanticRequest::new(&mut retry_budget, &cancellation),
+            )
+            .expect("a same-scope retry reparses after the unpaid syntax was dropped");
+        assert!(second.available_value().is_some(), "{second:?}");
+        assert_eq!(second.work().source_bytes, BATCH_CALL_SOURCE.len());
+        assert_eq!(retry_budget.used().source_bytes, BATCH_CALL_SOURCE.len());
+        assert!(session.retained_bytes() > 0);
+    }
+
+    #[test]
+    fn prepared_source_dispatch_session_reports_materialization_work_once() {
+        let fixture = typescript_fixture(&[("batch.ts", BATCH_CALL_SOURCE)]);
+        let file = ProjectFile::new(fixture.project_root(), "batch.ts");
+        let artifact = artifact_for(&fixture, &file);
+        let calls = all_call_sites(&artifact);
+        assert_eq!(calls.len(), 2, "the fixture has two external calls");
+        let oracle = fixture.analyzer.semantic_oracle_provider();
+        let cancellation = CancellationToken::default();
+        let mut baseline_budget = SemanticBudget::default();
+        let mut baseline_request = SemanticRequest::new(&mut baseline_budget, &cancellation);
+        let mut baseline_session =
+            oracle.prepare_source_dispatch_session_in_artifact(complete_materialization(&artifact));
+        let baseline_first = baseline_session
+            .resolve_at_source(calls[0].1, &mut baseline_request)
+            .expect("baseline first source dispatch");
+        let baseline_second = baseline_session
+            .resolve_at_source(calls[1].1, &mut baseline_request)
+            .expect("baseline second source dispatch");
+
+        let materialization_work = SemanticWork {
+            owned_text_bytes: 37,
+            ..SemanticWork::default()
+        };
+        let mut budget = SemanticBudget::default();
+        let mut request = SemanticRequest::new(&mut budget, &cancellation);
+        let mut session = oracle.prepare_source_dispatch_session_in_artifact(
+            complete_materialization_with_work(&artifact, materialization_work),
+        );
+
+        let first = session
+            .resolve_at_source(calls[0].1, &mut request)
+            .expect("first source dispatch");
+        let second = session
+            .resolve_at_source(calls[1].1, &mut request)
+            .expect("second source dispatch");
+
+        assert_eq!(
+            first.work(),
+            baseline_first.work().conservative_add(materialization_work)
+        );
+        assert_eq!(second.work(), baseline_second.work());
+    }
+
+    #[test]
+    fn prepared_source_dispatch_session_rejects_an_unrelated_budget_scope() {
+        let fixture = typescript_fixture(&[("batch.ts", BATCH_CALL_SOURCE)]);
+        let file = ProjectFile::new(fixture.project_root(), "batch.ts");
+        let artifact = artifact_for(&fixture, &file);
+        let calls = all_call_sites(&artifact);
+        assert_eq!(calls.len(), 2, "the fixture has two external calls");
+        let oracle = fixture.analyzer.semantic_oracle_provider();
+        let cancellation = CancellationToken::default();
+        let mut session =
+            oracle.prepare_source_dispatch_session_in_artifact(complete_materialization(&artifact));
+
+        let mut first_budget = SemanticBudget::default();
+        session
+            .resolve_at_source(
+                calls[0].1,
+                &mut SemanticRequest::new(&mut first_budget, &cancellation),
+            )
+            .expect("first logical budget scope binds the prepared session");
+
+        let first_scope = first_budget.scope_snapshot();
+        let mut same_scope_child =
+            SemanticBudget::new_child(SemanticBudget::default().limits(), &first_scope);
+        let same_scope = session
+            .resolve_at_source(
+                calls[1].1,
+                &mut SemanticRequest::new(&mut same_scope_child, &cancellation),
+            )
+            .expect("a child ledger in the same logical scope can reuse the session");
+        assert!(same_scope.available_value().is_some(), "{same_scope:?}");
+        assert_eq!(same_scope.work().source_bytes, 0);
+
+        let mut unrelated_budget = SemanticBudget::default();
+        let error = session
+            .resolve_at_source(
+                calls[0].1,
+                &mut SemanticRequest::new(&mut unrelated_budget, &cancellation),
+            )
+            .expect_err("fresh budget scope cannot inherit a retained parse charge");
+        assert!(
+            error.to_string().contains("semantic budget scopes"),
+            "{error}"
+        );
+        assert_eq!(unrelated_budget.used(), SemanticWork::default());
+    }
+
+    #[test]
+    fn source_dispatch_session_preserves_reverse_order_for_distinct_targets() {
+        let fixture = typescript_fixture(&[("ordered.ts", DISTINCT_CALL_SOURCE)]);
+        let file = ProjectFile::new(fixture.project_root(), "ordered.ts");
+        let artifact = artifact_for(&fixture, &file);
+        let mut calls = all_call_sites(&artifact);
+        calls.sort_by_key(|(_, range)| (range.start_byte, range.end_byte));
+        assert_eq!(calls.len(), 2, "the fixture has two distinct local calls");
+        let oracle = fixture.analyzer.semantic_oracle_provider();
+        let cancellation = CancellationToken::default();
+        let mut serial_outcomes = Vec::new();
+        let mut serial_shapes = Vec::new();
+        for (_, range) in &calls {
+            let mut serial_budget = SemanticBudget::default();
+            let serial = oracle
+                .dispatch_at_source_in_artifact(
+                    complete_materialization(&artifact),
+                    *range,
+                    &mut SemanticRequest::new(&mut serial_budget, &cancellation),
+                )
+                .expect("serial source dispatch baseline");
+            let result = serial.available_value().expect("serial target is resolved");
+            assert_eq!(result.observations().len(), 1);
+            serial_shapes.push(dispatch_shape(result.observations()[0].dispatch()));
+            serial_outcomes.push(outcome_label(&serial));
+        }
+        assert_ne!(
+            serial_shapes[0], serial_shapes[1],
+            "the regression requires distinguishable target answers"
+        );
+
+        let mut budget = SemanticBudget::default();
+        let mut request = SemanticRequest::new(&mut budget, &cancellation);
+        let mut session =
+            oracle.prepare_source_dispatch_session_in_artifact(complete_materialization(&artifact));
+        assert_eq!(session.retained_bytes(), 0);
+
+        let second = session
+            .resolve_at_source(calls[1].1, &mut request)
+            .expect("second row can be the first row actually requested");
+        let second_result = second.available_value().expect("second dispatch result");
+        assert_eq!(second_result.observations()[0].call(), &calls[1].0);
+        assert_eq!(outcome_label(&second), serial_outcomes[1]);
+        assert_eq!(
+            dispatch_shape(second_result.observations()[0].dispatch()),
+            serial_shapes[1]
+        );
+        assert_eq!(second.work().source_bytes, DISTINCT_CALL_SOURCE.len());
+
+        let first = session
+            .resolve_at_source(calls[0].1, &mut request)
+            .expect("an earlier skipped row does not desynchronize the session");
+        let first_result = first.available_value().expect("first dispatch result");
+        assert_eq!(first_result.observations()[0].call(), &calls[0].0);
+        assert_eq!(outcome_label(&first), serial_outcomes[0]);
+        assert_eq!(
+            dispatch_shape(first_result.observations()[0].dispatch()),
+            serial_shapes[0]
+        );
+        assert_eq!(first.work().source_bytes, 0);
+    }
+
+    #[test]
+    fn source_dispatch_session_defers_parse_until_a_range_contains_a_call() {
+        let fixture = typescript_fixture(&[("batch.ts", BATCH_CALL_SOURCE)]);
+        let file = ProjectFile::new(fixture.project_root(), "batch.ts");
+        let artifact = artifact_for(&fixture, &file);
+        let calls = all_call_sites(&artifact);
+        assert_eq!(calls.len(), 2, "the fixture has two external calls");
+        let oracle = fixture.analyzer.semantic_oracle_provider();
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let mut request = SemanticRequest::new(&mut budget, &cancellation);
+        let mut session =
+            oracle.prepare_source_dispatch_session_in_artifact(complete_materialization(&artifact));
+
+        let no_call = session
+            .resolve_at_source(
+                Range {
+                    start_byte: 0,
+                    end_byte: "import".len(),
+                    start_line: 0,
+                    end_line: 0,
+                },
+                &mut request,
+            )
+            .expect("a non-call range remains a typed source answer");
+        assert!(matches!(&no_call, SemanticOutcome::Unknown { .. }));
+        assert_eq!(no_call.work().source_bytes, 0);
+        assert_eq!(session.retained_bytes(), 0);
+
+        let first_call = session
+            .resolve_at_source(calls[0].1, &mut request)
+            .expect("the first real call initializes exact dispatch");
+        assert_eq!(first_call.work().source_bytes, BATCH_CALL_SOURCE.len());
+        assert_eq!(
+            session.retained_bytes(),
+            crate::analyzer::tree_sitter_analyzer::prepared_syntax_retained_bytes(
+                BATCH_CALL_SOURCE.len()
+            )
+            .saturating_add(file.retained_bytes())
+        );
+    }
+
+    #[test]
+    fn source_dispatch_session_cancellation_does_not_reclassify_prior_calls() {
+        let fixture = typescript_fixture(&[("batch.ts", BATCH_CALL_SOURCE)]);
+        let file = ProjectFile::new(fixture.project_root(), "batch.ts");
+        let artifact = artifact_for(&fixture, &file);
+        let calls = all_call_sites(&artifact);
+        assert_eq!(calls.len(), 2, "the fixture has two external calls");
+        let oracle = fixture.analyzer.semantic_oracle_provider();
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let mut request = SemanticRequest::new(&mut budget, &cancellation);
+        let mut session =
+            oracle.prepare_source_dispatch_session_in_artifact(complete_materialization(&artifact));
+
+        let first = session
+            .resolve_at_source(calls[0].1, &mut request)
+            .expect("first requested dispatch");
+        assert!(!matches!(first, SemanticOutcome::Cancelled { .. }));
+        assert_eq!(first.work().source_bytes, BATCH_CALL_SOURCE.len());
+
+        cancellation.cancel();
+        let second = session
+            .resolve_at_source(calls[1].1, &mut request)
+            .expect("second requested dispatch");
+        let SemanticOutcome::Cancelled { work, .. } = second else {
+            panic!("only the call requested after cancellation is cancelled: {second:?}");
+        };
+        assert_eq!(work.source_bytes, 0);
+        assert_eq!(work.call_sites, 0);
+        assert_eq!(work.nested_entries, 0);
     }
 
     /// #1477 Milestone 4: the source-position seam must publish exactly the

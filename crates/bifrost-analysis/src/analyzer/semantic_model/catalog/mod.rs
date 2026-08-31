@@ -34,7 +34,7 @@ pub const CATALOG_SCHEMA_VERSION: i64 = db::CURRENT_CATALOG_VERSION;
 ///
 /// Increment this whenever producer or compiler behavior can change the bytes
 /// or meaning of a generated pack without changing its other exact inputs.
-pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 1;
+pub const GENERATED_PRODUCTION_CACHE_VERSION: u32 = 3;
 pub const SEMANTIC_PACK_CACHE_ROOT_ENV: &str = "BIFROST_SEMANTIC_PACK_CACHE_ROOT";
 
 /// Resolve the generated catalog used when no explicit catalog is configured.
@@ -1030,6 +1030,73 @@ impl SemanticPackCatalog {
         })
     }
 
+    /// Install a release-provided production as an exact generated entry.
+    ///
+    /// The release source, extraction accounting, generated mapping, manifest,
+    /// and shard rows are committed by one catalog transaction. A synthetic
+    /// `generated` source row preserves the invariant used by
+    /// [`Self::generated_production`], while `source` retains the release
+    /// provenance for inventory and garbage-collection purposes.
+    pub fn install_release_generated(
+        &self,
+        key: &GeneratedProductionKey,
+        pack: &CompiledSemanticModelPack,
+        source: &DurablePackSource,
+        extraction: &PackExtractionAccounting,
+    ) -> Result<GeneratedInstallOutcome, CatalogError> {
+        validate_generated_pack_identity(key, &pack.manifest)?;
+        validate_extraction_accounting(extraction)?;
+        let generated_source = DurablePackSource {
+            kind: DurablePackSourceKind::Generated,
+            source_id: key.source_id(),
+        };
+        let install = self.install_with(pack, source, |transaction, manifest, now| {
+            insert_extraction_accounting(transaction, &manifest.content_sha256, extraction)?;
+            insert_generated_production(transaction, key, manifest, now)?;
+            insert_source(
+                transaction,
+                &manifest.content_sha256,
+                &generated_source,
+                now,
+            )
+        })?;
+        Ok(GeneratedInstallOutcome {
+            production: GeneratedProduction {
+                key: key.clone(),
+                manifest_digest: install.manifest_digest.clone(),
+                completeness: pack.manifest.completeness,
+            },
+            install,
+        })
+    }
+
+    /// Whether a verified durable pack carries exactly this source identity.
+    ///
+    /// A source may identify several manifests in one release, so this query
+    /// intentionally does not require a manifest digest. It is read-only and
+    /// does not hydrate or validate shard bytes.
+    pub fn durable_source_present(&self, source: &DurablePackSource) -> Result<bool, CatalogError> {
+        let connection = self
+            .connection
+            .lock()
+            .expect("semantic-pack catalog connection mutex poisoned");
+        connection
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1
+                   FROM catalog_sources AS sources
+                   JOIN catalog_packs AS packs
+                     ON packs.manifest_digest = sources.manifest_digest
+                   WHERE sources.source_kind = ?1
+                     AND sources.source_id = ?2
+                     AND packs.state = 'verified'
+                 )",
+                params![source.kind.as_str(), &source.source_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| CatalogError::sqlite("check durable pack source", error))
+    }
+
     pub fn extraction_accounting(
         &self,
         manifest_digest: &str,
@@ -1364,19 +1431,12 @@ impl SemanticPackCatalog {
                 &descriptor.routing_keys,
             )?;
         }
-        transaction
-            .execute(
-                "INSERT OR IGNORE INTO catalog_sources(
-                   manifest_digest, source_kind, source_id, installed_at
-                 ) VALUES(?1, ?2, ?3, ?4)",
-                params![
-                    &validated.manifest.content_sha256,
-                    source.kind.as_str(),
-                    &source.source_id,
-                    now
-                ],
-            )
-            .map_err(|error| CatalogError::sqlite("insert pack source", error))?;
+        insert_source(
+            &transaction,
+            &validated.manifest.content_sha256,
+            source,
+            now,
+        )?;
         record_install(&transaction, &validated.manifest, now)?;
         transaction
             .execute(
@@ -3019,6 +3079,28 @@ fn insert_manifest(
         )
         .map_err(|error| CatalogError::sqlite("insert pack manifest", error))?;
     Ok(!existed)
+}
+
+fn insert_source(
+    transaction: &Transaction<'_>,
+    manifest_digest: &str,
+    source: &DurablePackSource,
+    now: i64,
+) -> Result<(), CatalogError> {
+    transaction
+        .execute(
+            "INSERT OR IGNORE INTO catalog_sources(
+               manifest_digest, source_kind, source_id, installed_at
+             ) VALUES(?1, ?2, ?3, ?4)",
+            params![
+                manifest_digest,
+                source.kind.as_str(),
+                &source.source_id,
+                now
+            ],
+        )
+        .map_err(|error| CatalogError::sqlite("insert pack source", error))?;
+    Ok(())
 }
 
 fn insert_extraction_accounting(

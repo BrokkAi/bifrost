@@ -3,6 +3,10 @@ use super::{
     candidates_outcome_with_target_kind, no_type, type_reference_outcome,
 };
 use crate::analyzer::js_ts::providers::resolve_js_ts_source;
+use crate::analyzer::model::CodeUnitType;
+use crate::analyzer::semantic_model::{
+    SemanticModelCompleteness, SemanticModelOverlayDisposition, SemanticModelSymbol,
+};
 use crate::analyzer::usages::get_definition::{BoundedResolution, ResolutionSession};
 use crate::analyzer::usages::js_ts_graph::compute_jsts_import_binder;
 use crate::analyzer::usages::model::ImportKind;
@@ -196,13 +200,29 @@ fn resolve_js_ts_type(
     if let Some(type_node) = type_reference_node(node)
         && let Some(type_name) = type_reference_name(type_node, source)
     {
-        return resolve_declared_type_name(
-            host, support, file, language, &imports, aliases, type_name,
+        let candidates = identifier_candidates(
+            host, support, file, language, &imports, aliases, type_name, false,
         );
+        if candidates.is_empty() {
+            return model_type_outcome(
+                analyzer,
+                file,
+                type_name,
+                TypeLookupTargetKind::TypeReference,
+            )
+            .unwrap_or_else(|| {
+                no_type(
+                    "no_indexed_type_definition",
+                    format!("`{type_name}` did not resolve to an indexed TypeScript type"),
+                )
+            });
+        }
+        return type_reference_outcome(type_name.to_string(), candidates);
     }
 
     if let Some(type_node) = declaration_type_node_for_reference(node, source, site) {
         return resolve_declared_type_text(
+            analyzer,
             host,
             support,
             file,
@@ -262,6 +282,7 @@ fn resolve_js_ts_type(
             )
         {
             return resolve_declared_type_text(
+                analyzer,
                 host,
                 support,
                 file,
@@ -282,6 +303,7 @@ fn resolve_js_ts_type(
             local_binding_type_node_before(tree.root_node(), source, name, site.focus_start_byte)
     {
         return resolve_declared_type_text(
+            analyzer,
             host,
             support,
             file,
@@ -304,6 +326,7 @@ fn resolve_js_ts_type(
 
 #[allow(clippy::too_many_arguments)]
 fn resolve_declared_type_text(
+    analyzer: &dyn IAnalyzer,
     host: &dyn JsTsSource,
     support: &dyn BoundedDefinitionLookup,
     file: &ProjectFile,
@@ -354,6 +377,9 @@ fn resolve_declared_type_text(
                 target_kind,
             );
         }
+        if let Some(outcome) = model_type_outcome(analyzer, file, type_name, target_kind.clone()) {
+            return outcome;
+        }
     }
 
     let owners = ts_resolve_type_text_to_property_owners(
@@ -374,25 +400,55 @@ fn resolve_declared_type_text(
     )
 }
 
-fn resolve_declared_type_name(
-    host: &dyn JsTsSource,
-    support: &dyn BoundedDefinitionLookup,
+fn model_type_outcome(
+    analyzer: &dyn IAnalyzer,
     file: &ProjectFile,
-    language: Language,
-    imports: &JsTsImportBinder,
-    aliases: &AliasResolver,
     type_name: &str,
-) -> TypeLookupOutcome {
-    let candidates = identifier_candidates(
-        host, support, file, language, imports, aliases, type_name, false,
-    );
-    if candidates.is_empty() {
-        return no_type(
-            "no_indexed_type_definition",
-            format!("`{type_name}` did not resolve to an indexed TypeScript type"),
-        );
+    target_kind: TypeLookupTargetKind,
+) -> Option<TypeLookupOutcome> {
+    let overlay = analyzer.semantic_model_overlay()?;
+    let matched = overlay.symbols_named(type_name);
+    let records = matched
+        .records
+        .into_iter()
+        .filter(|symbol| {
+            symbol.owner_id.is_none()
+                && symbol.language == Language::TypeScript.config_label()
+                && (symbol.name == type_name || symbol.qualified_name == type_name)
+        })
+        .collect::<Vec<&SemanticModelSymbol>>();
+    if records.is_empty() {
+        return None;
     }
-    type_reference_outcome(type_name.to_string(), candidates)
+    let complete = matched.disposition == SemanticModelOverlayDisposition::Unique
+        && records.len() == 1
+        && !records[0].provenance.ambiguous
+        && records[0].provenance.completeness == SemanticModelCompleteness::Complete;
+    let definitions = records
+        .into_iter()
+        .map(|symbol| {
+            CodeUnit::with_signature(
+                file.clone(),
+                CodeUnitType::Class,
+                "",
+                symbol.qualified_name.clone(),
+                symbol.signature.clone(),
+                true,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut outcome =
+        candidates_outcome_with_target_kind(type_name.to_string(), definitions, target_kind);
+    if !complete {
+        outcome.status = TypeLookupStatus::Ambiguous;
+        outcome.diagnostics.push(TypeLookupDiagnostic {
+            kind: "semantic_model_type_incomplete".to_string(),
+            message: format!(
+                "active semantic models do not publish one complete `{type_name}` type identity"
+            ),
+        });
+    }
+    Some(outcome)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -654,6 +710,9 @@ fn binding_declaration_matches(node: Node<'_>, source: &str, name: &str) -> bool
                 || declaration_pattern_node(node)
                     .is_some_and(|pattern| pattern_binds_name(pattern, source, name))
         }
+        "assignment_expression" => node
+            .child_by_field_name("left")
+            .is_some_and(|left| identifier_text(left, source) == Some(name)),
         _ => false,
     }
 }

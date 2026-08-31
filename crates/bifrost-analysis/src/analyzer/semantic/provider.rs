@@ -1,6 +1,6 @@
 //! Provider outcomes, finite budgets, and the language-neutral adapter boundary.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
@@ -10,6 +10,7 @@ use crate::cancellation::CancellationToken;
 use super::capabilities::SemanticCapability;
 use super::ids::{SemanticArtifactKey, StableDigest};
 use super::ir::{SemanticArtifact, SemanticIrError};
+use super::leases::SemanticArtifactCollector;
 use crate::analyzer::work_budget::{BudgetLedger, WorkBudgetExceeded, define_work_dimensions};
 
 define_work_dimensions! {
@@ -83,9 +84,42 @@ impl SemanticWork {
 /// `Arc` here is copy-on-write, not sharing. Cloning a budget to stage a charge
 /// must be cheap, and a staged budget that is discarded must roll the set back
 /// with the numbers; `Arc::make_mut` gives both.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct SemanticBudget {
     ledger: BudgetLedger<SemanticWork>,
+    scope: Arc<SemanticBudgetScope>,
+    charged_artifacts: Arc<HashSet<StableDigest>>,
+}
+
+#[derive(Debug)]
+struct SemanticBudgetScope;
+
+/// Lightweight identity for one logical semantic-budget scope.
+///
+/// Unlike [`SemanticBudgetScopeSnapshot`], this token deliberately retains no
+/// charged-artifact set. Long-lived optimizations can therefore validate
+/// scope continuity without pinning copy-on-write accounting state.
+#[derive(Debug, Clone)]
+pub(crate) struct SemanticBudgetScopeIdentity {
+    scope: Arc<SemanticBudgetScope>,
+}
+
+/// Artifact censuses already paid within one logical semantic-budget scope.
+///
+/// Scalar work alone is not a complete scope snapshot: a later cache hit in the same
+/// scope must know which immutable artifact censuses the scope already paid so
+/// it can charge only the repeat-lookup work. The snapshot is opaque because it
+/// is accounting identity, not an artifact cache or a public result identity.
+#[derive(Debug, Clone)]
+pub struct SemanticBudgetScopeSnapshot {
+    scope: Arc<SemanticBudgetScope>,
+    charged_artifacts: Arc<HashSet<StableDigest>>,
+}
+
+#[derive(Debug)]
+pub struct SemanticBudgetCharge {
+    scope: Arc<SemanticBudgetScope>,
+    work: SemanticWork,
     charged_artifacts: Arc<HashSet<StableDigest>>,
 }
 
@@ -166,6 +200,7 @@ impl SemanticBudget {
         }
         Ok(Self {
             ledger: BudgetLedger::new(limits, SemanticWork::default()),
+            scope: Arc::new(SemanticBudgetScope),
             charged_artifacts: Arc::new(HashSet::new()),
         })
     }
@@ -194,6 +229,97 @@ impl SemanticBudget {
     /// Atomically charge work; a failed charge leaves the budget unchanged.
     pub fn charge(&mut self, work: SemanticWork) -> Result<(), SemanticBudgetExceeded> {
         self.ledger.charge(work).map_err(Into::into)
+    }
+
+    /// Snapshot this budget's logical scope and paid artifact identities.
+    ///
+    /// A child created from this snapshot starts with the same paid identities
+    /// but an independent scalar ledger. It can therefore charge only repeat
+    /// work for an overlapping complete artifact.
+    pub fn scope_snapshot(&self) -> SemanticBudgetScopeSnapshot {
+        SemanticBudgetScopeSnapshot {
+            scope: Arc::clone(&self.scope),
+            charged_artifacts: Arc::clone(&self.charged_artifacts),
+        }
+    }
+
+    /// Capture only this ledger's logical scope identity, without retaining
+    /// its copy-on-write charged-artifact set.
+    pub(crate) fn scope_identity(&self) -> SemanticBudgetScopeIdentity {
+        SemanticBudgetScopeIdentity {
+            scope: Arc::clone(&self.scope),
+        }
+    }
+
+    /// Whether this ledger belongs to the same logical accounting scope as a
+    /// previously captured identity. Cloned and child ledgers share a scope;
+    /// a newly constructed budget does not.
+    pub(crate) fn shares_scope_with(&self, identity: &SemanticBudgetScopeIdentity) -> bool {
+        Arc::ptr_eq(&self.scope, &identity.scope)
+    }
+
+    /// Create an independently bounded child ledger in the same logical scope.
+    ///
+    /// The child starts with no scalar work, but inherits the artifact censuses
+    /// its parent already paid. Its returned work can therefore be charged to
+    /// the parent without counting overlapping artifact censuses twice.
+    pub fn new_child(limits: SemanticWork, parent: &SemanticBudgetScopeSnapshot) -> Self {
+        Self {
+            ledger: BudgetLedger::new(limits, SemanticWork::default()),
+            scope: Arc::clone(&parent.scope),
+            charged_artifacts: Arc::clone(&parent.charged_artifacts),
+        }
+    }
+
+    /// Atomically charge one child ledger's scalar work and import its exact
+    /// artifact identities.
+    ///
+    /// The caller supplies the scalar charge because a coordinator may expose
+    /// a different retained-memory measure than the provider's owned-text
+    /// lane. Identities become paid only if that scalar charge succeeds.
+    pub fn into_child_charge(self) -> SemanticBudgetCharge {
+        let work = self.used();
+        SemanticBudgetCharge {
+            scope: self.scope,
+            work,
+            charged_artifacts: self.charged_artifacts,
+        }
+    }
+
+    pub fn apply_child_charge(
+        &mut self,
+        work: SemanticWork,
+        charge: SemanticBudgetCharge,
+    ) -> Result<(), SemanticBudgetExceeded> {
+        assert!(
+            Arc::ptr_eq(&self.scope, &charge.scope),
+            "semantic child charge belongs to a different logical scope"
+        );
+        let mut staged = self.clone();
+        staged.charge(work.component_max(charge.work))?;
+        if !Arc::ptr_eq(&staged.charged_artifacts, &charge.charged_artifacts) {
+            let charged = Arc::make_mut(&mut staged.charged_artifacts);
+            charged.extend(charge.charged_artifacts.iter().copied());
+        }
+        *self = staged;
+        Ok(())
+    }
+
+    /// Check the conservative scalar charge required to import a child charge.
+    ///
+    /// A coordinator may price retained memory more conservatively than the
+    /// provider's owned-text lane, but it may never import paid identities for
+    /// less than the child ledger actually charged.
+    pub fn check_child_charge(
+        &self,
+        work: SemanticWork,
+        charge: &SemanticBudgetCharge,
+    ) -> Result<(), SemanticBudgetExceeded> {
+        assert!(
+            Arc::ptr_eq(&self.scope, &charge.scope),
+            "semantic child charge belongs to a different logical scope"
+        );
+        self.check(work.component_max(charge.work))
     }
 
     /// Whether this budget has already been charged one artifact's full
@@ -240,7 +366,7 @@ pub struct SemanticExecutionBudget {
 struct SemanticExecutionBudgetState {
     max_materialized_files: usize,
     max_traversal_steps: usize,
-    materialized_files: HashSet<ProjectFile>,
+    materialized_files: Arc<BTreeSet<ProjectFile>>,
     externally_materialized_files: usize,
     traversal_steps: usize,
     exhausted: bool,
@@ -257,7 +383,7 @@ struct SemanticExecutionBudgetState {
 pub struct SemanticExecutionBudgetSnapshot {
     max_materialized_files: usize,
     max_traversal_steps: usize,
-    materialized_files: Box<[ProjectFile]>,
+    materialized_files: Arc<BTreeSet<ProjectFile>>,
     externally_materialized_files: usize,
     traversal_steps: usize,
     exhausted: bool,
@@ -265,16 +391,10 @@ pub struct SemanticExecutionBudgetSnapshot {
 
 impl SemanticExecutionBudgetSnapshot {
     fn from_state(state: &SemanticExecutionBudgetState) -> Self {
-        let mut materialized_files = state.materialized_files.iter().cloned().collect::<Vec<_>>();
-        materialized_files.sort_unstable_by(|left, right| {
-            left.root()
-                .cmp(right.root())
-                .then_with(|| left.rel_path().cmp(right.rel_path()))
-        });
         Self {
             max_materialized_files: state.max_materialized_files,
             max_traversal_steps: state.max_traversal_steps,
-            materialized_files: materialized_files.into_boxed_slice(),
+            materialized_files: Arc::clone(&state.materialized_files),
             externally_materialized_files: state.externally_materialized_files,
             traversal_steps: state.traversal_steps,
             exhausted: state.exhausted,
@@ -282,8 +402,26 @@ impl SemanticExecutionBudgetSnapshot {
     }
 
     pub fn retained_bytes(&self) -> usize {
-        std::mem::size_of::<Self>()
-            .saturating_add(std::mem::size_of_val(self.materialized_files.as_ref()))
+        // The set owns B-tree nodes in addition to one cloned `ProjectFile`
+        // handle per identity. Rust does not expose node allocations, so use a
+        // deliberately sparse-tree upper estimate rather than the old flat
+        // slice size; a COW snapshot can be the last owner of the old tree.
+        const ARC_HEADER_BYTES: usize = 2 * std::mem::size_of::<usize>();
+        const BTREE_NODE_BYTES_PER_FILE: usize = 32 * std::mem::size_of::<usize>();
+        let container_bytes = std::mem::size_of::<Self>()
+            .saturating_add(ARC_HEADER_BYTES)
+            .saturating_add(std::mem::size_of::<BTreeSet<ProjectFile>>());
+        self.materialized_files
+            .iter()
+            .fold(container_bytes, |bytes, file| {
+                bytes
+                    .saturating_add(BTREE_NODE_BYTES_PER_FILE)
+                    .saturating_add(file.retained_bytes())
+            })
+    }
+
+    pub fn contains_materialized_file(&self, file: &ProjectFile) -> bool {
+        self.materialized_files.contains(file)
     }
 }
 
@@ -298,8 +436,11 @@ pub struct SemanticExecutionBudgetCharge {
 
 impl SemanticExecutionBudgetCharge {
     pub fn retained_bytes(&self) -> usize {
-        std::mem::size_of::<Self>()
-            .saturating_add(std::mem::size_of_val(self.materialized_files.as_ref()))
+        self.materialized_files
+            .iter()
+            .fold(std::mem::size_of::<Self>(), |bytes, file| {
+                bytes.saturating_add(file.retained_bytes())
+            })
     }
 }
 
@@ -316,7 +457,7 @@ impl SemanticExecutionBudget {
             state: Arc::new(Mutex::new(SemanticExecutionBudgetState {
                 max_materialized_files,
                 max_traversal_steps,
-                materialized_files: HashSet::new(),
+                materialized_files: Arc::new(BTreeSet::new()),
                 externally_materialized_files: 0,
                 traversal_steps: 0,
                 exhausted: max_materialized_files == 0 || max_traversal_steps == 0,
@@ -340,13 +481,58 @@ impl SemanticExecutionBudget {
         SemanticExecutionBudgetSnapshot::from_state(&state)
     }
 
+    /// Fork an independently mutable child from one exact parent state.
+    ///
+    /// The snapshot and child are captured under the same lock. The child can
+    /// revisit already-admitted files at zero new-file cost, and its exact
+    /// delta can later be imported with [`Self::replay_charge`].
+    pub fn fork(&self) -> (SemanticExecutionBudgetSnapshot, Self) {
+        self.fork_with_additional_limits(usize::MAX, usize::MAX)
+    }
+
+    /// Fork an exact child whose new-file and traversal allowances are also
+    /// capped for one nested consumer.
+    ///
+    /// The pair is captured and the narrower maxima are derived under one
+    /// parent lock, so callers cannot mismatch a snapshot and child. Reaching
+    /// a narrower maximum remains complete; only a refused operation marks the
+    /// child exhausted, which a replay records as performed incomplete work.
+    pub fn fork_with_additional_limits(
+        &self,
+        max_new_materialized_files: usize,
+        max_additional_traversal_steps: usize,
+    ) -> (SemanticExecutionBudgetSnapshot, Self) {
+        let state = self.state.lock().expect("semantic execution budget lock");
+        let before = SemanticExecutionBudgetSnapshot::from_state(&state);
+        let used_files = state
+            .externally_materialized_files
+            .saturating_add(state.materialized_files.len());
+        let child = Self {
+            state: Arc::new(Mutex::new(SemanticExecutionBudgetState {
+                max_materialized_files: state
+                    .max_materialized_files
+                    .min(used_files.saturating_add(max_new_materialized_files)),
+                max_traversal_steps: state.max_traversal_steps.min(
+                    state
+                        .traversal_steps
+                        .saturating_add(max_additional_traversal_steps),
+                ),
+                materialized_files: Arc::clone(&state.materialized_files),
+                externally_materialized_files: state.externally_materialized_files,
+                traversal_steps: state.traversal_steps,
+                exhausted: state.exhausted,
+            })),
+        };
+        (before, child)
+    }
+
     pub fn charge_since(
         &self,
         before: &SemanticExecutionBudgetSnapshot,
     ) -> Option<SemanticExecutionBudgetCharge> {
         let state = self.state.lock().expect("semantic execution budget lock");
-        if state.max_materialized_files != before.max_materialized_files
-            || state.max_traversal_steps != before.max_traversal_steps
+        if state.max_materialized_files > before.max_materialized_files
+            || state.max_traversal_steps > before.max_traversal_steps
             || state.externally_materialized_files < before.externally_materialized_files
             || state.traversal_steps < before.traversal_steps
             || before
@@ -356,16 +542,16 @@ impl SemanticExecutionBudget {
         {
             return None;
         }
-        let before_files = before
-            .materialized_files
-            .iter()
-            .cloned()
-            .collect::<HashSet<_>>();
-        let mut materialized_files = state
-            .materialized_files
-            .difference(&before_files)
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut materialized_files =
+            if Arc::ptr_eq(&state.materialized_files, &before.materialized_files) {
+                Vec::new()
+            } else {
+                state
+                    .materialized_files
+                    .difference(&before.materialized_files)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
         materialized_files.sort_unstable_by(|left, right| {
             left.root()
                 .cmp(right.root())
@@ -381,6 +567,44 @@ impl SemanticExecutionBudget {
         })
     }
 
+    fn replay_charge_totals(
+        state: &SemanticExecutionBudgetState,
+        expected_before: &SemanticExecutionBudgetSnapshot,
+        charge: &SemanticExecutionBudgetCharge,
+    ) -> Option<(usize, usize)> {
+        if SemanticExecutionBudgetSnapshot::from_state(state) != *expected_before
+            || charge
+                .materialized_files
+                .iter()
+                .any(|file| state.materialized_files.contains(file))
+        {
+            return None;
+        }
+        let attempted_files = state
+            .externally_materialized_files
+            .checked_add(state.materialized_files.len())
+            .and_then(|used| used.checked_add(charge.externally_materialized_files))
+            .and_then(|used| used.checked_add(charge.materialized_files.len()))?;
+        let attempted_traversal = state.traversal_steps.checked_add(charge.traversal_steps)?;
+        if attempted_files > state.max_materialized_files
+            || attempted_traversal > state.max_traversal_steps
+        {
+            return None;
+        }
+        Some((attempted_files, attempted_traversal))
+    }
+
+    /// Whether [`Self::replay_charge`] can reproduce this exact child delta
+    /// without mutating the execution ledger.
+    pub fn can_replay_charge(
+        &self,
+        expected_before: &SemanticExecutionBudgetSnapshot,
+        charge: &SemanticExecutionBudgetCharge,
+    ) -> bool {
+        let state = self.state.lock().expect("semantic execution budget lock");
+        Self::replay_charge_totals(&state, expected_before, charge).is_some()
+    }
+
     /// Atomically reproduce provider work from an exact cached solve.
     pub fn replay_charge(
         &self,
@@ -388,31 +612,16 @@ impl SemanticExecutionBudget {
         charge: &SemanticExecutionBudgetCharge,
     ) -> bool {
         let mut state = self.state.lock().expect("semantic execution budget lock");
-        if SemanticExecutionBudgetSnapshot::from_state(&state) != *expected_before
-            || charge
-                .materialized_files
-                .iter()
-                .any(|file| state.materialized_files.contains(file))
-        {
+        let Some((_, attempted_traversal)) =
+            Self::replay_charge_totals(&state, expected_before, charge)
+        else {
             return false;
+        };
+        if !charge.materialized_files.is_empty() {
+            Arc::make_mut(&mut state.materialized_files)
+                .extend(charge.materialized_files.iter().cloned());
         }
-        let attempted_files = state
-            .externally_materialized_files
-            .saturating_add(state.materialized_files.len())
-            .saturating_add(charge.externally_materialized_files)
-            .saturating_add(charge.materialized_files.len());
-        let attempted_traversal = state.traversal_steps.saturating_add(charge.traversal_steps);
-        if attempted_files > state.max_materialized_files
-            || attempted_traversal > state.max_traversal_steps
-        {
-            return false;
-        }
-        state
-            .materialized_files
-            .extend(charge.materialized_files.iter().cloned());
-        state.externally_materialized_files = state
-            .externally_materialized_files
-            .saturating_add(charge.externally_materialized_files);
+        state.externally_materialized_files += charge.externally_materialized_files;
         state.traversal_steps = attempted_traversal;
         state.exhausted |= charge.exhausted;
         true
@@ -446,7 +655,7 @@ impl SemanticExecutionBudget {
             state.exhausted = true;
             return false;
         }
-        state.materialized_files.insert(file.clone());
+        Arc::make_mut(&mut state.materialized_files).insert(file.clone());
         true
     }
 
@@ -464,20 +673,25 @@ impl SemanticExecutionBudget {
 
     fn charge_external_work(&self, materialized_files: usize, traversal_steps: usize) -> bool {
         let mut state = self.state.lock().expect("semantic execution budget lock");
-        let attempted_files = state
+        let Some(attempted_files) = state
             .externally_materialized_files
-            .saturating_add(state.materialized_files.len())
-            .saturating_add(materialized_files);
-        let attempted_traversal = state.traversal_steps.saturating_add(traversal_steps);
+            .checked_add(state.materialized_files.len())
+            .and_then(|used| used.checked_add(materialized_files))
+        else {
+            state.exhausted = true;
+            return false;
+        };
+        let Some(attempted_traversal) = state.traversal_steps.checked_add(traversal_steps) else {
+            state.exhausted = true;
+            return false;
+        };
         if attempted_files > state.max_materialized_files
             || attempted_traversal > state.max_traversal_steps
         {
             state.exhausted = true;
             return false;
         }
-        state.externally_materialized_files = state
-            .externally_materialized_files
-            .saturating_add(materialized_files);
+        state.externally_materialized_files += materialized_files;
         state.traversal_steps = attempted_traversal;
         true
     }
@@ -615,6 +829,7 @@ pub struct SemanticRequest<'a> {
     pub budget: &'a mut SemanticBudget,
     pub cancellation: &'a CancellationToken,
     execution: Option<SemanticExecutionBudget>,
+    artifact_collector: Option<SemanticArtifactCollector>,
 }
 
 impl<'a> SemanticRequest<'a> {
@@ -623,6 +838,7 @@ impl<'a> SemanticRequest<'a> {
             budget,
             cancellation,
             execution: None,
+            artifact_collector: None,
         }
     }
 
@@ -635,7 +851,15 @@ impl<'a> SemanticRequest<'a> {
             budget,
             cancellation,
             execution: Some(execution.clone()),
+            artifact_collector: None,
         }
+    }
+
+    /// Observe complete artifacts materialized by this request and its staged
+    /// descendants.
+    pub fn with_artifact_collector(mut self, collector: &SemanticArtifactCollector) -> Self {
+        self.artifact_collector = Some(collector.clone());
+        self
     }
 
     pub fn staged<'b>(&self, budget: &'b mut SemanticBudget) -> SemanticRequest<'b>
@@ -646,11 +870,46 @@ impl<'a> SemanticRequest<'a> {
             budget,
             cancellation: self.cancellation,
             execution: self.execution.clone(),
+            artifact_collector: self.artifact_collector.clone(),
+        }
+    }
+
+    /// Reborrow this request while replacing its execution ledger.
+    ///
+    /// Policy adapters use this form when one evaluation region owns a
+    /// narrower execution budget. The scalar budget, cancellation token, and
+    /// complete-artifact observer remain those of the surrounding request.
+    pub fn staged_with_execution_budget<'b>(
+        &'b mut self,
+        execution: &SemanticExecutionBudget,
+    ) -> SemanticRequest<'b>
+    where
+        'a: 'b,
+    {
+        SemanticRequest {
+            budget: &mut *self.budget,
+            cancellation: self.cancellation,
+            execution: Some(execution.clone()),
+            artifact_collector: self.artifact_collector.clone(),
         }
     }
 
     pub fn execution_budget(&self) -> Option<&SemanticExecutionBudget> {
         self.execution.as_ref()
+    }
+
+    pub(crate) fn artifact_collector(&self) -> Option<&SemanticArtifactCollector> {
+        self.artifact_collector.as_ref()
+    }
+
+    pub(crate) fn observe_complete_artifact(
+        &self,
+        file: &ProjectFile,
+        artifact: &Arc<SemanticArtifact>,
+    ) {
+        if let Some(collector) = &self.artifact_collector {
+            collector.observe_complete(file, artifact);
+        }
     }
 
     pub fn admit_materialization(&self, file: &ProjectFile) -> bool {
@@ -858,13 +1117,175 @@ mod tests {
 
     #[test]
     fn semantic_budget_requires_every_limit_to_be_positive() {
-        assert_eq!(
+        assert!(matches!(
             SemanticBudget::uniform(0),
             Err(InvalidSemanticBudget {
-                dimension: SemanticBudgetDimension::SourceBytes,
+                dimension: SemanticBudgetDimension::SourceBytes
             })
-        );
+        ));
         assert!(SemanticBudget::uniform(1).is_ok());
+    }
+
+    #[test]
+    fn scope_identity_does_not_retain_the_charged_artifact_snapshot() {
+        let mut budget = SemanticBudget::default();
+        budget.record_charged_artifact(StableDigest::sha256(b"charged artifact"));
+        let artifact_snapshot_owners = Arc::strong_count(&budget.charged_artifacts);
+        let scope_owners = Arc::strong_count(&budget.scope);
+
+        let identity = budget.scope_identity();
+
+        assert_eq!(
+            Arc::strong_count(&budget.charged_artifacts),
+            artifact_snapshot_owners,
+            "a logical-scope token must not pin copy-on-write artifact state"
+        );
+        assert_eq!(Arc::strong_count(&budget.scope), scope_owners + 1);
+        drop(identity);
+        assert_eq!(Arc::strong_count(&budget.scope), scope_owners);
+    }
+
+    #[test]
+    fn child_charge_import_is_scope_bound_conservative_and_atomic() {
+        let mut parent = SemanticBudget::uniform(4).expect("parent budget");
+        let parent_scope = parent.scope_snapshot();
+        let artifact = StableDigest::sha256(b"child artifact");
+        let child_charge = || {
+            let mut child = SemanticBudget::new_child(SemanticWork::uniform(4), &parent_scope);
+            child
+                .charge(SemanticWork {
+                    procedures: 2,
+                    ..SemanticWork::default()
+                })
+                .expect("child work fits");
+            child.record_charged_artifact(artifact);
+            child.into_child_charge()
+        };
+        let checked_charge = child_charge();
+
+        let before = parent.used();
+        assert!(
+            parent
+                .check_child_charge(
+                    SemanticWork {
+                        procedures: 5,
+                        ..SemanticWork::default()
+                    },
+                    &checked_charge,
+                )
+                .is_err()
+        );
+        assert_eq!(parent.used(), before);
+        assert!(!parent.has_charged_artifact(artifact));
+        assert!(
+            parent
+                .apply_child_charge(
+                    SemanticWork {
+                        procedures: 5,
+                        ..SemanticWork::default()
+                    },
+                    checked_charge,
+                )
+                .is_err()
+        );
+        assert_eq!(parent.used(), before);
+        assert!(!parent.has_charged_artifact(artifact));
+
+        parent
+            .apply_child_charge(SemanticWork::default(), child_charge())
+            .expect("the exact child work fits");
+        assert_eq!(parent.used().procedures, 2);
+        assert!(parent.has_charged_artifact(artifact));
+
+        let parent_scope = parent.scope_snapshot();
+        let continuation = SemanticBudget::new_child(SemanticWork::uniform(4), &parent_scope);
+        assert!(continuation.has_charged_artifact(artifact));
+        assert_eq!(continuation.used(), SemanticWork::default());
+    }
+
+    #[test]
+    #[should_panic(expected = "semantic child charge belongs to a different logical scope")]
+    fn child_charge_import_rejects_an_unrelated_budget_scope() {
+        let mut parent = SemanticBudget::uniform(1).expect("parent budget");
+        let unrelated = SemanticBudget::uniform(1).expect("unrelated budget");
+        let unrelated_scope = unrelated.scope_snapshot();
+        let child = SemanticBudget::new_child(SemanticWork::uniform(1), &unrelated_scope);
+        let _ = parent.apply_child_charge(SemanticWork::default(), child.into_child_charge());
+    }
+
+    #[test]
+    fn execution_fork_preserves_overlap_and_replays_exact_child_work() {
+        let first = mock_file();
+        let second = ProjectFile::new(std::env::temp_dir(), "src/second.ts");
+        let third = ProjectFile::new(std::env::temp_dir(), "src/third.ts");
+        let execution = SemanticExecutionBudget::new(2, 3);
+
+        assert!(execution.admit_materialization(&first));
+        assert!(execution.charge_traversal(1));
+        let (before, child) = execution.fork_with_additional_limits(1, 2);
+        assert!(before.contains_materialized_file(&first));
+        assert!(!before.contains_materialized_file(&second));
+
+        assert!(child.admit_materialization(&first));
+        assert!(child.admit_materialization(&second));
+        assert!(!child.admit_materialization(&third));
+        assert!(child.charge_traversal(1));
+        let charge = child
+            .charge_since(&before)
+            .expect("forked child extends its exact parent state");
+
+        let work_before_preflight = execution.work();
+        assert!(execution.can_replay_charge(&before, &charge));
+        assert_eq!(
+            execution.work(),
+            work_before_preflight,
+            "execution replay preflight is non-mutating"
+        );
+        assert!(execution.replay_charge(&before, &charge));
+        assert_eq!(execution.work().materialized_files, 2);
+        assert_eq!(execution.work().traversal_steps, 2);
+        assert!(execution.work().exhausted);
+        assert!(!execution.can_replay_charge(&before, &charge));
+        assert!(!execution.replay_charge(&before, &charge));
+    }
+
+    #[test]
+    fn execution_fork_with_zero_new_files_allows_only_known_file_revisits() {
+        let known = mock_file();
+        let new = ProjectFile::new(std::env::temp_dir(), "src/new.ts");
+        let execution = SemanticExecutionBudget::new(2, 2);
+        assert!(execution.admit_materialization(&known));
+
+        let (before, child) = execution.fork_with_additional_limits(0, 1);
+        assert!(child.admit_materialization(&known));
+        assert!(!child.admit_materialization(&new));
+        let charge = child
+            .charge_since(&before)
+            .expect("forked child extends its exact parent state");
+
+        assert!(execution.replay_charge(&before, &charge));
+        assert_eq!(execution.work().materialized_files, 1);
+        assert!(execution.work().exhausted);
+    }
+
+    #[test]
+    fn execution_charge_retained_bytes_accounts_for_owned_file_paths() {
+        let short_file = mock_file();
+        let long_rel = format!("src/{}/subject.ts", "nested".repeat(128));
+        let long_file = ProjectFile::new(std::env::temp_dir(), &long_rel);
+        let charge_for = |file| SemanticExecutionBudgetCharge {
+            materialized_files: vec![file].into_boxed_slice(),
+            externally_materialized_files: 0,
+            traversal_steps: 0,
+            exhausted: false,
+        };
+
+        let short = charge_for(short_file).retained_bytes();
+        let long = charge_for(long_file).retained_bytes();
+        assert!(
+            long >= short.saturating_add(long_rel.len() / 2),
+            "cached execution charges must account for owned path storage"
+        );
     }
 
     #[test]
@@ -894,6 +1315,32 @@ mod tests {
                 exhausted: true,
             }
         );
+    }
+
+    #[test]
+    fn staged_execution_override_preserves_the_artifact_collector() {
+        let file = mock_file();
+        let outer_execution = SemanticExecutionBudget::new(2, 2);
+        let nested_execution = SemanticExecutionBudget::new(1, 1);
+        let collector = SemanticArtifactCollector::new();
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::uniform(10).unwrap();
+        let mut request =
+            SemanticRequest::with_execution_budget(&mut budget, &cancellation, &outer_execution)
+                .with_artifact_collector(&collector);
+
+        let staged = request.staged_with_execution_budget(&nested_execution);
+        assert!(staged.admit_materialization(&file));
+        assert!(
+            staged
+                .artifact_collector()
+                .expect("execution override preserves the collector")
+                .shares_state(&collector)
+        );
+        drop(staged);
+
+        assert_eq!(nested_execution.work().materialized_files, 1);
+        assert_eq!(outer_execution.work().materialized_files, 0);
     }
 
     #[test]

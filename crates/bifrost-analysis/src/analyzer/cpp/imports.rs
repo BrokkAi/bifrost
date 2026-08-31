@@ -96,6 +96,13 @@ pub enum HeaderLanguageAttribution {
 impl TestDetectionProvider for CppAnalyzer {}
 
 impl ImportAnalysisProvider for CppAnalyzer {
+    fn file_dependency_facts_for_files(
+        &self,
+        files: &[ProjectFile],
+    ) -> Option<crate::hash::HashMap<ProjectFile, crate::analyzer::FileDependencyFacts>> {
+        Some(self.inner.bulk_file_dependency_facts(files.iter().cloned()))
+    }
+
     fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();
@@ -286,6 +293,7 @@ impl CppAnalyzer {
         &self,
         token: QueryToken<'_>,
     ) -> HashMap<ProjectFile, Arc<HashSet<ProjectFile>>> {
+        let _scope = crate::profiling::scope("cpp.build_transitive_reverse_tu_index");
         let direct_reverse = self.reverse_include_index(token);
         let translation_units = self
             .inner
@@ -293,7 +301,19 @@ impl CppAnalyzer {
             .into_iter()
             .filter(is_cpp_translation_unit)
             .collect::<Vec<_>>();
-        build_transitive_reverse_tu_index(&direct_reverse, &translation_units)
+        let index = build_transitive_reverse_tu_index(&direct_reverse, &translation_units);
+        // Total membership, not key count, is what this index costs: a header
+        // reachable from many translation units contributes one entry per unit,
+        // so the product can grow far faster than the workspace does. The note
+        // is the cheapest way to tell a slow build from a quadratic one.
+        crate::profiling::note_with(|| {
+            let entries: usize = index.values().map(|set| set.len()).sum();
+            format!(
+                "transitive_reverse_tu_index keys={} total_membership={entries}",
+                index.len()
+            )
+        });
+        index
     }
 
     /// Every workspace translation unit whose `#include` closure transitively
@@ -307,6 +327,137 @@ impl CppAnalyzer {
             .get(file)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Every file of `files` that some workspace translation unit provably
+    /// compiles as C -- exactly the files
+    /// [`Self::header_language_attribution`] answers
+    /// [`HeaderLanguageAttribution::C`] or [`HeaderLanguageAttribution::Mixed`]
+    /// for, decided by the same evidence order, but computed for the whole
+    /// workspace in one propagation.
+    ///
+    /// This is the workspace mount's question, and the mount asks it of every
+    /// analyzed file. Asking it through the attribution function materializes
+    /// [`Self::transitive_reverse_tu_index`], which holds one
+    /// `HashSet<ProjectFile>` of reaching translation units per file: on Godot
+    /// that is 1,887,205 memberships built in 10.2 seconds to produce 8,356
+    /// booleans. Only three monotone bits of each of those sets are ever read
+    /// (see [`ReachingCompilationEvidence`]), so propagating the bits instead
+    /// of the sets answers the same question in the size of the include graph.
+    ///
+    /// The full index is not replaced: the resolution-time attribution surface
+    /// still needs the sets, and this function must agree with it file for
+    /// file. `predicate_agrees_with_the_transitive_index_over_a_mixed_workspace`
+    /// is that check.
+    pub(crate) fn files_compiled_as_c(
+        &self,
+        token: QueryToken<'_>,
+        files: &[ProjectFile],
+    ) -> HashSet<ProjectFile> {
+        if files.is_empty() {
+            // Asking about no file is not the propagation's answer for an
+            // empty set; it is no question at all. A workspace with no C
+            // translation unit reaches here, and building the include graph
+            // to answer nothing is what the mount used to avoid by testing
+            // that condition before calling the attribution.
+            return HashSet::default();
+        }
+        let _scope = crate::profiling::scope("cpp.files_compiled_as_c");
+        let evidence = self.propagate_reaching_compilation_evidence(token);
+        files
+            .iter()
+            .filter(|file| self.compiled_as_c(file, evidence.get(*file)))
+            .cloned()
+            .collect()
+    }
+
+    /// The evidence tiers of [`Self::header_language_attribution`], read off
+    /// one file's own compile-database entries and the propagated evidence of
+    /// the translation units that reach it.
+    fn compiled_as_c(
+        &self,
+        file: &ProjectFile,
+        reaching: Option<&ReachingCompilationEvidence>,
+    ) -> bool {
+        let direct_contexts = self.compile_contexts_for(file);
+        if !direct_contexts.is_empty() {
+            return direct_contexts
+                .iter()
+                .any(|context| context.tu_language(file.rel_path()) == CompiledLanguage::C);
+        }
+        let Some(reaching) = reaching else {
+            // Nothing reaches it and no entry names it: `Unknown`.
+            return false;
+        };
+        if reaching.database_entry {
+            reaching.database_c
+        } else {
+            reaching.extension_c
+        }
+    }
+
+    /// One iterative propagation of [`ReachingCompilationEvidence`] from every
+    /// workspace translation unit outward along `#include` edges, to a fixed
+    /// point. Same graph, same direction and same seeds as
+    /// [`build_transitive_reverse_tu_index`]; what differs is that a file
+    /// accumulates three bits rather than a set of translation units, so the
+    /// cost is the size of the graph and not the size of the reachability
+    /// relation over it.
+    fn propagate_reaching_compilation_evidence(
+        &self,
+        token: QueryToken<'_>,
+    ) -> HashMap<ProjectFile, ReachingCompilationEvidence> {
+        let direct_reverse = self.reverse_include_index(token);
+        let mut forward: HashMap<ProjectFile, Vec<ProjectFile>> = HashMap::default();
+        for (target, includers) in direct_reverse.iter() {
+            for includer in includers.iter() {
+                forward
+                    .entry(includer.clone())
+                    .or_default()
+                    .push(target.clone());
+            }
+        }
+
+        let mut evidence: HashMap<ProjectFile, ReachingCompilationEvidence> = HashMap::default();
+        let mut worklist: VecDeque<ProjectFile> = VecDeque::new();
+        for translation_unit in self
+            .inner
+            .all_files()
+            .into_iter()
+            .filter(is_cpp_translation_unit)
+        {
+            let seed = ReachingCompilationEvidence::of_translation_unit(
+                &translation_unit,
+                self.compile_contexts_for(&translation_unit),
+            );
+            evidence
+                .entry(translation_unit.clone())
+                .or_default()
+                .absorb(seed);
+            worklist.push_back(translation_unit);
+        }
+        while let Some(current) = worklist.pop_front() {
+            let Some(targets) = forward.get(&current) else {
+                continue;
+            };
+            let current_evidence = evidence
+                .get(&current)
+                .copied()
+                .expect("a file on the worklist was reached, so it carries evidence");
+            for target in targets {
+                if evidence
+                    .entry(target.clone())
+                    .or_default()
+                    .absorb(current_evidence)
+                {
+                    worklist.push_back(target.clone());
+                }
+            }
+        }
+        crate::profiling::note_with(|| {
+            format!("reaching_compilation_evidence files={}", evidence.len())
+        });
+        evidence
     }
 
     /// Which language(s) provably compile `file` when it is a header, per the
@@ -368,6 +519,62 @@ impl CppAnalyzer {
                 CompiledLanguage::Cpp
             }
         }))
+    }
+}
+
+/// Everything [`HeaderLanguageAttribution`] reads off the set of translation
+/// units that reach one file, reduced to three monotone bits.
+///
+/// The attribution's tiers only ever ask three yes/no questions of that set:
+/// does any of its translation units have a compile-database entry at all
+/// (which decides whether tier 2 or tier 3 answers), does any entry compile
+/// its unit as C, and is any reaching unit spelled `.c`. Each is a union over
+/// the set, so each survives being merged along an include edge, which is what
+/// lets the propagation carry the answer instead of the set.
+///
+/// The reduction is exact for the C-or-Mixed question the workspace mount
+/// asks; it is deliberately not enough to reproduce the four-way attribution,
+/// because `Cpp` and `Unknown` differ only by whether anything reaches the
+/// file at all and the mount treats both the same way.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ReachingCompilationEvidence {
+    /// Some reaching translation unit has a compile-database entry. Tier 2
+    /// answers when this holds, and tier 3 when it does not.
+    database_entry: bool,
+    /// Some reaching translation unit has a compile-database entry that
+    /// compiles it as C.
+    database_c: bool,
+    /// Some reaching translation unit is named `*.c`.
+    extension_c: bool,
+}
+
+impl ReachingCompilationEvidence {
+    fn of_translation_unit(
+        translation_unit: &ProjectFile,
+        contexts: &[brokk_bifrost_cpp::compile_context::CppCompileContext],
+    ) -> Self {
+        Self {
+            database_entry: !contexts.is_empty(),
+            database_c: contexts.iter().any(|context| {
+                context.tu_language(translation_unit.rel_path()) == CompiledLanguage::C
+            }),
+            extension_c: translation_unit
+                .rel_path()
+                .extension()
+                .and_then(|extension| extension.to_str())
+                == Some("c"),
+        }
+    }
+
+    /// Union `other` into `self`, reporting whether anything changed. The
+    /// worklist re-visits a file exactly when this says yes, so the
+    /// propagation terminates: three bits can only ever turn on.
+    fn absorb(&mut self, other: Self) -> bool {
+        let before = *self;
+        self.database_entry |= other.database_entry;
+        self.database_c |= other.database_c;
+        self.extension_c |= other.extension_c;
+        *self != before
     }
 }
 

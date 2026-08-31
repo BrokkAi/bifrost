@@ -258,6 +258,40 @@ pub fn kotlin_is_declaration_name(node: Node<'_>) -> bool {
             .is_some_and(|name| name.id() == node.id())
 }
 
+/// The identifier a Kotlin declaration names.
+///
+/// No declaration carries a `name` field, so the name is "the first named child
+/// of the declaration's name kind" -- the same positional rule
+/// [`kotlin_is_declaration_name`] checks from the other direction. A
+/// `property_declaration` holds its name one level down, inside its
+/// `variable_declaration`.
+///
+/// Without this a caller that only has fields to go on falls back to searching
+/// the declaration's text for the name, and a body that mentions the same name
+/// -- `fun offset(n: Int) { this.offset = n }` -- answers first (#2712).
+pub fn kotlin_declaration_name(declaration: Node<'_>) -> Option<Node<'_>> {
+    match declaration.kind() {
+        "class_declaration" | "object_declaration" => {
+            first_named_child_of_kind(declaration, "type_identifier")
+        }
+        "function_declaration" => first_named_child_of_kind(declaration, "simple_identifier"),
+        "property_declaration" => {
+            let variables: Vec<Node<'_>> = named_children(declaration)
+                .into_iter()
+                .filter(|child| child.kind() == "variable_declaration")
+                .collect();
+            match variables.as_slice() {
+                [variable] => first_named_child_of_kind(*variable, "simple_identifier"),
+                // A destructuring property spells its names in a
+                // `multi_variable_declaration`, and no single token is the
+                // name of the declaration as a whole.
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// The `import_header` enclosing `node`, if `node` sits inside an import.
 ///
 /// A focus inside an import can land on the `identifier`'s `simple_identifier`,

@@ -70,11 +70,12 @@ Node users can run `npm install -g @brokkai/bifrost` or use
 native command for the current platform.
 
 The installer downloads the checksum-verified release binary into `~/.local/bin`
-on macOS (Apple Silicon and Intel), Linux (x86-64 glibc or musl, ARM64 glibc),
-WSL, and Android under Termux. Homebrew users on macOS and Linux (x86-64 and
-ARM64 glibc) can run `brew install brokkai/tap/bifrost`
-instead. On Windows, and on ARM64 musl distributions such as Alpine, build from
-source with `cargo install brokk-bifrost --locked`. See
+on macOS (Apple Silicon and Intel), glibc 2.28+ Linux (x86-64 and ARM64), WSL,
+and Android under Termux. Homebrew users on macOS and glibc Linux can run
+`brew install brokkai/tap/bifrost` instead. On Windows, use the published
+archive or build from source. Musl distributions such as Alpine have no
+supported prebuilt release; users can attempt a source build with
+`cargo install brokk-bifrost --locked`. See
 [Install Bifrost](docs/src/content/docs/install.md) for the full platform
 table.
 

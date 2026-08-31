@@ -6,6 +6,7 @@
 
 use crate::analyzer::CodeUnitIndex;
 use crate::analyzer::common::language_for_file as file_language;
+use crate::analyzer::tree_sitter_analyzer::BulkFileStateSource;
 use crate::analyzer::{
     CodeUnit, ImportAnalysisProvider, ImportInfo, ImportReachability, Language, ProjectFile,
     build_reverse_file_index,
@@ -22,11 +23,296 @@ use brokk_bifrost_jvm::scala::wildcard_imports::{
     ScalaExplicitImportFacts, ScalaExplicitImportTier, ScalaWildcardImportEnvironment,
     ScalaWildcardImportOwner, ScalaWildcardOwnerFacts, ScalaWildcardOwnerKind,
     resolve_scala_explicit_import_tier, resolve_scala_wildcard_import_environment,
-    scala_import_path, scala_import_reachability,
+    scala_import_path, scala_import_path_candidates, scala_import_reachability,
 };
 
 use super::{ScalaAnalyzer, scala_enclosing_template_owner_fq_names};
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
+
+#[derive(Default)]
+pub(super) struct ScalaFileDependencyIndex {
+    package_by_file: HashMap<ProjectFile, String>,
+    type_identifiers_by_file: HashMap<ProjectFile, HashSet<String>>,
+    same_package_declarations_by_name: HashMap<String, HashMap<String, HashSet<ProjectFile>>>,
+    importable_files_by_package: HashMap<String, HashSet<ProjectFile>>,
+    declaration_files: HashMap<String, HashSet<ProjectFile>>,
+    direct_member_files: HashMap<String, HashSet<ProjectFile>>,
+    stable_singletons: HashSet<String>,
+    package_namespaces: Vec<String>,
+    export_dependencies: HashMap<ProjectFile, HashSet<ProjectFile>>,
+}
+
+impl ScalaFileDependencyIndex {
+    fn build(
+        analyzer: &ScalaAnalyzer,
+        files: &[ProjectFile],
+        cancellation: &crate::cancellation::CancellationToken,
+    ) -> Option<Self> {
+        let states = analyzer.bulk_file_states(files.iter().cloned(), BulkFileStateSource::Omit);
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        let scala_file_count = files
+            .iter()
+            .filter(|file| file_language(file) == Language::Scala)
+            .count();
+        if states.len() != scala_file_count {
+            return None;
+        }
+
+        let mut index = Self::default();
+        let mut export_sources = Vec::new();
+        for (file, state) in &states {
+            if cancellation.is_cancelled() {
+                return None;
+            }
+            index
+                .package_by_file
+                .insert(file.clone(), state.package_name.clone());
+            index
+                .type_identifiers_by_file
+                .insert(file.clone(), state.type_identifiers.clone());
+            for declaration in &state.declarations {
+                let normalized =
+                    brokk_bifrost_jvm::scala::scala_normalize_full_name(&declaration.fq_name());
+                index
+                    .declaration_files
+                    .entry(normalized.clone())
+                    .or_default()
+                    .insert(file.clone());
+                if declaration.is_class() && declaration.fq_name().ends_with('$') {
+                    index.stable_singletons.insert(normalized);
+                }
+                if is_scala_importable_top_level(declaration) {
+                    index
+                        .importable_files_by_package
+                        .entry(declaration.package_name().to_string())
+                        .or_default()
+                        .insert(file.clone());
+                    index
+                        .same_package_declarations_by_name
+                        .entry(declaration.package_name().to_string())
+                        .or_default()
+                        .entry(
+                            brokk_bifrost_jvm::scala::scala_short_name_terminal_segment(
+                                declaration.short_name(),
+                            )
+                            .trim_end_matches('$')
+                            .to_string(),
+                        )
+                        .or_default()
+                        .insert(file.clone());
+                }
+            }
+            for (owner, children) in &state.children {
+                let owner = brokk_bifrost_jvm::scala::scala_normalize_full_name(&owner.fq_name());
+                for child in children
+                    .iter()
+                    .filter(|child| is_scala_importable_direct_member(child))
+                {
+                    index
+                        .direct_member_files
+                        .entry(owner.clone())
+                        .or_default()
+                        .insert(child.source().clone());
+                }
+            }
+            if !state.scala_exports.is_empty() {
+                export_sources.push((
+                    file.clone(),
+                    state.package_name.clone(),
+                    state.imports.clone(),
+                    state
+                        .scala_exports
+                        .values()
+                        .flatten()
+                        .map(|export| export.owner_path.clone())
+                        .collect::<Vec<_>>(),
+                ));
+            }
+        }
+        index.package_namespaces = index.importable_files_by_package.keys().cloned().collect();
+        index.package_namespaces.sort_unstable();
+
+        for (file, package, imports, export_paths) in export_sources {
+            if cancellation.is_cancelled() {
+                return None;
+            }
+            let mut dependencies = index.resolve_imports(&file, &imports);
+            for owner_path in export_paths {
+                let rendered = owner_path.join(".");
+                for candidate in
+                    scala_import_path_candidates(&rendered, std::slice::from_ref(&package))
+                {
+                    dependencies.extend(index.declaration_files(&candidate));
+                }
+            }
+            if dependencies.is_empty() {
+                dependencies.extend(
+                    index
+                        .same_package_declarations_by_name
+                        .get(&package)
+                        .into_iter()
+                        .flat_map(HashMap::values)
+                        .flatten()
+                        .cloned(),
+                );
+            }
+            dependencies.remove(&file);
+            if !dependencies.is_empty() {
+                index.export_dependencies.insert(file, dependencies);
+            }
+        }
+        Some(index)
+    }
+
+    fn package_exists(&self, candidate: &str) -> bool {
+        let descendant_prefix = format!("{candidate}.");
+        let index = self
+            .package_namespaces
+            .partition_point(|package| package.as_str() < candidate);
+        self.package_namespaces
+            .get(index)
+            .is_some_and(|package| package == candidate || package.starts_with(&descendant_prefix))
+    }
+
+    fn declaration_files(&self, candidate: &str) -> impl Iterator<Item = ProjectFile> + '_ {
+        let candidate = brokk_bifrost_jvm::scala::scala_normalize_full_name(candidate);
+        self.declaration_files
+            .get(&candidate)
+            .into_iter()
+            .flatten()
+            .cloned()
+    }
+
+    fn files_in_package_tree(&self, package: &str) -> HashSet<ProjectFile> {
+        let descendant_prefix = format!("{package}.");
+        let start = self
+            .package_namespaces
+            .partition_point(|candidate| candidate.as_str() < package);
+        let mut files = HashSet::default();
+        for candidate in self.package_namespaces[start..]
+            .iter()
+            .take_while(|candidate| {
+                candidate.as_str() == package || candidate.starts_with(&descendant_prefix)
+            })
+        {
+            files.extend(
+                self.importable_files_by_package
+                    .get(candidate)
+                    .into_iter()
+                    .flatten()
+                    .cloned(),
+            );
+        }
+        files
+    }
+
+    fn declaration_owner_files(
+        &self,
+        info: &ImportInfo,
+        package_prefixes: &[String],
+    ) -> HashSet<ProjectFile> {
+        let Some(path) = info.path.as_ref() else {
+            return HashSet::default();
+        };
+        for prefix_len in (1..path.segments.len()).rev() {
+            let rendered = path.segments[..prefix_len].join(".");
+            let mut files = HashSet::default();
+            for candidate in scala_import_path_candidates(&rendered, package_prefixes) {
+                files.extend(self.declaration_files(&candidate));
+            }
+            if !files.is_empty() {
+                return files;
+            }
+        }
+        HashSet::default()
+    }
+
+    fn owner_facts(&self, candidate: &str) -> ScalaWildcardOwnerFacts {
+        let normalized = brokk_bifrost_jvm::scala::scala_normalize_full_name(candidate);
+        ScalaWildcardOwnerFacts {
+            package: self.importable_files_by_package.contains_key(candidate),
+            stable_singleton: self.stable_singletons.contains(&normalized),
+        }
+    }
+
+    fn resolve_imports(&self, file: &ProjectFile, imports: &[ImportInfo]) -> HashSet<ProjectFile> {
+        let Some(source_package) = self.package_by_file.get(file) else {
+            return HashSet::default();
+        };
+        let wildcard_environment = resolve_scala_wildcard_import_environment(
+            imports,
+            std::slice::from_ref(source_package),
+            |_| Vec::new(),
+            |candidate| self.owner_facts(candidate),
+        );
+        let mut imported = HashSet::default();
+        for (import_index, info) in imports.iter().enumerate() {
+            let Some(path) = scala_import_path(info) else {
+                continue;
+            };
+            if info.is_wildcard {
+                for owner in wildcard_environment
+                    .owners
+                    .iter()
+                    .filter(|owner| owner.import_index == import_index)
+                {
+                    match owner.kind {
+                        ScalaWildcardOwnerKind::Package => {
+                            imported.extend(
+                                self.importable_files_by_package
+                                    .get(&owner.fqn)
+                                    .into_iter()
+                                    .flatten()
+                                    .cloned(),
+                            );
+                        }
+                        ScalaWildcardOwnerKind::StableSingleton => {
+                            let normalized = brokk_bifrost_jvm::scala::scala_normalize_full_name(
+                                &owner.declaration_fqn(),
+                            );
+                            imported.extend(self.declaration_files(&normalized));
+                            imported.extend(
+                                self.direct_member_files
+                                    .get(&normalized)
+                                    .into_iter()
+                                    .flatten()
+                                    .cloned(),
+                            );
+                        }
+                    }
+                }
+                continue;
+            }
+            let package_prefixes = info
+                .path
+                .as_ref()
+                .map(|path| path.lexical_prefixes.as_slice())
+                .filter(|prefixes| !prefixes.is_empty())
+                .unwrap_or(std::slice::from_ref(source_package));
+            let Some(tier) =
+                resolve_scala_explicit_import_tier(&path, package_prefixes, |candidate| {
+                    ScalaExplicitImportFacts {
+                        declaration: self.declaration_files(candidate).next().is_some(),
+                        package: self.package_exists(candidate),
+                    }
+                })
+            else {
+                imported.extend(self.declaration_owner_files(info, package_prefixes));
+                continue;
+            };
+            if tier.declaration {
+                imported.extend(self.declaration_files(&tier.candidate));
+            }
+            if tier.package {
+                imported.extend(self.files_in_package_tree(&tier.candidate));
+            }
+        }
+        imported.remove(file);
+        imported
+    }
+}
 
 impl ScalaAnalyzer {
     fn resolve_import_info(
@@ -259,6 +545,13 @@ impl ScalaAnalyzer {
 }
 
 impl ImportAnalysisProvider for ScalaAnalyzer {
+    fn file_dependency_facts_for_files(
+        &self,
+        files: &[ProjectFile],
+    ) -> Option<crate::hash::HashMap<ProjectFile, crate::analyzer::FileDependencyFacts>> {
+        Some(self.inner.bulk_file_dependency_facts(files.iter().cloned()))
+    }
+
     fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();
@@ -324,6 +617,74 @@ impl ImportAnalysisProvider for ScalaAnalyzer {
 
     fn import_info_of(&self, token: QueryToken<'_>, file: &ProjectFile) -> Vec<ImportInfo> {
         self.inner.import_info_of(token, file)
+    }
+
+    fn imported_files_from_infos(
+        &self,
+        file: &ProjectFile,
+        imports: &[ImportInfo],
+    ) -> Option<HashSet<ProjectFile>> {
+        self.file_dependency_index
+            .get()
+            .map(|index| index.resolve_imports(file, imports))
+    }
+
+    fn prefetch_file_dependency_targets(
+        &self,
+        files: &[ProjectFile],
+        _import_infos: Option<&HashMap<ProjectFile, Vec<ImportInfo>>>,
+        cancellation: &crate::cancellation::CancellationToken,
+    ) {
+        if self.file_dependency_index.get().is_none()
+            && let Some(index) = ScalaFileDependencyIndex::build(self, files, cancellation)
+        {
+            let _ = self.file_dependency_index.set(index);
+        }
+    }
+
+    fn additional_direct_file_dependencies(
+        &self,
+        files: &[ProjectFile],
+        cancellation: &crate::cancellation::CancellationToken,
+    ) -> Option<crate::analyzer::AdditionalFileDependencies> {
+        let index = self.file_dependency_index.get()?;
+        let selected = files.iter().cloned().collect::<HashSet<_>>();
+        let mut dependencies = HashMap::default();
+        for file in files {
+            if cancellation.is_cancelled() {
+                return None;
+            }
+            let direct = dependencies
+                .entry(file.clone())
+                .or_insert_with(HashSet::default);
+            if let (Some(package), Some(identifiers)) = (
+                index.package_by_file.get(file),
+                index.type_identifiers_by_file.get(file),
+            ) && let Some(targets_by_name) = index.same_package_declarations_by_name.get(package)
+            {
+                for identifier in identifiers {
+                    direct.extend(
+                        targets_by_name
+                            .get(identifier)
+                            .into_iter()
+                            .flatten()
+                            .filter(|target| *target != file && selected.contains(*target))
+                            .cloned(),
+                    );
+                }
+            }
+            if let Some(exported) = index.export_dependencies.get(file) {
+                direct.extend(
+                    exported
+                        .iter()
+                        .filter(|target| selected.contains(*target))
+                        .cloned(),
+                );
+            }
+        }
+        Some(crate::analyzer::AdditionalFileDependencies::complete(
+            dependencies,
+        ))
     }
 
     fn could_import_file(

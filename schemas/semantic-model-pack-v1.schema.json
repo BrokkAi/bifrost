@@ -136,6 +136,40 @@
         "camel_case"
       ]
     },
+    "AuthoredConditionalResultRefinement": {
+      "type": "object",
+      "properties": {
+        "outcome": {
+          "type": "boolean"
+        },
+        "parameter_ordinal": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "predicate": {
+          "$ref": "#/$defs/AuthoredResultPredicate"
+        },
+        "proof_effect": {
+          "$ref": "#/$defs/AuthoredPredicateProofEffect"
+        },
+        "result_ordinal": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 65535,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "result_ordinal",
+        "outcome",
+        "parameter_ordinal",
+        "predicate",
+        "proof_effect"
+      ]
+    },
     "AuthoredDeclaredEffect": {
       "description": "One namespaced effect a reviewed pack attributes to a procedure (#2437).\n\n`id` is a namespaced identifier (`vendor.effect`); the namespace separator is\nrequired so two vendors can ship packs without colliding on bare words like\n`write`.",
       "type": "object",
@@ -155,6 +189,41 @@
         "id",
         "timing",
         "certainty"
+      ]
+    },
+    "AuthoredNormalReturnRefinement": {
+      "type": "object",
+      "properties": {
+        "parameter_ordinal": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "predicate": {
+          "$ref": "#/$defs/AuthoredResultPredicate"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "parameter_ordinal",
+        "predicate"
+      ]
+    },
+    "AuthoredOperationPrecondition": {
+      "type": "object",
+      "properties": {
+        "input": {
+          "$ref": "#/$defs/AuthoredSummaryInput"
+        },
+        "predicate": {
+          "$ref": "#/$defs/AuthoredResultPredicate"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "input",
+        "predicate"
       ]
     },
     "AuthoredPayload": {
@@ -235,11 +304,25 @@
         }
       ]
     },
+    "AuthoredPredicateProofEffect": {
+      "type": "string",
+      "enum": [
+        "establishes",
+        "does_not_establish"
+      ]
+    },
     "AuthoredProcedureSummary": {
       "type": "object",
       "properties": {
         "completeness": {
           "$ref": "#/$defs/Completeness"
+        },
+        "conditional_result_refinements": {
+          "description": "Reviewed effects that one boolean normal-result outcome has on a\npredicate over a parameter. A negative proof effect says only that the\noutcome does not prove the named predicate; it does not establish the\nopposite runtime value.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AuthoredConditionalResultRefinement"
+          }
         },
         "covers_overrides": {
           "description": "The author's explicit claim that every implementation of this member\noutside the workspace conforms to this summary (#2371).\n\nThis is a statement about the member's *implementations*, not about this\nsummary's own coverage of its target, so it is deliberately not inherited\nfrom `completeness: complete`. Only a summary carrying it can discharge a\ncall's residual dynamic-dispatch arm, and only after the workspace\nimplementors of the same declaring member have been enumerated.\n\nSerialized only when claimed, so adding the field leaves the content\ndigest of every summary that does not claim it unchanged.",
@@ -267,6 +350,43 @@
           "default": [],
           "items": {
             "$ref": "#/$defs/AuthoredSummaryLocation"
+          }
+        },
+        "normal_continuation_absent": {
+          "description": "The author's explicit claim that this procedure has no normal\ncontinuation. Omission or `false` makes no claim; only `true` may remove\nnormal control after exact runtime agreement.\n\nSerialized only when claimed, so adding the field leaves the content\ndigest of every existing summary unchanged.",
+          "type": "boolean"
+        },
+        "normal_result_count": {
+          "description": "Number of normal result ports the target returns. It is required when\n`result_contracts` or `conditional_result_refinements` is non-empty so\nthe compiler can reject invalid ordinals without materializing a source\ndeclaration.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "normal_return_refinements": {
+          "description": "Reviewed predicates established for parameters whenever this procedure\nreturns normally. These are path postconditions, not unconditional\nclaims about the argument at call entry.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AuthoredNormalReturnRefinement"
+          }
+        },
+        "preconditions": {
+          "description": "Reviewed predicates required of this exact procedure invocation's\ninputs. Omission means operation preconditions were not reviewed; a\npresent empty list means the procedure was reviewed and requires none.\n\nSerialized only when reviewed so adding this field leaves every\nexisting authored summary's canonical bytes and content digest\nunchanged.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/AuthoredOperationPrecondition"
+          }
+        },
+        "result_contracts": {
+          "description": "Reviewed conditions under which one normal result is valid to consume.\nA contract may name a separate condition result, as in a Go\n`(resource, error)` API, or state a validity predicate directly on the\nprotected result. The relation is explicit because return shape alone\ndoes not establish either contract.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AuthoredResultContract"
           }
         },
         "target": {
@@ -304,6 +424,11 @@
         },
         "symbol": {
           "type": "string"
+        },
+        "variadic": {
+          "description": "Whether the final formal parameter accepts zero or more actual\narguments. `parameter_count` includes that final variadic formal, so a\nvariadic target accepts at least `parameter_count - 1` actual arguments.\nSemantic claims may currently reference only the fixed prefix: the\nvalidator rejects a port or refinement that names the variadic tail.",
+          "type": "boolean",
+          "default": false
         }
       },
       "additionalProperties": false,
@@ -311,6 +436,106 @@
         "path",
         "symbol",
         "parameter_count"
+      ]
+    },
+    "AuthoredResultContract": {
+      "type": "object",
+      "properties": {
+        "condition_result_ordinal": {
+          "description": "A separate result whose reviewed predicate establishes that the\nprotected result is valid. Omit this together with `predicate` when\nvalidity is expressed directly by `result_success_predicate`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "member_contracts": {
+          "description": "Reviewed member behavior carried by this exact result port. This lets a\npack describe a resource returned by a multi-result API without\nattributing the same protocol to the other result ports.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AuthoredResultMemberContract"
+          }
+        },
+        "predicate": {
+          "description": "The predicate required of `condition_result_ordinal`. This field and\nthe condition ordinal must be present or absent together.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AuthoredResultPredicate"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "result_ordinal": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "result_success_predicate": {
+          "description": "The reviewed predicate that makes the protected result valid. For a\npaired contract, this is an optional correlation that independently\nproves the separate condition predicate. For a direct contract, this\nis the validity predicate and is required.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AuthoredResultPredicate"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "result_ordinal"
+      ]
+    },
+    "AuthoredResultMemberContract": {
+      "type": "object",
+      "properties": {
+        "completeness": {
+          "$ref": "#/$defs/Completeness"
+        },
+        "declared_effects": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AuthoredDeclaredEffect"
+          }
+        },
+        "member": {
+          "type": "string"
+        },
+        "parameter_count": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "preconditions": {
+          "description": "Reviewed predicates required of this exact member operation's inputs.\nOmission means operation preconditions were not reviewed; a present\nempty list means the operation was reviewed and requires none.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/AuthoredOperationPrecondition"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "member",
+        "parameter_count",
+        "completeness"
+      ]
+    },
+    "AuthoredResultPredicate": {
+      "type": "string",
+      "enum": [
+        "null",
+        "non_null"
       ]
     },
     "AuthoredShard": {
@@ -578,6 +803,26 @@
           "additionalProperties": false,
           "required": [
             "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "indexed_normal_return"
+            },
+            "ordinal": {
+              "type": "integer",
+              "format": "uint32",
+              "maximum": 65535,
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "ordinal"
           ]
         },
         {
@@ -1280,6 +1525,11 @@
           "items": {
             "type": "string"
           }
+        },
+        "callable_family_complete": {
+          "description": "The authored declarations contain every callable with this member's\nexact owner, name, receiver form, and fixed arity.\n\nThis is narrower than pack or owner-surface completeness. It permits\nan exact external-call binding for this one structural family while a\ncurated declaration pack remains globally partial. Same-family\nduplicates still conflict, and variadic families cannot yet make this\nclaim.",
+          "type": "boolean",
+          "default": false
         },
         "extension_receiver": {
           "anyOf": [

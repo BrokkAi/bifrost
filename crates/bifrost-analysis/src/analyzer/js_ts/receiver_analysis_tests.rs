@@ -11,11 +11,11 @@ mod tests {
     };
     use brokk_bifrost_core::analyzer::usages::receiver_analysis::DEFAULT_RECEIVER_MAX_TARGETS;
     use brokk_bifrost_core::analyzer::usages::receiver_analysis::{
-        ReceiverAnalysisBudget, ReceiverAnalysisOutcome,
+        ReceiverAnalysisBudget, ReceiverAnalysisOutcome, ReceiverValue,
     };
     use brokk_bifrost_core::analyzer::usages::reference_site::smallest_named_node_covering;
     use brokk_bifrost_js_ts::graph::receiver_analysis::*;
-    use brokk_bifrost_js_ts::syntax::JsTsImportBinder;
+    use brokk_bifrost_js_ts::syntax::{JsTsImportBinder, compute_import_binder};
     use std::path::PathBuf;
     use tree_sitter::Node;
     use tree_sitter::Parser;
@@ -196,6 +196,71 @@ export function caller(which: number) {
     }
 
     #[test]
+    fn receiver_history_does_not_false_prove_after_an_unknown_write() {
+        let cases = [
+            (
+                "annotated",
+                r#"
+class Store { put() {} }
+class Cache { put() {} static make() { return new Cache(); } }
+function run(store: Store) {
+  store = Cache.make();
+  store.put();
+}
+"#,
+                Some("Cache.put"),
+            ),
+            (
+                "dynamic-first",
+                r#"
+class Store { put() {} static make() { return new Store(); } }
+declare function dynamicValue(): unknown;
+function run() {
+  let store = dynamicValue();
+  store = Store.make();
+  store.put();
+}
+"#,
+                None,
+            ),
+        ];
+
+        for (label, source, exact_target) in cases {
+            let (_temp, file, analyzer) = test_project(source);
+            let tree = parse(source);
+            let definitions = AnalyzerDefinitionLookup::new(&analyzer, Language::TypeScript);
+            let provider = JsTsReceiverFactProvider::new(
+                &analyzer,
+                &definitions,
+                Language::TypeScript,
+                &file,
+                source,
+                tree.root_node(),
+                JsTsImportBinder::empty(),
+            );
+            let receiver = receiver_node(tree.root_node(), source, "store.put", "store");
+            let report = provider.resolve_member_targets_report(
+                receiver,
+                "put",
+                receiver.start_byte(),
+                ReceiverAnalysisBudget::default(),
+            );
+
+            match exact_target {
+                Some(expected) => assert!(
+                    matches!(&report.outcome, ReceiverAnalysisOutcome::Precise(targets)
+                        if matches!(targets.as_slice(), [target] if target.fq_name() == expected)),
+                    "{label}: the straight-line assignment proves Cache, never annotated Store: {report:#?}"
+                ),
+                None => assert!(
+                    !matches!(report.outcome, ReceiverAnalysisOutcome::Precise(_)),
+                    "{label}: an unknown earlier write remains explicit: {report:#?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
     fn nested_same_name_factory_does_not_reuse_the_enclosing_declaration() {
         let source = r#"
 class Outer {}
@@ -225,5 +290,98 @@ function make() {
         )
         .expect("inner function node");
         assert_eq!(provider.function_unit_for_node("make", inner), None);
+    }
+
+    #[test]
+    fn unique_package_imports_are_complete_module_receiver_identities() {
+        let source = r#"
+import path from "node:path";
+import * as os from "node:os";
+import { Buffer } from "node:buffer";
+const crypto = require("node:crypto");
+
+path.basename("a");
+os.platform();
+Buffer.from("a");
+crypto.randomUUID();
+"#;
+        let (_temp, file, analyzer) = test_project(source);
+        let tree = parse(source);
+        let definitions = AnalyzerDefinitionLookup::new(&analyzer, Language::TypeScript);
+        let provider = JsTsReceiverFactProvider::new(
+            &analyzer,
+            &definitions,
+            Language::TypeScript,
+            &file,
+            source,
+            tree.root_node(),
+            compute_import_binder(source, &tree),
+        );
+
+        for (marker, receiver, expected) in [
+            ("path.basename", "path", "node:path"),
+            ("os.platform", "os", "node:os"),
+            ("Buffer.from", "Buffer", "Buffer"),
+            ("crypto.randomUUID", "crypto", "node:crypto"),
+        ] {
+            let receiver = receiver_node(tree.root_node(), source, marker, receiver);
+            let report =
+                provider.resolve_receiver_node_report(receiver, ReceiverAnalysisBudget::default());
+            assert!(
+                matches!(
+                    report.outcome,
+                    ReceiverAnalysisOutcome::Precise(ref values)
+                        if matches!(
+                            values.as_slice(),
+                            [ReceiverValue::ModuleOrExportObject(unit)]
+                                if unit.fq_name() == expected
+                        )
+                ),
+                "{marker} must resolve to exact imported module identity {expected}: {:?}",
+                report.outcome
+            );
+            assert_eq!(report.work.summary_expansions, 0, "{marker}");
+        }
+    }
+
+    #[test]
+    fn competing_and_reassigned_import_receivers_stay_incomplete() {
+        let source = r#"
+import api from "pkg-a";
+import api from "pkg-b";
+import path from "node:path";
+
+api.exec("a");
+path = makePath();
+path.basename("a");
+"#;
+        let (_temp, file, analyzer) = test_project(source);
+        let tree = parse(source);
+        let definitions = AnalyzerDefinitionLookup::new(&analyzer, Language::TypeScript);
+        let provider = JsTsReceiverFactProvider::new(
+            &analyzer,
+            &definitions,
+            Language::TypeScript,
+            &file,
+            source,
+            tree.root_node(),
+            compute_import_binder(source, &tree),
+        );
+
+        let api = receiver_node(tree.root_node(), source, "api.exec", "api");
+        assert!(matches!(
+            provider
+                .resolve_receiver_node_report(api, ReceiverAnalysisBudget::default())
+                .outcome,
+            ReceiverAnalysisOutcome::Ambiguous(ref values) if values.is_empty()
+        ));
+
+        let path = receiver_node(tree.root_node(), source, "path.basename", "path");
+        assert!(matches!(
+            provider
+                .resolve_receiver_node_report(path, ReceiverAnalysisBudget::default())
+                .outcome,
+            ReceiverAnalysisOutcome::Unknown
+        ));
     }
 }

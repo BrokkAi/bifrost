@@ -15,11 +15,32 @@ Semantic-model packs describe API facts that are unavailable from workspace
 source, declarative facts produced by frameworks or generators, and reviewed
 external procedure behavior. They are versioned data artifacts: packs do not
 contain executable code, and installing one does not implicitly select the
-newest available content or download anything at runtime.
+newest available content. Generic analysis, explicit catalog activation, and
+direct consumers of this crate remain network-free; the released
+`brokk-bifrost` facade has a separate exact-production acquisition path.
 
 See the
 [semantic-model pack documentation](https://github.com/BrokkAi/bifrost/blob/master/docs/src/content/docs/semantic-model-packs.md)
 for the format, lifecycle, compatibility rules, and security boundaries.
+
+## Facade release-bundle acquisition
+
+The published `brokk-bifrost` facade opts into an acquisition provider for an
+exact generated dependency production. After a locked catalog miss, it checks
+only the matching public release for the running Bifrost version: the
+`bifrost-semantic-packs-vX.Y.Z.tar.gz` asset and its `.sha256` sidecar from the
+`BrokkAi/bifrost` release tagged `vX.Y.Z`. It verifies the archive checksum,
+safely extracts it, verifies the release index and inner manifest and shard
+checksums, and installs the requested production only when its exact
+`GeneratedProductionKey` matches (input digest, producer name and version,
+semantic schema version, and generated-production cache version).
+
+It does not consult a mutable branch, package index, or third-party source. A
+missing or invalid bundle, or any provider failure, becomes a warning and the
+normal local generation path remains the fallback. Set
+`BIFROST_SEMANTIC_PACK_DOWNLOAD=off` to disable this facade acquisition path;
+the unset/default value enables it. Dependency discovery still does not
+download package artifacts.
 
 ## Version 0.8.18
 

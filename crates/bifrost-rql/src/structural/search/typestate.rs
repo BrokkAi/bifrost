@@ -13,9 +13,10 @@ use super::{
     CodeQueryTypestateWitnessStepKind, CodeQueryTypestateWork, SemanticProcedureValue,
 };
 use crate::analyzer::semantic::{
-    CallSiteHandle, LengthDelimitedDigest, ProcedureHandle, ProgramPointHandle, SemanticBudget,
-    SemanticLocator,
+    CallSiteHandle, IcfgProvider, IcfgProviderBehaviorIdentity, LengthDelimitedDigest,
+    ProcedureHandle, ProgramPointHandle, SemanticBudget, SemanticLocator, WorkspaceIcfgProvider,
 };
+use crate::analyzer::semantic_model::ActiveSemanticModelSnapshot;
 use crate::analyzer::{ProjectFile, WorkspaceAnalyzer};
 use crate::cancellation::CancellationToken;
 use crate::hash::HashMap;
@@ -40,6 +41,9 @@ struct TypestateCacheKey {
     root: ProcedureHandle,
     protocol_hash: brokk_bifrost_flow::typestate::TypestateProtocolHash,
     binding_plan_hash: brokk_bifrost_flow::typestate::TypestateBindingPlanHash,
+    /// A query cache may outlive one provider construction, so topology is an
+    /// explicit key input even though every provider uses one captured Arc.
+    provider_behavior: IcfgProviderBehaviorIdentity,
 }
 
 #[derive(Debug)]
@@ -91,6 +95,7 @@ impl TypestateQueryState {
         semantic_budget: &mut SemanticBudget,
         limits: CodeQueryTypestateLimits,
         cancellation: &CancellationToken,
+        active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
     ) -> Vec<SemanticTypestateFindingValue> {
         let Some(analysis_context) = analysis_context else {
             self.push_diagnostic(
@@ -125,10 +130,15 @@ impl TypestateQueryState {
         // equivalent rematerialization after cache eviction, so execute
         // against the registered root after the durable identity check above.
         let analysis_root = registration.expected_root().clone();
+        let provider = WorkspaceIcfgProvider::with_active_semantic_model_snapshot(
+            workspace,
+            active_semantic_model_snapshot,
+        );
         let cache_key = TypestateCacheKey {
             root: analysis_root.clone(),
             protocol_hash: registration.protocol().hash(),
             binding_plan_hash: registration.bindings().hash(),
+            provider_behavior: provider.behavior_identity(),
         };
         let analysis = match self.cache.get(&cache_key).cloned() {
             Some(CachedTypestateAnalysis::Complete(analysis)) => {
@@ -146,7 +156,6 @@ impl TypestateQueryState {
                 let mut solver_budget = SolverBudget::new(limits.solver_work);
                 let mut request = DataflowRequest::new(&mut solver_budget, cancellation);
                 let summaries = analysis_context.summaries();
-                let provider = workspace.icfg_provider();
                 let solved = solve_typestate_with_production_summaries(
                     summaries,
                     &analysis_root,

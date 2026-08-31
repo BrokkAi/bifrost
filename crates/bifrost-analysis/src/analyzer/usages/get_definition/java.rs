@@ -108,6 +108,10 @@ impl<'a> JavaResolutionSession<'a> {
         self.charge(ReceiverBudgetLimit::ScopeNodes)
     }
 
+    fn is_stopped(&self) -> bool {
+        self.state.borrow().stop.is_some()
+    }
+
     fn charge_hierarchy_expansion(&self) -> bool {
         self.charge(ReceiverBudgetLimit::SummaryExpansions)
     }
@@ -994,6 +998,23 @@ struct JavaInvocationBinding {
     receiver: Vec<JavaReceiverType>,
 }
 
+/// The workspace candidates and external owner evidence produced by one
+/// structured static-import lookup. An external owner is retained only when
+/// the import lookup found no workspace candidate and all external imports
+/// name the same owner; callers can then publish the owner/member identity
+/// without guessing from the call's source spelling.
+struct JavaStaticImportResolution {
+    outcome: DefinitionLookupOutcome,
+    external_owner: Option<String>,
+}
+
+/// The enclosing-member ladder's outcome and whether it completed without a
+/// declaration claim, leaving static imports as the next lookup tier.
+struct JavaEnclosingMemberResolution {
+    outcome: DefinitionLookupOutcome,
+    static_import_fallback_allowed: bool,
+}
+
 impl JavaInvocationBinding {
     fn without_receiver(outcome: DefinitionLookupOutcome) -> Self {
         Self {
@@ -1104,25 +1125,9 @@ fn java_method_invocation_binding(
         return JavaInvocationBinding::without_receiver(outcome);
     }
 
-    let static_import = java_static_import_candidates(
-        analyzer,
-        token,
-        session,
-        file,
-        name,
-        JavaMemberLookupKind::Method,
-        Some(arity),
-    );
-    // The tier took the call's arity, so anything it names already accepts the
-    // argument list. A static-import boundary claim does not short-circuit: the
-    // enclosing class below can still declare the method (#1126's invariant).
-    if !static_import.definitions.is_empty() {
-        return JavaInvocationBinding::without_receiver(static_import);
-    }
-
     let (initial_static_context, outer_static_context) =
         session.enclosing_static_context(analyzer, file, name_node);
-    let outcome = java_member_candidates_in_enclosing_chain(
+    let enclosing = java_member_candidates_in_enclosing_chain(
         analyzer,
         token,
         session,
@@ -1133,7 +1138,42 @@ fn java_method_invocation_binding(
         JavaMemberLookupKind::Method,
         Some(arity),
     );
-    if outcome.status != DefinitionLookupStatus::NoDefinition {
+    // Java's implicit-this member ladder shadows static imports. A failed
+    // overload or static-context check is still an adjudicated member name,
+    // not permission to bind a same-named imported method.
+    if !enclosing.static_import_fallback_allowed {
+        return JavaInvocationBinding::without_receiver(enclosing.outcome);
+    }
+
+    let static_import = java_static_import_candidates(
+        analyzer,
+        token,
+        session,
+        file,
+        name,
+        JavaMemberLookupKind::Method,
+        Some(arity),
+    );
+    // The tier took the call's arity, so anything it names already accepts the
+    // argument list. A static-import boundary claim carries its structured
+    // owner through `reference` so downstream summary lookup can use the full
+    // owner/member/arity identity (#2736).
+    if static_import.outcome.status != DefinitionLookupStatus::NoDefinition {
+        let JavaStaticImportResolution {
+            mut outcome,
+            external_owner,
+        } = static_import;
+        if outcome.status == DefinitionLookupStatus::UnresolvableImportBoundary
+            && let Some(owner) = external_owner
+        {
+            outcome.reference = Some(ResolvedReferenceSite {
+                path: file.to_string(),
+                text: format!("{owner}.{name}"),
+                range: node_range(node),
+                focus_start_byte: name_node.start_byte(),
+                focus_end_byte: name_node.end_byte(),
+            });
+        }
         return JavaInvocationBinding::without_receiver(outcome);
     }
 
@@ -1979,7 +2019,28 @@ fn java_resolved_type_owner_fqn(
     // The overlay and jar index can both be empty in an inline fixture. An
     // explicit single-type import is still file-local structured evidence of
     // the owner FQN (#2364).
-    session.query_optional_row(|| java.explicit_imported_type_fqn(token, file, normalized))
+    if let Some(imported) =
+        session.query_optional_row(|| java.explicit_imported_type_fqn(token, file, normalized))
+    {
+        return Some(imported);
+    }
+
+    // java.lang is implicitly imported into every compilation unit. A golden
+    // summary pack can be the only active external surface in a small fixture,
+    // so no declaration fact exists for the ordinary type ladder to return.
+    // The caller has already rejected value shadowing, and the runtime lookup
+    // below asks the canonical summary index for an exact receiverless member;
+    // it does not infer an owner from source text or a member-name match.
+    if normalized.contains('.') {
+        return None;
+    }
+    let owner = format!("java.lang.{normalized}");
+    analyzer
+        .active_semantic_models()
+        .filter(|models| {
+            models.has_receiverless_procedure_summary_member("java", &owner, member_name)
+        })
+        .map(|_| owner)
 }
 
 /// The written bound of a type-parameter receiver whose bound this file imports
@@ -2069,7 +2130,8 @@ fn resolve_java_bare_identifier(
             name,
             JavaMemberLookupKind::Field,
             None,
-        );
+        )
+        .outcome;
         if outcome.status != DefinitionLookupStatus::NoDefinition {
             return outcome;
         }
@@ -2127,8 +2189,8 @@ fn java_bare_name_static_import_or_boundary(
         JavaMemberLookupKind::Field,
         None,
     );
-    if static_import.status != DefinitionLookupStatus::NoDefinition {
-        return static_import;
+    if static_import.outcome.status != DefinitionLookupStatus::NoDefinition {
+        return static_import.outcome;
     }
     // Workspace gate is the negation of the fused import-boundary predicate.
     gated_boundary(
@@ -4143,20 +4205,30 @@ fn java_member_candidates_in_enclosing_chain(
     member: &str,
     kind: JavaMemberLookupKind,
     arity: Option<usize>,
-) -> DefinitionLookupOutcome {
+) -> JavaEnclosingMemberResolution {
     let mut innermost_failure = None;
+    let mut walk_incomplete = false;
     let mut static_context = initial_static_context;
     for (owner_index, owner) in owners.into_iter().enumerate() {
         if owner_index > 0 {
             static_context |= outer_static_context;
         }
         if !session.charge_scope_step() {
-            return no_definition(
-                "java_resolution_stopped",
-                "Java member resolution stopped before completion",
-            );
+            return JavaEnclosingMemberResolution {
+                outcome: no_definition(
+                    "java_resolution_stopped",
+                    "Java member resolution stopped before completion",
+                ),
+                static_import_fallback_allowed: false,
+            };
         }
         let outcome = java_member_candidates(analyzer, token, session, &owner, member, kind, arity);
+        if session.is_stopped() {
+            return JavaEnclosingMemberResolution {
+                outcome,
+                static_import_fallback_allowed: false,
+            };
+        }
         let outcome = if static_context {
             java_static_context_member_outcome(analyzer, session, outcome, kind, member)
         } else {
@@ -4173,22 +4245,38 @@ fn java_member_candidates_in_enclosing_chain(
         // lexical chain, #2046).
         let crossed_boundary = outcome.status == DefinitionLookupStatus::UnresolvableImportBoundary;
         if outcome.status != DefinitionLookupStatus::NoDefinition && !crossed_boundary {
-            return outcome;
+            return JavaEnclosingMemberResolution {
+                outcome,
+                static_import_fallback_allowed: false,
+            };
         }
-        if !crossed_boundary
-            && java_member_declared_in_hierarchy(analyzer, session, &owner, member, kind)
-        {
-            return outcome;
+        if !crossed_boundary {
+            match java_member_declared_in_hierarchy(analyzer, session, &owner, member, kind) {
+                JavaMemberHierarchyResolution::Declared
+                | JavaMemberHierarchyResolution::Incomplete => {
+                    return JavaEnclosingMemberResolution {
+                        outcome,
+                        static_import_fallback_allowed: false,
+                    };
+                }
+                JavaMemberHierarchyResolution::NoDeclaration => {}
+            }
         }
+        walk_incomplete |= crossed_boundary;
         innermost_failure.get_or_insert(outcome);
         static_context |= java_class_is_static(analyzer, session, &owner);
     }
-    innermost_failure.unwrap_or_else(|| {
+    let outcome = innermost_failure.unwrap_or_else(|| {
         no_definition(
             "no_enclosing_class",
             format!("`{member}` has no enclosing indexed Java class"),
         )
-    })
+    });
+    JavaEnclosingMemberResolution {
+        static_import_fallback_allowed: !walk_incomplete
+            && outcome.status == DefinitionLookupStatus::NoDefinition,
+        outcome,
+    }
 }
 
 fn java_class_is_static(
@@ -4247,18 +4335,39 @@ fn java_static_context_member_outcome(
     }
 }
 
+enum JavaMemberHierarchyResolution {
+    Declared,
+    NoDeclaration,
+    Incomplete,
+}
+
 fn java_member_declared_in_hierarchy(
     analyzer: &dyn IAnalyzer,
     session: &JavaResolutionSession<'_>,
     owner: &CodeUnit,
     member: &str,
     kind: JavaMemberLookupKind,
-) -> bool {
+) -> JavaMemberHierarchyResolution {
+    let direct = java_owned_member_candidates(
+        session.fqn(&format!("{}.{}", owner.fq_name(), member)),
+        kind,
+        owner,
+    );
+    if session.is_stopped() {
+        return JavaMemberHierarchyResolution::Incomplete;
+    }
+    if !direct.is_empty() {
+        return JavaMemberHierarchyResolution::Declared;
+    }
     let Some(provider) = analyzer.type_hierarchy_provider() else {
-        return false;
+        return JavaMemberHierarchyResolution::Incomplete;
     };
     let mut seen = HashSet::default();
-    let mut level = vec![owner.clone()];
+    seen.insert(owner.clone());
+    let mut level = session.direct_ancestors(provider, owner);
+    if session.is_stopped() {
+        return JavaMemberHierarchyResolution::Incomplete;
+    }
     while !level.is_empty() {
         let mut next = Vec::new();
         for current in level {
@@ -4272,13 +4381,19 @@ fn java_member_declared_in_hierarchy(
             )
             .is_empty()
             {
-                return true;
+                return JavaMemberHierarchyResolution::Declared;
+            }
+            if session.is_stopped() {
+                return JavaMemberHierarchyResolution::Incomplete;
             }
             next.extend(session.direct_ancestors(provider, &current));
+            if session.is_stopped() {
+                return JavaMemberHierarchyResolution::Incomplete;
+            }
         }
         level = next;
     }
-    false
+    JavaMemberHierarchyResolution::NoDeclaration
 }
 
 fn java_member_candidates(
@@ -4564,16 +4679,19 @@ fn java_static_import_candidates(
     member: &str,
     kind: JavaMemberLookupKind,
     arity: Option<usize>,
-) -> DefinitionLookupOutcome {
+) -> JavaStaticImportResolution {
     let support: &dyn BoundedDefinitionLookup = session;
     let Some(java) = resolve_analyzer::<JavaAnalyzer>(analyzer) else {
-        return no_definition(
-            "no_java_analyzer",
-            "no Java analyzer is available for static import resolution",
-        );
+        return JavaStaticImportResolution {
+            outcome: no_definition(
+                "no_java_analyzer",
+                "no Java analyzer is available for static import resolution",
+            ),
+            external_owner: None,
+        };
     };
     let mut candidates = Vec::new();
-    let mut saw_external = false;
+    let mut external_owners = HashSet::default();
     for import in session.import_infos(token, java, file) {
         let Some(path) = import.path.as_ref() else {
             continue;
@@ -4603,7 +4721,7 @@ fn java_static_import_candidates(
                 );
             }
             if owner_candidates.is_empty() && !java_workspace_fqn_exists(support, &owner) {
-                saw_external = true;
+                external_owners.insert(owner);
             }
             candidates.extend(owner_candidates);
             continue;
@@ -4632,22 +4750,35 @@ fn java_static_import_candidates(
             );
         }
         if imported.is_empty() && !java_workspace_fqn_exists(support, &owner) {
-            saw_external = true;
+            external_owners.insert(owner);
         }
         candidates.extend(imported);
     }
     sort_units(&mut candidates);
     candidates.dedup();
+    // An external identity is safe only for one unambiguous external route.
+    // Workspace candidates and competing owners remain a typed boundary; they
+    // must not be converted into a name-only summary binding.
+    let saw_external = !external_owners.is_empty();
+    let external_owner = (candidates.is_empty() && external_owners.len() == 1)
+        .then(|| external_owners.into_iter().next())
+        .flatten();
     let applicability = java_candidate_applicability(analyzer, session, &candidates, arity);
-    if arity.is_some() && !applicability.winners.is_empty() {
+    if arity.is_some() && !saw_external && !applicability.winners.is_empty() {
         java_record_callable_applicability(&applicability, &applicability.winners);
-        return candidates_outcome(applicability.winners);
+        return JavaStaticImportResolution {
+            outcome: candidates_outcome(applicability.winners),
+            external_owner: None,
+        };
     }
     // A statically imported overload that cannot accept the call's argument list
     // is not the target (#1755), so it never stands in for one that can.
-    if !candidates.is_empty() && arity.is_none() {
+    if !candidates.is_empty() && !saw_external && arity.is_none() {
         java_record_callable_applicability(&applicability, &candidates);
-        return candidates_outcome(candidates);
+        return JavaStaticImportResolution {
+            outcome: candidates_outcome(candidates),
+            external_owner: None,
+        };
     }
     if !candidates.is_empty() {
         java_record_callable_applicability(&applicability, &[]);
@@ -4655,14 +4786,17 @@ fn java_static_import_candidates(
     // `saw_external` is set only when an import target is both unindexed and
     // `!java_workspace_fqn_exists(owner)`, so `!saw_external` is the workspace
     // gate (no double work — the flag already carries the check).
-    gated_boundary(
-        || !saw_external,
-        format!(
-            "`{member}` appears to cross a Java static import boundary not indexed in this workspace"
+    JavaStaticImportResolution {
+        outcome: gated_boundary(
+            || !saw_external,
+            format!(
+                "`{member}` appears to cross a Java static import boundary not indexed in this workspace"
+            ),
+            "no_static_import_match",
+            format!("`{member}` did not match an indexed Java static import"),
         ),
-        "no_static_import_match",
-        format!("`{member}` did not match an indexed Java static import"),
-    )
+        external_owner,
+    }
 }
 
 fn java_import_boundary_for_type(

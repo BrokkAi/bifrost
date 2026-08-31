@@ -2,6 +2,8 @@
 
 use std::mem::size_of;
 use std::sync::Arc;
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use git2::Oid;
 use moka::sync::Cache;
@@ -28,6 +30,13 @@ use super::{
 
 const DEFAULT_COMPLETE_CACHE_BYTES: u64 = 256 * 1024 * 1024 / 8;
 
+#[cfg(any(test, feature = "test-support"))]
+const NO_SEMANTIC_INVALIDATION_WITNESS: u8 = 0;
+#[cfg(any(test, feature = "test-support"))]
+const SELECTOR_CONTINUATION_INVALIDATION_WITNESS: u8 = 1;
+#[cfg(any(test, feature = "test-support"))]
+const EVALUATION_ROOT_CONTINUATION_INVALIDATION_WITNESS: u8 = 2;
+
 /// Immutable complete-artifact cache shared by one concrete analyzer adapter.
 ///
 /// Moka bounds retained bytes rather than entry count. Incomplete outcomes are
@@ -37,6 +46,19 @@ const DEFAULT_COMPLETE_CACHE_BYTES: u64 = 256 * 1024 * 1024 / 8;
 #[derive(Clone)]
 pub(crate) struct CompleteSemanticArtifactCache {
     inner: CompleteValueCache<SemanticArtifactKey, SemanticArtifact>,
+    /// Independent deterministic typestate-continuation eviction witnesses
+    /// shared by analyzer clones. Production builds carry neither the flags
+    /// nor the control surface.
+    #[cfg(any(test, feature = "test-support"))]
+    selector_continuation_invalidation_armed: Arc<AtomicBool>,
+    #[cfg(any(test, feature = "test-support"))]
+    evaluation_root_continuation_invalidation_armed: Arc<AtomicBool>,
+    #[cfg(any(test, feature = "test-support"))]
+    active_invalidation_witness: Arc<AtomicU8>,
+    #[cfg(any(test, feature = "test-support"))]
+    selector_continuation_revivals: Arc<AtomicU64>,
+    #[cfg(any(test, feature = "test-support"))]
+    evaluation_root_continuation_revivals: Arc<AtomicU64>,
 }
 
 impl Default for CompleteSemanticArtifactCache {
@@ -49,7 +71,110 @@ impl CompleteSemanticArtifactCache {
     pub(crate) fn new(max_retained_bytes: u64) -> Self {
         Self {
             inner: CompleteValueCache::new(max_retained_bytes, weigh_complete_artifact),
+            #[cfg(any(test, feature = "test-support"))]
+            selector_continuation_invalidation_armed: Arc::new(AtomicBool::new(false)),
+            #[cfg(any(test, feature = "test-support"))]
+            evaluation_root_continuation_invalidation_armed: Arc::new(AtomicBool::new(false)),
+            #[cfg(any(test, feature = "test-support"))]
+            active_invalidation_witness: Arc::new(AtomicU8::new(NO_SEMANTIC_INVALIDATION_WITNESS)),
+            #[cfg(any(test, feature = "test-support"))]
+            selector_continuation_revivals: Arc::new(AtomicU64::new(0)),
+            #[cfg(any(test, feature = "test-support"))]
+            evaluation_root_continuation_revivals: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn arm_selector_continuation_invalidation_for_test(&self) {
+        self.selector_continuation_invalidation_armed
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn invalidate_selector_continuation_if_armed_for_test(&self) {
+        if !self
+            .selector_continuation_invalidation_armed
+            .swap(false, Ordering::AcqRel)
+        {
+            return;
+        }
+        self.activate_invalidation_witness_for_test(
+            SELECTOR_CONTINUATION_INVALIDATION_WITNESS,
+            &self.selector_continuation_revivals,
+        );
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn arm_evaluation_root_continuation_invalidation_for_test(&self) {
+        self.evaluation_root_continuation_invalidation_armed
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn invalidate_evaluation_root_continuation_if_armed_for_test(&self) {
+        if !self
+            .evaluation_root_continuation_invalidation_armed
+            .swap(false, Ordering::AcqRel)
+        {
+            return;
+        }
+        self.activate_invalidation_witness_for_test(
+            EVALUATION_ROOT_CONTINUATION_INVALIDATION_WITNESS,
+            &self.evaluation_root_continuation_revivals,
+        );
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn activate_invalidation_witness_for_test(&self, witness: u8, counter: &AtomicU64) {
+        self.latch_active_invalidation_revivals_for_test();
+        counter.store(0, Ordering::Relaxed);
+        self.active_invalidation_witness
+            .store(witness, Ordering::Release);
+        self.inner.reset_revivals_for_test();
+        self.inner.invalidate_all_for_test();
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn latch_active_invalidation_revivals_for_test(&self) {
+        let revivals = self.inner.revivals_for_test();
+        match self.active_invalidation_witness.load(Ordering::Acquire) {
+            SELECTOR_CONTINUATION_INVALIDATION_WITNESS => {
+                self.selector_continuation_revivals
+                    .fetch_max(revivals, Ordering::Relaxed);
+            }
+            EVALUATION_ROOT_CONTINUATION_INVALIDATION_WITNESS => {
+                self.evaluation_root_continuation_revivals
+                    .fetch_max(revivals, Ordering::Relaxed);
+            }
+            NO_SEMANTIC_INVALIDATION_WITNESS => {}
+            witness => panic!("unknown semantic invalidation witness {witness}"),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn invalidation_revivals_for_test(&self, witness: u8, counter: &AtomicU64) -> u64 {
+        let retained = counter.load(Ordering::Relaxed);
+        if self.active_invalidation_witness.load(Ordering::Acquire) == witness {
+            retained.max(self.inner.revivals_for_test())
+        } else {
+            retained
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn selector_continuation_revivals_for_test(&self) -> u64 {
+        self.invalidation_revivals_for_test(
+            SELECTOR_CONTINUATION_INVALIDATION_WITNESS,
+            &self.selector_continuation_revivals,
+        )
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn evaluation_root_continuation_revivals_for_test(&self) -> u64 {
+        self.invalidation_revivals_for_test(
+            EVALUATION_ROOT_CONTINUATION_INVALIDATION_WITNESS,
+            &self.evaluation_root_continuation_revivals,
+        )
     }
 
     #[cfg(test)]
@@ -344,7 +469,9 @@ pub(crate) fn materialize_with_lowerer<A: LanguageAdapter>(
     // is also the only one that can charge a lookup rather than a file.
     if let Some(artifact) = served_from_unchanged_source(analyzer, cache, lowerer, file, request)? {
         let staged_budget = request.budget.clone();
-        return publish_cached(artifact, SemanticWork::default(), staged_budget, request);
+        let outcome = publish_cached(artifact, SemanticWork::default(), staged_budget, request);
+        observe_complete_artifact(file, &outcome, request);
+        return outcome;
     }
 
     let max_source_bytes = request.budget.remaining().source_bytes;
@@ -406,10 +533,20 @@ pub(crate) fn materialize_with_lowerer<A: LanguageAdapter>(
         .semantic_source_digests()
         .record(source_identity, content);
     let key = semantic_artifact_key_for_prepared(file, &prepared, content, identity)?;
-    let (acquisition, _cache_wait) = cache.acquire(&key, request.cancellation);
+    let (acquisition, cache_wait) = cache.acquire(&key, request.cancellation);
+    if cache_wait.wait_ns > 0 {
+        crate::profiling::note_with(|| {
+            format!(
+                "semantic.complete_cache_wait waits={} wait_ns={}",
+                cache_wait.waits, cache_wait.wait_ns
+            )
+        });
+    }
     let permit = match acquisition {
         CompleteValueAcquisition::Cached { value: artifact } => {
-            return publish_cached(artifact, source_work, staged_budget, request);
+            let outcome = publish_cached(artifact, source_work, staged_budget, request);
+            observe_complete_artifact(file, &outcome, request);
+            return outcome;
         }
         CompleteValueAcquisition::Leader { permit } => permit,
         CompleteValueAcquisition::Rejected => {
@@ -458,7 +595,22 @@ pub(crate) fn materialize_with_lowerer<A: LanguageAdapter>(
     if let Ok(SemanticOutcome::Complete { value, .. }) = &outcome {
         permit.publish_complete(Arc::clone(value));
     }
+    observe_complete_artifact(file, &outcome, request);
     outcome
+}
+
+/// Notify an opted-in caller only after a complete outcome has committed its
+/// semantic budget. Incomplete artifacts are deliberately invisible to the
+/// collector: retaining one would let a later coordinator mistake partial
+/// provider state for a complete cache continuation.
+fn observe_complete_artifact(
+    file: &ProjectFile,
+    outcome: &Result<SemanticOutcome<Arc<SemanticArtifact>>, SemanticProviderError>,
+    request: &SemanticRequest<'_>,
+) {
+    if let Ok(SemanticOutcome::Complete { value, .. }) = outcome {
+        request.observe_complete_artifact(file, value);
+    }
 }
 
 /// What one repeat cache hit actually performs: derive the artifact key, look
@@ -879,7 +1031,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::analyzer::semantic::SemanticBudget;
+    use crate::analyzer::semantic::{SemanticArtifactCollector, SemanticBudget};
     use crate::analyzer::typescript::TypescriptAdapter;
     use crate::analyzer::{
         AnalyzerQueryScope, IAnalyzer, Language, OverlayProject, Project, TestProject,
@@ -1376,6 +1528,82 @@ mod tests {
         assert_artifact_charged_without_reading(&second_budget, &second);
         assert_eq!(lowerer.calls(), 1);
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn semantic_cache_invalidation_witnesses_are_distinct_clone_shared_and_one_shot() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("root");
+        let file = write_file(&root, "src/main.ts", "export function main() {}\n");
+        let analyzer = analyzer(&root);
+        let cache = CompleteSemanticArtifactCache::default();
+        let lowerer = FakeLowerer::new(FakeMode::Complete);
+        let cancellation = super::super::CancellationToken::default();
+
+        let mut budget = SemanticBudget::default();
+        let SemanticOutcome::Complete { value: held, .. } = materialize(
+            &analyzer,
+            &cache,
+            &lowerer,
+            &file,
+            &mut budget,
+            &cancellation,
+        ) else {
+            panic!("initial complete artifact")
+        };
+
+        let cloned_cache = cache.clone();
+        cloned_cache.arm_selector_continuation_invalidation_for_test();
+        cache.invalidate_evaluation_root_continuation_if_armed_for_test();
+        assert_eq!(cache.len(), 1, "the evaluation witness is not armed");
+        cache.invalidate_selector_continuation_if_armed_for_test();
+        assert_eq!(cache.selector_continuation_revivals_for_test(), 0);
+        assert_eq!(cache.evaluation_root_continuation_revivals_for_test(), 0);
+        assert_eq!(cache.len(), 0);
+
+        let mut budget = SemanticBudget::default();
+        let SemanticOutcome::Complete { value: revived, .. } = materialize(
+            &analyzer,
+            &cache,
+            &lowerer,
+            &file,
+            &mut budget,
+            &cancellation,
+        ) else {
+            panic!("revived complete artifact")
+        };
+        assert!(Arc::ptr_eq(&held, &revived));
+        assert_eq!(cache.selector_continuation_revivals_for_test(), 1);
+        assert_eq!(cache.evaluation_root_continuation_revivals_for_test(), 0);
+
+        cloned_cache.arm_evaluation_root_continuation_invalidation_for_test();
+        cache.invalidate_selector_continuation_if_armed_for_test();
+        assert_eq!(cache.len(), 1, "the selector witness is no longer armed");
+        cache.invalidate_evaluation_root_continuation_if_armed_for_test();
+        assert_eq!(cache.selector_continuation_revivals_for_test(), 1);
+        assert_eq!(cache.evaluation_root_continuation_revivals_for_test(), 0);
+        assert_eq!(cache.len(), 0);
+
+        let mut budget = SemanticBudget::default();
+        let SemanticOutcome::Complete { value: revived, .. } = materialize(
+            &analyzer,
+            &cache,
+            &lowerer,
+            &file,
+            &mut budget,
+            &cancellation,
+        ) else {
+            panic!("second revived complete artifact")
+        };
+        assert!(Arc::ptr_eq(&held, &revived));
+        assert_eq!(cache.selector_continuation_revivals_for_test(), 1);
+        assert_eq!(cache.evaluation_root_continuation_revivals_for_test(), 1);
+
+        cache.invalidate_evaluation_root_continuation_if_armed_for_test();
+        assert_eq!(cache.selector_continuation_revivals_for_test(), 1);
+        assert_eq!(cache.evaluation_root_continuation_revivals_for_test(), 1);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(lowerer.calls(), 1);
     }
 
     /// One artifact's retained census, plus room for `repeats` repeat lookups
@@ -2238,16 +2466,19 @@ mod tests {
         let analyzer = analyzer(&root);
         let cache = CompleteSemanticArtifactCache::default();
         let lowerer = FakeLowerer::new(FakeMode::PartialThenComplete);
+        let collector = SemanticArtifactCollector::new();
+        let cancellation = super::super::CancellationToken::default();
 
         let mut budget = SemanticBudget::default();
-        let first = materialize(
+        let first = materialize_with_lowerer(
             &analyzer,
             &cache,
             &lowerer,
             &file,
-            &mut budget,
-            &super::super::CancellationToken::default(),
-        );
+            &mut SemanticRequest::new(&mut budget, &cancellation)
+                .with_artifact_collector(&collector),
+        )
+        .expect("partial materialization");
         assert!(matches!(
             first,
             SemanticOutcome::Unknown {
@@ -2256,19 +2487,25 @@ mod tests {
             }
         ));
         assert_eq!(cache.len(), 0);
+        assert_eq!(collector.len(), 0);
+        assert!(collector.take_complete(&file).is_empty());
 
         let mut budget = SemanticBudget::default();
-        assert!(
-            materialize(
-                &analyzer,
-                &cache,
-                &lowerer,
-                &file,
-                &mut budget,
-                &super::super::CancellationToken::default(),
-            )
-            .is_complete()
-        );
+        let completed = materialize_with_lowerer(
+            &analyzer,
+            &cache,
+            &lowerer,
+            &file,
+            &mut SemanticRequest::new(&mut budget, &cancellation)
+                .with_artifact_collector(&collector),
+        )
+        .expect("complete materialization");
+        let SemanticOutcome::Complete { value, .. } = completed else {
+            panic!("second materialization must complete")
+        };
+        let observed = collector.take_complete(&file);
+        assert_eq!(observed.len(), 1);
+        assert!(Arc::ptr_eq(observed[0].artifact(), &value));
         let mut budget = SemanticBudget::default();
         assert!(
             materialize(
@@ -2285,6 +2522,107 @@ mod tests {
     }
 
     #[test]
+    fn complete_artifact_collector_follows_staged_requests_and_drains_atomically() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("root");
+        let first = write_file(&root, "src/first.ts", "export const first = 1;\n");
+        let second = write_file(&root, "src/second.ts", "export const second = 2;\n");
+        let analyzer = analyzer(&root);
+        let cache = CompleteSemanticArtifactCache::default();
+        let lowerer = FakeLowerer::new(FakeMode::Complete);
+        let collector = SemanticArtifactCollector::new();
+        let cancellation = super::super::CancellationToken::default();
+        let mut parent_budget = SemanticBudget::default();
+        let parent_request = SemanticRequest::new(&mut parent_budget, &cancellation)
+            .with_artifact_collector(&collector);
+
+        let mut staged_budget = SemanticBudget::default();
+        let mut staged_request = parent_request.staged(&mut staged_budget);
+        let SemanticOutcome::Complete {
+            value: first_artifact,
+            ..
+        } = materialize_with_lowerer(&analyzer, &cache, &lowerer, &first, &mut staged_request)
+            .expect("first staged materialization")
+        else {
+            panic!("first staged materialization must complete")
+        };
+        let SemanticOutcome::Complete {
+            value: second_artifact,
+            ..
+        } = materialize_with_lowerer(&analyzer, &cache, &lowerer, &second, &mut staged_request)
+            .expect("second staged materialization")
+        else {
+            panic!("second staged materialization must complete")
+        };
+
+        drop(staged_request);
+        drop(parent_request);
+        assert_eq!(
+            parent_budget.used(),
+            SemanticWork::default(),
+            "staging keeps scalar work isolated from its parent request"
+        );
+        let drained = collector.take_all_complete();
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].file(), &first);
+        assert!(Arc::ptr_eq(drained[0].artifact(), &first_artifact));
+        assert_eq!(drained[1].file(), &second);
+        assert!(Arc::ptr_eq(drained[1].artifact(), &second_artifact));
+        assert!(collector.take_all_complete().is_empty());
+    }
+
+    #[test]
+    fn complete_artifact_collector_retains_distinct_same_key_allocations() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("root");
+        let file = write_file(&root, "src/subject.ts", "export const subject = 1;\n");
+        let analyzer = analyzer(&root);
+        let first_cache = CompleteSemanticArtifactCache::default();
+        let second_cache = CompleteSemanticArtifactCache::default();
+        let lowerer = FakeLowerer::new(FakeMode::Complete);
+        let collector = SemanticArtifactCollector::new();
+        let cancellation = super::super::CancellationToken::default();
+        let materialize_from = |cache: &CompleteSemanticArtifactCache| {
+            let mut budget = SemanticBudget::default();
+            let outcome = materialize_with_lowerer(
+                &analyzer,
+                cache,
+                &lowerer,
+                &file,
+                &mut SemanticRequest::new(&mut budget, &cancellation)
+                    .with_artifact_collector(&collector),
+            )
+            .expect("complete materialization");
+            let SemanticOutcome::Complete { value, .. } = outcome else {
+                panic!("materialization must complete")
+            };
+            value
+        };
+
+        let first = materialize_from(&first_cache);
+        let first_repeat = materialize_from(&first_cache);
+        let second = materialize_from(&second_cache);
+        assert!(Arc::ptr_eq(&first, &first_repeat));
+        assert_eq!(first.key(), second.key());
+        assert_eq!(first.materialization_id(), second.materialization_id());
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(lowerer.calls(), 2);
+
+        let retained = collector.take_complete(&file);
+        assert_eq!(retained.len(), 2);
+        assert!(
+            retained
+                .iter()
+                .any(|lease| Arc::ptr_eq(lease.artifact(), &first))
+        );
+        assert!(
+            retained
+                .iter()
+                .any(|lease| Arc::ptr_eq(lease.artifact(), &second))
+        );
+    }
+
+    #[test]
     fn retained_payload_budget_failure_is_atomic() {
         let temp = tempfile::tempdir().expect("temp dir");
         let root = temp.path().canonicalize().expect("root");
@@ -2292,23 +2630,30 @@ mod tests {
         let analyzer = analyzer(&root);
         let cache = CompleteSemanticArtifactCache::default();
         let lowerer = FakeLowerer::new(FakeMode::Complete);
+        let collector = SemanticArtifactCollector::new();
+        let cancellation = super::super::CancellationToken::default();
         let mut limits = SemanticBudget::default().limits();
         limits.owned_text_bytes = 1;
         let mut budget = SemanticBudget::new(limits).expect("positive limits");
 
-        let outcome = materialize(
+        let outcome = materialize_with_lowerer(
             &analyzer,
             &cache,
             &lowerer,
             &file,
-            &mut budget,
-            &super::super::CancellationToken::default(),
-        );
+            &mut SemanticRequest::new(&mut budget, &cancellation)
+                .with_artifact_collector(&collector),
+        )
+        .expect("budget-limited materialization");
         assert!(matches!(
             outcome,
             SemanticOutcome::ExceededBudget { partial: None, .. }
         ));
         assert_eq!(budget.used(), SemanticWork::default());
         assert_eq!(cache.len(), 0);
+        assert!(
+            collector.take_all_complete().is_empty(),
+            "a complete lowerer result whose budget commit failed is not observable"
+        );
     }
 }

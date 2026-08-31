@@ -16,7 +16,6 @@ test("declares each Bifrost release target", () => {
     [
       "universal-apple-darwin",
       "x86_64-unknown-linux-gnu",
-      "x86_64-unknown-linux-musl",
       "aarch64-unknown-linux-gnu",
       "aarch64-linux-android",
       "x86_64-pc-windows-msvc",
@@ -43,11 +42,11 @@ test("pins all platform packages in the root package", () => {
 });
 
 test("sets npm platform constraints", () => {
-  const platform = PLATFORMS.find((entry) => entry.target === "x86_64-unknown-linux-musl");
+  const platform = PLATFORMS.find((entry) => entry.target === "x86_64-unknown-linux-gnu");
   const manifest = platformManifest(platform, "0.8.22");
   assert.deepEqual(manifest.os, ["linux"]);
   assert.deepEqual(manifest.cpu, ["x64"]);
-  assert.deepEqual(manifest.libc, ["musl"]);
+  assert.deepEqual(manifest.libc, ["glibc"]);
   assert.equal(manifest.preferUnplugged, true);
   assert.equal(manifest.license, "Apache-2.0");
 });

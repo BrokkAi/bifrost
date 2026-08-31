@@ -24,9 +24,10 @@
 //! # Failed versus unknown
 //!
 //! Exactly the milestone-5 rule, applied per binding: a binding is `failed`
-//! only when its query completed and declared itself exhaustive and the
-//! candidate was still not there. A non-exhaustive query, an unexecutable
-//! prefix, or a row expansion this adapter does not replay is `unknown`.
+//! only when its query completed and declared itself exhaustive, every
+//! relevant later prefix was exhaustive, and the candidate was still not there.
+//! A non-exhaustive prefix, a prefix omitted by the execution budget, or a row
+//! expansion this adapter does not replay is `unknown`.
 //!
 //! # Bounds
 //!

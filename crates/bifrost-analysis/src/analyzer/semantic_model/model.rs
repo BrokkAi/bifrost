@@ -18,6 +18,16 @@ pub const MAX_PROCEDURE_SUMMARY_SANITIZE_LABELS: usize = 64;
 /// (#2437). Declared effects are a small, reviewed vocabulary per procedure,
 /// not a log, so the bound stays at the same order as the sanitize-label bound.
 pub const MAX_PROCEDURE_SUMMARY_DECLARED_EFFECTS: usize = 64;
+/// Upper bound on reviewed relationships among a procedure's normal results.
+/// These are API contracts, not observed executions, so one summary should
+/// need only a small set.
+pub const MAX_PROCEDURE_SUMMARY_RESULT_CONTRACTS: usize = 64;
+pub const MAX_RESULT_CONTRACT_MEMBER_CONTRACTS: usize = 64;
+pub const MAX_PROCEDURE_SUMMARY_NORMAL_RETURN_REFINEMENTS: usize = 64;
+/// Upper bound on reviewed boolean-result outcomes that refine a procedure's
+/// parameters. These rows are API contracts rather than observed executions,
+/// so one summary should need only a small set.
+pub const MAX_PROCEDURE_SUMMARY_CONDITIONAL_RESULT_REFINEMENTS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -109,7 +119,9 @@ pub struct Provenance {
     pub revision: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Completeness {
     Partial,
@@ -171,6 +183,20 @@ pub struct AuthoredProcedureSummary {
     /// digest of every summary that does not claim it unchanged.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub covers_overrides: bool,
+    /// The author's explicit claim that this procedure has no normal
+    /// continuation. Omission or `false` makes no claim; only `true` may remove
+    /// normal control after exact runtime agreement.
+    ///
+    /// Serialized only when claimed, so adding the field leaves the content
+    /// digest of every existing summary unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub normal_continuation_absent: bool,
+    /// Number of normal result ports the target returns. It is required when
+    /// `result_contracts` or `conditional_result_refinements` is non-empty so
+    /// the compiler can reject invalid ordinals without materializing a source
+    /// declaration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normal_result_count: Option<u32>,
     #[serde(default)]
     pub locations: Vec<AuthoredSummaryLocation>,
     pub transfers: Vec<AuthoredSummaryTransfer>,
@@ -189,6 +215,122 @@ pub struct AuthoredProcedureSummary {
     /// the same discipline `covers_overrides` uses above.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub declared_effects: Vec<AuthoredDeclaredEffect>,
+    /// Reviewed predicates required of this exact procedure invocation's
+    /// inputs. Omission means operation preconditions were not reviewed; a
+    /// present empty list means the procedure was reviewed and requires none.
+    ///
+    /// Serialized only when reviewed so adding this field leaves every
+    /// existing authored summary's canonical bytes and content digest
+    /// unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preconditions: Option<Vec<AuthoredOperationPrecondition>>,
+    /// Reviewed conditions under which one normal result is valid to consume.
+    /// A contract may name a separate condition result, as in a Go
+    /// `(resource, error)` API, or state a validity predicate directly on the
+    /// protected result. The relation is explicit because return shape alone
+    /// does not establish either contract.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub result_contracts: Vec<AuthoredResultContract>,
+    /// Reviewed effects that one boolean normal-result outcome has on a
+    /// predicate over a parameter. A negative proof effect says only that the
+    /// outcome does not prove the named predicate; it does not establish the
+    /// opposite runtime value.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditional_result_refinements: Vec<AuthoredConditionalResultRefinement>,
+    /// Reviewed predicates established for parameters whenever this procedure
+    /// returns normally. These are path postconditions, not unconditional
+    /// claims about the argument at call entry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub normal_return_refinements: Vec<AuthoredNormalReturnRefinement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoredConditionalResultRefinement {
+    #[schemars(range(max = 65535))]
+    pub result_ordinal: u32,
+    pub outcome: bool,
+    #[schemars(range(max = 65535))]
+    pub parameter_ordinal: u32,
+    pub predicate: AuthoredResultPredicate,
+    pub proof_effect: AuthoredPredicateProofEffect,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthoredPredicateProofEffect {
+    Establishes,
+    DoesNotEstablish,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoredNormalReturnRefinement {
+    #[schemars(range(max = 65535))]
+    pub parameter_ordinal: u32,
+    pub predicate: AuthoredResultPredicate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoredResultContract {
+    #[schemars(range(max = 65535))]
+    pub result_ordinal: u32,
+    /// A separate result whose reviewed predicate establishes that the
+    /// protected result is valid. Omit this together with `predicate` when
+    /// validity is expressed directly by `result_success_predicate`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(max = 65535))]
+    pub condition_result_ordinal: Option<u32>,
+    /// The predicate required of `condition_result_ordinal`. This field and
+    /// the condition ordinal must be present or absent together.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predicate: Option<AuthoredResultPredicate>,
+    /// The reviewed predicate that makes the protected result valid. For a
+    /// paired contract, this is an optional correlation that independently
+    /// proves the separate condition predicate. For a direct contract, this
+    /// is the validity predicate and is required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_success_predicate: Option<AuthoredResultPredicate>,
+    /// Reviewed member behavior carried by this exact result port. This lets a
+    /// pack describe a resource returned by a multi-result API without
+    /// attributing the same protocol to the other result ports.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub member_contracts: Vec<AuthoredResultMemberContract>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoredResultMemberContract {
+    pub member: String,
+    #[schemars(range(max = 65535))]
+    pub parameter_count: u32,
+    pub completeness: Completeness,
+    /// Reviewed predicates required of this exact member operation's inputs.
+    /// Omission means operation preconditions were not reviewed; a present
+    /// empty list means the operation was reviewed and requires none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preconditions: Option<Vec<AuthoredOperationPrecondition>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declared_effects: Vec<AuthoredDeclaredEffect>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoredOperationPrecondition {
+    pub input: AuthoredSummaryInput,
+    pub predicate: AuthoredResultPredicate,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthoredResultPredicate {
+    Null,
+    NonNull,
 }
 
 /// One namespaced effect a reviewed pack attributes to a procedure (#2437).
@@ -237,6 +379,14 @@ pub struct AuthoredProcedureTarget {
     pub symbol: String,
     #[serde(default)]
     pub has_receiver: bool,
+    /// Whether the final formal parameter accepts zero or more actual
+    /// arguments. `parameter_count` includes that final variadic formal, so a
+    /// variadic target accepts at least `parameter_count - 1` actual arguments.
+    /// Semantic claims may currently reference only the fixed prefix: the
+    /// validator rejects a port or refinement that names the variadic tail.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[schemars(extend("default" = false))]
+    pub variadic: bool,
     pub parameter_count: u32,
 }
 
@@ -256,7 +406,9 @@ pub enum AuthoredSummaryLocationKind {
     Heap,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AuthoredSummaryInput {
     Receiver {},
@@ -270,9 +422,17 @@ pub enum AuthoredSummaryInput {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AuthoredSummaryOutput {
     NormalReturn {},
+    IndexedNormalReturn {
+        #[schemars(range(max = 65535))]
+        ordinal: u32,
+    },
     Receiver {},
-    Capture { location: String },
-    Heap { location: String },
+    Capture {
+        location: String,
+    },
+    Heap {
+        location: String,
+    },
     ExceptionalReturn {},
 }
 
@@ -439,6 +599,17 @@ pub struct MemberFact {
     pub is_abstract: bool,
     #[serde(default)]
     pub is_virtual: bool,
+    /// The authored declarations contain every callable with this member's
+    /// exact owner, name, receiver form, and fixed arity.
+    ///
+    /// This is narrower than pack or owner-surface completeness. It permits
+    /// an exact external-call binding for this one structural family while a
+    /// curated declaration pack remains globally partial. Same-family
+    /// duplicates still conflict, and variadic families cannot yet make this
+    /// claim.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[schemars(extend("default" = false))]
+    pub callable_family_complete: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<Signature>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

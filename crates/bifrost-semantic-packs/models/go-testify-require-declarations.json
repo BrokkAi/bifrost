@@ -1,0 +1,142 @@
+{
+  "schema_version": 1,
+  "pack_id": "bifrost.go.testify.require-declarations",
+  "version": "1.0.0",
+  "producer": {
+    "name": "bifrost",
+    "version": "0.10.6"
+  },
+  "language": "go",
+  "ecosystem": "go-module",
+  "compatibility": {
+    "bifrost": ">=0.10.6, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "https://pkg.go.dev/github.com/stretchr/testify/require",
+    "revision": "v1.11.1"
+  },
+  "license": "MIT",
+  "completeness": "partial",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "go.testify.require.declarations",
+      "activation": [
+        {
+          "module": {
+            "name": "github.com/stretchr/testify",
+            "version": "=1.11.1"
+          }
+        }
+      ],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "type.66dc4abf1c89685d48c53a4f98f69a160a61abbfad9f955c25a70a2bab3b79f8",
+            "name": "github.com/stretchr/testify/require",
+            "type_kind": "module",
+            "visibility": "package",
+            "is_abstract": false,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [],
+            "aliases": [
+              "require"
+            ],
+            "extension_surfaces": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "require/requirements.go",
+              "symbol": "github.com/stretchr/testify/require"
+            }
+          },
+          {
+            "id": "type.253e4ec2c267b0a4d8e7ffbcb21aa17d591dd6f2557d12e01e32ba70dbe923b9",
+            "name": "github.com/stretchr/testify/require.TestingT",
+            "type_kind": "interface",
+            "visibility": "public",
+            "is_abstract": true,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [],
+            "aliases": [],
+            "extension_surfaces": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "require/requirements.go",
+              "symbol": "github.com/stretchr/testify/require.TestingT"
+            }
+          }
+        ],
+        "members": [
+          {
+            "id": "member.3de3ee8d4154a940e5cf65b19f308ef5e6ba51eb72c419b7fc1294389ba3bdfb",
+            "owner": "type.66dc4abf1c89685d48c53a4f98f69a160a61abbfad9f955c25a70a2bab3b79f8",
+            "name": "NoError",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "t",
+                  "type": {
+                    "kind": "declared",
+                    "id": "type.253e4ec2c267b0a4d8e7ffbcb21aa17d591dd6f2557d12e01e32ba70dbe923b9",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                },
+                {
+                  "name": "err",
+                  "type": {
+                    "kind": "named",
+                    "name": "error",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                },
+                {
+                  "name": "msgAndArgs",
+                  "type": {
+                    "kind": "named",
+                    "name": "interface{}",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": true
+                }
+              ]
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "require/require.go",
+              "symbol": "github.com/stretchr/testify/require.NoError"
+            }
+          }
+        ],
+        "relations": []
+      }
+    }
+  ]
+}

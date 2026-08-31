@@ -1,0 +1,789 @@
+{
+  "schema_version": 1,
+  "pack_id": "bifrost.go.stdlib.os",
+  "version": "1.0.0",
+  "producer": {
+    "name": "bifrost",
+    "version": "0.10.5"
+  },
+  "language": "go",
+  "ecosystem": "go",
+  "compatibility": {
+    "bifrost": ">=0.10.5, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "https://pkg.go.dev/os",
+    "revision": "go1.26.0"
+  },
+  "license": "BSD-3-Clause",
+  "completeness": "complete",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "go.stdlib.os.result-contracts",
+      "activation": [{}],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "os.create",
+            "target": {
+              "path": "src/os/file.go",
+              "symbol": "os.Create(name string)",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "normal_result_count": 2,
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "go.stdlib.os.create.file-allocation",
+                "output": {
+                  "kind": "indexed_normal_return",
+                  "ordinal": 0
+                }
+              }
+            ],
+            "result_contracts": [
+              {
+                "result_ordinal": 0,
+                "condition_result_ordinal": 1,
+                "predicate": "null",
+                "result_success_predicate": "non_null",
+                "member_contracts": [
+                  {
+                    "member": "Close",
+                    "parameter_count": 0,
+                    "completeness": "complete",
+                    "preconditions": [],
+                    "declared_effects": [
+                      {
+                        "id": "go.stdlib.os.file.close",
+                        "timing": "immediate",
+                        "certainty": "definite"
+                      }
+                    ]
+                  },
+                  {
+                    "member": "Fd",
+                    "parameter_count": 0,
+                    "completeness": "complete",
+                    "preconditions": [],
+                    "declared_effects": [
+                      {
+                        "id": "go.stdlib.os.file.fd",
+                        "timing": "immediate",
+                        "certainty": "definite"
+                      }
+                    ]
+                  },
+                  {
+                    "member": "Name",
+                    "parameter_count": 0,
+                    "completeness": "complete",
+                    "preconditions": [
+                      {
+                        "input": {
+                          "kind": "receiver"
+                        },
+                        "predicate": "non_null"
+                      }
+                    ],
+                    "declared_effects": [
+                      {
+                        "id": "go.stdlib.os.file.name",
+                        "timing": "immediate",
+                        "certainty": "definite"
+                      }
+                    ]
+                  },
+                  {
+                    "member": "Read",
+                    "parameter_count": 1,
+                    "completeness": "complete",
+                    "preconditions": [],
+                    "declared_effects": [
+                      {
+                        "id": "go.stdlib.os.file.read",
+                        "timing": "immediate",
+                        "certainty": "definite"
+                      }
+                    ]
+                  },
+                  {
+                    "member": "Seek",
+                    "parameter_count": 2,
+                    "completeness": "complete",
+                    "preconditions": []
+                  },
+                  {
+                    "member": "Stat",
+                    "parameter_count": 0,
+                    "completeness": "complete",
+                    "preconditions": []
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "id": "os.create-temp",
+            "target": {
+              "path": "src/os/tempfile.go",
+              "symbol": "os.CreateTemp(dir, pattern string)",
+              "has_receiver": false,
+              "parameter_count": 2
+            },
+            "completeness": "complete",
+            "normal_result_count": 2,
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "go.stdlib.os.create-temp.file-allocation",
+                "output": {
+                  "kind": "indexed_normal_return",
+                  "ordinal": 0
+                }
+              }
+            ],
+            "result_contracts": [
+              {
+                "result_ordinal": 0,
+                "condition_result_ordinal": 1,
+                "predicate": "null",
+                "result_success_predicate": "non_null",
+                "member_contracts": [
+                  {
+                    "member": "Close",
+                    "parameter_count": 0,
+                    "completeness": "complete",
+                    "preconditions": [],
+                    "declared_effects": [
+                      {
+                        "id": "go.stdlib.os.file.close",
+                        "timing": "immediate",
+                        "certainty": "definite"
+                      }
+                    ]
+                  },
+                  {
+                    "member": "Fd",
+                    "parameter_count": 0,
+                    "completeness": "complete",
+                    "preconditions": [],
+                    "declared_effects": [
+                      {
+                        "id": "go.stdlib.os.file.fd",
+                        "timing": "immediate",
+                        "certainty": "definite"
+                      }
+                    ]
+                  },
+                  {
+                    "member": "Name",
+                    "parameter_count": 0,
+                    "completeness": "complete",
+                    "preconditions": [
+                      {
+                        "input": {
+                          "kind": "receiver"
+                        },
+                        "predicate": "non_null"
+                      }
+                    ],
+                    "declared_effects": [
+                      {
+                        "id": "go.stdlib.os.file.name",
+                        "timing": "immediate",
+                        "certainty": "definite"
+                      }
+                    ]
+                  },
+                  {
+                    "member": "Read",
+                    "parameter_count": 1,
+                    "completeness": "complete",
+                    "preconditions": [],
+                    "declared_effects": [
+                      {
+                        "id": "go.stdlib.os.file.read",
+                        "timing": "immediate",
+                        "certainty": "definite"
+                      }
+                    ]
+                  },
+                  {
+                    "member": "Seek",
+                    "parameter_count": 2,
+                    "completeness": "complete",
+                    "preconditions": []
+                  },
+                  {
+                    "member": "Stat",
+                    "parameter_count": 0,
+                    "completeness": "complete",
+                    "preconditions": []
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "id": "os.exit",
+            "target": {
+              "path": "src/os/proc.go",
+              "symbol": "os.Exit(code int)",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "normal_continuation_absent": true,
+            "transfers": [],
+            "effects": []
+          },
+          {
+            "id": "os.is-not-exist",
+            "target": {
+              "path": "src/os/error.go",
+              "symbol": "os.IsNotExist(err error)",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "normal_result_count": 1,
+            "transfers": [],
+            "conditional_result_refinements": [
+              {
+                "result_ordinal": 0,
+                "outcome": true,
+                "parameter_ordinal": 0,
+                "predicate": "non_null",
+                "proof_effect": "establishes"
+              },
+              {
+                "result_ordinal": 0,
+                "outcome": false,
+                "parameter_ordinal": 0,
+                "predicate": "null",
+                "proof_effect": "does_not_establish"
+              }
+            ]
+          },
+          {
+            "id": "os.open",
+            "target": {
+              "path": "src/os/file.go",
+              "symbol": "os.Open(name string)",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "normal_result_count": 2,
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "go.stdlib.os.open.file-allocation",
+                "output": {
+                  "kind": "indexed_normal_return",
+                  "ordinal": 0
+                }
+              }
+            ],
+            "result_contracts": [
+              {
+                "result_ordinal": 0,
+                "condition_result_ordinal": 1,
+                "predicate": "null",
+                "result_success_predicate": "non_null",
+                "member_contracts": [
+                  {
+                    "member": "Close",
+                    "parameter_count": 0,
+                    "completeness": "complete",
+                    "preconditions": [],
+                    "declared_effects": [
+                      {
+                        "id": "go.stdlib.os.file.close",
+                        "timing": "immediate",
+                        "certainty": "definite"
+                      }
+                    ]
+                  },
+                  {
+                    "member": "Fd",
+                    "parameter_count": 0,
+                    "completeness": "complete",
+                    "preconditions": [],
+                    "declared_effects": [
+                      {
+                        "id": "go.stdlib.os.file.fd",
+                        "timing": "immediate",
+                        "certainty": "definite"
+                      }
+                    ]
+                  },
+                  {
+                    "member": "Name",
+                    "parameter_count": 0,
+                    "completeness": "complete",
+                    "preconditions": [
+                      {
+                        "input": {
+                          "kind": "receiver"
+                        },
+                        "predicate": "non_null"
+                      }
+                    ],
+                    "declared_effects": [
+                      {
+                        "id": "go.stdlib.os.file.name",
+                        "timing": "immediate",
+                        "certainty": "definite"
+                      }
+                    ]
+                  },
+                  {
+                    "member": "Read",
+                    "parameter_count": 1,
+                    "completeness": "complete",
+                    "preconditions": [],
+                    "declared_effects": [
+                      {
+                        "id": "go.stdlib.os.file.read",
+                        "timing": "immediate",
+                        "certainty": "definite"
+                      }
+                    ]
+                  },
+                  {
+                    "member": "Seek",
+                    "parameter_count": 2,
+                    "completeness": "complete",
+                    "preconditions": []
+                  },
+                  {
+                    "member": "Stat",
+                    "parameter_count": 0,
+                    "completeness": "complete",
+                    "preconditions": []
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "id": "os.open-file",
+            "target": {
+              "path": "src/os/file.go",
+              "symbol": "os.OpenFile(name string, flag int, perm FileMode)",
+              "has_receiver": false,
+              "parameter_count": 3
+            },
+            "completeness": "complete",
+            "normal_result_count": 2,
+            "transfers": [],
+            "effects": [
+              {
+                "kind": "allocation",
+                "event": "go.stdlib.os.open-file.file-allocation",
+                "output": {
+                  "kind": "indexed_normal_return",
+                  "ordinal": 0
+                }
+              }
+            ],
+            "result_contracts": [
+              {
+                "result_ordinal": 0,
+                "condition_result_ordinal": 1,
+                "predicate": "null",
+                "result_success_predicate": "non_null",
+                "member_contracts": [
+                  {
+                    "member": "Close",
+                    "parameter_count": 0,
+                    "completeness": "complete",
+                    "preconditions": [],
+                    "declared_effects": [
+                      {
+                        "id": "go.stdlib.os.file.close",
+                        "timing": "immediate",
+                        "certainty": "definite"
+                      }
+                    ]
+                  },
+                  {
+                    "member": "Fd",
+                    "parameter_count": 0,
+                    "completeness": "complete",
+                    "preconditions": [],
+                    "declared_effects": [
+                      {
+                        "id": "go.stdlib.os.file.fd",
+                        "timing": "immediate",
+                        "certainty": "definite"
+                      }
+                    ]
+                  },
+                  {
+                    "member": "Name",
+                    "parameter_count": 0,
+                    "completeness": "complete",
+                    "preconditions": [
+                      {
+                        "input": {
+                          "kind": "receiver"
+                        },
+                        "predicate": "non_null"
+                      }
+                    ],
+                    "declared_effects": [
+                      {
+                        "id": "go.stdlib.os.file.name",
+                        "timing": "immediate",
+                        "certainty": "definite"
+                      }
+                    ]
+                  },
+                  {
+                    "member": "Read",
+                    "parameter_count": 1,
+                    "completeness": "complete",
+                    "preconditions": [],
+                    "declared_effects": [
+                      {
+                        "id": "go.stdlib.os.file.read",
+                        "timing": "immediate",
+                        "certainty": "definite"
+                      }
+                    ]
+                  },
+                  {
+                    "member": "Seek",
+                    "parameter_count": 2,
+                    "completeness": "complete",
+                    "preconditions": []
+                  },
+                  {
+                    "member": "Stat",
+                    "parameter_count": 0,
+                    "completeness": "complete",
+                    "preconditions": []
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "id": "os.file-stat",
+            "target": {
+              "path": "src/os/stat_unix.go",
+              "symbol": "os.File.Stat()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "complete",
+            "normal_result_count": 2,
+            "transfers": [],
+            "result_contracts": [
+              {
+                "result_ordinal": 0,
+                "condition_result_ordinal": 1,
+                "predicate": "null",
+                "result_success_predicate": "non_null",
+                "member_contracts": [
+                  {
+                    "member": "Name",
+                    "parameter_count": 0,
+                    "completeness": "complete",
+                    "preconditions": [
+                      {
+                        "input": {
+                          "kind": "receiver"
+                        },
+                        "predicate": "non_null"
+                      }
+                    ]
+                  },
+                  {
+                    "member": "Size",
+                    "parameter_count": 0,
+                    "completeness": "complete",
+                    "preconditions": [
+                      {
+                        "input": {
+                          "kind": "receiver"
+                        },
+                        "predicate": "non_null"
+                      }
+                    ]
+                  },
+                  {
+                    "member": "Mode",
+                    "parameter_count": 0,
+                    "completeness": "complete",
+                    "preconditions": [
+                      {
+                        "input": {
+                          "kind": "receiver"
+                        },
+                        "predicate": "non_null"
+                      }
+                    ]
+                  },
+                  {
+                    "member": "ModTime",
+                    "parameter_count": 0,
+                    "completeness": "complete",
+                    "preconditions": [
+                      {
+                        "input": {
+                          "kind": "receiver"
+                        },
+                        "predicate": "non_null"
+                      }
+                    ]
+                  },
+                  {
+                    "member": "IsDir",
+                    "parameter_count": 0,
+                    "completeness": "complete",
+                    "preconditions": [
+                      {
+                        "input": {
+                          "kind": "receiver"
+                        },
+                        "predicate": "non_null"
+                      }
+                    ]
+                  },
+                  {
+                    "member": "Sys",
+                    "parameter_count": 0,
+                    "completeness": "complete",
+                    "preconditions": [
+                      {
+                        "input": {
+                          "kind": "receiver"
+                        },
+                        "predicate": "non_null"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "id": "os.stat",
+            "target": {
+              "path": "src/os/stat.go",
+              "symbol": "os.Stat(name string)",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "normal_result_count": 2,
+            "transfers": [],
+            "result_contracts": [
+              {
+                "result_ordinal": 0,
+                "condition_result_ordinal": 1,
+                "predicate": "null",
+                "result_success_predicate": "non_null",
+                "member_contracts": [
+                  {
+                    "member": "Name",
+                    "parameter_count": 0,
+                    "completeness": "complete",
+                    "preconditions": [
+                      {
+                        "input": {
+                          "kind": "receiver"
+                        },
+                        "predicate": "non_null"
+                      }
+                    ]
+                  },
+                  {
+                    "member": "Size",
+                    "parameter_count": 0,
+                    "completeness": "complete",
+                    "preconditions": [
+                      {
+                        "input": {
+                          "kind": "receiver"
+                        },
+                        "predicate": "non_null"
+                      }
+                    ]
+                  },
+                  {
+                    "member": "Mode",
+                    "parameter_count": 0,
+                    "completeness": "complete",
+                    "preconditions": [
+                      {
+                        "input": {
+                          "kind": "receiver"
+                        },
+                        "predicate": "non_null"
+                      }
+                    ]
+                  },
+                  {
+                    "member": "ModTime",
+                    "parameter_count": 0,
+                    "completeness": "complete",
+                    "preconditions": [
+                      {
+                        "input": {
+                          "kind": "receiver"
+                        },
+                        "predicate": "non_null"
+                      }
+                    ]
+                  },
+                  {
+                    "member": "IsDir",
+                    "parameter_count": 0,
+                    "completeness": "complete",
+                    "preconditions": [
+                      {
+                        "input": {
+                          "kind": "receiver"
+                        },
+                        "predicate": "non_null"
+                      }
+                    ]
+                  },
+                  {
+                    "member": "Sys",
+                    "parameter_count": 0,
+                    "completeness": "complete",
+                    "preconditions": [
+                      {
+                        "input": {
+                          "kind": "receiver"
+                        },
+                        "predicate": "non_null"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "id": "os.lstat",
+            "target": {
+              "path": "src/os/stat.go",
+              "symbol": "os.Lstat(name string)",
+              "has_receiver": false,
+              "parameter_count": 1
+            },
+            "completeness": "complete",
+            "normal_result_count": 2,
+            "transfers": [],
+            "result_contracts": [
+              {
+                "result_ordinal": 0,
+                "condition_result_ordinal": 1,
+                "predicate": "null",
+                "result_success_predicate": "non_null",
+                "member_contracts": [
+                  {
+                    "member": "Name",
+                    "parameter_count": 0,
+                    "completeness": "complete",
+                    "preconditions": [
+                      {
+                        "input": {
+                          "kind": "receiver"
+                        },
+                        "predicate": "non_null"
+                      }
+                    ]
+                  },
+                  {
+                    "member": "Size",
+                    "parameter_count": 0,
+                    "completeness": "complete",
+                    "preconditions": [
+                      {
+                        "input": {
+                          "kind": "receiver"
+                        },
+                        "predicate": "non_null"
+                      }
+                    ]
+                  },
+                  {
+                    "member": "Mode",
+                    "parameter_count": 0,
+                    "completeness": "complete",
+                    "preconditions": [
+                      {
+                        "input": {
+                          "kind": "receiver"
+                        },
+                        "predicate": "non_null"
+                      }
+                    ]
+                  },
+                  {
+                    "member": "ModTime",
+                    "parameter_count": 0,
+                    "completeness": "complete",
+                    "preconditions": [
+                      {
+                        "input": {
+                          "kind": "receiver"
+                        },
+                        "predicate": "non_null"
+                      }
+                    ]
+                  },
+                  {
+                    "member": "IsDir",
+                    "parameter_count": 0,
+                    "completeness": "complete",
+                    "preconditions": [
+                      {
+                        "input": {
+                          "kind": "receiver"
+                        },
+                        "predicate": "non_null"
+                      }
+                    ]
+                  },
+                  {
+                    "member": "Sys",
+                    "parameter_count": 0,
+                    "completeness": "complete",
+                    "preconditions": [
+                      {
+                        "input": {
+                          "kind": "receiver"
+                        },
+                        "predicate": "non_null"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

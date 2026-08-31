@@ -893,6 +893,50 @@ fn classified_match_finding_over_host_evidence_cap_is_omitted_not_failed() {
     );
 }
 
+/// #2779 regression, the policy-level case: a match policy whose selector
+/// query matches more rows than the host's findings cap must end
+/// Inconclusive with a diagnostics list that names the truncation
+/// (`QueryResultLimit`, from the RQL `ResultLimitReached` diagnostic), not a
+/// bare, unexplained reason with an empty diagnostics list -- the OWASP xss
+/// category's actual failure mode.
+#[test]
+fn classified_match_run_over_findings_cap_names_the_truncation() {
+    let mut source = String::new();
+    for index in 0..10 {
+        source.push_str(&format!("export function caller{index}() {{ alpha(); }}\n"));
+    }
+    let budget = PolicyBudget::builder()
+        .with_max_findings(3)
+        .unwrap()
+        .build()
+        .unwrap();
+    let run = classified_match_run(&source, budget);
+
+    assert!(
+        matches!(
+            run.completion(),
+            PolicyRunCompletion::Inconclusive { reasons }
+                if reasons.contains(&PolicyIncompleteReason::QueryResultLimit)
+        ),
+        "completion: {:?}",
+        run.completion()
+    );
+    assert!(
+        !run.diagnostics().is_empty(),
+        "an inconclusive run over the findings cap must name the truncation"
+    );
+    assert!(
+        run.diagnostics().iter().any(|diagnostic| matches!(
+            diagnostic.code(),
+            PolicyDiagnosticCode::CodeQuery {
+                code: CodeQueryDiagnosticCode::ResultLimitReached
+            }
+        )),
+        "diagnostics: {:?}",
+        run.diagnostics()
+    );
+}
+
 #[test]
 fn scenario_display_prefix_selection_is_logarithmic_and_maximal() {
     let calls = std::cell::Cell::new(0_usize);
@@ -1409,6 +1453,7 @@ fn direct_call_terminal_downgrades_proven_proof_when_caller_identity_is_unavaila
         },
         source_slice_sha256: Some([7; 32]),
         provenance: Vec::new(),
+        decorated_parameter: None,
     };
     let candidate = adapt_match_candidate(&policy_id, item, evidence, &[], &mut HashMap::new())
         .expect("synthetic detailed/public terminal pair adapts");
@@ -1655,6 +1700,7 @@ fn invalid_owner_candidate_forces_weak_anchor() {
         ),
         source_slice_sha256: Some([1; 32]),
         provenance: Vec::new(),
+        decorated_parameter: None,
     };
     assert!(matches!(OwnerCandidate::Rejected, OwnerCandidate::Rejected));
     let key = weak_finding_key(&evidence);
@@ -1697,6 +1743,7 @@ fn weak_key_is_domain_and_span_separated() {
         stable_owner_candidate: None,
         source_slice_sha256: None,
         provenance: Vec::new(),
+        decorated_parameter: None,
     };
     assert_ne!(
         weak_finding_key(&evidence(0..4)),

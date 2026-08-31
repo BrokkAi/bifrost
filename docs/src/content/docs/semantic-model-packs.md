@@ -48,16 +48,43 @@ must use schema version `1`:
 `catalog` is a workspace-relative catalog directory. Omitting it stores locally
 generated packs in the repository's versioned `.bifrost/cache` catalog, shared
 with linked worktrees and relocated by the normal Bifrost cache environment
-overrides. Set `BIFROST_SEMANTIC_PACK_CACHE_ROOT` to a writable machine-local
-directory when independent repositories should share the same
-content-addressed generated productions. A cold cache still generates each
-pack from the exact local artifact; later sessions reuse that verified
-production. Bifrost never downloads packs or dependencies as part of
-activation. `ecosystems` names the dependency ecosystems to discover, and may
-be an empty array to explicitly disable ambient dependency-pack activation.
+overrides. An analyzer explicitly built with ephemeral storage instead uses a
+delete-on-drop catalog, so a scoped or test session does not create `.bifrost`
+inside the workspace. Supplying `catalog` or a cache environment override is an
+explicit opt-in to persistent reuse. Set `BIFROST_SEMANTIC_PACK_CACHE_ROOT` to
+a writable machine-local directory when independent repositories should share
+the same content-addressed generated productions. A cold cache still generates
+each pack from the exact local artifact; later sessions reuse that verified
+production. The analysis catalog and activation APIs do not download packs or
+dependencies. The released `brokk-bifrost` facade separately opts into an
+exact-production acquisition provider; see [Released-facade generated-pack
+acquisition](#released-facade-generated-pack-acquisition). `ecosystems` names
+the dependency ecosystems to discover, and may be an empty array to explicitly
+disable ambient dependency-pack activation.
 When the document is absent, the shared host path selects every ecosystem that
 serves a language present in the workspace. An explicit `enable` entry can
 satisfy a pack's `review_required` gate; it cannot bypass compatibility checks.
+
+## Released-facade generated-pack acquisition
+
+Generic analysis, explicit catalog activation, direct consumers of
+`brokk-bifrost-semantic-packs`, and package dependency discovery remain
+network-free. The published `brokk-bifrost` facade registers a provider that
+runs only after the generated-production cache miss has been rechecked under
+its key-specific lock. It requests the immutable bundle for the running
+release from the public `BrokkAi/bifrost` `vX.Y.Z` release, together with its
+checksum sidecar; it does not use a mutable branch, package index, or
+third-party source.
+
+The provider verifies the archive SHA-256, safe extraction, release index, and
+inner manifest and shard checksums before installing anything. Installation is
+accepted only when the bundle contains the requested exact
+`GeneratedProductionKey`, which binds the input digest, producer name and
+version, semantic schema version, and generated-production cache version. An
+unavailable, invalid, or otherwise failed acquisition emits a warning and
+falls back to local generation. Set
+`BIFROST_SEMANTIC_PACK_DOWNLOAD=off` to disable this facade path; unset/default
+enables it.
 
 Policy reports expose whether dependency activation was `default`,
 `configured`, or `disabled`, together with the selected, missing,
@@ -213,10 +240,29 @@ from `.bifrost/packs.json` and reports an inert pack as a
 `workspace-model-inert` warning.
 
 Procedure-summary targets use the declaration identity that Bifrost publishes;
-they are not source-text search patterns. For Rust, `target.path` is the
-artifact-relative path and `target.symbol` must be the declaration row's exact
-dot-qualified `fq_name`, with the authored `has_receiver` flag and
-`parameter_count` matching that declaration's structured callable signature.
+they are not source-text search patterns. `has_receiver` is the normalized
+semantic receiver availability at the call boundary, not simply whether the
+syntax has an AST object. For Java, a fully-qualified or import-qualified static
+type qualifier such as `URLDecoder.decode(...)` is not an actual receiver, so a
+summary authors `"has_receiver": false`; the engine normalizes the proven type
+reference to that receiverless key. An instance transform such as `s.trim()`
+uses `"has_receiver": true` and cannot cross-bind to a static summary. For Rust,
+`target.path` is the artifact-relative path and `target.symbol` must be the
+declaration row's exact dot-qualified `fq_name`, with the authored
+`has_receiver` flag and `parameter_count` matching that declaration's
+structured callable signature.
+
+For a declaration with a variadic final formal, set `variadic: true` and count
+that tail once in `parameter_count`; a target with three total formals then
+matches calls with two or more actual arguments. Fixed-arity targets continue
+to require an exact count. Variadic applicability is used only for canonical
+member call-shape matching; exact artifact-and-symbol lookup still names the
+one authored formal declaration. A version-one summary cannot yet describe
+flow from or a refinement of the variadic tail itself: authoring validation
+rejects claims that reference the final formal ordinal. Fixed-prefix claims,
+such as Testify's refinement of `err` before `msgAndArgs`, apply at every
+accepted actual arity.
+
 For example, a free function declared as `parse_ruby_tree` in
 `crates/bifrost-ruby/src/declarations.rs` is authored as
 `crates.bifrost-ruby.src.declarations.parse_ruby_tree` with
@@ -360,12 +406,13 @@ selected objects across processes.
 
 That catalog identity is deliberately distinct from the runtime
 `active_model_set_hash`. The runtime hash covers selected semantic shard
-digests, payload kinds, and the matcher representation version but not
-equivalent source attribution or storage encoding. Analyzer-snapshot caches use
-a canonical activation-request key and retain only complete immutable
-runtimes. Before publication, the runtime rechecks source generations and
-coordinates selected catalog references with the workspace store. A failed or
-incomplete build preserves the previous active set.
+digests, payload kinds, matcher precedence and activation evidence, extraction
+gaps, and the matcher representation version. It excludes equivalent source
+attribution and storage encoding. Analyzer-snapshot caches use a canonical
+activation-request key and retain only complete immutable runtimes. Before
+publication, the runtime rechecks source generations and coordinates selected
+catalog references with the workspace store. A failed or incomplete build
+preserves the previous active set.
 
 ### Projection into synthetic analyzer declarations and model URIs
 
@@ -710,6 +757,16 @@ language spelling such as `TValue`, `_value`, or `getURL`; only pack and fact
 identities use Bifrost's lowercase stable-ID grammar. The complete checked
 fixture below is compiled by the integration suite.
 
+A curated declaration pack may remain globally `partial` while one reviewed
+fixed-arity member sets `callable_family_complete: true`. The claim covers only
+that member's exact structural lookup family: language, owner, member name,
+receiver form, and arity. It does not prove the owner's whole member surface or
+the pack complete. A second declaration in the same family remains ambiguous,
+and authoring validation rejects the claim on variadic members until their
+multi-arity completeness can be represented explicitly. Omit the field (its
+default is `false`) whenever that exact family has not been exhaustively
+reviewed.
+
 <!-- semantic-model-doc-test:tests/fixtures/semantic-model-packs/declarations-v1.yaml -->
 ```yaml
 schema_version: 1
@@ -786,6 +843,20 @@ shards:
           from: member.widget.create
           to: type.widget
 ```
+
+Curated Go behavior packs activate alongside declaration companion packs when
+an exact package function or concrete result type must be selected at a call
+site. The companions are deliberately `partial` package surfaces: each
+declaration is a positive identity and signature fact, while an unlisted
+package member remains unknown rather than proved absent. Separate companions
+ship for `os`, `errors`, `log`, `net`, `net/url`, and Testify `require`; the
+`testing` pack already carries its partial concrete-receiver declarations. Keeping a
+partial declaration surface out of a complete behavior pack also preserves the
+envelope invariant that a partial pack cannot claim a complete summary. The
+declarations-only `path/filepath` pack publishes the module plus the exact
+variadic `Join(...string) string` signature, allowing a containing modeled call
+to distinguish its single result from Go's multi-result argument expansion
+without attaching a behavior summary to `Join`.
 
 ## Generator-rule payload
 
@@ -889,10 +960,18 @@ shards:
 
 A procedure-summary shard describes externally reviewed behavior without
 activating it. Each record has a stable ID and a structured target consisting
-of a canonical artifact-relative path, an exact symbol, receiver availability,
-and parameter count. The compiler derives a pack-scoped model ID, a summary
-contract version, and a content digest for every record; the defensive decoder
-recomputes and verifies those fields.
+of a canonical artifact-relative path, an exact symbol, normalized semantic
+receiver availability, and parameter count. The compiler derives a pack-scoped
+model ID, a summary contract version, and a content digest for every record; the
+defensive decoder recomputes and verifies those fields.
+
+For Java, `has_receiver` distinguishes an actual value receiver from a type
+qualifier. Fully-qualified and import-qualified static calls such as
+`URLDecoder.decode(...)` bind with `false`, after structured resolution proves
+that the qualifier names the target owner. Instance transforms bind with
+`true`; unresolved, shadowed, ambiguous, or mismatched receivers remain
+inconclusive rather than being guessed. This field remains a boolean and its
+canonical key is unchanged.
 
 Transfers connect a receiver or zero-based parameter to a normal return,
 receiver, exceptional return, declared capture, or declared heap location.
@@ -904,6 +983,19 @@ escapes, unknown calls, unknown-call boundaries, and explicitly ambiguous call
 sets. Inputs must exist on the target, outputs must reference a location of the
 right kind, call targets must exist, and all collections have fixed validation
 budgets. Duplicate targets and duplicate IDs are rejected across shards.
+
+`normal_continuation_absent: true` is an optional reviewed control claim that
+the exact procedure never returns normally. Omission or `false` makes no claim.
+The flag can be the only substantive content in a summary, and a `partial`
+summary may state it because completeness of other behavior is independent of
+this explicit control fact. A summary carrying the flag cannot also contain a
+normal transfer, an allocation or sanitizer whose output is a normal return, a
+result contract, or a normal-return refinement. Exceptional transfers and
+effects that occur before termination remain valid. `normal_result_count` is
+signature metadata rather than a normal-return claim, so it may also remain on
+a non-returning summary. At activation time, matching summaries must agree on
+the flag; an empty or conflicting match never proves that normal control is
+absent.
 
 `declared_effects` is a separate, optional list of namespaced effect
 identifiers the reviewed pack attributes to the exact procedure, such as
@@ -925,6 +1017,33 @@ procedure and disagree about their declared effects resolve to a conflict and
 are not used. Omitting the field changes no digest, so a pack that declares no
 effects keeps the compiled bytes and the digests it had before the field
 existed.
+
+A procedure summary can publish optional call-entry `preconditions` over its
+receiver and parameters. The field is three-state: omission means entry
+requirements were not reviewed, an empty list is a reviewed claim that there
+are none, and a populated list states the exact predicates required at the
+call. Exact call-argument analysis uses these claims only when every possible
+runtime target is covered and agrees. This is distinct from normal-return
+refinements, which establish a predicate after a call returns.
+
+A result contract relates one indexed normal result to a predicate over a
+different indexed result, such as a resource whose validity requires its paired
+error to be null. A member contract can then describe one operation on that
+result by exact member name and parameter count. Its own optional
+`preconditions` field has the same three states:
+
+- omitted means the operation's input requirements were not reviewed;
+- an empty list means the operation was reviewed and requires no input
+  predicate;
+- a populated list names each receiver or parameter predicate the operation
+  requires.
+
+These states are not interchangeable. Omitting knowledge must not create a
+finding or a clean negative, while a reviewed empty list is positive evidence
+that the operation is applicable without first establishing the result's
+success predicate. Preconditions reuse the summary's typed inputs and result
+predicate vocabulary, so a pack cannot invent an unbound receiver, parameter,
+or textual condition.
 
 Completeness is explicit at both levels. A `partial` record remains partial
 after compilation and decoding; a partial pack cannot claim a `complete`

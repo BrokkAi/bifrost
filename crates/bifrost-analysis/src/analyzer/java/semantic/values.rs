@@ -160,7 +160,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     metadata,
                     SemanticValueKind::Local,
                 )?;
-                if let Some(type_name) = node
+                let type_node = node
                     .child_by_field_name("type")
                     .or_else(|| {
                         node.parent()
@@ -170,10 +170,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                         named_children(node)
                             .into_iter()
                             .find(|child| child.kind() == "catch_type")
-                    })
-                    .and_then(|type_node| node_text(self.prepared.source(), type_node))
-                {
-                    self.local_types.insert(value, type_name.into());
+                    });
+                if let Some(type_node) = type_node {
+                    if let Some(type_name) = node_text(self.prepared.source(), type_node) {
+                        self.local_types.insert(value, type_name.into());
+                    }
+                    self.local_type_nodes.insert(value, type_node);
                 }
                 if node.kind() == "catch_formal_parameter" {
                     self.non_null_values.insert(value);
@@ -973,7 +975,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     .get(&(owner.clone(), name.into()))
             })
             .and_then(|entry| *entry)
-            .map(|field| field.anchor);
+            .map(|field| field.anchor)
+            .or_else(|| self.array_element_field_anchor(object, node));
         let resolved = declaration_anchor.is_some();
         let anchor = declaration_anchor.unwrap_or(occurrence_anchor);
         Ok((
@@ -987,6 +990,39 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             ),
             resolved,
         ))
+    }
+
+    /// Resolve a member access whose receiver is a local array element through
+    /// the declared component type. The receiver is intentionally limited to
+    /// a direct identifier-backed local array and a single structured
+    /// `array_type` node; parameters, aliases, inferred values, and nested
+    /// expressions retain the ordinary occurrence locator and identity gap.
+    /// This is a syntax-backed declaration proof, not a name-based fallback.
+    fn array_element_field_anchor(
+        &self,
+        object: Node<'tree>,
+        field: Node<'tree>,
+    ) -> Option<SourceAnchor> {
+        if object.kind() != "array_access" {
+            return None;
+        }
+        let array = object.child_by_field_name("array")?;
+        if array.kind() != "identifier" {
+            return None;
+        }
+        let name = node_text(self.prepared.source(), array)?;
+        let array_value = self.local_at(name, array.start_byte())?;
+        let array_type = self.local_type_nodes.get(&array_value)?;
+        if array_type.kind() != "array_type" {
+            return None;
+        }
+        let element_type = array_type.child_by_field_name("element")?;
+        let owner = node_text(self.prepared.source(), element_type)?;
+        let field_name = node_text(self.prepared.source(), field)?;
+        self.field_declaration_anchors
+            .get(&(owner.into(), field_name.into()))
+            .and_then(|entry| *entry)
+            .map(|field| field.anchor)
     }
 
     pub(super) fn add_field_identity_gap(

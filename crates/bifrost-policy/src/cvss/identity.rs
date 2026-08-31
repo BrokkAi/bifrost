@@ -116,6 +116,7 @@ const fn incomplete_reason_label(reason: super::PolicyIncompleteReason) -> &'sta
         R::PipelineRowBudget => b"pipeline-row-budget",
         R::ImportGraphBudget => b"import-graph-budget",
         R::ReferenceCandidateBudget => b"reference-candidate-budget",
+        R::NoAnalyzableFiles => b"no-analyzable-files",
         R::PartialDiscovery => b"partial-discovery",
         R::CapabilityIncomplete => b"capability-incomplete",
         R::EndpointDominanceUndecidable => b"endpoint-dominance-undecidable",

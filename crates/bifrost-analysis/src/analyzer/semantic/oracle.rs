@@ -13,6 +13,7 @@ mod heap;
 mod limits;
 mod model;
 mod relation;
+mod retained;
 mod traits;
 mod value_flow;
 

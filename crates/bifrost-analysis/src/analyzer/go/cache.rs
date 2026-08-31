@@ -2,7 +2,7 @@ use crate::analyzer::{CodeUnit, PoolSafeMemo, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_go::graph::resolver::GoEdgeIndex;
 use brokk_bifrost_go::hierarchy::GoHierarchyIndex;
-use brokk_bifrost_go::packages::{GoWorkspacePathIndex, invalidate_nearest_go_module_cache};
+use brokk_bifrost_go::packages::GoWorkspacePathIndex;
 use moka::sync::Cache;
 use std::sync::{
     Arc, OnceLock,
@@ -33,7 +33,6 @@ pub(super) struct GoMemoCaches {
 
 impl GoMemoCaches {
     pub(super) fn new(budget_bytes: u64) -> Self {
-        invalidate_nearest_go_module_cache();
         Self {
             budget_bytes,
             imported_code_units: build_weighted_cache(budget_bytes / 4, weight_code_unit_set),

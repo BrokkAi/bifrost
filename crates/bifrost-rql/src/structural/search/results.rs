@@ -364,6 +364,10 @@ pub enum CodeQueryResultValue {
         #[serde(flatten)]
         value: Box<CodeQueryCallShape>,
     },
+    CallResult {
+        #[serde(flatten)]
+        value: Box<CodeQueryCallResult>,
+    },
     CallArgumentGroup {
         #[serde(flatten)]
         value: Box<CodeQueryCallArgumentGroup>,
@@ -379,6 +383,18 @@ pub enum CodeQueryResultValue {
     CallEffect {
         #[serde(flatten)]
         value: Box<CodeQueryCallEffect>,
+    },
+    CallResultContract {
+        #[serde(flatten)]
+        value: Box<CodeQueryCallResultContract>,
+    },
+    ResultContractUse {
+        #[serde(flatten)]
+        value: Box<CodeQueryResultContractUse>,
+    },
+    ResultContractFailureUse {
+        #[serde(flatten)]
+        value: Box<CodeQueryResultContractFailureUse>,
     },
     ProcedureEffect {
         #[serde(flatten)]

@@ -3,17 +3,18 @@ use super::ir::{
     CallSiteTraversalFilter, CallTraversalFilter, CandidateFilter, CandidateOutcomeLabel,
     CodeQuery, CodeQueryPlan, CodeQueryPlanSource, CodeQueryResultDetail, CodeQuerySeed,
     ControlRelationFilter, DEFAULT_LIMIT, DeclarationStateFilter, DecoratorBindingFilter,
-    EdgeFilter, ExportFilter, ExportSeed, FlowRelationFilter, GenerationSiteFilter,
-    GenerationSiteSeed, HierarchyTraversal, JsxAttributeValueTraversal, MAX_ARITY,
-    MAX_BINDING_NAME_LENGTH, MAX_CAPTURE_LENGTH, MAX_DECORATOR_BINDING_FILTER_LENGTH,
-    MAX_ENVIRONMENT_FILTER_ENTRIES, MAX_GLOB_LENGTH, MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH,
-    MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT, MAX_OCCURRENCE_FILTER_ENTRIES, MAX_PATTERN_DEPTH,
-    MAX_PATTERN_NODES, MAX_QUERY_BRANCHES, MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES,
-    MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES, MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS,
-    OccurrenceFilter, OccurrenceSeed, PathFilter, PathSeed, Pattern, QueryError, QueryStep,
-    ReceiverTraversalFilter, ReferenceTraversalFilter, RewritePathFilter, ScopeFilter, ScopeSeed,
-    SegmentsOfOptions, SetOperator, StateEventFilter, StringPredicate, TaintTraversal,
-    TypestateTraversal, UNATTRIBUTED_TIER_LABEL, ValueFlowTraversal, WitnessTraversal,
+    EdgeFilter, ExportFilter, ExportSeed, FailureUseConsumer, FailureUseProvenance,
+    FlowRelationFilter, GenerationSiteFilter, GenerationSiteSeed, HierarchyTraversal,
+    JsxAttributeValueTraversal, MAX_ARITY, MAX_BINDING_NAME_LENGTH, MAX_CAPTURE_LENGTH,
+    MAX_DECORATOR_BINDING_FILTER_LENGTH, MAX_ENVIRONMENT_FILTER_ENTRIES, MAX_GLOB_LENGTH,
+    MAX_KIND_LIST_ENTRIES, MAX_KWARG_NAME_LENGTH, MAX_KWARGS, MAX_LANGUAGE_FILTERS, MAX_LIMIT,
+    MAX_OCCURRENCE_FILTER_ENTRIES, MAX_PATTERN_DEPTH, MAX_PATTERN_NODES, MAX_QUERY_BRANCHES,
+    MAX_QUERY_PLAN_DEPTH, MAX_QUERY_PLAN_NODES, MAX_QUERY_STEPS, MAX_ROLE_LIST_ENTRIES,
+    MAX_STRING_PREDICATE_LENGTH, MAX_WHERE_GLOBS, OccurrenceFilter, OccurrenceSeed, PathFilter,
+    PathSeed, Pattern, QueryError, QueryStep, ReceiverTraversalFilter, ReferenceTraversalFilter,
+    ResultContractFailureUseFilter, RewritePathFilter, ScopeFilter, ScopeSeed, SegmentsOfOptions,
+    SetOperator, StateEventFilter, StringPredicate, TaintTraversal, TypestateTraversal,
+    UNATTRIBUTED_TIER_LABEL, ValueFlowTraversal, WitnessTraversal,
 };
 use super::schema::{
     ALL_QUERY_STEP_OPS, CodeQueryExecutionMode, PatternField, QueryField, QueryStepField,
@@ -893,6 +894,36 @@ pub(super) fn decode_flow_relation_filter(
     })
 }
 
+pub(super) fn decode_result_contract_failure_use_filter(
+    object: &Map<String, Value>,
+    path: &str,
+) -> Result<ResultContractFailureUseFilter, QueryError> {
+    let provenances = QueryStepField::FailureUseProvenances.label();
+    let consumers = QueryStepField::FailureUseConsumers.label();
+    reject_unknown_filter_fields(
+        object,
+        path,
+        &[provenances, consumers, "op"],
+        "result-contract failure use",
+    )?;
+    Ok(ResultContractFailureUseFilter {
+        provenances: decode_environment_axis(
+            object,
+            path,
+            provenances,
+            "failure-use provenance",
+            FailureUseProvenance::from_label,
+        )?,
+        consumers: decode_environment_axis(
+            object,
+            path,
+            consumers,
+            "failure-use consumer",
+            FailureUseConsumer::from_label,
+        )?,
+    })
+}
+
 pub(super) fn decode_control_relation_filter(
     object: &Map<String, Value>,
     path: &str,
@@ -1293,6 +1324,7 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
         let flow_relation = matches!(step, QueryStep::FlowRelationsOf(_));
         let control_relation = matches!(step, QueryStep::ControlRelations(_));
         let rewrite_path = matches!(step, QueryStep::RewritePathsOf(_));
+        let failure_use = matches!(step, QueryStep::ResultContractFailureUses(_));
         let segments = matches!(step, QueryStep::SegmentsOf(_));
         for key in object.keys() {
             match QueryStepField::from_label(key) {
@@ -1363,6 +1395,9 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                 Some(QueryStepField::ControlRelations | QueryStepField::ControlExitPartitions)
                     if control_relation => {}
                 Some(
+                    QueryStepField::FailureUseProvenances | QueryStepField::FailureUseConsumers,
+                ) if failure_use => {}
+                Some(
                     QueryStepField::Depth
                     | QueryStepField::Transitive
                     | QueryStepField::ReferenceKinds
@@ -1407,6 +1442,8 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                     | QueryStepField::RewriteOutcomes
                     | QueryStepField::ControlRelations
                     | QueryStepField::ControlExitPartitions
+                    | QueryStepField::FailureUseProvenances
+                    | QueryStepField::FailureUseConsumers
                     | QueryStepField::Resolved,
                 )
                 | None => {
@@ -1473,6 +1510,11 @@ fn decode_steps(value: &Value, path: &str) -> Result<Vec<QueryStep>, QueryError>
                 QueryStep::ControlRelations(decode_control_relation_filter(object, &entry_path)?);
         } else if rewrite_path {
             step = QueryStep::RewritePathsOf(decode_rewrite_path_filter(object, &entry_path)?);
+        } else if failure_use {
+            step = QueryStep::ResultContractFailureUses(decode_result_contract_failure_use_filter(
+                object,
+                &entry_path,
+            )?);
         } else if edge {
             let filter = decode_edge_filter(object, &entry_path)?;
             step = match step {

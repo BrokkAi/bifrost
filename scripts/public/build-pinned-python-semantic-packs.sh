@@ -34,7 +34,7 @@ cd - >/dev/null
 cargo run --locked --release --features release-tooling \
   -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- generate \
   "${output_dir}" \
-  semantic-packs/python/typeshed-stdlib-2026.8.8.json \
+  semantic-packs/python/typeshed-stdlib-2026.8.31.json \
   "${input_dir}/typeshed-stdlib-1620e2254765"
 cargo run --locked --release --features release-tooling \
   -p brokk-bifrost-semantic-packs --bin bifrost-semantic-pack -- verify \

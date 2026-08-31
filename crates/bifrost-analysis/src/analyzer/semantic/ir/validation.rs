@@ -84,21 +84,43 @@ type AsyncSuspendIndex = HashMap<ProgramPointId, (ControlContinuation, ControlCo
 
 #[derive(Default)]
 struct GapIndex {
-    facts: HashMap<(ProgramPointId, SemanticGapSubject, SemanticCapability), SemanticGapKind>,
+    facts: HashMap<(ProgramPointId, SemanticGapSubject, SemanticCapability), GapFact>,
     subjects: HashSet<(SemanticGapSubject, SemanticCapability)>,
 }
 
+struct GapFact {
+    id: SemanticGapId,
+    kind: SemanticGapKind,
+    detail: Box<str>,
+}
+
 impl GapIndex {
-    fn insert(&mut self, procedure: ProcedureId, gap: &SemanticGap) -> Result<(), SemanticIrError> {
+    fn insert(
+        &mut self,
+        procedure: &ProcedureSemanticsParts,
+        gap: &SemanticGap,
+    ) -> Result<(), SemanticIrError> {
         let fact = (gap.point, gap.subject, gap.capability);
-        if let Some(previous) = self.facts.insert(fact, gap.kind) {
+        if let Some(previous) = self.facts.insert(
+            fact,
+            GapFact {
+                id: gap.id,
+                kind: gap.kind,
+                detail: gap.detail.clone(),
+            },
+        ) {
             return Err(SemanticIrError::procedure(
-                procedure,
+                procedure.id,
                 SemanticIrErrorKind::GapContract,
                 format!(
-                    "gap {} duplicates the same scoped fact with {} and {} outcomes",
+                    "procedure {} {:?} gap {} ({}) duplicates gap {} ({}) at the same scoped fact with {} and {} outcomes",
+                    procedure.locator.path(),
+                    procedure.locator.declaration(),
                     gap.id,
-                    previous.label(),
+                    gap.detail,
+                    previous.id,
+                    previous.detail,
+                    previous.kind.label(),
                     gap.kind.label()
                 ),
             ));
@@ -113,7 +135,9 @@ impl GapIndex {
         subject: SemanticGapSubject,
         capability: SemanticCapability,
     ) -> Option<SemanticGapKind> {
-        self.facts.get(&(point, subject, capability)).copied()
+        self.facts
+            .get(&(point, subject, capability))
+            .map(|fact| fact.kind)
     }
 
     fn has_subject(&self, subject: SemanticGapSubject, capability: SemanticCapability) -> bool {
@@ -186,6 +210,7 @@ pub(super) fn measure_artifact_work(
                 | SemanticValueKind::Receiver { .. }
                 | SemanticValueKind::Return
                 | SemanticValueKind::Temporary
+                | SemanticValueKind::Address
                 | SemanticValueKind::Constant
                 | SemanticValueKind::Exception
                 | SemanticValueKind::Callable
@@ -253,6 +278,7 @@ pub(super) fn measure_artifact_work(
                     | SemanticEffect::ExceptionalExit
                     | SemanticEffect::Assignment { .. }
                     | SemanticEffect::ValueFlow { .. }
+                    | SemanticEffect::ValueUse { .. }
                     | SemanticEffect::Allocation { .. }
                     | SemanticEffect::MemoryLoad { .. }
                     | SemanticEffect::MemoryStore { .. }
@@ -467,6 +493,20 @@ fn validate_procedure(
     validate_dense_rows(procedure)?;
     for mapping in &procedure.source_mappings {
         validate_locator_scope(key, id, "source mapping", &mapping.locator)?;
+        if let Some(identity) = mapping.ast_identity
+            && identity.content() != key.revision().content()
+        {
+            return Err(SemanticIrError::procedure(
+                id,
+                SemanticIrErrorKind::SourceScope,
+                format!(
+                    "source mapping {} structural identity belongs to content {}, expected artifact revision content {}",
+                    mapping.id,
+                    identity.content(),
+                    key.revision().content()
+                ),
+            ));
+        }
     }
 
     ensure_source(
@@ -541,6 +581,84 @@ fn validate_procedure(
                 ),
             ));
         }
+        if gap.discharge == SemanticGapDischarge::RetainedEvaluationOrder
+            && !matches!(gap.subject, SemanticGapSubject::Point)
+        {
+            return Err(SemanticIrError::procedure(
+                id,
+                SemanticIrErrorKind::GapContract,
+                format!(
+                    "gap {} declares a retained-evaluation-order discharge without a point subject",
+                    gap.id
+                ),
+            ));
+        }
+        if gap.discharge == SemanticGapDischarge::RetainedControlTopology
+            && (!matches!(gap.subject, SemanticGapSubject::Point)
+                || !matches!(
+                    (gap.capability, gap.kind),
+                    (
+                        SemanticCapability::NormalControlFlow,
+                        SemanticGapKind::Unknown
+                    ) | (
+                        SemanticCapability::ConcurrentSpawn,
+                        SemanticGapKind::Unknown | SemanticGapKind::Unsupported
+                    )
+                ))
+        {
+            return Err(SemanticIrError::procedure(
+                id,
+                SemanticIrErrorKind::GapContract,
+                format!(
+                    "gap {} declares retained control topology outside a point-scoped parent-control gap",
+                    gap.id
+                ),
+            ));
+        }
+        if gap.discharge == SemanticGapDischarge::NonRejoiningExceptionalExit
+            && (gap.capability != SemanticCapability::ExceptionalControlFlow
+                || !matches!(
+                    gap.subject,
+                    SemanticGapSubject::Point | SemanticGapSubject::Value(_)
+                )
+                || !matches!(
+                    gap.kind,
+                    SemanticGapKind::Unknown | SemanticGapKind::Unsupported
+                ))
+        {
+            return Err(SemanticIrError::procedure(
+                id,
+                SemanticIrErrorKind::GapContract,
+                format!(
+                    "gap {} declares a non-rejoining exceptional exit outside a point- or value-scoped unknown exceptional-control gap",
+                    gap.id
+                ),
+            ));
+        }
+        if gap.discharge == SemanticGapDischarge::ExitOnlyProcedureCompletion
+            && (!matches!(
+                (gap.capability, gap.subject),
+                (
+                    SemanticCapability::DeferredExecution | SemanticCapability::CleanupControlFlow,
+                    SemanticGapSubject::Point
+                ) | (
+                    SemanticCapability::ExceptionalControlFlow,
+                    SemanticGapSubject::Point | SemanticGapSubject::Value(_)
+                )
+            ) || !matches!(
+                gap.kind,
+                SemanticGapKind::Unknown | SemanticGapKind::Unsupported
+            ))
+        {
+            return Err(SemanticIrError::procedure(
+                id,
+                SemanticIrErrorKind::GapContract,
+                format!(
+                    "gap {} declares exit-only procedure completion outside a local unknown or unsupported deferred, cleanup, or exceptional-control gap",
+                    gap.id
+                ),
+            ));
+        }
         if gap.kind == SemanticGapKind::Unproven
             && !matches!(
                 procedure.evidence_rows[gap.evidence.index()].proof,
@@ -555,6 +673,23 @@ fn validate_procedure(
         }
         validate_gap_capability(id, capabilities, gap)?;
         validate_gap_subject(id, procedure, &async_suspends, gap)?;
+        if gap.discharge == SemanticGapDischarge::CanonicalIndexIdentity
+            && !gap_certifies_canonical_index_identity(
+                gap,
+                &procedure.points,
+                &procedure.memory_locations,
+                &procedure.values,
+            )
+        {
+            return Err(SemanticIrError::procedure(
+                id,
+                SemanticIrErrorKind::GapContract,
+                format!(
+                    "gap {} declares canonical index identity outside an unsupported index-memory gap whose point retains an access to its constant-indexed location",
+                    gap.id
+                ),
+            ));
+        }
         validate_gap_impacts(id, gap)?;
         if (gap.kind == SemanticGapKind::ExceededBudget) != gap.budget.is_some() {
             return Err(SemanticIrError::procedure(
@@ -566,7 +701,7 @@ fn validate_procedure(
                 ),
             ));
         }
-        gap_index.insert(id, gap)?;
+        gap_index.insert(procedure, gap)?;
     }
 
     let mut parameter_ordinals = HashSet::default();
@@ -1329,6 +1464,40 @@ fn validate_call_site(
     for argument in &call_site.arguments {
         ensure_value(id, argument.value, procedure.values.len(), "call argument")?;
     }
+    if call_site.result.is_some() && !call_site.normal_results.is_empty() {
+        return Err(SemanticIrError::procedure(
+            id,
+            SemanticIrErrorKind::CallContract,
+            format!(
+                "call site {} cannot publish both a singular result and indexed normal results",
+                call_site.id
+            ),
+        ));
+    }
+    if call_site.normal_results.len() == 1 {
+        return Err(SemanticIrError::procedure(
+            id,
+            SemanticIrErrorKind::CallContract,
+            format!(
+                "call site {} must use its singular result field for exactly one normal result",
+                call_site.id
+            ),
+        ));
+    }
+    let mut distinct_results = HashSet::default();
+    for result in &call_site.normal_results {
+        ensure_value(id, *result, procedure.values.len(), "indexed call result")?;
+        if !distinct_results.insert(*result) {
+            return Err(SemanticIrError::procedure(
+                id,
+                SemanticIrErrorKind::CallContract,
+                format!(
+                    "call site {} repeats indexed normal result {}",
+                    call_site.id, result
+                ),
+            ));
+        }
+    }
     if let Some(result) = call_site.result {
         ensure_value(id, result, procedure.values.len(), "call result")?;
     }
@@ -1714,6 +1883,9 @@ fn validate_events(
                     ensure_value(id, *source, procedure.values.len(), "value-flow source")?;
                     ensure_value(id, *target, procedure.values.len(), "value-flow target")?;
                     validate_value_flow_kind(procedure, *kind, *source, *target)?;
+                }
+                SemanticEffect::ValueUse { value, .. } => {
+                    ensure_value(id, *value, procedure.values.len(), "used value")?;
                 }
                 SemanticEffect::Allocation { allocation } => {
                     ensure_allocation(
@@ -2251,7 +2423,7 @@ fn validate_value_flow_kind(
             matches!(source_kind, SemanticValueKind::Receiver { .. })
                 || matches!(target_kind, SemanticValueKind::Receiver { .. })
         }
-        ValueFlowKind::Return => {
+        ValueFlowKind::Return | ValueFlowKind::IndexedReturn { .. } => {
             matches!(source_kind, SemanticValueKind::Return)
                 || matches!(target_kind, SemanticValueKind::Return)
         }
@@ -2822,11 +2994,14 @@ fn effect_capabilities(effect: &SemanticEffect) -> &'static [SemanticCapability]
             ValueFlowKind::Receiver => {
                 &[SemanticCapability::Values, SemanticCapability::ReceiverFlow]
             }
-            ValueFlowKind::Return => &[SemanticCapability::Values, SemanticCapability::ReturnFlow],
+            ValueFlowKind::Return | ValueFlowKind::IndexedReturn { .. } => {
+                &[SemanticCapability::Values, SemanticCapability::ReturnFlow]
+            }
             ValueFlowKind::LanguageDefined => {
                 &[SemanticCapability::Values, SemanticCapability::LocalFlow]
             }
         },
+        SemanticEffect::ValueUse { .. } => &[SemanticCapability::Values],
         SemanticEffect::Allocation { .. } => &[SemanticCapability::Allocations],
         SemanticEffect::MemoryLoad { kind, .. } | SemanticEffect::MemoryStore { kind, .. } => {
             match memory_access_capability(*kind) {

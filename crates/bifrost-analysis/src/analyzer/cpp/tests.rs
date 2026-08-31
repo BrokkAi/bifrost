@@ -494,6 +494,7 @@ void SidePanelContentProxy::ResetAvailableCallback() {
 #[cfg(test)]
 mod header_language_attribution_tests {
     use super::*;
+    use brokk_bifrost_cpp::graph::resolver::is_c_source_file;
 
     #[test]
     fn header_included_only_by_a_c_file_is_attributed_c() {
@@ -649,6 +650,169 @@ mod header_language_attribution_tests {
         assert_eq!(
             HeaderLanguageAttribution::C,
             analyzer.header_language_attribution(token, &header)
+        );
+    }
+
+    /// The workspace mount asks "does any translation unit compile this file
+    /// as C?" of every analyzed file. `files_compiled_as_c` answers it by
+    /// propagating three bits over the include graph; `header_language_attribution`
+    /// answers it by materializing the reaching-translation-unit set of every
+    /// file. They must agree file for file, or the `cpp:c` mount changes.
+    ///
+    /// The fixture exercises every tier the two share: a `.c` and a `.cpp`
+    /// translation unit, a header each reaches alone and a header both reach,
+    /// a chain that reaches a leaf only transitively, an include cycle (which
+    /// the propagation must terminate on), a `.cpp` unit forced to C by its
+    /// compile-database entry, a header named directly by the database, and an
+    /// orphan nothing reaches.
+    #[test]
+    fn predicate_agrees_with_the_transitive_index_over_a_mixed_workspace() {
+        let (_temp, analyzer) = mixed_c_and_cpp_workspace();
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
+
+        let files = analyzer.inner.analyzed_files();
+        let predicate = analyzer.files_compiled_as_c(token, &files);
+        let mut from_index = BTreeSet::new();
+        for file in &files {
+            if matches!(
+                analyzer.header_language_attribution(token, file),
+                HeaderLanguageAttribution::C | HeaderLanguageAttribution::Mixed
+            ) {
+                from_index.insert(file.clone());
+            }
+        }
+        assert_eq!(
+            from_index,
+            predicate.iter().cloned().collect::<BTreeSet<_>>(),
+            "the predicate and the transitive index must name the same C-compiled files"
+        );
+        // Not a vacuous agreement: the fixture has to produce all three
+        // shapes, or the comparison above proves nothing.
+        let project_root = analyzer.inner.project().root().to_path_buf();
+        for name in ["c_only.h", "shared.h", "forced_c.h", "database_named.h"] {
+            assert!(
+                from_index.contains(&ProjectFile::new(project_root.clone(), name)),
+                "{name} must be C-compiled: {from_index:?}"
+            );
+        }
+        for name in ["cpp_only.h", "orphan.h", "unit.cpp", "mixed_evidence.h"] {
+            assert!(
+                !from_index.contains(&ProjectFile::new(project_root.clone(), name)),
+                "{name} must not be C-compiled: {from_index:?}"
+            );
+        }
+        assert!(
+            from_index.contains(&ProjectFile::new(project_root.clone(), "chain_leaf.h")),
+            "the transitive chain must reach the leaf through the cycle: {from_index:?}"
+        );
+    }
+
+    /// A workspace with both dialects, a header each reaches alone and one
+    /// both reach, a transitive chain, an include cycle, a `.cpp` unit the
+    /// compile database forces to C, a header the database names directly,
+    /// and an orphan.
+    fn mixed_c_and_cpp_workspace() -> (tempfile::TempDir, CppAnalyzer) {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        for (name, source) in [
+            // Reached by the C unit only.
+            ("c_only.h", "struct COnly { int value; };\n"),
+            // Reached by the C++ unit only.
+            ("cpp_only.h", "struct CppOnly { int value; };\n"),
+            // Reached by both.
+            (
+                "shared.h",
+                "#include \"chain_top.h\"\nstruct Shared { int value; };\n",
+            ),
+            // Reached only through shared.h, and cyclic with its own child.
+            (
+                "chain_top.h",
+                "#include \"chain_leaf.h\"\nstruct ChainTop { int value; };\n",
+            ),
+            (
+                "chain_leaf.h",
+                "#include \"chain_top.h\"\nstruct ChainLeaf { int value; };\n",
+            ),
+            // Named directly by the compile database, reached by nothing.
+            ("database_named.h", "struct DatabaseNamed { int value; };\n"),
+            // Reached only by a .cpp unit the database forces to C.
+            ("forced_c.h", "struct ForcedC { int value; };\n"),
+            // Reached by nothing at all.
+            ("orphan.h", "struct Orphan { int value; };\n"),
+            // Reached by a `.c` unit the database does not name and by a
+            // `.cpp` unit it does. Tier 2 answers whenever any reaching unit
+            // has an entry, so the database's C++ verdict decides and the `.c`
+            // extension never gets a vote: this file is NOT C-compiled. It is
+            // the case that separates the tiered rule from "any C evidence
+            // wins".
+            ("mixed_evidence.h", "struct MixedEvidence { int value; };\n"),
+            (
+                "db_cpp.cpp",
+                "#include \"mixed_evidence.h\"\nint db_cpp_main() { return 0; }\n",
+            ),
+            (
+                "unit.c",
+                "#include \"c_only.h\"\n#include \"shared.h\"\n#include \"mixed_evidence.h\"\nint c_main(void) { return 0; }\n",
+            ),
+            (
+                "unit.cpp",
+                "#include \"cpp_only.h\"\n#include \"shared.h\"\nint cpp_main() { return 0; }\n",
+            ),
+            (
+                "forced.cpp",
+                "#include \"forced_c.h\"\nint forced_main() { return 0; }\n",
+            ),
+            (
+                "compile_commands.json",
+                r#"[{"directory":".","file":"forced.cpp","arguments":["clang","-x","c","-c","forced.cpp"]},
+                    {"directory":".","file":"db_cpp.cpp","arguments":["clang++","-c","db_cpp.cpp"]},
+                    {"directory":".","file":"database_named.h","arguments":["clang","-x","c","-c","database_named.h"]}]"#,
+            ),
+        ] {
+            ProjectFile::new(root.clone(), name)
+                .write(source)
+                .expect("write fixture file");
+        }
+        let analyzer = CppAnalyzer::from_project(crate::TestProject::new(root, Language::Cpp));
+        (temp, analyzer)
+    }
+
+    /// The `cpp:c` rows are a pure function of the file list the mount hands
+    /// to `sync_content_reading_workspace_files`, so comparing that list
+    /// against the attribution-driven formulation it replaced is comparing the
+    /// published rows. The fixture is the mixed workspace above, which
+    /// exercises every tier.
+    #[test]
+    fn the_mount_publishes_the_same_files_the_attribution_would() {
+        let (_temp, analyzer) = mixed_c_and_cpp_workspace();
+        let scope = AnalyzerQueryScope::new(&analyzer);
+        let token = scope.token();
+
+        let analyzed_files = analyzer.inner.analyzed_files();
+        let has_c_translation_unit = analyzed_files.iter().any(is_c_source_file);
+        let as_attributed = analyzed_files
+            .iter()
+            .filter(|file| {
+                is_c_source_file(file)
+                    || (has_c_translation_unit
+                        && !imports::is_cpp_translation_unit(file)
+                        && matches!(
+                            analyzer.header_language_attribution(token, file),
+                            HeaderLanguageAttribution::C | HeaderLanguageAttribution::Mixed
+                        ))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            as_attributed,
+            analyzer.c_reading_workspace_files(token),
+            "the mount must publish the same files, in the same order"
+        );
+        assert!(
+            !as_attributed.is_empty(),
+            "a fixture that mounts nothing would prove nothing"
         );
     }
 

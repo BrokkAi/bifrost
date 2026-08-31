@@ -19,7 +19,7 @@ use crate::analyzer::tree_sitter_analyzer::{
 use crate::analyzer::{JavaAnalyzer, Language, ProjectFile, Range};
 use crate::hash::{HashMap, HashSet};
 
-const ADAPTER_VERSION: &[u8] = b"java-value-semantics-v8";
+const ADAPTER_VERSION: &[u8] = b"java-value-semantics-v9";
 
 impl_program_semantics_provider!(JavaAnalyzer, JavaSemanticLowerer);
 
@@ -310,6 +310,7 @@ struct LoweringContext<'tree, 'targets> {
         HashMap<(Box<str>, Box<str>), Option<values::FieldDeclarationAnchor>>,
     type_name_roots: HashSet<Box<str>>,
     local_types: HashMap<ValueId, Box<str>>,
+    local_type_nodes: HashMap<ValueId, Node<'tree>>,
     non_null_values: HashSet<ValueId>,
     catch_binders: HashMap<ProgramPointId, ValueId>,
     parameters: HashMap<Box<str>, ValueId>,

@@ -200,6 +200,13 @@ pub enum CodeQueryResultRef {
         call_kind: &'static str,
         coverage: &'static str,
     },
+    CallResult {
+        id: String,
+        site_id: String,
+        path: String,
+        range: CodeQueryRange,
+        ordinal: u64,
+    },
     CallArgumentGroup {
         id: String,
         site_id: String,
@@ -220,6 +227,30 @@ pub enum CodeQueryResultRef {
         path: String,
         range: CodeQueryRange,
         #[serde(skip_serializing_if = "Option::is_none")]
+        semantic_target_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        target_origin: Option<&'static str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        receiver_type_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pack_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model_record_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model_activation_status: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model_activation_source_kind: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model_activation_source_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model_origin: Option<&'static str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model_proof: Option<&'static str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model_completeness: Option<&'static str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         binding_kind: Option<&'static str>,
         mapping: &'static str,
         coverage: &'static str,
@@ -232,6 +263,42 @@ pub enum CodeQueryResultRef {
         #[serde(skip_serializing_if = "Option::is_none")]
         effect_id: Option<String>,
         derivation: &'static str,
+        coverage: &'static str,
+    },
+    CallResultContract {
+        id: String,
+        site_id: String,
+        path: String,
+        range: CodeQueryRange,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        result_ordinal: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        condition_result_ordinal: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        predicate: Option<&'static str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        result_success_predicate: Option<&'static str>,
+        coverage: &'static str,
+    },
+    ResultContractUse {
+        id: String,
+        acquisition_id: String,
+        path: String,
+        range: CodeQueryRange,
+        use_kind: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parameter_ordinal: Option<u32>,
+        applicability: &'static str,
+        guard: &'static str,
+        coverage: &'static str,
+    },
+    ResultContractFailureUse {
+        id: String,
+        acquisition_id: String,
+        path: String,
+        range: CodeQueryRange,
+        provenance: &'static str,
+        consumer: &'static str,
         coverage: &'static str,
     },
     ProcedureEffect {

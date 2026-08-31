@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "pack_id": "bifrost.go.stdlib.path-filepath",
+  "version": "1.0.0",
+  "producer": {
+    "name": "bifrost",
+    "version": "0.10.6"
+  },
+  "language": "go",
+  "ecosystem": "go",
+  "compatibility": {
+    "bifrost": ">=0.10.6, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "https://pkg.go.dev/path/filepath",
+    "revision": "go1.26.0"
+  },
+  "license": "BSD-3-Clause",
+  "completeness": "partial",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "go.stdlib.path-filepath.declarations",
+      "activation": [{}],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "type.33dc6b27fc2fb9bd533a266302e4d09a14385aa8c724f4bdea2af28edd4684a9",
+            "name": "path/filepath",
+            "type_kind": "module",
+            "visibility": "package",
+            "is_abstract": false,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [],
+            "aliases": [
+              "filepath"
+            ],
+            "extension_surfaces": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "path/filepath/path.go",
+              "symbol": "path/filepath"
+            }
+          }
+        ],
+        "members": [
+          {
+            "id": "member.4487256f4efd0f78c6669e8df5a703973c97af6719870435a760f9051d95d84e",
+            "owner": "type.33dc6b27fc2fb9bd533a266302e4d09a14385aa8c724f4bdea2af28edd4684a9",
+            "name": "Join",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "elem",
+                  "type": {
+                    "kind": "named",
+                    "name": "string",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": true
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "string",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "path/filepath/path.go",
+              "symbol": "path/filepath.Join"
+            }
+          }
+        ],
+        "relations": []
+      }
+    }
+  ]
+}

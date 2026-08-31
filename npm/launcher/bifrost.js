@@ -22,7 +22,6 @@ export function platformPackageName(
     "darwin-x64": "@brokkai/bifrost-darwin-universal",
     "linux-arm64-gnu": "@brokkai/bifrost-linux-arm64-gnu",
     "linux-x64-gnu": "@brokkai/bifrost-linux-x64-gnu",
-    "linux-x64-musl": "@brokkai/bifrost-linux-x64-musl",
     "android-arm64": "@brokkai/bifrost-android-arm64",
     "win32-arm64": "@brokkai/bifrost-win32-arm64",
     "win32-x64": "@brokkai/bifrost-win32-x64",

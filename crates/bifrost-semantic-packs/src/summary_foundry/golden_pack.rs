@@ -74,7 +74,7 @@ const PRODUCER_NAME: &str = "bifrost-golden-foundry";
 
 /// The pack content version. It is the golden content's own version, not the
 /// Bifrost version, and advances when the shipped claims change.
-const PACK_CONTENT_VERSION: &str = "0.1.0";
+const PACK_CONTENT_VERSION: &str = "0.2.0";
 
 /// The authored golden content is Bifrost's own claim, not a slice of the JDK
 /// or of CPython. New Bifrost-owned public packs use the public project
@@ -123,7 +123,9 @@ pub struct GoldenRealm {
     /// The `provenance.revision` recorded in the pack.
     pub provenance_revision: &'static str,
     /// Whether a call to an external static (module-level) procedure presents a
-    /// receiver at the boundary. See [`shipped_has_receiver`].
+    /// receiver at the boundary for this realm. Java type qualifiers are
+    /// normalized away when they are proven to name the target owner, while
+    /// Python module qualifiers remain receiver-shaped.
     pub qualified_static_call_has_receiver: bool,
 }
 
@@ -141,10 +143,10 @@ pub const JDK_REALM: GoldenRealm = GoldenRealm {
     targets: &["jvm"],
     provenance_source: "hand-authored golden-core JDK flow-through summaries",
     provenance_revision: "golden-core",
-    // A Java call to an external static method always spells its owner --
-    // `java.net.URLDecoder.decode(x, enc)` -- and the Java IR models that owner
-    // qualifier as the call receiver (#1978).
-    qualified_static_call_has_receiver: true,
+    // Java staticness is preserved from the authored semantic target. The
+    // engine normalizes a proven type qualifier such as
+    // `java.net.URLDecoder.decode(x, enc)` to a receiverless boundary (#1981).
+    qualified_static_call_has_receiver: false,
 };
 
 /// The CPython realm. Its ecosystem and toolchain names match the pinned
@@ -583,20 +585,33 @@ const JAVA_FINAL_OWNERS: &[&str] = &[
 ];
 
 /// Whether the shipped summary may claim `covers_overrides` (#2371) from
-/// language semantics alone: a static method has exactly one target, and an
-/// instance method on a `final` class has no overrides. A constructor's target
-/// is also exact, but it stays receiverless after conversion and a receiverless
-/// claim is rejected at validation, so it keeps `false`. Everything else --
-/// interface and overridable-class members -- stays `false` honestly.
+/// language semantics alone. A receiverless static method already has exactly
+/// one target, so it needs no override claim. An instance method on a `final`
+/// class has no overrides and may make the claim. Constructors likewise remain
+/// receiverless with `false`. Everything else -- interface and
+/// overridable-class members -- stays `false` honestly.
 ///
 /// Reads the authored `has_receiver`, which marks staticness, so it must run
-/// before [`shipped_has_receiver`] rewrites the field for binding.
+/// before any realm-specific receiver-shape normalization for binding.
 fn shipped_covers_overrides(target: &AuthoredProcedureTarget, realm: GoldenRealm) -> bool {
-    if realm.language != "java" || target.symbol.contains("<init>") {
+    if target.symbol.contains("<init>") {
+        return false;
+    }
+    // JavaScript and TypeScript spell module-level and runtime-global static
+    // procedures as member calls. `has_receiver` therefore describes the call
+    // syntax used to bind the model, not an overridable instance receiver. The
+    // JS/TS golden inventory contains only those statically owned procedures;
+    // receiver-method transforms are excluded at the candidate boundary. A
+    // complete summary can consequently claim the exact target set even though
+    // the lowered call carries a receiver value (#2608).
+    if matches!(realm.language, "javascript" | "typescript") {
+        return true;
+    }
+    if realm.language != "java" {
         return false;
     }
     if !target.has_receiver {
-        return true;
+        return false;
     }
     let name = target.symbol.split('(').next().unwrap_or(&target.symbol);
     name.rsplit_once('.')
@@ -617,10 +632,16 @@ fn build_summary(candidate: GoldenCandidate, realm: GoldenRealm) -> AuthoredProc
         target,
         completeness: candidate.completeness,
         covers_overrides,
+        normal_continuation_absent: false,
+        normal_result_count: None,
         locations: Vec::new(),
         transfers: candidate.transfers,
         effects: Vec::new(),
         declared_effects: Vec::new(),
+        preconditions: None,
+        result_contracts: Vec::new(),
+        conditional_result_refinements: Vec::new(),
+        normal_return_refinements: Vec::new(),
     }
 }
 
@@ -735,13 +756,11 @@ fn canonical_owner_and_member(symbol: &str) -> Option<(&str, &str)> {
 /// declaration and `ProcedureSummaryMemberKey` for an unmaterialized
 /// fully-qualified callee (#1978) -- and a mismatched key simply never binds.
 ///
-/// A call to an external static procedure always spells its owner
-/// (`java.net.URLDecoder.decode(x, enc)`, `urllib.parse.unquote(x)`), and the
-/// IR models that qualifier as the call receiver. So such a target ships with a
-/// receiver even though the language calls the method static. This is the
-/// authoring rule #1978's fix left as a follow-up: it was applied by hand to
-/// `URLDecoder.decode`, which drifted the checked-in pack from its generator,
-/// and now applies uniformly here.
+/// A Java type qualifier is not an actual receiver. The engine normalizes a
+/// proven owner qualifier (`java.net.URLDecoder.decode(x, enc)`) to the same
+/// receiverless boundary as the authored static target. Python module
+/// qualifiers remain receiver-shaped, so that realm still opts into its
+/// historical lowering rule.
 ///
 /// A constructor is different. `new StringBuilder(s)` has no qualifier before
 /// the member, so an `<init>` target keeps the candidate's `false`.
@@ -962,11 +981,12 @@ mod tests {
         assert_eq!(first, second);
     }
 
-    /// A static candidate is authored with no receiver -- that is the language
-    /// truth -- but ships with one, because the call spells its owner and the IR
-    /// models that qualifier as the receiver. A constructor keeps `false`.
+    /// A Java static candidate preserves its authored receiverless semantic
+    /// shape even though the call spells its owner. An instance target keeps a
+    /// receiver, while a constructor remains receiverless and makes no
+    /// overrides claim.
     #[test]
-    fn a_static_target_ships_with_the_receiver_the_call_presents() {
+    fn java_static_and_instance_targets_preserve_semantic_receiver_shapes() {
         let statics = r#"[
           {
             "target": {"path": "java.base/java/lang/String.java", "symbol": "java.lang.String.valueOf(int)", "has_receiver": false, "parameter_count": 1},
@@ -978,6 +998,12 @@ mod tests {
             "target": {"path": "java.base/java/lang/StringBuilder.java", "symbol": "java.lang.StringBuilder.<init>(java.lang.String)", "has_receiver": false, "parameter_count": 1},
             "completeness": "complete",
             "transfers": [{"input": {"kind": "parameter", "ordinal": 0}, "exit_kind": "normal", "output": {"kind": "normal_return"}}],
+            "rationale": "flow", "provenance": "hand", "confidence": "high", "citations": "javadoc"
+          },
+          {
+            "target": {"path": "java.base/java/lang/String.java", "symbol": "java.lang.String.trim()", "has_receiver": true, "parameter_count": 0},
+            "completeness": "complete",
+            "transfers": [{"input": {"kind": "receiver"}, "exit_kind": "normal", "output": {"kind": "normal_return"}}],
             "rationale": "flow", "provenance": "hand", "confidence": "high", "citations": "javadoc"
           }
         ]"#;
@@ -995,13 +1021,37 @@ mod tests {
                 .as_bool()
                 .expect("has_receiver is a bool")
         };
+        let covers_overrides = |symbol: &str| {
+            summaries
+                .iter()
+                .find(|summary| summary["target"]["symbol"] == symbol)
+                .unwrap_or_else(|| panic!("{symbol} is shipped"))["covers_overrides"]
+                .as_bool()
+                .unwrap_or(false)
+        };
         assert!(
-            shape("java.lang.String.valueOf(int)"),
-            "a static target ships with the qualifier receiver the call presents"
+            !shape("java.lang.String.valueOf(int)"),
+            "a Java static target preserves its authored receiverless semantic shape"
+        );
+        assert!(
+            !covers_overrides("java.lang.String.valueOf(int)"),
+            "a receiverless Java static target has no overrides to cover"
         );
         assert!(
             !shape("java.lang.StringBuilder.<init>(java.lang.String)"),
             "a constructor call has no qualifier before the member, so it keeps no receiver"
+        );
+        assert!(
+            !covers_overrides("java.lang.StringBuilder.<init>(java.lang.String)"),
+            "a constructor does not make an overrides claim"
+        );
+        assert!(
+            shape("java.lang.String.trim()"),
+            "an instance target retains its receiver"
+        );
+        assert!(
+            covers_overrides("java.lang.String.trim()"),
+            "an instance target on final String covers its exact target set"
         );
     }
 
@@ -1166,6 +1216,11 @@ mod tests {
             js["shards"][0]["payload"]["summaries"][0]["target"]["has_receiver"],
             serde_json::Value::Bool(true),
             "a JS/TS member call is lowered with a receiver, unlike a Rust scoped path"
+        );
+        assert_eq!(
+            js["shards"][0]["payload"]["summaries"][0]["covers_overrides"],
+            serde_json::Value::Bool(true),
+            "the receiver is static owner syntax, so a complete JS/TS summary closes its exact external target"
         );
     }
 }

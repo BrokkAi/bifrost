@@ -3,8 +3,8 @@
 //! declaration queries built on top of them, written as free functions over a
 //! source trait instead of as methods on [`CSharpAnalyzer`].
 //!
-//! [`CSharpAnalyzer`] owns the lazy cells (six moka caches, six `OnceLock`s and
-//! two `PoolSafeMemo`s) and implements [`CSharpSource`] out of its own
+//! [`CSharpAnalyzer`] owns the generation caches and lazy cells and implements
+//! [`CSharpSource`] out of its own
 //! accessors, so the functions below reach back for the memoized products they
 //! need without naming the analyzer type.
 //!

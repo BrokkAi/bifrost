@@ -130,7 +130,7 @@ export function caller(flag: boolean) {
     let root = temp.path().canonicalize().expect("canonical temp dir");
     let file = ProjectFile::new(root.clone(), PathBuf::from("app.ts"));
     file.write(source).expect("write source");
-    let workspace = WorkspaceAnalyzer::build_ephemeral(
+    let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
         Arc::new(TestProject::new(root, Language::TypeScript)),
         AnalyzerConfig::default(),
     )
@@ -250,7 +250,7 @@ export function caller() {
     let root = temp.path().canonicalize().expect("canonical temp dir");
     let file = ProjectFile::new(root.clone(), PathBuf::from("app.ts"));
     file.write(source).expect("write source");
-    let workspace = WorkspaceAnalyzer::build_ephemeral(
+    let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
         Arc::new(TestProject::new(root, Language::TypeScript)),
         AnalyzerConfig::default(),
     )
@@ -395,7 +395,7 @@ fn workspace_semantic_gate_and_compatibility_provider_share_one_budget() {
     let root = temp.path().canonicalize().expect("canonical temp dir");
     let file = ProjectFile::new(root.clone(), PathBuf::from("app.ts"));
     file.write(&source).expect("write source");
-    let workspace = WorkspaceAnalyzer::build_ephemeral(
+    let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
         Arc::new(TestProject::new(root, Language::TypeScript)),
         AnalyzerConfig::default(),
     )
@@ -512,7 +512,7 @@ void Call(Service service) {
     let root = temp.path().canonicalize().expect("canonical temp dir");
     let file = ProjectFile::new(root.clone(), PathBuf::from("Receiver.cs"));
     file.write(source).expect("write source");
-    let workspace = WorkspaceAnalyzer::build_ephemeral(
+    let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
         Arc::new(TestProject::new(root, Language::CSharp)),
         AnalyzerConfig::default(),
     )
@@ -689,7 +689,7 @@ void Call()
     let root = temp.path().canonicalize().expect("canonical temp dir");
     let file = ProjectFile::new(root.clone(), PathBuf::from("Receiver.cs"));
     file.write(source).expect("write source");
-    let workspace = WorkspaceAnalyzer::build_ephemeral(
+    let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
         Arc::new(TestProject::new(root, Language::CSharp)),
         AnalyzerConfig::default(),
     )
@@ -1013,7 +1013,7 @@ void Call(DifferentService service) { service.Execute(); }
     unrelated_file
         .write(unrelated_source)
         .expect("write unrelated source");
-    let workspace = WorkspaceAnalyzer::build_ephemeral(
+    let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
         Arc::new(TestProject::new(root, Language::CSharp)),
         AnalyzerConfig::default(),
     )
@@ -1097,7 +1097,7 @@ class Caller {
     let root = temp.path().canonicalize().expect("canonical temp dir");
     let file = ProjectFile::new(root.clone(), PathBuf::from("Partial.cs"));
     file.write(source).expect("write source");
-    let workspace = WorkspaceAnalyzer::build_ephemeral(
+    let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
         Arc::new(TestProject::new(root, Language::CSharp)),
         AnalyzerConfig::default(),
     )
@@ -1152,7 +1152,7 @@ void Call(Service service, dynamic opaque) {
     let root = temp.path().canonicalize().expect("canonical temp dir");
     let file = ProjectFile::new(root.clone(), PathBuf::from("Dynamic.cs"));
     file.write(source).expect("write source");
-    let workspace = WorkspaceAnalyzer::build_ephemeral(
+    let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
         Arc::new(TestProject::new(root, Language::CSharp)),
         AnalyzerConfig::default(),
     )
@@ -1210,7 +1210,7 @@ void Call() { this.Touch(); }
     let root = temp.path().canonicalize().expect("canonical temp dir");
     let file = ProjectFile::new(root.clone(), PathBuf::from("Current.cs"));
     file.write(source).expect("write source");
-    let workspace = WorkspaceAnalyzer::build_ephemeral(
+    let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
         Arc::new(TestProject::new(root, Language::CSharp)),
         AnalyzerConfig::default(),
     )
@@ -1308,7 +1308,7 @@ void caller() {
     let root = temp.path().canonicalize().expect("canonical temp dir");
     let file = ProjectFile::new(root.clone(), PathBuf::from("Sample.java"));
     file.write(source).expect("write source");
-    let workspace = WorkspaceAnalyzer::build_ephemeral(
+    let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
         Arc::new(TestProject::new(root, Language::Java)),
         AnalyzerConfig::default(),
     )
@@ -1532,7 +1532,7 @@ fn java_compatibility_resolution_bounds_deep_hierarchy_and_precancellation() {
     let root = temp.path().canonicalize().expect("canonical temp dir");
     let file = ProjectFile::new(root.clone(), PathBuf::from("DeepHierarchy.java"));
     file.write(&source).expect("write source");
-    let workspace = WorkspaceAnalyzer::build_ephemeral(
+    let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
         Arc::new(TestProject::new(root, Language::Java)),
         AnalyzerConfig::default(),
     )
@@ -1736,7 +1736,7 @@ fn java_allocation_projection_stops_at_target_cap_lookahead() {
     let root = temp.path().canonicalize().expect("canonical temp dir");
     let file = ProjectFile::new(root.clone(), PathBuf::from("Allocations.java"));
     file.write(&source).expect("write source");
-    let workspace = WorkspaceAnalyzer::build_ephemeral(
+    let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
         Arc::new(TestProject::new(root, Language::Java)),
         AnalyzerConfig::default(),
     )
@@ -1853,7 +1853,7 @@ void caller(boolean choice) {
     cartesian_file
         .write(cartesian_source)
         .expect("write cartesian source");
-    let cartesian_workspace = WorkspaceAnalyzer::build_ephemeral(
+    let cartesian_workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
         Arc::new(TestProject::new(cartesian_root, Language::Java)),
         AnalyzerConfig::default(),
     )
@@ -1969,7 +1969,7 @@ static class Worker {
     let root = temp.path().canonicalize().expect("canonical temp dir");
     let file = ProjectFile::new(root.clone(), PathBuf::from("Nested.java"));
     file.write(source).expect("write source");
-    let workspace = WorkspaceAnalyzer::build_ephemeral(
+    let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
         Arc::new(TestProject::new(root, Language::Java)),
         AnalyzerConfig::default(),
     )
@@ -2250,7 +2250,7 @@ fn semantic_receiver_gate_preserves_provider_identity_failures() {
     let root = temp.path().canonicalize().expect("canonical root");
     let file = ProjectFile::new(root.clone(), PathBuf::from("app.ts"));
     file.write(source).expect("write source");
-    let workspace = WorkspaceAnalyzer::build_ephemeral(
+    let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
         Arc::new(TestProject::new(root, Language::TypeScript)),
         AnalyzerConfig::default(),
     )

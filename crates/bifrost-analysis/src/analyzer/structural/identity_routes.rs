@@ -835,7 +835,7 @@ mod tests {
                 sources.push((*source).to_owned());
             }
             let project = TestProject::new(root, language);
-            let workspace = WorkspaceAnalyzer::build_ephemeral(
+            let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(
                 Arc::new(project) as Arc<dyn Project>,
                 AnalyzerConfig::default(),
             )

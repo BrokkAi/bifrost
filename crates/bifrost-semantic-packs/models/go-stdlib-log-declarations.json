@@ -1,0 +1,529 @@
+{
+  "schema_version": 1,
+  "pack_id": "bifrost.go.stdlib.log-declarations",
+  "version": "1.0.0",
+  "producer": {
+    "name": "bifrost",
+    "version": "0.10.6"
+  },
+  "language": "go",
+  "ecosystem": "go",
+  "compatibility": {
+    "bifrost": ">=0.10.6, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "https://pkg.go.dev/log",
+    "revision": "go1.26.0"
+  },
+  "license": "BSD-3-Clause",
+  "completeness": "partial",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "go.stdlib.log.declarations",
+      "activation": [
+        {}
+      ],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "type.1bfd7f7f8d262c8bd74df76a79e63800b7ab1ce63b2fade5fb70a3440172b7cf",
+            "name": "log",
+            "type_kind": "module",
+            "visibility": "package",
+            "is_abstract": false,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [],
+            "aliases": [
+              "log"
+            ],
+            "extension_surfaces": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "log/log.go",
+              "symbol": "log"
+            }
+          },
+          {
+            "id": "type.934b81bf9bda0c9cad8d242c7249cdbb6a44ad697fecee0ab01855549a81e8ee",
+            "name": "log.Logger",
+            "type_kind": "struct",
+            "visibility": "public",
+            "is_abstract": false,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [],
+            "aliases": [],
+            "extension_surfaces": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "log/log.go",
+              "symbol": "log.Logger"
+            }
+          }
+        ],
+        "members": [
+          {
+            "id": "member.66d2922ed2d140e6933d5d8d1bd700a9b4cc601ec415399709814cb76fc1762f",
+            "owner": "type.1bfd7f7f8d262c8bd74df76a79e63800b7ab1ce63b2fade5fb70a3440172b7cf",
+            "name": "Fatal",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "v",
+                  "type": {
+                    "kind": "named",
+                    "name": "any",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": true
+                }
+              ]
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "log/log.go",
+              "symbol": "log.Fatal"
+            }
+          },
+          {
+            "id": "member.d22ee2dd7d4cd53dd0771d2e052131b82216782d70ccad91793439b536b79040",
+            "owner": "type.1bfd7f7f8d262c8bd74df76a79e63800b7ab1ce63b2fade5fb70a3440172b7cf",
+            "name": "Fatalf",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "format",
+                  "type": {
+                    "kind": "named",
+                    "name": "string",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                },
+                {
+                  "name": "v",
+                  "type": {
+                    "kind": "named",
+                    "name": "any",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": true
+                }
+              ]
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "log/log.go",
+              "symbol": "log.Fatalf"
+            }
+          },
+          {
+            "id": "member.b87240c0ec482c00c0d8a26fdb5add598e669a30eefdb5620fd327ccf79524d8",
+            "owner": "type.1bfd7f7f8d262c8bd74df76a79e63800b7ab1ce63b2fade5fb70a3440172b7cf",
+            "name": "Fatalln",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "v",
+                  "type": {
+                    "kind": "named",
+                    "name": "any",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": true
+                }
+              ]
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "log/log.go",
+              "symbol": "log.Fatalln"
+            }
+          },
+          {
+            "id": "member.0666b4b8db7db19e1a8936a14244aa37d3bbd2f70229691fffd54cc9f4d75af7",
+            "owner": "type.1bfd7f7f8d262c8bd74df76a79e63800b7ab1ce63b2fade5fb70a3440172b7cf",
+            "name": "Panic",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "v",
+                  "type": {
+                    "kind": "named",
+                    "name": "any",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": true
+                }
+              ]
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "log/log.go",
+              "symbol": "log.Panic"
+            }
+          },
+          {
+            "id": "member.e855829aefae7b680c8e290e8cd13e2648cb88ff45f8e0dbb78e90b57838862a",
+            "owner": "type.1bfd7f7f8d262c8bd74df76a79e63800b7ab1ce63b2fade5fb70a3440172b7cf",
+            "name": "Panicf",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "format",
+                  "type": {
+                    "kind": "named",
+                    "name": "string",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                },
+                {
+                  "name": "v",
+                  "type": {
+                    "kind": "named",
+                    "name": "any",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": true
+                }
+              ]
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "log/log.go",
+              "symbol": "log.Panicf"
+            }
+          },
+          {
+            "id": "member.0a615e08b73ac1f1fc4c5f0af10a84d4d2c8ae60bca33ed4051f5325bd27d34d",
+            "owner": "type.1bfd7f7f8d262c8bd74df76a79e63800b7ab1ce63b2fade5fb70a3440172b7cf",
+            "name": "Panicln",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "v",
+                  "type": {
+                    "kind": "named",
+                    "name": "any",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": true
+                }
+              ]
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "log/log.go",
+              "symbol": "log.Panicln"
+            }
+          },
+          {
+            "id": "member.12e437dc9a1956095976c819f301a594712cde481e850263b3b44914d5d9613b",
+            "owner": "type.934b81bf9bda0c9cad8d242c7249cdbb6a44ad697fecee0ab01855549a81e8ee",
+            "name": "Fatal",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "v",
+                  "type": {
+                    "kind": "named",
+                    "name": "any",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": true
+                }
+              ]
+            },
+            "receiver": {
+              "pointer": true
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "log/log.go",
+              "symbol": "log.Logger.Fatal"
+            }
+          },
+          {
+            "id": "member.8ebcfaee00774c3060c16a5e29ef31952de1ee74fc1d15df6168b6a45a7b2b39",
+            "owner": "type.934b81bf9bda0c9cad8d242c7249cdbb6a44ad697fecee0ab01855549a81e8ee",
+            "name": "Fatalf",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "format",
+                  "type": {
+                    "kind": "named",
+                    "name": "string",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                },
+                {
+                  "name": "v",
+                  "type": {
+                    "kind": "named",
+                    "name": "any",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": true
+                }
+              ]
+            },
+            "receiver": {
+              "pointer": true
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "log/log.go",
+              "symbol": "log.Logger.Fatalf"
+            }
+          },
+          {
+            "id": "member.a9ce4feeeffe226c4bffb4cdd4bead6f958e2e5142861e4c00107243e6745a15",
+            "owner": "type.934b81bf9bda0c9cad8d242c7249cdbb6a44ad697fecee0ab01855549a81e8ee",
+            "name": "Fatalln",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "v",
+                  "type": {
+                    "kind": "named",
+                    "name": "any",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": true
+                }
+              ]
+            },
+            "receiver": {
+              "pointer": true
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "log/log.go",
+              "symbol": "log.Logger.Fatalln"
+            }
+          },
+          {
+            "id": "member.02661ce2b4ad570b8892c03cb76624cd7c2fac1ebd2274a50d6731ee68d3c342",
+            "owner": "type.934b81bf9bda0c9cad8d242c7249cdbb6a44ad697fecee0ab01855549a81e8ee",
+            "name": "Panic",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "v",
+                  "type": {
+                    "kind": "named",
+                    "name": "any",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": true
+                }
+              ]
+            },
+            "receiver": {
+              "pointer": true
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "log/log.go",
+              "symbol": "log.Logger.Panic"
+            }
+          },
+          {
+            "id": "member.fa4cd66ff4d9b77956dfafaeee4fac69c1e8c01fd4955f8e9159fadb5fb29eb9",
+            "owner": "type.934b81bf9bda0c9cad8d242c7249cdbb6a44ad697fecee0ab01855549a81e8ee",
+            "name": "Panicf",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "format",
+                  "type": {
+                    "kind": "named",
+                    "name": "string",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                },
+                {
+                  "name": "v",
+                  "type": {
+                    "kind": "named",
+                    "name": "any",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": true
+                }
+              ]
+            },
+            "receiver": {
+              "pointer": true
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "log/log.go",
+              "symbol": "log.Logger.Panicf"
+            }
+          },
+          {
+            "id": "member.02c40e6a8b167e3b2215b74b194ffe47b6ec436792f4119d5155102f282c8fa8",
+            "owner": "type.934b81bf9bda0c9cad8d242c7249cdbb6a44ad697fecee0ab01855549a81e8ee",
+            "name": "Panicln",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "v",
+                  "type": {
+                    "kind": "named",
+                    "name": "any",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": true
+                }
+              ]
+            },
+            "receiver": {
+              "pointer": true
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "log/log.go",
+              "symbol": "log.Logger.Panicln"
+            }
+          }
+        ],
+        "relations": []
+      }
+    }
+  ]
+}

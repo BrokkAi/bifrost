@@ -3,10 +3,10 @@
 //!
 //! Rows follow the reference-edge precedent ([`super::edges`]): plain pipeline
 //! values derived on demand and memoised per request, never carried in the
-//! semantic artifact. One file is derived once per query, and the derivation's
-//! own per-axis completeness becomes typed diagnostics before any filter runs
-//! -- so a `:class read` filter that drops every row still leaves the reason
-//! the row set is partial on the response.
+//! semantic artifact. One requested file or procedure scope is derived once
+//! per query, and its per-axis completeness becomes typed diagnostics before
+//! any filter runs -- so a `:class read` filter that drops every row still
+//! leaves the reason the row set is partial on the response.
 //!
 //! There is no capability table here on purpose. The eleven adapters declare
 //! identical semantic capability rows (see
@@ -17,16 +17,21 @@
 use super::super::flow_state::{
     FLOW_STATE_AXES, FileFlowState, FlowRelationRow, FlowStateAxis, FlowStateCompleteness,
     FlowStateDerivation, FlowStateIncompleteReason, FlowStateRequest, StateEventRow,
-    flow_state_for_file,
+    flow_state_for_file, flow_state_for_materialized_artifact,
+    flow_state_for_materialized_procedure,
 };
 use super::rel_path_string;
 use super::results::{
     CodeQueryDiagnostic, CodeQueryDiagnosticCode, CodeQueryDiagnosticImpact, CodeQueryFlowRelation,
     CodeQueryRange, CodeQueryStateEvent, CodeQueryStateEventRef,
 };
-use crate::analyzer::semantic::LengthDelimitedDigest;
 #[cfg(test)]
-use crate::analyzer::semantic::{SemanticCapability, SemanticGapKind};
+use crate::analyzer::semantic::SemanticGapKind;
+use crate::analyzer::semantic::{
+    LengthDelimitedDigest, ProcedureHandle, ProcedureId, SemanticArtifact, SemanticCapability,
+    SemanticOutcome,
+};
+use crate::analyzer::semantic_model::ActiveSemanticModelSnapshot;
 use crate::analyzer::{Language, ProjectFile, WorkspaceAnalyzer};
 use crate::cancellation::CancellationToken;
 use crate::hash::{HashMap, HashSet};
@@ -38,14 +43,100 @@ const STATE_EVENT_ID_DOMAIN: &[u8] = b"bifrost.code_query.state_event.v1";
 const FLOW_RELATION_ID_DOMAIN: &[u8] = b"bifrost.code_query.flow_relation.v1";
 
 /// Per-request memo of derived flow state plus the diagnostics already
-/// reported, so one file is derived once and one reason is reported once.
-#[derive(Default)]
+/// reported, so one file/procedure scope is derived once and one reason is
+/// reported once.
 pub(super) struct FlowStateTraversalCache {
-    files: HashMap<ProjectFile, Arc<FileFlowState>>,
+    /// One immutable activation snapshot for every file this request derives.
+    active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
+    /// The same snapshot identity carried into every memo key. `None` remains
+    /// distinct from the hash of an activated but empty model set.
+    active_model_set_hash: Option<Arc<str>>,
+    files: HashMap<FlowStateCacheKey, CachedFileFlowState>,
     reported: HashSet<(String, &'static str)>,
 }
 
+struct CachedFileFlowState {
+    /// Retain the exact artifact allocation whose handles the derivation
+    /// accepts. `None` marks the standalone acquisition path, which cannot
+    /// prove identity with a separately materialized query artifact.
+    artifact: Option<Arc<SemanticArtifact>>,
+    state: Arc<FileFlowState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FlowStateCacheKey {
+    file: ProjectFile,
+    active_model_set_hash: Option<Arc<str>>,
+    scope: FlowStateCacheScope,
+    outcome: FlowStateOutcomeIdentity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum FlowStateCacheScope {
+    File,
+    Procedure(ProcedureId),
+}
+
+/// The parts of a semantic outcome that shape flow-state completeness.
+///
+/// Work counters do not change derived rows. Unsupported capability does
+/// appear in the typed reason, so it remains part of the identity alongside
+/// the outcome discriminant and exact artifact allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum FlowStateOutcomeIdentity {
+    Standalone,
+    Complete,
+    Ambiguous,
+    Unknown,
+    Unsupported(SemanticCapability),
+    Unproven,
+    ExceededBudget,
+    Cancelled,
+}
+
+impl FlowStateOutcomeIdentity {
+    fn for_outcome<T>(outcome: &SemanticOutcome<T>) -> Self {
+        match outcome {
+            SemanticOutcome::Complete { .. } => Self::Complete,
+            SemanticOutcome::Ambiguous { .. } => Self::Ambiguous,
+            SemanticOutcome::Unknown { .. } => Self::Unknown,
+            SemanticOutcome::Unsupported { capability, .. } => Self::Unsupported(*capability),
+            SemanticOutcome::Unproven { .. } => Self::Unproven,
+            SemanticOutcome::ExceededBudget { .. } => Self::ExceededBudget,
+            SemanticOutcome::Cancelled { .. } => Self::Cancelled,
+        }
+    }
+}
+
+impl Default for FlowStateTraversalCache {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
+
 impl FlowStateTraversalCache {
+    /// Start one request cache from the activation snapshot its other semantic
+    /// row families use.
+    pub(super) fn new(
+        active_semantic_model_snapshot: Option<Arc<ActiveSemanticModelSnapshot>>,
+    ) -> Self {
+        let active_model_set_hash = active_semantic_model_snapshot
+            .as_ref()
+            .map(|snapshot| Arc::<str>::from(snapshot.active_models().active_model_set_hash()));
+        Self {
+            active_semantic_model_snapshot,
+            active_model_set_hash,
+            files: HashMap::default(),
+            reported: HashSet::default(),
+        }
+    }
+
+    /// Release derived rows for a completed artifact-independent file window.
+    /// Completeness diagnostics remain deduplicated across the whole request.
+    pub(super) fn release_file_window(&mut self) {
+        self.files.clear();
+    }
+
     /// Derive (or replay) the flow state of one file.
     pub(super) fn for_file(
         &mut self,
@@ -53,16 +144,120 @@ impl FlowStateTraversalCache {
         file: &ProjectFile,
         cancellation: Option<&CancellationToken>,
     ) -> Arc<FileFlowState> {
-        if let Some(cached) = self.files.get(file) {
-            return Arc::clone(cached);
+        let key = FlowStateCacheKey {
+            file: file.clone(),
+            active_model_set_hash: self.active_model_set_hash.clone(),
+            scope: FlowStateCacheScope::File,
+            outcome: FlowStateOutcomeIdentity::Standalone,
+        };
+        if let Some(cached) = self.files.get(&key) {
+            return Arc::clone(&cached.state);
         }
         let token = cancellation.cloned().unwrap_or_default();
-        let derived = Arc::new(flow_state_for_file(
+        let mut request = FlowStateRequest::new(&token)
+            .with_active_semantic_model_snapshot(self.active_semantic_model_snapshot.clone());
+        let derived = Arc::new(flow_state_for_file(workspace, file, &mut request));
+        self.files.insert(
+            key,
+            CachedFileFlowState {
+                artifact: None,
+                state: Arc::clone(&derived),
+            },
+        );
+        derived
+    }
+
+    /// Derive (or replay) flow state from the exact semantic artifact outcome
+    /// whose handles the caller will join against.
+    pub(super) fn for_materialized_file(
+        &mut self,
+        workspace: &WorkspaceAnalyzer,
+        file: &ProjectFile,
+        outcome: SemanticOutcome<Arc<SemanticArtifact>>,
+        cancellation: Option<&CancellationToken>,
+    ) -> Arc<FileFlowState> {
+        let key = FlowStateCacheKey {
+            file: file.clone(),
+            active_model_set_hash: self.active_model_set_hash.clone(),
+            scope: FlowStateCacheScope::File,
+            outcome: FlowStateOutcomeIdentity::for_outcome(&outcome),
+        };
+        let artifact = outcome.available_value().cloned();
+        if let (Some(wanted), Some(cached)) = (artifact.as_ref(), self.files.get(&key))
+            && cached
+                .artifact
+                .as_ref()
+                .is_some_and(|retained| Arc::ptr_eq(retained, wanted))
+        {
+            return Arc::clone(&cached.state);
+        }
+        let token = cancellation.cloned().unwrap_or_default();
+        let mut request = FlowStateRequest::new(&token)
+            .with_active_semantic_model_snapshot(self.active_semantic_model_snapshot.clone());
+        let derived = Arc::new(flow_state_for_materialized_artifact(
             workspace,
             file,
-            &mut FlowStateRequest::new(&token),
+            outcome,
+            &mut request,
         ));
-        self.files.insert(file.clone(), Arc::clone(&derived));
+        self.files.insert(
+            key,
+            CachedFileFlowState {
+                artifact,
+                state: Arc::clone(&derived),
+            },
+        );
+        derived
+    }
+
+    /// Derive (or replay) flow state for one exact procedure from the semantic
+    /// artifact allocation that minted its handle.
+    pub(super) fn for_materialized_procedure(
+        &mut self,
+        workspace: &WorkspaceAnalyzer,
+        file: &ProjectFile,
+        outcome: SemanticOutcome<Arc<SemanticArtifact>>,
+        procedure: &ProcedureHandle,
+        cancellation: Option<&CancellationToken>,
+    ) -> Arc<FileFlowState> {
+        let key = FlowStateCacheKey {
+            file: file.clone(),
+            active_model_set_hash: self.active_model_set_hash.clone(),
+            scope: FlowStateCacheScope::Procedure(procedure.id()),
+            outcome: FlowStateOutcomeIdentity::for_outcome(&outcome),
+        };
+        let artifact = outcome.available_value().cloned();
+        if let Some(artifact) = artifact.as_ref() {
+            assert!(
+                Arc::ptr_eq(artifact, procedure.artifact()),
+                "procedure-scoped flow cache requires a handle from the supplied artifact allocation"
+            );
+        }
+        if let (Some(wanted), Some(cached)) = (artifact.as_ref(), self.files.get(&key))
+            && cached
+                .artifact
+                .as_ref()
+                .is_some_and(|retained| Arc::ptr_eq(retained, wanted))
+        {
+            return Arc::clone(&cached.state);
+        }
+        let token = cancellation.cloned().unwrap_or_default();
+        let mut request = FlowStateRequest::new(&token)
+            .with_active_semantic_model_snapshot(self.active_semantic_model_snapshot.clone());
+        let derived = Arc::new(flow_state_for_materialized_procedure(
+            workspace,
+            file,
+            outcome,
+            procedure,
+            &mut request,
+        ));
+        self.files.insert(
+            key,
+            CachedFileFlowState {
+                artifact,
+                state: Arc::clone(&derived),
+            },
+        );
         derived
     }
 
@@ -180,6 +375,14 @@ fn classify_reason(reason: &FlowStateIncompleteReason) -> (CodeQueryDiagnosticCo
         BindingWithoutEstablishment { .. } => (
             CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
             "the lowering declares a local binding it never establishes",
+        ),
+        ControlProjectionRejected { .. } => (
+            CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
+            "the request-local control projection did not match the semantic artifact",
+        ),
+        ModeledControlProjectionIncomplete { .. } => (
+            CodeQueryDiagnosticCode::FlowStateDerivationIncomplete,
+            "an applicable modeled control projection could not be proved exactly",
         ),
     }
 }

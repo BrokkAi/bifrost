@@ -142,8 +142,9 @@ pub(crate) enum MostRelevantProjectFilesOutcome {
     Cancelled,
 }
 
-enum Cancellable<T> {
+pub(crate) enum Cancellable<T> {
     Complete(T),
+    Incomplete(T),
     Cancelled,
 }
 
@@ -560,7 +561,7 @@ pub(crate) fn most_relevant_project_files_with_ranking_mode_and_cancellation(
         graph_kind,
         cancellation,
     ) {
-        Cancellable::Complete(candidates) => candidates,
+        Cancellable::Complete(candidates) | Cancellable::Incomplete(candidates) => candidates,
         Cancellable::Cancelled => return MostRelevantProjectFilesOutcome::Cancelled,
     };
     for candidate in usage_candidates {
@@ -605,23 +606,28 @@ fn related_files_by_usage(
         return Cancellable::Complete(Vec::new());
     }
 
-    let ranking_graph = match build_usage_ranking_graph_with_kind_and_cancellation(
-        analyzer,
-        token,
-        seed_weights,
-        graph_kind,
-        cancellation,
-    ) {
-        Cancellable::Complete(graph) => graph,
-        Cancellable::Cancelled => return Cancellable::Cancelled,
-    };
-    related_files_by_usage_graph_with_cancellation(
+    let (ranking_graph, graph_incomplete) =
+        match build_usage_ranking_graph_with_kind_and_cancellation(
+            analyzer,
+            token,
+            seed_weights,
+            graph_kind,
+            cancellation,
+        ) {
+            Cancellable::Complete(graph) => (graph, false),
+            Cancellable::Incomplete(graph) => (graph, true),
+            Cancellable::Cancelled => return Cancellable::Cancelled,
+        };
+    match related_files_by_usage_graph_with_cancellation(
         &ranking_graph,
         seed_weights,
         k,
         UsageReferenceWeights::CALIBRATED,
         cancellation,
-    )
+    ) {
+        Cancellable::Complete(files) if graph_incomplete => Cancellable::Incomplete(files),
+        other => other,
+    }
 }
 
 #[cfg(test)]
@@ -635,6 +641,9 @@ fn build_usage_ranking_graph(analyzer: &dyn IAnalyzer) -> Arc<UsageRankingGraph>
         &CancellationToken::default(),
     ) {
         Cancellable::Complete(graph) => Arc::new(graph),
+        Cancellable::Incomplete(_) => {
+            unreachable!("exact usage graph construction cannot be incomplete")
+        }
         Cancellable::Cancelled => {
             unreachable!("default cancellation token cannot cancel usage graph construction")
         }
@@ -680,6 +689,46 @@ fn build_usage_ranking_graph_with_kind_and_cancellation(
         ));
     }
 
+    acquire_usage_ranking_graph_with_cancellation(
+        analyzer,
+        token,
+        seed_weights,
+        &selected_ecosystems,
+        graph_kind,
+        cancellation,
+    )
+}
+
+/// Acquire the complete coarse file-import graph for `selected_ecosystems`.
+///
+/// This is the shared seam used by relevance ranking and blast-radius
+/// analysis. The graph is snapshot-owned, keyed by the selected ecosystems'
+/// content identity, and published to the single-flight cache only after a
+/// complete build.
+pub(crate) fn acquire_file_usage_graph_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    selected_ecosystems: &BTreeSet<UsageEcosystem>,
+    cancellation: &CancellationToken,
+) -> Cancellable<Arc<UsageRankingGraph>> {
+    acquire_usage_ranking_graph_with_cancellation(
+        analyzer,
+        token,
+        &HashMap::default(),
+        selected_ecosystems,
+        WorkspaceUsageGraphKind::File,
+        cancellation,
+    )
+}
+
+fn acquire_usage_ranking_graph_with_cancellation(
+    analyzer: &dyn IAnalyzer,
+    token: QueryToken<'_>,
+    seed_weights: &HashMap<ProjectFile, f64>,
+    selected_ecosystems: &BTreeSet<UsageEcosystem>,
+    graph_kind: WorkspaceUsageGraphKind,
+    cancellation: &CancellationToken,
+) -> Cancellable<Arc<UsageRankingGraph>> {
     let Some(cache) = analyzer
         .snapshot_caches()
         .map(|caches| caches.usage_graphs())
@@ -688,7 +737,7 @@ fn build_usage_ranking_graph_with_kind_and_cancellation(
             analyzer,
             token,
             seed_weights,
-            &selected_ecosystems,
+            selected_ecosystems,
             graph_kind,
             cancellation,
         )
@@ -712,7 +761,7 @@ fn build_usage_ranking_graph_with_kind_and_cancellation(
             analyzer,
             token,
             seed_weights,
-            &selected_ecosystems,
+            selected_ecosystems,
             graph_kind,
             cancellation,
         )
@@ -731,12 +780,15 @@ fn build_usage_ranking_graph_with_kind_and_cancellation(
                 analyzer,
                 token,
                 seed_weights,
-                &selected_ecosystems,
+                selected_ecosystems,
                 graph_kind,
                 cancellation,
             ) {
                 Cancellable::Complete(graph) => {
                     WorkspaceUsageGraphCacheBuildOutcome::Complete(graph)
+                }
+                Cancellable::Incomplete(graph) => {
+                    WorkspaceUsageGraphCacheBuildOutcome::Incomplete(graph)
                 }
                 Cancellable::Cancelled => WorkspaceUsageGraphCacheBuildOutcome::Cancelled,
             },
@@ -758,6 +810,9 @@ fn build_usage_ranking_graph_with_kind_and_cancellation(
                 }
                 return Cancellable::Complete(graph);
             }
+            WorkspaceUsageGraphCacheAcquisition::Incomplete(graph) => {
+                return Cancellable::Incomplete(graph);
+            }
             WorkspaceUsageGraphCacheAcquisition::Cancelled => return Cancellable::Cancelled,
             WorkspaceUsageGraphCacheAcquisition::Stale => continue,
         }
@@ -769,6 +824,7 @@ impl<T> Cancellable<T> {
     fn map<U>(self, map: impl FnOnce(T) -> U) -> Cancellable<U> {
         match self {
             Self::Complete(value) => Cancellable::Complete(map(value)),
+            Self::Incomplete(value) => Cancellable::Incomplete(map(value)),
             Self::Cancelled => Cancellable::Cancelled,
         }
     }
@@ -794,6 +850,9 @@ fn build_usage_ranking_graph_uncached(
         };
         return match graph_outcome {
             WorkspaceFileUsageGraphBuildOutcome::Complete(graph) => Cancellable::Complete(graph),
+            WorkspaceFileUsageGraphBuildOutcome::Incomplete(graph) => {
+                Cancellable::Incomplete(graph)
+            }
             WorkspaceFileUsageGraphBuildOutcome::Cancelled => Cancellable::Cancelled,
         };
     }
@@ -850,6 +909,7 @@ fn related_files_by_usage_graph(
         &CancellationToken::default(),
     ) {
         Cancellable::Complete(files) => files,
+        Cancellable::Incomplete(files) => files,
         Cancellable::Cancelled => {
             unreachable!("default cancellation token cannot cancel usage ranking")
         }
@@ -3418,6 +3478,7 @@ mod tests {
             &crate::CancellationToken::default(),
         ) {
             super::Cancellable::Complete(graph) => graph,
+            super::Cancellable::Incomplete(graph) => graph,
             super::Cancellable::Cancelled => panic!("uncancelled selected graph build"),
         };
         let warm_graph = match super::build_usage_ranking_graph_with_cancellation(
@@ -3426,6 +3487,7 @@ mod tests {
             &crate::CancellationToken::default(),
         ) {
             super::Cancellable::Complete(graph) => graph,
+            super::Cancellable::Incomplete(graph) => graph,
             super::Cancellable::Cancelled => panic!("uncancelled warm graph acquisition"),
         };
         assert!(Arc::ptr_eq(&selected_graph, &warm_graph));

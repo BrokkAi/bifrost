@@ -493,6 +493,7 @@ fn scala_entry_facts(
             is_virtual: member_kind == MemberKind::Method
                 && !is_static
                 && !has_modifier(node, "final"),
+            callable_family_complete: false,
             signature,
             receiver: None,
             extension_receiver: None,
@@ -533,6 +534,7 @@ fn empty_constructor_fact(owner: &TypeFact, name: String) -> MemberFact {
         is_static: false,
         is_abstract: false,
         is_virtual: false,
+        callable_family_complete: false,
         signature: Some(Signature {
             type_parameters: Vec::new(),
             parameters: Vec::new(),

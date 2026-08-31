@@ -29,6 +29,7 @@ pub mod get_type;
 pub(crate) mod go_graph;
 pub(crate) mod inverted_edges;
 pub(crate) mod java_graph;
+pub(crate) mod java_usage_evidence_cache;
 pub(crate) mod js_ts_graph;
 pub(crate) mod kotlin_graph;
 pub mod member_family;
@@ -63,8 +64,8 @@ pub use call_relations::{
     CallRelationLimits, CallRelationResult, CallSite, bind_call_site_arguments,
 };
 pub(crate) use call_relations::{
-    CallDispatchBoundaryKind, CallDispatchTarget, ExactCallLocation,
-    call_dispatch_equivalence_source,
+    CallDispatchBoundaryKind, CallDispatchLookup, CallDispatchSession, CallDispatchTarget,
+    CallRelationWork, call_dispatch_equivalence_source,
 };
 pub use call_relations::{CallRelationService, is_call_relation_unit, nearest_call_relation_unit};
 pub use candidates::{

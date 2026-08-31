@@ -20,7 +20,7 @@ use crate::analyzer::{CSharpAnalyzer, Language, ProjectFile};
 use crate::hash::{HashMap, HashSet};
 use brokk_bifrost_core::analyzer::tree_walk::ParentIndex;
 
-const ADAPTER_VERSION: &[u8] = b"csharp-value-semantics-v6";
+const ADAPTER_VERSION: &[u8] = b"csharp-value-semantics-v7";
 
 impl_program_semantics_provider!(CSharpAnalyzer, CSharpSemanticLowerer);
 
@@ -139,13 +139,10 @@ fn csharp_capabilities() -> SemanticCapabilities {
         SemanticCapability::DeferredExecution,
         SemanticCapability::AsyncSuspendResume,
         SemanticCapability::GeneratorSuspension,
+        SemanticCapability::GuardFacts,
     ] {
         builder = builder.partial(capability);
     }
-    // Explicitly unsupported: this adapter normalizes no branch conditions, so
-    // an empty `guard_facts` table means "this language publishes no guard
-    // facts" rather than "this procedure has no decision" (#2443).
-    builder = builder.unsupported(SemanticCapability::GuardFacts);
     builder.build()
 }
 
@@ -2207,6 +2204,18 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         scope: ScopeFrameId,
         stack: &mut Vec<Work<'tree>>,
     ) -> Result<(), CSharpLoweringError> {
+        if let Some(value) = csharp_folded_boolean_constant(self.prepared.source(), node) {
+            let taken = if value { when_true } else { when_false };
+            self.edge(builder, entry, taken)?;
+            return self.record_guard(
+                builder,
+                entry,
+                GuardPredicate::ConstantBoolean { value },
+                None,
+                value.then_some(when_true),
+                (!value).then_some(when_false),
+            );
+        }
         match (node.kind(), binary_operator(node)) {
             ("binary_expression", Some("&&")) => {
                 let left = required_field(node, "left")?;
@@ -2312,6 +2321,17 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 let decision = self.point(builder, node, Vec::new())?;
                 self.edge(builder, decision, when_true)?;
                 self.edge(builder, decision, when_false)?;
+                let subject = self.expression_value(builder, node, expression_value_kind(node))?;
+                self.record_guard(
+                    builder,
+                    decision,
+                    GuardPredicate::Opaque {
+                        digest: GuardConditionDigest::from_syntax_kind(node.kind()),
+                    },
+                    Some(subject),
+                    Some(when_true),
+                    Some(when_false),
+                )?;
                 stack.push(Work::Expression {
                     node,
                     entry,
@@ -2321,6 +2341,37 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 Ok(())
             }
         }
+    }
+
+    /// Publish one guard fact for a decision this lowerer just made.
+    ///
+    /// Arms must already have been added as edges; the IR validator enforces
+    /// that. Conditions this adapter cannot normalize remain opaque.
+    #[allow(clippy::too_many_arguments)]
+    fn record_guard(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        point: ProgramPointId,
+        predicate: GuardPredicate,
+        subject: Option<ValueId>,
+        when_true: Option<EdgeTarget>,
+        when_false: Option<EdgeTarget>,
+    ) -> Result<(), CSharpLoweringError> {
+        let arm = |target: Option<EdgeTarget>| {
+            target.map(|target| GuardArm {
+                target_point: target.point,
+                kind: target.kind,
+            })
+        };
+        self.session.add_guard_fact(
+            builder,
+            point,
+            predicate,
+            subject,
+            arm(when_true),
+            arm(when_false),
+        )?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3135,6 +3186,12 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .into_iter()
             .filter(Node::is_named)
             .collect::<Vec<_>>();
+        let has_first_iteration = csharp_for_has_first_iteration(
+            self.prepared.source(),
+            &initializers,
+            condition,
+            &updates,
+        );
         let condition_entry = match condition {
             Some(condition) => self.point(builder, condition, Vec::new())?,
             None => self.point(builder, node, Vec::new())?,
@@ -3154,6 +3211,11 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     .map(|entry| (initializer, entry))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let initial_condition_target = if has_first_iteration {
+            ControlTarget::normal(body_entry)
+        } else {
+            ControlTarget::normal(condition_entry)
+        };
         schedule_c_style_loop(
             builder,
             &self.session,
@@ -3164,7 +3226,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             &initializers,
             condition.map(|payload| (payload, condition_entry)),
             condition_entry,
-            ControlTarget::normal(condition_entry),
+            initial_condition_target,
             (body, body_entry),
             &updates,
             stack,
@@ -3970,6 +4032,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 callee,
                 receiver,
                 arguments: argument_values.into_boxed_slice(),
+                normal_results: Box::new([]),
                 result: Some(result),
                 thrown: Some(thrown),
                 declared_targets: resolution.clone(),
@@ -4751,6 +4814,126 @@ fn variable_declarator_initializer(declarator: Node<'_>) -> Option<Node<'_>> {
                 .into_iter()
                 .find(|child| child.start_byte() > name.end_byte())
         })
+}
+
+/// Whether a C# `for` statement is known to enter its body before its first
+/// condition check.
+///
+/// This deliberately proves only the ordinary counted-loop shape. Unknown
+/// expressions, multiple initializers or updates, and all other loop forms
+/// retain the shared zero-trip approximation.
+fn csharp_for_has_first_iteration(
+    source: &str,
+    initializers: &[Node<'_>],
+    condition: Option<Node<'_>>,
+    updates: &[Node<'_>],
+) -> bool {
+    if initializers.len() != 1 || updates.len() != 1 {
+        return false;
+    }
+    let (Some(initializer), Some(condition)) = (initializers.first().copied(), condition) else {
+        return false;
+    };
+    let update = updates[0];
+    if initializer.kind() != "variable_declaration"
+        || condition.kind() != "binary_expression"
+        || condition
+            .child_by_field_name("operator")
+            .is_none_or(|operator| operator.kind() != "<")
+        || !is_update_expression_shape(update)
+    {
+        return false;
+    }
+    let declarators = named_children(initializer)
+        .into_iter()
+        .filter(|child| child.kind() == "variable_declarator")
+        .collect::<Vec<_>>();
+    let Some(declarator) = declarators.first().copied() else {
+        return false;
+    };
+    if declarators.len() != 1 {
+        return false;
+    }
+    let Some(name) = declarator.child_by_field_name("name") else {
+        return false;
+    };
+    let Some(start) = variable_declarator_initializer(declarator)
+        .and_then(|node| csharp_integer_literal_value(source, node))
+    else {
+        return false;
+    };
+    let Some(left) = condition
+        .child_by_field_name("left")
+        .filter(|node| node.kind() == "identifier")
+    else {
+        return false;
+    };
+    let Some(limit) = condition
+        .child_by_field_name("right")
+        .and_then(|node| csharp_integer_literal_value(source, node))
+    else {
+        return false;
+    };
+    let Some(incremented) = first_named_child(update).filter(|node| node.kind() == "identifier")
+    else {
+        return false;
+    };
+    node_text(source, name) == node_text(source, left)
+        && node_text(source, name) == node_text(source, incremented)
+        && start < limit
+}
+
+fn is_update_expression_shape(node: Node<'_>) -> bool {
+    if !matches!(
+        node.kind(),
+        "prefix_unary_expression" | "postfix_unary_expression"
+    ) {
+        return false;
+    }
+    let operator = match node.kind() {
+        "prefix_unary_expression" => node.child(0),
+        "postfix_unary_expression" => node.child(node.child_count().saturating_sub(1)),
+        _ => None,
+    };
+    operator.is_some_and(|operator| operator.kind() == "++")
+}
+
+fn csharp_integer_literal_value(source: &str, node: Node<'_>) -> Option<i64> {
+    (node.kind() == "integer_literal")
+        .then(|| node_text(source, node))
+        .flatten()
+        .and_then(|text| text.parse().ok())
+}
+
+/// The boolean value of a C# condition that bottoms out in a literal through
+/// transparent parentheses or a prefix logical-not. The AST is the source of
+/// truth here; every unsupported shape remains an opaque decision.
+fn csharp_folded_boolean_constant(source: &str, node: Node<'_>) -> Option<bool> {
+    let mut current = node;
+    let mut negated = false;
+    loop {
+        match current.kind() {
+            "parenthesized_expression" => current = first_runtime_named_child(current)?,
+            "prefix_unary_expression" => {
+                let operator = current.child(0)?;
+                if operator.kind() != "!" {
+                    return None;
+                }
+                current = first_named_child(current)?;
+                negated = !negated;
+            }
+            _ => break,
+        }
+    }
+    let value = match current.kind() {
+        "boolean_literal" => match node_text(source, current)? {
+            "true" => true,
+            "false" => false,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some(value != negated)
 }
 
 /// The `(namespace, owner, method)` key an invocation names, when the owner is

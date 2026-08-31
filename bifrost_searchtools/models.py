@@ -12,11 +12,51 @@ MostRelevantFilesRankingModeValue = Literal[
 MostRelevantFilesIncompleteReasonValue = Literal["cancelled", "time_budget"]
 SymbolSourcesIncompleteReasonValue = Literal["cancelled"]
 TestFileKindValue = Literal["test", "test_support", "production", "ambiguous"]
+FileGraphCompletionValue = Literal["complete", "incomplete"]
+BlastRadiusBaseRecoveryValue = Literal["not_needed", "complete", "cancelled"]
+BlastRadiusIncompleteReasonValue = Literal[
+    "target_graph_cancelled",
+    "base_graph_cancelled",
+    "compilation_scope_unresolved",
+    "unresolved_changed_paths",
+    "unresolved_base_paths",
+]
+BlastRadiusCallableChangeValue = Literal[
+    "edited", "introduced", "deleted", "moved", "signature_changed"
+]
+BlastRadiusScopeKindValue = Literal["file", "directory"]
+MissingTestsIncompleteReasonValue = Literal[
+    "target_graph_cancelled",
+    "compilation_scope_unresolved",
+    "unresolved_changed_path",
+    "changed_function_unresolved",
+    "usage_cancelled",
+    "usage_time_budget",
+    "usage_candidate_files",
+    "usage_source_bytes",
+    "usage_callsites",
+    "usage_response_budget",
+    "usage_resolution_candidates",
+    "usage_target_not_found",
+    "usage_target_ambiguous",
+    "usage_analysis_failure",
+    "usage_analysis_incomplete",
+    "unproven_references",
+    "usage_site_without_enclosing_declaration",
+]
+CyclomaticComplexityChangeValue = Literal["introduced", "edited"]
 _CODE_QUERY_EXECUTION_MODES = get_args(CodeQueryExecutionMode)
 _MOST_RELEVANT_FILES_RANKING_MODES = get_args(MostRelevantFilesRankingModeValue)
 _MOST_RELEVANT_FILES_INCOMPLETE_REASONS = get_args(MostRelevantFilesIncompleteReasonValue)
 _SYMBOL_SOURCES_INCOMPLETE_REASONS = get_args(SymbolSourcesIncompleteReasonValue)
 _TEST_FILE_KINDS = get_args(TestFileKindValue)
+_FILE_GRAPH_COMPLETIONS = get_args(FileGraphCompletionValue)
+_BLAST_RADIUS_BASE_RECOVERIES = get_args(BlastRadiusBaseRecoveryValue)
+_BLAST_RADIUS_INCOMPLETE_REASONS = get_args(BlastRadiusIncompleteReasonValue)
+_BLAST_RADIUS_CALLABLE_CHANGES = get_args(BlastRadiusCallableChangeValue)
+_BLAST_RADIUS_SCOPE_KINDS = get_args(BlastRadiusScopeKindValue)
+_MISSING_TESTS_INCOMPLETE_REASONS = get_args(MissingTestsIncompleteReasonValue)
+_CYCLOMATIC_COMPLEXITY_CHANGES = get_args(CyclomaticComplexityChangeValue)
 _MISSING = object()
 
 
@@ -31,6 +71,13 @@ def _strict_nonnegative_int(data: dict, key: str) -> int:
     value = data[key]
     if type(value) is not int or value < 0:
         raise TypeError(f"{key} must be a non-negative integer")
+    return value
+
+
+def _strict_int(data: dict, key: str) -> int:
+    value = data[key]
+    if type(value) is not int:
+        raise TypeError(f"{key} must be an integer")
     return value
 
 
@@ -91,6 +138,13 @@ def _test_file_kind(value: Any) -> TestFileKindValue:
         expected = ", ".join(repr(kind) for kind in _TEST_FILE_KINDS)
         raise ValueError(f"test must be one of {expected}, got {value!r}")
     return cast(TestFileKindValue, value)
+
+
+def _closed_value(value: Any, allowed: tuple[Any, ...], field_name: str) -> Any:
+    if value not in allowed:
+        expected = ", ".join(repr(item) for item in allowed)
+        raise ValueError(f"{field_name} must be one of {expected}, got {value!r}")
+    return value
 
 
 def _render_numbered_block(text: str, start_line: int) -> str:
@@ -5418,6 +5472,532 @@ class DiffEndpoints:
     @classmethod
     def from_dict(cls, data: dict) -> DiffEndpoints:
         return cls(base=data["base"], target=data["target"])
+
+
+@dataclass(frozen=True)
+class CyclomaticComplexitySummary:
+    introduced: int
+    edited: int
+    increased: int
+    decreased: int
+    unchanged: int
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CyclomaticComplexitySummary:
+        result = cls(
+            introduced=_strict_nonnegative_int(data, "introduced"),
+            edited=_strict_nonnegative_int(data, "edited"),
+            increased=_strict_nonnegative_int(data, "increased"),
+            decreased=_strict_nonnegative_int(data, "decreased"),
+            unchanged=_strict_nonnegative_int(data, "unchanged"),
+        )
+        if result.edited != result.increased + result.decreased + result.unchanged:
+            raise ValueError(
+                "edited must equal increased + decreased + unchanged"
+            )
+        return result
+
+
+@dataclass(frozen=True)
+class CyclomaticComplexityFunction:
+    fqn: str
+    name: str
+    signature: str
+    path: str
+    start_line: int
+    end_line: int
+    language: str
+    is_test: bool
+    complexity: int
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CyclomaticComplexityFunction:
+        return cls(
+            fqn=data["fqn"],
+            name=data["name"],
+            signature=data["signature"],
+            path=data["path"],
+            start_line=_strict_nonnegative_int(data, "start_line"),
+            end_line=_strict_nonnegative_int(data, "end_line"),
+            language=data["language"],
+            is_test=_strict_bool(data, "is_test"),
+            complexity=_strict_nonnegative_int(data, "complexity"),
+        )
+
+
+@dataclass(frozen=True)
+class CyclomaticComplexityChange:
+    change: CyclomaticComplexityChangeValue
+    before: CyclomaticComplexityFunction | None
+    after: CyclomaticComplexityFunction
+    delta: int | None
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CyclomaticComplexityChange:
+        change = cast(
+            CyclomaticComplexityChangeValue,
+            _closed_value(
+                data["change"], _CYCLOMATIC_COMPLEXITY_CHANGES, "change"
+            ),
+        )
+        before = (
+            CyclomaticComplexityFunction.from_dict(data["before"])
+            if data.get("before") is not None
+            else None
+        )
+        delta = _strict_int(data, "delta") if data.get("delta") is not None else None
+        if change == "introduced" and (before is not None or delta is not None):
+            raise ValueError("introduced functions must omit before and delta")
+        if change == "edited" and (before is None or delta is None):
+            raise ValueError("edited functions require before and delta")
+        return cls(
+            change=change,
+            before=before,
+            after=CyclomaticComplexityFunction.from_dict(data["after"]),
+            delta=delta,
+        )
+
+
+@dataclass(frozen=True)
+class CyclomaticComplexityAnalysis:
+    paths_outside_analysis: list[str]
+    unresolved_changed_paths: list[str]
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CyclomaticComplexityAnalysis:
+        return cls(
+            paths_outside_analysis=_strict_string_list(
+                data, "paths_outside_analysis"
+            ),
+            unresolved_changed_paths=_strict_string_list(
+                data, "unresolved_changed_paths"
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class CyclomaticComplexityDiffResult:
+    endpoints: DiffEndpoints
+    summary: CyclomaticComplexitySummary
+    functions: list[CyclomaticComplexityChange]
+    analysis: CyclomaticComplexityAnalysis
+    rendered_text: str | None = None
+
+    @classmethod
+    def from_dict(
+        cls, data: dict, rendered_text: str | None = None
+    ) -> CyclomaticComplexityDiffResult:
+        return cls(
+            endpoints=DiffEndpoints.from_dict(data["endpoints"]),
+            summary=CyclomaticComplexitySummary.from_dict(data["summary"]),
+            functions=[
+                CyclomaticComplexityChange.from_dict(item)
+                for item in _strict_list(data, "functions")
+            ],
+            analysis=CyclomaticComplexityAnalysis.from_dict(data["analysis"]),
+            rendered_text=rendered_text,
+        )
+
+    def render_text(self) -> str:
+        if self.rendered_text is not None:
+            return self.rendered_text
+        lines = [
+            "Cyclomatic complexity changes",
+            f"Endpoints: {self.endpoints.base} -> {self.endpoints.target}",
+            f"Introduced functions: {self.summary.introduced}",
+            "Edited functions: "
+            f"{self.summary.edited} ({self.summary.increased} increased, "
+            f"{self.summary.decreased} decreased, {self.summary.unchanged} unchanged)",
+        ]
+        for function in self.functions:
+            if function.change == "introduced":
+                lines.append(
+                    f"{function.after.fqn}: introduced with complexity "
+                    f"{function.after.complexity}"
+                )
+            else:
+                assert function.before is not None and function.delta is not None
+                lines.append(
+                    f"{function.after.fqn}: {function.before.complexity} -> "
+                    f"{function.after.complexity} ({function.delta:+d})"
+                )
+        return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class BlastRadiusAnalysis:
+    mode: Literal["file_imports"]
+    graph_completion: FileGraphCompletionValue
+    base_recovery: BlastRadiusBaseRecoveryValue
+    reached_test_file_count: int
+    paths_outside_file_graph: list[str]
+    analyzer_changed_test_paths: list[str]
+    unresolved_changed_paths: list[str]
+    unavailable_removed_test_count: int
+    incomplete_reasons: list[BlastRadiusIncompleteReasonValue]
+
+    @classmethod
+    def from_dict(cls, data: dict) -> BlastRadiusAnalysis:
+        mode = _closed_value(data["mode"], ("file_imports",), "mode")
+        graph_completion = _closed_value(
+            data["graph_completion"], _FILE_GRAPH_COMPLETIONS, "graph_completion"
+        )
+        base_recovery = _closed_value(
+            data["base_recovery"], _BLAST_RADIUS_BASE_RECOVERIES, "base_recovery"
+        )
+        reasons = [
+            _closed_value(value, _BLAST_RADIUS_INCOMPLETE_REASONS, "incomplete_reasons")
+            for value in _strict_string_list(data, "incomplete_reasons")
+        ]
+        return cls(
+            mode=cast(Literal["file_imports"], mode),
+            graph_completion=cast(FileGraphCompletionValue, graph_completion),
+            base_recovery=cast(BlastRadiusBaseRecoveryValue, base_recovery),
+            reached_test_file_count=_strict_nonnegative_int(
+                data, "reached_test_file_count"
+            ),
+            paths_outside_file_graph=_strict_string_list(
+                data, "paths_outside_file_graph"
+            ),
+            analyzer_changed_test_paths=_strict_string_list(
+                data, "analyzer_changed_test_paths"
+            ),
+            unresolved_changed_paths=_strict_string_list(
+                data, "unresolved_changed_paths"
+            ),
+            unavailable_removed_test_count=_strict_nonnegative_int(
+                data, "unavailable_removed_test_count"
+            ),
+            incomplete_reasons=cast(list[BlastRadiusIncompleteReasonValue], reasons),
+        )
+
+
+@dataclass(frozen=True)
+class BlastRadiusCallableSymbol:
+    """One changed declaration and whether it sits in test context.
+
+    ``in_test_context`` includes structurally attributed test regions and
+    language-recognized test-tree paths. It does not claim that the declaration
+    is an individually runnable test or that its file is a ``TestScope``.
+    """
+
+    fqn: str
+    name: str
+    kind: str
+    signature: str
+    path: str
+    start_line: int
+    end_line: int
+    language: str
+    in_test_context: bool
+
+    @classmethod
+    def from_dict(cls, data: dict) -> BlastRadiusCallableSymbol:
+        return cls(
+            fqn=data["fqn"],
+            name=data["name"],
+            kind=data["kind"],
+            signature=data.get("signature", ""),
+            path=data["path"],
+            start_line=int(data["start_line"]),
+            end_line=int(data["end_line"]),
+            language=data["language"],
+            in_test_context=bool(data["in_test_context"]),
+        )
+
+
+@dataclass(frozen=True)
+class ChangedCallable:
+    before: BlastRadiusCallableSymbol | None
+    after: BlastRadiusCallableSymbol | None
+    changes: list[BlastRadiusCallableChangeValue]
+
+    @classmethod
+    def from_dict(cls, data: dict) -> ChangedCallable:
+        changes = [
+            _closed_value(value, _BLAST_RADIUS_CALLABLE_CHANGES, "changes")
+            for value in _strict_string_list(data, "changes")
+        ]
+        return cls(
+            before=(
+                BlastRadiusCallableSymbol.from_dict(data["before"])
+                if data.get("before") is not None
+                else None
+            ),
+            after=(
+                BlastRadiusCallableSymbol.from_dict(data["after"])
+                if data.get("after") is not None
+                else None
+            ),
+            changes=cast(list[BlastRadiusCallableChangeValue], changes),
+        )
+
+
+@dataclass(frozen=True)
+class TestScope:
+    path: str
+    kind: BlastRadiusScopeKindValue
+    reached_file_count: int
+    covered_analyzable_file_count: int
+    minimum_dependency_distance: int
+    maximum_dependency_distance: int
+    sample_reached_files: list[str]
+
+    @classmethod
+    def from_dict(cls, data: dict) -> TestScope:
+        return cls(
+            path=data["path"],
+            kind=cast(
+                BlastRadiusScopeKindValue,
+                _closed_value(data["kind"], _BLAST_RADIUS_SCOPE_KINDS, "kind"),
+            ),
+            reached_file_count=_strict_nonnegative_int(data, "reached_file_count"),
+            covered_analyzable_file_count=_strict_nonnegative_int(
+                data, "covered_analyzable_file_count"
+            ),
+            minimum_dependency_distance=_strict_nonnegative_int(
+                data, "minimum_dependency_distance"
+            ),
+            maximum_dependency_distance=_strict_nonnegative_int(
+                data, "maximum_dependency_distance"
+            ),
+            sample_reached_files=_strict_string_list(data, "sample_reached_files"),
+        )
+
+
+@dataclass(frozen=True)
+class BlastRadiusResult:
+    """Structured file-dependency evidence for test files reached by the graph.
+
+    This is not an individual method-call graph or runtime coverage report.
+    """
+
+    endpoints: DiffEndpoints
+    analysis: BlastRadiusAnalysis
+    changed_callables: list[ChangedCallable]
+    test_scopes: list[TestScope]
+    rendered_text: str | None = None
+
+    @classmethod
+    def from_dict(
+        cls, data: dict, rendered_text: str | None = None
+    ) -> BlastRadiusResult:
+        return cls(
+            endpoints=DiffEndpoints.from_dict(data["endpoints"]),
+            analysis=BlastRadiusAnalysis.from_dict(data["analysis"]),
+            changed_callables=[
+                ChangedCallable.from_dict(item)
+                for item in _strict_list(data, "changed_callables")
+            ],
+            test_scopes=[
+                TestScope.from_dict(item) for item in _strict_list(data, "test_scopes")
+            ],
+            rendered_text=rendered_text,
+        )
+
+    def render_text(self) -> str:
+        if self.rendered_text is not None:
+            return self.rendered_text
+        lines = [
+            "Test blast radius (structured file-dependency evidence)",
+            "This is not a method call graph or runtime coverage report.",
+            f"Endpoints: {self.endpoints.base} -> {self.endpoints.target}",
+            f"File-graph completion: {self.analysis.graph_completion}",
+            "Test files reached through structured file dependencies: "
+            f"{self.analysis.reached_test_file_count}",
+        ]
+        if self.analysis.paths_outside_file_graph:
+            paths = ", ".join(self.analysis.paths_outside_file_graph)
+            lines.append(f"Changed paths outside the file graph: {paths}")
+            lines.append(
+                "These paths may require build, data, or workflow validation "
+                "that this graph cannot infer."
+            )
+        if self.analysis.analyzer_changed_test_paths:
+            paths = ", ".join(self.analysis.analyzer_changed_test_paths)
+            lines.append(
+                "Changed target files structurally classified as tests: " + paths
+            )
+        if not self.test_scopes:
+            lines.append(
+                "No test files were reached through structured file dependencies."
+            )
+        lines.extend(f"- {scope.path} ({scope.kind})" for scope in self.test_scopes)
+        return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class MissingTestsAnalysis:
+    mode: Literal["file_imports_then_exact_usages"]
+    file_graph_completion: FileGraphCompletionValue
+    exact_usage_completion: FileGraphCompletionValue
+    candidate_function_count: int
+    reached_function_count: int
+    missing_function_count: int
+    indeterminate_function_count: int
+    paths_outside_file_graph: list[str]
+    unresolved_changed_paths: list[str]
+    incomplete_reasons: list[MissingTestsIncompleteReasonValue]
+
+    @classmethod
+    def from_dict(cls, data: dict) -> MissingTestsAnalysis:
+        mode = _closed_value(
+            data["mode"], ("file_imports_then_exact_usages",), "mode"
+        )
+        file_graph_completion = _closed_value(
+            data["file_graph_completion"],
+            _FILE_GRAPH_COMPLETIONS,
+            "file_graph_completion",
+        )
+        exact_usage_completion = _closed_value(
+            data["exact_usage_completion"],
+            _FILE_GRAPH_COMPLETIONS,
+            "exact_usage_completion",
+        )
+        reasons = [
+            _closed_value(
+                value,
+                _MISSING_TESTS_INCOMPLETE_REASONS,
+                "incomplete_reasons",
+            )
+            for value in _strict_string_list(data, "incomplete_reasons")
+        ]
+        result = cls(
+            mode=cast(Literal["file_imports_then_exact_usages"], mode),
+            file_graph_completion=cast(
+                FileGraphCompletionValue, file_graph_completion
+            ),
+            exact_usage_completion=cast(
+                FileGraphCompletionValue, exact_usage_completion
+            ),
+            candidate_function_count=_strict_nonnegative_int(
+                data, "candidate_function_count"
+            ),
+            reached_function_count=_strict_nonnegative_int(
+                data, "reached_function_count"
+            ),
+            missing_function_count=_strict_nonnegative_int(
+                data, "missing_function_count"
+            ),
+            indeterminate_function_count=_strict_nonnegative_int(
+                data, "indeterminate_function_count"
+            ),
+            paths_outside_file_graph=_strict_string_list(
+                data, "paths_outside_file_graph"
+            ),
+            unresolved_changed_paths=_strict_string_list(
+                data, "unresolved_changed_paths"
+            ),
+            incomplete_reasons=cast(
+                list[MissingTestsIncompleteReasonValue], reasons
+            ),
+        )
+        if result.candidate_function_count != (
+            result.reached_function_count
+            + result.missing_function_count
+            + result.indeterminate_function_count
+        ):
+            raise ValueError(
+                "candidate_function_count must equal reached + missing + indeterminate"
+            )
+        return result
+
+
+@dataclass(frozen=True)
+class MissingTestFunction:
+    before: BlastRadiusCallableSymbol | None
+    after: BlastRadiusCallableSymbol
+    changes: list[BlastRadiusCallableChangeValue]
+    incomplete_reasons: list[MissingTestsIncompleteReasonValue]
+
+    @classmethod
+    def from_dict(cls, data: dict) -> MissingTestFunction:
+        changes = [
+            _closed_value(value, _BLAST_RADIUS_CALLABLE_CHANGES, "changes")
+            for value in _strict_string_list(data, "changes")
+        ]
+        if not any(
+            change in ("edited", "introduced", "signature_changed")
+            for change in changes
+        ):
+            raise ValueError("missing-test functions require an actionable change")
+        reasons = [
+            _closed_value(
+                value,
+                _MISSING_TESTS_INCOMPLETE_REASONS,
+                "incomplete_reasons",
+            )
+            for value in _strict_string_list(
+                {"incomplete_reasons": data.get("incomplete_reasons", [])},
+                "incomplete_reasons",
+            )
+        ]
+        return cls(
+            before=(
+                BlastRadiusCallableSymbol.from_dict(data["before"])
+                if data.get("before") is not None
+                else None
+            ),
+            after=BlastRadiusCallableSymbol.from_dict(data["after"]),
+            changes=cast(list[BlastRadiusCallableChangeValue], changes),
+            incomplete_reasons=cast(
+                list[MissingTestsIncompleteReasonValue], reasons
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class MissingTestsResult:
+    """Changed functions without a complete static call path from tests."""
+
+    endpoints: DiffEndpoints
+    analysis: MissingTestsAnalysis
+    missing_functions: list[MissingTestFunction]
+    indeterminate_functions: list[MissingTestFunction]
+    rendered_text: str | None = None
+
+    @classmethod
+    def from_dict(
+        cls, data: dict, rendered_text: str | None = None
+    ) -> MissingTestsResult:
+        return cls(
+            endpoints=DiffEndpoints.from_dict(data["endpoints"]),
+            analysis=MissingTestsAnalysis.from_dict(data["analysis"]),
+            missing_functions=[
+                MissingTestFunction.from_dict(item)
+                for item in _strict_list(data, "missing_functions")
+            ],
+            indeterminate_functions=[
+                MissingTestFunction.from_dict(item)
+                for item in _strict_list(data, "indeterminate_functions")
+            ],
+            rendered_text=rendered_text,
+        )
+
+    def render_text(self) -> str:
+        if self.rendered_text is not None:
+            return self.rendered_text
+        lines = [
+            "Missing-test candidates (bounded structured usage evidence)",
+            "The file graph narrows the search; exact static usage paths determine "
+            "reachability. This is not runtime coverage.",
+            f"Endpoints: {self.endpoints.base} -> {self.endpoints.target}",
+            "Candidates: "
+            f"{self.analysis.candidate_function_count} "
+            f"({self.analysis.reached_function_count} reached, "
+            f"{self.analysis.missing_function_count} missing, "
+            f"{self.analysis.indeterminate_function_count} indeterminate)",
+        ]
+        lines.extend(
+            f"- {function.after.fqn} ({function.after.path})"
+            for function in self.missing_functions
+        )
+        lines.extend(
+            f"- {function.after.fqn} (indeterminate: "
+            f"{', '.join(function.incomplete_reasons)})"
+            for function in self.indeterminate_functions
+        )
+        return "\n".join(lines)
 
 
 @dataclass(frozen=True)

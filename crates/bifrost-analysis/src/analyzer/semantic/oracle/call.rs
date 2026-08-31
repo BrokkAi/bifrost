@@ -484,7 +484,7 @@ impl CallBindings {
         let mut formal_mapping_counts = std::collections::HashMap::<u32, usize>::new();
         let mut implicit_formals = std::collections::HashSet::new();
         let mut has_receiver = false;
-        let mut has_normal_return = false;
+        let mut normal_return_bindings = std::collections::HashSet::new();
         let mut has_exceptional_return = false;
         let mut has_open_group = false;
         let mut has_truncated_group = false;
@@ -703,19 +703,24 @@ impl CallBindings {
                     }
                     require_same_procedure(formal.procedure(), &callee)?;
                     require_same_procedure(result.procedure(), caller)?;
-                    if call_row.result != Some(result.id())
-                        || formal.kind() != ProcedurePortKind::NormalReturn
-                    {
+                    let return_matches = match formal.kind() {
+                        ProcedurePortKind::NormalReturn => call_row.result == Some(result.id()),
+                        ProcedurePortKind::IndexedNormalReturn { ordinal } => {
+                            !call_row.normal_results.is_empty()
+                                && call_row.normal_result(ordinal as usize) == Some(result.id())
+                        }
+                        _ => false,
+                    };
+                    if !return_matches {
                         return Err(OracleContractError::InvalidCallBinding(
                             "normal-return binding does not match the call result and callee return port",
                         ));
                     }
-                    if has_normal_return {
+                    if !normal_return_bindings.insert(formal.kind()) {
                         return Err(OracleContractError::InvalidCallBinding(
-                            "call binding contains more than one normal-return relation",
+                            "call binding contains more than one relation for one normal-return port",
                         ));
                     }
-                    has_normal_return = true;
                 }
                 CallBinding::ExceptionalReturn {
                     relation,
@@ -780,7 +785,16 @@ impl CallBindings {
                 .iter()
                 .any(|value| matches!(value.kind, SemanticValueKind::Receiver { .. }))
                 || has_receiver;
-            let returns_bound = call_row.result.is_none() || has_normal_return;
+            let returns_bound = if call_row.normal_results.is_empty() {
+                call_row.result.is_none()
+                    || normal_return_bindings.contains(&ProcedurePortKind::NormalReturn)
+            } else {
+                (0..call_row.normal_results.len()).all(|ordinal| {
+                    normal_return_bindings.contains(&ProcedurePortKind::IndexedNormalReturn {
+                        ordinal: ordinal as u32,
+                    })
+                })
+            };
             let throws_bound = call_row.thrown.is_none() || has_exceptional_return;
             if !all_actuals_bound
                 || !all_formals_bound

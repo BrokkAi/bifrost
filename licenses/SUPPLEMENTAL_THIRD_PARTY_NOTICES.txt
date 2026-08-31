@@ -1487,11 +1487,11 @@ Copyright notice:
   jloup@gzip.org          madler@alumni.caltech.edu
 
 ================================================================================
-SQLite 3.46.0
+SQLite 3.53.2
 ================================================================================
 
-Rust package: libsqlite3-sys@0.30.1
-Package source: https://crates.io/crates/libsqlite3-sys/0.30.1
+Rust package: libsqlite3-sys@0.38.2
+Package source: https://crates.io/crates/libsqlite3-sys/0.38.2
 Source notice: sqlite3/sqlite3.c (public-domain notice)
 Inclusion: compiled from the bundled SQLite amalgamation on every release target
 
@@ -1961,14 +1961,15 @@ SOFTWARE.
 brokk-tree-sitter-kotlin parser
 ================================================================================
 
-Rust package: brokk-tree-sitter-kotlin@0.4.0
-Package source: https://crates.io/crates/brokk-tree-sitter-kotlin/0.4.0
+Rust package: brokk-tree-sitter-kotlin@0.4.1
+Package source: https://crates.io/crates/brokk-tree-sitter-kotlin/0.4.1
 Source notice: LICENSE
 Inclusion: compiled into Bifrost on every release target
 
 The MIT License (MIT)
 
 Copyright (c) 2019 fwcd
+Copyright (c) 2026 Brokk contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
 

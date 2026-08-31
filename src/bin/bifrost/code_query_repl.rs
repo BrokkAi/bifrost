@@ -1473,6 +1473,21 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         site_id,
                     ));
                 }
+                CodeQueryResultValue::CallResult { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} #{} value={} ({}; {})\n  call {}\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(Style::new().fg(Color::Blue), "call result:", use_color),
+                        value.ordinal,
+                        value.value_id,
+                        value.proof,
+                        value.completeness,
+                        sanitize_terminal_text(&value.call_id),
+                    ));
+                }
                 CodeQueryResultValue::CallArgumentGroup { value } => {
                     let path = sanitize_terminal_text(&value.path);
                     let site_id = sanitize_terminal_text(&value.site_id);
@@ -1553,6 +1568,77 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                             .map(|certainty| format!(" {certainty}"))
                             .unwrap_or_default(),
                         site_id,
+                    ));
+                }
+                CodeQueryResultValue::CallResultContract { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let site_id = sanitize_terminal_text(&value.site_id);
+                    let contract = match (
+                        value.result_ordinal,
+                        value.condition_result_ordinal,
+                        value.predicate,
+                    ) {
+                        (Some(result), Some(condition), Some(predicate)) => {
+                            format!("result #{result} requires result #{condition} {predicate}")
+                        }
+                        _ => "no declared result contract".to_owned(),
+                    };
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} ({})\n  site {}\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(
+                            Style::new().fg(Color::Blue),
+                            "call result contract:",
+                            use_color
+                        ),
+                        contract,
+                        value.coverage,
+                        site_id,
+                    ));
+                }
+                CodeQueryResultValue::ResultContractUse { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let operation =
+                        sanitize_terminal_text(value.member.as_deref().unwrap_or(value.use_kind));
+                    let acquisition_id = sanitize_terminal_text(&value.acquisition_id);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} [{}; {}; {}; {}]\n  acquisition {}\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(
+                            Style::new().fg(Color::Blue),
+                            "result contract use:",
+                            use_color
+                        ),
+                        paint(Style::new().bold(), &operation, use_color),
+                        value.timing,
+                        value.applicability,
+                        value.guard,
+                        value.coverage,
+                        acquisition_id,
+                    ));
+                }
+                CodeQueryResultValue::ResultContractFailureUse { value } => {
+                    let path = sanitize_terminal_text(&value.path);
+                    let acquisition_id = sanitize_terminal_text(&value.acquisition_id);
+                    out.push_str(&format!(
+                        "{}:{}:{}\n  {} {} [{}; {}; {}]\n  acquisition {}\n",
+                        paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
+                        value.range.start_line,
+                        value.range.start_column,
+                        paint(
+                            Style::new().fg(Color::Blue),
+                            "result contract failure use:",
+                            use_color
+                        ),
+                        value.consumer,
+                        value.failure_provenance,
+                        value.proof,
+                        value.coverage,
+                        acquisition_id,
                     ));
                 }
                 CodeQueryResultValue::ProcedureEffect { value } => {
@@ -1688,6 +1774,11 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         .as_deref()
                         .map(sanitize_terminal_text)
                         .unwrap_or_else(|| "unknown".to_owned());
+                    let value_id = value
+                        .value_id
+                        .as_deref()
+                        .map(sanitize_terminal_text)
+                        .unwrap_or_else(|| "unknown".to_owned());
                     let ordinal = value
                         .parameter_ordinal
                         .map_or_else(|| "unknown".to_owned(), |ordinal| ordinal.to_string());
@@ -1717,7 +1808,7 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         .map(|reason| format!(" reason={}", sanitize_terminal_text(reason)))
                         .unwrap_or_default();
                     out.push_str(&format!(
-                        "{}:{}:{}-{}:{}\n  {} {} decorator={} at {}:{}-{}:{}\n  owner={} procedure={} ordinal={} port={} module={} imported={} local={} binding={} boundary={} completion={} coverage={} terminal={}{}\n",
+                        "{}:{}:{}-{}:{}\n  {} {} decorator={} at {}:{}-{}:{}\n  owner={} procedure={} value={} ordinal={} port={} module={} imported={} local={} binding={} boundary={} completion={} coverage={} terminal={}{}\n",
                         paint(Style::new().fg(Color::Cyan).bold(), &path, use_color),
                         value.range.start_line,
                         value.range.start_column,
@@ -1736,6 +1827,7 @@ fn render_code_query_repl_output(output: &CodeQueryResult, use_color: bool) -> S
                         value.decorator_range.end_column,
                         owner_id,
                         procedure_id,
+                        value_id,
                         ordinal,
                         port_id,
                         module,
@@ -2873,6 +2965,7 @@ mod tests {
                             },
                             owner_id: Some("Controller.handle".to_owned()),
                             procedure_id: Some("procedure".to_owned()),
+                            value_id: Some("value".to_owned()),
                             parameter_ordinal: Some(1),
                             port_id: Some("procedure:parameter:1".to_owned()),
                             decorator_name: "Query".to_owned(),
@@ -2903,7 +2996,7 @@ mod tests {
         );
         assert!(
             output.contains(
-                "owner=Controller.handle procedure=procedure ordinal=1 port=procedure:parameter:1"
+                "owner=Controller.handle procedure=procedure value=value ordinal=1 port=procedure:parameter:1"
             ),
             "{output}"
         );

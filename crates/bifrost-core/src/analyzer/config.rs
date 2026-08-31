@@ -263,11 +263,32 @@ pub struct GoAnalyzerConfig {
     pub dependency_discovery: GoDependencyDiscoveryConfig,
 }
 
+/// How a host uses the exact package graph reported by the Go toolchain.
+///
+/// Curated-pack evidence is intentionally distinct from full dependency-pack
+/// production. The former needs only the exact reachable module coordinates
+/// that can select an already installed reviewed pack; the latter reads every
+/// reachable dependency source set and may generate a declaration pack for
+/// each one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GoDependencyDiscoveryMode {
+    /// Do not invoke the Go toolchain or publish dependency evidence.
+    #[default]
+    Disabled,
+    /// Discover exact reachable modules for compatible installed-pack
+    /// activation, without reading dependency sources or generating packs.
+    CuratedPackEvidence,
+    /// Discover exact reachable source sets and prepare dependency packs for
+    /// the complete dependency surface.
+    FullProduction,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GoDependencyDiscoveryConfig {
-    /// Go dependency discovery is opt-in because it invokes the configured Go
-    /// toolchain and can index a large local module graph.
-    pub enabled: bool,
+    /// Go dependency discovery is opt-in because every enabled mode invokes
+    /// the configured Go toolchain. Full production can additionally index a
+    /// large local module graph.
+    pub mode: GoDependencyDiscoveryMode,
     /// Go executable to use. Relative names are resolved by the parent
     /// process before the hardened child environment is installed.
     pub go_executable: Option<PathBuf>,
@@ -284,7 +305,7 @@ pub struct GoDependencyDiscoveryConfig {
 impl Default for GoDependencyDiscoveryConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            mode: GoDependencyDiscoveryMode::Disabled,
             go_executable: None,
             workspace_patterns: vec!["./...".to_owned()],
             gopath: None,

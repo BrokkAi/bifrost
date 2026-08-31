@@ -12,10 +12,13 @@ use super::super::lexical_environment::{
 use super::super::occurrence_rows::ast_id;
 use super::super::occurrences::Namespace;
 use super::callable_signature::declaration_site_id;
-use super::results::CodeQueryDecoratedParameter;
+use super::results::{CodeQueryDecoratedParameter, DetailedCodeQueryDecoratedParameterEvidence};
 use super::*;
 use crate::analyzer::lexical_definitions::formal_parameter_slots;
-use crate::analyzer::semantic::SemanticValueKind;
+use crate::analyzer::semantic::{
+    DurablePortIdentity, DurableValueIdentity, ProcedurePortHandle, SemanticValueKind,
+    StructuralNodeIdentity, ValueHandle,
+};
 use crate::analyzer::usages::get_definition::parse_tree_for_language;
 use brokk_bifrost_core::analyzer::structural::resolution::BoundaryStatus;
 
@@ -35,6 +38,7 @@ pub(super) struct DecoratedParameterValue {
     pub(super) file: ProjectFile,
     pub(super) range: Range,
     pub(super) row: CodeQueryDecoratedParameter,
+    pub(super) semantic: Option<Box<DetailedCodeQueryDecoratedParameterEvidence>>,
 }
 
 impl DecoratedParameterValue {
@@ -56,9 +60,12 @@ pub(super) fn expansions_for_seed(
     let owner = enclosing_declaration_value(analyzer, seed, declarations).0;
     let owner_id = owner.as_ref().map(declaration_site_id);
     let environment = environment_for_file(analyzer, &seed.file);
-    let semantic_identity = semantic.and_then(|context| {
+    let (semantic_identity, semantic_reason) = semantic.map_or((None, None), |context| {
         let procedures = context.procedure_of_match(seed);
-        semantic_parameter_identity(&procedures, parameter_range)
+        semantic_parameter_identity(
+            &procedures,
+            &StructuralNodeIdentity::new(seed.facts.source_identity(), seed.fact_match.node),
+        )
     });
     let syntax_ordinal = owner.as_ref().and_then(|owner| {
         let tree = parse_tree_for_language(&seed.file, seed.language, seed.facts.source())?;
@@ -81,25 +88,16 @@ pub(super) fn expansions_for_seed(
                 .saturating_sub(1),
         )
     });
-    let identity = semantic_identity.or_else(|| {
-        syntax_ordinal.map(|ordinal| ParameterIdentity {
-            procedure_id: None,
-            ordinal: Some(ordinal),
-            port_id: Some(parameter_port_id(
-                owner_id.as_deref().unwrap_or(&parameter_id),
-                ordinal as u32,
-            )),
-            coverage: "partial",
-            completion: "incomplete",
-        })
-    });
+    let identity = semantic_identity
+        .or_else(|| syntax_ordinal.map(ParameterIdentity::incomplete_with_ordinal));
     let decorator_targets = seed
         .facts
         .role_targets(seed.fact_match.node, Role::Decorator)
         .collect::<Vec<_>>();
     decorator_targets
         .into_iter()
-        .map(|target| {
+        .enumerate()
+        .map(|(decorator_ordinal, target)| {
             let decorator_range = Range {
                 start_byte: target.span.start_byte,
                 end_byte: target.span.end_byte,
@@ -132,6 +130,9 @@ pub(super) fn expansions_for_seed(
                 ),
             };
             let mut reason = binding.reason;
+            if reason.is_none() {
+                reason = semantic_reason.clone();
+            }
             let identity = identity
                 .clone()
                 .unwrap_or_else(ParameterIdentity::incomplete);
@@ -151,8 +152,12 @@ pub(super) fn expansions_for_seed(
             } else {
                 "partial"
             };
+            let semantic = (effective_completion == "complete")
+                .then(|| identity.semantic.clone())
+                .flatten()
+                .map(Box::new);
             let id =
-                decorated_parameter_id(&parameter_id, decorator_id.as_deref(), decorator_range);
+                decorated_parameter_id(&parameter_id, decorator_id.as_deref(), decorator_ordinal);
             let row = CodeQueryDecoratedParameter {
                 id,
                 parameter_id: parameter_id.clone(),
@@ -163,6 +168,7 @@ pub(super) fn expansions_for_seed(
                 decorator_range: range_for_span(&seed.facts, target.span),
                 owner_id: owner_id.clone(),
                 procedure_id: identity.procedure_id,
+                value_id: identity.value_id,
                 parameter_ordinal: identity.ordinal,
                 port_id: identity.port_id,
                 decorator_name,
@@ -180,6 +186,7 @@ pub(super) fn expansions_for_seed(
                 file: seed.file.clone(),
                 range: parameter_range,
                 row,
+                semantic,
             }))
         })
         .collect()
@@ -199,8 +206,10 @@ struct DecoratorBinding {
 #[derive(Debug, Clone)]
 struct ParameterIdentity {
     procedure_id: Option<String>,
+    value_id: Option<String>,
     ordinal: Option<usize>,
     port_id: Option<String>,
+    semantic: Option<DetailedCodeQueryDecoratedParameterEvidence>,
     coverage: &'static str,
     completion: &'static str,
 }
@@ -209,10 +218,19 @@ impl ParameterIdentity {
     fn incomplete() -> Self {
         Self {
             procedure_id: None,
+            value_id: None,
             ordinal: None,
             port_id: None,
+            semantic: None,
             coverage: "partial",
             completion: "incomplete",
+        }
+    }
+
+    fn incomplete_with_ordinal(ordinal: usize) -> Self {
+        Self {
+            ordinal: Some(ordinal),
+            ..Self::incomplete()
         }
     }
 }
@@ -286,8 +304,20 @@ fn decorator_binding(
 
 fn semantic_parameter_identity(
     procedures: &[SemanticProcedureValue],
-    range: Range,
-) -> Option<ParameterIdentity> {
+    query_identity: &StructuralNodeIdentity,
+) -> (Option<ParameterIdentity>, Option<String>) {
+    if let Some(reason) = procedures
+        .iter()
+        .find_map(SemanticProcedureValue::exact_selection_incomplete_reason)
+    {
+        return (
+            None,
+            Some(format!(
+                "semantic enclosing-procedure selection is incomplete: {reason}"
+            )),
+        );
+    }
+    let mut candidates = Vec::new();
     for procedure in procedures {
         for value in procedure.handle.semantics().values() {
             let SemanticValueKind::Parameter { ordinal, .. } = value.kind else {
@@ -296,40 +326,97 @@ fn semantic_parameter_identity(
             let Some(mapping) = procedure.handle.semantics().source_mapping(value.source) else {
                 continue;
             };
-            let span = mapping.locator.anchor().span();
-            if span.start_byte() as usize != range.start_byte
-                || span.end_byte() as usize != range.end_byte
-            {
+            if mapping.ast_identity.as_ref() != Some(query_identity) {
                 continue;
             }
             let procedure_id = procedure.wire_id();
-            let port_id = parameter_port_id(&procedure_id, ordinal);
-            return Some(ParameterIdentity {
+            let value_handle = procedure
+                .handle
+                .value_handle(value.id)
+                .expect("semantic parameter value must resolve in its procedure");
+            let value_identity = DurableValueIdentity::of(&value_handle)
+                .expect("semantic parameter value has a durable source identity");
+            let value_id = semantic_value_id(&value_handle, &value_identity);
+            let port_handle = ProcedurePortHandle::parameter(procedure.handle.clone(), ordinal)
+                .expect("semantic parameter value establishes its parameter port");
+            let port = DurablePortIdentity::of(&port_handle)
+                .expect("semantic parameter port has a durable identity");
+            let port_id = semantic_port_id(&procedure_id, &port);
+            candidates.push(ParameterIdentity {
                 procedure_id: Some(procedure_id),
+                value_id: Some(value_id.clone()),
                 ordinal: Some(ordinal as usize),
-                port_id: Some(port_id),
+                port_id: Some(port_id.clone()),
+                semantic: Some(DetailedCodeQueryDecoratedParameterEvidence {
+                    procedure_id: procedure.wire_id(),
+                    value_id,
+                    port_id,
+                    value_locator: value_handle.durable_locator(),
+                    port,
+                }),
                 coverage: "complete",
                 completion: "complete",
             });
         }
     }
-    None
+    match candidates.as_slice() {
+        [candidate] => (Some(candidate.clone()), None),
+        [] => (
+            None,
+            Some(
+                "no semantic Parameter value has the exact structural source identity".to_string(),
+            ),
+        ),
+        _ => (
+            None,
+            Some(format!(
+                "multiple semantic Parameter values have the exact structural source identity: {candidates:?}"
+            )),
+        ),
+    }
 }
 
-fn parameter_port_id(procedure_id: &str, ordinal: u32) -> String {
-    let mut digest = LengthDelimitedDigest::new(b"bifrost.code_query.parameter_port.v1");
-    digest.push(procedure_id.as_bytes());
-    digest.push(&ordinal.to_le_bytes());
+fn semantic_value_id(value: &ValueHandle, identity: &DurableValueIdentity) -> String {
+    let mut digest = LengthDelimitedDigest::new(b"bifrost.code_query.semantic_value.v1");
+    digest.push(
+        value
+            .procedure()
+            .artifact()
+            .key()
+            .public_fingerprint()
+            .as_bytes(),
+    );
+    identity.locator.push_stable_identity(&mut digest);
+    digest.push(identity.role.as_bytes());
+    if let Some(ordinal) = identity.ordinal {
+        digest.push(&ordinal.to_le_bytes());
+    }
     digest.finish().to_string()
 }
 
-fn decorated_parameter_id(parameter_id: &str, decorator_id: Option<&str>, range: Range) -> String {
-    let mut digest = LengthDelimitedDigest::new(b"bifrost.code_query.decorated_parameter.v1");
+fn semantic_port_id(procedure_id: &str, port: &DurablePortIdentity) -> String {
+    let mut digest = LengthDelimitedDigest::new(b"bifrost.code_query.parameter_port.v2");
+    digest.push(procedure_id.as_bytes());
+    match port {
+        DurablePortIdentity::Parameter { ordinal } => {
+            digest.push(b"parameter");
+            digest.push(&ordinal.to_le_bytes());
+        }
+        other => panic!("semantic parameter resolved to non-parameter port: {other:?}"),
+    }
+    digest.finish().to_string()
+}
+
+fn decorated_parameter_id(
+    parameter_id: &str,
+    decorator_id: Option<&str>,
+    decorator_ordinal: usize,
+) -> String {
+    let mut digest = LengthDelimitedDigest::new(b"bifrost.code_query.decorated_parameter.v2");
     digest.push(parameter_id.as_bytes());
     if let Some(decorator_id) = decorator_id {
         digest.push(decorator_id.as_bytes());
     }
-    digest.push(&range.start_byte.to_le_bytes());
-    digest.push(&range.end_byte.to_le_bytes());
+    digest.push(&decorator_ordinal.to_le_bytes());
     digest.finish().to_string()
 }

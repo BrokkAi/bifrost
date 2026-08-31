@@ -95,10 +95,14 @@ pub enum QueryValueKind {
     ReceiverOutcome,
     ReceiverEvidence,
     CallShape,
+    CallResult,
     CallArgumentGroup,
     CallArgument,
     CallBinding,
     CallEffect,
+    CallResultContract,
+    ResultContractUse,
+    ResultContractFailureUse,
     ProcedureEffect,
     CallableSignature,
     SignatureParameter,
@@ -153,10 +157,14 @@ impl QueryValueKind {
             Self::ReceiverOutcome => "receiver_outcome",
             Self::ReceiverEvidence => "receiver_evidence",
             Self::CallShape => "call_shape",
+            Self::CallResult => "call_result",
             Self::CallArgumentGroup => "call_argument_group",
             Self::CallArgument => "call_argument",
             Self::CallBinding => "call_binding",
             Self::CallEffect => "call_effect",
+            Self::CallResultContract => "call_result_contract",
+            Self::ResultContractUse => "result_contract_use",
+            Self::ResultContractFailureUse => "result_contract_failure_use",
             Self::ProcedureEffect => "procedure_effect",
             Self::CallableSignature => "callable_signature",
             Self::SignatureParameter => "signature_parameter",
@@ -250,6 +258,87 @@ impl StateEventFilter {
 pub struct FlowRelationFilter {
     pub relations: Vec<FlowRelationLabel>,
     pub certainties: Vec<FlowCertainty>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FailureUseProvenance {
+    ConditionResult,
+    DistinctZeroBinding,
+    DistinctBinding,
+    Independent,
+    Unknown,
+}
+
+impl FailureUseProvenance {
+    pub const LABELS: &[&str] = &[
+        "condition_result",
+        "distinct_zero_binding",
+        "distinct_binding",
+        "independent",
+        "unknown",
+    ];
+    pub const ALL: [Self; 5] = [
+        Self::ConditionResult,
+        Self::DistinctZeroBinding,
+        Self::DistinctBinding,
+        Self::Independent,
+        Self::Unknown,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ConditionResult => "condition_result",
+            Self::DistinctZeroBinding => "distinct_zero_binding",
+            Self::DistinctBinding => "distinct_binding",
+            Self::Independent => "independent",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|value| value.label() == label)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FailureUseConsumer {
+    Return,
+    ReturnedCallArgument,
+    CallArgument,
+}
+
+impl FailureUseConsumer {
+    pub const LABELS: &[&str] = &["return", "returned_call_argument", "call_argument"];
+    pub const ALL: [Self; 3] = [Self::Return, Self::ReturnedCallArgument, Self::CallArgument];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Return => "return",
+            Self::ReturnedCallArgument => "returned_call_argument",
+            Self::CallArgument => "call_argument",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|value| value.label() == label)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ResultContractFailureUseFilter {
+    pub provenances: Vec<FailureUseProvenance>,
+    pub consumers: Vec<FailureUseConsumer>,
+}
+
+impl ResultContractFailureUseFilter {
+    pub fn is_empty(&self) -> bool {
+        self.provenances.is_empty() && self.consumers.is_empty()
+    }
+
+    pub fn accepts(&self, provenance: FailureUseProvenance, consumer: FailureUseConsumer) -> bool {
+        (self.provenances.is_empty() || self.provenances.contains(&provenance))
+            && (self.consumers.is_empty() || self.consumers.contains(&consumer))
+    }
 }
 
 impl FlowRelationFilter {
@@ -429,10 +518,16 @@ pub enum QueryStep {
     ReceiverOutcome,
     ReceiverEvidence,
     CallShape,
+    CallResults,
     CallArgumentGroups,
     CallArguments,
     CallBindings,
     CallEffects,
+    ResultContractCalls,
+    CallResultContracts,
+    ResultContractUses,
+    ResultContractOperationUses,
+    ResultContractFailureUses(ResultContractFailureUseFilter),
     ProcedureEffects,
     CallableSignature,
     SignatureParameters,
@@ -951,10 +1046,16 @@ impl QueryStep {
             Self::ReceiverOutcome => QueryStepOp::ReceiverOutcome,
             Self::ReceiverEvidence => QueryStepOp::ReceiverEvidence,
             Self::CallShape => QueryStepOp::CallShape,
+            Self::CallResults => QueryStepOp::CallResults,
             Self::CallArgumentGroups => QueryStepOp::CallArgumentGroups,
             Self::CallArguments => QueryStepOp::CallArguments,
             Self::CallBindings => QueryStepOp::CallBindings,
             Self::CallEffects => QueryStepOp::CallEffects,
+            Self::ResultContractCalls => QueryStepOp::ResultContractCalls,
+            Self::CallResultContracts => QueryStepOp::CallResultContracts,
+            Self::ResultContractUses => QueryStepOp::ResultContractUses,
+            Self::ResultContractOperationUses => QueryStepOp::ResultContractOperationUses,
+            Self::ResultContractFailureUses(_) => QueryStepOp::ResultContractFailureUses,
             Self::ProcedureEffects => QueryStepOp::ProcedureEffects,
             Self::CallableSignature => QueryStepOp::CallableSignature,
             Self::SignatureParameters => QueryStepOp::SignatureParameters,
@@ -1047,10 +1148,18 @@ impl QueryStep {
             QueryStepOp::ReceiverOutcome => Some(Self::ReceiverOutcome),
             QueryStepOp::ReceiverEvidence => Some(Self::ReceiverEvidence),
             QueryStepOp::CallShape => Some(Self::CallShape),
+            QueryStepOp::CallResults => Some(Self::CallResults),
             QueryStepOp::CallArgumentGroups => Some(Self::CallArgumentGroups),
             QueryStepOp::CallArguments => Some(Self::CallArguments),
             QueryStepOp::CallBindings => Some(Self::CallBindings),
             QueryStepOp::CallEffects => Some(Self::CallEffects),
+            QueryStepOp::ResultContractCalls => Some(Self::ResultContractCalls),
+            QueryStepOp::CallResultContracts => Some(Self::CallResultContracts),
+            QueryStepOp::ResultContractUses => Some(Self::ResultContractUses),
+            QueryStepOp::ResultContractOperationUses => Some(Self::ResultContractOperationUses),
+            QueryStepOp::ResultContractFailureUses => Some(Self::ResultContractFailureUses(
+                ResultContractFailureUseFilter::default(),
+            )),
             QueryStepOp::ProcedureEffects => Some(Self::ProcedureEffects),
             QueryStepOp::CallableSignature => Some(Self::CallableSignature),
             QueryStepOp::SignatureParameters => Some(Self::SignatureParameters),
@@ -1151,10 +1260,14 @@ impl QueryStep {
                 | QueryValueKind::ReceiverOutcome
                 | QueryValueKind::ReceiverEvidence
                 | QueryValueKind::CallShape
+                | QueryValueKind::CallResult
                 | QueryValueKind::CallArgumentGroup
                 | QueryValueKind::CallArgument
                 | QueryValueKind::CallBinding
                 | QueryValueKind::CallEffect
+                | QueryValueKind::CallResultContract
+                | QueryValueKind::ResultContractUse
+                | QueryValueKind::ResultContractFailureUse
                 | QueryValueKind::ProcedureEffect
                 | QueryValueKind::CallableSignature
                 | QueryValueKind::SignatureParameter
@@ -1232,11 +1345,27 @@ impl QueryStep {
             (Self::CallArgumentGroups, QueryValueKind::CallShape) => {
                 Some(QueryValueKind::CallArgumentGroup)
             }
+            (Self::CallResults, QueryValueKind::CallShape) => Some(QueryValueKind::CallResult),
             (Self::CallArguments, QueryValueKind::CallArgumentGroup) => {
                 Some(QueryValueKind::CallArgument)
             }
             (Self::CallBindings, QueryValueKind::CallShape) => Some(QueryValueKind::CallBinding),
             (Self::CallEffects, QueryValueKind::CallShape) => Some(QueryValueKind::CallEffect),
+            (Self::ResultContractCalls, QueryValueKind::CallShape) => {
+                Some(QueryValueKind::CallShape)
+            }
+            (Self::CallResultContracts, QueryValueKind::CallShape) => {
+                Some(QueryValueKind::CallResultContract)
+            }
+            (Self::ResultContractUses, QueryValueKind::CallResultContract) => {
+                Some(QueryValueKind::CallResultContract)
+            }
+            (Self::ResultContractOperationUses, QueryValueKind::CallResultContract) => {
+                Some(QueryValueKind::ResultContractUse)
+            }
+            (Self::ResultContractFailureUses(_), QueryValueKind::CallResultContract) => {
+                Some(QueryValueKind::ResultContractFailureUse)
+            }
             (Self::ProcedureEffects, QueryValueKind::Declaration) => {
                 Some(QueryValueKind::ProcedureEffect)
             }
@@ -1401,7 +1530,7 @@ pub(super) fn validate_query_steps(
             QueryStep::Taint(_) => "procedure",
             QueryStep::Witness(_) => "typestate_finding or flow_endpoint",
             QueryStep::FileOf => {
-                "structural_match, declaration, procedure, program_point, control_edge, typestate_finding, typestate_witness, flow_endpoint, flow_witness, taint_finding, reference_site, call_site, expression_site, jsx_attribute_value, receiver_analysis, receiver_outcome, receiver_evidence, occurrence, lexical_scope, or binding"
+                "structural_match, declaration, procedure, program_point, control_edge, typestate_finding, typestate_witness, flow_endpoint, flow_witness, taint_finding, reference_site, call_site, expression_site, jsx_attribute_value, receiver_analysis, receiver_outcome, receiver_evidence, result_contract_failure_use, occurrence, lexical_scope, or binding"
             }
             QueryStep::ImportsOf | QueryStep::ImportersOf => "file",
             QueryStep::Supertypes(_)
@@ -1424,10 +1553,16 @@ pub(super) fn validate_query_steps(
             QueryStep::MemberTargets(_) => "structural_match, reference_site, or occurrence",
             QueryStep::ReceiverOutcome | QueryStep::ReceiverEvidence => "receiver_analysis",
             QueryStep::CallShape => "structural_match, call_site, or occurrence",
+            QueryStep::CallResults => "call_shape",
             QueryStep::CallArgumentGroups => "call_shape",
             QueryStep::CallArguments => "call_argument_group",
             QueryStep::CallBindings => "call_shape",
             QueryStep::CallEffects => "call_shape",
+            QueryStep::ResultContractCalls => "call_shape",
+            QueryStep::CallResultContracts => "call_shape",
+            QueryStep::ResultContractUses
+            | QueryStep::ResultContractOperationUses
+            | QueryStep::ResultContractFailureUses(_) => "call_result_contract",
             QueryStep::ProcedureEffects => "declaration",
             QueryStep::CallableSignature => "declaration",
             QueryStep::SignatureParameters => "callable_signature",

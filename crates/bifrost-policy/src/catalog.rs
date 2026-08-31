@@ -1342,6 +1342,7 @@ enum PortWire {
     MatchedValue,
     Receiver,
     ReturnValue,
+    ResultIndex { index: u32 },
     ArgumentIndex { index: u32 },
     ArgumentName { name: String },
 }
@@ -1371,6 +1372,7 @@ enum PortKindWire {
     MatchedValue,
     Receiver,
     ReturnValue,
+    ResultIndex,
     ArgumentIndex,
     ArgumentName,
 }
@@ -1417,6 +1419,11 @@ impl<'de> Deserialize<'de> for PortWire {
             (PortKindWire::ReturnValue, OptionalWireField::Missing, OptionalWireField::Missing) => {
                 Ok(Self::ReturnValue)
             }
+            (
+                PortKindWire::ResultIndex,
+                OptionalWireField::Present(index),
+                OptionalWireField::Missing,
+            ) => Ok(Self::ResultIndex { index }),
             (
                 PortKindWire::ArgumentIndex,
                 OptionalWireField::Present(index),
@@ -1831,6 +1838,7 @@ impl From<PortWire> for PolicyPort {
             PortWire::MatchedValue => Self::MatchedValue,
             PortWire::Receiver => Self::Receiver,
             PortWire::ReturnValue => Self::ReturnValue,
+            PortWire::ResultIndex { index } => Self::ResultIndex { index },
             PortWire::ArgumentIndex { index } => Self::ArgumentIndex { index },
             PortWire::ArgumentName { name } => Self::ArgumentName { name },
         }
@@ -1843,6 +1851,7 @@ impl From<&PolicyPort> for PortWire {
             PolicyPort::MatchedValue => Self::MatchedValue,
             PolicyPort::Receiver => Self::Receiver,
             PolicyPort::ReturnValue => Self::ReturnValue,
+            PolicyPort::ResultIndex { index } => Self::ResultIndex { index: *index },
             PolicyPort::ArgumentIndex { index } => Self::ArgumentIndex { index: *index },
             PolicyPort::ArgumentName { name } => Self::ArgumentName { name: name.clone() },
         }
@@ -1943,6 +1952,7 @@ pub(crate) fn endpoint_binding_to_port(binding: &PolicyEndpointBinding) -> Polic
         PolicyEndpointBinding::MatchedValue => PolicyPort::MatchedValue,
         PolicyEndpointBinding::Receiver => PolicyPort::Receiver,
         PolicyEndpointBinding::ReturnValue => PolicyPort::ReturnValue,
+        PolicyEndpointBinding::ResultIndex { index } => PolicyPort::ResultIndex { index: *index },
         PolicyEndpointBinding::ArgumentIndex { index } => {
             PolicyPort::ArgumentIndex { index: *index }
         }
@@ -1957,6 +1967,7 @@ pub(crate) fn typestate_seed_binding_to_port(binding: &TypestateSeedBinding) -> 
         TypestateSeedBinding::MatchedValue => PolicyPort::MatchedValue,
         TypestateSeedBinding::Receiver => PolicyPort::Receiver,
         TypestateSeedBinding::ReturnValue => PolicyPort::ReturnValue,
+        TypestateSeedBinding::ResultIndex { index } => PolicyPort::ResultIndex { index: *index },
         TypestateSeedBinding::ArgumentIndex { index } => {
             PolicyPort::ArgumentIndex { index: *index }
         }
@@ -1970,6 +1981,7 @@ pub(crate) fn typestate_call_binding_to_port(binding: &TypestateCallBinding) -> 
     match binding {
         TypestateCallBinding::Receiver => PolicyPort::Receiver,
         TypestateCallBinding::ReturnValue => PolicyPort::ReturnValue,
+        TypestateCallBinding::ResultIndex { index } => PolicyPort::ResultIndex { index: *index },
         TypestateCallBinding::ArgumentIndex { index } => {
             PolicyPort::ArgumentIndex { index: *index }
         }
@@ -1983,6 +1995,7 @@ pub(crate) fn phase_accepts_port(phase: EndpointObservationPhase, port: &PolicyP
     match port {
         PolicyPort::MatchedValue => phase == EndpointObservationPhase::AtMatch,
         PolicyPort::ReturnValue => phase == EndpointObservationPhase::AfterNormalReturn,
+        PolicyPort::ResultIndex { .. } => phase == EndpointObservationPhase::AfterNormalReturn,
         PolicyPort::Receiver
         | PolicyPort::ArgumentIndex { .. }
         | PolicyPort::ArgumentName { .. } => {

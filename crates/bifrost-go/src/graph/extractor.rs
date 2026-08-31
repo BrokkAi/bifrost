@@ -17,10 +17,10 @@ use brokk_bifrost_core::hash::{HashMap, HashSet};
 use crate::graph::ast::{
     NON_OWNER_TOKEN, OWNER_TOKEN, SELF_RECEIVER_TOKEN, clause_binding_names, clause_statement_list,
     composite_literal_owner_path_for_key, composite_literal_owner_type_for_key, field_owner_token,
-    for_each_var_spec, is_definition_identifier, is_identifier_node, is_method_receiver_parameter,
-    is_method_receiver_type_name, lhs_identifier_slots, parameter_names,
-    receive_statement_is_short_declaration, receiver_symbol_from_qualifier, rhs_expressions,
-    selector_parts, type_ref_from_node, var_spec_name_slots, var_spec_names,
+    for_each_var_spec, is_clause, is_definition_identifier, is_identifier_node,
+    is_method_receiver_parameter, is_method_receiver_type_name, lhs_identifier_slots,
+    parameter_names, receive_statement_is_short_declaration, receiver_symbol_from_qualifier,
+    rhs_expressions, selector_parts, type_ref_from_node, var_spec_name_slots, var_spec_names,
 };
 use crate::graph::hits::{record_hit, record_self_receiver_hit, record_unproven_hit};
 use crate::graph::reference::go_is_top_level_decl;
@@ -192,7 +192,7 @@ fn scan_node(node: Node<'_>, ctx: &mut ScanCtx<'_>, locals: &mut LocalInferenceE
             scan_type_switch(node, ctx, locals);
             return;
         }
-        "communication_case" | "type_case" | "default_case" => {
+        _ if is_clause(node) => {
             scan_clause(node, ctx, locals);
             return;
         }

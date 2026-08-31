@@ -187,6 +187,16 @@ fn validate_wrapper(
     let Some(query) = args.last() else {
         return;
     };
+    if form.query_step_op().is_some() {
+        let steps = query_to_json(query)
+            .ok()
+            .and_then(|value| value.get("steps").and_then(Value::as_array).map(Vec::len))
+            .unwrap_or(0);
+        analysis.path(
+            format!("{}[{steps}]", rql_query_child_path(path, "steps")),
+            head_range.clone(),
+        );
+    }
     match form {
         RqlForm::Where => {
             let values = &args[..args.len().saturating_sub(1)];
@@ -641,7 +651,8 @@ fn validate_wrapper(
         RqlForm::EdgesOf | RqlForm::EdgesFrom => {
             validate_edge_wrapper(form, args, query, analysis);
         }
-        RqlForm::StateEventsOf
+        RqlForm::ResultContractFailureUses
+        | RqlForm::StateEventsOf
         | RqlForm::FlowRelationsOf
         | RqlForm::ControlRelations
         | RqlForm::RewritePathsOf => {
@@ -670,10 +681,15 @@ fn validate_wrapper(
         | RqlForm::ReceiverOutcome
         | RqlForm::ReceiverEvidence
         | RqlForm::CallShape
+        | RqlForm::CallResults
         | RqlForm::CallArgumentGroups
         | RqlForm::CallArguments
         | RqlForm::CallBindings
         | RqlForm::CallEffects
+        | RqlForm::ResultContractCalls
+        | RqlForm::CallResultContracts
+        | RqlForm::ResultContractUses
+        | RqlForm::ResultContractOperationUses
         | RqlForm::ProcedureEffects
         | RqlForm::CallableSignature
         | RqlForm::SignatureParameters
@@ -1498,9 +1514,9 @@ fn validate_edge_wrapper(form: RqlForm, args: &[Expr], query: &Expr, analysis: &
     }
 }
 
-/// Validate the option pairs of the wrappers whose options are lists of
-/// constrained labels: `(state-events-of ...)`, `(flow-relations-of ...)` and
-/// `(rewrite-paths-of ...)`.
+/// Validate the option pairs of wrappers whose options are schema-registered
+/// lists of constrained labels, including flow/control relations, rewrite
+/// paths, and result-contract failure uses.
 ///
 /// Every accepted spelling, every allowed value, and every help string is read
 /// from the schema registry, so a vocabulary change cannot leave the editor
@@ -2116,6 +2132,8 @@ fn validate_property_value(
         | super::schema::ValueShape::FlowSubjectKindList
         | super::schema::ValueShape::FlowRelationList
         | super::schema::ValueShape::FlowCertaintyList
+        | super::schema::ValueShape::FailureUseProvenanceList
+        | super::schema::ValueShape::FailureUseConsumerList
         | super::schema::ValueShape::RewriteDomainList
         | super::schema::ValueShape::RewriteOutcomeList
         | super::schema::ValueShape::ControlRelationKindList

@@ -6,17 +6,20 @@
 //! serving a language present in the workspace. A present document with an
 //! empty `ecosystems` list explicitly disables that dependency-pack route.
 //! The CLI policy runner, the MCP host, and the LSP host all read this one
-//! document, so every entry point activates the same packs (#1868).
+//! document, so every entry point applies the same dependency-pack selection
+//! (#1868). A host may separately request the reviewed shipped packs selected
+//! by intrinsic language evidence.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use semver::Version;
 use serde::Deserialize;
 
 use crate::analyzer::semantic_model::{
     CatalogError, CatalogOpenMode, CatalogOptions, DependencyPackLimits,
-    RegisteredWorkspaceSemanticModel, SemanticModelActivationControl,
+    RegisteredWorkspaceSemanticModel, SEMANTIC_PACK_CACHE_ROOT_ENV, SemanticModelActivationControl,
     SemanticModelActivationEvidence, SemanticModelActivationRequest, SemanticModelControlAction,
     SemanticModelControlScope, SemanticModelPackSelector, SemanticModelRuntimeLimits,
     SemanticPackCatalog, WORKSPACE_SEMANTIC_MODEL_DIRECTORY, WorkspaceSemanticModelOptions,
@@ -25,8 +28,9 @@ use crate::analyzer::semantic_model::{
 };
 use crate::analyzer::{
     AnalyzerConfig, DependencyPackActivationOutcome, DependencyPackEcosystem,
-    DependencyPackWorkspaceContext, WorkspaceAnalyzer,
+    DependencyPackWorkspaceContext, Language, WorkspaceAnalyzer,
 };
+use crate::gitblob::{CACHE_DIR_ENV, CACHE_ROOT_ENV};
 use crate::workspace_document::{
     WorkspaceDocumentError, WorkspacePathError, WorkspaceRoot, read_workspace_document,
     validate_workspace_relative_path,
@@ -41,6 +45,64 @@ pub const MAX_WORKSPACE_PACKS_CATALOG_PATH_BYTES: usize = 1_024;
 
 const WORKSPACE_PACKS_SCHEMA_VERSION: u32 = 1;
 const MAX_JSON_ERROR_BYTES: usize = 512;
+
+/// Facade-owned registration hook for reviewed shipped semantic packs.
+pub type SemanticModelCatalogBootstrap = fn(&SemanticPackCatalog) -> Result<(), String>;
+
+static SEMANTIC_MODEL_CATALOG_BOOTSTRAP: OnceLock<SemanticModelCatalogBootstrap> = OnceLock::new();
+
+/// Configure the downstream shipped-pack provider once for this process.
+pub fn install_semantic_model_catalog_bootstrap(
+    bootstrap: SemanticModelCatalogBootstrap,
+) -> Result<(), &'static str> {
+    SEMANTIC_MODEL_CATALOG_BOOTSTRAP
+        .set(bootstrap)
+        .map_err(|_| "semantic-model catalog bootstrap is already configured")
+}
+
+/// Register reviewed shipped packs when the facade installed a provider.
+pub fn bootstrap_semantic_model_catalog(catalog: &SemanticPackCatalog) -> Result<bool, String> {
+    let Some(bootstrap) = SEMANTIC_MODEL_CATALOG_BOOTSTRAP.get().copied() else {
+        return Ok(false);
+    };
+    bootstrap(catalog)?;
+    Ok(true)
+}
+
+/// Intrinsic language evidence selects shipped language/runtime packs without
+/// pretending that the workspace declared an external dependency.
+pub fn intrinsic_language_evidence(
+    workspace: &WorkspaceAnalyzer,
+) -> Vec<SemanticModelActivationEvidence> {
+    workspace
+        .analyzer()
+        .languages()
+        .into_iter()
+        .map(|language| SemanticModelActivationEvidence {
+            language: language.config_label().to_owned(),
+            ecosystem: intrinsic_ecosystem(language).to_owned(),
+            package: None,
+            module: None,
+            toolchain: None,
+            target: None,
+            configuration: None,
+            artifact_sha256: None,
+        })
+        .collect()
+}
+
+fn intrinsic_ecosystem(language: Language) -> &'static str {
+    match language {
+        Language::Java | Language::Scala | Language::Kotlin => "maven",
+        Language::Rust => "cargo",
+        Language::Go => "go",
+        Language::Python => "pypi",
+        Language::Ruby => "rubygems",
+        Language::JavaScript | Language::TypeScript => "npm",
+        Language::CSharp => "nuget",
+        Language::Cpp | Language::Php | Language::None => "language",
+    }
+}
 
 /// The normalized pack-activation configuration for one workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,12 +288,16 @@ pub struct WorkspaceActivationSources<'a> {
     pub workspace_model_root: Option<&'a Path>,
     /// The pack-activation document, when the workspace has one.
     pub config: Option<&'a WorkspacePacksConfig>,
+    /// Include reviewed shipped packs selected by intrinsic language evidence.
+    pub intrinsic_shipped_models: bool,
 }
 
 /// Why one activation transaction could not be built.
 #[derive(Debug)]
 pub enum WorkspaceActivationError {
     Catalog(CatalogError),
+    /// The facade's reviewed shipped-pack provider failed registration.
+    ShippedModels(String),
     /// The reviewed workspace-local route refused to contribute its models.
     WorkspaceModels(WorkspaceSemanticModelRegistrationError),
 }
@@ -240,6 +306,7 @@ impl fmt::Display for WorkspaceActivationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Catalog(error) => error.fmt(formatter),
+            Self::ShippedModels(error) => error.fmt(formatter),
             Self::WorkspaceModels(error) => error.fmt(formatter),
         }
     }
@@ -249,6 +316,7 @@ impl std::error::Error for WorkspaceActivationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Catalog(error) => Some(error),
+            Self::ShippedModels(_) => None,
             Self::WorkspaceModels(error) => Some(error),
         }
     }
@@ -286,11 +354,14 @@ pub fn activate_workspace_packs(
             catalog_root: workspace_root,
             workspace_model_root: None,
             config: Some(config),
+            intrinsic_shipped_models: false,
         },
         cancellation,
     ) {
         Ok(activation) => Ok(activation),
         Err(WorkspaceActivationError::Catalog(error)) => Err(error),
+        // Unreachable: the shipped-model route is switched off above.
+        Err(WorkspaceActivationError::ShippedModels(error)) => Err(CatalogError::Integrity(error)),
         // Unreachable: the reviewed workspace-local route is switched off
         // above, and it is the only producer of this variant.
         Err(WorkspaceActivationError::WorkspaceModels(error)) => {
@@ -299,11 +370,12 @@ pub fn activate_workspace_packs(
     }
 }
 
-/// Activate every semantic source one workspace opts into, as one transaction.
+/// Activate every semantic source selected for one workspace, as one transaction.
 ///
-/// Two routes feed one activation request, because they have to: the resolver
-/// publishes exactly one active model set onto an analyzer, so running the
-/// routes separately would leave the second overwriting the first.
+/// The dependency, reviewed workspace-local, and reviewed intrinsic routes feed
+/// one activation request, because they have to: the resolver publishes exactly
+/// one active model set onto an analyzer, so running the routes separately would
+/// leave later routes overwriting earlier ones.
 ///
 /// - The pack-activation document names the dependency ecosystems and the
 ///   catalog, and its `enable` list supplies the review controls. It may also
@@ -314,7 +386,7 @@ pub fn activate_workspace_packs(
 ///   checked in beside its policies. Their presence is the opt-in; an absent
 ///   directory contributes nothing.
 ///
-/// Returns `Ok(None)` when neither route contributes anything.
+/// Returns `Ok(None)` when none of the selected routes contributes anything.
 pub fn activate_workspace_semantic_sources(
     workspace: &WorkspaceAnalyzer,
     analyzer_config: &AnalyzerConfig,
@@ -325,7 +397,7 @@ pub fn activate_workspace_semantic_sources(
     let workspace_models_present = sources.workspace_model_root.is_some_and(|root| {
         std::fs::symlink_metadata(root.join(WORKSPACE_SEMANTIC_MODEL_DIRECTORY)).is_ok()
     });
-    if ecosystems.is_empty() && !workspace_models_present {
+    if ecosystems.is_empty() && !workspace_models_present && !sources.intrinsic_shipped_models {
         return Ok(None);
     }
     let catalog = match sources.config.and_then(WorkspacePacksConfig::catalog) {
@@ -334,9 +406,11 @@ pub fn activate_workspace_semantic_sources(
             CatalogOpenMode::ReadWrite,
             CatalogOptions::default(),
         )?,
-        None => {
-            open_default_semantic_pack_catalog(sources.catalog_root, CatalogOptions::default())?
-        }
+        None => open_ambient_semantic_pack_catalog(
+            workspace,
+            sources.catalog_root,
+            CatalogOptions::default(),
+        )?,
     };
     activate_workspace_semantic_sources_in_catalog(
         workspace,
@@ -346,6 +420,28 @@ pub fn activate_workspace_semantic_sources(
         &[],
         cancellation,
     )
+}
+
+/// Open the omitted semantic-pack catalog using the analyzer's actual
+/// persistence decision.
+///
+/// An explicitly ephemeral analyzer must not leave generated state in the
+/// checkout merely because semantic-pack bootstrap needs a writable catalog.
+/// Explicit cache relocation is still an opt-in to durable reuse, and a
+/// persisted analyzer keeps the ordinary versioned catalog beside its store.
+pub fn open_ambient_semantic_pack_catalog(
+    workspace: &WorkspaceAnalyzer,
+    workspace_root: &Path,
+    options: CatalogOptions,
+) -> Result<SemanticPackCatalog, CatalogError> {
+    let persistent_cache_requested = [SEMANTIC_PACK_CACHE_ROOT_ENV, CACHE_DIR_ENV, CACHE_ROOT_ENV]
+        .into_iter()
+        .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()));
+    if workspace.persisted_store_path().is_none() && !persistent_cache_requested {
+        SemanticPackCatalog::open_ephemeral(options)
+    } else {
+        open_default_semantic_pack_catalog(workspace_root, options)
+    }
 }
 
 /// Activate all semantic sources against a caller-opened catalog.
@@ -372,12 +468,21 @@ pub fn activate_workspace_semantic_sources_in_catalog(
     let workspace_model_root = sources.workspace_model_root.filter(|root| {
         std::fs::symlink_metadata(root.join(WORKSPACE_SEMANTIC_MODEL_DIRECTORY)).is_ok()
     });
-    // Nothing to open a catalog for: no relevant ecosystem and no reviewed
-    // workspace-local route. This keeps a configured catalog directory from
-    // being created by a run that would activate nothing.
-    if ecosystems.is_empty() && workspace_model_root.is_none() {
+    // Nothing to publish when the caller selected no dependency, workspace,
+    // host-evidence, or intrinsic route.
+    if ecosystems.is_empty()
+        && workspace_model_root.is_none()
+        && additional_evidence.is_empty()
+        && !sources.intrinsic_shipped_models
+    {
         return Ok(None);
     }
+    let shipped_models = if sources.intrinsic_shipped_models {
+        bootstrap_semantic_model_catalog(catalog)
+            .map_err(WorkspaceActivationError::ShippedModels)?
+    } else {
+        false
+    };
     // The reviewed workspace-local models join the same catalog handle and the
     // same evidence, before the dependency route resolves. A discovery,
     // compile, or registration failure aborts the transaction: a checked-in
@@ -392,7 +497,11 @@ pub fn activate_workspace_semantic_sources_in_catalog(
         .map_err(WorkspaceActivationError::WorkspaceModels)?,
         None => WorkspaceSemanticModelRegistration::default(),
     };
-    if ecosystems.is_empty() && registration.models.is_empty() {
+    if ecosystems.is_empty()
+        && registration.models.is_empty()
+        && additional_evidence.is_empty()
+        && !shipped_models
+    {
         return Ok(None);
     }
     // Every shipped pack declares `safety.review_required`, so activation
@@ -418,6 +527,9 @@ pub fn activate_workspace_semantic_sources_in_catalog(
         .collect();
     let mut evidence = additional_evidence.to_vec();
     evidence.extend(registration.evidence);
+    if shipped_models {
+        evidence.extend(intrinsic_language_evidence(workspace));
+    }
     evidence.sort();
     evidence.dedup();
     let activation = SemanticModelActivationRequest {
@@ -429,7 +541,7 @@ pub fn activate_workspace_semantic_sources_in_catalog(
     };
     // An empty ecosystem list still resolves: the dependency loop simply has
     // nothing to discover, and the request's workspace evidence is what
-    // selects. That keeps one code path for both routes.
+    // selects. That keeps one code path for all routes.
     let outcome = workspace.activate_dependency_packs(
         analyzer_config,
         &ecosystems,
@@ -706,7 +818,7 @@ mod tests {
         fs::write(temp.path().join("lib.rs"), "pub fn value() {}\n").unwrap();
         let project = Arc::new(crate::FilesystemProject::new(temp.path()).unwrap());
         let workspace =
-            WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default()).unwrap();
+            WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default()).unwrap();
         let activation = activate_workspace_semantic_sources(
             &workspace,
             &AnalyzerConfig::default(),
@@ -714,12 +826,50 @@ mod tests {
                 catalog_root: temp.path(),
                 workspace_model_root: None,
                 config: None,
+                intrinsic_shipped_models: false,
             },
             &crate::CancellationToken::default(),
         )
         .unwrap()
         .expect("the ambient Cargo ecosystem should be selected");
         assert_eq!(activation.ecosystems, [DependencyPackEcosystem::Cargo]);
+        assert!(
+            !temp.path().join(crate::gitblob::PROJECT_DIR_NAME).exists(),
+            "ephemeral ambient activation must not create workspace-generated state"
+        );
+    }
+
+    #[test]
+    fn persisted_ambient_activation_keeps_the_versioned_catalog() {
+        let temp = TempDir::new().unwrap();
+        fs::write(temp.path().join("lib.rs"), "pub fn value() {}\n").unwrap();
+        let project = Arc::new(crate::FilesystemProject::new(temp.path()).unwrap());
+        let workspace = WorkspaceAnalyzer::build_persisted_without_automatic_gc(
+            project,
+            AnalyzerConfig::default(),
+        )
+        .unwrap();
+
+        let activation = activate_workspace_semantic_sources(
+            &workspace,
+            &AnalyzerConfig::default(),
+            WorkspaceActivationSources {
+                catalog_root: temp.path(),
+                workspace_model_root: None,
+                config: None,
+                intrinsic_shipped_models: false,
+            },
+            &crate::CancellationToken::default(),
+        )
+        .unwrap()
+        .expect("the ambient Cargo ecosystem should be selected");
+
+        assert_eq!(activation.ecosystems, [DependencyPackEcosystem::Cargo]);
+        assert!(
+            crate::analyzer::semantic_model::default_semantic_pack_catalog_root(temp.path())
+                .exists(),
+            "persisted activation must retain the reusable versioned catalog"
+        );
     }
 
     #[test]
@@ -728,7 +878,7 @@ mod tests {
         fs::write(temp.path().join("lib.rs"), "pub fn value() {}\n").unwrap();
         let project = Arc::new(crate::FilesystemProject::new(temp.path()).unwrap());
         let workspace =
-            WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default()).unwrap();
+            WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default()).unwrap();
         let config = parse_workspace_packs_config(
             r#"{ "schema_version": 1, "catalog": ".bifrost/disabled-catalog", "ecosystems": [] }"#,
         )
@@ -741,6 +891,7 @@ mod tests {
                     catalog_root: temp.path(),
                     workspace_model_root: None,
                     config: Some(&config),
+                    intrinsic_shipped_models: false,
                 },
                 &crate::CancellationToken::default(),
             )

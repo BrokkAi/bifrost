@@ -331,6 +331,7 @@ fn run_job(job: &ActivationJob) -> Option<DependencyPackActivation> {
             catalog_root: &job.workspace_root,
             workspace_model_root: None,
             config: job.packs_config.as_ref(),
+            intrinsic_shipped_models: false,
         },
         &job.cancellation,
     );

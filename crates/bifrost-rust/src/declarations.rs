@@ -186,16 +186,41 @@ pub fn parse_rust_file(file: &ProjectFile, source: &str, tree: &Tree) -> ParsedF
     let item_macro_definitions = rust_rules_item_macro_definitions(root, source);
     let mut impl_import_binder = ImportBinder::empty();
 
+    // Every module-owned `use` and `extern crate` the file writes, at any
+    // module depth. A `use` inside `mod tests { ... }` names a file this file
+    // depends on exactly as a top-level one does, and the coarse file graph
+    // reads this family, so restricting it to the top level lost those edges.
+    //
+    // A function-local `use` is deliberately excluded. This family has no
+    // per-entry scope for its consumers, so admitting one would make a name
+    // bound inside one function body resolve everywhere in the file: the
+    // `LEAKED_LOCAL_IMPORT` and `ALIAS_OUTSIDE_FUNCTION` near misses in
+    // `tests/suite_usages` both start resolving. Local extents are already
+    // persisted separately, with their bounds, in
+    // `rust_usage_facts.import_targets`.
+    //
+    // The binder below stays top-level-only for its own reason: it resolves the
+    // owners of top-level `impl` blocks, and a name bound inside a nested
+    // module is not in scope for them.
+    parsed.imports = crate::imports::rust_import_projection(root, source, &parsed.package_name)
+        .into_iter()
+        .filter(|projected| {
+            matches!(
+                projected.owner,
+                crate::imports::RustImportOwner::Module { .. }
+            )
+        })
+        .map(|projected| projected.import.info)
+        .collect();
+
     for index in 0..root.named_child_count() {
         let Some(child) = root.named_child(index) else {
             continue;
         };
         if child.kind() == "use_declaration" {
-            let imports = rust_imports_from_use_declaration(child, source);
-            for import in &imports {
-                crate::lexical_scope::insert_rust_import_binding(&mut impl_import_binder, import);
+            for import in rust_imports_from_use_declaration(child, source) {
+                crate::lexical_scope::insert_rust_import_binding(&mut impl_import_binder, &import);
             }
-            parsed.imports.extend(imports);
         }
     }
     for index in 0..root.named_child_count() {
@@ -841,7 +866,7 @@ fn visit_rust_macro_invocation_definitions(
 
 /// Byte range `[start, end)` of a `token_tree`'s interior, excluding its
 /// delimiters. Returns `None` if the node is not a delimited token tree.
-fn rust_macro_token_tree_interior(token_tree: Node<'_>) -> Option<(usize, usize)> {
+pub fn rust_macro_token_tree_interior(token_tree: Node<'_>) -> Option<(usize, usize)> {
     let open = token_tree.child(0)?;
     let close = token_tree.child(token_tree.child_count().checked_sub(1)?)?;
     if !matches!(open.kind(), "(" | "[" | "{") || !matches!(close.kind(), ")" | "]" | "}") {

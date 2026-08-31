@@ -1,11 +1,14 @@
 use super::artifact::{
-    ArtifactEncoding, ArtifactError, CompiledDeclaredEffect, CompiledDeclaredEffectCertainty,
-    CompiledDeclaredEffectTiming, CompiledPackManifest, CompiledPayload, CompiledProcedureSummary,
-    CompiledProcedureTarget, CompiledSemanticModelPack, CompiledShard, CompiledShardArtifact,
-    CompiledShardDescriptor, CompiledSummaryEffect, CompiledSummaryExitKind, CompiledSummaryInput,
-    CompiledSummaryLocation, CompiledSummaryLocationKind, CompiledSummaryOutput,
-    CompiledSummaryTransfer, DecodeLimits, canonical_json, content_digest, manifest_content_digest,
-    manifest_semantic_digest, payload_inventory, routing_keys, semantic_digest, stored_digest,
+    ArtifactEncoding, ArtifactError, CompiledConditionalResultRefinement, CompiledDeclaredEffect,
+    CompiledDeclaredEffectCertainty, CompiledDeclaredEffectTiming, CompiledNormalReturnRefinement,
+    CompiledOperationPrecondition, CompiledPackManifest, CompiledPayload,
+    CompiledPredicateProofEffect, CompiledProcedureSummary, CompiledProcedureTarget,
+    CompiledResultContract, CompiledResultMemberContract, CompiledResultPredicate,
+    CompiledSemanticModelPack, CompiledShard, CompiledShardArtifact, CompiledShardDescriptor,
+    CompiledSummaryEffect, CompiledSummaryExitKind, CompiledSummaryInput, CompiledSummaryLocation,
+    CompiledSummaryLocationKind, CompiledSummaryOutput, CompiledSummaryTransfer, DecodeLimits,
+    canonical_json, content_digest, manifest_content_digest, manifest_semantic_digest,
+    payload_inventory, routing_keys, semantic_digest, stored_digest,
 };
 use super::model::*;
 use super::source::{SourceFormat, parse_source};
@@ -302,6 +305,22 @@ pub(crate) fn normalize(mut pack: AuthoredSemanticModelPack) -> AuthoredSemantic
                         .declared_effects
                         .sort_by(|left, right| left.id.cmp(&right.id));
                     summary.declared_effects.dedup();
+                    if let Some(preconditions) = &mut summary.preconditions {
+                        preconditions.sort();
+                    }
+                    for contract in &mut summary.result_contracts {
+                        for member in &mut contract.member_contracts {
+                            if let Some(preconditions) = &mut member.preconditions {
+                                preconditions.sort();
+                            }
+                        }
+                    }
+                    summary.result_contracts.sort();
+                    summary.result_contracts.dedup();
+                    summary.conditional_result_refinements.sort();
+                    summary.conditional_result_refinements.dedup();
+                    summary.normal_return_refinements.sort();
+                    summary.normal_return_refinements.dedup();
                 }
                 summaries.sort_by(|left, right| left.id.cmp(&right.id));
             }
@@ -391,10 +410,13 @@ fn compile_procedure_summary(
             path: summary.target.path.clone(),
             symbol: summary.target.symbol.clone(),
             has_receiver: summary.target.has_receiver,
+            variadic: summary.target.variadic,
             parameter_count: summary.target.parameter_count,
         },
         completeness: summary.completeness,
         covers_overrides: summary.covers_overrides,
+        normal_continuation_absent: summary.normal_continuation_absent,
+        normal_result_count: summary.normal_result_count,
         locations: summary
             .locations
             .iter()
@@ -424,7 +446,84 @@ fn compile_procedure_summary(
             .iter()
             .map(compile_declared_effect)
             .collect(),
+        preconditions: summary.preconditions.as_ref().map(|preconditions| {
+            preconditions
+                .iter()
+                .map(|precondition| CompiledOperationPrecondition {
+                    input: compile_summary_input(&precondition.input),
+                    predicate: compile_result_predicate(precondition.predicate),
+                })
+                .collect()
+        }),
+        result_contracts: summary
+            .result_contracts
+            .iter()
+            .map(|contract| CompiledResultContract {
+                result_ordinal: contract.result_ordinal,
+                condition_result_ordinal: contract.condition_result_ordinal,
+                predicate: contract.predicate.map(compile_result_predicate),
+                result_success_predicate: contract
+                    .result_success_predicate
+                    .map(compile_result_predicate),
+                member_contracts: contract
+                    .member_contracts
+                    .iter()
+                    .map(|member| CompiledResultMemberContract {
+                        member: member.member.clone(),
+                        parameter_count: member.parameter_count,
+                        completeness: member.completeness,
+                        preconditions: member.preconditions.as_ref().map(|preconditions| {
+                            preconditions
+                                .iter()
+                                .map(|precondition| CompiledOperationPrecondition {
+                                    input: compile_summary_input(&precondition.input),
+                                    predicate: compile_result_predicate(precondition.predicate),
+                                })
+                                .collect()
+                        }),
+                        declared_effects: member
+                            .declared_effects
+                            .iter()
+                            .map(compile_declared_effect)
+                            .collect(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+        conditional_result_refinements: summary
+            .conditional_result_refinements
+            .iter()
+            .map(|refinement| CompiledConditionalResultRefinement {
+                result_ordinal: refinement.result_ordinal,
+                outcome: refinement.outcome,
+                parameter_ordinal: refinement.parameter_ordinal,
+                predicate: compile_result_predicate(refinement.predicate),
+                proof_effect: match refinement.proof_effect {
+                    AuthoredPredicateProofEffect::Establishes => {
+                        CompiledPredicateProofEffect::Establishes
+                    }
+                    AuthoredPredicateProofEffect::DoesNotEstablish => {
+                        CompiledPredicateProofEffect::DoesNotEstablish
+                    }
+                },
+            })
+            .collect(),
+        normal_return_refinements: summary
+            .normal_return_refinements
+            .iter()
+            .map(|refinement| CompiledNormalReturnRefinement {
+                parameter_ordinal: refinement.parameter_ordinal,
+                predicate: compile_result_predicate(refinement.predicate),
+            })
+            .collect(),
     })
+}
+
+fn compile_result_predicate(predicate: AuthoredResultPredicate) -> CompiledResultPredicate {
+    match predicate {
+        AuthoredResultPredicate::Null => CompiledResultPredicate::Null,
+        AuthoredResultPredicate::NonNull => CompiledResultPredicate::NonNull,
+    }
 }
 
 fn compile_declared_effect(effect: &AuthoredDeclaredEffect) -> CompiledDeclaredEffect {
@@ -454,6 +553,9 @@ fn compile_summary_input(input: &AuthoredSummaryInput) -> CompiledSummaryInput {
 fn compile_summary_output(output: &AuthoredSummaryOutput) -> CompiledSummaryOutput {
     match output {
         AuthoredSummaryOutput::NormalReturn {} => CompiledSummaryOutput::NormalReturn {},
+        AuthoredSummaryOutput::IndexedNormalReturn { ordinal } => {
+            CompiledSummaryOutput::IndexedNormalReturn { ordinal: *ordinal }
+        }
         AuthoredSummaryOutput::Receiver {} => CompiledSummaryOutput::Receiver {},
         AuthoredSummaryOutput::Capture { location } => CompiledSummaryOutput::Capture {
             location: location.clone(),

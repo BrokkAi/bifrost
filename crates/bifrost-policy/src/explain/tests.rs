@@ -7,12 +7,15 @@
 
 use std::sync::Arc;
 
-use brokk_bifrost_analysis::analyzer::{Language, ProjectFile, TestProject, TypescriptAnalyzer};
+use brokk_bifrost_analysis::analyzer::{
+    AnalyzerConfig, Language, Project, ProjectFile, TestProject, TypescriptAnalyzer,
+    WorkspaceAnalyzer,
+};
 use brokk_bifrost_rql::structural::CodeQueryExecutionLimits;
 
 use crate::budget::PolicyBudget;
 use crate::catalog::{CatalogRegistryLimits, TaintCatalogRegistry};
-use crate::coordinator::PolicyEvaluationInput;
+use crate::coordinator::{PolicyEvaluationInput, PolicyEvaluationOptions, evaluate_policy_inputs};
 use crate::definition::PolicyAnalysisType;
 use crate::evaluator::{DefaultPolicyEvaluator, PolicyEvaluationContext, PolicyEvaluator};
 use crate::finding::{
@@ -21,6 +24,7 @@ use crate::finding::{
 };
 use crate::finding_identity::PolicyFindingId;
 use crate::registry::{PolicyRegistry, PolicyRegistryLimits};
+use crate::report::PolicyReportDiagnosticCode;
 use crate::resolved::LoadedPolicy;
 use crate::source::PolicySourceIdentity;
 
@@ -37,8 +41,11 @@ use super::near_miss::{
 };
 use super::why::{explain_finding, explain_match_finding};
 use super::why_not::{
-    ExplanationCandidate, explain_candidate, explain_match_candidate, row_covers_candidate,
+    ExplanationCandidate, MATCH_SELECTOR_PATH, PrefixExecution, explain_candidate,
+    explain_match_candidate, row_covers_candidate, run_prefixes,
 };
+
+use crate::inline_project::InlineTestProject;
 
 /// One class with one member plus a free function, so a candidate can sit
 /// inside a class but outside every member.
@@ -61,6 +68,37 @@ const LOOSE_POLICY: &str = r#"(policy
   :message "loose is reported"
   :severity warning
   :analysis (analysis :type match :selector (rql (function :name "loose"))))"#;
+
+/// A selector whose relation moves from the declaration anchor to a reference
+/// anchor elsewhere in the file.
+const REFERENCES_POLICY: &str = r#"(policy
+  :id "test.explain.references"
+  :name "Render references"
+  :message "render references are reported"
+  :severity warning
+  :analysis (analysis :type match :selector
+    (rql (references-of (enclosing-decl (function :name "render"))))))"#;
+
+/// The reference row is an intermediate anchor; the final projection returns
+/// to the referenced declaration and no longer covers that source position.
+const REFERENCE_TARGET_POLICY: &str = r#"(policy
+  :id "test.explain.reference-target"
+  :name "Render reference targets"
+  :message "render reference targets are reported"
+  :severity warning
+  :analysis (analysis :type match :selector
+    (rql (occurrence-target
+      (occurrences-of (enclosing-decl (function :name "render")))))))"#;
+
+/// A two-prefix selector used to pin execution accounting when presentation
+/// stops after the source stage.
+const WIDGET_DECLARATION_POLICY: &str = r#"(policy
+  :id "test.explain.widget-declaration"
+  :name "Widget declaration"
+  :message "Widget is reported"
+  :severity warning
+  :analysis (analysis :type match :selector
+    (rql (enclosing-decl (class :name "Widget")))))"#;
 
 /// A non-match policy, used to prove the missing-adapter condition is a value
 /// and not a panic.
@@ -103,6 +141,10 @@ const RELATIONAL_FIXTURE: &str =
 /// The same shape with a second value read, so a one-row pipeline budget
 /// truncates the binding and leaves the run inconclusive with a finding.
 const RELATIONAL_TWO_READS: &str = "export function render(): number {\n  return 1;\n}\n\nexport const alias = render;\nexport const second = render;\n";
+
+/// Two reference sites with the same semantic target. Their detailed semantic
+/// key is shared, so exact why-not lineage must also retain source identity.
+const TWO_RENDER_REFERENCES: &str = "export function render(): number {\n  return 1;\n}\n\nexport const first = render;\nexport const second = render;\n";
 
 /// A member access, so the two-binding plan's `member_position` binding has a
 /// row and its row expansion is reached.
@@ -800,6 +842,252 @@ fn why_not_reports_satisfied_when_the_selector_retains_the_candidate() {
 }
 
 #[test]
+fn why_not_tracks_a_candidate_across_an_anchor_changing_relation() {
+    let fixture = Fixture::with_source(RELATIONAL_FIXTURE);
+    let reference_offset = u64::try_from(
+        RELATIONAL_FIXTURE
+            .rfind("render")
+            .expect("fixture contains the reference"),
+    )
+    .expect("fixture offsets fit u64");
+    let reference = ExplanationCandidate::at_offset("app.ts", reference_offset).expect("candidate");
+    let explanation = why_not(
+        &fixture,
+        REFERENCES_POLICY,
+        &reference,
+        &PolicyBudget::default(),
+    );
+
+    assert_eq!(
+        stage_labels(&explanation),
+        vec![
+            (String::from("seed"), ExplanationOutcome::Satisfied),
+            (
+                String::from("enclosing_decl"),
+                ExplanationOutcome::Satisfied,
+            ),
+            (String::from("references_of"), ExplanationOutcome::Satisfied),
+        ],
+        "typed provenance, not terminal source containment, correlates the reference with its seed"
+    );
+    assert_eq!(explanation.outcome(), ExplanationOutcome::Satisfied);
+
+    let bounded = with_policy(REFERENCES_POLICY, |policy| {
+        explain_match_candidate(
+            policy,
+            &fixture.context(),
+            &reference,
+            &PolicyBudget::default(),
+            &ExplanationLimits::default().with_max_prefix_executions(2),
+        )
+        .expect("bounded explanation")
+    });
+    assert_eq!(
+        bounded.outcome(),
+        ExplanationOutcome::Unknown,
+        "an omitted anchor-changing relation leaves the terminal-site candidate undecided"
+    );
+    assert_eq!(
+        stage_labels(&bounded),
+        vec![(String::from("seed"), ExplanationOutcome::Unknown)]
+    );
+    assert!(bounded.root().children_truncated());
+    assert_eq!(bounded.root().omitted_children_lower_bound(), 2);
+
+    let budget = PolicyBudget::default();
+    with_policy(REFERENCES_POLICY, |policy| {
+        let selector = policy
+            .resolved_selectors()
+            .iter()
+            .find(|selector| selector.path.as_str() == MATCH_SELECTOR_PATH)
+            .expect("match selector");
+        let (_, query) = selector.as_query().expect("query selector");
+        let walk = run_prefixes(
+            query,
+            &fixture.context(),
+            &reference,
+            &budget,
+            2,
+            PrefixExecution::AnalyzerOnly,
+            budget.max_findings(),
+        );
+        assert_eq!(walk.executed(), 2);
+        assert!(walk.prefixes_truncated());
+        assert_eq!(walk.omitted_prefixes(), 2);
+        assert_eq!(walk.into_stages().len(), 1);
+    });
+}
+
+#[test]
+fn why_not_lineage_distinguishes_sibling_sites_with_the_same_semantic_key() {
+    let fixture = Fixture::with_source(TWO_RENDER_REFERENCES);
+    let first = TWO_RENDER_REFERENCES
+        .find("render;")
+        .expect("fixture contains the first reference");
+    let second = TWO_RENDER_REFERENCES
+        .rfind("render;")
+        .expect("fixture contains the second reference");
+    assert_ne!(first, second);
+    let reference = ExplanationCandidate::at_offset(
+        "app.ts",
+        u64::try_from(second).expect("fixture offsets fit u64"),
+    )
+    .expect("candidate");
+    let explanation = why_not(
+        &fixture,
+        REFERENCES_POLICY,
+        &reference,
+        &PolicyBudget::default(),
+    );
+
+    let reference_stage = explanation
+        .root()
+        .children()
+        .iter()
+        .find(|node| node.label() == "references_of")
+        .expect("reference stage");
+    let actual = reference_stage.actual().expect("retained row identity");
+    let second_range = format!("bytes [{second}, {})", second + "render".len());
+    let first_range = format!("bytes [{first}, {})", first + "render".len());
+    assert!(actual.contains(&second_range), "{actual}");
+    assert!(!actual.contains(&first_range), "{actual}");
+
+    let repeated = why_not(
+        &fixture,
+        REFERENCES_POLICY,
+        &reference,
+        &PolicyBudget::default(),
+    );
+    assert_eq!(explanation.to_json(), repeated.to_json());
+    let other_fixture = Fixture::with_source(TWO_RENDER_REFERENCES);
+    let independent = why_not(
+        &other_fixture,
+        REFERENCES_POLICY,
+        &reference,
+        &PolicyBudget::default(),
+    );
+    assert_eq!(explanation.to_json(), independent.to_json());
+}
+
+#[test]
+fn why_not_does_not_blame_a_complete_seed_when_a_later_anchor_change_is_incomplete() {
+    let fixture = Fixture::with_source(TWO_RENDER_REFERENCES);
+    let second = TWO_RENDER_REFERENCES
+        .rfind("render;")
+        .expect("fixture contains the second reference");
+    let reference = ExplanationCandidate::at_offset(
+        "app.ts",
+        u64::try_from(second).expect("fixture offsets fit u64"),
+    )
+    .expect("candidate");
+    let budget = PolicyBudget::builder()
+        .with_max_findings(1)
+        .expect("one retained finding")
+        .build()
+        .expect("bounded policy budget");
+
+    let explanation = why_not(&fixture, REFERENCES_POLICY, &reference, &budget);
+
+    assert_eq!(
+        stage_labels(&explanation),
+        vec![(String::from("seed"), ExplanationOutcome::Unknown)],
+        "the complete declaration seed cannot exclude a reference candidate that the bounded relation may have omitted"
+    );
+    assert_eq!(explanation.outcome(), ExplanationOutcome::Unknown);
+    assert!(
+        !explanation.root().children_truncated(),
+        "every prefix executed; uncertainty comes from the later query's completion, not the prefix budget"
+    );
+    let seed = explanation
+        .root()
+        .children()
+        .iter()
+        .find(|node| node.label() == "seed")
+        .expect("seed stage");
+    assert!(
+        seed.reasons()
+            .contains(&PolicyIncompleteReason::QueryResultLimit),
+        "the seed carries the exact reason the later anchor-changing prefix could not prove absence: {seed:?}"
+    );
+}
+
+#[test]
+fn prefix_walk_charges_preexecuted_prefixes_that_are_not_presented() {
+    let fixture = Fixture::new();
+    let budget = PolicyBudget::default();
+    with_policy(WIDGET_DECLARATION_POLICY, |policy| {
+        let selector = policy
+            .resolved_selectors()
+            .iter()
+            .find(|selector| selector.path.as_str() == MATCH_SELECTOR_PATH)
+            .expect("match selector");
+        let (_, query) = selector.as_query().expect("query selector");
+        let walk = run_prefixes(
+            query,
+            &fixture.context(),
+            &candidate("loose"),
+            &budget,
+            2,
+            PrefixExecution::AnalyzerOnly,
+            budget.max_findings(),
+        );
+
+        assert_eq!(walk.executed(), 2, "the seed and deepest prefix both ran");
+        assert_eq!(
+            walk.into_stages().len(),
+            1,
+            "presentation stops when the source proves the candidate absent"
+        );
+    });
+}
+
+#[test]
+fn why_not_uses_intermediate_lineage_when_a_later_relation_changes_anchor_again() {
+    let fixture = Fixture::with_source(RELATIONAL_FIXTURE);
+    let reference_offset = u64::try_from(
+        RELATIONAL_FIXTURE
+            .rfind("render")
+            .expect("fixture contains the reference"),
+    )
+    .expect("fixture offsets fit u64");
+    let reference = ExplanationCandidate::at_offset("app.ts", reference_offset).expect("candidate");
+    let explanation = why_not(
+        &fixture,
+        REFERENCE_TARGET_POLICY,
+        &reference,
+        &PolicyBudget::default(),
+    );
+
+    assert_eq!(
+        stage_labels(&explanation),
+        vec![
+            (String::from("seed"), ExplanationOutcome::Satisfied),
+            (
+                String::from("enclosing_decl"),
+                ExplanationOutcome::Satisfied,
+            ),
+            (
+                String::from("occurrences_of"),
+                ExplanationOutcome::Satisfied,
+            ),
+            (
+                String::from("occurrence_target"),
+                ExplanationOutcome::Unknown,
+            ),
+        ],
+        "the deepest candidate-bearing prefix supplies lineage before the final anchor change"
+    );
+    assert_eq!(explanation.outcome(), ExplanationOutcome::Unknown);
+    assert!(
+        explanation
+            .root()
+            .actual()
+            .expect("root prose")
+            .contains("occurrence_target")
+    );
+}
+
+#[test]
 fn why_not_reports_unknown_rather_than_failed_when_the_prefix_query_is_incomplete() {
     let fixture = Fixture::new();
     let budget = PolicyBudget::builder()
@@ -1399,6 +1687,7 @@ fn the_host_refuses_a_selection_that_is_not_exactly_one_policy() {
     let temp = host_workspace(RELATIONAL_FIXTURE, FORBID_READS_RELATIONAL);
     let root = temp.path().canonicalize().expect("canonical root");
     let candidate = ExplanationCandidate::at_offset("app.ts", 0).expect("candidate");
+    let owned_builds_before = super::host::owned_workspace_build_count_for_test();
 
     let empty = explain_policy_inputs(
         &root,
@@ -1413,6 +1702,11 @@ fn the_host_refuses_a_selection_that_is_not_exactly_one_policy() {
     assert_eq!(
         empty,
         ExplainError::AmbiguousPolicySelection { selected: 0 }
+    );
+    assert_eq!(
+        super::host::owned_workspace_build_count_for_test(),
+        owned_builds_before,
+        "zero policy inputs are rejected before constructing an owned analyzer"
     );
 
     let two = explain_policy_inputs(
@@ -1432,6 +1726,41 @@ fn the_host_refuses_a_selection_that_is_not_exactly_one_policy() {
     )
     .expect_err("an explanation is about one policy");
     assert_eq!(two, ExplainError::AmbiguousPolicySelection { selected: 2 });
+}
+
+#[test]
+fn cancellation_after_registration_wins_over_ambiguous_selection() {
+    let temp = host_workspace(RELATIONAL_FIXTURE, FORBID_READS_RELATIONAL);
+    let root = temp.path().canonicalize().expect("canonical root");
+    let project: Arc<dyn Project> = Arc::new(TestProject::new(root.clone(), Language::TypeScript));
+    let workspace = WorkspaceAnalyzer::build_ephemeral_footgun(project, AnalyzerConfig::default())
+        .expect("ephemeral workspace");
+    let cancellation = brokk_bifrost_analysis::CancellationToken::cancel_after_checks_for_test(5);
+    let candidate = ExplanationCandidate::at_offset("app.ts", 0).expect("candidate");
+
+    let error = explain_policy_inputs(
+        &root,
+        &[
+            PolicyEvaluationInput::workspace_file("policies/explain.rqlp"),
+            PolicyEvaluationInput::embedded(
+                PolicySourceIdentity::new("test:explain-second"),
+                LOOSE_POLICY,
+            ),
+        ],
+        &ExplanationTarget::Candidate(candidate),
+        Some(&workspace),
+        None,
+        Some(&cancellation),
+        &ExplanationLimits::default(),
+    )
+    .expect_err("cancellation after the final registration wins before selection");
+
+    assert_eq!(
+        error,
+        ExplainError::PolicyUnavailable {
+            message: "policy explanation cancelled".to_string()
+        }
+    );
 }
 
 #[test]
@@ -1455,6 +1784,131 @@ fn the_host_reports_an_unloadable_policy_as_a_stated_condition() {
         matches!(error, ExplainError::PolicyUnavailable { .. }),
         "{error:?}"
     );
+}
+
+#[test]
+fn the_host_honors_front_door_cancellation_before_loading_policy_inputs() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("app.ts", FIXTURE)
+        .build();
+    let candidate = ExplanationCandidate::at_offset("app.ts", 0).expect("candidate");
+    let cancellation = brokk_bifrost_analysis::CancellationToken::new();
+    cancellation.cancel();
+
+    let error = explain_policy_inputs(
+        project.root(),
+        &[PolicyEvaluationInput::workspace_file(
+            "policies/absent.rqlp",
+        )],
+        &ExplanationTarget::Candidate(candidate),
+        None,
+        None,
+        Some(&cancellation),
+        &ExplanationLimits::default(),
+    )
+    .expect_err("explicit cancellation wins before the absent input is loaded");
+    assert_eq!(
+        error,
+        ExplainError::PolicyUnavailable {
+            message: "policy explanation cancelled".to_string()
+        }
+    );
+}
+
+#[test]
+fn the_host_resolves_qualified_call_and_receiver_locators_with_its_owned_analyzer() {
+    const SOURCE: &str = r#"class Widget {
+    int create(int value) { return value; }
+}
+
+class Caller {
+    int run(Widget widget) { return widget.create(1); }
+}
+"#;
+    const POLICY: &str = r#"(policy
+  :id "test.explain.qualified-locators"
+  :name "Qualified locators"
+  :message "Widget.create is selected"
+  :severity warning
+  :analysis (analysis :type assertion
+    (bind :name calls :query
+      (rql (call-bindings (call-shape (call :callee "create")))))
+    (call :over calls :resolves-to "Widget.create" :proof exact
+          :receiver-type "Widget")))"#;
+
+    let project = InlineTestProject::with_language(Language::Java)
+        .file("Example.java", SOURCE)
+        .file("policies/qualified.rqlp", POLICY)
+        .build();
+    let root = project.root();
+    let inputs = [PolicyEvaluationInput::workspace_file(
+        "policies/qualified.rqlp",
+    )];
+    let offset = u64::try_from(SOURCE.find("widget.create").expect("call site"))
+        .expect("fixture offset fits u64");
+    let candidate =
+        ExplanationCandidate::at_offset("Example.java", offset).expect("candidate location");
+
+    let explanation = explain_policy_inputs(
+        root,
+        &inputs,
+        &ExplanationTarget::Candidate(candidate),
+        None,
+        None,
+        None,
+        &ExplanationLimits::default(),
+    )
+    .expect("owned-analyzer registration resolves both qualified locators");
+    assert_eq!(explanation.question(), ExplanationQuestion::WhyNot);
+    assert_eq!(
+        explanation.policy_id().as_str(),
+        "test.explain.qualified-locators"
+    );
+}
+
+#[test]
+fn the_host_explains_a_retained_finding_after_a_malformed_packs_document() {
+    let project = InlineTestProject::with_language(Language::TypeScript)
+        .file("app.ts", FIXTURE)
+        .file("policies/explain.rqlp", LOOSE_POLICY)
+        .file(".bifrost/packs.json", "{ not json")
+        .build();
+    let root = project.root();
+    let inputs = [PolicyEvaluationInput::workspace_file(
+        "policies/explain.rqlp",
+    )];
+
+    let options =
+        PolicyEvaluationOptions::new("2026-08-28".parse().expect("fixed explanation parity date"));
+    let outcome = evaluate_policy_inputs(root, &inputs, &options)
+        .expect("normal evaluation diagnoses packs and continues");
+    assert!(
+        outcome
+            .report()
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| { diagnostic.code() == PolicyReportDiagnosticCode::PacksLoadFailed })
+    );
+    let [run] = outcome.report().runs() else {
+        panic!("one normal policy run");
+    };
+    let finding_id = only_finding(run);
+
+    let explanation = explain_policy_inputs(
+        root,
+        &inputs,
+        &ExplanationTarget::Finding(finding_id),
+        None,
+        None,
+        None,
+        &ExplanationLimits::default(),
+    )
+    .expect("the retained unreliable finding remains explainable");
+    assert_eq!(explanation.question(), ExplanationQuestion::Why);
+    assert!(matches!(
+        explanation.subject(),
+        ExplanationSubject::Finding { finding_id: explained, .. } if *explained == finding_id
+    ));
 }
 
 // --- flow and taint: why ----------------------------------------------------

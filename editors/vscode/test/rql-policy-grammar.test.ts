@@ -41,6 +41,11 @@ void test("tokenizes policy structure with conservative syntactic scopes", async
   assertScoped(tokens, "call-modeling", "entity.name.function.record.bifrost-rql-policy");
   assertScoped(tokens, ":call-modeling", "variable.parameter.keyword.bifrost-rql-policy");
   assertScoped(tokens, ":unmodeled", "variable.parameter.keyword.bifrost-rql-policy");
+  assertScoped(tokens, "call", "entity.name.function.record.bifrost-rql-policy");
+  assertScoped(tokens, "call-argument", "entity.name.function.record.bifrost-rql-policy");
+  assertScoped(tokens, ":resolves-to", "variable.parameter.keyword.bifrost-rql-policy");
+  assertScoped(tokens, ":receiver-type", "variable.parameter.keyword.bifrost-rql-policy");
+  assertScoped(tokens, ":formal-name", "variable.parameter.keyword.bifrost-rql-policy");
 });
 
 void test("includes native RQL scopes only inside inline rql bodies", async () => {

@@ -1285,6 +1285,63 @@ mod tests {
     }
 
     #[test]
+    fn public_explain_reports_result_contract_projection_and_use_facets() {
+        let query = query(branch(
+            seed("Open"),
+            vec![
+                QueryStep::CallShape,
+                QueryStep::ResultContractCalls,
+                QueryStep::CallResultContracts,
+                QueryStep::ResultContractUses,
+                QueryStep::ResultContractOperationUses,
+            ],
+        ));
+        let public = PhysicalQueryPlan::select(
+            LogicalQueryPlan::lower(&query).expect("result-contract query should lower"),
+        )
+        .public_explain(&query, 1);
+        let requests = public
+            .physical_plan
+            .nodes
+            .iter()
+            .filter_map(|node| node.semantic_request)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            requests,
+            vec![
+                CodeQuerySemanticRequest {
+                    procedures: true,
+                    dispatch: true,
+                    program_points: true,
+                    control_edges: true,
+                    typestate: false,
+                    value_flow: false,
+                    taint: false,
+                },
+                CodeQuerySemanticRequest {
+                    procedures: true,
+                    dispatch: true,
+                    program_points: true,
+                    control_edges: true,
+                    typestate: false,
+                    value_flow: false,
+                    taint: false,
+                },
+                CodeQuerySemanticRequest {
+                    procedures: true,
+                    dispatch: true,
+                    program_points: true,
+                    control_edges: true,
+                    typestate: false,
+                    value_flow: false,
+                    taint: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn public_explain_reports_typestate_without_resolving_a_registration() {
         let query = query(branch(
             seed("lifecycle"),

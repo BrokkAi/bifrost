@@ -25,6 +25,7 @@ use brokk_bifrost_core::analyzer::{BoundedDefinitionLookup, ProjectFile, Range};
 use brokk_bifrost_core::text_utils::compute_line_starts;
 use tree_sitter::{Node, Parser, Tree};
 
+use crate::graph::ast::{range_clause_binding_names, range_clause_is_short_declaration};
 use crate::graph::resolver::GoImportBindings;
 use crate::packages::{GO_MODULE_SCOPE_SEGMENT, canonical_go_package_name};
 
@@ -198,6 +199,11 @@ impl GoDiagnosticCollector<'_> {
                 stack.push(ScanFrame::ExitScope);
                 push_named_children(stack, node);
             }
+            "for_statement" => {
+                scopes.enter();
+                stack.push(ScanFrame::ExitScope);
+                push_named_children(stack, node);
+            }
             "type_spec" | "type_alias" => {
                 if node.child_by_field_name("type_parameters").is_some() {
                     scopes.enter();
@@ -228,8 +234,13 @@ impl GoDiagnosticCollector<'_> {
                 push_field_if_present(stack, node, "left");
             }
             "range_clause" => {
-                stack.push(ScanFrame::SeedRange(node));
-                push_field_if_present(stack, node, "right");
+                if range_clause_is_short_declaration(node) {
+                    stack.push(ScanFrame::SeedRange(node));
+                    push_field_if_present(stack, node, "right");
+                } else {
+                    push_field_if_present(stack, node, "right");
+                    push_field_if_present(stack, node, "left");
+                }
             }
             "selector_expression" | "qualified_type" => {
                 self.check_selector(node, scopes);
@@ -243,10 +254,8 @@ impl GoDiagnosticCollector<'_> {
     }
 
     fn seed_range_clause(&mut self, node: Node<'_>, scopes: &mut ScopeStack) {
-        if let Some(left) = node.child_by_field_name("left") {
-            for name in identifier_texts(left, self.source) {
-                scopes.declare(name);
-            }
+        for name in range_clause_binding_names(node, self.source) {
+            scopes.declare(name);
         }
     }
 
@@ -730,10 +739,14 @@ fn is_declaration_identifier(node: Node<'_>) -> bool {
                 .children_by_field_name("name", &mut cursor)
                 .any(|name| same_node(name, node))
         }
-        "short_var_declaration" | "range_clause" => {
-            parent.child_by_field_name("left").is_some_and(|left| {
-                left.start_byte() <= node.start_byte() && node.end_byte() <= left.end_byte()
-            })
+        "short_var_declaration" => parent.child_by_field_name("left").is_some_and(|left| {
+            left.start_byte() <= node.start_byte() && node.end_byte() <= left.end_byte()
+        }),
+        "range_clause" => {
+            range_clause_is_short_declaration(parent)
+                && parent.child_by_field_name("left").is_some_and(|left| {
+                    left.start_byte() <= node.start_byte() && node.end_byte() <= left.end_byte()
+                })
         }
         _ => false,
     }

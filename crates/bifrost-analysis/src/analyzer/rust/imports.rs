@@ -18,6 +18,13 @@ use super::RustAnalyzer;
 use crate::analyzer::{AnalyzerQueryScope, QueryScope};
 
 impl ImportAnalysisProvider for RustAnalyzer {
+    fn file_dependency_facts_for_files(
+        &self,
+        files: &[ProjectFile],
+    ) -> Option<crate::hash::HashMap<ProjectFile, crate::analyzer::FileDependencyFacts>> {
+        Some(self.inner.bulk_file_dependency_facts(files.iter().cloned()))
+    }
+
     fn imported_code_units_of(&self, file: &ProjectFile) -> Arc<HashSet<CodeUnit>> {
         let scope = AnalyzerQueryScope::new(self);
         let token = scope.token();
@@ -77,6 +84,33 @@ impl ImportAnalysisProvider for RustAnalyzer {
                 })
                 .collect(),
         )
+    }
+
+    fn additional_direct_file_dependencies(
+        &self,
+        files: &[ProjectFile],
+        cancellation: &crate::cancellation::CancellationToken,
+    ) -> Option<crate::analyzer::AdditionalFileDependencies> {
+        let routes = self.cargo_routes_while(&|| !cancellation.is_cancelled())?;
+        let selected: HashSet<_> = files.iter().cloned().collect();
+        let mut dependencies: crate::hash::HashMap<ProjectFile, HashSet<ProjectFile>> =
+            crate::hash::HashMap::default();
+        for declaration in routes.external_module_declarations() {
+            if cancellation.is_cancelled() {
+                return None;
+            }
+            if selected.contains(&declaration.declaring_file)
+                && selected.contains(&declaration.target_file)
+            {
+                dependencies
+                    .entry(declaration.declaring_file.clone())
+                    .or_default()
+                    .insert(declaration.target_file.clone());
+            }
+        }
+        Some(crate::analyzer::AdditionalFileDependencies::complete(
+            dependencies,
+        ))
     }
 
     fn could_import_file(

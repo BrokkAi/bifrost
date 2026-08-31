@@ -1,0 +1,693 @@
+{
+  "schema_version": 1,
+  "pack_id": "bifrost.go.stdlib.testing",
+  "version": "1.0.0",
+  "producer": {
+    "name": "bifrost",
+    "version": "0.10.5"
+  },
+  "language": "go",
+  "ecosystem": "go",
+  "compatibility": {
+    "bifrost": ">=0.10.5, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "https://pkg.go.dev/testing",
+    "revision": "go1.26.0"
+  },
+  "license": "BSD-3-Clause",
+  "completeness": "partial",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "go.stdlib.testing.concrete-receivers",
+      "activation": [{}],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "type.testing.module",
+            "name": "testing",
+            "type_kind": "module",
+            "visibility": "public",
+            "aliases": ["testing"],
+            "locator": {
+              "kind": "source",
+              "path": "src/testing/testing.go",
+              "symbol": "testing"
+            }
+          },
+          {
+            "id": "type.testing.t",
+            "name": "testing.T",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "source",
+              "path": "src/testing/testing.go",
+              "symbol": "testing.T"
+            }
+          },
+          {
+            "id": "type.testing.b",
+            "name": "testing.B",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "source",
+              "path": "src/testing/benchmark.go",
+              "symbol": "testing.B"
+            }
+          },
+          {
+            "id": "type.testing.f",
+            "name": "testing.F",
+            "type_kind": "struct",
+            "visibility": "public",
+            "locator": {
+              "kind": "source",
+              "path": "src/testing/fuzz.go",
+              "symbol": "testing.F"
+            }
+          }
+        ],
+        "members": [
+          {
+            "id": "member.testing.t.fail-now",
+            "owner": "type.testing.t",
+            "name": "FailNow",
+            "member_kind": "method",
+            "visibility": "public",
+            "signature": { "parameters": [] },
+            "receiver": { "pointer": true },
+            "locator": {
+              "kind": "source",
+              "path": "src/testing/testing.go",
+              "symbol": "testing.T.FailNow"
+            }
+          },
+          {
+            "id": "member.testing.t.fatal",
+            "owner": "type.testing.t",
+            "name": "Fatal",
+            "member_kind": "method",
+            "visibility": "public",
+            "signature": {
+              "parameters": [
+                {
+                  "name": "args",
+                  "type": { "kind": "named", "name": "any" },
+                  "variadic": true
+                }
+              ]
+            },
+            "receiver": { "pointer": true },
+            "locator": {
+              "kind": "source",
+              "path": "src/testing/testing.go",
+              "symbol": "testing.T.Fatal"
+            }
+          },
+          {
+            "id": "member.testing.t.fatalf",
+            "owner": "type.testing.t",
+            "name": "Fatalf",
+            "member_kind": "method",
+            "visibility": "public",
+            "signature": {
+              "parameters": [
+                {
+                  "name": "format",
+                  "type": { "kind": "named", "name": "string" }
+                },
+                {
+                  "name": "args",
+                  "type": { "kind": "named", "name": "any" },
+                  "variadic": true
+                }
+              ]
+            },
+            "receiver": { "pointer": true },
+            "locator": {
+              "kind": "source",
+              "path": "src/testing/testing.go",
+              "symbol": "testing.T.Fatalf"
+            }
+          },
+          {
+            "id": "member.testing.t.skip",
+            "owner": "type.testing.t",
+            "name": "Skip",
+            "member_kind": "method",
+            "visibility": "public",
+            "signature": {
+              "parameters": [
+                {
+                  "name": "args",
+                  "type": { "kind": "named", "name": "any" },
+                  "variadic": true
+                }
+              ]
+            },
+            "receiver": { "pointer": true },
+            "locator": {
+              "kind": "source",
+              "path": "src/testing/testing.go",
+              "symbol": "testing.T.Skip"
+            }
+          },
+          {
+            "id": "member.testing.t.skipf",
+            "owner": "type.testing.t",
+            "name": "Skipf",
+            "member_kind": "method",
+            "visibility": "public",
+            "signature": {
+              "parameters": [
+                {
+                  "name": "format",
+                  "type": { "kind": "named", "name": "string" }
+                },
+                {
+                  "name": "args",
+                  "type": { "kind": "named", "name": "any" },
+                  "variadic": true
+                }
+              ]
+            },
+            "receiver": { "pointer": true },
+            "locator": {
+              "kind": "source",
+              "path": "src/testing/testing.go",
+              "symbol": "testing.T.Skipf"
+            }
+          },
+          {
+            "id": "member.testing.t.skip-now",
+            "owner": "type.testing.t",
+            "name": "SkipNow",
+            "member_kind": "method",
+            "visibility": "public",
+            "signature": { "parameters": [] },
+            "receiver": { "pointer": true },
+            "locator": {
+              "kind": "source",
+              "path": "src/testing/testing.go",
+              "symbol": "testing.T.SkipNow"
+            }
+          },
+          {
+            "id": "member.testing.b.fail-now",
+            "owner": "type.testing.b",
+            "name": "FailNow",
+            "member_kind": "method",
+            "visibility": "public",
+            "signature": { "parameters": [] },
+            "receiver": { "pointer": true },
+            "locator": {
+              "kind": "source",
+              "path": "src/testing/testing.go",
+              "symbol": "testing.B.FailNow"
+            }
+          },
+          {
+            "id": "member.testing.b.fatal",
+            "owner": "type.testing.b",
+            "name": "Fatal",
+            "member_kind": "method",
+            "visibility": "public",
+            "signature": {
+              "parameters": [
+                {
+                  "name": "args",
+                  "type": { "kind": "named", "name": "any" },
+                  "variadic": true
+                }
+              ]
+            },
+            "receiver": { "pointer": true },
+            "locator": {
+              "kind": "source",
+              "path": "src/testing/testing.go",
+              "symbol": "testing.B.Fatal"
+            }
+          },
+          {
+            "id": "member.testing.b.fatalf",
+            "owner": "type.testing.b",
+            "name": "Fatalf",
+            "member_kind": "method",
+            "visibility": "public",
+            "signature": {
+              "parameters": [
+                {
+                  "name": "format",
+                  "type": { "kind": "named", "name": "string" }
+                },
+                {
+                  "name": "args",
+                  "type": { "kind": "named", "name": "any" },
+                  "variadic": true
+                }
+              ]
+            },
+            "receiver": { "pointer": true },
+            "locator": {
+              "kind": "source",
+              "path": "src/testing/testing.go",
+              "symbol": "testing.B.Fatalf"
+            }
+          },
+          {
+            "id": "member.testing.b.skip",
+            "owner": "type.testing.b",
+            "name": "Skip",
+            "member_kind": "method",
+            "visibility": "public",
+            "signature": {
+              "parameters": [
+                {
+                  "name": "args",
+                  "type": { "kind": "named", "name": "any" },
+                  "variadic": true
+                }
+              ]
+            },
+            "receiver": { "pointer": true },
+            "locator": {
+              "kind": "source",
+              "path": "src/testing/testing.go",
+              "symbol": "testing.B.Skip"
+            }
+          },
+          {
+            "id": "member.testing.b.skipf",
+            "owner": "type.testing.b",
+            "name": "Skipf",
+            "member_kind": "method",
+            "visibility": "public",
+            "signature": {
+              "parameters": [
+                {
+                  "name": "format",
+                  "type": { "kind": "named", "name": "string" }
+                },
+                {
+                  "name": "args",
+                  "type": { "kind": "named", "name": "any" },
+                  "variadic": true
+                }
+              ]
+            },
+            "receiver": { "pointer": true },
+            "locator": {
+              "kind": "source",
+              "path": "src/testing/testing.go",
+              "symbol": "testing.B.Skipf"
+            }
+          },
+          {
+            "id": "member.testing.b.skip-now",
+            "owner": "type.testing.b",
+            "name": "SkipNow",
+            "member_kind": "method",
+            "visibility": "public",
+            "signature": { "parameters": [] },
+            "receiver": { "pointer": true },
+            "locator": {
+              "kind": "source",
+              "path": "src/testing/testing.go",
+              "symbol": "testing.B.SkipNow"
+            }
+          },
+          {
+            "id": "member.testing.f.fail-now",
+            "owner": "type.testing.f",
+            "name": "FailNow",
+            "member_kind": "method",
+            "visibility": "public",
+            "signature": { "parameters": [] },
+            "receiver": { "pointer": true },
+            "locator": {
+              "kind": "source",
+              "path": "src/testing/testing.go",
+              "symbol": "testing.F.FailNow"
+            }
+          },
+          {
+            "id": "member.testing.f.fatal",
+            "owner": "type.testing.f",
+            "name": "Fatal",
+            "member_kind": "method",
+            "visibility": "public",
+            "signature": {
+              "parameters": [
+                {
+                  "name": "args",
+                  "type": { "kind": "named", "name": "any" },
+                  "variadic": true
+                }
+              ]
+            },
+            "receiver": { "pointer": true },
+            "locator": {
+              "kind": "source",
+              "path": "src/testing/testing.go",
+              "symbol": "testing.F.Fatal"
+            }
+          },
+          {
+            "id": "member.testing.f.fatalf",
+            "owner": "type.testing.f",
+            "name": "Fatalf",
+            "member_kind": "method",
+            "visibility": "public",
+            "signature": {
+              "parameters": [
+                {
+                  "name": "format",
+                  "type": { "kind": "named", "name": "string" }
+                },
+                {
+                  "name": "args",
+                  "type": { "kind": "named", "name": "any" },
+                  "variadic": true
+                }
+              ]
+            },
+            "receiver": { "pointer": true },
+            "locator": {
+              "kind": "source",
+              "path": "src/testing/testing.go",
+              "symbol": "testing.F.Fatalf"
+            }
+          },
+          {
+            "id": "member.testing.f.skip",
+            "owner": "type.testing.f",
+            "name": "Skip",
+            "member_kind": "method",
+            "visibility": "public",
+            "signature": {
+              "parameters": [
+                {
+                  "name": "args",
+                  "type": { "kind": "named", "name": "any" },
+                  "variadic": true
+                }
+              ]
+            },
+            "receiver": { "pointer": true },
+            "locator": {
+              "kind": "source",
+              "path": "src/testing/testing.go",
+              "symbol": "testing.F.Skip"
+            }
+          },
+          {
+            "id": "member.testing.f.skipf",
+            "owner": "type.testing.f",
+            "name": "Skipf",
+            "member_kind": "method",
+            "visibility": "public",
+            "signature": {
+              "parameters": [
+                {
+                  "name": "format",
+                  "type": { "kind": "named", "name": "string" }
+                },
+                {
+                  "name": "args",
+                  "type": { "kind": "named", "name": "any" },
+                  "variadic": true
+                }
+              ]
+            },
+            "receiver": { "pointer": true },
+            "locator": {
+              "kind": "source",
+              "path": "src/testing/testing.go",
+              "symbol": "testing.F.Skipf"
+            }
+          },
+          {
+            "id": "member.testing.f.skip-now",
+            "owner": "type.testing.f",
+            "name": "SkipNow",
+            "member_kind": "method",
+            "visibility": "public",
+            "signature": { "parameters": [] },
+            "receiver": { "pointer": true },
+            "locator": {
+              "kind": "source",
+              "path": "src/testing/testing.go",
+              "symbol": "testing.F.SkipNow"
+            }
+          }
+        ],
+        "relations": []
+      }
+    },
+    {
+      "id": "go.stdlib.testing.normal-continuation",
+      "activation": [{}],
+      "payload": {
+        "kind": "procedure_summaries",
+        "summaries": [
+          {
+            "id": "testing.t.fail-now",
+            "target": {
+              "path": "src/testing/testing.go",
+              "symbol": "testing.T.FailNow()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "partial",
+            "normal_continuation_absent": true,
+            "transfers": []
+          },
+          {
+            "id": "testing.t.fatal",
+            "target": {
+              "path": "src/testing/testing.go",
+              "symbol": "testing.T.Fatal(args ...any)",
+              "has_receiver": true,
+              "variadic": true,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "normal_continuation_absent": true,
+            "transfers": []
+          },
+          {
+            "id": "testing.t.fatalf",
+            "target": {
+              "path": "src/testing/testing.go",
+              "symbol": "testing.T.Fatalf(format string, args ...any)",
+              "has_receiver": true,
+              "variadic": true,
+              "parameter_count": 2
+            },
+            "completeness": "partial",
+            "normal_continuation_absent": true,
+            "transfers": []
+          },
+          {
+            "id": "testing.t.skip",
+            "target": {
+              "path": "src/testing/testing.go",
+              "symbol": "testing.T.Skip(args ...any)",
+              "has_receiver": true,
+              "variadic": true,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "normal_continuation_absent": true,
+            "transfers": []
+          },
+          {
+            "id": "testing.t.skipf",
+            "target": {
+              "path": "src/testing/testing.go",
+              "symbol": "testing.T.Skipf(format string, args ...any)",
+              "has_receiver": true,
+              "variadic": true,
+              "parameter_count": 2
+            },
+            "completeness": "partial",
+            "normal_continuation_absent": true,
+            "transfers": []
+          },
+          {
+            "id": "testing.t.skip-now",
+            "target": {
+              "path": "src/testing/testing.go",
+              "symbol": "testing.T.SkipNow()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "partial",
+            "normal_continuation_absent": true,
+            "transfers": []
+          },
+          {
+            "id": "testing.b.fail-now",
+            "target": {
+              "path": "src/testing/testing.go",
+              "symbol": "testing.B.FailNow()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "partial",
+            "normal_continuation_absent": true,
+            "transfers": []
+          },
+          {
+            "id": "testing.b.fatal",
+            "target": {
+              "path": "src/testing/testing.go",
+              "symbol": "testing.B.Fatal(args ...any)",
+              "has_receiver": true,
+              "variadic": true,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "normal_continuation_absent": true,
+            "transfers": []
+          },
+          {
+            "id": "testing.b.fatalf",
+            "target": {
+              "path": "src/testing/testing.go",
+              "symbol": "testing.B.Fatalf(format string, args ...any)",
+              "has_receiver": true,
+              "variadic": true,
+              "parameter_count": 2
+            },
+            "completeness": "partial",
+            "normal_continuation_absent": true,
+            "transfers": []
+          },
+          {
+            "id": "testing.b.skip",
+            "target": {
+              "path": "src/testing/testing.go",
+              "symbol": "testing.B.Skip(args ...any)",
+              "has_receiver": true,
+              "variadic": true,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "normal_continuation_absent": true,
+            "transfers": []
+          },
+          {
+            "id": "testing.b.skipf",
+            "target": {
+              "path": "src/testing/testing.go",
+              "symbol": "testing.B.Skipf(format string, args ...any)",
+              "has_receiver": true,
+              "variadic": true,
+              "parameter_count": 2
+            },
+            "completeness": "partial",
+            "normal_continuation_absent": true,
+            "transfers": []
+          },
+          {
+            "id": "testing.b.skip-now",
+            "target": {
+              "path": "src/testing/testing.go",
+              "symbol": "testing.B.SkipNow()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "partial",
+            "normal_continuation_absent": true,
+            "transfers": []
+          },
+          {
+            "id": "testing.f.fail-now",
+            "target": {
+              "path": "src/testing/testing.go",
+              "symbol": "testing.F.FailNow()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "partial",
+            "normal_continuation_absent": true,
+            "transfers": []
+          },
+          {
+            "id": "testing.f.fatal",
+            "target": {
+              "path": "src/testing/testing.go",
+              "symbol": "testing.F.Fatal(args ...any)",
+              "has_receiver": true,
+              "variadic": true,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "normal_continuation_absent": true,
+            "transfers": []
+          },
+          {
+            "id": "testing.f.fatalf",
+            "target": {
+              "path": "src/testing/testing.go",
+              "symbol": "testing.F.Fatalf(format string, args ...any)",
+              "has_receiver": true,
+              "variadic": true,
+              "parameter_count": 2
+            },
+            "completeness": "partial",
+            "normal_continuation_absent": true,
+            "transfers": []
+          },
+          {
+            "id": "testing.f.skip",
+            "target": {
+              "path": "src/testing/testing.go",
+              "symbol": "testing.F.Skip(args ...any)",
+              "has_receiver": true,
+              "variadic": true,
+              "parameter_count": 1
+            },
+            "completeness": "partial",
+            "normal_continuation_absent": true,
+            "transfers": []
+          },
+          {
+            "id": "testing.f.skipf",
+            "target": {
+              "path": "src/testing/testing.go",
+              "symbol": "testing.F.Skipf(format string, args ...any)",
+              "has_receiver": true,
+              "variadic": true,
+              "parameter_count": 2
+            },
+            "completeness": "partial",
+            "normal_continuation_absent": true,
+            "transfers": []
+          },
+          {
+            "id": "testing.f.skip-now",
+            "target": {
+              "path": "src/testing/testing.go",
+              "symbol": "testing.F.SkipNow()",
+              "has_receiver": true,
+              "parameter_count": 0
+            },
+            "completeness": "partial",
+            "normal_continuation_absent": true,
+            "transfers": []
+          }
+        ]
+      }
+    }
+  ]
+}

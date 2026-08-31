@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use super::super::ir::{
-    CaptureSource, EvidenceCompleteness, ProcedureHandle, ProgramPointHandle, ProofStatus,
-    SemanticEffect, SemanticValueKind, ValueFlowKind, ValueHandle,
+    CaptureSource, EvidenceCompleteness, MemoryLocationKind, ProcedureHandle, ProgramPointHandle,
+    ProofStatus, SemanticEffect, SemanticValueKind, ValueFlowKind, ValueHandle,
 };
 use super::error::{OracleContractError, require_same_procedure};
 use super::limits::OracleLimits;
@@ -253,6 +253,21 @@ fn is_container_collapse(relation: &ValueFlowRelation, defined: ValueId) -> bool
         && value_endpoint(&relation.target, defined)
 }
 
+/// A direct capture-slot access uses the same procedure port that a parent
+/// `CaptureBind` targets. This is the only memory row whose direct endpoint is
+/// a port rather than an abstract location.
+fn direct_capture_port_matches(
+    procedure: &ProcedureHandle,
+    location: crate::analyzer::semantic::MemoryLocationId,
+    endpoint: &ValueFlowEndpoint,
+) -> bool {
+    procedure
+        .semantics()
+        .memory_location(location)
+        .is_some_and(|row| matches!(row.kind, MemoryLocationKind::Capture { .. }))
+        && port_endpoint(endpoint, ProcedurePortKind::Capture { slot: location })
+}
+
 /// `chains` is derived on the first access shape that needs it and reused for
 /// every later relation. Deriving it walks the whole procedure, which most
 /// snapshots never need: only a memory access whose relation endpoint is not a
@@ -326,6 +341,18 @@ fn relation_matches_event(
                 && port_endpoint(&relation.target, ProcedurePortKind::NormalReturn)
         }
         SemanticEffect::ValueFlow {
+            kind: ValueFlowKind::IndexedReturn { ordinal },
+            source,
+            ..
+        } => {
+            relation.kind == ValueFlowRelationKind::NormalReturn
+                && value_endpoint(&relation.source, *source)
+                && port_endpoint(
+                    &relation.target,
+                    ProcedurePortKind::IndexedNormalReturn { ordinal: *ordinal },
+                )
+        }
+        SemanticEffect::ValueFlow {
             kind: ValueFlowKind::LanguageDefined,
             source,
             target,
@@ -334,6 +361,7 @@ fn relation_matches_event(
                 && value_endpoint(&relation.source, *source)
                 && value_endpoint(&relation.target, *target)
         }
+        SemanticEffect::ValueUse { .. } => false,
         SemanticEffect::Allocation { allocation } => procedure
             .semantics()
             .allocation(*allocation)
@@ -355,6 +383,7 @@ fn relation_matches_event(
         } => {
             (relation.kind == ValueFlowRelationKind::MemoryLoad
                 && (matches!(&relation.source, ValueFlowEndpoint::Location(_))
+                    || direct_capture_port_matches(procedure, *location, &relation.source)
                     || chains
                         .get_or_insert_with(|| MemoryAccessChains::derive(procedure))
                         .is_indexed(procedure, *location))
@@ -367,6 +396,7 @@ fn relation_matches_event(
             relation.kind == ValueFlowRelationKind::MemoryStore
                 && value_endpoint(&relation.source, *value)
                 && (matches!(&relation.target, ValueFlowEndpoint::Location(_))
+                    || direct_capture_port_matches(procedure, *location, &relation.target)
                     || chains
                         .get_or_insert_with(|| MemoryAccessChains::derive(procedure))
                         .is_indexed(procedure, *location))

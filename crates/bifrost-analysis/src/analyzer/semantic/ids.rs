@@ -135,6 +135,40 @@ typed_digests! {
     WorkspaceMountId,
 }
 
+/// The exact content-scoped identity of one normalized structural fact node.
+///
+/// The normalized node id is meaningful only for the exact source content it
+/// was extracted from. Keeping the content identity beside the dense id makes
+/// joins between structural facts and semantic source mappings fail closed
+/// across revisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StructuralNodeIdentity {
+    content: ContentIdentity,
+    normalized_node_id: u32,
+}
+
+impl StructuralNodeIdentity {
+    pub const fn new(content: ContentIdentity, normalized_node_id: u32) -> Self {
+        Self {
+            content,
+            normalized_node_id,
+        }
+    }
+
+    pub const fn content(self) -> ContentIdentity {
+        self.content
+    }
+
+    pub const fn normalized_node_id(self) -> u32 {
+        self.normalized_node_id
+    }
+
+    /// Alias for callers that use the structural fact vocabulary directly.
+    pub const fn node_id(self) -> u32 {
+        self.normalized_node_id
+    }
+}
+
 impl WorkspaceMountId {
     /// Derive the mount identity used by every semantic producer for one
     /// normalized workspace root.
@@ -148,11 +182,13 @@ pub const SEMANTIC_IR_SCHEMA_DOMAIN: &[u8] = b"bifrost-language-neutral-semantic
 
 /// Current language-neutral semantic IR schema revision.
 ///
-/// Revision 8 adds the `guard_facts` table (issue #2443 slice 2). Every cached
-/// semantic artifact and every wire id derived from one rotates exactly once
-/// when this constant moves; that is a mechanical consequence of adding a
-/// table, not a signal that anything else changed.
-pub const SEMANTIC_IR_SCHEMA_VERSION: u32 = 8;
+/// Revision 14 adds producer-authored structural fact identity to source
+/// mappings for narrow downstream proofs while retaining revision 13's active
+/// cleanup and deferred-execution vocabulary. Every cached semantic artifact
+/// and every wire id derived from one rotates exactly once when this constant
+/// moves; that is a mechanical consequence of extending source-mapping
+/// provenance, not a signal that anything else changed.
+pub const SEMANTIC_IR_SCHEMA_VERSION: u32 = 14;
 
 impl SemanticIrVersion {
     /// The contract-owned fingerprint shared by every language adapter that
@@ -926,6 +962,7 @@ impl SemanticArtifactKey {
     }
 }
 
+#[derive(Clone)]
 pub struct LengthDelimitedDigest(Sha256);
 
 impl LengthDelimitedDigest {
@@ -1109,10 +1146,10 @@ mod tests {
         let current = SemanticIrVersion::current();
         assert_eq!(
             current.to_string(),
-            "98e9be05ec247dfaff97c75a9917a01017d1b9ec4dde224c548b1dba9788b05e"
+            "787f18917a81c1a3b0202189e9e8970f70097530a5c0785a62ab961e5927c9fc"
         );
         assert_ne!(current.as_bytes(), &[0_u8; 32]);
-        assert_eq!(SEMANTIC_IR_SCHEMA_VERSION, 8);
+        assert_eq!(SEMANTIC_IR_SCHEMA_VERSION, 14);
     }
 
     fn digest(label: &str) -> StableDigest {

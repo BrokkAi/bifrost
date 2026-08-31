@@ -2031,7 +2031,7 @@ mod tests {
         );
         let expected = distinct_definitions(fresh, token, fresh_definitions);
 
-        let reopened = WorkspaceAnalyzer::build_ephemeral(
+        let reopened = WorkspaceAnalyzer::build_ephemeral_footgun(
             Arc::new(fixture.test_project().clone()),
             AnalyzerConfig::default(),
         )
@@ -2381,7 +2381,7 @@ mod tests {
         let initial = fixture.analyzer.analyzer();
         assert_eq!(2, initial.definitions("compute").count());
 
-        let reopened = WorkspaceAnalyzer::build_ephemeral(
+        let reopened = WorkspaceAnalyzer::build_ephemeral_footgun(
             Arc::new(fixture.test_project().clone()),
             AnalyzerConfig::default(),
         )

@@ -2,31 +2,87 @@ use super::syntax::*;
 use super::*;
 
 impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
-    pub(super) fn emit_captured_receiver(
+    pub(super) fn emit_capture_inputs(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
         entry: ProgramPointId,
         spec: &ProcedureSpec<'tree>,
         capture_binding_expected: bool,
     ) -> Result<(), TsLoweringError> {
-        let Some(lexical_parent) = spec.lexical_parent.filter(|_| spec.captures_receiver) else {
+        let Some(lexical_parent) = spec.lexical_parent else {
             return Ok(());
         };
-        let metadata = self.value_mapping(builder, spec.callable)?;
-        let (value, location) =
-            self.session
-                .add_receiver_capture_input(builder, entry, metadata, lexical_parent)?;
-        if !capture_binding_expected {
+        if spec.captures_receiver {
+            let metadata = self.value_mapping(builder, spec.callable)?;
+            let (value, location) = self.session.add_receiver_capture_input(
+                builder,
+                entry,
+                metadata,
+                lexical_parent,
+            )?;
+            if !capture_binding_expected {
+                self.add_gap(
+                    builder,
+                    entry,
+                    SemanticGapSubject::MemoryLocation(location),
+                    SemanticCapability::Captures,
+                    SemanticGapKind::Unsupported,
+                    "lexical receiver capture source is not represented by the parent procedure",
+                )?;
+            }
+            self.captured_receiver = Some(value);
+        }
+        for (index, capture) in spec.captures.iter().enumerate() {
+            let metadata = self.value_mapping(builder, capture.reference)?;
+            let value = self.session.add_value_with_metadata(
+                builder,
+                metadata,
+                SemanticValueKind::Local,
+            )?;
+            let location = self.session.add_memory_location(
+                builder,
+                entry,
+                MemoryLocationKind::Capture { lexical_parent },
+            )?;
+            let expected = lexical_capture_destination(spec.captures_receiver, index)?;
+            if location != expected {
+                return Err(TsLoweringError::Invalid(format!(
+                    "JS/TS capture destination must be {expected}, allocated {location}"
+                )));
+            }
+            self.append_effect(
+                builder,
+                entry,
+                SemanticEffect::MemoryLoad {
+                    kind: MemoryAccessKind::Capture,
+                    location,
+                    result: value,
+                },
+            )?;
+            if !capture_binding_expected {
+                self.add_gap(
+                    builder,
+                    entry,
+                    SemanticGapSubject::MemoryLocation(location),
+                    SemanticCapability::Captures,
+                    SemanticGapKind::Unsupported,
+                    "lexical value capture source is not represented by the parent procedure",
+                )?;
+            }
+            self.captured_bindings.insert(capture.binding, value);
+        }
+        for capture in &spec.omitted_captures {
+            let value =
+                self.expression_value(builder, capture.reference, SemanticValueKind::Local)?;
             self.add_gap(
                 builder,
                 entry,
-                SemanticGapSubject::MemoryLocation(location),
+                SemanticGapSubject::Value(value),
                 SemanticCapability::Captures,
                 SemanticGapKind::Unsupported,
-                "lexical receiver capture source is not represented by the parent procedure",
+                "closure capture is mutable, relayed, ambiguous, or not initialized before callable creation",
             )?;
         }
-        self.captured_receiver = Some(value);
         Ok(())
     }
 
@@ -63,10 +119,23 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     metadata,
                     SemanticValueKind::Local,
                 )?;
+                let binding = self
+                    .lexical_bindings
+                    .binding_identifier_ranges_at(text, name.start_byte())
+                    .into_iter()
+                    .find(|range| {
+                        range.start_byte == name.start_byte() && range.end_byte == name.end_byte()
+                    })
+                    .ok_or_else(|| {
+                        TsLoweringError::Invalid(format!(
+                            "local binding `{text}` has no declaration identity"
+                        ))
+                    })?;
                 self.locals
                     .entry(text.into())
                     .or_default()
                     .push(LocalBinding {
+                        binding,
                         scope_start,
                         scope_end,
                         value,
@@ -342,6 +411,8 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
 
         let source = self.prepared.source();
         let mut candidates: HashMap<ValueId, Candidate> = HashMap::default();
+        let mut element_fields: HashMap<ValueId, HashMap<u64, HashMap<Box<str>, SemanticLocator>>> =
+            HashMap::default();
         try_walk_named_tree_preorder(body, true, |node| {
             if self.session.cancellation().is_cancelled() {
                 return Err(TsLoweringError::Cancelled(Box::new(
@@ -366,6 +437,9 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                     declaration_parent: declaration_parent.id(),
                     available_after: node.end_byte(),
                 });
+                if let Some(fields) = self.array_literal_element_fields(initializer)? {
+                    element_fields.insert(value, fields);
+                }
             }
             Ok(WalkControl::Continue)
         })?;
@@ -437,6 +511,7 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         }
 
         let mut invalid_roots = HashSet::default();
+        let mut invalid_element_indices: HashMap<ValueId, HashSet<u64>> = HashMap::default();
         let mut escapes: HashMap<ValueId, usize> = HashMap::default();
         let mut boundary_ends = Vec::new();
         try_walk_named_tree_preorder(body, true, |node| {
@@ -472,9 +547,24 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             let Some(candidate) = candidates.get(&value) else {
                 return Ok(WalkControl::Continue);
             };
-            let supported_index = array_subscript_base_use(node)
-                .and_then(|index| constant_array_index(source, index))
-                .is_some();
+            let element_index = array_subscript_base_use(node)
+                .and_then(|index| constant_array_index(source, index));
+            let supported_index = element_index.is_some();
+            // A direct `items[0].field` access keeps the object at index 0
+            // under this lowerer's control. Any other use of `items[0]`
+            // (for example `const x = items[0]`, `f(items[0])`, or
+            // `items[0] = other`) can mutate or replace that object, so it
+            // invalidates only that element's literal field map. The array's
+            // own constant-index proof remains valid for other elements.
+            if let Some(index) = element_index
+                && let Some(subscript) = node.parent()
+                && !direct_array_element_member_use(subscript)
+            {
+                invalid_element_indices
+                    .entry(candidate.root)
+                    .or_default()
+                    .insert(index);
+            }
             let alias_use = array_alias_use(node).is_some_and(|(target, source_node)| {
                 let target_value = node_text(source, target)
                     .and_then(|name| self.local_at(name, target.start_byte()));
@@ -509,12 +599,21 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             Ok(WalkControl::Continue)
         })?;
         candidates.retain(|_, candidate| !invalid_roots.contains(&candidate.root));
+        element_fields.retain(|root, _| !invalid_roots.contains(root));
+        for (root, indices) in invalid_element_indices {
+            if let Some(elements) = element_fields.get_mut(&root) {
+                for index in indices {
+                    elements.remove(&index);
+                }
+            }
+        }
         self.array_locals = candidates
             .into_iter()
             .map(|(value, candidate)| {
                 (
                     value,
                     ArrayLocal {
+                        root: candidate.root,
                         declaration_parent: candidate.declaration_parent,
                         available_after: candidate.available_after,
                         escapes_after: escapes.get(&candidate.root).copied(),
@@ -522,7 +621,88 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                 )
             })
             .collect();
+        self.array_element_fields = element_fields;
         Ok(())
+    }
+
+    /// Return field locators for an array literal only when every element is
+    /// a directly written, plain object literal. The full child stream is
+    /// checked so elisions and spreads cannot be mistaken for adjacent
+    /// element positions; no source-text delimiter parsing is involved.
+    fn array_literal_element_fields(
+        &self,
+        initializer: Node<'tree>,
+    ) -> Result<Option<ArrayElementFields>, TsLoweringError> {
+        let source = self.prepared.source();
+        let mut elements = Vec::new();
+        let mut saw_open = false;
+        let mut expecting_element = false;
+        let mut saw_element = false;
+        let mut closed = false;
+        let mut cursor = initializer.walk();
+        for child in initializer.children(&mut cursor) {
+            if closed {
+                return Ok(None);
+            }
+            if !saw_open {
+                if child.kind() != "[" {
+                    return Ok(None);
+                }
+                saw_open = true;
+                expecting_element = true;
+                continue;
+            }
+            if child.kind() == "]" {
+                // A final comma is valid and does not create an elision.
+                if !expecting_element && !saw_element {
+                    return Ok(None);
+                }
+                closed = true;
+                continue;
+            }
+            if child.kind() == "," {
+                if expecting_element {
+                    return Ok(None);
+                }
+                expecting_element = true;
+                continue;
+            }
+            if !child.is_named() || !expecting_element || child.kind() != "object" {
+                return Ok(None);
+            }
+            if !is_plain_object_literal(source, child) {
+                return Ok(None);
+            }
+            elements.push(child);
+            saw_element = true;
+            expecting_element = false;
+        }
+        if !saw_open || !closed {
+            return Ok(None);
+        }
+        let mut result = HashMap::default();
+        for (index, element) in elements.into_iter().enumerate() {
+            let mut fields = HashMap::default();
+            for member in named_children(element) {
+                if member.kind() == "comment" {
+                    continue;
+                }
+                if member.kind() != "pair" {
+                    return Ok(None);
+                }
+                let Some(key) = member.child_by_field_name("key") else {
+                    return Ok(None);
+                };
+                let Some(field) = stable_member_key(source, key) else {
+                    return Ok(None);
+                };
+                fields
+                    .entry(field)
+                    .or_insert(self.memory_member_locator(key)?);
+            }
+            result.insert(index as u64, fields);
+        }
+        Ok(Some(result))
     }
 
     /// Whether `access` is a field access whose base identifier resolves to a
@@ -640,6 +820,68 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         false
     }
 
+    /// Whether a field access is rooted at a non-escaping array literal
+    /// element whose object-literal shape is known. This is separate from the
+    /// array's constant-index proof: the latter establishes only the array
+    /// slot, while this proof establishes the object and its data fields in
+    /// that slot.
+    pub(super) fn established_array_element_object(
+        &self,
+        access: Node<'tree>,
+        object: Node<'tree>,
+    ) -> bool {
+        let Some(array) = object.child_by_field_name("object") else {
+            return false;
+        };
+        let Some(index_node) = object.child_by_field_name("index") else {
+            return false;
+        };
+        let Some(index) = constant_array_index(self.prepared.source(), index_node) else {
+            return false;
+        };
+        if !self.established_array_base(access, array, index_node) {
+            return false;
+        }
+        let Some(name) = node_text(self.prepared.source(), array) else {
+            return false;
+        };
+        let Some(value) = self.local_at(name, array.start_byte()) else {
+            return false;
+        };
+        let Some(array_local) = self.array_locals.get(&value) else {
+            return false;
+        };
+        self.array_element_fields
+            .get(&array_local.root)
+            .is_some_and(|elements| elements.contains_key(&index))
+    }
+
+    /// Resolve a field on a proven array-literal element to the corresponding
+    /// object-literal key. A missing key remains unresolved and therefore
+    /// retains the ordinary identity gap.
+    pub(super) fn array_element_member_locator(
+        &self,
+        access: Node<'tree>,
+        object: Node<'tree>,
+        property: Node<'tree>,
+    ) -> Option<SemanticLocator> {
+        if !self.established_array_element_object(access, object) {
+            return None;
+        }
+        let array = object.child_by_field_name("object")?;
+        let index_node = object.child_by_field_name("index")?;
+        let index = constant_array_index(self.prepared.source(), index_node)?;
+        let name = node_text(self.prepared.source(), array)?;
+        let value = self.local_at(name, array.start_byte())?;
+        let array_local = self.array_locals.get(&value)?;
+        let field = stable_member_key(self.prepared.source(), property)?;
+        self.array_element_fields
+            .get(&array_local.root)?
+            .get(&index)?
+            .get(&field)
+            .cloned()
+    }
+
     pub(super) fn plain_object_member_locator(
         &mut self,
         object: Node<'tree>,
@@ -681,33 +923,47 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
             .map(|binding| binding.value)
     }
 
+    pub(super) fn stable_binding_value(&self, binding: &Range) -> Option<ValueId> {
+        self.locals
+            .values()
+            .flatten()
+            .find(|local| local.binding == *binding)
+            .map(|local| local.value)
+            .or_else(|| self.captured_bindings.get(binding).copied())
+    }
+
+    fn captured_binding_at(&self, name: &str, byte: usize) -> Option<ValueId> {
+        let bindings = self
+            .lexical_bindings
+            .binding_identifier_ranges_at(name, byte);
+        (bindings.len() == 1)
+            .then(|| self.captured_bindings.get(&bindings[0]).copied())
+            .flatten()
+    }
+
     pub(super) fn emit_procedure_inputs(
         &mut self,
         builder: &mut ProcedureCfgBuilder,
         spec: &ProcedureSpec<'tree>,
     ) -> Result<(), TsLoweringError> {
         let callable = spec.callable;
-        let declaration_range = node_range(callable);
-        let layout = if spec.kind == ProcedureKind::Initializer {
-            Default::default()
+        let parameter_slots = if spec.kind == ProcedureKind::Initializer {
+            Vec::new()
         } else {
-            formal_parameter_slots(
+            formal_parameter_slots_for_owner_with_nodes(
                 self.prepared.dialect().language(),
-                self.prepared.tree().root_node(),
+                callable,
                 self.prepared.source(),
-                &declaration_range,
             )
             .unwrap_or_default()
         };
         let mut ordinal = 0_u32;
-        for slot in layout.slots {
-            let node = callable
-                .named_descendant_for_byte_range(
-                    slot.declaration_range.start_byte,
-                    slot.declaration_range.end_byte,
-                )
-                .unwrap_or(callable);
-            let metadata = self.value_mapping(builder, node)?;
+        for (slot, node) in parameter_slots {
+            let metadata = if self.prepared.dialect().language() == Language::TypeScript {
+                self.parameter_mapping(builder, node)?
+            } else {
+                self.value_mapping(builder, node)?
+            };
             let receiver_slot = slot.receiver || slot.names.iter().any(|name| name == "this");
             if receiver_slot {
                 let receiver = self.session.add_value_with_metadata(
@@ -811,6 +1067,10 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
                             .copied()
                             .map(|source| (source, ValueFlowKind::Parameter))
                     })
+                    .or_else(|| {
+                        self.captured_binding_at(name, node.start_byte())
+                            .map(|source| (source, ValueFlowKind::Local))
+                    })
             })
         } else {
             None
@@ -883,6 +1143,23 @@ impl<'tree, 'targets> LoweringContext<'tree, 'targets> {
         let anchor = source_anchor(node, 0).map_err(TsLoweringError::Invalid)?;
         self.session
             .add_mapping(builder, anchor, SourceMappingKind::Exact)
+    }
+
+    fn parameter_mapping(
+        &mut self,
+        builder: &mut ProcedureCfgBuilder,
+        node: Node<'tree>,
+    ) -> Result<PointMetadata, TsLoweringError> {
+        let anchor = source_anchor(node, 0).map_err(TsLoweringError::Invalid)?;
+        let ast_identity = self
+            .structural_node_index
+            .and_then(|index| index.identity(node));
+        self.session.add_mapping_with_ast_identity(
+            builder,
+            anchor,
+            SourceMappingKind::Exact,
+            ast_identity,
+        )
     }
 
     pub(super) fn memory_member_locator(
@@ -1139,6 +1416,15 @@ fn array_subscript_base_use(node: Node<'_>) -> Option<Node<'_>> {
                 .and_then(|_| parent.child_by_field_name("index"))
         })
         .flatten()
+}
+
+fn direct_array_element_member_use(subscript: Node<'_>) -> bool {
+    subscript.parent().is_some_and(|parent| {
+        parent.kind() == "member_expression"
+            && parent
+                .child_by_field_name("object")
+                .is_some_and(|object| object.id() == subscript.id())
+    })
 }
 
 fn array_alias_use(node: Node<'_>) -> Option<(Node<'_>, Node<'_>)> {

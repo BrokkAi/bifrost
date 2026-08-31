@@ -46,6 +46,20 @@ macro_rules! forward_relational_definition_batch {
         fn active_query_cancellation(&self) -> Option<crate::CancellationToken> {
             self.inner.active_query_cancellation()
         }
+
+        fn active_query_semantic_model_overlay(
+            &self,
+        ) -> Option<Option<std::sync::Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>> {
+            self.inner.active_query_semantic_model_overlay()
+        }
+
+        fn active_query_semantic_model_snapshot(
+            &self,
+        ) -> Option<
+            Option<std::sync::Arc<crate::analyzer::semantic_model::ActiveSemanticModelSnapshot>>,
+        > {
+            self.inner.active_query_semantic_model_snapshot()
+        }
     };
 }
 
@@ -501,15 +515,39 @@ fn escape_sigil_anchors(pattern: &str) -> String {
 /// on most of `IAnalyzer`; carrying it on the request boundary that already
 /// exists gives the same reach without one.
 #[doc(hidden)]
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct AnalyzerQueryContext {
     first_store_error: Mutex<Option<StoreError>>,
     cancellation: Option<CancellationToken>,
+    /// A resolver overlay frozen by this scope's owner thread. The outer
+    /// `Option` distinguishes no override from a deliberately frozen absence;
+    /// the thread identity prevents the analyzer's shared context stack from
+    /// leaking one concurrent request's overlay into another.
+    semantic_model_overlay_override: Option<(
+        std::thread::ThreadId,
+        Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+    )>,
+    active_semantic_model_snapshot_override: Option<(
+        std::thread::ThreadId,
+        Option<Arc<crate::analyzer::semantic_model::ActiveSemanticModelSnapshot>>,
+    )>,
     /// Storage-funnel crossings observed while this request boundary was
     /// active, one counter per [`InformationTier`]. Scopes nest, so an access
     /// made under an inner scope is recorded on every enclosing scope too:
     /// each of them did pay for it.
     tier_accesses: [AtomicUsize; InformationTier::COUNT],
+}
+
+impl Default for AnalyzerQueryContext {
+    fn default() -> Self {
+        Self {
+            first_store_error: Mutex::new(None),
+            cancellation: None,
+            semantic_model_overlay_override: None,
+            active_semantic_model_snapshot_override: None,
+            tier_accesses: Default::default(),
+        }
+    }
 }
 
 /// Tier crossings paid while constructing one workspace analyzer.
@@ -602,6 +640,8 @@ pub struct AnalyzerSnapshotCaches {
     derived_layers: Arc<crate::analyzer::structural::derived_cache::SnapshotDerivedLayerCache>,
     usage_graphs:
         Arc<crate::analyzer::usages::workspace_graph_cache::SnapshotWorkspaceUsageGraphCache>,
+    java_usage_evidence:
+        Arc<crate::analyzer::usages::java_usage_evidence_cache::SnapshotJavaUsageEvidenceCache>,
     semantic_models: crate::analyzer::semantic_model::SemanticModelRuntimeCache,
 }
 
@@ -616,6 +656,11 @@ impl AnalyzerSnapshotCaches {
             usage_graphs: Arc::new(crate::analyzer::usages::workspace_graph_cache::SnapshotWorkspaceUsageGraphCache::new(
                 derived_layer_budget_bytes,
             )),
+            java_usage_evidence: Arc::new(
+                crate::analyzer::usages::java_usage_evidence_cache::SnapshotJavaUsageEvidenceCache::new(
+                    derived_layer_budget_bytes,
+                ),
+            ),
             semantic_models: crate::analyzer::semantic_model::SemanticModelRuntimeCache::new(
                 derived_layer_budget_bytes,
             ),
@@ -635,6 +680,7 @@ impl AnalyzerSnapshotCaches {
         Self {
             derived_layers: Arc::clone(&self.derived_layers),
             usage_graphs: Arc::clone(&self.usage_graphs),
+            java_usage_evidence: Arc::clone(&self.java_usage_evidence),
             semantic_models: crate::analyzer::semantic_model::SemanticModelRuntimeCache::new(
                 self.derived_layers.max_retained_bytes(),
             ),
@@ -653,6 +699,12 @@ impl AnalyzerSnapshotCaches {
         &self.usage_graphs
     }
 
+    pub(crate) fn java_usage_evidence(
+        &self,
+    ) -> &crate::analyzer::usages::java_usage_evidence_cache::SnapshotJavaUsageEvidenceCache {
+        &self.java_usage_evidence
+    }
+
     pub(crate) fn semantic_models(
         &self,
     ) -> &crate::analyzer::semantic_model::SemanticModelRuntimeCache {
@@ -665,10 +717,10 @@ impl AnalyzerSnapshotCaches {
         self.semantic_models.overlay()
     }
 
-    fn active_semantic_models(
+    fn active_semantic_model_snapshot(
         &self,
-    ) -> Option<Arc<crate::analyzer::semantic_model::ResolvedActiveSemanticModels>> {
-        self.semantic_models.active()
+    ) -> Option<Arc<crate::analyzer::semantic_model::ActiveSemanticModelSnapshot>> {
+        self.semantic_models.snapshot()
     }
 
     #[cfg(test)]
@@ -787,8 +839,56 @@ impl AnalyzerQueryContext {
         Self {
             first_store_error: Mutex::new(None),
             cancellation: Some(cancellation),
+            semantic_model_overlay_override: None,
+            active_semantic_model_snapshot_override: None,
             tier_accesses: Default::default(),
         }
+    }
+
+    fn with_semantic_model_overlay(
+        semantic_model_overlay: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+    ) -> Self {
+        Self {
+            first_store_error: Mutex::new(None),
+            cancellation: None,
+            semantic_model_overlay_override: Some((
+                std::thread::current().id(),
+                semantic_model_overlay,
+            )),
+            active_semantic_model_snapshot_override: None,
+            tier_accesses: Default::default(),
+        }
+    }
+
+    fn with_active_semantic_model_snapshot(
+        snapshot: Option<Arc<crate::analyzer::semantic_model::ActiveSemanticModelSnapshot>>,
+    ) -> Self {
+        Self {
+            first_store_error: Mutex::new(None),
+            cancellation: None,
+            semantic_model_overlay_override: None,
+            active_semantic_model_snapshot_override: Some((std::thread::current().id(), snapshot)),
+            tier_accesses: Default::default(),
+        }
+    }
+
+    pub(crate) fn semantic_model_overlay_override_for_current_thread(
+        &self,
+    ) -> Option<Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>> {
+        if let Some(snapshot) = self.active_semantic_model_snapshot_override_for_current_thread() {
+            return Some(
+                snapshot.and_then(|snapshot| snapshot.semantic_model_overlay().map(Arc::clone)),
+            );
+        }
+        let (owner, overlay) = self.semantic_model_overlay_override.as_ref()?;
+        (owner == &std::thread::current().id()).then(|| overlay.clone())
+    }
+
+    pub(crate) fn active_semantic_model_snapshot_override_for_current_thread(
+        &self,
+    ) -> Option<Option<Arc<crate::analyzer::semantic_model::ActiveSemanticModelSnapshot>>> {
+        let (owner, snapshot) = self.active_semantic_model_snapshot_override.as_ref()?;
+        (owner == &std::thread::current().id()).then(|| snapshot.clone())
     }
 
     /// Records one crossing of `tier`'s storage funnel under this request.
@@ -856,6 +956,24 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
         None
     }
 
+    /// The innermost frozen semantic-model overlay on the current thread.
+    ///
+    /// `None` means no query override is active and the analyzer may read its
+    /// live publication. `Some(None)` deliberately freezes an absent overlay.
+    #[doc(hidden)]
+    fn active_query_semantic_model_overlay(
+        &self,
+    ) -> Option<Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>> {
+        None
+    }
+
+    #[doc(hidden)]
+    fn active_query_semantic_model_snapshot(
+        &self,
+    ) -> Option<Option<Arc<crate::analyzer::semantic_model::ActiveSemanticModelSnapshot>>> {
+        None
+    }
+
     /// Starts a disposable file-local analyzer read used by broad sequential
     /// consumers such as C++ include-visibility traversal.
     #[doc(hidden)]
@@ -908,6 +1026,19 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
     /// always warm.
     fn query_indexes_warm(&self) -> bool {
         true
+    }
+
+    /// Stable identity of any external declaration surface consulted while
+    /// resolving dispatch for this analyzer generation.
+    ///
+    /// Asking for the identity may initialize the same lazy index dispatch
+    /// would read. `None` means this analyzer has no external dispatch surface,
+    /// not that its identity is unknown.
+    #[doc(hidden)]
+    fn external_dispatch_behavior_identity(
+        &self,
+    ) -> Option<crate::analyzer::semantic::StableDigest> {
+        None
     }
 
     /// Drop any cached bulk working-tree identities before an explicit
@@ -1136,8 +1267,23 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
     fn semantic_model_overlay(
         &self,
     ) -> Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>> {
+        if let Some(semantic_model_overlay) = self.active_query_semantic_model_overlay() {
+            return semantic_model_overlay;
+        }
         self.snapshot_caches()
             .and_then(AnalyzerSnapshotCaches::semantic_model_overlay)
+    }
+
+    /// The activated models and declaration overlay from one atomic runtime
+    /// publication, if a host has acquired them for this analyzer snapshot.
+    fn active_semantic_model_snapshot(
+        &self,
+    ) -> Option<Arc<crate::analyzer::semantic_model::ActiveSemanticModelSnapshot>> {
+        if let Some(snapshot) = self.active_query_semantic_model_snapshot() {
+            return snapshot;
+        }
+        self.snapshot_caches()
+            .and_then(AnalyzerSnapshotCaches::active_semantic_model_snapshot)
     }
 
     /// The activated semantic-model set published for this analyzer snapshot,
@@ -1153,8 +1299,8 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
     fn active_semantic_models(
         &self,
     ) -> Option<Arc<crate::analyzer::semantic_model::ResolvedActiveSemanticModels>> {
-        self.snapshot_caches()
-            .and_then(AnalyzerSnapshotCaches::active_semantic_models)
+        self.active_semantic_model_snapshot()
+            .map(|snapshot| Arc::clone(snapshot.active_models()))
     }
 
     /// Dependency-discovery evidence a host retained for `language`'s
@@ -1294,6 +1440,12 @@ pub trait IAnalyzer: CodeUnitIndex + Send + Sync + Any {
 
     fn contains_tests(&self, _file: &ProjectFile) -> bool {
         false
+    }
+
+    /// Whether a directly changed file contains runnable test evidence that is
+    /// too repository-local to classify every reverse-walk graph candidate.
+    fn contains_tests_for_changed_file(&self, file: &ProjectFile) -> bool {
+        self.contains_tests(file)
     }
 
     /// Whether `code_unit` sits in a structurally-evidenced test region — a
@@ -1559,6 +1711,19 @@ pub trait AnalyzerTestHooks {
         0
     }
 
+    /// Lifecycle counters for the snapshot-owned Java exact usage-evidence
+    /// cache. These counters are deliberately request-independent: they make
+    /// cold/warm and shared-work tests observable without timing assumptions.
+    #[doc(hidden)]
+    fn reset_java_usage_evidence_cache_stats_for_test(&self) {}
+
+    #[doc(hidden)]
+    fn java_usage_evidence_cache_stats_for_test(
+        &self,
+    ) -> crate::analyzer::JavaUsageEvidenceCacheStats {
+        Default::default()
+    }
+
     #[doc(hidden)]
     fn reset_workspace_path_scan_count_for_test(&self) {}
 
@@ -1585,6 +1750,34 @@ pub trait AnalyzerTestHooks {
 
     #[doc(hidden)]
     fn scala_query_walk_count_for_test(&self) -> usize {
+        0
+    }
+
+    /// Arm one deterministic semantic-cache invalidation after a selected
+    /// result-contract artifact has been promoted and before it is
+    /// materialized through the policy continuation.
+    #[doc(hidden)]
+    fn arm_selector_continuation_semantic_cache_invalidation_for_test(&self) {}
+
+    #[doc(hidden)]
+    fn invalidate_selector_continuation_semantic_cache_if_armed_for_test(&self) {}
+
+    #[doc(hidden)]
+    fn selector_continuation_semantic_cache_revivals_for_test(&self) -> u64 {
+        0
+    }
+
+    /// Arm one deterministic semantic-cache invalidation after a successful
+    /// typestate evaluation root has committed its artifact window and before
+    /// the next root starts.
+    #[doc(hidden)]
+    fn arm_evaluation_root_continuation_semantic_cache_invalidation_for_test(&self) {}
+
+    #[doc(hidden)]
+    fn invalidate_evaluation_root_continuation_semantic_cache_if_armed_for_test(&self) {}
+
+    #[doc(hidden)]
+    fn evaluation_root_continuation_semantic_cache_revivals_for_test(&self) -> u64 {
         0
     }
 }
@@ -1617,6 +1810,34 @@ impl<'a> AnalyzerQueryScope<'a> {
     ) -> Self {
         let context = Arc::new(AnalyzerQueryContext::with_cancellation(
             cancellation.clone(),
+        ));
+        analyzer.begin_query(&context);
+        Self { analyzer, context }
+    }
+
+    /// Open a resolver boundary against one exact semantic-model overlay.
+    /// Passing `None` freezes the absence instead of falling through to a
+    /// publication that may appear later in the request.
+    pub fn with_semantic_model_overlay(
+        analyzer: &'a dyn IAnalyzer,
+        semantic_model_overlay: Option<Arc<crate::analyzer::semantic_model::SemanticModelOverlay>>,
+    ) -> Self {
+        let context = Arc::new(AnalyzerQueryContext::with_semantic_model_overlay(
+            semantic_model_overlay,
+        ));
+        analyzer.begin_query(&context);
+        Self { analyzer, context }
+    }
+
+    /// Open a request boundary against one atomic active/overlay publication.
+    /// Nested consumers can recapture this snapshot without observing a later
+    /// live publication; `None` deliberately freezes the absence.
+    pub fn with_active_semantic_model_snapshot(
+        analyzer: &'a dyn IAnalyzer,
+        snapshot: Option<Arc<crate::analyzer::semantic_model::ActiveSemanticModelSnapshot>>,
+    ) -> Self {
+        let context = Arc::new(AnalyzerQueryContext::with_active_semantic_model_snapshot(
+            snapshot,
         ));
         analyzer.begin_query(&context);
         Self { analyzer, context }

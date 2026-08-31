@@ -3,11 +3,12 @@ use std::{cmp::Ordering, error::Error, fmt, hash::Hash, mem::size_of_val, sync::
 use crate::analyzer::semantic::{
     AbstractLocation, AbstractObject, AccessPathRoot, CallArgumentEndpoint, CallBinding,
     CallBindings, CallSiteHandle, CallSiteId, CallableTarget, CallableTargetResolution,
-    CandidateCoverage, ControlEdgeId, DeclarationLocator, DispatchBoundaryKind,
-    EvidenceCompleteness, GuardFact, IcfgEdgeKind, MemoryLocationKind, ObjectCardinality,
-    ProcedureHandle, ProcedureSemantics, ProgramPointHandle, ProgramPointId, ProofStatus,
-    SemanticArtifact, SemanticArtifactKey, SemanticEffect, SemanticGapImpact, SemanticGapKind,
-    SemanticLocator, SemanticValueKind, ValueFlowRelationKind, ValueFlowSnapshot,
+    CandidateCoverage, ControlEdgeId, DeclarationLocator, DeclarationSegmentKind,
+    DispatchBoundaryKind, EvidenceCompleteness, GuardFact, IcfgEdgeKind, MemoryLocationKind,
+    ObjectCardinality, ProcedureHandle, ProcedureSemantics, ProgramPointHandle, ProgramPointId,
+    ProofStatus, SemanticArtifact, SemanticArtifactKey, SemanticEffect, SemanticGapImpact,
+    SemanticGapKind, SemanticGapSubject, SemanticLocator, SemanticValueKind, ValueFlowRelationKind,
+    ValueFlowSnapshot,
 };
 use crate::dataflow::{
     CuratedCallModel, CuratedCallModelFingerprint, ExternalSemanticSummarySet,
@@ -302,6 +303,8 @@ fn completeness_heap_bytes(completeness: &EvidenceCompleteness) -> usize {
 fn classify_snapshot_openness(
     snapshot: &ValueFlowSnapshot,
     binding_complete: &HashMap<CallSiteHandle, bool>,
+    sources: &[ValueFlowSourceSpec],
+    sinks: &[ValueFlowSinkSpec],
 ) -> Option<Vec<CallSiteHandle>> {
     let procedure = snapshot.procedure();
     if crate::analyzer::semantic::workspace_oracle::value_flow_capabilities_are_open(procedure) {
@@ -310,6 +313,7 @@ fn classify_snapshot_openness(
     let abort_user_code = crate::analyzer::semantic::workspace_oracle::abort_paths_run_user_code(
         procedure.semantics(),
     );
+    let relevant_value_gaps = relevant_value_gap_carriers(snapshot, sources, sinks);
     let mut residual = Vec::new();
     for gap in procedure.semantics().gaps() {
         if !crate::analyzer::semantic::workspace_oracle::gap_impacts_value_flow(gap) {
@@ -355,10 +359,90 @@ fn classify_snapshot_openness(
             // with `None`, exactly as before -- the fails-closed path is
             // unchanged.
             None if snapshot.gap_is_discharged(gap.id) => {}
+            None if value_call_gap_is_local_dead_end(snapshot, gap, &relevant_value_gaps) => {}
             None => return None,
         }
     }
     Some(residual)
+}
+
+/// The value carriers whose incomplete semantics can affect a selected source
+/// or sink, or escape this procedure through a port, memory location, or call
+/// operand.
+///
+/// Build the reverse closure once per snapshot rather than walking every
+/// relation once per gap. The seed set is conservative at every boundary: a
+/// value passed to a call or projected onto heap/port state stays relevant even
+/// when this plan has no local sink for it (#2600).
+fn relevant_value_gap_carriers(
+    snapshot: &ValueFlowSnapshot,
+    sources: &[ValueFlowSourceSpec],
+    sinks: &[ValueFlowSinkSpec],
+) -> HashSet<ValueFlowCarrier> {
+    let mut predecessors: HashMap<ValueFlowCarrier, Vec<ValueFlowCarrier>> = HashMap::default();
+    let mut pending = sources
+        .iter()
+        .map(|source| source.carrier().clone())
+        .chain(sinks.iter().map(|sink| sink.carrier().clone()))
+        .collect::<Vec<_>>();
+    for relation in snapshot.relations() {
+        let source = ValueFlowCarrier::from(&relation.source);
+        let target = ValueFlowCarrier::from(&relation.target);
+        if matches!(
+            source,
+            ValueFlowCarrier::Port(_) | ValueFlowCarrier::Location(_)
+        ) {
+            pending.push(source.clone());
+        }
+        if matches!(
+            target,
+            ValueFlowCarrier::Port(_) | ValueFlowCarrier::Location(_)
+        ) {
+            pending.push(target.clone());
+        }
+        predecessors.entry(target).or_default().push(source);
+    }
+    for call in snapshot.procedure().semantics().call_sites() {
+        pending.extend(
+            std::iter::once(call.callee)
+                .chain(call.receiver)
+                .chain(call.arguments.iter().map(|argument| argument.value))
+                .filter_map(|value| snapshot.procedure().value_handle(value))
+                .map(ValueFlowCarrier::Value),
+        );
+    }
+
+    let mut reached = HashSet::default();
+    while let Some(carrier) = pending.pop() {
+        if !reached.insert(carrier.clone()) {
+            continue;
+        }
+        if let Some(sources) = predecessors.get(&carrier) {
+            pending.extend(sources.iter().cloned());
+        }
+    }
+    reached
+}
+
+/// Whether a value-scoped call-semantics gap is trapped in unobserved local
+/// values. Other capabilities, including callable-reference construction, keep
+/// their existing fail-closed behavior even when their subject looks dead.
+fn value_call_gap_is_local_dead_end(
+    snapshot: &ValueFlowSnapshot,
+    gap: &crate::analyzer::semantic::SemanticGap,
+    relevant: &HashSet<ValueFlowCarrier>,
+) -> bool {
+    if gap.capability != crate::analyzer::semantic::SemanticCapability::Calls {
+        return false;
+    }
+    let SemanticGapSubject::Value(value) = gap.subject else {
+        return false;
+    };
+    let Some(value) = snapshot.procedure().value_handle(value) else {
+        debug_assert!(false, "validated gap subject must name a live value");
+        return false;
+    };
+    !relevant.contains(&ValueFlowCarrier::Value(value))
 }
 
 fn summary_evidence_is_proven_complete(evidence: &SummaryEvidence) -> bool {
@@ -419,17 +503,17 @@ enum SummaryInputBinding {
     Unbound,
 }
 
-/// One residual dispatch arm closed by an authored-complete external summary
+/// One dispatch boundary closed by an authored-complete external summary
 /// (#2342).
 ///
 /// A run that concludes `ProvenBySummary` because of such a closure is trusting
-/// an authored claim to describe a call's target set, not only that target's
-/// behavior. That is a stronger use of the claim than binding its transfers, so
-/// the run records which claim it was: the call whose arm was closed, the exact
-/// target the summary was selected by, and the summary's authored origin --
-/// model id, content hash, and contract version. A consumer rendering the run
-/// can state what proved the closure instead of reporting an unexplained
-/// conclusion.
+/// an authored claim to model an external target. When the dispatch result also
+/// retained a residual arm, the claim describes that target's whole target set,
+/// not only its behavior. The run records which claim it was in both cases: the
+/// call whose boundary was closed, the exact target the summary was selected by,
+/// and the summary's authored origin -- model id, content hash, and contract
+/// version. A consumer rendering the run can state what proved the closure
+/// instead of reporting an unexplained conclusion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthoredArmClosure {
     call: CallSiteHandle,
@@ -438,7 +522,7 @@ pub struct AuthoredArmClosure {
 }
 
 impl AuthoredArmClosure {
-    /// The call whose residual dispatch arm this closure discharged.
+    /// The call whose dispatch boundary this closure discharged.
     pub const fn call(&self) -> &CallSiteHandle {
         &self.call
     }
@@ -1071,7 +1155,8 @@ impl ValueFlowPlan {
             } else if matches!(input.status(), SemanticInputStatus::Unknown)
                 && input.value().coverage() == CandidateCoverage::Open
             {
-                match classify_snapshot_openness(input.value(), &binding_complete) {
+                match classify_snapshot_openness(input.value(), &binding_complete, &sources, &sinks)
+                {
                     Some(residual) if residual.is_empty() => SnapshotDiscovery::Complete,
                     Some(residual) => SnapshotDiscovery::Refinable {
                         calls: residual.into_boxed_slice(),
@@ -1326,48 +1411,45 @@ impl ValueFlowPlan {
     /// in this immutable plan. Duplicate allocations are intentional: bounded
     /// host registries deduplicate them while accounting and validating.
     pub fn for_each_retained_artifact(&self, mut visit: impl FnMut(&Arc<SemanticArtifact>)) {
-        let mut visit_procedure = |procedure: &ProcedureHandle| visit(procedure.artifact());
-        visit_procedure(&self.root);
+        visit(self.root.artifact());
         for procedure in &self.snapshot_procedures {
-            visit_procedure(procedure);
+            visit(procedure.artifact());
         }
         for (call, callee) in &self.binding_pairs {
-            visit_procedure(call.procedure());
-            visit_procedure(callee);
+            visit(call.procedure().artifact());
+            visit(callee.artifact());
         }
         for carrier in &self.carriers {
-            if let Some(procedure) = carrier.procedure() {
-                visit_procedure(procedure);
-            }
+            carrier.for_each_retained_artifact(&mut visit);
         }
         for rule in &self.local_rules {
-            visit_procedure(rule.point.procedure());
+            visit(rule.point.procedure().artifact());
         }
         for rule in &self.call_rules {
-            visit_procedure(rule.call.procedure());
-            visit_procedure(&rule.callee);
+            visit(rule.call.procedure().artifact());
+            visit(rule.callee.artifact());
         }
         for profile in &self.fallback_profiles {
-            visit_procedure(profile.call.procedure());
+            visit(profile.call.procedure().artifact());
         }
         for model in &self.curated_call_models {
-            visit_procedure(model.call.procedure());
+            visit(model.call.procedure().artifact());
         }
         for binding in &self.summary_location_bindings {
-            visit_procedure(binding.call.procedure());
+            visit(binding.call.procedure().artifact());
         }
         for source in &self.sources {
-            visit_procedure(source.spec.point().procedure());
+            visit(source.spec.point().procedure().artifact());
         }
         for sink in &self.sinks {
-            visit_procedure(sink.spec.point().procedure());
+            visit(sink.spec.point().procedure().artifact());
         }
         if let Some(cause) = &self.first_incomplete_cause {
-            visit_procedure(cause.procedure());
+            visit(cause.procedure().artifact());
             if let ValueFlowIncompleteCause::CallBinding { call, .. }
             | ValueFlowIncompleteCause::CallBindingCoverage { call, .. } = cause
             {
-                visit_procedure(call.procedure());
+                visit(call.procedure().artifact());
             }
         }
     }
@@ -1625,6 +1707,7 @@ impl ValueFlowPlan {
             self.carrier_keys[rule.target.index()].hash(state);
             rule.proof.hash(state);
             rule.completeness.hash(state);
+            rule.strong_update.hash(state);
         }
         for rule in &self.call_rules {
             rule.call.hash(state);
@@ -1977,14 +2060,16 @@ impl ValueFlowPlan {
             .filter_map(SummaryBoundary::origin)
             .filter(|call| self.call_boundaries_are_fully_modeled(result, call, requirement))
             .collect::<Vec<_>>();
+        let abort_paths_only_unwind = std::cell::OnceCell::new();
         let edge_is_discharged = |edge: &crate::dataflow::SummaryEdge| {
-            matches!(
+            (matches!(
                 edge.kind(),
                 IcfgEdgeKind::CallToNormalContinuation
                     | IcfgEdgeKind::CallToExceptionalContinuation
             ) && edge
                 .origin()
-                .is_some_and(|origin| fully_modeled_calls.contains(&origin))
+                .is_some_and(|origin| fully_modeled_calls.contains(&origin)))
+                || self.exceptional_return_edge_is_abort_only(edge, &abort_paths_only_unwind)
         };
         result
             .coverage()
@@ -1996,11 +2081,14 @@ impl ValueFlowPlan {
                 .partial_edges()
                 .iter()
                 .all(edge_is_discharged)
-            && result
-                .coverage()
-                .boundaries()
-                .iter()
-                .all(|boundary| self.boundary_is_fully_modeled(result, boundary, requirement))
+            && result.coverage().boundaries().iter().all(|boundary| {
+                self.boundary_is_fully_modeled(
+                    result,
+                    boundary,
+                    requirement,
+                    &abort_paths_only_unwind,
+                )
+            })
     }
 
     /// Whether typed discovery is closed for this execution result (#1952):
@@ -2070,9 +2158,10 @@ impl ValueFlowPlan {
         result: &SummaryDataflowResult<Fact>,
         boundary: &SummaryBoundary,
         requirement: SummaryProofRequirement,
+        abort_paths_only_unwind: &std::cell::OnceCell<bool>,
     ) -> bool {
         if matches!(boundary.kind(), SummaryBoundaryKind::Semantic(_)) {
-            if self.exceptional_exit_boundary_is_abort_only(boundary) {
+            if self.exceptional_exit_boundary_is_abort_only(boundary, abort_paths_only_unwind) {
                 return true;
             }
             return boundary.origin().is_some_and(|call| {
@@ -2122,11 +2211,14 @@ impl ValueFlowPlan {
         } else {
             SemanticInputStatus::Complete
         };
+        let abort_paths_only_unwind = std::cell::OnceCell::new();
         result
             .coverage()
             .boundaries()
             .iter()
-            .filter(|boundary| !self.exceptional_exit_boundary_is_abort_only(boundary))
+            .filter(|boundary| {
+                !self.exceptional_exit_boundary_is_abort_only(boundary, &abort_paths_only_unwind)
+            })
             .filter_map(|boundary| match boundary.kind() {
                 SummaryBoundaryKind::Semantic(status) => Some(*status),
                 SummaryBoundaryKind::Dispatch(_)
@@ -2136,9 +2228,10 @@ impl ValueFlowPlan {
             .fold(seed, |current, incoming| current.merge(incoming))
     }
 
-    pub(crate) fn exceptional_exit_boundary_is_abort_only(
+    fn exceptional_exit_boundary_is_abort_only(
         &self,
         boundary: &SummaryBoundary,
+        abort_paths_only_unwind: &std::cell::OnceCell<bool>,
     ) -> bool {
         let SummaryBoundaryKind::Semantic(SemanticInputStatus::Unsupported {
             capability: crate::analyzer::semantic::SemanticCapability::ExceptionalControlFlow,
@@ -2156,6 +2249,30 @@ impl ValueFlowPlan {
         {
             return false;
         }
+        *abort_paths_only_unwind.get_or_init(|| self.abort_paths_only_unwind())
+    }
+
+    /// Whether an exceptional-return edge was weakened only by the same
+    /// implicit-abort profile that completion discharges at the callee's
+    /// exceptional-exit boundary.
+    ///
+    /// Return projection attaches the profile's proof and completeness to the
+    /// edge as well as publishing its semantic boundary. Its structured marker
+    /// is present only when the incoming call transfer was independently
+    /// proven and complete, so this discharge cannot forgive dispatch or call
+    /// evaluation uncertainty. Rendered proof text is deliberately not parsed.
+    fn exceptional_return_edge_is_abort_only(
+        &self,
+        edge: &crate::dataflow::SummaryEdge,
+        abort_paths_only_unwind: &std::cell::OnceCell<bool>,
+    ) -> bool {
+        if edge.kind() != IcfgEdgeKind::ExceptionalReturn || !edge.implicit_abort_only() {
+            return false;
+        }
+        *abort_paths_only_unwind.get_or_init(|| self.abort_paths_only_unwind())
+    }
+
+    fn abort_paths_only_unwind(&self) -> bool {
         self.summary_procedures().all(|procedure| {
             !crate::analyzer::semantic::workspace_oracle::abort_paths_run_user_code(
                 procedure.semantics(),
@@ -2198,24 +2315,20 @@ impl ValueFlowPlan {
         })
     }
 
-    /// The contract-claiming external summary that closes this call's residual
-    /// blanket-refinement arm, if the guards permit the closure (#2342, #2371).
+    /// The contract-claiming external summary that closes this call's named
+    /// external boundary or residual blanket-refinement arm, if the guards
+    /// permit the closure (#2342, #2371).
     ///
-    /// A call to a callee with no analyzed body carries two dispatch arms: the
-    /// named-target arm the activated summary binds to, and a residual
-    /// `Unresolved` arm minted from the adapter's blanket "the target may
-    /// select an override" gap. Neither dispatch-gap discharge route in
-    /// `workspace_oracle::dispatch` can fire on such a call, because both
-    /// require a materialized candidate and this call by construction has
-    /// none. The residual arm names no target, so `external_summary_for_boundary`
-    /// can never address it, and `ProvenBySummary` was unreachable for every
-    /// external call regardless of how complete the authored claim was.
+    /// The named-target arm is addressed directly by its activated summary. A
+    /// call whose language adapter also retained a blanket "the target may
+    /// select an override" gap carries a residual `Unresolved` arm beside it.
+    /// That residual names no target, so `external_summary_for_boundary` cannot
+    /// address it directly.
     ///
-    /// A contract-claiming summary for the exact target named on a sibling arm
-    /// of the same call is an assertion about every implementation of that
-    /// target, so it answers the residual arm too -- that is the "external
-    /// residual" half of #2371's discharge rule. The guards keep that from
-    /// becoming a blanket amnesty:
+    /// A contract-claiming summary for the exact target named on the call is an
+    /// assertion about every implementation of that target, so it answers the
+    /// residual arm too -- that is the "external residual" half of #2371's
+    /// discharge rule. The guards keep that from becoming a blanket amnesty:
     ///
     ///   * The caller admits only `AcceptAuthoredComplete`, so `Complete` keeps
     ///     asking `Derived` and authored trust still cannot launder into it
@@ -2225,12 +2338,11 @@ impl ValueFlowPlan {
     ///     second `Unresolved` arm name none, and a `Limit` or `Continuation`
     ///     boundary is not a dispatch arm at all -- none of them can carry the
     ///     summary, so a genuinely ambiguous target set still refuses.
-    ///   * The summary must carry an explicit `covers_overrides` claim (#2371),
-    ///     be authored complete, and be fully bindable at this call. Complete
-    ///     alone is not enough: it is a statement about the summary's own
-    ///     target, not about every implementation of it, so closing on
-    ///     completeness alone -- what this closure did before #2371 -- is
-    ///     exactly the inheritance the design rejects.
+    ///   * A receiver-bearing summary must carry an explicit
+    ///     `covers_overrides` claim (#2371). A receiverless target has no
+    ///     overrides to cover, so authored completeness is already a statement
+    ///     about its whole target set. In both cases the summary must be fully
+    ///     bindable at this call.
     ///   * The call must have no analyzed callee of its own. A call that both
     ///     enters a workspace body and names an unmaterialized declaration --
     ///     an interface member with one visible implementor, say -- has a
@@ -2238,16 +2350,17 @@ impl ValueFlowPlan {
     ///     about the implementors nobody enumerated. That is exactly the
     ///     genuine ambiguity the residual arm exists to report, so it refuses.
     ///
-    /// This closure is the "external residual" half of the discharge rule
-    /// only. The "workspace half" -- CHA proving the workspace implementors of
-    /// the resolved declaring member enumerated, possibly empty -- is proven
-    /// upstream in `workspace_oracle::dispatch`: a call whose only named target
-    /// is an unmaterialized external member carries no workspace declaration to
-    /// run CHA against, so that half is proven instead from the analyzer's
-    /// complete short-name index, and when it cannot be proven the call gets an
-    /// additional `Truncated` arm that this closure cannot address (`Truncated`
-    /// is excluded above), so `call_boundaries_are_fully_modeled` still refuses
-    /// the call as a whole. This closure never has to ask that question itself.
+    /// When a residual exists, this closure is the "external residual" half of
+    /// the discharge rule only. The "workspace half" -- CHA proving the
+    /// workspace implementors of the resolved declaring member enumerated,
+    /// possibly empty -- is proven upstream in `workspace_oracle::dispatch`.
+    /// A call whose only named target is an unmaterialized external member
+    /// carries no workspace declaration to run CHA against, so that half is
+    /// proven instead from the analyzer's complete short-name index. When it
+    /// cannot be proven the call gets an additional `Truncated` arm that this
+    /// closure cannot address (`Truncated` is excluded above), so
+    /// `call_boundaries_are_fully_modeled` still refuses the call as a whole.
+    /// This closure never has to ask that question itself.
     ///
     /// A sibling arm that names a target the activated packs do not summarize
     /// fails `call_boundaries_are_fully_modeled` on its own turn through the
@@ -2257,10 +2370,7 @@ impl ValueFlowPlan {
         result: &SummaryDataflowResult<Fact>,
         call: &CallSiteHandle,
     ) -> Option<AuthoredArmClosure> {
-        if self.has_binding_for_call(call) {
-            return None;
-        }
-        result
+        let target = result
             .coverage()
             .boundaries()
             .iter()
@@ -2269,48 +2379,59 @@ impl ValueFlowPlan {
                 let SummaryBoundaryKind::Dispatch(kind) = sibling.kind() else {
                     return None;
                 };
-                let target = match kind {
+                match kind {
                     DispatchBoundaryKind::External(Some(target))
-                    | DispatchBoundaryKind::Unmaterialized(target) => target,
+                    | DispatchBoundaryKind::Unmaterialized(target) => Some(target),
                     DispatchBoundaryKind::External(None)
                     | DispatchBoundaryKind::Deferred { .. }
                     | DispatchBoundaryKind::Unresolved
-                    | DispatchBoundaryKind::Truncated => return None,
-                };
-                let summary = self.external_summaries.summary_for(target)?;
-                let SummaryOrigin::External(origin) = summary.key().identity().origin() else {
-                    // An inferred summary is derived from a body Bifrost read,
-                    // so it is not an authored claim and has no authored
-                    // identity to record.
-                    return None;
-                };
-                // #2371: completeness alone used to be enough to close this
-                // arm, which is exactly the inheritance the design rejects --
-                // a summary can be honestly complete about its own target
-                // without its author having asserted anything about every
-                // other implementation of the member. `covers_overrides` is
-                // the explicit opt-in that statement requires; a call whose
-                // sibling arm names a target with no such claim keeps its
-                // residual arm open regardless of how complete the summary is.
-                if !origin.covers_overrides()
-                    || !summary.completeness().is_complete()
-                    || !self.model_is_fully_bindable(
-                        call,
-                        summary.transfers(),
-                        SummaryProofRequirement::AcceptAuthoredComplete,
-                    )
-                {
-                    return None;
+                    | DispatchBoundaryKind::Truncated => None,
                 }
-                Some(AuthoredArmClosure {
-                    call: call.clone(),
-                    target: target.clone(),
-                    origin: origin.clone(),
-                })
-            })
+            })?;
+        self.authored_target_closure(call, target)
     }
 
-    /// Every residual dispatch arm this result closed by an authored-complete
+    fn authored_target_closure(
+        &self,
+        call: &CallSiteHandle,
+        target: &SemanticLocator,
+    ) -> Option<AuthoredArmClosure> {
+        if self.has_binding_for_call(call) {
+            return None;
+        }
+        let summary = self.external_summaries.summary_for(target)?;
+        let SummaryOrigin::External(origin) = summary.key().identity().origin() else {
+            // An inferred summary is derived from a body Bifrost read, so it is
+            // not an authored claim and has no authored identity to record.
+            return None;
+        };
+        // #2371: receiver-bearing calls need an explicit claim about every
+        // implementation. A receiverless target has no implementations
+        // selected by override dispatch, so its complete summary already
+        // describes the entire target set.
+        let target_has_receiver = target
+            .declaration()
+            .segments()
+            .last()
+            .is_some_and(|segment| segment.kind() == DeclarationSegmentKind::Method);
+        if (target_has_receiver && !origin.covers_overrides())
+            || !summary.completeness().is_complete()
+            || !self.model_is_fully_bindable(
+                call,
+                summary.transfers(),
+                SummaryProofRequirement::AcceptAuthoredComplete,
+            )
+        {
+            return None;
+        }
+        Some(AuthoredArmClosure {
+            call: call.clone(),
+            target: target.clone(),
+            origin: origin.clone(),
+        })
+    }
+
+    /// Every dispatch boundary this result closed by an authored-complete
     /// external summary, in call order (#2342).
     ///
     /// A run that concludes `ProvenBySummary` because of such a closure must be
@@ -2323,18 +2444,26 @@ impl ValueFlowPlan {
     ) -> Vec<AuthoredArmClosure> {
         let mut closures = Vec::new();
         for boundary in result.coverage().boundaries() {
-            let (Some(call), SummaryBoundaryKind::Dispatch(DispatchBoundaryKind::Unresolved)) =
+            let (Some(call), SummaryBoundaryKind::Dispatch(kind)) =
                 (boundary.origin(), boundary.kind())
             else {
                 continue;
             };
-            if closures
-                .iter()
-                .any(|closure: &AuthoredArmClosure| &closure.call == call)
+            let closure = match kind {
+                DispatchBoundaryKind::External(Some(target))
+                | DispatchBoundaryKind::Unmaterialized(target) => {
+                    self.authored_target_closure(call, target)
+                }
+                DispatchBoundaryKind::Unresolved => self.authored_arm_closure(result, call),
+                DispatchBoundaryKind::External(None)
+                | DispatchBoundaryKind::Deferred { .. }
+                | DispatchBoundaryKind::Truncated => None,
+            };
+            if let Some(closure) = closure
+                && !closures.iter().any(|existing: &AuthoredArmClosure| {
+                    existing.call == closure.call && existing.target == closure.target
+                })
             {
-                continue;
-            }
-            if let Some(closure) = self.authored_arm_closure(result, call) {
                 closures.push(closure);
             }
         }
@@ -2639,6 +2768,7 @@ impl ValueFlowPlan {
             SummaryPort::Receiver => row.receiver?,
             SummaryPort::Parameter(index) => row.arguments.get(*index as usize)?.value,
             SummaryPort::NormalReturn => row.result?,
+            SummaryPort::IndexedNormalReturn(index) => row.normal_result(*index as usize)?,
             SummaryPort::ExceptionalReturn => row.thrown?,
             SummaryPort::Capture(_) | SummaryPort::Heap(_) => return None,
         };
@@ -3214,8 +3344,40 @@ fn carrierless_summary_input_is_vacuous(
 }
 
 #[cfg(test)]
+#[allow(clippy::duplicate_mod)]
+#[path = "../../../../test-support/inline_project.rs"]
+mod inline_project;
+
+#[cfg(test)]
 mod tests {
+    use std::hash::Hasher;
+
+    use crate::analyzer::semantic::{
+        CancellationToken, OracleCallContext, SemanticBudget, SemanticRequest, ValueFlowOracle,
+    };
+    use crate::analyzer::{AnalyzerConfig, Language};
+
+    use super::inline_project::InlineTestProject;
     use super::*;
+
+    #[derive(Default)]
+    struct HashTrace(Vec<u8>);
+
+    impl Hasher for HashTrace {
+        fn finish(&self) -> u64 {
+            0
+        }
+
+        fn write(&mut self, bytes: &[u8]) {
+            self.0.extend_from_slice(bytes);
+        }
+    }
+
+    fn propagation_hash_trace(plan: &ValueFlowPlan) -> Vec<u8> {
+        let mut trace = HashTrace::default();
+        plan.propagation_semantics_hash(&mut trace);
+        trace.0
+    }
 
     #[test]
     fn only_carrierless_constant_parameters_are_vacuous_summary_inputs() {
@@ -3235,6 +3397,97 @@ mod tests {
             &SummaryPort::Parameter(0),
             None,
         ));
+    }
+
+    #[test]
+    fn strong_update_changes_propagation_compatibility_hash() {
+        const SOURCE: &str = r#"
+package fixture
+
+type box struct {
+    value string
+}
+
+func run(input string) string {
+    holder := &box{}
+    holder.value = input
+    return holder.value
+}
+"#;
+
+        let project = InlineTestProject::with_language(Language::Go)
+            .file("flow.go", SOURCE)
+            .build();
+        let workspace = project.workspace_analyzer(AnalyzerConfig::default());
+        let cancellation = CancellationToken::default();
+        let mut budget = SemanticBudget::default();
+        let artifact_outcome = workspace
+            .materialize_program_semantics(
+                &project.file("flow.go"),
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("fixture semantics materialize");
+        let artifact = artifact_outcome
+            .available_value()
+            .cloned()
+            .expect("fixture semantics remain available");
+        let procedure = artifact
+            .procedures()
+            .iter()
+            .find(|procedure| {
+                procedure
+                    .locator()
+                    .declaration()
+                    .segments()
+                    .last()
+                    .and_then(|segment| segment.name())
+                    == Some("run")
+            })
+            .expect("fixture declares run");
+        let root = artifact
+            .procedure_handle(procedure.id())
+            .expect("fixture procedure remains live");
+
+        let mut budget = SemanticBudget::default();
+        let snapshot_outcome = workspace
+            .semantic_oracle_provider()
+            .procedure_relations(
+                &root,
+                &OracleCallContext::empty(),
+                &mut SemanticRequest::new(&mut budget, &cancellation),
+            )
+            .expect("fixture value-flow snapshot materializes");
+        let status = SemanticInputStatus::from_outcome(&snapshot_outcome);
+        let snapshot = snapshot_outcome
+            .available_value()
+            .cloned()
+            .expect("fixture value-flow snapshot remains available");
+        let plan = ValueFlowPlan::try_new(
+            root,
+            vec![ValueFlowInput::new(snapshot, status)],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("fixture value-flow plan");
+        let store = plan
+            .local_rules
+            .iter()
+            .position(|rule| rule.kind == ValueFlowRelationKind::MemoryStore)
+            .expect("fixture publishes a memory-store rule");
+
+        let mut changed = plan.clone();
+        changed.local_rules[store].strong_update = !changed.local_rules[store].strong_update;
+
+        assert!(
+            !plan.has_same_propagation_semantics(&changed),
+            "strong-update eligibility changes exact propagation semantics"
+        );
+        assert_ne!(
+            propagation_hash_trace(&plan),
+            propagation_hash_trace(&changed),
+            "the compatibility hash must partition every distinction enforced by exact compatibility"
+        );
     }
 }
 

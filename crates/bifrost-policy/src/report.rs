@@ -513,6 +513,12 @@ impl Serialize for EndpointBindingWire<'_> {
             PolicyEndpointBinding::MatchedValue => tagged_unit(serializer, "matched_value"),
             PolicyEndpointBinding::Receiver => tagged_unit(serializer, "receiver"),
             PolicyEndpointBinding::ReturnValue => tagged_unit(serializer, "return_value"),
+            PolicyEndpointBinding::ResultIndex { index } => {
+                let mut state = serializer.serialize_struct("PolicyEndpointBinding", 2)?;
+                state.serialize_field("type", "result_index")?;
+                state.serialize_field("index", index)?;
+                state.end()
+            }
             PolicyEndpointBinding::ArgumentIndex { index } => {
                 let mut state = serializer.serialize_struct("PolicyEndpointBinding", 2)?;
                 state.serialize_field("type", "argument_index")?;
@@ -1950,7 +1956,9 @@ impl RetainedSize for PolicyPackDecision {
 
 /// Top-level audit of semantic-pack activation for one evaluation (#1868).
 /// Records whether dependency packs used the absent-document default, an
-/// explicit ecosystem configuration, or explicit disablement.
+/// explicit ecosystem configuration, or explicit disablement, and includes
+/// reviewed models under `.bifrost/semantic-models/` when that route ran.
+/// Intrinsic shipped models alone do not add this optional review (#2493).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PolicyPackActivationReview {
     document_path: String,
@@ -2026,9 +2034,9 @@ impl RetainedSize for PolicyPackActivationReview {
 }
 
 /// The optional top-level reviews a report attaches when the matching input
-/// (a diff base, a workspace packs document, or a baseline document) is
+/// (a diff base, workspace pack configuration, or a baseline document) is
 /// present. Each review stays additive: a report without any of them keeps
-/// its exact schema-version-5 shape (#1880, #1868, #1881).
+/// its exact schema-version-5 shape (#1880, #1868, #1881, #2493).
 ///
 /// Folding the three into one collection gives them a single retained-size
 /// accounting site (the `RetainedSize` impl below) instead of a bespoke

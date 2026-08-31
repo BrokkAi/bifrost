@@ -118,18 +118,15 @@ fn semantic_execution_limits_require_each_dimension_to_be_positive() {
 }
 
 /// Issue #2523. Without a per-dimension table the executor must keep pricing
-/// each row lane against half of `max_retained_bytes`, split across the row
-/// dimensions -- that estimate is all a caller who supplies one scalar for
-/// fourteen lanes has given it. With a table the caller has priced the lanes
-/// itself against its own ledger, and the estimate must not narrow them: on
-/// google/gson it capped `nested_entries` at 11,650 rows against an audited
-/// 2,944,018.
+/// homogeneous retained-row lanes against half of `max_retained_bytes`, split
+/// across the row dimensions. With a table the caller has priced the lanes
+/// itself against its own ledger, and the estimate must not narrow them.
 #[test]
 fn a_per_dimension_row_table_overrides_the_retained_byte_estimate() {
     let defaults = CodeQuerySemanticLimits::default();
     let estimated = semantic::semantic_budget_limits(defaults);
     assert!(
-        estimated.nested_entries < defaults.max_rows_per_dimension,
+        estimated.program_points < defaults.max_rows_per_dimension,
         "the fixed defaults must exercise the estimate: {estimated:?}"
     );
 
@@ -149,6 +146,37 @@ fn a_per_dimension_row_table_overrides_the_retained_byte_estimate() {
     // The byte lanes are not row dimensions and keep their own limits.
     assert_eq!(published.source_bytes, estimated.source_bytes);
     assert_eq!(published.owned_text_bytes, estimated.owned_text_bytes);
+}
+
+/// `nested_entries` combines retained collections with bounded traversal that
+/// has no retained row. Treating every unit as a 96-byte `SemanticLocator`
+/// reduced the default scalar cap of 1,000,000 to 49,932 and left a fresh
+/// two-file exact Go switch query only six entries beyond that derived limit.
+#[test]
+fn heterogeneous_nested_work_uses_the_authored_row_limit() {
+    let defaults = CodeQuerySemanticLimits::default();
+    let published = semantic::semantic_budget_limits(defaults);
+    assert_eq!(published.nested_entries, defaults.max_rows_per_dimension);
+
+    let requested = 49_938;
+    let narrowed = semantic::semantic_budget_limits(CodeQuerySemanticLimits {
+        max_rows_per_dimension: requested,
+        ..defaults
+    });
+    assert_eq!(narrowed.nested_entries, requested);
+}
+
+#[test]
+fn owned_semantic_text_uses_retention_capacity_not_source_volume() {
+    let limits = CodeQuerySemanticLimits {
+        max_source_bytes: 1024 * 1024,
+        max_retained_bytes: 8 * 1024 * 1024,
+        ..CodeQuerySemanticLimits::default()
+    };
+    let published = semantic::semantic_budget_limits(limits);
+
+    assert_eq!(published.source_bytes, limits.max_source_bytes);
+    assert_eq!(published.owned_text_bytes, 4 * 1024 * 1024);
 }
 
 pub(super) fn assert_serial_profile_reconciles(profile: &QueryExecutionProfile) {
@@ -581,6 +609,7 @@ fn semantic_result_contracts_serialize_render_and_retain_source_evidence() {
             )),
             source_slice_sha256: Some([u8::try_from(index).unwrap(); 32]),
             provenance: Vec::new(),
+            decorated_parameter: None,
         }
     };
     let detailed = DetailedCodeQueryResult {
@@ -618,6 +647,7 @@ fn semantic_result_contracts_serialize_render_and_retain_source_evidence() {
             ),
         ],
         profile: None,
+        semantic_receipt: None,
     };
     detailed.assert_invariants();
 }
@@ -673,6 +703,7 @@ fn diagnostic_codes_have_exhaustive_stable_impacts_and_completion() {
         (Code::NoEnclosingProcedure, Impact::Advisory),
         (Code::SemanticCapabilityUnsupported, Impact::Incomplete),
         (Code::SemanticAnalysisPartial, Impact::Incomplete),
+        (Code::CallBindingDispatchPartial, Impact::Incomplete),
         (Code::SemanticBudgetExhausted, Impact::Incomplete),
         (Code::SemanticProviderFailed, Impact::Incomplete),
         (Code::ReceiverAnalysisPartial, Impact::Incomplete),
@@ -785,6 +816,75 @@ fn typed_diagnostic_producers_cover_budget_output_and_cancellation() {
     assert!(matches!(
         cancelled_query_result().completion(),
         CodeQueryCompletion::Cancelled
+    ));
+}
+
+/// Unit coverage for the #2779 root terminal-cap backstop's decision logic:
+/// `needs_root_terminal_cap_diagnostic` gates whether
+/// `execute_internal_with_analysis_strategy` pushes a truncation diagnostic
+/// for a truncated result that nothing else already explains. Exercised
+/// directly (rather than only through a full query execution) because every
+/// plan the RQL layer builds today always wraps its root in a `Limit`
+/// operator that already reports the cap it enforces (see the execution
+/// tests for that path); this pins the backstop's own conditions so it is
+/// covered even though the currently reachable plan shapes never trip it.
+#[test]
+fn root_terminal_cap_backstop_fires_only_for_an_unexplained_cap_truncation() {
+    // The fingerprint of a root-cap truncation: truncated, not cancelled, a
+    // positive limit, the row count landing exactly on that limit, and no
+    // diagnostic already carrying `Incomplete` impact.
+    assert!(needs_root_terminal_cap_diagnostic(true, false, 5, 5, &[]));
+
+    // Nothing to explain.
+    assert!(!needs_root_terminal_cap_diagnostic(false, false, 5, 5, &[]));
+
+    // A cancellation names itself with its own `Cancelled` diagnostic and can
+    // leave any row count; it must never be relabeled as a cap truncation.
+    assert!(!needs_root_terminal_cap_diagnostic(true, true, 5, 5, &[]));
+
+    // A zero limit makes an empty result trivial, not evidence of a cut.
+    assert!(!needs_root_terminal_cap_diagnostic(true, false, 0, 0, &[]));
+
+    // A row count below the limit means a different, unrelated mechanism
+    // (a budget lane, a stale-content retry, ...) stopped the query short;
+    // that mechanism must name itself instead of being mislabeled as the cap.
+    assert!(!needs_root_terminal_cap_diagnostic(true, false, 4, 5, &[]));
+
+    // An existing `Incomplete`-impact diagnostic already explains the
+    // truncation -- do not double- or mis-attribute it, whether or not it is
+    // literally `ResultLimitReached`.
+    assert!(!needs_root_terminal_cap_diagnostic(
+        true,
+        false,
+        5,
+        5,
+        &[diagnostic(
+            CodeQueryDiagnosticCode::ResultLimitReached,
+            CodeQueryDiagnosticImpact::Incomplete,
+        )]
+    ));
+    assert!(!needs_root_terminal_cap_diagnostic(
+        true,
+        false,
+        5,
+        5,
+        &[diagnostic(
+            CodeQueryDiagnosticCode::ExecutionBudgetExhausted,
+            CodeQueryDiagnosticImpact::Incomplete,
+        )]
+    ));
+
+    // An `Advisory`-impact diagnostic (e.g. `BroadQuery`) does not explain an
+    // incompleteness, so the backstop must still fire alongside it.
+    assert!(needs_root_terminal_cap_diagnostic(
+        true,
+        false,
+        5,
+        5,
+        &[diagnostic(
+            CodeQueryDiagnosticCode::BroadQuery,
+            CodeQueryDiagnosticImpact::Advisory,
+        )]
     ));
 }
 

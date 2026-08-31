@@ -39,10 +39,11 @@ pub use brokk_bifrost_analysis::{
     summarize_inputs,
 };
 pub use brokk_bifrost_analysis::{
-    analyzer, cache_db, cache_gc, cancellation, code_quality, compact_graph, diff_analysis,
-    file_tools, git_file, gitblob, hash, model_context, navigation, path_normalization, path_utils,
-    process, profiling, relevance, schema_version, searchtools, searchtools_render, summary,
-    symbol_rename, text_utils, usages, util, workspace_document,
+    analyzer, cache_db, cache_gc, cancellation, code_quality, compact_graph,
+    cyclomatic_complexity_diff, diff_analysis, file_tools, git_file, gitblob, hash, model_context,
+    navigation, path_normalization, path_utils, process, profiling, relevance, schema_version,
+    searchtools, searchtools_render, summary, symbol_rename, text_utils, usages, util,
+    workspace_document,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use brokk_bifrost_analysis::{
@@ -52,8 +53,8 @@ pub use brokk_bifrost_analysis::{
 pub use brokk_bifrost_flow as flow;
 pub use brokk_bifrost_lsp::lsp;
 pub use brokk_bifrost_mcp::{
-    mcp_cli, mcp_common, mcp_core, mcp_extended, mcp_registry, mcp_slopcop, mcp_text, rmcp_host,
-    scoped_project, searchtools_service, tool_arguments,
+    mcp_cli, mcp_common, mcp_core, mcp_diff, mcp_extended, mcp_registry, mcp_slopcop, mcp_text,
+    rmcp_host, scoped_project, searchtools_service, tool_arguments,
 };
 pub use brokk_bifrost_policy as policy;
 pub use brokk_bifrost_rql::{
@@ -74,7 +75,11 @@ pub fn install_bifrost_semantic_model_packs() -> Result<(), String> {
             brokk_bifrost_mcp::searchtools_service::install_semantic_model_catalog_bootstrap(
                 register_bifrost_semantic_model_packs,
             )
-            .map_err(str::to_owned)
+            .map_err(str::to_owned)?;
+            brokk_bifrost_analysis::analyzer::semantic_model::set_generated_production_acquisition_hook(
+                Some(brokk_bifrost_semantic_packs::download::acquire_generated_production),
+            );
+            Ok(())
         })
         .clone()
 }

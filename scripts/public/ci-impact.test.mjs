@@ -138,7 +138,7 @@ test("ordinary analyzer and test changes select the Rust matrix only", () => {
 test("pinned semantic-pack inputs and builders select only their matching lanes", () => {
   for (const [changedPath, component] of [
     ["semantic-packs/jvm/temurin-jdk-21.0.8+9.json", "semantic_pack_jvm"],
-    ["semantic-packs/python/typeshed-stdlib-2026.8.8.json", "semantic_pack_python"],
+    ["semantic-packs/python/typeshed-stdlib-2026.8.31.json", "semantic_pack_python"],
     ["semantic-packs/typescript/typescript-7.0.2.json", "semantic_pack_typescript"],
     ["semantic-packs/rust/rust-stdlib-nightly-2026-08-24.json", "semantic_pack_rust"],
     ["scripts/public/build-pinned-jvm-semantic-packs.sh", "semantic_pack_jvm"],

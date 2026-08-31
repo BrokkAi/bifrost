@@ -1,0 +1,699 @@
+{
+  "schema_version": 1,
+  "pack_id": "bifrost.go.stdlib.net-declarations",
+  "version": "1.1.0",
+  "producer": {
+    "name": "bifrost",
+    "version": "0.10.7"
+  },
+  "language": "go",
+  "ecosystem": "go",
+  "compatibility": {
+    "bifrost": ">=0.10.7, <1.0.0",
+    "toolchains": []
+  },
+  "provenance": {
+    "source": "https://pkg.go.dev/net",
+    "revision": "go1.26.0"
+  },
+  "license": "BSD-3-Clause",
+  "completeness": "partial",
+  "safety": {
+    "generated_code_only": false,
+    "review_required": false
+  },
+  "shards": [
+    {
+      "id": "go.stdlib.net.declarations",
+      "activation": [
+        {}
+      ],
+      "payload": {
+        "kind": "declaration_facts",
+        "types": [
+          {
+            "id": "type.d38a97811c1f5377b31ce35fec4044aade55f1f9cabbd6d84bb45563d695de48",
+            "name": "net",
+            "type_kind": "module",
+            "visibility": "package",
+            "is_abstract": false,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [],
+            "aliases": [
+              "net"
+            ],
+            "extension_surfaces": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "net/net.go",
+              "symbol": "net"
+            }
+          },
+          {
+            "id": "type.e787bbcd3ab1d2d588b3b05c3f88fa0dcdd40bb4ecba196ca5cc8e5638016f77",
+            "name": "net.Conn",
+            "type_kind": "interface",
+            "visibility": "public",
+            "is_abstract": true,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [],
+            "aliases": [],
+            "extension_surfaces": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "net/net.go",
+              "symbol": "net.Conn"
+            }
+          },
+          {
+            "id": "type.d5d96e805db6a6ba6abef788cfe33345bb3d78948c5b1fe95abb810898505e3d",
+            "name": "net.Listener",
+            "type_kind": "interface",
+            "visibility": "public",
+            "is_abstract": true,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [],
+            "aliases": [],
+            "extension_surfaces": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "net/net.go",
+              "symbol": "net.Listener"
+            }
+          },
+          {
+            "id": "type.fdff4962d361a2e29fa9b73643fd573cd0ebab82d9d459416bfe025d698bd1ae",
+            "name": "net.Addr",
+            "type_kind": "interface",
+            "visibility": "public",
+            "is_abstract": true,
+            "is_sealed": false,
+            "has_explicit_type_terms": false,
+            "type_parameters": [],
+            "type_parameter_constraints": [],
+            "embedded_types": [],
+            "hierarchy": [],
+            "aliases": [],
+            "extension_surfaces": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "net/net.go",
+              "symbol": "net.Addr"
+            }
+          }
+        ],
+        "members": [
+          {
+            "id": "member.d0aa465e92136c45be3c6a1d2b6f54fb1addae8b625dd4ce3b9c8e2a51f1dd17",
+            "owner": "type.d38a97811c1f5377b31ce35fec4044aade55f1f9cabbd6d84bb45563d695de48",
+            "name": "Dial",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "network",
+                  "type": {
+                    "kind": "named",
+                    "name": "string",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                },
+                {
+                  "name": "address",
+                  "type": {
+                    "kind": "named",
+                    "name": "string",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ],
+              "returns": {
+                "kind": "tuple",
+                "elements": [
+                  {
+                    "kind": "declared",
+                    "id": "type.e787bbcd3ab1d2d588b3b05c3f88fa0dcdd40bb4ecba196ca5cc8e5638016f77",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  {
+                    "kind": "named",
+                    "name": "error",
+                    "arguments": [],
+                    "nullable": false
+                  }
+                ]
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "net/dial.go",
+              "symbol": "net.Dial"
+            }
+          },
+          {
+            "id": "member.ead53a44232a9997505b0c78665160d60989ad5374576153b2a28ee96ac1ef57",
+            "owner": "type.d38a97811c1f5377b31ce35fec4044aade55f1f9cabbd6d84bb45563d695de48",
+            "name": "DialTimeout",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "network",
+                  "type": {
+                    "kind": "named",
+                    "name": "string",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                },
+                {
+                  "name": "address",
+                  "type": {
+                    "kind": "named",
+                    "name": "string",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                },
+                {
+                  "name": "timeout",
+                  "type": {
+                    "kind": "named",
+                    "name": "time.Duration",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ],
+              "returns": {
+                "kind": "tuple",
+                "elements": [
+                  {
+                    "kind": "declared",
+                    "id": "type.e787bbcd3ab1d2d588b3b05c3f88fa0dcdd40bb4ecba196ca5cc8e5638016f77",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  {
+                    "kind": "named",
+                    "name": "error",
+                    "arguments": [],
+                    "nullable": false
+                  }
+                ]
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "net/dial.go",
+              "symbol": "net.DialTimeout"
+            }
+          },
+          {
+            "id": "member.7e970dc0ebba4aec16eaf04bffd6ef9ce97abecd540ebe6c1613cd59d5dd3cb1",
+            "owner": "type.d38a97811c1f5377b31ce35fec4044aade55f1f9cabbd6d84bb45563d695de48",
+            "name": "Listen",
+            "member_kind": "function",
+            "visibility": "public",
+            "is_static": true,
+            "is_abstract": false,
+            "is_virtual": false,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "network",
+                  "type": {
+                    "kind": "named",
+                    "name": "string",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                },
+                {
+                  "name": "address",
+                  "type": {
+                    "kind": "named",
+                    "name": "string",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ],
+              "returns": {
+                "kind": "tuple",
+                "elements": [
+                  {
+                    "kind": "declared",
+                    "id": "type.d5d96e805db6a6ba6abef788cfe33345bb3d78948c5b1fe95abb810898505e3d",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  {
+                    "kind": "named",
+                    "name": "error",
+                    "arguments": [],
+                    "nullable": false
+                  }
+                ]
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "net/dial.go",
+              "symbol": "net.Listen"
+            }
+          },
+          {
+            "id": "member.a94387c564df330568778ae3c34af7584e806fdce77e13459880b377b37bf6a1",
+            "owner": "type.e787bbcd3ab1d2d588b3b05c3f88fa0dcdd40bb4ecba196ca5cc8e5638016f77",
+            "name": "Read",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "b",
+                  "type": {
+                    "kind": "slice",
+                    "element": {
+                      "kind": "named",
+                      "name": "byte",
+                      "arguments": [],
+                      "nullable": false
+                    }
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ],
+              "returns": {
+                "kind": "tuple",
+                "elements": [
+                  {
+                    "kind": "named",
+                    "name": "int",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  {
+                    "kind": "named",
+                    "name": "error",
+                    "arguments": [],
+                    "nullable": false
+                  }
+                ]
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "net/net.go",
+              "symbol": "net.Conn.Read"
+            }
+          },
+          {
+            "id": "member.2cbd9496c842076da0a62e26712847a558c13a8409b3b0c49ee3700f63b23011",
+            "owner": "type.e787bbcd3ab1d2d588b3b05c3f88fa0dcdd40bb4ecba196ca5cc8e5638016f77",
+            "name": "Write",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "b",
+                  "type": {
+                    "kind": "slice",
+                    "element": {
+                      "kind": "named",
+                      "name": "byte",
+                      "arguments": [],
+                      "nullable": false
+                    }
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ],
+              "returns": {
+                "kind": "tuple",
+                "elements": [
+                  {
+                    "kind": "named",
+                    "name": "int",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  {
+                    "kind": "named",
+                    "name": "error",
+                    "arguments": [],
+                    "nullable": false
+                  }
+                ]
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "net/net.go",
+              "symbol": "net.Conn.Write"
+            }
+          },
+          {
+            "id": "member.9e5d7791074079fe5b96c95aeceb02a66d57f7fe7d86d44ee75fcd951685cb67",
+            "owner": "type.e787bbcd3ab1d2d588b3b05c3f88fa0dcdd40bb4ecba196ca5cc8e5638016f77",
+            "name": "Close",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "error",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "net/net.go",
+              "symbol": "net.Conn.Close"
+            }
+          },
+          {
+            "id": "member.60e3f5cc4a879960d4a2db0c131b0a0a4379d466d9ba6ce2a5db533367c0ea37",
+            "owner": "type.e787bbcd3ab1d2d588b3b05c3f88fa0dcdd40bb4ecba196ca5cc8e5638016f77",
+            "name": "LocalAddr",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [],
+              "returns": {
+                "kind": "declared",
+                "id": "type.fdff4962d361a2e29fa9b73643fd573cd0ebab82d9d459416bfe025d698bd1ae",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "net/net.go",
+              "symbol": "net.Conn.LocalAddr"
+            }
+          },
+          {
+            "id": "member.d9f81ee9a095a7cef3c0fb0059fd199c121a3d621ac86c0113c50e6c4228ff14",
+            "owner": "type.e787bbcd3ab1d2d588b3b05c3f88fa0dcdd40bb4ecba196ca5cc8e5638016f77",
+            "name": "RemoteAddr",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [],
+              "returns": {
+                "kind": "declared",
+                "id": "type.fdff4962d361a2e29fa9b73643fd573cd0ebab82d9d459416bfe025d698bd1ae",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "net/net.go",
+              "symbol": "net.Conn.RemoteAddr"
+            }
+          },
+          {
+            "id": "member.56cd504f8cffb4b197f739de9a42598409ce4f2818acb83df1ed59410461c87e",
+            "owner": "type.e787bbcd3ab1d2d588b3b05c3f88fa0dcdd40bb4ecba196ca5cc8e5638016f77",
+            "name": "SetDeadline",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "t",
+                  "type": {
+                    "kind": "named",
+                    "name": "time.Time",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "error",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "net/net.go",
+              "symbol": "net.Conn.SetDeadline"
+            }
+          },
+          {
+            "id": "member.e26d9433a8e0c69fe5407de1ba8f90fcc79a8c28d58be1b9bfaac094dac9591b",
+            "owner": "type.e787bbcd3ab1d2d588b3b05c3f88fa0dcdd40bb4ecba196ca5cc8e5638016f77",
+            "name": "SetReadDeadline",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "t",
+                  "type": {
+                    "kind": "named",
+                    "name": "time.Time",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "error",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "net/net.go",
+              "symbol": "net.Conn.SetReadDeadline"
+            }
+          },
+          {
+            "id": "member.55fb7bf7b01bb3cce4102fe976108ecb49a3702d51702972f8bdf0e5cc6a45e4",
+            "owner": "type.e787bbcd3ab1d2d588b3b05c3f88fa0dcdd40bb4ecba196ca5cc8e5638016f77",
+            "name": "SetWriteDeadline",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [
+                {
+                  "name": "t",
+                  "type": {
+                    "kind": "named",
+                    "name": "time.Time",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  "optional": false,
+                  "variadic": false
+                }
+              ],
+              "returns": {
+                "kind": "named",
+                "name": "error",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "net/net.go",
+              "symbol": "net.Conn.SetWriteDeadline"
+            }
+          },
+          {
+            "id": "member.06cebde229380755cb67610307caac617e42eec90584be0ca1eea18589e207d6",
+            "owner": "type.d5d96e805db6a6ba6abef788cfe33345bb3d78948c5b1fe95abb810898505e3d",
+            "name": "Accept",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [],
+              "returns": {
+                "kind": "tuple",
+                "elements": [
+                  {
+                    "kind": "declared",
+                    "id": "type.e787bbcd3ab1d2d588b3b05c3f88fa0dcdd40bb4ecba196ca5cc8e5638016f77",
+                    "arguments": [],
+                    "nullable": false
+                  },
+                  {
+                    "kind": "named",
+                    "name": "error",
+                    "arguments": [],
+                    "nullable": false
+                  }
+                ]
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "net/net.go",
+              "symbol": "net.Listener.Accept"
+            }
+          },
+          {
+            "id": "member.55f712f755092c3ed22f0682d7392224ca0f51b58d8d73367890ae8d13c46216",
+            "owner": "type.d5d96e805db6a6ba6abef788cfe33345bb3d78948c5b1fe95abb810898505e3d",
+            "name": "Close",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [],
+              "returns": {
+                "kind": "named",
+                "name": "error",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "net/net.go",
+              "symbol": "net.Listener.Close"
+            }
+          },
+          {
+            "id": "member.effebae083533e73bc1bf11f4715c5ce5b7698b0b45dea86b4828b025404b07d",
+            "owner": "type.d5d96e805db6a6ba6abef788cfe33345bb3d78948c5b1fe95abb810898505e3d",
+            "name": "Addr",
+            "member_kind": "method",
+            "visibility": "public",
+            "is_static": false,
+            "is_abstract": true,
+            "is_virtual": true,
+            "signature": {
+              "type_parameters": [],
+              "parameters": [],
+              "returns": {
+                "kind": "declared",
+                "id": "type.fdff4962d361a2e29fa9b73643fd573cd0ebab82d9d459416bfe025d698bd1ae",
+                "arguments": [],
+                "nullable": false
+              }
+            },
+            "aliases": [],
+            "locator": {
+              "kind": "artifact",
+              "path": "net/net.go",
+              "symbol": "net.Listener.Addr"
+            }
+          }
+        ],
+        "relations": []
+      }
+    }
+  ]
+}

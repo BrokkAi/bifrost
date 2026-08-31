@@ -3,6 +3,10 @@ use super::*;
 use brokk_bifrost_core::analyzer::model::CallableArity;
 use brokk_bifrost_core::analyzer::structural::resolution::MethodFamilyRelation;
 
+use super::call_binding::{
+    semantic_model_completeness_label, semantic_model_origin_label, semantic_model_proof_label,
+};
+
 pub(super) fn insert_pipeline_row(
     rows: &mut Vec<PipelineRow>,
     indexes: &mut HashMap<PipelineKey, usize>,
@@ -98,6 +102,17 @@ pub(super) fn render_pipeline_item(
         PipelineValue::CallEffect(value) => CodeQueryResultValue::CallEffect {
             value: Box::new(render_call_effect(analyzer, &value, detail, cache)),
         },
+        PipelineValue::CallResultContract(value) => CodeQueryResultValue::CallResultContract {
+            value: Box::new(render_call_result_contract(analyzer, &value, detail, cache)),
+        },
+        PipelineValue::ResultContractUse(value) => CodeQueryResultValue::ResultContractUse {
+            value: Box::new(render_result_contract_use(analyzer, &value, cache)),
+        },
+        PipelineValue::ResultContractFailureUse(value) => {
+            CodeQueryResultValue::ResultContractFailureUse {
+                value: Box::new(render_result_contract_failure_use(analyzer, &value, cache)),
+            }
+        }
         PipelineValue::ProcedureEffect(value) => CodeQueryResultValue::ProcedureEffect {
             value: Box::new(render_procedure_effect(analyzer, &value, cache)),
         },
@@ -279,6 +294,18 @@ pub(super) fn render_provenance(
                             site_id: rendered.site_id,
                             path: rendered.path,
                             range: rendered.range,
+                            semantic_target_id: rendered.semantic_target_id,
+                            target_origin: rendered.target_origin,
+                            model_id: rendered.model_id,
+                            receiver_type_id: rendered.receiver_type_id,
+                            pack_id: rendered.pack_id,
+                            model_record_id: rendered.model_record_id,
+                            model_activation_status: rendered.model_activation_status,
+                            model_activation_source_kind: rendered.model_activation_source_kind,
+                            model_activation_source_id: rendered.model_activation_source_id,
+                            model_origin: rendered.model_origin,
+                            model_proof: rendered.model_proof,
+                            model_completeness: rendered.model_completeness,
                             binding_kind: rendered.binding_kind,
                             mapping: rendered.mapping,
                             coverage: rendered.coverage,
@@ -293,6 +320,46 @@ pub(super) fn render_provenance(
                             range: rendered.range,
                             effect_id: rendered.effect_id,
                             derivation: rendered.derivation,
+                            coverage: rendered.coverage,
+                        }
+                    }
+                    PipelineTraceValue::CallResultContract(value) => {
+                        let rendered = render_call_result_contract(analyzer, value, detail, cache);
+                        CodeQueryResultRef::CallResultContract {
+                            id: rendered.id,
+                            site_id: rendered.site_id,
+                            path: rendered.path,
+                            range: rendered.range,
+                            result_ordinal: rendered.result_ordinal,
+                            condition_result_ordinal: rendered.condition_result_ordinal,
+                            predicate: rendered.predicate,
+                            result_success_predicate: rendered.result_success_predicate,
+                            coverage: rendered.coverage,
+                        }
+                    }
+                    PipelineTraceValue::ResultContractUse(value) => {
+                        let rendered = render_result_contract_use(analyzer, value, cache);
+                        CodeQueryResultRef::ResultContractUse {
+                            id: rendered.id,
+                            acquisition_id: rendered.acquisition_id,
+                            path: rendered.path,
+                            range: rendered.range,
+                            use_kind: rendered.use_kind,
+                            parameter_ordinal: rendered.parameter_ordinal,
+                            applicability: rendered.applicability,
+                            guard: rendered.guard,
+                            coverage: rendered.coverage,
+                        }
+                    }
+                    PipelineTraceValue::ResultContractFailureUse(value) => {
+                        let rendered = render_result_contract_failure_use(analyzer, value, cache);
+                        CodeQueryResultRef::ResultContractFailureUse {
+                            id: rendered.id,
+                            acquisition_id: rendered.acquisition_id,
+                            path: rendered.path,
+                            range: rendered.range,
+                            provenance: rendered.failure_provenance,
+                            consumer: rendered.consumer,
                             coverage: rendered.coverage,
                         }
                     }
@@ -1443,18 +1510,33 @@ pub(super) fn render_declaration(
         .or_else(|| analyzer.signatures_of(&declaration.unit).into_iter().next());
     let semantic_model = analyzer.semantic_model_overlay().and_then(|overlay| {
         let matched = overlay.symbols_named(&fq_name);
-        (matched.disposition
-            == crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique)
-            .then(|| Box::new(matched.records[0].provenance.clone()))
+        if matched.disposition
+            != crate::analyzer::semantic_model::SemanticModelOverlayDisposition::Unique
+        {
+            return None;
+        }
+        let symbol = matched.records[0];
+        let exact_origin = declaration.unit.is_synthetic()
+            || matches!(
+                &symbol.location,
+                crate::analyzer::semantic_model::SemanticModelLocation::Authored(anchor)
+                    if anchor.path == path && anchor.symbol == fq_name
+            );
+        exact_origin.then(|| (symbol.id.clone(), Box::new(symbol.provenance.clone())))
     });
     CodeQueryDeclaration {
         id: full.then(|| {
-            declaration_id(
-                &path,
-                declaration.identity_kind_label(),
-                &fq_name,
-                declaration.range,
-            )
+            semantic_model
+                .as_ref()
+                .map(|(id, _)| id.clone())
+                .unwrap_or_else(|| {
+                    declaration_id(
+                        &path,
+                        declaration.identity_kind_label(),
+                        &fq_name,
+                        declaration.range,
+                    )
+                })
         }),
         path,
         language: crate::analyzer::common::language_for_file(declaration.unit.source())
@@ -1467,7 +1549,7 @@ pub(super) fn render_declaration(
         node_range: full
             .then(|| cache.range_for_declaration(analyzer, declaration))
             .flatten(),
-        semantic_model,
+        semantic_model: semantic_model.map(|(_, provenance)| provenance),
     }
 }
 
@@ -2071,9 +2153,11 @@ pub(super) fn render_call_shape(
         callee_range: outcome
             .callee_range
             .map(|range| render_source_range(analyzer, &outcome.file, &range, cache)),
+        callee_name: outcome.callee_name.clone(),
         call_kind: outcome.call_kind.label(),
         coverage: outcome.coverage.label(),
         group_count: value.report.groups.len(),
+        argument_count: value.report.arguments.len(),
     }
 }
 
@@ -2122,6 +2206,8 @@ pub(super) fn render_call_binding(
 ) -> CodeQueryCallBinding {
     let report = &value.site.report;
     let row = value.row();
+    let provenance = value.site.semantic_model_provenance.as_deref();
+    let summary = value.site.selector.summary_provenance.as_deref();
     CodeQueryCallBinding {
         id: row.id.clone(),
         site_id: row.site_id.clone(),
@@ -2136,16 +2222,48 @@ pub(super) fn render_call_binding(
             .target
             .as_ref()
             .map(|target| render_declaration(analyzer, target, detail, cache)),
-        semantic_target_id: value.site.dispatch.target_id.clone(),
+        semantic_target_id: value.site.semantic_target_id.clone(),
+        target_origin: value.site.target_origin,
         dispatch_outcome: value.site.dispatch.outcome,
         dispatch_coverage: value.site.dispatch.coverage,
         dispatch_proof: value.site.dispatch.proof,
         dispatch_completeness: value.site.dispatch.completeness,
         dispatch_target_count: value.site.dispatch.target_count,
         dispatch_targets_truncated: value.site.dispatch.targets_truncated,
+        selector_exact: value.site.selector.exact,
+        selector_proof: value.site.selector.tier,
+        selector_summary_id: value.site.selector.summary_id.clone(),
+        selector_summary_model_id: value.site.selector.summary_model_id.clone(),
+        selector_summary_pack_id: summary.map(|value| value.pack_id.clone()),
+        selector_summary_active_set_hash: summary.map(|value| value.active_model_set_hash.clone()),
+        selector_summary_pack_digest: summary.map(|value| value.pack_digest.clone()),
+        selector_summary_pack_version: summary.map(|value| value.pack_version.clone()),
+        selector_summary_record_id: summary.map(|value| value.record_id.clone()),
+        selector_summary_origin: summary.map(|value| semantic_model_origin_label(value.origin)),
+        selector_summary_model_proof: summary.map(|value| semantic_model_proof_label(value.proof)),
+        selector_summary_completeness: summary
+            .map(|value| semantic_model_completeness_label(value.completeness)),
+        selector_summary_producer: summary.map(|value| value.producer.clone()),
+        selector_summary_producer_version: summary.map(|value| value.producer_version.clone()),
         signature_id: value.site.signature_id.clone(),
         model_id: value.site.model_id.clone(),
+        receiver_type_id: value.site.receiver_type_id.clone(),
         pack_id: value.site.pack_id.clone(),
+        model_active_set_hash: provenance.map(|value| value.active_model_set_hash.clone()),
+        model_pack_digest: provenance.map(|value| value.pack_digest.clone()),
+        model_pack_version: provenance.map(|value| value.pack_version.clone()),
+        model_record_id: provenance.map(|value| value.record_id.clone()),
+        model_activation_status: provenance.map(|value| value.activation.status.clone()),
+        model_activation_reason: provenance.map(|value| value.activation.reason.clone()),
+        model_activation_source_kind: provenance.map(|value| value.activation.source_kind.clone()),
+        model_activation_source_id: provenance.map(|value| value.activation.source_id.clone()),
+        model_origin: provenance.map(|value| semantic_model_origin_label(value.origin)),
+        model_proof: provenance.map(|value| semantic_model_proof_label(value.proof)),
+        model_completeness: provenance
+            .map(|value| semantic_model_completeness_label(value.completeness)),
+        model_ambiguous: provenance.map(|value| value.ambiguous),
+        model_producer: provenance.map(|value| value.producer.clone()),
+        model_producer_version: provenance.map(|value| value.producer_version.clone()),
         actual_index: row.actual_index,
         actual_name: row.actual_name.clone(),
         formal_index: row.formal_index,
@@ -2197,6 +2315,135 @@ pub(super) fn render_call_effect(
         arm_count: report.arm_count,
         modeled_arm_count: report.modeled_arm_count,
         terminal: row.terminal,
+    }
+}
+
+pub(super) fn render_call_result_contract(
+    analyzer: &dyn IAnalyzer,
+    value: &effects::CallResultContractValue,
+    detail: CodeQueryResultDetail,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryCallResultContract {
+    CodeQueryCallResultContract {
+        id: value.id.clone(),
+        site_id: value.site_id.clone(),
+        site_ast_id: value.site_ast_id.clone(),
+        path: rel_path_string(&value.file),
+        language: crate::analyzer::common::language_for_file(&value.file).config_label(),
+        range: render_source_range(analyzer, &value.file, &value.range, cache),
+        target_id: value.target_id.clone(),
+        callee: value
+            .callee
+            .as_ref()
+            .map(|callee| render_declaration(analyzer, callee, detail, cache)),
+        callee_symbol: value.callee_symbol.clone(),
+        result_ordinal: value.result_ordinal,
+        condition_result_ordinal: value.condition_result_ordinal,
+        predicate: value.predicate.map(effects::result_predicate_label),
+        result_success_predicate: value
+            .result_success_predicate
+            .map(effects::result_predicate_label),
+        proof: value.proof.map(|proof| proof.label()),
+        coverage: value.coverage.label(),
+        reason: value.reason.map(|reason| reason.label()),
+        pack_id: value.pack_id.clone(),
+        model_id: value.model_id.clone(),
+        summary_id: value.summary_id.clone(),
+        arm_count: value.arm_count,
+        modeled_arm_count: value.modeled_arm_count,
+        terminal: value.terminal,
+        result_use_count: value.result_use_count,
+        unguarded_result_use_count: value.unguarded_result_use_count,
+        use_validation: value.use_validation,
+        use_validation_coverage: value
+            .use_validation_coverage
+            .map(|coverage| coverage.label()),
+        success_guard_count: value.success_guard_edges.len(),
+        fresh_allocation: value.fresh_allocation,
+        member_contract_count: value.member_contracts.len(),
+        member_contracts: value.member_contracts.clone(),
+        success_guard_coverage: value.success_guard_coverage,
+        success_guard_edges: value.success_guard_edges.clone(),
+        possible_success_guard_edges: value.possible_success_guard_edges.clone(),
+    }
+}
+
+pub(super) fn render_result_contract_use(
+    analyzer: &dyn IAnalyzer,
+    value: &effects::ResultContractUseValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultContractUse {
+    CodeQueryResultContractUse {
+        id: value.id.clone(),
+        acquisition_id: value.acquisition_id.clone(),
+        acquisition_site_id: value.acquisition_site_id.clone(),
+        acquisition_site_ast_id: value.acquisition_site_ast_id.clone(),
+        operation_point_id: value.operation_point_id.clone(),
+        operation_site_id: value.operation_site_id.clone(),
+        operation_site_ast_id: value.operation_site_ast_id.clone(),
+        ast_id: value.ast_id.clone(),
+        path: rel_path_string(&value.file),
+        language: crate::analyzer::common::language_for_file(&value.file).config_label(),
+        range: render_source_range(analyzer, &value.file, &value.range, cache),
+        result_ordinal: value.result_ordinal,
+        condition_result_ordinal: value.condition_result_ordinal,
+        acquisition_predicate: value
+            .acquisition_predicate
+            .map(effects::result_predicate_label),
+        result_success_predicate: value
+            .result_success_predicate
+            .map(effects::result_predicate_label),
+        required_predicate: value
+            .required_predicate
+            .map(effects::result_predicate_label),
+        use_kind: value.use_kind.label(),
+        timing: value.timing.label(),
+        applicability: value.applicability.label(),
+        guard: value.guard.label(),
+        coverage: value.coverage.label(),
+        member: value.member.clone(),
+        parameter_count: value.parameter_count,
+        parameter_ordinal: value.parameter_ordinal,
+        pack_id: value.pack_id.clone(),
+        model_id: value.model_id.clone(),
+        summary_id: value.summary_id.clone(),
+    }
+}
+
+pub(super) fn render_result_contract_failure_use(
+    analyzer: &dyn IAnalyzer,
+    value: &effects::ResultContractFailureUseValue,
+    cache: &mut PipelineRenderCache,
+) -> CodeQueryResultContractFailureUse {
+    CodeQueryResultContractFailureUse {
+        id: value.id.clone(),
+        acquisition_id: value.acquisition_id.clone(),
+        acquisition_site_id: value.acquisition_site_id.clone(),
+        acquisition_site_ast_id: value.acquisition_site_ast_id.clone(),
+        procedure_id: value.procedure_id.clone(),
+        condition_result_ordinal: value.condition_result_ordinal,
+        condition_value_id: value.condition_value_id,
+        failure_edge_id: value.failure_edge_id.clone(),
+        consumer_point_id: value.consumer_point_id.clone(),
+        consumer_call_id: value.consumer_call_id.clone(),
+        consumer_site_id: value.consumer_site_id.clone(),
+        consumer_site_ast_id: value.consumer_site_ast_id.clone(),
+        ast_id: value.ast_id.clone(),
+        path: rel_path_string(&value.file),
+        language: crate::analyzer::common::language_for_file(&value.file).config_label(),
+        range: render_source_range(analyzer, &value.file, &value.range, cache),
+        operand_value_id: value.operand_value_id,
+        binding_value_id: value.binding_value_id,
+        establishment_point_id: value.establishment_point_id.clone(),
+        establishment_value_id: value.establishment_value_id,
+        failure_provenance: value.provenance.label(),
+        consumer: value.consumer.label(),
+        argument_ordinal: value.argument_ordinal,
+        proof: value.proof.label(),
+        coverage: value.coverage.label(),
+        pack_id: value.pack_id.clone(),
+        model_id: value.model_id.clone(),
+        summary_id: value.summary_id.clone(),
     }
 }
 
@@ -2316,13 +2563,23 @@ pub(super) fn render_receiver_evidence(
     };
     let declaration =
         declaration_unit.map(|unit| declaration_value_for_unit(analyzer, unit, fallback));
-    let rendered_declaration_id = declaration.as_ref().map(|declaration| {
-        declaration_id(
-            &rel_path_string(declaration.unit.source()),
-            declaration.identity_kind_label(),
-            &declaration.unit.fq_name(),
-            declaration.range,
-        )
+    let rendered_declaration = declaration.as_ref().map(|declaration| {
+        render_declaration(analyzer, declaration, CodeQueryResultDetail::Full, cache)
+    });
+    let rendered_declaration_id = rendered_declaration
+        .as_ref()
+        .and_then(|declaration| declaration.id.clone());
+    let model_id = rendered_declaration.as_ref().and_then(|declaration| {
+        declaration
+            .semantic_model
+            .as_ref()
+            .and_then(|_| declaration.id.clone())
+    });
+    let pack_id = rendered_declaration.as_ref().and_then(|declaration| {
+        declaration
+            .semantic_model
+            .as_ref()
+            .map(|provenance| provenance.pack_id.clone())
     });
     let factory_id = value.factory.as_ref().map(|factory| {
         let declaration = declaration_value_for_unit(analyzer, factory, fallback);
@@ -2343,6 +2600,12 @@ pub(super) fn render_receiver_evidence(
         site_id: value.receiver.site_id.clone(),
         site_ast_id: value.receiver.site_ast_id.clone(),
         path: rel_path_string(&value.receiver.report.site.file),
+        range: render_source_range(
+            analyzer,
+            &value.receiver.report.site.file,
+            &value.receiver.report.site.range,
+            cache,
+        ),
         parent_evidence_id: value.parent_evidence_id.clone(),
         ordinal: value.ordinal,
         chain_hop: value.chain_hop,
@@ -2350,6 +2613,8 @@ pub(super) fn render_receiver_evidence(
         declaration_id: rendered_declaration_id,
         declaration_fq_name: declaration.as_ref().map(|value| value.unit.fq_name()),
         declaration_kind: declaration.as_ref().map(DeclarationValue::kind_label),
+        model_id,
+        pack_id,
         factory_id,
         proof,
         completeness,

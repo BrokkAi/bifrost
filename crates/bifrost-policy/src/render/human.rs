@@ -1141,6 +1141,7 @@ fn write_endpoint_binding<W: Write>(
         PolicyEndpointBinding::MatchedValue => write!(output, "matched value"),
         PolicyEndpointBinding::Receiver => write!(output, "receiver"),
         PolicyEndpointBinding::ReturnValue => write!(output, "return value"),
+        PolicyEndpointBinding::ResultIndex { index } => write!(output, "result {index}"),
         PolicyEndpointBinding::ArgumentIndex { index } => write!(output, "argument {index}"),
         PolicyEndpointBinding::ArgumentName { name } => {
             write!(output, "argument {}", escape_terminal_text(name))
