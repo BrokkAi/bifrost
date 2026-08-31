@@ -17,6 +17,7 @@
 //! evaluation: prefix queries are built by cloning the resolved selector and
 //! truncating its step list.
 
+use std::collections::BTreeSet;
 use std::ops::Range;
 
 use brokk_bifrost_analysis::analyzer::ProjectFile;
@@ -441,16 +442,17 @@ pub(super) fn run_prefixes(
     // reasons of every strict suffix before consuming the results for
     // authored-order presentation.
     let mut suffix_exhaustive = true;
-    let mut suffix_reasons = Vec::new();
+    let mut suffix_reasons = BTreeSet::new();
     let mut later_prefix_state = Vec::with_capacity(executable);
     for (_, executed) in executed_prefixes.iter().rev() {
-        later_prefix_state.push((suffix_exhaustive, suffix_reasons.clone()));
+        later_prefix_state.push((
+            suffix_exhaustive,
+            suffix_reasons.iter().copied().collect::<Vec<_>>(),
+        ));
         let completion = executed.result.completion();
         if !matches!(completion, CodeQueryCompletion::Complete) {
             suffix_exhaustive = false;
             suffix_reasons.extend(absence_reasons(&completion, executed.result.truncated));
-            suffix_reasons.sort();
-            suffix_reasons.dedup();
         }
     }
     later_prefix_state.reverse();
