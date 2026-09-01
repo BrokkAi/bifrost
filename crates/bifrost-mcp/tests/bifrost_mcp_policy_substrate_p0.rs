@@ -52,6 +52,9 @@ fn mcp_server_binary() -> &'static str {
 
 fn spawn_server(root: &Path) -> Child {
     Command::new(mcp_server_binary())
+        // This fixture proves a checked-in workspace model, not whichever JDK
+        // dependency pack the developer machine happens to expose.
+        .env_remove("JAVA_HOME")
         // The workspace-authoring location for semantic models is opt-in.
         .env("BIFROST_WORKSPACE_SEMANTIC_MODELS", "on")
         // A functional wire test must not incidentally assert the cold-start

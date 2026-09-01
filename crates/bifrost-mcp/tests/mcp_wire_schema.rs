@@ -525,6 +525,9 @@ impl WireSession {
 
     fn spawn(revision: &'static str, mut command: Command) -> Self {
         // A wire-schema test asserts message shape, not cold-start latency.
+        // It must also not inherit dependency-pack work from the developer
+        // machine; controlled pack tests opt into their own fake JDK.
+        command.env_remove("JAVA_HOME");
         // Left at the production default, a first call made during the
         // workspace build is held to COLD_WORKSPACE_REQUEST_BUDGET (4.5s), so
         // suite saturation would fail a schema assertion for box load. Two

@@ -450,16 +450,7 @@ fn bifrost_searchtools_server_speaks_mcp_stdio() {
     )
     .expect("set remote default");
 
-    let mut child = Command::new(mcp_server_binary())
-        .arg("--root")
-        .arg(fixture_root.path())
-        .arg("--mcp")
-        .arg("searchtools")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn bifrost");
+    let mut child = spawn_server(fixture_root.path(), "searchtools", &[]);
 
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
@@ -5256,6 +5247,9 @@ fn spawn_server(root: &std::path::Path, mode: &str, extra_args: &[&str]) -> std:
 /// select the wrong budget by passing the wrong argument.
 fn spawn_server_at_production_budget(root: &std::path::Path, mode: &str) -> std::process::Child {
     Command::new(mcp_server_binary())
+        // This guard measures the source workspace cold-start contract. Pack
+        // activation has dedicated tests with a controlled fake JDK.
+        .env_remove("JAVA_HOME")
         .arg("--root")
         .arg(root)
         .arg("--mcp")
@@ -5493,7 +5487,15 @@ fn profiled_stderr_capture_bounds_tail_and_transport_evidence() {
 
 fn mcp_server_command(root: &std::path::Path, mode: &str, extra_args: &[&str]) -> Command {
     let mut command = Command::new(mcp_server_binary());
-    command.arg("--root").arg(root).arg("--mcp").arg(mode);
+    // Ordinary protocol fixtures must not inherit dependency-pack work from
+    // the developer machine. Pack-activation tests set their fake JDK after
+    // constructing this command.
+    command
+        .env_remove("JAVA_HOME")
+        .arg("--root")
+        .arg(root)
+        .arg("--mcp")
+        .arg(mode);
     for arg in extra_args {
         command.arg(arg);
     }
@@ -5692,6 +5694,7 @@ fn spawn_rootless_server(cwd: &std::path::Path, mode: &str) -> std::process::Chi
     // not cold-start latency.
     apply_test_request_budget(&mut command);
     command
+        .env_remove("JAVA_HOME")
         .arg("--mcp")
         .arg(mode)
         .current_dir(cwd)
@@ -5710,6 +5713,7 @@ fn spawn_server_no_args(cwd: &std::path::Path) -> std::process::Child {
     // not cold-start latency.
     apply_test_request_budget(&mut command);
     command
+        .env_remove("JAVA_HOME")
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
