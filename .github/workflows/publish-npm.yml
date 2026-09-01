@@ -135,7 +135,9 @@ jobs:
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/npm-qualified"
           mapfile -t files < <(jq -r '.files[] | select(.path | startswith("brokkai-bifrost-") and endswith(".tgz")) | .path' qualification/release-qualification.json)
-          test "${#files[@]}" -eq 8
+          # One root package plus six platform packages. The separately named
+          # brokk-bifrost-agent archive is published by release.yml.
+          test "${#files[@]}" -eq 7
           for file in "${files[@]}"; do cp "qualification/$file" "$RUNNER_TEMP/npm-qualified/"; done
 
       - name: Install npm trusted-publishing client
