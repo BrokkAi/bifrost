@@ -226,13 +226,38 @@ impl LspServer {
     /// points, so "the next publishDiagnostics" is not necessarily the
     /// response to the latest edit.
     pub fn read_publish_diagnostics_for_version(&mut self, uri: &str, version: i64) -> Value {
+        self.read_publish_diagnostics_for_version_matching(uri, version, |_| true, "any state")
+    }
+
+    /// Read version-matched diagnostic publishes until their level-triggered
+    /// state satisfies `settled`. Background activation may republish the same
+    /// URI and version, so callers asserting content must not assume the first
+    /// matching notification is the state caused by their edit.
+    pub fn read_publish_diagnostics_for_version_matching(
+        &mut self,
+        uri: &str,
+        version: i64,
+        settled: impl Fn(&[Value]) -> bool,
+        what: &str,
+    ) -> Value {
+        let mut last = Value::Null;
         for _ in 0..32 {
             let msg = self.read_notification("textDocument/publishDiagnostics");
-            if msg["params"]["uri"] == uri && msg["params"]["version"] == version {
+            if msg["params"]["uri"] != uri || msg["params"]["version"] != version {
+                continue;
+            }
+            let diagnostics = msg["params"]["diagnostics"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            if settled(diagnostics) {
                 return msg;
             }
+            last = msg;
         }
-        panic!("did not receive publishDiagnostics for {uri} version {version} within 32 messages");
+        panic!(
+            "publishDiagnostics for {uri} version {version} did not settle on {what} within 32 messages; last was {last}"
+        );
     }
 
     /// Read inbound messages until the response with `id` arrives.

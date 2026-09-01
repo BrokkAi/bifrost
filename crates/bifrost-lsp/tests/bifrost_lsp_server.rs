@@ -10395,7 +10395,12 @@ fn bifrost_lsp_server_incremental_utf16_crlf_edits_refresh_hover_and_diagnostics
             ]
         }
     }));
-    let broken = server.read_publish_diagnostics_for_version(&file_uri, 2);
+    let broken = server.read_publish_diagnostics_for_version_matching(
+        &file_uri,
+        2,
+        |diagnostics| !diagnostics.is_empty(),
+        "the malformed incremental Rust diagnostic",
+    );
     assert!(
         !broken["params"]["diagnostics"]
             .as_array()
@@ -10419,7 +10424,12 @@ fn bifrost_lsp_server_incremental_utf16_crlf_edits_refresh_hover_and_diagnostics
             }]
         }
     }));
-    let cleared = server.read_publish_diagnostics_for_version(&file_uri, 3);
+    let cleared = server.read_publish_diagnostics_for_version_matching(
+        &file_uri,
+        3,
+        |diagnostics| diagnostics.is_empty(),
+        "cleared diagnostics after removing malformed Rust",
+    );
     assert!(
         cleared["params"]["diagnostics"]
             .as_array()
