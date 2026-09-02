@@ -172,6 +172,20 @@ impl Language {
         }
     }
 
+    /// Every analyzable language whose source registry contains `extension`,
+    /// including reference-only files such as `.vue` and `.razor`. A shared
+    /// file can belong to more than one language: `.vue` belongs to both
+    /// JavaScript and TypeScript.
+    pub fn languages_for_source_extension(extension: &str) -> impl Iterator<Item = Self> {
+        let normalized = extension.trim_start_matches('.').to_ascii_lowercase();
+        Self::ANALYZABLE.into_iter().filter(move |language| {
+            language.extensions().contains(&normalized.as_str())
+                || language
+                    .reference_only_sibling_extensions()
+                    .contains(&normalized.as_str())
+        })
+    }
+
     pub fn is_source_extension(extension: &str) -> bool {
         let normalized = extension.trim_start_matches('.').to_ascii_lowercase();
         Self::ANALYZABLE.iter().any(|language| {
@@ -354,6 +368,27 @@ mod language_dialect_tests {
             "typescript"
         );
         assert_eq!(LanguageDialect::CppC.semantic_pack_label(), "cpp-c");
+    }
+}
+
+#[cfg(test)]
+mod language_source_extension_tests {
+    use super::*;
+
+    #[test]
+    fn source_extension_classification_includes_reference_only_siblings() {
+        assert_eq!(
+            Language::languages_for_source_extension(".vue").collect::<Vec<_>>(),
+            vec![Language::JavaScript, Language::TypeScript]
+        );
+        assert_eq!(
+            Language::languages_for_source_extension("RAZOR").collect::<Vec<_>>(),
+            vec![Language::CSharp]
+        );
+        assert_eq!(
+            Language::languages_for_source_extension(".unknown").count(),
+            0
+        );
     }
 }
 

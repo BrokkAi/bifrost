@@ -1,10 +1,11 @@
 use crate::{
-    SearchToolsService, SearchToolsServiceError, SearchToolsServiceErrorCode,
+    Language, SearchToolsService, SearchToolsServiceError, SearchToolsServiceErrorCode,
     mcp_common::McpRenderOptions, mcp_registry::resolve_server_spec_for_render_options,
     scoped_project::create_scoped_service, searchtools_render::RenderOptions,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 #[pyclass(name = "SearchToolsNativeSession")]
@@ -142,10 +143,66 @@ fn code_query_variant_inventory_json() -> PyResult<String> {
     serde_json::to_string(&inventory).map_err(|err| PyRuntimeError::new_err(err.to_string()))
 }
 
+/// Every file extension for the language(s) present among `paths`, including reference-only
+/// siblings such as TS/JS's `.vue`/`.svelte`, derived from Bifrost's own source-extension registry
+/// rather than a caller-maintained copy of it. Pure and does not open a workspace: a caller can
+/// scope a
+/// [`SearchToolsNativeSession`]'s `sources` to a diff's own language(s) before paying the cost of
+/// indexing anything -- e.g. skip a large unrelated frontend when a diff only touches backend code.
+#[pyfunction]
+fn extensions_for_paths(paths: Vec<String>) -> Vec<String> {
+    let mut extensions = BTreeSet::new();
+    for path in &paths {
+        let Some(extension) = std::path::Path::new(path)
+            .extension()
+            .and_then(|value| value.to_str())
+        else {
+            continue;
+        };
+        extensions.extend(
+            Language::languages_for_source_extension(extension).flat_map(|language| {
+                language
+                    .extensions()
+                    .iter()
+                    .copied()
+                    .chain(language.reference_only_sibling_extensions().iter().copied())
+            }),
+        );
+    }
+    extensions.into_iter().map(String::from).collect()
+}
+
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<SearchToolsNativeSession>()?;
     module.add_function(wrap_pyfunction!(tool_descriptors_json, module)?)?;
     module.add_function(wrap_pyfunction!(code_query_variant_inventory_json, module)?)?;
+    module.add_function(wrap_pyfunction!(extensions_for_paths, module)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extensions_for_paths_expands_reference_only_siblings() {
+        assert_eq!(
+            extensions_for_paths(vec![
+                "src/components/App.vue".to_string(),
+                "src/pages/Home.razor".to_string()
+            ]),
+            vec![
+                "cjs", "cs", "cshtml", "js", "jsx", "mjs", "razor", "svelte", "ts", "tsx", "vue"
+            ]
+        );
+    }
+
+    #[test]
+    fn extensions_for_paths_ignores_unknown_extensions() {
+        assert_eq!(
+            extensions_for_paths(vec!["artifact.unknown".to_string(), "LICENSE".to_string()]),
+            Vec::<String>::new()
+        );
+    }
 }
