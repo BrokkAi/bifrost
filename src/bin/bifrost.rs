@@ -102,6 +102,7 @@ enum PolicyColorMode {
 }
 
 fn main() -> ExitCode {
+    brokk_bifrost::ensure_global_rayon_pool();
     if let Err(error) = brokk_bifrost::install_bifrost_semantic_model_packs() {
         eprintln!("{error}");
         return ExitCode::FAILURE;

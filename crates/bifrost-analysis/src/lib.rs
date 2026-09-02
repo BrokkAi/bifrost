@@ -66,9 +66,9 @@ pub use analyzer::{
     ScalaAnalyzer, SourceContent, SourceIngestionError, SourceIngestionKind, SubsetCoverage,
     TestAssertionAnalysis, TestAssertionSmell, TestAssertionWeights, TestDetectionProvider,
     TestProject, TreeSitterAnalyzer, TypeAliasProvider, TypeHierarchyProvider, TypescriptAnalyzer,
-    WorkspaceAnalyzer, WorkspaceFileListingCache, collect_workspace_files, ingest_source_bytes,
-    resolve_php_semantic_pack_dependencies, resolve_ruby_semantic_pack_dependencies,
-    resolve_rust_semantic_pack_dependencies,
+    WorkspaceAnalyzer, WorkspaceFileListingCache, collect_workspace_files,
+    ensure_global_rayon_pool, ingest_source_bytes, resolve_php_semantic_pack_dependencies,
+    resolve_ruby_semantic_pack_dependencies, resolve_rust_semantic_pack_dependencies,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use analyzer::{

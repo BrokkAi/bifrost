@@ -144,6 +144,7 @@ fn code_query_variant_inventory_json() -> PyResult<String> {
 
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    crate::ensure_global_rayon_pool();
     module.add_class::<SearchToolsNativeSession>()?;
     module.add_function(wrap_pyfunction!(tool_descriptors_json, module)?)?;
     module.add_function(wrap_pyfunction!(code_query_variant_inventory_json, module)?)?;

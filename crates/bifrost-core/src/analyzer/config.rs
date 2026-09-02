@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -440,6 +441,23 @@ pub(crate) fn default_parallelism() -> usize {
     std::thread::available_parallelism()
         .map(|value| value.get())
         .unwrap_or(1)
+}
+
+/// Cap rayon's implicit global pool to [`default_parallelism`], so every unguarded
+/// `.par_iter()` call across the analyzer honors `BIFROST_PARALLELISM` too, not just pools
+/// (like [`crate::analyzer::pool_memo::dedicated_build_pool`]) that read it explicitly.
+///
+/// Idempotent and safe to call from every process entry point (CLI, MCP/LSP server, Python
+/// module init): the first caller in the process wins, `rayon::ThreadPoolBuilder::build_global`
+/// is deliberately allowed to fail on a repeat or already-initialized pool, and that failure is
+/// not a caller-visible error -- a later entry point sharing the process is expected, not a bug.
+pub fn ensure_global_rayon_pool() {
+    static DONE: OnceLock<()> = OnceLock::new();
+    DONE.get_or_init(|| {
+        let _ = rayon::ThreadPoolBuilder::new()
+            .num_threads(default_parallelism())
+            .build_global();
+    });
 }
 
 impl Default for AnalyzerConfig {
