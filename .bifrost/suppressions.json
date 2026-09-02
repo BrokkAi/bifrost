@@ -420,6 +420,30 @@
       "accepted_by": "jbellis",
       "accepted_at": "2026-09-02",
       "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.correctness.dynamic-evaluation",
+      "finding_id": "313fdda4d185ede66194ee398169485fb4c8d36187a247c76ef0837da3a1c8a4",
+      "path": "docs/fixtures/scan-tutorial/src/settings.py",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Intentional positive teaching fixture for the documented Scan a codebase tutorial. The direct eval call must remain present so the tutorial produces and explains the promised dynamic-evaluation finding.",
+      "policy_hash_at_acceptance": "455fca5f51f3291329d71adaa89b4c5e478df8a869272e633b6cd138afe54fb3",
+      "accepted_by": "dbakereffendi",
+      "accepted_at": "2026-09-02",
+      "expires_at": null
+    },
+    {
+      "policy_id": "bifrost.correctness.unsafe-deserialization",
+      "finding_id": "2b0cf183173e8271cde89430d783ce0b2e861601cfea4737ed31284c641c90cd",
+      "path": "docs/fixtures/scan-tutorial/src/settings.py",
+      "identity_stability": "strong",
+      "status": "accepted",
+      "reason": "Intentional positive teaching fixture for the documented Scan a codebase tutorial. The pickle.loads call must remain present so the tutorial produces and explains the promised unsafe-deserialization finding.",
+      "policy_hash_at_acceptance": "04fe7a69f28ebc3d702bf909b01b29bad3def6fe5d6072351337fcd17c0ed867",
+      "accepted_by": "dbakereffendi",
+      "accepted_at": "2026-09-02",
+      "expires_at": null
     }
   ]
 }
