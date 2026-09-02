@@ -33,6 +33,7 @@ use std::hash::Hash;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
+use crate::analyzer::config::default_parallelism;
 use crate::hash::HashMap;
 
 const CANCELLABLE_WAIT_INTERVAL: Duration = Duration::from_millis(10);
@@ -51,16 +52,16 @@ thread_local! {
 /// global-pool worker park on it instead of duplicating it serially. Built once
 /// per process; its workers sleep while no build is in flight.
 ///
-/// Sized by the analyzer parallelism setting rather than by rayon's own default,
-/// the way `HEAVY_SCAN_POOL` in `searchtools/scan_usages.rs` is: a batch consumer
-/// running many analyzers in one process caps every pool with
-/// `BIFROST_PARALLELISM` to hold its process-wide thread budget, and a dedicated
-/// pool that ignored the setting would defeat that budget.
+/// Sized via [`default_parallelism`] (honors `BIFROST_PARALLELISM`), not left to rayon's own
+/// all-cores default: this pool runs the longest-lived, heaviest background work in the
+/// analyzer (whole-workspace index builds), so it is exactly the pool a batch consumer most
+/// needs to cap to avoid oversubscribing cores -- the same goal `BIFROST_PARALLELISM` already
+/// serves for every other configured pool.
 fn dedicated_build_pool() -> &'static rayon::ThreadPool {
     static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
     POOL.get_or_init(|| {
         rayon::ThreadPoolBuilder::new()
-            .num_threads(crate::analyzer::config::AnalyzerConfig::default().parallelism())
+            .num_threads(default_parallelism())
             .thread_name(|index| format!("bifrost-index-build-{index}"))
             .start_handler(|_| ON_DEDICATED_BUILD_POOL.with(|flag| flag.set(true)))
             .build()

@@ -426,7 +426,11 @@ impl JvmMavenCoordinate {
 /// Default analyzer thread-pool size. Honors `BIFROST_PARALLELISM` (a positive integer)
 /// so batch consumers running many analyzers concurrently can cap each pool and avoid
 /// oversubscribing cores / exhausting the process thread budget; otherwise uses all cores.
-fn default_parallelism() -> usize {
+///
+/// `pub(crate)`: also read directly by `pool_memo::dedicated_build_pool`, which builds its
+/// own rayon pool outside `AnalyzerConfig` and would otherwise silently default to every
+/// core regardless of this setting.
+pub(crate) fn default_parallelism() -> usize {
     if let Ok(raw) = std::env::var("BIFROST_PARALLELISM")
         && let Ok(value) = raw.trim().parse::<usize>()
         && value > 0
